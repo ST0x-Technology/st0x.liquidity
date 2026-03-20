@@ -47,7 +47,7 @@ use crate::symbol::cache::SymbolCache;
 use crate::test_utils::setup_test_db;
 use crate::threshold::ExecutionThreshold;
 use crate::tokenization::alpaca::tests::setup_anvil;
-use crate::trading::onchain::inclusion::ChainIncluded;
+use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::trade_accountant::TradeAccountingError;
 use crate::vault_registry::VaultRegistryId;
 use st0x_float_macro::float;
@@ -93,7 +93,7 @@ async fn assert_position(
 /// `OnchainTrade` and a matching `ChainIncluded` event ready for CQRS processing.
 struct AnvilTrade {
     trade: OnchainTrade,
-    trade_event: ChainIncluded<RaindexTradeEvent>,
+    trade_event: EmittedOnChain<RaindexTradeEvent>,
     tx_hash: B256,
     log_index: u64,
     input_vault_id: B256,
@@ -323,7 +323,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
         let tx_hash = trade.tx_hash;
         let log_index = trade.log_index;
 
-        let trade_event = ChainIncluded {
+        let trade_event = EmittedOnChain {
             tx_hash,
             log_index,
             block_number: take_log.block_number.unwrap(),

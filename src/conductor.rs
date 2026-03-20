@@ -12,6 +12,9 @@ use alloy::primitives::{Address, IntoLogData};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Log;
 use alloy::sol_types;
+use apalis_codec::json::JsonCodec;
+use apalis_sqlite::fetcher::SqliteFetcher;
+use apalis_sqlite::{CompactType, SqliteStorage};
 use futures_util::{Stream, StreamExt};
 use sqlx::SqlitePool;
 use std::collections::HashMap;
@@ -58,7 +61,8 @@ use crate::symbol::lock::get_symbol_lock;
 use crate::threshold::ExecutionThreshold;
 use crate::tokenization::Tokenizer;
 use crate::tokenization::alpaca::AlpacaTokenizationService;
-use crate::trading::onchain::inclusion::ChainIncluded;
+use crate::trading::onchain::inclusion::EmittedOnChain;
+use crate::trading::onchain::trade_accountant::AccountForDexTrade;
 use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryId};
 use crate::wrapper::WrapperService;
 
@@ -136,34 +140,6 @@ pub(crate) enum EventProcessingError {
     AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
 }
 
-pub(crate) async fn run_market_hours_loop<E>(
-    executor: E,
-    ctx: Ctx,
-    pool: SqlitePool,
-    executor_maintenance: Option<JoinHandle<()>>,
-    event_sender: broadcast::Sender<ServerMessage>,
-    inventory: Arc<BroadcastingInventory>,
-) -> anyhow::Result<()>
-where
-    E: Executor + Clone + Send + 'static,
-    EventProcessingError: From<E::Error>,
-{
-    let mut conductor = Conductor::start(
-        ctx,
-        pool,
-        executor,
-        executor_maintenance,
-        event_sender,
-        inventory,
-    )
-    .await?;
-
-    info!("Conductor running");
-    let result = conductor.wait_for_completion().await;
-    conductor.abort_all();
-    result
-}
-
 /// Context for vault discovery operations during trade processing.
 pub(crate) struct VaultDiscoveryCtx<'a> {
     pub(crate) vault_registry: &'a Store<VaultRegistry>,
@@ -172,159 +148,157 @@ pub(crate) struct VaultDiscoveryCtx<'a> {
 }
 
 impl Conductor {
-    pub(crate) fn start<E>(
+    pub(crate) async fn run<E>(
+        executor: E,
         ctx: Ctx,
         pool: SqlitePool,
-        executor: E,
         executor_maintenance: Option<JoinHandle<()>>,
         event_sender: broadcast::Sender<ServerMessage>,
         inventory: Arc<BroadcastingInventory>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Self>> + Send>>
+    ) -> anyhow::Result<()>
     where
         E: Executor + Clone + Send + 'static,
         EventProcessingError: From<E::Error>,
     {
-        Box::pin(async move {
-            let ws = WsConnect::new(ctx.evm.ws_rpc_url.as_str());
-            let provider = ProviderBuilder::new().connect_ws(ws).await?;
-            let cache = SymbolCache::default();
-            let orderbook = IOrderBookV6Instance::new(ctx.evm.orderbook, &provider);
+        let ws = WsConnect::new(ctx.evm.ws_rpc_url.as_str());
+        let provider = ProviderBuilder::new().connect_ws(ws).await?;
+        let cache = SymbolCache::default();
+        let orderbook = IOrderBookV6Instance::new(ctx.evm.orderbook, &provider);
 
-            let mut clear_stream = orderbook.ClearV3_filter().watch().await?.into_stream();
-            let mut take_stream = orderbook.TakeOrderV3_filter().watch().await?.into_stream();
+        let mut clear_stream = orderbook.ClearV3_filter().watch().await?.into_stream();
+        let mut take_stream = orderbook.TakeOrderV3_filter().watch().await?.into_stream();
 
-            let cutoff_block =
-                get_cutoff_block(&mut clear_stream, &mut take_stream, &provider, &pool).await?;
+        let cutoff_block =
+            get_cutoff_block(&mut clear_stream, &mut take_stream, &provider, &pool).await?;
 
-            if let Some(end_block) = cutoff_block.checked_sub(1) {
-                backfill_events(&pool, &provider, &ctx.evm, end_block).await?;
-            }
+        if let Some(end_block) = cutoff_block.checked_sub(1) {
+            backfill_events(&provider, &ctx.evm, end_block).await?;
+        }
 
-            let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
+        let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await?;
+
+        let (vault_registry, vault_registry_projection) =
+            StoreBuilder::<VaultRegistry>::new(pool.clone())
                 .build(())
                 .await?;
 
-            let (vault_registry, vault_registry_projection) =
-                StoreBuilder::<VaultRegistry>::new(pool.clone())
-                    .build(())
-                    .await?;
+        seed_vault_registry_from_config(&vault_registry, &ctx).await?;
 
-            seed_vault_registry_from_config(&vault_registry, &ctx).await?;
+        let rebalancing = match ctx.rebalancing_ctx() {
+            Ok(ctx) => Some(ctx.clone()),
+            Err(CtxError::NotRebalancing) => None,
+            Err(error) => return Err(error.into()),
+        };
 
-            let rebalancing = match ctx.rebalancing_ctx() {
-                Ok(ctx) => Some(ctx.clone()),
-                Err(CtxError::NotRebalancing) => None,
-                Err(error) => return Err(error.into()),
-            };
+        let (
+            position,
+            position_projection,
+            snapshot,
+            rebalancer,
+            ethereum_wallet,
+            base_wallet,
+            alpaca_wallet,
+        ) = if let Some(rebalancing_ctx) = rebalancing {
+            let ethereum_wallet = rebalancing_ctx.ethereum_wallet().clone();
+            let base_wallet = rebalancing_ctx.base_wallet().clone();
+            let infra = spawn_rebalancing_infrastructure(
+                rebalancing_ctx,
+                ethereum_wallet.clone(),
+                base_wallet.clone(),
+                RebalancingDeps {
+                    pool: pool.clone(),
+                    ctx: ctx.clone(),
+                    inventory: inventory.clone(),
+                    event_sender,
+                    vault_registry: vault_registry.clone(),
+                    vault_registry_projection: vault_registry_projection.clone(),
+                },
+            )
+            .await?;
 
-            let (
+            (
+                infra.position,
+                infra.position_projection,
+                infra.snapshot,
+                Some(infra.rebalancer),
+                Some(ethereum_wallet),
+                Some(base_wallet),
+                Some(infra.alpaca_wallet),
+            )
+        } else {
+            let (position, position_projection) = build_position_cqrs(&pool).await?;
+            let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
+                .build(())
+                .await?;
+            (
                 position,
                 position_projection,
                 snapshot,
-                rebalancer,
-                ethereum_wallet,
-                base_wallet,
-                alpaca_wallet,
-            ) = if let Some(rebalancing_ctx) = rebalancing {
-                let ethereum_wallet = rebalancing_ctx.ethereum_wallet().clone();
-                let base_wallet = rebalancing_ctx.base_wallet().clone();
-                let infra = spawn_rebalancing_infrastructure(
-                    rebalancing_ctx,
-                    ethereum_wallet.clone(),
-                    base_wallet.clone(),
-                    RebalancingDeps {
-                        pool: pool.clone(),
-                        ctx: ctx.clone(),
-                        inventory: inventory.clone(),
-                        event_sender,
-                        vault_registry: vault_registry.clone(),
-                        vault_registry_projection: vault_registry_projection.clone(),
-                    },
-                )
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+
+        let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer(executor.clone()));
+
+        let (offchain_order, offchain_order_projection) =
+            StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(order_placer)
                 .await?;
 
-                (
-                    infra.position,
-                    infra.position_projection,
-                    infra.snapshot,
-                    Some(infra.rebalancer),
-                    Some(ethereum_wallet),
-                    Some(base_wallet),
-                    Some(infra.alpaca_wallet),
-                )
-            } else {
-                let (position, position_projection) = build_position_cqrs(&pool).await?;
-                let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
-                    .build(())
-                    .await?;
-                (
-                    position,
-                    position_projection,
-                    snapshot,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-            };
+        let frameworks = CqrsFrameworks {
+            onchain_trade,
+            position,
+            position_projection,
+            offchain_order,
+            offchain_order_projection,
+            vault_registry,
+            vault_registry_projection,
+            snapshot,
+        };
 
-            let order_placer: Arc<dyn OrderPlacer> =
-                Arc::new(ExecutorOrderPlacer(executor.clone()));
+        let job_queue =
+            SqliteStorage::<AccountForDexTrade, JsonCodec<CompactType>, SqliteFetcher>::new(&pool);
 
-            let (offchain_order, offchain_order_projection) =
-                StoreBuilder::<OffchainOrder>::new(pool.clone())
-                    .build(order_placer)
-                    .await?;
-
-            let frameworks = CqrsFrameworks {
-                onchain_trade,
-                position,
-                position_projection,
-                offchain_order,
-                offchain_order_projection,
-                vault_registry,
-                vault_registry_projection,
-                snapshot,
-            };
-
-            let mut builder = ConductorBuilder::new(
-                ctx.clone(),
-                pool.clone(),
-                cache,
-                provider,
-                executor,
-                ctx.execution_threshold,
-                frameworks,
-            )
+        let mut builder = ConductorBuilder::new(ctx.clone(), job_queue)
             .with_executor_maintenance(executor_maintenance)
             .with_dex_event_streams(clear_stream, take_stream);
 
-            if let Some(rebalancer_handle) = rebalancer {
-                builder = builder.with_rebalancer(rebalancer_handle);
-            }
+        if let Some(rebalancer_handle) = rebalancer {
+            builder = builder.with_rebalancer(rebalancer_handle);
+        }
 
-            if let Some(wallet) = ethereum_wallet {
-                builder = builder.with_ethereum_wallet(wallet);
-            }
+        if let Some(wallet) = ethereum_wallet {
+            builder = builder.with_ethereum_wallet(wallet);
+        }
 
-            if let Some(wallet) = base_wallet {
-                let unwrapped_equity_token_addresses =
-                    base_wallet_unwrapped_equity_token_addresses(&ctx);
-                let wrapped_equity_token_addresses =
-                    base_wallet_wrapped_equity_token_addresses(&ctx);
-                builder = builder.with_base_wallet(
-                    wallet,
-                    unwrapped_equity_token_addresses,
-                    wrapped_equity_token_addresses,
-                );
-            }
+        if let Some(wallet) = base_wallet {
+            let unwrapped_equity_token_addresses =
+                base_wallet_unwrapped_equity_token_addresses(&ctx);
 
-            if let Some(wallet) = alpaca_wallet {
-                builder = builder.with_alpaca_wallet(wallet);
-            }
+            let wrapped_equity_token_addresses = base_wallet_wrapped_equity_token_addresses(&ctx);
 
-            Ok(builder.spawn())
-        })
+            builder = builder.with_base_wallet(
+                wallet,
+                unwrapped_equity_token_addresses,
+                wrapped_equity_token_addresses,
+            );
+        }
+
+        if let Some(wallet) = alpaca_wallet {
+            builder = builder.with_alpaca_wallet(wallet);
+        }
+
+        let mut conductor = builder.spawn();
+
+        info!("Conductor running");
+        let result = conductor.wait_for_completion().await;
+        conductor.abort_all();
+        result
     }
 }
 
@@ -754,7 +728,7 @@ where
 /// - USDC vault: token == USDC_BASE
 /// - Equity vault: token matches the trade's symbol (via cache lookup)
 pub(crate) async fn discover_vaults_for_trade(
-    trade_event: &ChainIncluded<RaindexTradeEvent>,
+    trade_event: &EmittedOnChain<RaindexTradeEvent>,
     trade: &OnchainTrade,
     context: &VaultDiscoveryCtx<'_>,
 ) -> Result<(), EventProcessingError> {
@@ -942,7 +916,7 @@ async fn execute_acknowledge_fill(
 
 pub(crate) async fn process_queued_trade<E: Executor>(
     executor: &E,
-    trade_event: &ChainIncluded<RaindexTradeEvent>,
+    trade_event: &EmittedOnChain<RaindexTradeEvent>,
     trade: OnchainTrade,
     cqrs: &TradeProcessingCqrs,
     asset_enabled: bool,

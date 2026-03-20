@@ -16,7 +16,7 @@ use std::num::TryFromIntError;
 /// Wraps an arbitrary event type with metadata about the exact point
 /// at which the event was included in the ledger.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct ChainIncluded<Event> {
+pub(crate) struct EmittedOnChain<Event> {
     pub(crate) event: Event,
     pub(crate) tx_hash: TxHash,
     pub(crate) log_index: u64,
@@ -24,7 +24,7 @@ pub(crate) struct ChainIncluded<Event> {
     pub(crate) block_timestamp: Option<DateTime<Utc>>,
 }
 
-impl<Event> ChainIncluded<Event> {
+impl<Event> EmittedOnChain<Event> {
     /// Extracts block inclusion metadata from an RPC log and pairs it
     /// with the already-decoded event.
     pub(crate) fn from_log(event: Event, log: &Log) -> Result<Self, BlockInclusionError> {
@@ -116,7 +116,7 @@ mod tests {
     #[test]
     fn from_log_extracts_all_fields() {
         let log = valid_log();
-        let included = ChainIncluded::from_log("test_event", &log).unwrap();
+        let included = EmittedOnChain::from_log("test_event", &log).unwrap();
 
         assert_eq!(included.event, "test_event");
         assert_eq!(included.tx_hash, log.transaction_hash.unwrap());
@@ -133,7 +133,7 @@ mod tests {
         let mut log = valid_log();
         log.block_timestamp = None;
 
-        let included = ChainIncluded::from_log("event", &log).unwrap();
+        let included = EmittedOnChain::from_log("event", &log).unwrap();
 
         assert!(
             included.block_timestamp.is_none(),
@@ -146,7 +146,7 @@ mod tests {
         let mut log = valid_log();
         log.transaction_hash = None;
 
-        let error = ChainIncluded::from_log("event", &log).unwrap_err();
+        let error = EmittedOnChain::from_log("event", &log).unwrap_err();
 
         assert!(
             matches!(
@@ -162,7 +162,7 @@ mod tests {
         let mut log = valid_log();
         log.log_index = None;
 
-        let error = ChainIncluded::from_log("event", &log).unwrap_err();
+        let error = EmittedOnChain::from_log("event", &log).unwrap_err();
 
         assert!(
             matches!(
@@ -178,7 +178,7 @@ mod tests {
         let mut log = valid_log();
         log.block_number = None;
 
-        let error = ChainIncluded::from_log("event", &log).unwrap_err();
+        let error = EmittedOnChain::from_log("event", &log).unwrap_err();
 
         assert!(
             matches!(
@@ -192,7 +192,7 @@ mod tests {
     #[test]
     fn timestamp_parsed_as_utc_datetime() {
         let log = valid_log();
-        let included = ChainIncluded::from_log("event", &log).unwrap();
+        let included = EmittedOnChain::from_log("event", &log).unwrap();
 
         let timestamp = included.block_timestamp.unwrap();
         assert_eq!(timestamp.timestamp(), 1_700_000_000);

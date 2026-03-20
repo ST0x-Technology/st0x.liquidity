@@ -257,15 +257,8 @@ async fn run_bot_session(
             let executor = MockExecutorCtx.try_into_executor().await?;
             let maintenance = executor.run_executor_maintenance().await;
 
-            conductor::run_market_hours_loop(
-                executor,
-                ctx,
-                pool,
-                maintenance,
-                event_sender,
-                inventory,
-            )
-            .await
+            conductor::Conductor::run(executor, ctx, pool, maintenance, event_sender, inventory)
+                .await
         }
         BrokerCtx::Schwab(schwab_auth) => {
             info!("Initializing Schwab executor");
@@ -273,45 +266,24 @@ async fn run_bot_session(
             let executor = schwab_ctx.try_into_executor().await?;
             let maintenance = executor.run_executor_maintenance().await;
 
-            conductor::run_market_hours_loop(
-                executor,
-                ctx,
-                pool,
-                maintenance,
-                event_sender,
-                inventory,
-            )
-            .await
+            conductor::Conductor::run(executor, ctx, pool, maintenance, event_sender, inventory)
+                .await
         }
         BrokerCtx::AlpacaTradingApi(alpaca_auth) => {
             info!("Initializing Alpaca Trading API executor");
             let executor = alpaca_auth.try_into_executor().await?;
             let maintenance = executor.run_executor_maintenance().await;
 
-            conductor::run_market_hours_loop(
-                executor,
-                ctx,
-                pool,
-                maintenance,
-                event_sender,
-                inventory,
-            )
-            .await
+            conductor::Conductor::run(executor, ctx, pool, maintenance, event_sender, inventory)
+                .await
         }
         BrokerCtx::AlpacaBrokerApi(alpaca_auth) => {
             info!("Initializing Alpaca Broker API executor");
             let executor = alpaca_auth.try_into_executor().await?;
             let maintenance = executor.run_executor_maintenance().await;
 
-            conductor::run_market_hours_loop(
-                executor,
-                ctx,
-                pool,
-                maintenance,
-                event_sender,
-                inventory,
-            )
-            .await
+            conductor::Conductor::run(executor, ctx, pool, maintenance, event_sender, inventory)
+                .await
         }
     }
 }

@@ -21,7 +21,7 @@ use super::EvmCtx;
 use super::OnChainError;
 use crate::bindings::IOrderBookV6::{ClearV3, TakeOrderV3};
 use crate::onchain::trade::RaindexTradeEvent;
-use crate::trading::onchain::inclusion::ChainIncluded;
+use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::trade_accountant::{AccountForDexTrade, DexTradeAccountingJobQueue};
 
 pub(crate) fn get_backfill_retry_strat() -> ExponentialBuilder {
@@ -171,7 +171,7 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
             }
         })
         .filter_map(|(event, log)| {
-            ChainIncluded::<RaindexTradeEvent>::from_log(event, &log)
+            EmittedOnChain::<RaindexTradeEvent>::from_log(event, &log)
                 .inspect_err(
                     |error| warn!(%error, "Failed to extract block inclusion metadata during backfill"),
                 )

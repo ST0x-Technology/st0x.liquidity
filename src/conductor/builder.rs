@@ -64,7 +64,7 @@ pub(crate) struct WithExecutorMaintenance {
 }
 
 pub(crate) struct ConductorBuilder<Prov, Exec, State> {
-    common: ConductorCtx<Prov, Exec>,
+    context: ConductorCtx<Prov, Exec>,
     job_queue: DexTradeAccountingJobQueue,
     dex_streams: DexEventStreams,
     state: State,
@@ -74,12 +74,12 @@ impl<Prov: Provider + Clone + Send + 'static, Exec: Executor + Clone + Send + 's
     ConductorBuilder<Prov, Exec, Initial>
 {
     pub(crate) fn new(
-        common: ConductorCtx<Prov, Exec>,
+        context: ConductorCtx<Prov, Exec>,
         job_queue: DexTradeAccountingJobQueue,
         dex_streams: DexEventStreams,
     ) -> Self {
         Self {
-            common,
+            context: common,
             job_queue,
             dex_streams,
             state: Initial,
@@ -91,7 +91,7 @@ impl<Prov: Provider + Clone + Send + 'static, Exec: Executor + Clone + Send + 's
         executor_maintenance: Option<JoinHandle<()>>,
     ) -> ConductorBuilder<Prov, Exec, WithExecutorMaintenance> {
         ConductorBuilder {
-            common: self.common,
+            context: self.context,
             job_queue: self.job_queue,
             dex_streams: self.dex_streams,
             state: WithExecutorMaintenance {
@@ -122,75 +122,75 @@ where
         log_optional_task_status("executor maintenance", executor_maintenance.is_some());
         log_optional_task_status("rebalancer", rebalancer.is_some());
 
-        let order_owner = self.common.ctx.order_owner();
-        let evm = ReadOnlyEvm::new(self.common.provider.clone());
+        let order_owner = self.context.ctx.order_owner();
+        let evm = ReadOnlyEvm::new(self.context.provider.clone());
         let raindex_service = Arc::new(RaindexService::new(
             evm,
-            self.common.ctx.evm.orderbook,
-            self.common.frameworks.vault_registry_projection.clone(),
+            self.context.ctx.evm.orderbook,
+            self.context.frameworks.vault_registry_projection.clone(),
             order_owner,
         ));
 
         let polling_service = InventoryPollingService::new(
             raindex_service,
-            self.common.executor.clone(),
-            self.common.frameworks.vault_registry.clone(),
-            self.common.ctx.evm.orderbook,
+            self.context.executor.clone(),
+            self.context.frameworks.vault_registry.clone(),
+            self.context.ctx.evm.orderbook,
             order_owner,
-            self.common.frameworks.snapshot,
-            self.common.wallet_polling,
+            self.context.frameworks.snapshot,
+            self.context.wallet_polling,
         );
 
         let inventory_poller = Some(spawn_inventory_poller(
             polling_service,
-            std::time::Duration::from_secs(self.common.ctx.inventory_poll_interval),
-            self.common.poll_notify.clone(),
+            std::time::Duration::from_secs(self.context.ctx.inventory_poll_interval),
+            self.context.poll_notify.clone(),
         ));
         log_optional_task_status("inventory poller", inventory_poller.is_some());
 
         let order_poller = spawn_order_poller(
-            &self.common.ctx,
-            self.common.executor.clone(),
-            (*self.common.frameworks.offchain_order_projection).clone(),
-            self.common.frameworks.offchain_order.clone(),
-            self.common.frameworks.position.clone(),
+            &self.context.ctx,
+            self.context.executor.clone(),
+            (*self.context.frameworks.offchain_order_projection).clone(),
+            self.context.frameworks.offchain_order.clone(),
+            self.context.frameworks.position.clone(),
         );
 
         let position_checker = spawn_periodic_accumulated_position_check()
-            .executor(self.common.executor.clone())
-            .position(self.common.frameworks.position.clone())
-            .position_projection(self.common.frameworks.position_projection.clone())
-            .offchain_order(self.common.frameworks.offchain_order.clone())
-            .execution_threshold(self.common.execution_threshold)
+            .executor(self.context.executor.clone())
+            .position(self.context.frameworks.position.clone())
+            .position_projection(self.context.frameworks.position_projection.clone())
+            .offchain_order(self.context.frameworks.offchain_order.clone())
+            .execution_threshold(self.context.execution_threshold)
             .check_interval(std::time::Duration::from_secs(
-                self.common.ctx.position_check_interval,
+                self.context.ctx.position_check_interval,
             ))
-            .ctx(self.common.ctx.clone())
+            .ctx(self.context.ctx.clone())
             .call();
 
         let trade_cqrs = super::TradeProcessingCqrs {
-            onchain_trade: self.common.frameworks.onchain_trade,
-            position: self.common.frameworks.position,
-            position_projection: self.common.frameworks.position_projection,
-            offchain_order: self.common.frameworks.offchain_order,
-            execution_threshold: self.common.execution_threshold,
-            assets: self.common.ctx.assets.clone(),
+            onchain_trade: self.context.frameworks.onchain_trade,
+            position: self.context.frameworks.position,
+            position_projection: self.context.frameworks.position_projection,
+            offchain_order: self.context.frameworks.offchain_order,
+            execution_threshold: self.context.execution_threshold,
+            assets: self.context.ctx.assets.clone(),
         };
 
         let accountant_ctx = Arc::new(AccountantCtx {
-            orderbook: self.common.ctx.evm.orderbook,
-            ctx: self.common.ctx.clone(),
-            cache: self.common.cache,
+            orderbook: self.context.ctx.evm.orderbook,
+            ctx: self.context.ctx.clone(),
+            cache: self.context.cache,
             feed_id_cache: FeedIdCache::default(),
-            evm: ReadOnlyEvm::new(self.common.provider),
+            evm: ReadOnlyEvm::new(self.context.provider),
             cqrs: trade_cqrs,
-            vault_registry: self.common.frameworks.vault_registry,
-            executor: self.common.executor,
+            vault_registry: self.context.frameworks.vault_registry,
+            executor: self.context.executor,
         });
 
         let order_fill_monitor = OrderFillMonitor::new(
-            self.common.ctx.evm.ws_rpc_url.clone(),
-            self.common.ctx.evm.orderbook,
+            self.context.ctx.evm.ws_rpc_url.clone(),
+            self.context.ctx.evm.orderbook,
             self.job_queue.clone(),
             self.dex_streams,
         );

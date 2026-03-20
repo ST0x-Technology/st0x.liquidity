@@ -21,7 +21,7 @@ use url::Url;
 
 use crate::bindings::IOrderBookV6::{ClearV3, IOrderBookV6Instance, TakeOrderV3};
 use crate::onchain::trade::RaindexTradeEvent;
-use crate::trading::onchain::inclusion::ChainIncluded;
+use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::trade_accountant::{AccountForDexTrade, DexTradeAccountingJobQueue};
 
 /// Monitors DEX WebSocket streams and pushes
@@ -141,7 +141,7 @@ impl OrderFillMonitor {
         event: RaindexTradeEvent,
         log: &alloy::rpc::types::Log,
     ) -> TaskResult {
-        let trade_event = match ChainIncluded::<RaindexTradeEvent>::from_log(event, log) {
+        let trade_event = match EmittedOnChain::<RaindexTradeEvent>::from_log(event, log) {
             Ok(trade_event) => trade_event,
             Err(err) => {
                 error!(%err, "Failed to extract block inclusion metadata from log");

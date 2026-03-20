@@ -22,7 +22,7 @@ use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
 use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
 use st0x_execution::{ExecutionError, Executor};
 
-use super::inclusion::ChainIncluded;
+use super::inclusion::EmittedOnChain;
 use crate::conductor::job::{Job, Label};
 use crate::conductor::{
     TradeProcessingCqrs, VaultDiscoveryCtx, discover_vaults_for_trade, process_queued_trade,
@@ -45,7 +45,7 @@ pub(crate) type DexTradeAccountingJobQueue =
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AccountForDexTrade {
     /// Raindex trade event with block inclusion metadata
-    pub(crate) trade: ChainIncluded<RaindexTradeEvent>,
+    pub(crate) trade: EmittedOnChain<RaindexTradeEvent>,
 }
 
 /// Bundles the shared dependencies needed by the trade accounting job.
@@ -69,7 +69,7 @@ where
     type Error = TradeAccountingError;
 
     fn label(&self) -> Label {
-        let ChainIncluded {
+        let EmittedOnChain {
             event,
             block_number,
             log_index,
@@ -159,7 +159,7 @@ where
     }
 }
 
-fn reconstruct_log(orderbook: Address, trade: &ChainIncluded<RaindexTradeEvent>) -> Log {
+fn reconstruct_log(orderbook: Address, trade: &EmittedOnChain<RaindexTradeEvent>) -> Log {
     use RaindexTradeEvent::{ClearV3, TakeOrderV3};
 
     let log_data = match &trade.event {
@@ -238,7 +238,7 @@ mod tests {
         }));
 
         AccountForDexTrade {
-            trade: ChainIncluded::from_log(event, &log).unwrap(),
+            trade: EmittedOnChain::from_log(event, &log).unwrap(),
         }
     }
 
