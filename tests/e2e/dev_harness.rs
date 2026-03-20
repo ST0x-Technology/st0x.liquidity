@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use alloy::primitives::{Address, U256, utils::parse_units};
 use alloy::providers::{Provider, RootProvider};
-use rust_decimal_macros::dec;
+use st0x_float_macro::float;
 use tokio::sync::broadcast;
 
 use st0x_dto::Statement;
@@ -76,7 +76,7 @@ fn build_dev_ctx<P: Provider + Clone>(
     )?);
 
     let rebalancing_ctx = RebalancingCtx::with_wallets()
-        .equity(ImbalanceThreshold::new(dec!(0.5), dec!(0.1))?)
+        .equity(ImbalanceThreshold::new(float!(0.5), float!(0.1))?)
         .usdc(UsdcRebalancing::Disabled)
         .redemption_wallet(REDEMPTION_WALLET)
         .alpaca_broker_auth(alpaca_auth.clone())
@@ -105,12 +105,15 @@ fn build_dev_ctx<P: Provider + Clone>(
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "long-running dev harness, not a CI test"]
 async fn dev_harness() -> anyhow::Result<()> {
     crate::test_infra::init_tracing();
 
-    let infra =
-        TestInfra::start(vec![("AAPL", dec!(150.25)), ("TSLA", dec!(245.00))], vec![]).await?;
+    let infra = TestInfra::start(
+        vec![("AAPL", float!(150.25)), ("TSLA", float!(245.00))],
+        vec![],
+    )
+    .await?;
 
     let usdc_amount: U256 = parse_units("100000", 6)?.into();
     let _usdc_vault_id = infra.base_chain.create_usdc_vault(usdc_amount).await?;
@@ -120,8 +123,8 @@ async fn dev_harness() -> anyhow::Result<()> {
         .base_chain
         .setup_order()
         .symbol("AAPL")
-        .amount(dec!(5.0))
-        .price(dec!(155.00))
+        .amount(float!(5.0))
+        .price(float!(155.00))
         .direction(TakeDirection::SellEquity)
         .call()
         .await?;
@@ -168,8 +171,8 @@ async fn dev_harness() -> anyhow::Result<()> {
         let prepared = chain
             .setup_order()
             .symbol("AAPL")
-            .amount(dec!(2.0))
-            .price(dec!(155.00))
+            .amount(float!(2.0))
+            .price(float!(155.00))
             .direction(TakeDirection::SellEquity)
             .call()
             .await?;

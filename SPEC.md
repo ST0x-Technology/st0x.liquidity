@@ -2637,7 +2637,6 @@ enum EnvelopePayload {
 }
 ```
 
-<<<<<<< variant A
 The `Batch` variant handles atomic multi-category updates. For example, a trade
 completion affects both Trading and Inventory — these arrive as a single batch
 with one sequence number so the client applies them together without flashing
@@ -2656,9 +2655,6 @@ enum Inquiry {
     // Future: Adjust(Adjustment) — circuit breakers, spread tweaks, etc.
 }
 ```
->>>>>>> variant B
-##### Future: client-to-server messages
-======= end
 
 **Sync protocol**: On connect, the client sends a `Sync` inquiry. For a fresh
 page load, `last_sequence: None` — the server responds with full statements for
@@ -2695,11 +2691,7 @@ produces a `TransferStatementDelta` containing only the changed status field.
 Full statements are produced for new entities (first time the client learns
 about something) and sync responses.
 
-1. Reactor receives the event for entity X
-2. Rebuilds entity state (standard event sourcing)
-3. Converts to DTO (each tracked aggregate implements a DTO conversion trait)
-4. Compares to the last-broadcast DTO for that entity
-5. If different: broadcasts `{ entity_type, entity_id, sequence, trigger, dto }`
+##### TanStack Query Integration
 
 WebSocket messages populate the TanStack Query cache. Each `PublicStatement`
 variant maps to query keys (e.g., `["trades"]`, `["inventory"]`,
@@ -2808,18 +2800,16 @@ Supports two bot instances (Schwab and Alpaca) via broker selector in header.
 
 #### Panels
 
-Two panels, one per core concern. Both update live via WebSocket snapshots.
+1. **Performance Metrics**: Key metrics (AUM, P&L, volume, trade count, Sharpe,
+   Sortino, max drawdown, hedge lag, uptime) with timeframe selector (1h, 1d,
+   1w, 1m, all-time).
 
-1. **Inventory**: Per-symbol equity holdings and cash balances across onchain
-   vaults and the offchain broker, with available/inflight breakdowns. Below the
-   balances, an "Inventory Transfers" section shows active and recent transfer
-   operations (minting, redemption, USDC bridging) with status.
+2. **Inventory**: Per-symbol equity holdings and cash balances across venues,
+   with available/inflight breakdowns. Includes an "Inventory Transfers" section
+   showing active and recent transfer operations with status.
 
-2. **Trading Activity**: The core operational view. Shows onchain trades as they
-   are detected, the current net position per asset, pending offchain hedge
-   orders, and their fills. This is the panel that makes live testing viable --
-   if the bot detects a trade and places a hedge, the operator sees it
-   immediately.
+3. **Spreads**: Last realized spreads per asset (buy/sell prices, Pyth
+   reference, spread bps) and per-symbol price charts over time.
 
 4. **Trade History**: Recent trades filterable by venue (onchain/offchain/both).
 

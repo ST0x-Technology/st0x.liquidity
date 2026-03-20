@@ -87,11 +87,10 @@ pub async fn launch_with_event_channel(
 
     let inventory = Arc::new(inventory::BroadcastingInventory::new(
         inventory::InventoryView::default(),
-        event_sender.clone(),
     ));
 
-    let server_task = spawn_server_task(&ctx, &pool, event_sender.clone(), inventory.clone());
-    let bot_task = spawn_bot_task(ctx, pool, event_sender, inventory);
+    let server_task = spawn_server_task(&ctx, &pool, event_sender, inventory.clone());
+    let bot_task = spawn_bot_task(ctx, pool, inventory);
 
     await_shutdown(server_task, bot_task).await?;
 
@@ -210,7 +209,6 @@ fn check_bot_result(result: Result<anyhow::Result<()>, JoinError>) -> anyhow::Re
 async fn run(
     ctx: Ctx,
     pool: SqlitePool,
-    event_sender: broadcast::Sender<Statement>,
     inventory: Arc<inventory::BroadcastingInventory>,
 ) -> anyhow::Result<()> {
     const RERUN_DELAY_SECS: u64 = 10;
@@ -252,7 +250,6 @@ async fn run(
 async fn run_bot_session(
     ctx: Ctx,
     pool: SqlitePool,
-    event_sender: broadcast::Sender<Statement>,
     inventory: Arc<inventory::BroadcastingInventory>,
 ) -> anyhow::Result<()> {
     match ctx.broker.clone() {
@@ -305,11 +302,6 @@ mod tests {
         pool
     }
 
-    fn create_test_event_sender() -> broadcast::Sender<Statement> {
-        let (sender, _) = broadcast::channel(16);
-        sender
-    }
-
     fn create_test_inventory() -> Arc<inventory::BroadcastingInventory> {
         Arc::new(inventory::BroadcastingInventory::new_without_broadcast(
             inventory::InventoryView::default(),
@@ -323,14 +315,9 @@ mod tests {
         ));
         let pool = create_test_pool().await;
         ctx.evm.ws_rpc_url = "ws://invalid.nonexistent.url:8545".parse().unwrap();
-        let error = Box::pin(run(
-            ctx,
-            pool,
-            create_test_event_sender(),
-            create_test_inventory(),
-        ))
-        .await
-        .unwrap_err();
+        let error = Box::pin(run(ctx, pool, create_test_inventory()))
+            .await
+            .unwrap_err();
 
         assert!(
             error.downcast_ref::<ExecutionError>().is_some(),
@@ -346,14 +333,9 @@ mod tests {
         let pool = create_test_pool().await;
         ctx.evm.orderbook = Address::ZERO;
         ctx.evm.ws_rpc_url = "ws://localhost:8545".parse().unwrap();
-        let error = Box::pin(run(
-            ctx,
-            pool,
-            create_test_event_sender(),
-            create_test_inventory(),
-        ))
-        .await
-        .unwrap_err();
+        let error = Box::pin(run(ctx, pool, create_test_inventory()))
+            .await
+            .unwrap_err();
 
         assert!(
             error.downcast_ref::<ExecutionError>().is_some(),
@@ -368,14 +350,9 @@ mod tests {
         ));
         ctx.evm.ws_rpc_url = "ws://invalid.nonexistent.localhost:9999".parse().unwrap();
         let pool = create_test_pool().await;
-        let error = Box::pin(run(
-            ctx,
-            pool,
-            create_test_event_sender(),
-            create_test_inventory(),
-        ))
-        .await
-        .unwrap_err();
+        let error = Box::pin(run(ctx, pool, create_test_inventory()))
+            .await
+            .unwrap_err();
 
         assert!(
             error.downcast_ref::<ExecutionError>().is_some(),
