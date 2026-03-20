@@ -172,56 +172,51 @@ impl Conductor {
             Err(error) => return Err(error.into()),
         };
 
-        let (
-            position,
-            position_projection,
-            snapshot,
-            rebalancer,
-            _ethereum_wallet,
-            _base_wallet,
-            _alpaca_wallet,
-        ) = if let Some(rebalancing_ctx) = rebalancing {
-            let ethereum_wallet = rebalancing_ctx.ethereum_wallet().clone();
-            let base_wallet = rebalancing_ctx.base_wallet().clone();
-            let infra = spawn_rebalancing_infrastructure(
-                rebalancing_ctx,
-                ethereum_wallet.clone(),
-                base_wallet.clone(),
-                RebalancingDeps {
-                    pool: pool.clone(),
-                    ctx: ctx.clone(),
-                    inventory: inventory.clone(),
-                    event_sender,
-                    vault_registry: vault_registry.clone(),
-                    vault_registry_projection: vault_registry_projection.clone(),
-                },
-            )
-            .await?;
-
-            (
-                infra.position,
-                infra.position_projection,
-                infra.snapshot,
-                Some(infra.rebalancer),
-                Some(ethereum_wallet),
-                Some(base_wallet),
-                Some(infra.alpaca_wallet),
-            )
-        } else {
-            let (position, position_projection) = build_position_cqrs(&pool).await?;
-            let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
-                .build(())
+        let (position, position_projection, snapshot, rebalancer, wallet_polling) =
+            if let Some(rebalancing_ctx) = rebalancing {
+                let ethereum_wallet = rebalancing_ctx.ethereum_wallet().clone();
+                let base_wallet = rebalancing_ctx.base_wallet().clone();
+                let infra = spawn_rebalancing_infrastructure(
+                    rebalancing_ctx,
+                    ethereum_wallet.clone(),
+                    base_wallet.clone(),
+                    RebalancingDeps {
+                        pool: pool.clone(),
+                        ctx: ctx.clone(),
+                        inventory: inventory.clone(),
+                        event_sender,
+                        vault_registry: vault_registry.clone(),
+                        vault_registry_projection: vault_registry_projection.clone(),
+                    },
+                )
                 .await?;
-            (
-                position,
-                position_projection,
-                snapshot,
-                None,
-                None,
-                None,
-                None,
-            )
-        };
+
+                let wallet_polling = crate::inventory::WalletPollingCtx {
+                    ethereum: Arc::new(ethereum_wallet),
+                    base: Arc::new(base_wallet),
+                    alpaca_wallet: infra.alpaca_wallet,
+                    unwrapped_equity_token_addresses: base_wallet_unwrapped_equity_token_addresses(
+                        &ctx,
+                    ),
+                    wrapped_equity_token_addresses: base_wallet_wrapped_equity_token_addresses(
+                        &ctx,
+                    ),
+                };
+
+                (
+                    infra.position,
+                    infra.position_projection,
+                    infra.snapshot,
+                    Some(infra.rebalancer),
+                    Some(wallet_polling),
+                )
+            } else {
+                let (position, position_projection) = build_position_cqrs(&pool).await?;
+                let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
+                    .build(())
+                    .await?;
+                (position, position_projection, snapshot, None, None)
+            };
 
         let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer(executor.clone()));
 
@@ -254,7 +249,7 @@ impl Conductor {
             execution_threshold: ctx.execution_threshold,
             frameworks,
             poll_notify: Arc::new(tokio::sync::Notify::new()),
-            wallet_polling: None,
+            wallet_polling,
         };
 
         let mut conductor = builder::spawn()
@@ -310,7 +305,9 @@ impl Conductor {
 
     pub(crate) fn abort_all(&mut self) {
         info!("Aborting all conductor tasks");
-        self.supervisor.shutdown();
+        if let Err(error) = self.supervisor.shutdown() {
+            error!(%error, "Failed to shutdown supervisor");
+        }
         self.monitor.abort();
         self.order_poller.abort();
         self.position_checker.abort();
