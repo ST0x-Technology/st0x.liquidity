@@ -1,41 +1,30 @@
-//! Orchestrates the main bot loop: subscribes to DEX events, queues them,
-//! processes trades, places offsetting broker orders, and manages background
-//! tasks (order polling, rebalancing, inventory tracking). [`Conductor`] owns
-//! the task handles; [`run_market_hours_loop`] drives the lifecycle.
+//! Orchestrates the bot lifecycle: startup sequencing, runtime task management,
+//! and trade processing. [`Conductor::run`] is the entry point.
 
 mod builder;
 pub(crate) mod job;
 mod manifest;
 mod order_fill_monitor;
 
-use alloy::primitives::{Address, IntoLogData};
-use alloy::providers::{Provider, ProviderBuilder, WsConnect};
-use alloy::rpc::types::Log;
-use alloy::sol_types;
-use apalis_codec::json::JsonCodec;
-use apalis_sqlite::fetcher::SqliteFetcher;
-use apalis_sqlite::{CompactType, SqliteStorage};
-use futures_util::{Stream, StreamExt};
+use alloy::primitives::Address;
+use alloy::providers::{ProviderBuilder, WsConnect};
+use apalis_sqlite::SqliteStorage;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::broadcast;
-use tokio::sync::mpsc;
-use tokio::sync::mpsc::UnboundedSender;
+use task_supervisor::SupervisorHandle;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 
 use st0x_dto::ServerMessage;
-use st0x_event_sorcery::{Projection, SendError, Store, StoreBuilder};
-use st0x_evm::{Evm, ReadOnlyEvm, Wallet};
-use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
-use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
-use st0x_execution::{ExecutionError, Executor, FractionalShares, Symbol};
+use st0x_event_sorcery::{Projection, Store, StoreBuilder};
+use st0x_evm::Wallet;
+use st0x_execution::{Executor, FractionalShares, Symbol};
 
 use crate::alpaca_wallet::AlpacaWalletService;
-use crate::bindings::IOrderBookV6::{ClearV3, IOrderBookV6Instance, TakeOrderV3};
+use crate::bindings::IOrderBookV6::IOrderBookV6Instance;
 use crate::config::{AssetsConfig, Ctx, CtxError};
 use crate::dashboard::EventBroadcaster;
 use crate::inventory::{BroadcastingInventory, InventoryPollingService, InventorySnapshot};
@@ -43,12 +32,12 @@ use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer,
 };
+use crate::onchain::OnchainTrade;
 use crate::onchain::USDC_BASE;
 use crate::onchain::accumulator::{ExecutionCtx, check_all_positions, check_execution_readiness};
 use crate::onchain::backfill::backfill_events;
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::onchain::trade::{RaindexTradeEvent, extract_owned_vaults, extract_vaults_from_clear};
-use crate::onchain::{OnChainError, OnchainTrade};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::rebalancing::equity::EquityTransferServices;
@@ -57,17 +46,16 @@ use crate::rebalancing::{
     RebalancingTriggerConfig,
 };
 use crate::symbol::cache::SymbolCache;
-use crate::symbol::lock::get_symbol_lock;
 use crate::threshold::ExecutionThreshold;
 use crate::tokenization::Tokenizer;
 use crate::tokenization::alpaca::AlpacaTokenizationService;
 use crate::trading::onchain::inclusion::EmittedOnChain;
-use crate::trading::onchain::trade_accountant::AccountForDexTrade;
+use crate::trading::onchain::trade_accountant::{DexTradeAccountingJobQueue, TradeAccountingError};
 use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryId};
 use crate::wrapper::WrapperService;
 
 use self::manifest::QueryManifest;
-pub(crate) use builder::{ConductorBuilder, CqrsFrameworks};
+pub(crate) use builder::CqrsFrameworks;
 
 /// Sets up apalis SQLite storage tables, tolerating pre-existing
 /// application migrations in the shared `_sqlx_migrations` table.
@@ -91,18 +79,13 @@ pub(crate) struct TradeProcessingCqrs {
 }
 
 pub(crate) struct Conductor {
-    pub(crate) executor_maintenance: Option<JoinHandle<()>>,
-    pub(crate) rebalancer: Option<JoinHandle<()>>,
-    pub(crate) inventory_poller: Option<JoinHandle<()>>,
-    pub(crate) trading_tasks: Option<TradingTasks>,
-}
-
-pub(crate) struct TradingTasks {
-    pub(crate) order_poller: JoinHandle<()>,
-    pub(crate) dex_event_receiver: JoinHandle<()>,
-    pub(crate) event_processor: JoinHandle<()>,
-    pub(crate) position_checker: JoinHandle<()>,
-    pub(crate) queue_processor: JoinHandle<()>,
+    supervisor: SupervisorHandle,
+    monitor: JoinHandle<()>,
+    order_poller: JoinHandle<()>,
+    position_checker: JoinHandle<()>,
+    executor_maintenance: Option<JoinHandle<()>>,
+    rebalancer: Option<JoinHandle<()>>,
+    inventory_poller: Option<JoinHandle<()>>,
 }
 
 fn base_wallet_unwrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Address> {
@@ -125,21 +108,6 @@ fn base_wallet_wrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Addr
         .collect()
 }
 
-/// Event processing errors for live event handling.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum EventProcessingError {
-    #[error("Onchain trade processing error: {0}")]
-    OnChain(#[from] OnChainError),
-    #[error("Vault registry command failed: {0}")]
-    VaultRegistry(#[from] SendError<VaultRegistry>),
-    #[error("Execution error: {0}")]
-    Execution(#[from] ExecutionError),
-    #[error("Alpaca trading API error: {0}")]
-    AlpacaTradingApi(#[from] AlpacaTradingApiError),
-    #[error("Alpaca broker API error: {0}")]
-    AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
-}
-
 /// Context for vault discovery operations during trade processing.
 pub(crate) struct VaultDiscoveryCtx<'a> {
     pub(crate) vault_registry: &'a Store<VaultRegistry>,
@@ -158,21 +126,33 @@ impl Conductor {
     ) -> anyhow::Result<()>
     where
         E: Executor + Clone + Send + 'static,
-        EventProcessingError: From<E::Error>,
+        TradeAccountingError: From<E::Error>,
     {
+        // Phase 1: connect WS and set up apalis tables (parallel)
         let ws = WsConnect::new(ctx.evm.ws_rpc_url.as_str());
         let provider = ProviderBuilder::new().connect_ws(ws).await?;
         let cache = SymbolCache::default();
         let orderbook = IOrderBookV6Instance::new(ctx.evm.orderbook, &provider);
 
+        setup_apalis_tables(&pool).await?;
+        let job_queue: DexTradeAccountingJobQueue = SqliteStorage::new(&pool);
+
         let mut clear_stream = orderbook.ClearV3_filter().watch().await?.into_stream();
         let mut take_stream = orderbook.TakeOrderV3_filter().watch().await?.into_stream();
 
-        let cutoff_block =
-            get_cutoff_block(&mut clear_stream, &mut take_stream, &provider, &pool).await?;
+        // Phase 2: determine cutoff block from WS subscription
+        let cutoff_block = get_cutoff_block(&mut clear_stream, &mut take_stream, &provider).await?;
 
+        // Phase 3: backfill historical events to the job queue
         if let Some(end_block) = cutoff_block.checked_sub(1) {
-            backfill_events(&provider, &ctx.evm, end_block).await?;
+            backfill_events(
+                &provider,
+                &ctx.evm,
+                end_block,
+                backon::ExponentialBuilder::default(),
+                job_queue.clone(),
+            )
+            .await?;
         }
 
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
@@ -197,9 +177,9 @@ impl Conductor {
             position_projection,
             snapshot,
             rebalancer,
-            ethereum_wallet,
-            base_wallet,
-            alpaca_wallet,
+            _ethereum_wallet,
+            _base_wallet,
+            _alpaca_wallet,
         ) = if let Some(rebalancing_ctx) = rebalancing {
             let ethereum_wallet = rebalancing_ctx.ethereum_wallet().clone();
             let base_wallet = rebalancing_ctx.base_wallet().clone();
@@ -261,39 +241,29 @@ impl Conductor {
             snapshot,
         };
 
-        let job_queue =
-            SqliteStorage::<AccountForDexTrade, JsonCodec<CompactType>, SqliteFetcher>::new(&pool);
+        let dex_streams = order_fill_monitor::DexEventStreams {
+            clear: Box::pin(clear_stream),
+            take: Box::pin(take_stream),
+        };
 
-        let mut builder = ConductorBuilder::new(ctx.clone(), job_queue)
-            .with_executor_maintenance(executor_maintenance)
-            .with_dex_event_streams(clear_stream, take_stream);
+        let conductor_ctx = builder::ConductorCtx {
+            ctx: ctx.clone(),
+            cache,
+            provider,
+            executor,
+            execution_threshold: ctx.execution_threshold,
+            frameworks,
+            poll_notify: Arc::new(tokio::sync::Notify::new()),
+            wallet_polling: None,
+        };
 
-        if let Some(rebalancer_handle) = rebalancer {
-            builder = builder.with_rebalancer(rebalancer_handle);
-        }
-
-        if let Some(wallet) = ethereum_wallet {
-            builder = builder.with_ethereum_wallet(wallet);
-        }
-
-        if let Some(wallet) = base_wallet {
-            let unwrapped_equity_token_addresses =
-                base_wallet_unwrapped_equity_token_addresses(&ctx);
-
-            let wrapped_equity_token_addresses = base_wallet_wrapped_equity_token_addresses(&ctx);
-
-            builder = builder.with_base_wallet(
-                wallet,
-                unwrapped_equity_token_addresses,
-                wrapped_equity_token_addresses,
-            );
-        }
-
-        if let Some(wallet) = alpaca_wallet {
-            builder = builder.with_alpaca_wallet(wallet);
-        }
-
-        let mut conductor = builder.spawn();
+        let mut conductor = builder::spawn()
+            .context(conductor_ctx)
+            .job_queue(job_queue)
+            .dex_streams(dex_streams)
+            .maybe_executor_maintenance(executor_maintenance)
+            .maybe_rebalancer(rebalancer)
+            .call();
 
         info!("Conductor running");
         let result = conductor.wait_for_completion().await;
@@ -303,40 +273,47 @@ impl Conductor {
 }
 
 impl Conductor {
-    pub(crate) async fn wait_for_completion(&mut self) -> Result<(), anyhow::Error> {
-        let infra = wait_for_infrastructure(
-            &mut self.executor_maintenance,
-            &mut self.rebalancer,
-            &mut self.inventory_poller,
-        );
-
-        if let Some(tasks) = self.trading_tasks.as_mut() {
-            wait_for_all_tasks(infra, tasks).await
-        } else {
-            infra.await;
-            Ok(())
+    pub(crate) async fn wait_for_completion(&mut self) -> anyhow::Result<()> {
+        tokio::select! {
+            result = self.supervisor.wait() => {
+                result?;
+                info!("Supervisor exited");
+            }
+            result = &mut self.monitor => {
+                if let Err(join_error) = result {
+                    if !join_error.is_cancelled() {
+                        return Err(anyhow::anyhow!("Apalis monitor failed: {join_error}"));
+                    }
+                }
+                info!("Apalis monitor exited");
+            }
+            result = &mut self.order_poller => {
+                if let Err(join_error) = result {
+                    if !join_error.is_cancelled() {
+                        return Err(anyhow::anyhow!("Order poller failed: {join_error}"));
+                    }
+                }
+                info!("Order poller exited");
+            }
+            result = &mut self.position_checker => {
+                if let Err(join_error) = result {
+                    if !join_error.is_cancelled() {
+                        return Err(anyhow::anyhow!("Position checker failed: {join_error}"));
+                    }
+                }
+                info!("Position checker exited");
+            }
         }
-    }
 
-    pub(crate) fn abort_trading_tasks(&mut self) {
-        let Some(tasks) = self.trading_tasks.take() else {
-            info!("No trading tasks to abort");
-            return;
-        };
-
-        info!(
-            "Aborting trading tasks (keeping rebalancer, inventory poller, and broker maintenance alive)"
-        );
-        tasks.order_poller.abort();
-        tasks.dex_event_receiver.abort();
-        tasks.event_processor.abort();
-        tasks.position_checker.abort();
-        tasks.queue_processor.abort();
-        info!("Trading tasks aborted successfully");
+        Ok(())
     }
 
     pub(crate) fn abort_all(&mut self) {
-        self.abort_trading_tasks();
+        info!("Aborting all conductor tasks");
+        self.supervisor.shutdown();
+        self.monitor.abort();
+        self.order_poller.abort();
+        self.position_checker.abort();
 
         if let Some(ref handle) = self.rebalancer {
             handle.abort();
@@ -543,8 +520,8 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             .ok_or(CtxError::MissingCashVaultId)?;
 
         let handle = services.spawn(
-            RaindexVaultId(usdc_vault_id),
             market_maker_wallet,
+            RaindexVaultId(usdc_vault_id),
             operation_receiver,
             frameworks,
         );
@@ -559,62 +536,6 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
     })
 }
 
-async fn wait_for_infrastructure(
-    executor_maintenance: &mut Option<JoinHandle<()>>,
-    rebalancer: &mut Option<JoinHandle<()>>,
-    inventory_poller: &mut Option<JoinHandle<()>>,
-) {
-    tokio::join!(
-        wait_for_optional_task(executor_maintenance, "Executor maintenance"),
-        wait_for_optional_task(rebalancer, "Rebalancer"),
-        wait_for_optional_task(inventory_poller, "Inventory poller"),
-    );
-}
-
-async fn wait_for_all_tasks(
-    infrastructure: impl std::future::Future<Output = ()>,
-    tasks: &mut TradingTasks,
-) -> anyhow::Result<()> {
-    let ((), poller, dex, processor, position, queue) = tokio::join!(
-        infrastructure,
-        &mut tasks.order_poller,
-        &mut tasks.dex_event_receiver,
-        &mut tasks.event_processor,
-        &mut tasks.position_checker,
-        &mut tasks.queue_processor
-    );
-
-    for (name, result) in [
-        ("Order poller", poller),
-        ("DEX event receiver", dex),
-        ("Event processor", processor),
-        ("Position checker", position),
-        ("Queue processor", queue),
-    ] {
-        if let Err(join_error) = result {
-            if join_error.is_cancelled() {
-                info!("{name} cancelled (expected during shutdown)");
-                continue;
-            }
-            return Err(anyhow::anyhow!("{name} task failed: {join_error}"));
-        }
-    }
-
-    Ok(())
-}
-
-async fn wait_for_optional_task(handle: &mut Option<JoinHandle<()>>, task_name: &str) {
-    let Some(handle) = handle else { return };
-
-    match handle.await {
-        Ok(()) => info!("{task_name} completed successfully"),
-        Err(error) if error.is_cancelled() => {
-            info!("{task_name} cancelled (expected during shutdown)");
-        }
-        Err(error) => error!("{task_name} task panicked: {error}"),
-    }
-}
-
 /// Constructs the position CQRS framework with its view query
 /// (without rebalancing trigger). Used when rebalancing is disabled.
 async fn build_position_cqrs(
@@ -623,6 +544,68 @@ async fn build_position_cqrs(
     Ok(StoreBuilder::<Position>::new(pool.clone())
         .build(())
         .await?)
+}
+
+/// Determines the block number at which the WS subscription starts.
+///
+/// Waits up to 5 seconds for the first event on either stream. If an event
+/// arrives, its block number is the cutoff. If no events arrive within the
+/// timeout, falls back to the provider's current block number.
+async fn get_cutoff_block<S1, S2, P>(
+    clear_stream: &mut S1,
+    take_stream: &mut S2,
+    provider: &P,
+) -> anyhow::Result<u64>
+where
+    S1: futures_util::Stream<
+            Item = Result<
+                (
+                    crate::bindings::IOrderBookV6::ClearV3,
+                    alloy::rpc::types::Log,
+                ),
+                alloy::sol_types::Error,
+            >,
+        > + Unpin,
+    S2: futures_util::Stream<
+            Item = Result<
+                (
+                    crate::bindings::IOrderBookV6::TakeOrderV3,
+                    alloy::rpc::types::Log,
+                ),
+                alloy::sol_types::Error,
+            >,
+        > + Unpin,
+    P: alloy::providers::Provider + Clone,
+{
+    use futures_util::StreamExt;
+
+    info!("Waiting for first WebSocket event to determine cutoff block...");
+
+    let timeout = tokio::time::sleep(Duration::from_secs(5));
+    tokio::pin!(timeout);
+
+    loop {
+        let block_number = tokio::select! {
+            Some(result) = clear_stream.next() => {
+                result?.1.block_number
+            }
+            Some(result) = take_stream.next() => {
+                result?.1.block_number
+            }
+            () = &mut timeout => {
+                let current_block = provider.get_block_number().await?;
+                info!("No events within timeout, using current block {current_block} as cutoff");
+                return Ok(current_block);
+            }
+        };
+
+        if let Some(block) = block_number {
+            info!("First event at block {block}, using as cutoff");
+            return Ok(block);
+        }
+
+        warn!("Event missing block number, waiting for next event");
+    }
 }
 
 fn spawn_order_poller<E: Executor + Clone + Send + 'static>(
@@ -666,7 +649,7 @@ fn spawn_periodic_accumulated_position_check<E>(
 ) -> JoinHandle<()>
 where
     E: Executor + Clone + Send + 'static,
-    EventProcessingError: From<E::Error>,
+    TradeAccountingError: From<E::Error>,
 {
     info!("Starting periodic accumulated position checker");
 
@@ -697,6 +680,7 @@ where
 fn spawn_inventory_poller<Chain, Exe>(
     service: InventoryPollingService<Chain, Exe>,
     poll_interval: std::time::Duration,
+    poll_notify: Arc<tokio::sync::Notify>,
 ) -> JoinHandle<()>
 where
     Chain: st0x_evm::Evm,
@@ -709,7 +693,13 @@ where
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                () = poll_notify.notified() => {
+                    debug!("Inventory poll triggered by notification");
+                }
+            }
+
             debug!("Running inventory poll");
             if let Err(error) = service.poll_and_record().await {
                 error!(%error, "Inventory polling failed");
@@ -731,7 +721,7 @@ pub(crate) async fn discover_vaults_for_trade(
     trade_event: &EmittedOnChain<RaindexTradeEvent>,
     trade: &OnchainTrade,
     context: &VaultDiscoveryCtx<'_>,
-) -> Result<(), EventProcessingError> {
+) -> Result<(), TradeAccountingError> {
     let tx_hash = trade_event.tx_hash;
     let base_symbol = trade.symbol.base();
     let expected_equity_token = trade.equity_token;
@@ -920,7 +910,7 @@ pub(crate) async fn process_queued_trade<E: Executor>(
     trade: OnchainTrade,
     cqrs: &TradeProcessingCqrs,
     asset_enabled: bool,
-) -> Result<Option<OffchainOrderId>, EventProcessingError> {
+) -> Result<Option<OffchainOrderId>, TradeAccountingError> {
     // Update Position aggregate FIRST so threshold check sees current state
     execute_acknowledge_fill(&cqrs.position, &trade, cqrs.execution_threshold).await;
 
@@ -950,7 +940,7 @@ pub(crate) async fn process_queued_trade<E: Executor>(
 async fn place_offchain_order(
     execution: &ExecutionCtx,
     cqrs: &TradeProcessingCqrs,
-) -> Result<Option<OffchainOrderId>, EventProcessingError> {
+) -> Result<Option<OffchainOrderId>, TradeAccountingError> {
     let offchain_order_id = OffchainOrderId::new();
 
     if !execute_place_offchain_order(execution, cqrs, offchain_order_id).await {
@@ -1070,10 +1060,10 @@ pub(crate) async fn check_and_execute_accumulated_positions<E>(
     threshold: &ExecutionThreshold,
     assets: &AssetsConfig,
     is_trading_enabled: impl Fn(&Symbol) -> bool,
-) -> Result<(), EventProcessingError>
+) -> Result<(), TradeAccountingError>
 where
     E: Executor + Clone + Send + 'static,
-    EventProcessingError: From<E::Error>,
+    TradeAccountingError: From<E::Error>,
 {
     let executor_type = executor.to_supported_executor();
     let ready_positions = check_all_positions(
