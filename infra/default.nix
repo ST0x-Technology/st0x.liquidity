@@ -19,8 +19,11 @@ let
       identity="$2"
       shift 2
     else
-      echo "ERROR: -i <identity_file> is required" >&2
-      exit 1
+      identity="$HOME/.ssh/id_ed25519"
+      if [ ! -f "$identity" ]; then
+        echo "ERROR: no -i flag and default key $identity not found" >&2
+        exit 1
+      fi
     fi
   '';
 

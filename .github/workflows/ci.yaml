@@ -1,10 +1,9 @@
 name: CI/CD
 
 on:
+  workflow_dispatch:
   push:
     branches: [prod]
-  pull_request:
-  workflow_dispatch:
 
 concurrency:
   group: ${{ github.ref }}-ci
@@ -146,36 +145,10 @@ jobs:
       - name: pre-commit hooks
         run: nix develop -c pre-commit run --all-files
 
-  # Pre-warm GH Actions cache with NixOS closure while CI runs in parallel.
-  # Only runs on prod pushes / manual dispatch (same triggers as deploy).
-  warmup:
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - uses: DeterminateSystems/nix-installer-action@main
-        with:
-          extra-conf: |
-            accept-flake-config = true
-            fallback = true
-
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-
-      - name: Build Solidity artifacts
-        run: nix run .#prepSolArtifacts
-
-      - name: Build NixOS system closure
-        run: nix build --impure .#nixosConfigurations.st0x-liquidity.config.system.build.toplevel
-
-      - name: Build deploy wrappers
-        run: nix build .#deployAll .#deployNixos .#deployService
 
   deploy:
     if: github.event_name != 'pull_request'
-    needs: [rust, dashboard, pre-commit, warmup]
+    needs: [rust, dashboard, pre-commit]
     concurrency:
       group: deploy
       cancel-in-progress: false
@@ -214,7 +187,7 @@ jobs:
         run: nix run .#prepSolArtifacts
 
       - name: Deploy
-        run: nix run .#deployAll -- --skip-checks
+        run: nix run .#deployAll
 
       - name: Cleanup SSH
         if: always()

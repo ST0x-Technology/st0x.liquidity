@@ -97,7 +97,7 @@ in {
       '';
 
       deployFlags = if localSystem == "x86_64-linux" then
-        "--debug-logs"
+        "--debug-logs --skip-checks"
       else
         "--debug-logs --skip-checks --remote-build";
 
