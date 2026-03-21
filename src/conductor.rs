@@ -776,11 +776,7 @@ pub(crate) async fn discover_vaults_for_trade(
     Ok(())
 }
 
-/// Returns `true` if the trade is witnessed (newly or already), `false` if
-/// the witness failed for a non-idempotent reason (e.g. missing timestamp).
-///
-/// A trade that was already witnessed returns `true` so that retries of the
-/// same job can continue to the acknowledge/hedge steps.
+/// Returns `true` if the witness was accepted, `false` if rejected.
 async fn execute_witness_trade(
     onchain_trade: &Store<OnChainTrade>,
     trade: &OnchainTrade,
@@ -820,20 +816,11 @@ async fn execute_witness_trade(
             true
         }
         Err(error) => {
-            let error_str = error.to_string();
-            if error_str.contains("already been filled") {
-                info!(
-                    "OnChainTrade already witnessed (retry), continuing: tx_hash={:?}, log_index={}",
-                    trade.tx_hash, trade.log_index
-                );
-                true
-            } else {
-                warn!(
-                    "OnChainTrade::Witness failed: {error}, tx_hash={:?}, log_index={}, symbol={}",
-                    trade.tx_hash, trade.log_index, trade.symbol
-                );
-                false
-            }
+            warn!(
+                "OnChainTrade::Witness rejected: {error}, tx_hash={:?}, log_index={}, symbol={}",
+                trade.tx_hash, trade.log_index, trade.symbol
+            );
+            false
         }
     }
 }
@@ -928,6 +915,19 @@ pub(crate) async fn process_queued_trade<E: Executor>(
     cqrs: &TradeProcessingCqrs,
     asset_enabled: bool,
 ) -> Result<Option<OffchainOrderId>, TradeAccountingError> {
+    let trade_id = OnChainTradeId {
+        tx_hash: trade.tx_hash,
+        log_index: trade.log_index,
+    };
+
+    if let Ok(Some(_)) = cqrs.onchain_trade.load(&trade_id).await {
+        info!(
+            ?trade_id,
+            "Trade already processed (duplicate event), skipping"
+        );
+        return Ok(None);
+    }
+
     let witnessed =
         execute_witness_trade(&cqrs.onchain_trade, &trade, trade_event.block_number).await;
 
