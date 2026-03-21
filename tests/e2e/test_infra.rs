@@ -18,6 +18,7 @@ use st0x_execution::Symbol;
 use st0x_execution::alpaca_broker_api::{AlpacaBrokerMock, MockPosition};
 use st0x_hedge::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
 use st0x_hedge::mock_api::{AlpacaTokenizationMock, REDEMPTION_WALLET};
+use st0x_hedge::telemetry::mk_env_filter;
 
 use crate::base_chain::{BaseChain, DeployableERC20};
 
@@ -27,13 +28,9 @@ static TRACING_INIT: Once = Once::new();
 /// Safe to call multiple times — only the first call takes effect.
 pub fn init_tracing() {
     TRACING_INIT.call_once(|| {
-        let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            "warn,st0x_hedge=debug,st0x_execution=debug,st0x_dto=debug,\
-             st0x_event_sorcery=debug,st0x_evm=debug,st0x_finance=debug,\
-             st0x_bridge=debug,e2e=debug,rocket=off,hyper=off,\
-             tungstenite=off,tokio_tungstenite=off,reqwest=off"
-                .into()
-        });
+        let level = tracing::Level::TRACE;
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| mk_env_filter(level));
 
         tracing_subscriber::fmt()
             .compact()

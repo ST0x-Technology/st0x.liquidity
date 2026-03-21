@@ -152,7 +152,7 @@ struct AnvilOrderBook<P> {
 ///
 /// Initializes the OpenZeppelin ERC20 storage layout: totalSupply, name ("USD Coin"),
 /// symbol ("USDC"), decimals (6), and balance for `owner`.
-async fn deploy_usdc_at_base<P: alloy::providers::Provider>(provider: &P, owner: Address) {
+async fn deploy_usdc_at_base<P: Provider>(provider: &P, owner: Address) {
     let total_supply = U256::from(1_000_000_000_000u64);
 
     provider

@@ -37,8 +37,8 @@ use crate::base_chain::{self, TakeDirection};
 use crate::cctp::{CctpInfra, CctpOverrides};
 use crate::hedging::assertions::assert_full_hedging_flow;
 use crate::poll::{
-    await_dashboard_disconnect, connect_db, count_events, poll_for_events,
-    poll_for_events_with_timeout, poll_for_ready, sleep_or_crash, spawn_bot_with_event_channel,
+    await_dashboard_disconnect, connect_db, count_events, poll_for_broker_fills, poll_for_events,
+    poll_for_events_with_timeout, poll_for_ready, spawn_bot_with_event_channel,
 };
 use crate::rebalancing::assertions::TestWallet;
 use crate::test_infra::TestInfra;
@@ -137,8 +137,8 @@ fn build_full_system_ctx<P: Provider + Clone>(
 #[tokio::test]
 async fn full_system() -> anyhow::Result<()> {
     crate::test_infra::init_tracing();
-    // -- Infrastructure (superset of all scenarios) --
 
+    // -- Infrastructure (superset of all scenarios) --
     let aapl_broker_price = float!(150.25);
     let tsla_broker_price = float!(245.00);
 
@@ -157,7 +157,6 @@ async fn full_system() -> anyhow::Result<()> {
     // -- Phase 1: Hedging (AAPL sell) --
     // Set up a SellEquity order for AAPL. Uses setup_order + take_prepared_order
     // so the order is created before the bot starts (nonce safety).
-
     let aapl_onchain_price = float!(155.00);
     let aapl_sell_amount = float!(10.75);
 
@@ -174,7 +173,6 @@ async fn full_system() -> anyhow::Result<()> {
     let aapl_equity_vault_id = aapl_sell_prepared.output_vault_id;
 
     // -- Phase 2 prep: TSLA hedging (buy) --
-
     let tsla_onchain_price = float!(250.00);
     let tsla_buy_amount = float!(5.0);
 
@@ -189,7 +187,6 @@ async fn full_system() -> anyhow::Result<()> {
         .await?;
 
     // -- Phase 3 prep: Equity mint (3 AAPL sells to trigger imbalance) --
-
     let aapl_mint_price = float!(150.00);
     let aapl_mint_amount = float!(7.5);
     let mut mint_prepared_orders = Vec::new();
@@ -240,7 +237,6 @@ async fn full_system() -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_secs(6)).await;
 
     // === Phase 1: AAPL sell hedge ===
-
     let aapl_sell_result = infra
         .base_chain
         .take_prepared_order(&aapl_sell_prepared)
@@ -261,7 +257,6 @@ async fn full_system() -> anyhow::Result<()> {
     pool.close().await;
 
     // === Phase 2: TSLA buy hedge ===
-
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     let tsla_buy_result = infra
@@ -327,46 +322,19 @@ async fn full_system() -> anyhow::Result<()> {
         infra.base_chain.take_prepared_order(prepared).await?;
     }
 
-    // Wait for all AAPL hedges by polling the broker mock for total filled
-    // buy quantity. Onchain sells: 10.75 + 3 * 7.5 = 33.25 shares total.
-    // The bot hedges with offsetting buys on the broker.
-    //
-    // With concurrent job processing, multiple onchain trades may batch into
-    // fewer offchain orders (e.g. two 7.5-share trades trigger one 15-share
-    // hedge), so we assert on total quantity rather than order count.
-    use st0x_execution::alpaca_broker_api::{OrderSide, OrderStatus};
+    // Wait for all AAPL hedges by polling the broker for total filled buy
+    // quantity. Onchain sells: 10.75 + 3 * 7.5 = 33.25 shares total.
+    // With concurrent processing, trades may batch into fewer orders.
+    poll_for_broker_fills(
+        &mut bot,
+        &infra.broker_service,
+        "AAPL",
+        st0x_execution::alpaca_broker_api::OrderSide::Buy,
+        FractionalShares::new(float!(33.25)),
+        Duration::from_secs(120),
+    )
+    .await;
 
-    let expected_aapl_buys = float!(33.25);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-    loop {
-        sleep_or_crash(&mut bot, "AAPL broker buy total").await;
-
-        let filled_aapl_buys: FractionalShares = infra
-            .broker_service
-            .orders()
-            .iter()
-            .filter(|order| {
-                order.symbol == "AAPL"
-                    && order.side == OrderSide::Buy
-                    && order.status == OrderStatus::Filled
-            })
-            .fold(FractionalShares::ZERO, |acc, order| {
-                (acc + FractionalShares::new(order.quantity)).unwrap()
-            });
-
-        let expected = FractionalShares::new(expected_aapl_buys.clone());
-        if filled_aapl_buys == expected {
-            break;
-        }
-
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "Timed out waiting for 33.25 AAPL shares bought on broker. \
-             Current filled buy total: {filled_aapl_buys}",
-        );
-    }
-
-    // Now wait for the mint rebalancing to complete
     poll_for_events_with_timeout(
         &mut bot,
         &infra.db_path,

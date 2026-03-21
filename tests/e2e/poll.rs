@@ -330,6 +330,48 @@ pub async fn fetch_all_domain_events(
     Ok(events)
 }
 
+/// Polls the broker mock until the total filled quantity for a symbol/side
+/// reaches the expected amount. This asserts on the actual external
+/// interaction (broker orders) rather than internal event counts.
+pub async fn poll_for_broker_fills(
+    bot: &mut JoinHandle<anyhow::Result<()>>,
+    broker: &st0x_execution::alpaca_broker_api::AlpacaBrokerMock,
+    symbol: &str,
+    side: st0x_execution::alpaca_broker_api::OrderSide,
+    expected_total: st0x_execution::FractionalShares,
+    timeout: Duration,
+) {
+    use st0x_execution::FractionalShares;
+    use st0x_execution::alpaca_broker_api::OrderStatus;
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    let context = format!("{expected_total} {symbol} {side}");
+
+    loop {
+        sleep_or_crash(bot, &context).await;
+
+        let filled_total: FractionalShares = broker
+            .orders()
+            .iter()
+            .filter(|order| {
+                order.symbol == symbol && order.side == side && order.status == OrderStatus::Filled
+            })
+            .fold(FractionalShares::ZERO, |acc, order| {
+                (acc + FractionalShares::new(order.quantity)).unwrap()
+            });
+
+        if filled_total == expected_total {
+            return;
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Timed out after {timeout:?} waiting for {context}. \
+             Current filled total: {filled_total}",
+        );
+    }
+}
+
 /// Fetches events for a specific aggregate type, ordered by insertion.
 pub async fn fetch_events_by_type(
     pool: &SqlitePool,

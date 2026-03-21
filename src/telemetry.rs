@@ -70,8 +70,8 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::time::Duration;
 use thiserror::Error;
-use tracing_subscriber::Registry;
 use tracing_subscriber::layer::{Layer, SubscriberExt};
+use tracing_subscriber::{EnvFilter, Registry};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -157,16 +157,8 @@ impl TelemetryCtx {
             .with_tracer(tracer)
             .with_level(true);
 
-        let default_filter = format!("st0x_hedge={log_level},st0x_execution={log_level}");
-
-        let fmt_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| default_filter.clone().into());
-
-        let telemetry_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| default_filter.into());
-
-        let fmt_layer = tracing_subscriber::fmt::layer().with_filter(fmt_filter);
-        let telemetry_layer = telemetry_layer.with_filter(telemetry_filter);
+        let fmt_layer = tracing_subscriber::fmt::layer().with_filter(mk_env_filter(log_level));
+        let telemetry_layer = telemetry_layer.with_filter(mk_env_filter(log_level));
 
         let subscriber = Registry::default().with(fmt_layer).with(telemetry_layer);
 
@@ -242,29 +234,37 @@ impl From<Box<dyn std::any::Any + Send>> for TelemetryError {
 /// maintained for semantic clarity.
 const TRACER_NAME: &str = "st0x-tracer";
 
-// TODO: parse from the manifest or something
-const CRATES: [&str; 6] = [
-    "dto",
-    "event-sorcery",
-    "execution",
-    "finance",
-    "bridge",
-    "evm",
-];
-
 pub fn setup_tracing(log_level: &crate::config::LogLevel) {
     let level: tracing::Level = log_level.into();
+    let env_filter = mk_env_filter(level);
 
-    let fallback_filter = CRATES
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .compact()
+        .init();
+}
+
+pub fn mk_env_filter(level: tracing::Level) -> EnvFilter {
+    // TODO: parse from the manifest or something
+    const CRATES: [&str; 9] = [
+        "hedge",
+        "bridge",
+        "dto",
+        "event-sorcery",
+        "evm",
+        "execution",
+        "finance",
+        "float-macro",
+        "float-serde",
+    ];
+
+    let our_crates = CRATES
         .iter()
+        .map(|pkg| pkg.replace('-', "_"))
         .map(|pkg| format!("st0x_{pkg}={level}"))
         .join(",");
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| fallback_filter.into()),
-        )
-        .compact()
-        .init();
+    let fallback_filter = EnvFilter::from(format!("warn,{our_crates}"));
+
+    EnvFilter::try_from_default_env().unwrap_or(fallback_filter)
 }

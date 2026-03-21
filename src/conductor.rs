@@ -7,8 +7,9 @@ mod manifest;
 mod order_fill_monitor;
 
 use alloy::primitives::Address;
-use alloy::providers::{ProviderBuilder, WsConnect};
+use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use apalis_sqlite::SqliteStorage;
+use futures_util::StreamExt;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,7 +25,7 @@ use st0x_evm::Wallet;
 use st0x_execution::{Executor, FractionalShares, Symbol};
 
 use crate::alpaca_wallet::AlpacaWalletService;
-use crate::bindings::IOrderBookV6::IOrderBookV6Instance;
+use crate::bindings::IOrderBookV6::{self, IOrderBookV6Instance};
 use crate::config::{AssetsConfig, Ctx, CtxError};
 use crate::dashboard::EventBroadcaster;
 use crate::inventory::{BroadcastingInventory, InventoryPollingService, InventorySnapshot};
@@ -54,8 +55,8 @@ use crate::trading::onchain::trade_accountant::{DexTradeAccountingJobQueue, Trad
 use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryId};
 use crate::wrapper::WrapperService;
 
-use self::manifest::QueryManifest;
 pub(crate) use builder::CqrsFrameworks;
+use manifest::QueryManifest;
 
 /// Sets up apalis SQLite storage tables, tolerating pre-existing
 /// application migrations in the shared `_sqlx_migrations` table.
@@ -528,13 +529,49 @@ async fn build_position_cqrs(
 /// Waits up to 5 seconds for the first event on either stream. If an event
 /// arrives, its block number is the cutoff. If no events arrive within the
 /// timeout, falls back to the provider's current block number.
-async fn get_cutoff_block<S1, S2, P>(
-    clear_stream: &mut S1,
-    take_stream: &mut S2,
+async fn get_cutoff_block<ClearEvents, TakeOrderEvents, P>(
+    clear_stream: &mut ClearEvents,
+    take_stream: &mut TakeOrderEvents,
     provider: &P,
 ) -> anyhow::Result<u64>
 where
-    S1: futures_util::Stream<
+    ClearEvents: futures_util::Stream<
+            Item = Result<(IOrderBookV6::ClearV3, alloy::rpc::types::Log), alloy::sol_types::Error>,
+        > + Unpin,
+    TakeOrderEvents: futures_util::Stream<
+            Item = Result<
+                (IOrderBookV6::TakeOrderV3, alloy::rpc::types::Log),
+                alloy::sol_types::Error,
+            >,
+        > + Unpin,
+    P: Provider + Clone,
+{
+    info!("Waiting for first WebSocket event to determine cutoff block...");
+
+    let timeout = tokio::time::sleep(Duration::from_secs(5));
+    tokio::pin!(timeout);
+
+    loop {
+        let block_number =
+            await_next_block(clear_stream, take_stream, &mut timeout, provider).await?;
+
+        if let Some(block) = block_number {
+            info!("First event at block {block}, using as cutoff");
+            return Ok(block);
+        }
+
+        warn!("Event missing block number, waiting for next event");
+    }
+}
+
+async fn await_next_block<ClearEvents, TakeOrderEvents, P>(
+    clear_stream: &mut ClearEvents,
+    take_stream: &mut TakeOrderEvents,
+    timeout: &mut std::pin::Pin<&mut tokio::time::Sleep>,
+    provider: &P,
+) -> anyhow::Result<Option<u64>>
+where
+    ClearEvents: futures_util::Stream<
             Item = Result<
                 (
                     crate::bindings::IOrderBookV6::ClearV3,
@@ -543,7 +580,7 @@ where
                 alloy::sol_types::Error,
             >,
         > + Unpin,
-    S2: futures_util::Stream<
+    TakeOrderEvents: futures_util::Stream<
             Item = Result<
                 (
                     crate::bindings::IOrderBookV6::TakeOrderV3,
@@ -552,36 +589,20 @@ where
                 alloy::sol_types::Error,
             >,
         > + Unpin,
-    P: alloy::providers::Provider + Clone,
+    P: Provider + Clone,
 {
-    use futures_util::StreamExt;
-
-    info!("Waiting for first WebSocket event to determine cutoff block...");
-
-    let timeout = tokio::time::sleep(Duration::from_secs(5));
-    tokio::pin!(timeout);
-
-    loop {
-        let block_number = tokio::select! {
-            Some(result) = clear_stream.next() => {
-                result?.1.block_number
-            }
-            Some(result) = take_stream.next() => {
-                result?.1.block_number
-            }
-            () = &mut timeout => {
-                let current_block = provider.get_block_number().await?;
-                info!("No events within timeout, using current block {current_block} as cutoff");
-                return Ok(current_block);
-            }
-        };
-
-        if let Some(block) = block_number {
-            info!("First event at block {block}, using as cutoff");
-            return Ok(block);
+    tokio::select! {
+        Some(result) = clear_stream.next() => {
+            Ok(result?.1.block_number)
         }
-
-        warn!("Event missing block number, waiting for next event");
+        Some(result) = take_stream.next() => {
+            Ok(result?.1.block_number)
+        }
+        () = &mut *timeout => {
+            let current_block = provider.get_block_number().await?;
+            info!("No events within timeout, using current block {current_block} as cutoff");
+            Ok(Some(current_block))
+        }
     }
 }
 
@@ -1171,9 +1192,7 @@ mod tests {
 
     use st0x_dto::ServerMessage;
     use st0x_event_sorcery::{StoreBuilder, test_store};
-    use st0x_execution::{
-        Direction, ExecutorOrderId, MarketOrder, MockExecutor, Positive, Symbol,
-    };
+    use st0x_execution::{Direction, ExecutorOrderId, MarketOrder, MockExecutor, Positive, Symbol};
     use st0x_finance::{Usd, Usdc};
 
     use super::*;
@@ -1341,9 +1360,6 @@ mod tests {
             "Disabled assets should be excluded from Base-wallet wrapped equity polling"
         );
     }
-
-
-
 
     #[tokio::test]
     async fn test_get_cutoff_block_with_timeout() {
@@ -1636,7 +1652,11 @@ mod tests {
         assert!(
             has_goog_vault,
             "Equity vault should use the trade's symbol (GOOG), got vaults: {:?}",
-            registry.equity_vaults.values().map(|vault| &vault.symbol).collect::<Vec<_>>()
+            registry
+                .equity_vaults
+                .values()
+                .map(|vault| &vault.symbol)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1754,14 +1774,8 @@ mod tests {
         let trade_event = make_trade_event(10);
         let trade = test_trade_with_amount(float!(0.5), 10);
 
-        let result = process_queued_trade(
-            &MockExecutor::new(),
-            &trade_event,
-            trade,
-            &cqrs,
-            true,
-        )
-        .await;
+        let result =
+            process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true).await;
 
         assert_eq!(
             result.unwrap(),
@@ -1797,14 +1811,8 @@ mod tests {
         let trade_event = make_trade_event(20);
         let trade = test_trade_with_amount(float!(1.5), 20);
 
-        let result = process_queued_trade(
-            &MockExecutor::new(),
-            &trade_event,
-            trade,
-            &cqrs,
-            true,
-        )
-        .await;
+        let result =
+            process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true).await;
 
         let offchain_order_id = result
             .unwrap()
@@ -1847,14 +1855,8 @@ mod tests {
         let trade_event_1 = make_trade_event(30);
         let trade_1 = test_trade_with_amount(float!(0.5), 30);
 
-        let result_1 = process_queued_trade(
-            &MockExecutor::new(),
-            &trade_event_1,
-            trade_1,
-            &cqrs,
-            true,
-        )
-        .await;
+        let result_1 =
+            process_queued_trade(&MockExecutor::new(), &trade_event_1, trade_1, &cqrs, true).await;
 
         assert_eq!(
             result_1.unwrap(),
@@ -1865,14 +1867,8 @@ mod tests {
         let trade_event_2 = make_trade_event(31);
         let trade_2 = test_trade_with_amount(float!(0.7), 31);
 
-        let result_2 = process_queued_trade(
-            &MockExecutor::new(),
-            &trade_event_2,
-            trade_2,
-            &cqrs,
-            true,
-        )
-        .await;
+        let result_2 =
+            process_queued_trade(&MockExecutor::new(), &trade_event_2, trade_2, &cqrs, true).await;
 
         assert!(
             result_2.unwrap().is_some(),
@@ -1901,28 +1897,17 @@ mod tests {
         let trade_event_1 = make_trade_event(40);
         let trade_1 = test_trade_with_amount(float!(1.5), 40);
 
-        let first_order_id = process_queued_trade(
-            &MockExecutor::new(),
-            &trade_event_1,
-            trade_1,
-            &cqrs,
-            true,
-        )
-        .await
-        .unwrap()
-        .expect("first trade should place an order");
+        let first_order_id =
+            process_queued_trade(&MockExecutor::new(), &trade_event_1, trade_1, &cqrs, true)
+                .await
+                .unwrap()
+                .expect("first trade should place an order");
 
         let trade_event_2 = make_trade_event(41);
         let trade_2 = test_trade_with_amount(float!(1.5), 41);
 
-        let result_2 = process_queued_trade(
-            &MockExecutor::new(),
-            &trade_event_2,
-            trade_2,
-            &cqrs,
-            true,
-        )
-        .await;
+        let result_2 =
+            process_queued_trade(&MockExecutor::new(), &trade_event_2, trade_2, &cqrs, true).await;
 
         assert_eq!(
             result_2.unwrap(),
@@ -1960,30 +1945,19 @@ mod tests {
         let trade_event_1 = make_trade_event(50);
         let trade_1 = test_trade_with_amount(float!(1.5), 50);
 
-        let first_order_id = process_queued_trade(
-            &MockExecutor::new(),
-            &trade_event_1,
-            trade_1,
-            &cqrs,
-            true,
-        )
-        .await
-        .unwrap()
-        .expect("first trade should place an order");
+        let first_order_id =
+            process_queued_trade(&MockExecutor::new(), &trade_event_1, trade_1, &cqrs, true)
+                .await
+                .unwrap()
+                .expect("first trade should place an order");
 
         // Process second trade -> blocked by pending order
         let trade_event_2 = make_trade_event(51);
         let trade_2 = test_trade_with_amount(float!(1.5), 51);
 
-        process_queued_trade(
-            &MockExecutor::new(),
-            &trade_event_2,
-            trade_2,
-            &cqrs,
-            true,
-        )
-        .await
-        .unwrap();
+        process_queued_trade(&MockExecutor::new(), &trade_event_2, trade_2, &cqrs, true)
+            .await
+            .unwrap();
 
         // Complete the first order via CQRS
         let symbol = Symbol::new("AAPL").unwrap();
@@ -2697,15 +2671,9 @@ mod tests {
         let trade_event = make_trade_event(70);
         let trade = test_trade_with_amount(float!(1.5), 70);
 
-        process_queued_trade(
-            &MockExecutor::new(),
-            &trade_event,
-            trade,
-            &cqrs,
-            true,
-        )
-        .await
-        .unwrap();
+        process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true)
+            .await
+            .unwrap();
 
         let position = cqrs
             .position_projection
@@ -2869,15 +2837,9 @@ mod tests {
             .with_enrichment(50000, 1_000_000_000, pyth_price)
             .build();
 
-        process_queued_trade(
-            &MockExecutor::new(),
-            &trade_event,
-            trade,
-            &cqrs,
-            true,
-        )
-        .await
-        .unwrap();
+        process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true)
+            .await
+            .unwrap();
 
         let trade_id = OnChainTradeId {
             tx_hash: fixed_bytes!(
@@ -2911,15 +2873,9 @@ mod tests {
 
         let trade = test_trade_with_amount(float!("1.5"), 60);
 
-        process_queued_trade(
-            &MockExecutor::new(),
-            &trade_event,
-            trade,
-            &cqrs,
-            true,
-        )
-        .await
-        .unwrap();
+        process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true)
+            .await
+            .unwrap();
 
         let trade_id = OnChainTradeId {
             tx_hash: fixed_bytes!(
