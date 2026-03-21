@@ -327,33 +327,42 @@ async fn full_system() -> anyhow::Result<()> {
         infra.base_chain.take_prepared_order(prepared).await?;
     }
 
-    // Wait for all AAPL hedges to complete by polling the broker mock's
-    // position. Onchain sells: 10.75 + 3 * 7.5 = 33.25 total. The bot
-    // hedges with offsetting buys, so the broker should hold 33.25 AAPL
-    // (minus the shares consumed by rebalancing mints). We poll until the
-    // Position aggregate shows net=0 (fully hedged).
+    // Wait for all AAPL hedges by polling the broker mock for total filled
+    // buy quantity. Onchain sells: 10.75 + 3 * 7.5 = 33.25 shares total.
+    // The bot hedges with offsetting buys on the broker.
+    //
+    // With concurrent job processing, multiple onchain trades may batch into
+    // fewer offchain orders (e.g. two 7.5-share trades trigger one 15-share
+    // hedge), so we assert on total quantity rather than order count.
+    use st0x_execution::alpaca_broker_api::{OrderSide, OrderStatus};
+
+    let expected_aapl_buys = float!(33.25);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     loop {
-        sleep_or_crash(&mut bot, "AAPL fully hedged").await;
+        sleep_or_crash(&mut bot, "AAPL broker buy total").await;
 
-        let pool = connect_db(&infra.db_path).await?;
-        let position = Projection::<Position>::sqlite(pool.clone())
-            .load(&Symbol::new("AAPL")?)
-            .await?;
-        pool.close().await;
+        let filled_aapl_buys: FractionalShares = infra
+            .broker_service
+            .orders()
+            .iter()
+            .filter(|order| {
+                order.symbol == "AAPL"
+                    && order.side == OrderSide::Buy
+                    && order.status == OrderStatus::Filled
+            })
+            .fold(FractionalShares::ZERO, |acc, order| {
+                (acc + FractionalShares::new(order.quantity)).unwrap()
+            });
 
-        if let Some(ref position) = position {
-            if position.net == FractionalShares::ZERO
-                && position.accumulated_short == FractionalShares::new(float!(33.25))
-                && position.pending_offchain_order_id.is_none()
-            {
-                break;
-            }
+        let expected = FractionalShares::new(expected_aapl_buys.clone());
+        if filled_aapl_buys == expected {
+            break;
         }
 
         assert!(
             tokio::time::Instant::now() < deadline,
-            "Timed out waiting for AAPL to be fully hedged. Position: {position:?}",
+            "Timed out waiting for 33.25 AAPL shares bought on broker. \
+             Current filled buy total: {filled_aapl_buys}",
         );
     }
 

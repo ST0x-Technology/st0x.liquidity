@@ -81,8 +81,6 @@ pub(crate) struct TradeProcessingCqrs {
 pub(crate) struct Conductor {
     supervisor: SupervisorHandle,
     monitor: JoinHandle<()>,
-    order_poller: JoinHandle<()>,
-    position_checker: JoinHandle<()>,
     executor_maintenance: Option<JoinHandle<()>>,
     rebalancer: Option<JoinHandle<()>>,
     inventory_poller: Option<JoinHandle<()>>,
@@ -275,42 +273,24 @@ impl Conductor {
                 info!("Supervisor exited");
             }
             result = &mut self.monitor => {
-                if let Err(join_error) = result {
-                    if !join_error.is_cancelled() {
-                        return Err(anyhow::anyhow!("Apalis monitor failed: {join_error}"));
-                    }
+                if let Err(join_error) = result
+                    && !join_error.is_cancelled()
+                {
+                    return Err(anyhow::anyhow!("Apalis monitor failed: {join_error}"));
                 }
                 info!("Apalis monitor exited");
-            }
-            result = &mut self.order_poller => {
-                if let Err(join_error) = result {
-                    if !join_error.is_cancelled() {
-                        return Err(anyhow::anyhow!("Order poller failed: {join_error}"));
-                    }
-                }
-                info!("Order poller exited");
-            }
-            result = &mut self.position_checker => {
-                if let Err(join_error) = result {
-                    if !join_error.is_cancelled() {
-                        return Err(anyhow::anyhow!("Position checker failed: {join_error}"));
-                    }
-                }
-                info!("Position checker exited");
             }
         }
 
         Ok(())
     }
 
-    pub(crate) fn abort_all(&mut self) {
+    pub(crate) fn abort_all(&self) {
         info!("Aborting all conductor tasks");
         if let Err(error) = self.supervisor.shutdown() {
             error!(%error, "Failed to shutdown supervisor");
         }
         self.monitor.abort();
-        self.order_poller.abort();
-        self.position_checker.abort();
 
         if let Some(ref handle) = self.rebalancer {
             handle.abort();

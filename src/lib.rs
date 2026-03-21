@@ -36,7 +36,7 @@ mod position;
 mod rebalancing;
 mod shares;
 mod symbol;
-mod telemetry;
+pub mod telemetry;
 mod threshold;
 mod tokenization;
 mod trading;
@@ -47,7 +47,7 @@ mod usdc_rebalance;
 mod vault_registry;
 mod wrapper;
 
-pub use telemetry::{TelemetryError, TelemetryGuard, setup_tracing};
+pub use telemetry::{TelemetryError, TelemetryGuard, mk_env_filter, setup_tracing};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use config::TradingMode;
@@ -129,7 +129,7 @@ fn spawn_bot_task(
     event_sender: broadcast::Sender<ServerMessage>,
     inventory: Arc<inventory::BroadcastingInventory>,
 ) -> JoinHandle<anyhow::Result<()>> {
-    tokio::spawn(async move { run(ctx, pool, event_sender, inventory).await })
+    tokio::spawn(async move { Box::pin(run(ctx, pool, event_sender, inventory)).await })
 }
 
 async fn await_shutdown(
@@ -212,12 +212,12 @@ async fn run(
     const RERUN_DELAY_SECS: u64 = 10;
 
     loop {
-        let result = run_bot_session(
+        let result = Box::pin(run_bot_session(
             ctx.clone(),
             pool.clone(),
             event_sender.clone(),
             inventory.clone(),
-        )
+        ))
         .await;
 
         match result {

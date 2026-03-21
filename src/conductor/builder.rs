@@ -100,7 +100,7 @@ where
     ));
     log_optional_task_status("inventory poller", inventory_poller.is_some());
 
-    let order_poller = spawn_order_poller(
+    let order_poller_handle = spawn_order_poller(
         &context.ctx,
         context.executor.clone(),
         (*context.frameworks.offchain_order_projection).clone(),
@@ -108,7 +108,7 @@ where
         context.frameworks.position.clone(),
     );
 
-    let position_checker = spawn_periodic_accumulated_position_check()
+    let position_checker_handle = spawn_periodic_accumulated_position_check()
         .executor(context.executor.clone())
         .position(context.frameworks.position.clone())
         .position_projection(context.frameworks.position_projection.clone())
@@ -153,7 +153,7 @@ where
         .run();
 
     let monitor = tokio::spawn(async move {
-        let monitor = Monitor::new()
+        let apalis_monitor = Monitor::new()
             .should_restart(|_ctx, _error, attempt| {
                 info!(attempt, "Restarting order fill worker");
                 true
@@ -165,16 +165,24 @@ where
                     .build(work::<AccountantCtx<Prov, Exec>, _>)
             });
 
-        if let Err(monitor_error) = monitor.run().await {
-            error!(%monitor_error, "Apalis monitor exited with error");
+        tokio::select! {
+            result = apalis_monitor.run() => {
+                if let Err(monitor_error) = result {
+                    error!(%monitor_error, "Apalis monitor exited with error");
+                }
+            }
+            _ = order_poller_handle => {
+                error!("Order poller exited unexpectedly");
+            }
+            _ = position_checker_handle => {
+                error!("Position checker exited unexpectedly");
+            }
         }
     });
 
     Conductor {
         supervisor,
         monitor,
-        order_poller,
-        position_checker,
         executor_maintenance,
         rebalancer,
         inventory_poller,
