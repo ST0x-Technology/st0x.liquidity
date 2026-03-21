@@ -38,7 +38,7 @@ use crate::cctp::{CctpInfra, CctpOverrides};
 use crate::hedging::assertions::assert_full_hedging_flow;
 use crate::poll::{
     await_dashboard_disconnect, connect_db, count_events, poll_for_events,
-    poll_for_events_with_timeout, poll_for_ready, spawn_bot_with_event_channel,
+    poll_for_events_with_timeout, poll_for_ready, sleep_or_crash, spawn_bot_with_event_channel,
 };
 use crate::rebalancing::assertions::TestWallet;
 use crate::test_infra::TestInfra;
@@ -327,15 +327,35 @@ async fn full_system() -> anyhow::Result<()> {
         infra.base_chain.take_prepared_order(prepared).await?;
     }
 
-    // Wait for all Phase 3 hedges to complete (2 from earlier + 3 new = 5 total)
-    poll_for_events_with_timeout(
-        &mut bot,
-        &infra.db_path,
-        "OffchainOrderEvent::Filled",
-        5,
-        Duration::from_secs(120),
-    )
-    .await;
+    // Wait for all AAPL hedges to complete by polling the broker mock's
+    // position. Onchain sells: 10.75 + 3 * 7.5 = 33.25 total. The bot
+    // hedges with offsetting buys, so the broker should hold 33.25 AAPL
+    // (minus the shares consumed by rebalancing mints). We poll until the
+    // Position aggregate shows net=0 (fully hedged).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        sleep_or_crash(&mut bot, "AAPL fully hedged").await;
+
+        let pool = connect_db(&infra.db_path).await?;
+        let position = Projection::<Position>::sqlite(pool.clone())
+            .load(&Symbol::new("AAPL")?)
+            .await?;
+        pool.close().await;
+
+        if let Some(ref position) = position {
+            if position.net == FractionalShares::ZERO
+                && position.accumulated_short == FractionalShares::new(float!(33.25))
+                && position.pending_offchain_order_id.is_none()
+            {
+                break;
+            }
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Timed out waiting for AAPL to be fully hedged. Position: {position:?}",
+        );
+    }
 
     // Now wait for the mint rebalancing to complete
     poll_for_events_with_timeout(

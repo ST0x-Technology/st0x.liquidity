@@ -776,8 +776,11 @@ pub(crate) async fn discover_vaults_for_trade(
     Ok(())
 }
 
-/// Returns `true` if the witness was accepted, `false` if rejected
-/// (e.g. duplicate trade already witnessed).
+/// Returns `true` if the trade is witnessed (newly or already), `false` if
+/// the witness failed for a non-idempotent reason (e.g. missing timestamp).
+///
+/// A trade that was already witnessed returns `true` so that retries of the
+/// same job can continue to the acknowledge/hedge steps.
 async fn execute_witness_trade(
     onchain_trade: &Store<OnChainTrade>,
     trade: &OnchainTrade,
@@ -817,11 +820,20 @@ async fn execute_witness_trade(
             true
         }
         Err(error) => {
-            warn!(
-                "OnChainTrade::Witness rejected: {error}, tx_hash={:?}, log_index={}, symbol={}",
-                trade.tx_hash, trade.log_index, trade.symbol
-            );
-            false
+            let error_str = error.to_string();
+            if error_str.contains("already been filled") {
+                info!(
+                    "OnChainTrade already witnessed (retry), continuing: tx_hash={:?}, log_index={}",
+                    trade.tx_hash, trade.log_index
+                );
+                true
+            } else {
+                warn!(
+                    "OnChainTrade::Witness failed: {error}, tx_hash={:?}, log_index={}, symbol={}",
+                    trade.tx_hash, trade.log_index, trade.symbol
+                );
+                false
+            }
         }
     }
 }
