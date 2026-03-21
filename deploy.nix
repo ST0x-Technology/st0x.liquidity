@@ -97,44 +97,38 @@ in {
       '';
 
       deployFlags = if localSystem == "x86_64-linux" then
-        ""
+        "--debug-logs --skip-checks"
       else
-        "--skip-checks --remote-build";
+        "--debug-logs --skip-checks --remote-build";
+
+      nixFlags =
+        "--impure --accept-flake-config --extra-experimental-features 'nix-command flakes'";
+
+      mkDeployScript = name:
+        { prelude ? "", target }:
+        pkgs.writeShellApplication {
+          inherit name;
+          runtimeInputs = deployInputs;
+          text = ''
+            ${deployPreamble}
+            ${prelude}
+            deploy ${deployFlags} ''${ssh_flag:+"$ssh_flag"} ${target} \
+              -- ${nixFlags} "$@"
+          '';
+        };
 
     in {
-      deployNixos = pkgs.writeShellApplication {
-        name = "deploy-nixos";
-        runtimeInputs = deployInputs;
-        text = ''
-          ${deployPreamble}
-          deploy ${deployFlags} ''${ssh_flag:+"$ssh_flag"} .#st0x-liquidity.system \
-            -- --impure --accept-flake-config \
-            --extra-experimental-features 'nix-command flakes' "$@"
-        '';
-      };
+      deployNixos =
+        mkDeployScript "deploy-nixos" { target = ".#st0x-liquidity.system"; };
 
-      deployService = pkgs.writeShellApplication {
-        name = "deploy-service";
-        runtimeInputs = deployInputs;
-        text = ''
-          ${deployPreamble}
+      deployService = mkDeployScript "deploy-service" {
+        prelude = ''
           profile="''${1:?usage: deploy-service <profile>}"
           shift
-          deploy ${deployFlags} ''${ssh_flag:+"$ssh_flag"} ".#st0x-liquidity.$profile" \
-            -- --impure --accept-flake-config \
-            --extra-experimental-features 'nix-command flakes' "$@"
         '';
+        target = ''.#st0x-liquidity."$profile"'';
       };
 
-      deployAll = pkgs.writeShellApplication {
-        name = "deploy-all";
-        runtimeInputs = deployInputs;
-        text = ''
-          ${deployPreamble}
-          deploy ${deployFlags} ''${ssh_flag:+"$ssh_flag"} .#st0x-liquidity \
-            -- --impure --accept-flake-config \
-            --extra-experimental-features 'nix-command flakes' "$@"
-        '';
-      };
+      deployAll = mkDeployScript "deploy-all" { target = ".#st0x-liquidity"; };
     };
 }

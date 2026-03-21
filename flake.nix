@@ -2,23 +2,26 @@
   description = "Flake to rule the world";
 
   inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+
     rainix.url =
       "github:rainprotocol/rainix?rev=6e14de54456eb33821c2f334cf4d250bcc22c121";
+    rainix.inputs.nixpkgs.follows = "nixpkgs";
 
     flake-utils.url = "github:numtide/flake-utils";
     ragenix.url = "github:yaxitech/ragenix";
     deploy-rs.url = "github:serokell/deploy-rs";
 
     bun2nix.url = "github:nix-community/bun2nix?tag=2.0.7";
-    bun2nix.inputs.nixpkgs.follows = "rainix/nixpkgs";
+    bun2nix.inputs.nixpkgs.follows = "nixpkgs";
 
     crane.url = "github:ipetkov/crane";
 
     disko.url = "github:nix-community/disko";
-    disko.inputs.nixpkgs.follows = "rainix/nixpkgs";
+    disko.inputs.nixpkgs.follows = "nixpkgs";
 
     nixos-anywhere.url = "github:nix-community/nixos-anywhere";
-    nixos-anywhere.inputs.nixpkgs.follows = "rainix/nixpkgs";
+    nixos-anywhere.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs = { self, flake-utils, rainix, bun2nix, ragenix, deploy-rs, disko
@@ -192,9 +195,9 @@
 
           remote = pkgs.writeShellApplication {
             name = "remote";
-            runtimeInputs = infraPkgs.buildInputs ++ [ pkgs.openssh ];
+            runtimeInputs = infraPkgs.sshBuildInputs ++ [ pkgs.openssh ];
             text = ''
-              ${infraPkgs.resolveIp}
+              ${infraPkgs.resolveHost}
               exec ssh -i "$identity" "root@$host_ip" "$@"
             '';
           };

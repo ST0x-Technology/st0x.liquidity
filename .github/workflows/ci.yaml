@@ -1,9 +1,13 @@
-name: CI
-on: [push]
+name: CI/CD
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [prod]
 
 concurrency:
   group: ${{ github.ref }}-ci
-  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   id-token: write
@@ -140,3 +144,51 @@ jobs:
 
       - name: pre-commit hooks
         run: nix develop -c pre-commit run --all-files
+
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: [rust, dashboard, pre-commit]
+    concurrency:
+      group: deploy
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            accept-flake-config = true
+            fallback = true
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+      - name: Resolve and mask host IP
+        run: |
+          host_ip=$(nix run .#resolveIp)
+          echo "::add-mask::$host_ip"
+          host_key=$(nix eval --raw --file keys.nix keys.host)
+          echo "$host_ip $host_key" > ~/.ssh/known_hosts
+
+      - name: Build Solidity artifacts
+        run: nix run .#prepSolArtifacts
+
+      - name: Deploy
+        run: nix run .#deployAll
+
+      - name: Cleanup SSH
+        if: always()
+        run: rm -rf ~/.ssh/id_ed25519
