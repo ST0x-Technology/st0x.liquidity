@@ -195,9 +195,9 @@
 
           remote = pkgs.writeShellApplication {
             name = "remote";
-            runtimeInputs = infraPkgs.buildInputs ++ [ pkgs.openssh ];
+            runtimeInputs = infraPkgs.sshBuildInputs ++ [ pkgs.openssh ];
             text = ''
-              ${infraPkgs.resolveIp}
+              ${infraPkgs.resolveHost}
               exec ssh -i "$identity" "root@$host_ip" "$@"
             '';
           };
