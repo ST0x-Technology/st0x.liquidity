@@ -130,19 +130,88 @@ excellent async ecosystem for handling concurrent trading flows.
 - Generate unique identifiers using transaction hash and log index for trade
   tracking
 
-#### Event-Driven Async Architecture
+#### Orchestration
 
-- Each blockchain event spawns an independent async execution flow using Rust's
-  async/await
-- Multiple trade flows run concurrently without blocking each other
-- Handles throughput mismatch: fast onchain events vs slower broker
-  execution/confirmation
-- No artificial concurrency limits - process events as fast as they arrive
-- Tokio async runtime manages hundreds of concurrent trades efficiently on
-  limited hardware
-- Each flow: Parse Event -> Event Queue -> Deduplication Check -> Position
-  Accumulation -> Broker Execution (when threshold reached) -> Record Result
-- Failed flows retry independently without affecting other trades
+Orchestration is split into two layers:
+
+- **Baton**: Reusable orchestration toolkit crate built on two foundations:
+  **apalis** (persistent job queues, scheduled jobs, durable workflows) and
+  **task-supervisor** (long-running streaming services with auto-reconnect and
+  exponential backoff). Baton provides unified abstractions on top of both: the
+  `Job` trait, common worker patterns, and the job taxonomy described below. Any
+  service that needs structured concurrency depends on Baton.
+- **Conductor**: Service-specific orchestration logic. Uses Baton to wire up the
+  specific jobs, services, and startup sequence for the liquidity bot. Tightly
+  coupled to the domain it orchestrates for obvious reasons.
+
+All work flows through one of these patterns:
+
+- **Finite jobs** (apalis): Serialized to SQLite, processed by workers in FIFO
+  order. Durable across process restarts. Examples: trade accounting, vault
+  discovery, rebalancing operations.
+- **Long-running streaming services** (task-supervisor): Continuous async tasks
+  that maintain connections and restart with exponential backoff on failure.
+  Ephemeral resources (WebSocket connections) are created inside `run()` so each
+  restart establishes a fresh connection. Examples: DEX event monitoring.
+- **Scheduled jobs** (apalis, future): Cron/interval-triggered work replacing
+  manual polling loops. Examples: inventory polling, executor maintenance.
+- **Lifecycle workflows** (apalis-workflow, future): Durable multi-step
+  pipelines where each step is a checkpoint. Sequential or DAG-based.
+
+The apalis Monitor and task-supervisor together provide unified lifecycle
+management: restart policies, graceful shutdown, and event observability.
+
+##### Startup Sequencing
+
+Startup has explicit dependency phases with parallelism where possible:
+
+```mermaid
+graph LR
+    connect_ws --> get_cutoff_block
+    setup_cqrs --> get_cutoff_block
+    setup_cqrs --> seed_vaults
+    setup_cqrs --> setup_rebalancing
+    setup_apalis_tables --> backfill
+    get_cutoff_block --> backfill
+    seed_vaults --> start_runtime
+    setup_rebalancing --> start_runtime
+    backfill --> start_runtime
+```
+
+The trade accounting worker starts only after backfill completes, guaranteeing
+historical events are processed before live events. The WebSocket subscription
+is established early, so no events are missed -- they buffer until the runtime
+starts.
+
+##### Future: Lifecycle Workflows
+
+Business processes with multiple steps will be modeled as durable workflows via
+apalis-workflow. Each step is a checkpoint -- if the process crashes
+mid-workflow, it resumes at the last completed step. This is particularly
+valuable for the trade lifecycle where a crash between acknowledging an onchain
+fill and placing the offchain hedge represents real financial exposure.
+
+```mermaid
+graph LR
+    subgraph Trade Lifecycle
+        event[event arrives] --> convert[convert trade]
+        event --> discover[discover vaults]
+        convert --> fill[acknowledge fill]
+        fill --> hedge[place hedge]
+        hedge --> await[await broker fill]
+        await --> confirm[confirm or retry]
+    end
+```
+
+```mermaid
+graph LR
+    subgraph Rebalancing Lifecycle
+        trigger[imbalance detected] --> plan[plan transfer]
+        plan --> execute[execute onchain tx]
+        execute --> await_conf[await confirmations]
+        await_conf --> reconcile[reconcile]
+    end
+```
 
 ### Trade Execution
 
@@ -403,11 +472,10 @@ The system provides two top-level capabilities:
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
 │  st0x-hedge                            st0x-rebalance                   │
-│  ├─ Conductor                          ├─ Rebalancer                    │
-│  ├─ Accumulator                        ├─ Trigger logic                 │
-│  ├─ Position tracking                  ├─ Mint/Redeem managers          │
-│  └─ Queue processing                   └─ CQRS aggregates               │
-│                                                                         │
+│  ├─ Trade accounting                   ├─ Rebalancer                    │
+│  ├─ Position tracking                  ├─ Trigger logic                 │
+│  └─ CQRS aggregates                    ├─ Mint/Redeem managers          │
+│                                         └─ CQRS aggregates              │
 │  depends on: execution                 depends on: tokenization,        │
 │                                                    bridge, raindex      │
 │                                                                         │
@@ -418,16 +486,13 @@ The system provides two top-level capabilities:
 │                           APPLICATION                                   │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
+│  st0x-baton (orchestration toolkit, wraps apalis)                       │
+│  ├─ Job trait, worker patterns, apalis helpers                          │
+│                                                                         │
 │  st0x-server                           st0x-dashboard                   │
-│  ├─ main.rs                            ├─ Websocket events              │
-│  ├─ API endpoints                      ├─ Admin UI backend              │
-│  ├─ Automated flows                    └─ Manual operations (future)    │
-│  │                                                                      │
-│  │ features:                                                            │
-│  │ ├─ schwab, alpaca-trading, mock                                      │
-│  │ ├─ alpaca-tokenization                                               │
-│  │ ├─ cctp                                                              │
-│  │ └─ rain                                                              │
+│  ├─ Conductor (uses Baton)             ├─ Websocket events              │
+│  ├─ Startup, Monitor, job wiring       ├─ Admin UI backend              │
+│  └─ API endpoints                      └─ Own conductor (future)        │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 
@@ -623,7 +688,7 @@ The source of truth for all table schemas is the `migrations/` directory.
 `equity_redemption_view`, `schwab_auth_view`. Some views use SQLite generated
 columns to expose JSON fields as queryable columns for Grafana dashboards.
 
-**Legacy tables** (still used directly): `event_queue`, `schwab_auth`.
+**Legacy tables** (still used directly): `schwab_auth`.
 
 ### Architecture Decision: Position as Aggregate
 
@@ -2080,52 +2145,44 @@ proper tracking of asset movements that required manual resolution.
 
 #### OnChain Event Processing
 
-**Current Flow** (Event-driven with Conductor):
+**Current Flow** (apalis-orchestrated with CQRS/ES):
 
 ```mermaid
 sequenceDiagram
     participant BC as Blockchain
-    participant DER as DEX Event Receiver
-    participant EP as Event Processor
-    participant Q as Event Queue (SQLite)
-    participant QP as Queue Processor
-    participant Acc as Accumulator
+    participant OFM as OrderFillMonitor
+    participant Q as Job Queue (apalis/SQLite)
+    participant W as Trade Accountant Worker
+    participant P as Position Aggregate
+    participant OO as OffchainOrder Aggregate
     participant Broker as Broker API
     participant OP as Order Poller
-    participant PC as Position Checker
 
-    BC->>DER: ClearV2/TakeOrderV2 event
-    DER->>EP: Send via channel
-    EP->>Q: Enqueue event
+    BC->>OFM: ClearV3/TakeOrderV3 event (WebSocket)
+    OFM->>Q: Push AccountForDexTrade job
 
-    loop Process Queue
-        QP->>Q: Get next unprocessed
-        Q-->>QP: Queued event
-        QP->>QP: Convert to OnchainTrade
-        QP->>Acc: Process trade
-        Acc->>Acc: Update accumulators
-        alt Threshold met
-            Acc-->>QP: Create pending execution
-            QP->>Broker: Place market order
-        end
-        QP->>Q: Mark processed
+    W->>Q: Pull next job
+    W->>W: Convert event to OnchainTrade
+    W->>W: Discover and register vaults
+    W->>P: AcknowledgeOnChainFill
+    alt Threshold met
+        W->>OO: Place offchain order
+        OO->>Broker: Execute market order
     end
 
     loop Poll Orders
         OP->>Broker: Get order status
         Broker-->>OP: Order filled
-        OP->>Acc: Update execution status
-    end
-
-    loop Periodic Check
-        PC->>Acc: Check accumulated positions
-        alt Position ready
-            PC->>Broker: Execute accumulated order
-        end
+        OP->>OO: CompleteFill
+        OP->>P: CompleteOffChainOrder
     end
 ```
 
-**New Flow** (CQRS/ES with Managers):
+On startup, backfill pushes historical events as `AccountForDexTrade` jobs into
+the same queue. The worker starts after backfill completes, processing
+historical events before live events in FIFO order.
+
+**Target Flow** (lifecycle workflows, future):
 
 ```mermaid
 sequenceDiagram
@@ -2178,22 +2235,52 @@ sequenceDiagram
     App->>Views: Update projections
 ```
 
+#### Orchestration Job Taxonomy
+
+All work managed by the Conductor falls into one of these categories:
+
+**Finite jobs** (one-shot, durable, processed from SQLite queue):
+
+| Job                      | Description                                                               |
+| ------------------------ | ------------------------------------------------------------------------- |
+| `AccountForDexTrade`     | Convert raindex event, discover vaults, acknowledge fill, place hedge     |
+| `DiscoverVaultsForTrade` | Extract and register vault info from trade event (no ordering constraint) |
+| `EnrichTrade`            | Add pyth pricing and gas metadata to OnChainTrade aggregate               |
+| Backfill                 | Fetch historical events, push as `AccountForDexTrade` jobs                |
+| Seed vault registry      | Populate known vaults from config at startup                              |
+| Rebalancing operation    | Execute a cross-venue asset transfer (mint/redeem/bridge)                 |
+
+**Long-running services** (streaming, restart on failure):
+
+| Service             | Description                                               |
+| ------------------- | --------------------------------------------------------- |
+| Order fill monitor  | WS subscription to ClearV3/TakeOrderV3, pushes trade jobs |
+| Rebalancing trigger | Detects inventory imbalances, pushes rebalancing jobs     |
+
+**Scheduled jobs** (periodic, future — currently long-running with sleep loops):
+
+| Job                  | Interval | Description                                          |
+| -------------------- | -------- | ---------------------------------------------------- |
+| Inventory poll       | ~30s     | Poll vault + broker balances, broadcast to dashboard |
+| Order status poll    | ~10s     | Poll broker for pending order fills                  |
+| Position check       | ~60s     | Reconcile accumulated positions (safety net)         |
+| Executor maintenance | ~15m     | Refresh auth tokens, check asset availability        |
+
+**Lifecycle workflows** (stepped, durable, future):
+
+| Workflow           | Steps                                                                                  |
+| ------------------ | -------------------------------------------------------------------------------------- |
+| Trade lifecycle    | convert -> discover_vaults -> acknowledge_fill -> place_hedge -> await_fill -> confirm |
+| Equity rebalancing | plan_transfer -> execute_onchain -> await_confirmations -> reconcile                   |
+| USDC rebalancing   | plan_bridge -> execute_bridge -> await_confirmations -> reconcile                      |
+
 #### Manager Pattern
 
-Managers coordinate between aggregates by subscribing to events and sending
-commands. They can be stateless (simple event->command reactions) or stateful
-(long-running processes with state).
-
-**TradeManager**: Stateless - listens to OnChainTradeEvent::Filled and sends
-PositionCommand::AcknowledgeOnChainFill
-
-**OrderManager**: Stateful - manages broker order lifecycle:
-
-- Listens to PositionEvent::OffChainOrderPlaced
-- Executes broker API calls
-- Polls for order completion
-- Tracks in-flight orders
-- Sends commands to OffchainOrder and Position aggregates
+The current implementation uses a flat job model where `AccountForDexTrade`
+performs the full trade pipeline in a single `perform()` call. As the system
+evolves toward lifecycle workflows, the pipeline steps will become discrete
+workflow steps coordinated by apalis-workflow, with each step as a durable
+checkpoint.
 
 #### Future Consideration: Reorg Handling
 
@@ -2299,13 +2386,13 @@ src/                              - Main st0x-hedge library crate
   vault_registry.rs               - VaultRegistry aggregate
   shares.rs                       - FractionalShares newtype and arithmetic
   threshold.rs                    - Execution threshold and Usdc/Dollars newtypes
-  queue.rs                        - Event queue for idempotent processing
   config.rs                       - Application configuration
   api.rs                          - REST API endpoints
   tokenization.rs                 - Tokenizer trait and Alpaca tokenization
+  trading/                        - Trade accounting jobs and inclusion metadata
   onchain/                        - Blockchain event processing, Raindex service
   offchain/                       - Off-chain order execution and polling
-  conductor/                      - Trade accumulation and execution orchestration
+  conductor/                      - Orchestration layer (apalis Monitor, jobs, startup)
   inventory/                      - Cross-venue inventory tracking and imbalance detection
   rebalancing/                    - Cross-venue transfer orchestration and triggers
   symbol/                         - Token symbol caching and locking

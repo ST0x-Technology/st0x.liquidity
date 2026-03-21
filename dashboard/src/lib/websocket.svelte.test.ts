@@ -13,7 +13,7 @@ class MockWebSocket {
 
   url: string
   onopen: (() => void) | null = null
-  onclose: (() => void) | null = null
+  onclose: ((event: CloseEvent) => void) | null = null
   onmessage: ((event: { data: string }) => void) | null = null
   onerror: (() => void) | null = null
 
@@ -23,7 +23,7 @@ class MockWebSocket {
   }
 
   close() {
-    this.onclose?.()
+    this.onclose?.({ code: 1000, reason: '' } as CloseEvent)
   }
 
   simulateOpen() {
@@ -42,8 +42,8 @@ class MockWebSocket {
     this.onerror?.()
   }
 
-  simulateClose() {
-    this.onclose?.()
+  simulateClose(code = 1000, reason = '') {
+    this.onclose?.({ code, reason } as CloseEvent)
   }
 
   static getInstance(index: number): MockWebSocket {
@@ -230,7 +230,7 @@ describe('createWebSocket', () => {
     expect(result[0]).toEqual(newEvent)
   })
 
-  it('schedules reconnect on close with exponential backoff', () => {
+  it('schedules reconnect on close with fixed delay', () => {
     const queryClient = createMockQueryClient()
     const ws = createWebSocket('ws://localhost:8080', queryClient)
 
@@ -240,15 +240,15 @@ describe('createWebSocket', () => {
 
     expect(ws.state).toBe('error')
 
-    vi.advanceTimersByTime(1000)
+    vi.advanceTimersByTime(5000)
     expect(MockWebSocket.instances.length).toBe(2)
 
     MockWebSocket.getInstance(1).simulateClose()
-    vi.advanceTimersByTime(2000)
+    vi.advanceTimersByTime(5000)
     expect(MockWebSocket.instances.length).toBe(3)
 
     MockWebSocket.getInstance(2).simulateClose()
-    vi.advanceTimersByTime(4000)
+    vi.advanceTimersByTime(5000)
     expect(MockWebSocket.instances.length).toBe(4)
   })
 
@@ -260,14 +260,14 @@ describe('createWebSocket', () => {
     MockWebSocket.getInstance(0).simulateOpen()
     MockWebSocket.getInstance(0).simulateClose()
 
-    vi.advanceTimersByTime(1000)
+    vi.advanceTimersByTime(5000)
     MockWebSocket.getInstance(1).simulateClose()
 
-    vi.advanceTimersByTime(2000)
+    vi.advanceTimersByTime(5000)
     MockWebSocket.getInstance(2).simulateOpen()
     MockWebSocket.getInstance(2).simulateClose()
 
-    vi.advanceTimersByTime(1000)
+    vi.advanceTimersByTime(5000)
     expect(MockWebSocket.instances.length).toBe(4)
   })
 
@@ -376,7 +376,7 @@ describe('createWebSocket', () => {
     consoleSpy.mockRestore()
   })
 
-  it('caps reconnect delay at maximum', () => {
+  it('keeps retrying with fixed delay indefinitely', () => {
     const queryClient = createMockQueryClient()
     const ws = createWebSocket('ws://localhost:8080', queryClient)
 
@@ -384,11 +384,11 @@ describe('createWebSocket', () => {
 
     for (let i = 0; i < 10; i++) {
       MockWebSocket.getInstance(i).simulateClose()
-      vi.advanceTimersByTime(30000)
+      vi.advanceTimersByTime(5000)
     }
 
     MockWebSocket.getInstance(10).simulateClose()
-    vi.advanceTimersByTime(30000)
+    vi.advanceTimersByTime(5000)
     expect(MockWebSocket.instances.length).toBe(12)
   })
 
@@ -413,12 +413,12 @@ describe('createWebSocket', () => {
     MockWebSocket.getInstance(0).simulateOpen()
     MockWebSocket.getInstance(0).simulateClose()
 
-    expect(ws.error).toEqual({ attempts: 1, nextRetryMs: 1000 })
+    expect(ws.error).toEqual({ attempts: 1, nextRetryMs: 5000 })
 
-    vi.advanceTimersByTime(1000)
+    vi.advanceTimersByTime(5000)
     MockWebSocket.getInstance(1).simulateClose()
 
-    expect(ws.error).toEqual({ attempts: 2, nextRetryMs: 2000 })
+    expect(ws.error).toEqual({ attempts: 2, nextRetryMs: 5000 })
   })
 
   it('clears error context on successful reconnection', () => {
@@ -431,7 +431,7 @@ describe('createWebSocket', () => {
 
     expect(ws.error).not.toBeNull()
 
-    vi.advanceTimersByTime(1000)
+    vi.advanceTimersByTime(5000)
     MockWebSocket.getInstance(1).simulateOpen()
 
     expect(ws.error).toBeNull()

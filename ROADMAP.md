@@ -1,5 +1,17 @@
 # Roadmap
 
+> TODO: i'll integrate this into the roadmap later so don't worry about that for
+> now but we should try hooking up the frontend to the e2e tests and then it
+> will be really easy to see whether everything is working as expected. much
+> faster than deploying manually. and then that also means that i can add github
+> actions for deployments in parallel on top of that branch that makes it
+> possible to disable all operations so the bot would just be monitoring and
+> shit. so yeah, let's do both, i think that's the most efficient way we now
+> have and didn't have before for figuring out all these issues before they even
+> hit prod. so if we can unlock e2e testing + loccal dashboard testing under
+> simulated scenarios then we can really get through everything remaining nice
+> and fast
+
 Each `##` section is an epic -- a goal-oriented group of related issues. Epics
 are ordered by priority (highest first).
 
@@ -259,7 +271,9 @@ graph LR
 
 #### Infrastructure
 
-- [ ] [#296 Replace hand-rolled conductor with apalis + task-supervisor](https://github.com/ST0x-Technology/st0x.liquidity/issues/296)
+- [x] [#296 Replace hand-rolled conductor with apalis + task-supervisor](https://github.com/ST0x-Technology/st0x.liquidity/issues/296)
+  - PR:
+    [#414 Replace hand-rolled conductor with apalis + task-supervisor](https://github.com/ST0x-Technology/st0x.liquidity/pull/414)
 - [ ] [#293 Granular SSH access control: limit root access and per-user deploy keys](https://github.com/ST0x-Technology/st0x.liquidity/issues/293)
 - [ ] [#294 Document secret management setup and opsec](https://github.com/ST0x-Technology/st0x.liquidity/issues/294)
 - [ ] [#35 Document the bot](https://github.com/ST0x-Technology/st0x.liquidity/issues/35)

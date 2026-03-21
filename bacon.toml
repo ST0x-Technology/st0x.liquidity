@@ -10,7 +10,7 @@ default_job = "check"
 env.CARGO_TERM_COLOR = "always"
 
 wrap = false
-reverse = false
+reverse = true
 
 [jobs.check]
 need_stdout = false
