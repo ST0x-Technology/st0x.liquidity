@@ -2,12 +2,15 @@
 
 use async_trait::async_trait;
 use chrono::Utc;
+use sqlx::SqlitePool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::broadcast;
 use tracing::warn;
 
 use st0x_dto::{EventStoreEntry, ServerMessage};
-use st0x_event_sorcery::{DomainEvent, EntityList, EventSourced, Never, Reactor, deps};
+use st0x_event_sorcery::{
+    DomainEvent, EntityList, EventSourced, Never, Reactor, deps, load_entity,
+};
 
 use crate::equity_redemption::EquityRedemption;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
@@ -25,13 +28,15 @@ deps!(
 pub(crate) struct EventBroadcaster {
     sender: broadcast::Sender<ServerMessage>,
     sequence: AtomicU64,
+    pool: SqlitePool,
 }
 
 impl EventBroadcaster {
-    pub(crate) fn new(sender: broadcast::Sender<ServerMessage>) -> Self {
+    pub(crate) fn new(sender: broadcast::Sender<ServerMessage>, pool: SqlitePool) -> Self {
         Self {
             sender,
             sequence: AtomicU64::new(0),
+            pool,
         }
     }
 
@@ -50,6 +55,12 @@ impl EventBroadcaster {
             warn!("Failed to broadcast event (no receivers): {error}");
         }
     }
+
+    fn broadcast_transfer(&self, transfer: st0x_dto::TransferOperation) {
+        if let Err(error) = self.sender.send(ServerMessage::Transfer(transfer)) {
+            warn!("Failed to broadcast transfer update (no receivers): {error}");
+        }
+    }
 }
 
 #[async_trait]
@@ -63,12 +74,34 @@ impl Reactor for EventBroadcaster {
         event
             .on(|id, event| async move {
                 self.broadcast_event::<TokenizedEquityMint>(&id, &event);
+
+                match load_entity::<TokenizedEquityMint>(&self.pool, &id).await {
+                    Ok(Some(entity)) => self.broadcast_transfer(entity.to_dto(&id)),
+                    Ok(None) => warn!(%id, "Mint entity not found for transfer broadcast"),
+                    Err(error) => warn!(%id, ?error, "Failed to load mint entity for broadcast"),
+                }
             })
             .on(|id, event| async move {
                 self.broadcast_event::<EquityRedemption>(&id, &event);
+
+                match load_entity::<EquityRedemption>(&self.pool, &id).await {
+                    Ok(Some(entity)) => self.broadcast_transfer(entity.to_dto(&id)),
+                    Ok(None) => warn!(%id, "Redemption entity not found for transfer broadcast"),
+                    Err(error) => {
+                        warn!(%id, ?error, "Failed to load redemption entity for broadcast");
+                    }
+                }
             })
             .on(|id, event| async move {
                 self.broadcast_event::<UsdcRebalance>(&id, &event);
+
+                match load_entity::<UsdcRebalance>(&self.pool, &id).await {
+                    Ok(Some(entity)) => self.broadcast_transfer(entity.to_dto(&id)),
+                    Ok(None) => warn!(%id, "USDC rebalance entity not found for broadcast"),
+                    Err(error) => {
+                        warn!(%id, ?error, "Failed to load USDC rebalance entity for broadcast");
+                    }
+                }
             })
             .exhaustive()
             .await;
@@ -88,6 +121,7 @@ mod tests {
 
     use super::*;
     use crate::equity_redemption::{EquityRedemptionEvent, RedemptionAggregateId};
+    use crate::test_utils::setup_test_db;
     use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMintEvent};
     use crate::usdc_rebalance::{UsdcRebalanceEvent, UsdcRebalanceId};
 
@@ -118,8 +152,9 @@ mod tests {
 
     #[tokio::test]
     async fn event_broadcaster_sends_to_channel() {
+        let pool = setup_test_db().await;
         let (sender, mut receiver) = broadcast::channel(16);
-        let broadcaster = EventBroadcaster::new(sender);
+        let broadcaster = EventBroadcaster::new(sender, pool);
 
         let id = IssuerRequestId::new("mint-123".to_string());
 
@@ -133,14 +168,15 @@ mod tests {
                 assert_eq!(entry.aggregate_id, "mint-123");
                 assert_eq!(entry.event_type, "TokenizedEquityMintEvent::MintRequested");
             }
-            ServerMessage::Initial(_) => panic!("expected Event message"),
+            other => panic!("expected Event message, got {other:?}"),
         }
     }
 
     #[tokio::test]
     async fn event_broadcaster_handles_no_receivers() {
+        let pool = setup_test_db().await;
         let (sender, _) = broadcast::channel::<ServerMessage>(16);
-        let broadcaster = EventBroadcaster::new(sender);
+        let broadcaster = EventBroadcaster::new(sender, pool);
 
         let id = IssuerRequestId::new("mint-456".to_string());
 
@@ -149,8 +185,9 @@ mod tests {
 
     #[tokio::test]
     async fn reactor_receive_broadcasts_mint_event() {
+        let pool = setup_test_db().await;
         let (sender, mut receiver) = broadcast::channel(16);
-        let harness = ReactorHarness::new(EventBroadcaster::new(sender));
+        let harness = ReactorHarness::new(EventBroadcaster::new(sender, pool));
 
         let id = IssuerRequestId::new("mint-multi".to_string());
 
@@ -165,14 +202,15 @@ mod tests {
             ServerMessage::Event(entry) => {
                 assert_eq!(entry.event_type, "TokenizedEquityMintEvent::MintRequested");
             }
-            ServerMessage::Initial(_) => panic!("expected Event message"),
+            other => panic!("expected Event message, got {other:?}"),
         }
     }
 
     #[tokio::test]
     async fn reactor_receive_works_for_equity_redemption() {
+        let pool = setup_test_db().await;
         let (sender, mut receiver) = broadcast::channel(16);
-        let harness = ReactorHarness::new(EventBroadcaster::new(sender));
+        let harness = ReactorHarness::new(EventBroadcaster::new(sender, pool));
 
         let id = RedemptionAggregateId::new("redemption-123".to_string());
 
@@ -189,14 +227,15 @@ mod tests {
                 assert_eq!(entry.aggregate_id, "redemption-123");
                 assert_eq!(entry.event_type, "EquityRedemptionEvent::Completed");
             }
-            ServerMessage::Initial(_) => panic!("expected Event message"),
+            other => panic!("expected Event message, got {other:?}"),
         }
     }
 
     #[tokio::test]
     async fn reactor_receive_works_for_usdc_rebalance() {
+        let pool = setup_test_db().await;
         let (sender, mut receiver) = broadcast::channel(16);
-        let harness = ReactorHarness::new(EventBroadcaster::new(sender));
+        let harness = ReactorHarness::new(EventBroadcaster::new(sender, pool));
 
         let id = UsdcRebalanceId(Uuid::new_v4());
 
@@ -213,7 +252,7 @@ mod tests {
                 assert_eq!(entry.aggregate_id, id.to_string());
                 assert_eq!(entry.event_type, "UsdcRebalanceEvent::WithdrawalConfirmed");
             }
-            ServerMessage::Initial(_) => panic!("expected Event message"),
+            other => panic!("expected Event message, got {other:?}"),
         }
     }
 
@@ -222,7 +261,8 @@ mod tests {
         let (sender, mut receiver1) = broadcast::channel(16);
         let mut receiver2 = sender.subscribe();
         let mut receiver3 = sender.subscribe();
-        let broadcaster = EventBroadcaster::new(sender);
+        let pool = setup_test_db().await;
+        let broadcaster = EventBroadcaster::new(sender, pool);
 
         let id = IssuerRequestId::new("multi-sub".to_string());
 
@@ -251,8 +291,8 @@ mod tests {
                         i + 1
                     );
                 }
-                ServerMessage::Initial(_) => {
-                    panic!("receiver {} expected Event message", i + 1)
+                other => {
+                    panic!("receiver {} expected Event message, got {other:?}", i + 1)
                 }
             }
         }
@@ -260,8 +300,9 @@ mod tests {
 
     #[tokio::test]
     async fn broadcast_empty_does_nothing() {
+        let pool = setup_test_db().await;
         let (sender, mut receiver) = broadcast::channel(16);
-        let _broadcaster = EventBroadcaster::new(sender);
+        let _broadcaster = EventBroadcaster::new(sender, pool);
 
         let result =
             tokio::time::timeout(std::time::Duration::from_millis(10), receiver.recv()).await;
@@ -269,10 +310,11 @@ mod tests {
         assert!(result.is_err(), "should timeout with no messages");
     }
 
-    #[test]
-    fn event_store_entry_serializes_correctly() {
+    #[tokio::test]
+    async fn event_store_entry_serializes_correctly() {
+        let pool = setup_test_db().await;
         let (sender, _) = broadcast::channel(16);
-        let broadcaster = EventBroadcaster::new(sender);
+        let broadcaster = EventBroadcaster::new(sender, pool);
 
         let id = IssuerRequestId::new("serialize-test".to_string());
 
@@ -298,8 +340,9 @@ mod tests {
 
     #[tokio::test]
     async fn reactor_broadcasts_mint_event_with_fractional_quantity() {
+        let pool = setup_test_db().await;
         let (sender, mut receiver) = broadcast::channel(16);
-        let harness = ReactorHarness::new(EventBroadcaster::new(sender));
+        let harness = ReactorHarness::new(EventBroadcaster::new(sender, pool));
 
         let id = IssuerRequestId::new("mint-frac".to_string());
         let fractional_qty = Float::parse("25.5".to_string()).unwrap();
@@ -315,7 +358,7 @@ mod tests {
             ServerMessage::Event(entry) => {
                 assert_eq!(entry.event_type, "TokenizedEquityMintEvent::MintRequested");
             }
-            ServerMessage::Initial(_) => panic!("expected Event message"),
+            other => panic!("expected Event message, got {other:?}"),
         }
     }
 }

@@ -13,9 +13,16 @@ use alloy::providers::{Identity, Provider, ProviderBuilder, WalletProvider};
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
+use serde::Deserialize;
 use tracing::info;
 
-use crate::{Evm, EvmError, Wallet};
+use crate::{Evm, EvmError, TryIntoWallet, Wallet, WalletCtx};
+
+/// Secrets needed to construct a [`RawPrivateKeyWallet`].
+#[derive(Deserialize)]
+pub struct PrivateKeySecrets {
+    pub private_key: B256,
+}
 
 /// Provider type produced by wrapping a base provider with default fillers
 /// and a [`WalletFiller`].
@@ -134,6 +141,23 @@ where
     }
 }
 
+#[async_trait]
+impl<P> TryIntoWallet for RawPrivateKeyWallet<P>
+where
+    P: Provider + Clone + Send + Sync + 'static,
+{
+    type Settings = ();
+    type Credentials = PrivateKeySecrets;
+
+    async fn try_from_ctx(ctx: WalletCtx<(), PrivateKeySecrets, P>) -> Result<Self, EvmError> {
+        Self::new(
+            &ctx.credentials.private_key,
+            ctx.provider,
+            ctx.required_confirmations,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::node_bindings::{Anvil, AnvilInstance};
@@ -184,6 +208,26 @@ mod tests {
             .unwrap();
 
         (anvil, wallet, token_address, signer_address)
+    }
+
+    #[tokio::test]
+    async fn try_from_ctx_produces_correct_wallet() {
+        let anvil = Anvil::new().spawn();
+        let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let expected_address = anvil.addresses()[0];
+
+        let provider = ProviderBuilder::new().connect_http(anvil.endpoint().parse().unwrap());
+
+        let ctx = WalletCtx {
+            settings: (),
+            credentials: PrivateKeySecrets { private_key },
+            provider,
+            required_confirmations: 1,
+        };
+
+        let wallet = RawPrivateKeyWallet::try_from_ctx(ctx).await.unwrap();
+
+        assert_eq!(wallet.address(), expected_address);
     }
 
     #[tokio::test]

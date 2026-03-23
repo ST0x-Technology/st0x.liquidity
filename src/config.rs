@@ -969,7 +969,6 @@ pub(crate) mod tests {
             ethereum_rpc_url = "https://mainnet.infura.io"
 
             [rebalancing.wallet]
-            type = "private-key"
             private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         "#,
         );
@@ -992,7 +991,7 @@ pub(crate) mod tests {
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
             [rebalancing.wallet]
-            type = "private-key"
+            kind = "private-key"
             address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
             [rebalancing.equity]
@@ -1070,7 +1069,6 @@ pub(crate) mod tests {
             ethereum_rpc_url = "https://mainnet.infura.io"
 
             [rebalancing.wallet]
-            type = "private-key"
             private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         "#,
         );
@@ -1089,7 +1087,7 @@ pub(crate) mod tests {
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
             [rebalancing.wallet]
-            type = "private-key"
+            kind = "private-key"
             address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
             [rebalancing.equity]
@@ -1180,7 +1178,7 @@ pub(crate) mod tests {
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
             [rebalancing.wallet]
-            type = "private-key"
+            kind = "private-key"
             address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
             [rebalancing.equity]
@@ -1194,7 +1192,29 @@ pub(crate) mod tests {
         "#,
         );
 
-        let error = Ctx::load_files(config.path(), example_secrets_toml())
+        let secrets = toml_file(
+            r#"
+            hyperdx.api_key = "test-key"
+
+            [evm]
+            ws_rpc_url = "ws://localhost:8545"
+
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "test_key"
+            api_secret = "test_secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+            mode = "sandbox"
+
+            [rebalancing]
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://mainnet.infura.io"
+
+            [rebalancing.wallet]
+            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        "#,
+        );
+        let error = Ctx::load_files(config.path(), secrets.path())
             .await
             .unwrap_err();
         assert!(
@@ -1317,7 +1337,7 @@ pub(crate) mod tests {
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
             [rebalancing.wallet]
-            type = "private-key"
+            kind = "private-key"
             address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
             [rebalancing.equity]
@@ -1452,7 +1472,6 @@ pub(crate) mod tests {
             ethereum_rpc_url = "https://mainnet.infura.io"
 
             [rebalancing.wallet]
-            type = "private-key"
             private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         "#,
         );
@@ -1471,7 +1490,7 @@ pub(crate) mod tests {
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
             [rebalancing.wallet]
-            type = "private-key"
+            kind = "private-key"
             address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
             [rebalancing.equity]

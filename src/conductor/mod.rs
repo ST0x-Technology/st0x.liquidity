@@ -15,7 +15,6 @@ use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedSender;
@@ -34,7 +33,7 @@ use crate::alpaca_wallet::AlpacaWalletService;
 use crate::bindings::IOrderBookV6::{ClearV3, IOrderBookV6Instance, TakeOrderV3};
 use crate::config::{AssetsConfig, Ctx, CtxError};
 use crate::dashboard::EventBroadcaster;
-use crate::inventory::{InventoryPollingService, InventorySnapshot, InventoryView};
+use crate::inventory::{BroadcastingInventory, InventoryPollingService, InventorySnapshot};
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer,
@@ -139,13 +138,21 @@ pub(crate) async fn run_market_hours_loop<E>(
     pool: SqlitePool,
     executor_maintenance: Option<JoinHandle<()>>,
     event_sender: broadcast::Sender<ServerMessage>,
+    inventory: Arc<BroadcastingInventory>,
 ) -> anyhow::Result<()>
 where
     E: Executor + Clone + Send + 'static,
     EventProcessingError: From<E::Error>,
 {
-    let mut conductor =
-        Conductor::start(ctx, pool, executor, executor_maintenance, event_sender).await?;
+    let mut conductor = Conductor::start(
+        ctx,
+        pool,
+        executor,
+        executor_maintenance,
+        event_sender,
+        inventory,
+    )
+    .await?;
 
     info!("Conductor running");
     let result = conductor.wait_for_completion().await;
@@ -167,6 +174,7 @@ impl Conductor {
         executor: E,
         executor_maintenance: Option<JoinHandle<()>>,
         event_sender: broadcast::Sender<ServerMessage>,
+        inventory: Arc<BroadcastingInventory>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Self>> + Send>>
     where
         E: Executor + Clone + Send + 'static,
@@ -191,8 +199,6 @@ impl Conductor {
             let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
                 .build(())
                 .await?;
-
-            let inventory = Arc::new(RwLock::new(InventoryView::default()));
 
             let (vault_registry, vault_registry_projection) =
                 StoreBuilder::<VaultRegistry>::new(pool.clone())
@@ -289,12 +295,12 @@ impl Conductor {
             .with_executor_maintenance(executor_maintenance)
             .with_dex_event_streams(clear_stream, take_stream);
 
-            if let Some(wallet) = ethereum_wallet {
-                builder = builder.with_ethereum_wallet(wallet);
-            }
-
             if let Some(rebalancer_handle) = rebalancer {
                 builder = builder.with_rebalancer(rebalancer_handle);
+            }
+
+            if let Some(wallet) = ethereum_wallet {
+                builder = builder.with_ethereum_wallet(wallet);
             }
 
             if let Some(wallet) = base_wallet {
@@ -378,7 +384,7 @@ struct RebalancingInfrastructure {
 struct RebalancingDeps {
     pool: SqlitePool,
     ctx: Ctx,
-    inventory: Arc<RwLock<InventoryView>>,
+    inventory: Arc<BroadcastingInventory>,
     event_sender: broadcast::Sender<ServerMessage>,
     vault_registry: Arc<Store<VaultRegistry>>,
     vault_registry_projection: Arc<Projection<VaultRegistry>>,
@@ -393,6 +399,17 @@ async fn seed_vault_registry_from_config(
     vault_registry: &Store<VaultRegistry>,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
+    // Pre-flight validation: ensure every rebalancing-enabled equity has a
+    // vault_id before performing any writes to the vault registry.
+    for (symbol, equity_config) in &ctx.assets.equities.symbols {
+        if equity_config.vault_id.is_none() && ctx.is_rebalancing_enabled(symbol) {
+            return Err(CtxError::MissingEquityVaultId {
+                symbol: symbol.clone(),
+            }
+            .into());
+        }
+    }
+
     let vault_registry_id = VaultRegistryId {
         orderbook: ctx.evm.orderbook,
         owner: ctx.order_owner(),
@@ -508,7 +525,8 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             wrapper,
         ));
 
-        let event_broadcaster = Arc::new(EventBroadcaster::new(deps.event_sender));
+        let event_broadcaster =
+            Arc::new(EventBroadcaster::new(deps.event_sender, deps.pool.clone()));
         let manifest = QueryManifest::new(rebalancing_trigger, event_broadcaster);
 
         let built = manifest
@@ -548,8 +566,8 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             .ok_or(CtxError::MissingCashVaultId)?;
 
         let handle = services.spawn(
-            market_maker_wallet,
             RaindexVaultId(usdc_vault_id),
+            market_maker_wallet,
             operation_receiver,
             frameworks,
         );
@@ -1672,7 +1690,9 @@ mod tests {
     use rain_math_float::Float;
     use std::collections::HashSet;
     use std::sync::Arc;
+    use tokio::sync::broadcast;
 
+    use st0x_dto::ServerMessage;
     use st0x_event_sorcery::{StoreBuilder, test_store};
     use st0x_execution::{
         Direction, ExecutorOrderId, MarketOrder, MockExecutor, MockExecutorCtx, Positive, Symbol,
@@ -1689,7 +1709,7 @@ mod tests {
     use crate::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
 
     use crate::inventory::view::Operator;
-    use crate::inventory::{ImbalanceThreshold, Inventory, Venue};
+    use crate::inventory::{ImbalanceThreshold, Inventory, InventoryView, Venue};
     use crate::onchain::trade::OnchainTrade;
     use crate::rebalancing::{RebalancingTrigger, TriggeredOperation};
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
@@ -3662,7 +3682,11 @@ mod tests {
             .await
             .unwrap();
 
-        let inventory = Arc::new(RwLock::new(imbalanced_inventory(&symbol)));
+        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            imbalanced_inventory(&symbol),
+            event_sender,
+        ));
         let (operation_sender, mut operation_receiver) = mpsc::channel(10);
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
@@ -3757,7 +3781,8 @@ mod tests {
             )
             .unwrap();
 
-        let inventory = Arc::new(RwLock::new(initial_inventory));
+        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(initial_inventory, event_sender));
         let (operation_sender, _operation_receiver) = mpsc::channel(10);
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
@@ -3869,7 +3894,8 @@ mod tests {
             )
             .unwrap();
 
-        let inventory = Arc::new(RwLock::new(initial_inventory));
+        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(initial_inventory, event_sender));
         let (operation_sender, mut receiver) = mpsc::channel(10);
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
@@ -3996,7 +4022,8 @@ mod tests {
             )
             .unwrap();
 
-        let inventory = Arc::new(RwLock::new(initial_inventory));
+        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(initial_inventory, event_sender));
         let (operation_sender, receiver) = mpsc::channel(10);
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
@@ -4494,6 +4521,73 @@ mod tests {
                 .iter()
                 .any(|event_type| event_type == "OnChainTradeEvent::Enriched"),
             "Should not emit Enriched when enrichment fields are None, got: {event_types:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_vault_registry_rejects_missing_vault_id_without_side_effects() {
+        let pool = setup_test_db().await;
+        let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), ());
+
+        // Two equities with rebalancing enabled: one has a vault_id, one does not.
+        // The pre-flight validation must reject before any seeds are applied.
+        let mut symbols = HashMap::new();
+
+        symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            EquityAssetConfig {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: Address::ZERO,
+                vault_id: Some(fixed_bytes!(
+                    "0x0000000000000000000000000000000000000000000000000000000000000001"
+                )),
+                trading: OperationMode::Disabled,
+                rebalancing: OperationMode::Enabled,
+                operational_limit: None,
+            },
+        );
+
+        symbols.insert(
+            Symbol::new("TSLA").unwrap(),
+            EquityAssetConfig {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: Address::ZERO,
+                vault_id: None,
+                trading: OperationMode::Disabled,
+                rebalancing: OperationMode::Enabled,
+                operational_limit: None,
+            },
+        );
+
+        let ctx = Ctx {
+            assets: AssetsConfig {
+                equities: EquitiesConfig {
+                    operational_limit: None,
+                    symbols,
+                },
+                cash: None,
+            },
+            ..create_test_ctx_with_order_owner(Address::ZERO)
+        };
+
+        let error = seed_vault_registry_from_config(&vault_registry, &ctx)
+            .await
+            .expect_err("should fail when vault_id is missing for TSLA");
+
+        let ctx_error = error
+            .downcast_ref::<CtxError>()
+            .expect("error should be CtxError");
+
+        assert!(
+            matches!(ctx_error, CtxError::MissingEquityVaultId { symbol } if symbol.to_string() == "TSLA"),
+            "expected MissingEquityVaultId for TSLA, got: {ctx_error:?}"
+        );
+
+        let events = get_vault_registry_events(&pool).await;
+
+        assert!(
+            events.is_empty(),
+            "Vault registry should have no events after validation failure, got: {events:?}"
         );
     }
 }
