@@ -13,7 +13,8 @@ use st0x_finance::Usdc;
 
 use super::ConvertDirection;
 use crate::alpaca_wallet::{
-    AlpacaWalletService, Network, TokenSymbol, TransferStatus, TravelRuleInfo, WhitelistStatus,
+    AlpacaWalletService, Network, TokenSymbol, TransferStatus, TravelRuleInfo, WhitelistEntry,
+    WhitelistStatus,
 };
 use crate::bindings::IERC20;
 use crate::config::{BrokerCtx, Ctx};
@@ -123,6 +124,73 @@ pub(super) async fn alpaca_deposit_command<Registry: IntoErrorRegistry, W: Write
     Ok(())
 }
 
+/// Prints whitelisted addresses for the given asset, splitting them into
+/// approved (usable for withdrawals) and non-approved (pending/rejected).
+///
+/// Accepts a pre-fetched whitelist when available to avoid redundant API
+/// calls. Falls back to fetching from the API when `None`.
+async fn print_whitelisted_addresses<W: Write>(
+    stdout: &mut W,
+    alpaca_wallet: &AlpacaWalletService,
+    asset: &TokenSymbol,
+    prefetched: Option<&[WhitelistEntry]>,
+) -> anyhow::Result<()> {
+    let owned;
+    let entries: &[WhitelistEntry] = if let Some(entries) = prefetched {
+        entries
+    } else {
+        owned = alpaca_wallet.get_whitelisted_addresses().await?;
+        &owned
+    };
+
+    // Filter by asset only -- chain comparison is intentionally omitted
+    // because Alpaca's API returns inconsistent chain values ("ETH" vs
+    // "ethereum"). See is_address_whitelisted_and_approved for context.
+    let relevant: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.asset == *asset)
+        .collect();
+
+    if relevant.is_empty() {
+        writeln!(stdout, "\nNo whitelisted addresses found for {asset}.")?;
+        writeln!(
+            stdout,
+            "Use `alpaca-whitelist` to whitelist an address first."
+        )?;
+        return Ok(());
+    }
+
+    let (approved, other): (Vec<_>, Vec<_>) = relevant
+        .into_iter()
+        .partition(|entry| entry.status == WhitelistStatus::Approved);
+
+    if approved.is_empty() {
+        writeln!(
+            stdout,
+            "\nNo approved addresses available for {asset} withdrawal."
+        )?;
+    } else {
+        writeln!(
+            stdout,
+            "\nApproved addresses (usable for {asset} withdrawal):"
+        )?;
+
+        for entry in &approved {
+            writeln!(stdout, "   {}", entry.address)?;
+        }
+    }
+
+    if !other.is_empty() {
+        writeln!(stdout, "\nNot yet usable:")?;
+
+        for entry in &other {
+            writeln!(stdout, "   {} ({:?})", entry.address, entry.status,)?;
+        }
+    }
+
+    Ok(())
+}
+
 pub(super) async fn alpaca_withdraw_command<Registry: IntoErrorRegistry, W: Write>(
     stdout: &mut W,
     amount: Usdc,
@@ -137,31 +205,7 @@ pub(super) async fn alpaca_withdraw_command<Registry: IntoErrorRegistry, W: Writ
     };
 
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
-    let sender_address = rebalancing_ctx.base_wallet().address();
 
-    let destination = to_address.unwrap_or(sender_address);
-    writeln!(stdout, "   Destination address: {destination}")?;
-
-    let (usdc_address, network) = if alpaca_auth.is_sandbox() {
-        (USDC_ETHEREUM_SEPOLIA, "Ethereum Sepolia")
-    } else {
-        (USDC_ETHEREUM, "Ethereum Mainnet")
-    };
-
-    writeln!(stdout, "   Network: {network}")?;
-    writeln!(stdout, "   USDC contract: {usdc_address}")?;
-
-    let balance_before = rebalancing_ctx
-        .ethereum_wallet()
-        .call::<Registry, _>(
-            usdc_address,
-            IERC20::balanceOfCall {
-                account: destination,
-            },
-        )
-        .await?;
-
-    writeln!(stdout, "   Balance before: {balance_before}")?;
     let alpaca_wallet = AlpacaWalletService::new(
         alpaca_auth.base_url().to_string(),
         rebalancing_ctx.alpaca_broker_auth.account_id,
@@ -170,11 +214,64 @@ pub(super) async fn alpaca_withdraw_command<Registry: IntoErrorRegistry, W: Writ
     );
 
     let usdc_asset = TokenSymbol::new("USDC");
+
+    let Some(to_address) = to_address else {
+        writeln!(stdout, "\nNo --to address provided.")?;
+        print_whitelisted_addresses(stdout, &alpaca_wallet, &usdc_asset, None).await?;
+        anyhow::bail!("--to is required. See above for whitelisted addresses");
+    };
+
+    writeln!(stdout, "   Destination address: {to_address}")?;
+
     let positive_amount = Positive::new(amount)?;
+
+    // Check whitelist before on-chain balance to fail fast on invalid destinations.
+    // Chain comparison intentionally omitted -- Alpaca returns inconsistent chain
+    // values ("ETH" vs "ethereum"). Matches is_address_whitelisted_and_approved.
+    let whitelist = alpaca_wallet.get_whitelisted_addresses().await?;
+    let is_whitelisted = whitelist.iter().any(|entry| {
+        entry.address == to_address
+            && entry.asset == usdc_asset
+            && entry.status == WhitelistStatus::Approved
+    });
+
+    if !is_whitelisted {
+        writeln!(
+            stdout,
+            "Error: address {to_address} is not whitelisted for USDC"
+        )?;
+        print_whitelisted_addresses(stdout, &alpaca_wallet, &usdc_asset, Some(&whitelist)).await?;
+        anyhow::bail!(
+            "Address {to_address} is not whitelisted. \
+             See above for available addresses"
+        );
+    }
+
+    let (usdc_address, network_name) = if alpaca_auth.is_sandbox() {
+        (USDC_ETHEREUM_SEPOLIA, "Ethereum Sepolia")
+    } else {
+        (USDC_ETHEREUM, "Ethereum Mainnet")
+    };
+
+    writeln!(stdout, "   Network: {network_name}")?;
+    writeln!(stdout, "   USDC contract: {usdc_address}")?;
+
+    // Capture on-chain balance before the side-effecting withdrawal call
+    let balance_before = rebalancing_ctx
+        .ethereum_wallet()
+        .call::<Registry, _>(
+            usdc_address,
+            IERC20::balanceOfCall {
+                account: to_address,
+            },
+        )
+        .await?;
+
+    writeln!(stdout, "   Balance before: {balance_before}")?;
 
     writeln!(stdout, "   Initiating withdrawal...")?;
     let transfer = alpaca_wallet
-        .initiate_withdrawal(positive_amount, &usdc_asset, &destination)
+        .initiate_withdrawal(positive_amount, &usdc_asset, &to_address)
         .await?;
 
     writeln!(stdout, "   Withdrawal initiated: {}", transfer.id)?;
@@ -204,7 +301,7 @@ pub(super) async fn alpaca_withdraw_command<Registry: IntoErrorRegistry, W: Writ
                 .call::<Registry, _>(
                     usdc_address,
                     IERC20::balanceOfCall {
-                        account: destination,
+                        account: to_address,
                     },
                 )
                 .await?;
@@ -254,6 +351,13 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
     writeln!(stdout, "   Asset: USDC")?;
     writeln!(stdout, "   Network: Ethereum")?;
 
+    let travel_rule_config = ctx.travel_rule.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing [broker.travel_rule] in config -- required for Alpaca whitelist creation"
+        )
+    })?;
+    let travel_rule_info = TravelRuleInfo::from_config(travel_rule_config);
+
     let alpaca_wallet = AlpacaWalletService::new(
         alpaca_auth.base_url().to_string(),
         rebalancing_ctx.alpaca_broker_auth.account_id,
@@ -272,13 +376,6 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
             return Ok(());
         }
     }
-
-    let travel_rule_config = ctx.travel_rule.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "missing [broker.travel_rule] in config — required for Alpaca whitelist creation"
-        )
-    })?;
-    let travel_rule_info = TravelRuleInfo::from_config(travel_rule_config);
 
     writeln!(stdout, "   Creating whitelist entry...")?;
     let entry = alpaca_wallet
@@ -360,7 +457,7 @@ pub(super) async fn alpaca_whitelist_patch_travel_rule_command<W: Write>(
 
     let travel_rule_config = ctx.travel_rule.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
-            "missing [broker.travel_rule] in config — required for travel rule patching"
+            "missing [broker.travel_rule] in config -- required for travel rule patching"
         )
     })?;
     let travel_rule_info = TravelRuleInfo::from_config(travel_rule_config);
@@ -680,6 +777,10 @@ mod tests {
     }
 
     fn create_full_alpaca_ctx() -> Ctx {
+        create_full_alpaca_ctx_with_mode(AlpacaBrokerApiMode::Sandbox)
+    }
+
+    fn create_full_alpaca_ctx_with_mode(mode: AlpacaBrokerApiMode) -> Ctx {
         let alpaca_account_id = AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
         Ctx {
             database_url: ":memory:".to_string(),
@@ -698,7 +799,7 @@ mod tests {
                 api_key: "test-key".to_string(),
                 api_secret: "test-secret".to_string(),
                 account_id: alpaca_account_id,
-                mode: Some(AlpacaBrokerApiMode::Sandbox),
+                mode: Some(mode.clone()),
                 asset_cache_ttl: std::time::Duration::from_secs(3600),
                 time_in_force: TimeInForce::default(),
             }),
@@ -722,7 +823,7 @@ mod tests {
                         api_key: "test-key".to_string(),
                         api_secret: "test-secret".to_string(),
                         account_id: alpaca_account_id,
-                        mode: Some(AlpacaBrokerApiMode::Sandbox),
+                        mode: Some(mode),
                         asset_cache_ttl: std::time::Duration::from_secs(3600),
                         time_in_force: TimeInForce::default(),
                     })
@@ -770,13 +871,18 @@ mod tests {
     async fn test_alpaca_withdraw_requires_rebalancing_ctx() {
         let ctx = create_alpaca_ctx_without_rebalancing();
         let amount = Usdc::new(float!(100));
+        let destination = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let mut stdout = Vec::new();
-        let err_msg =
-            alpaca_withdraw_command::<NoOpErrorRegistry, _>(&mut stdout, amount, None, &ctx)
-                .await
-                .unwrap_err()
-                .to_string();
+        let err_msg = alpaca_withdraw_command::<NoOpErrorRegistry, _>(
+            &mut stdout,
+            amount,
+            Some(destination),
+            &ctx,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(
             err_msg.contains("requires rebalancing mode"),
             "Expected rebalancing config error, got: {err_msg}"
@@ -917,6 +1023,172 @@ mod tests {
         assert!(
             output.contains("$250"),
             "Expected price in output, got: {output}"
+        );
+    }
+
+    fn mock_whitelist_endpoint(
+        server: &MockServer,
+        entries: serde_json::Value,
+    ) -> httpmock::Mock<'_> {
+        server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/whitelists"));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(entries);
+        })
+    }
+
+    #[tokio::test]
+    async fn test_alpaca_withdraw_no_to_lists_whitelisted_addresses() {
+        let server = MockServer::start();
+        let ctx = create_full_alpaca_ctx_with_mode(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let approved = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let pending = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+
+        let whitelist_mock = mock_whitelist_endpoint(
+            &server,
+            json!([
+                {
+                    "id": "wl-1",
+                    "address": approved.to_string(),
+                    "asset": "USDC",
+                    "chain": "ethereum",
+                    "status": "APPROVED",
+                    "created_at": "2024-01-01T00:00:00Z"
+                },
+                {
+                    "id": "wl-2",
+                    "address": pending.to_string(),
+                    "asset": "USDC",
+                    "chain": "ethereum",
+                    "status": "PENDING",
+                    "created_at": "2024-01-02T00:00:00Z"
+                }
+            ]),
+        );
+
+        let amount = Usdc::new(float!(100));
+        let mut stdout = Vec::new();
+
+        let err_msg =
+            alpaca_withdraw_command::<NoOpErrorRegistry, _>(&mut stdout, amount, None, &ctx)
+                .await
+                .unwrap_err()
+                .to_string();
+
+        whitelist_mock.assert_calls(1);
+
+        let output = String::from_utf8(stdout).unwrap();
+
+        assert!(
+            err_msg.contains("--to is required"),
+            "Expected --to required error, got: {err_msg}"
+        );
+
+        assert!(
+            output.contains("Approved addresses"),
+            "Expected approved section, got: {output}"
+        );
+
+        assert!(
+            output.contains(&approved.to_string()),
+            "Expected approved address in output, got: {output}"
+        );
+
+        assert!(
+            output.contains("Not yet usable"),
+            "Expected pending section, got: {output}"
+        );
+
+        assert!(
+            output.contains(&pending.to_string()),
+            "Expected pending address in output, got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_alpaca_withdraw_no_to_empty_whitelist() {
+        let server = MockServer::start();
+        let ctx = create_full_alpaca_ctx_with_mode(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let whitelist_mock = mock_whitelist_endpoint(&server, json!([]));
+
+        let amount = Usdc::new(float!(100));
+        let mut stdout = Vec::new();
+
+        alpaca_withdraw_command::<NoOpErrorRegistry, _>(&mut stdout, amount, None, &ctx)
+            .await
+            .unwrap_err();
+
+        whitelist_mock.assert_calls(1);
+
+        let output = String::from_utf8(stdout).unwrap();
+
+        assert!(
+            output.contains("No whitelisted addresses found for USDC"),
+            "Expected empty whitelist message, got: {output}"
+        );
+
+        assert!(
+            output.contains("alpaca-whitelist"),
+            "Expected alpaca-whitelist hint, got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_alpaca_withdraw_not_whitelisted_lists_addresses() {
+        let server = MockServer::start();
+        let ctx = create_full_alpaca_ctx_with_mode(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let approved = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let bad_destination = address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+
+        // Whitelist endpoint is called once for the explicit whitelist check.
+        // print_whitelisted_addresses reuses the prefetched whitelist slice.
+        let whitelist_check = mock_whitelist_endpoint(
+            &server,
+            json!([{
+                "id": "wl-1",
+                "address": approved.to_string(),
+                "asset": "USDC",
+                "chain": "ethereum",
+                "status": "APPROVED",
+                "created_at": "2024-01-01T00:00:00Z"
+            }]),
+        );
+
+        let amount = Usdc::new(float!(100));
+        let mut stdout = Vec::new();
+
+        let err_msg = alpaca_withdraw_command::<NoOpErrorRegistry, _>(
+            &mut stdout,
+            amount,
+            Some(bad_destination),
+            &ctx,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        whitelist_check.assert_calls(1);
+
+        let output = String::from_utf8(stdout).unwrap();
+
+        assert!(
+            err_msg.contains("not whitelisted"),
+            "Expected not-whitelisted error, got: {err_msg}"
+        );
+
+        assert!(
+            output.contains("Approved addresses"),
+            "Expected approved section in output, got: {output}"
+        );
+
+        assert!(
+            output.contains(&approved.to_string()),
+            "Expected approved address in output, got: {output}"
         );
     }
 }
