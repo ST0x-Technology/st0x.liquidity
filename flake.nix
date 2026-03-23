@@ -105,10 +105,7 @@
           localSystem = system;
         };
 
-        st0xRust = pkgs.callPackage ./rust.nix {
-          inherit craneLib;
-          inherit (pkgs) sqlx-cli;
-        };
+        st0xRust = pkgs.callPackage ./rust.nix { inherit craneLib; };
 
       in rec {
         packages = rainixPkgs // infraPkgs.packages // deployScripts // {
