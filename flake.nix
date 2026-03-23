@@ -12,7 +12,7 @@
     ragenix.url = "github:yaxitech/ragenix";
     deploy-rs.url = "github:serokell/deploy-rs";
 
-    bun2nix.url = "github:nix-community/bun2nix?tag=2.0.7";
+    bun2nix.url = "github:nix-community/bun2nix?tag=2.0.8";
     bun2nix.inputs.nixpkgs.follows = "nixpkgs";
 
     crane.url = "github:ipetkov/crane";
@@ -112,7 +112,6 @@
 
       in rec {
         packages = rainixPkgs // infraPkgs.packages // deployScripts // {
-
           st0x-dto = st0xRust.dto;
           st0x-liquidity = st0xRust.package;
           st0x-cli = st0xRust.cli;
@@ -144,6 +143,19 @@
               (cd lib/rain.orderbook/lib/rain.interpreter/ && forge build)
               (cd lib/forge-std/ && forge build)
               (cd lib/pyth-crosschain/target_chains/ethereum/sdk/solidity/ && forge build)
+            '';
+          };
+
+          e2e = rainix.mkTask.${system} {
+            name = "e2e";
+            body = ''
+              set -euxo pipefail
+              (cd dashboard && bun run dev) &
+              dev_pid=$!
+              trap 'kill $dev_pid 2>/dev/null' EXIT
+              sleep 2
+              open http://localhost:5173 || true
+              cargo nextest run --test e2e full_system --nocapture
             '';
           };
 
@@ -259,7 +271,11 @@
         devShells.default = pkgs.mkShell {
           inherit (rainix.devShells.${system}.default) nativeBuildInputs;
           inherit (rainix.devShells.${system}.default) shellHook;
-          DATABASE_URL = "sqlite:liquidity.db";
+
+          SQLX_OFFLINE = true;
+          DATABASE_URL = "sqlite:dev.db";
+          FOUNDRY_DISABLE_NIGHTLY_WARNING = true;
+
           buildInputs = with pkgs;
             [
               bacon
@@ -267,14 +283,11 @@
               sqlx-cli
               cargo-expand
               cargo-nextest
-              terraform
               ragenix.packages.${system}.default
               packages.ci
               packages.prepSolArtifacts
               packages.secret
               packages.rekey
-              packages.tfRekey
-              packages.bootstrap
             ] ++ builtins.attrValues infraPkgs.packages
             ++ builtins.attrValues deployScripts
             ++ rainix.devShells.${system}.default.buildInputs;

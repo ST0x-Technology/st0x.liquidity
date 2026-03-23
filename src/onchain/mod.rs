@@ -18,7 +18,6 @@ use st0x_execution::{
 };
 
 use crate::position::{Position, PositionError};
-use crate::queue::EventQueueError;
 
 pub(crate) mod accumulator;
 pub(crate) mod backfill;
@@ -95,8 +94,6 @@ pub(crate) enum OnChainError {
     InvalidIndex(#[from] FromUintError<usize>),
     #[error("Execution error: {0}")]
     Execution(#[from] ExecutionError),
-    #[error("Event queue error: {0}")]
-    EventQueue(#[from] EventQueueError),
     #[error("Order status parse error: {0}")]
     OrderStatusParse(#[from] ParseOrderStatusError),
     #[error("Invalid executor: {0}")]
@@ -125,6 +122,8 @@ pub(crate) enum OnChainError {
     PositionProjection(#[from] ProjectionError<Position>),
     #[error("Market hours check failed")]
     MarketHoursCheck(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("Failed to push job into queue")]
+    JobQueue(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 pub(crate) const USDC_ETHEREUM: Address = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");

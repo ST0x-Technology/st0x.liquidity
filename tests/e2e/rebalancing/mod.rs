@@ -24,7 +24,7 @@
 //! test verifies the first stage of the pipeline (inventory polling +
 //! snapshot events).
 
-mod assertions;
+pub(crate) mod assertions;
 
 use std::collections::HashMap;
 

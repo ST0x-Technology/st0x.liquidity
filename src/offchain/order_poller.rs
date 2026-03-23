@@ -209,7 +209,7 @@ impl<E: Executor> OrderStatusPoller<E> {
             %offchain_order_id,
             ?price,
             %symbol,
-            "Order filled, executing CQRS commands"
+            "Order filled"
         );
 
         self.complete_offchain_order_fill(offchain_order_id, price)
@@ -342,6 +342,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::offchain_order::noop_placed_shares;
     use crate::position::TradeId;
     use crate::test_utils::{OnchainTradeBuilder, setup_test_db};
     use crate::threshold::ExecutionThreshold;
@@ -501,34 +502,65 @@ mod tests {
             .await
             .unwrap();
 
-        let aggregate_id = offchain_order_id.to_string();
-        let offchain_order_events: Vec<String> = sqlx::query_scalar(
-            "SELECT event_type FROM events \
-            WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ? ORDER BY sequence",
-        )
-        .bind(&aggregate_id)
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+        let offchain_order = poller
+            .offchain_order
+            .load(&offchain_order_id)
+            .await
+            .unwrap()
+            .expect("OffchainOrder should exist");
 
-        assert_eq!(offchain_order_events.len(), 3);
-        assert_eq!(offchain_order_events[0], "OffchainOrderEvent::Placed");
-        assert_eq!(offchain_order_events[1], "OffchainOrderEvent::Submitted");
-        assert_eq!(offchain_order_events[2], "OffchainOrderEvent::Filled");
+        let OffchainOrder::Filled {
+            symbol: filled_symbol,
+            shares: filled_shares,
+            direction: filled_direction,
+            executor: filled_executor,
+            executor_order_id: filled_executor_order_id,
+            price: filled_price,
+            ..
+        } = offchain_order
+        else {
+            panic!("Expected Filled state, got: {offchain_order:?}");
+        };
 
-        let position_events: Vec<String> = sqlx::query_scalar(
-            "SELECT event_type FROM events \
-            WHERE aggregate_type = 'Position' AND aggregate_id = 'AAPL' ORDER BY sequence",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+        assert_eq!(filled_symbol, symbol, "Filled symbol mismatch");
+        assert_eq!(
+            filled_shares,
+            noop_placed_shares(shares),
+            "Filled shares mismatch"
+        );
+        assert_eq!(
+            filled_direction,
+            Direction::Buy,
+            "Filled direction mismatch"
+        );
+        assert_eq!(
+            filled_executor,
+            SupportedExecutor::Schwab,
+            "Filled executor mismatch"
+        );
+        assert_eq!(
+            filled_executor_order_id,
+            ExecutorOrderId::new("noop"),
+            "Filled executor_order_id mismatch"
+        );
+        assert_eq!(
+            filled_price,
+            Usd::new(float!(150.25)),
+            "Filled price mismatch"
+        );
 
-        assert_eq!(position_events.len(), 4);
-        assert_eq!(position_events[0], "PositionEvent::Initialized");
-        assert_eq!(position_events[1], "PositionEvent::OnChainOrderFilled");
-        assert_eq!(position_events[2], "PositionEvent::OffChainOrderPlaced");
-        assert_eq!(position_events[3], "PositionEvent::OffChainOrderFilled");
+        let symbol = Symbol::new("AAPL").unwrap();
+        let position = poller
+            .position
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("Position should exist");
+
+        assert_eq!(
+            position.pending_offchain_order_id, None,
+            "Position should have no pending order after fill"
+        );
     }
 
     #[tokio::test]
@@ -581,33 +613,57 @@ mod tests {
             .await
             .unwrap();
 
-        let aggregate_id = offchain_order_id.to_string();
-        let offchain_order_events: Vec<String> = sqlx::query_scalar(
-            "SELECT event_type FROM events \
-            WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ? ORDER BY sequence",
-        )
-        .bind(&aggregate_id)
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+        let offchain_order = poller
+            .offchain_order
+            .load(&offchain_order_id)
+            .await
+            .unwrap()
+            .expect("OffchainOrder should exist");
 
-        assert_eq!(offchain_order_events.len(), 3);
-        assert_eq!(offchain_order_events[0], "OffchainOrderEvent::Placed");
-        assert_eq!(offchain_order_events[1], "OffchainOrderEvent::Submitted");
-        assert_eq!(offchain_order_events[2], "OffchainOrderEvent::Failed");
+        let OffchainOrder::Failed {
+            symbol: failed_symbol,
+            shares: failed_shares,
+            direction: failed_direction,
+            executor: failed_executor,
+            error: failed_error,
+            ..
+        } = offchain_order
+        else {
+            panic!("Expected Failed state, got: {offchain_order:?}");
+        };
 
-        let position_events: Vec<String> = sqlx::query_scalar(
-            "SELECT event_type FROM events \
-            WHERE aggregate_type = 'Position' AND aggregate_id = 'TSLA' ORDER BY sequence",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+        assert_eq!(failed_symbol, symbol, "Failed symbol mismatch");
+        assert_eq!(
+            failed_shares,
+            noop_placed_shares(shares),
+            "Failed shares mismatch"
+        );
+        assert_eq!(
+            failed_direction,
+            Direction::Sell,
+            "Failed direction mismatch"
+        );
+        assert_eq!(
+            failed_executor,
+            SupportedExecutor::Schwab,
+            "Failed executor mismatch"
+        );
+        assert_eq!(
+            failed_error, "Broker API timeout",
+            "Failed error message mismatch"
+        );
 
-        assert_eq!(position_events.len(), 4);
-        assert_eq!(position_events[0], "PositionEvent::Initialized");
-        assert_eq!(position_events[1], "PositionEvent::OnChainOrderFilled");
-        assert_eq!(position_events[2], "PositionEvent::OffChainOrderPlaced");
-        assert_eq!(position_events[3], "PositionEvent::OffChainOrderFailed");
+        let symbol = Symbol::new("TSLA").unwrap();
+        let position = poller
+            .position
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("Position should exist");
+
+        assert_eq!(
+            position.pending_offchain_order_id, None,
+            "Position should have no pending order after failure"
+        );
     }
 }

@@ -1,6 +1,6 @@
 use clap::Parser;
 use st0x_hedge::config::{Ctx, Env};
-use st0x_hedge::launch;
+use st0x_hedge::run_bot_session;
 use st0x_hedge::setup_tracing;
 
 #[tokio::main]
@@ -24,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let result = launch(ctx).await;
+    let result = run_bot_session(ctx).await;
 
     // Explicitly drop the telemetry guard to ensure TelemetryGuard::drop runs
     // before we return. Drop flushes pending spans and shuts down the tracer
