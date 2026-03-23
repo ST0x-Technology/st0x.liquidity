@@ -63,9 +63,14 @@ let
 
   syncRemote = ''
     if [ -f ${state.path} ]; then
-      jq -r '.outputs.droplet_ipv4.value' ${state.path} > ${remote.path}
-      ${remote.encrypt}
-      rm -f ${remote.path}
+      host_ip=$(jq -r '.outputs.droplet_ipv4.value // empty' ${state.path})
+      if [ -n "$host_ip" ]; then
+        echo "$host_ip" > ${remote.path}
+        ${remote.encrypt}
+        rm -f ${remote.path}
+      else
+        rm -f ${remote.agePath} ${remote.path}
+      fi
     fi
   '';
 
@@ -91,8 +96,12 @@ let
     ${parseIdentity}
     trap 'rm -f ${state.path}' EXIT
     ${state.decrypt}
-    host_ip=$(jq -r '.outputs.droplet_ipv4.value' ${state.path})
+    host_ip=$(jq -r '.outputs.droplet_ipv4.value // empty' ${state.path})
     rm -f ${state.path}
+    if [ -z "$host_ip" ]; then
+      echo "ERROR: droplet_ipv4 output is missing from terraform state" >&2
+      exit 1
+    fi
   '';
 
   resolveHost = ''

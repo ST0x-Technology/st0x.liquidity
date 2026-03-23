@@ -259,7 +259,9 @@ graph LR
 
 #### Infrastructure
 
-- [ ] [#296 Replace hand-rolled conductor with apalis + task-supervisor](https://github.com/ST0x-Technology/st0x.liquidity/issues/296)
+- [x] [#296 Replace hand-rolled conductor with apalis + task-supervisor](https://github.com/ST0x-Technology/st0x.liquidity/issues/296)
+  - PR:
+    [#414 Replace hand-rolled conductor with apalis + task-supervisor](https://github.com/ST0x-Technology/st0x.liquidity/pull/414)
 - [ ] [#293 Granular SSH access control: limit root access and per-user deploy keys](https://github.com/ST0x-Technology/st0x.liquidity/issues/293)
 - [ ] [#294 Document secret management setup and opsec](https://github.com/ST0x-Technology/st0x.liquidity/issues/294)
 - [ ] [#35 Document the bot](https://github.com/ST0x-Technology/st0x.liquidity/issues/35)

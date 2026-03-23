@@ -13,7 +13,7 @@ class MockWebSocket {
 
   url: string
   onopen: (() => void) | null = null
-  onclose: (() => void) | null = null
+  onclose: ((event: CloseEvent) => void) | null = null
   onmessage: ((event: { data: string }) => void) | null = null
   onerror: (() => void) | null = null
 
@@ -23,7 +23,7 @@ class MockWebSocket {
   }
 
   close() {
-    this.onclose?.()
+    this.onclose?.({ code: 1000, reason: '' } as CloseEvent)
   }
 
   simulateOpen() {
@@ -42,8 +42,8 @@ class MockWebSocket {
     this.onerror?.()
   }
 
-  simulateClose() {
-    this.onclose?.()
+  simulateClose(code = 1000, reason = '') {
+    this.onclose?.({ code, reason } as CloseEvent)
   }
 
   static getInstance(index: number): MockWebSocket {
@@ -376,7 +376,7 @@ describe('createWebSocket', () => {
     consoleSpy.mockRestore()
   })
 
-  it('caps reconnect delay at maximum', () => {
+  it('keeps retrying with exponential backoff', () => {
     const queryClient = createMockQueryClient()
     const ws = createWebSocket('ws://localhost:8080', queryClient)
 
@@ -384,11 +384,13 @@ describe('createWebSocket', () => {
 
     for (let i = 0; i < 10; i++) {
       MockWebSocket.getInstance(i).simulateClose()
-      vi.advanceTimersByTime(30000)
+      const delay = Math.min(1000 * Math.pow(2, i), 30000)
+      vi.advanceTimersByTime(delay)
     }
 
     MockWebSocket.getInstance(10).simulateClose()
-    vi.advanceTimersByTime(30000)
+    const delay = Math.min(1000 * Math.pow(2, 10), 30000)
+    vi.advanceTimersByTime(delay)
     expect(MockWebSocket.instances.length).toBe(12)
   })
 

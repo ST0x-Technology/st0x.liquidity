@@ -154,6 +154,7 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
     socket = new WebSocket(url)
 
     socket.onopen = () => {
+      if (import.meta.env.DEV) console.log(`[ws] connected to ${url}`)
       fsm.send('open')
     }
 
@@ -166,13 +167,17 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
           return
         }
 
+        const { type } = parsed
+        if (import.meta.env.DEV) console.log(`[ws] received "${type}"`)
+
         handleMessage(parsed)
       } catch (e) {
         console.error('Failed to parse WebSocket message:', e, 'Raw data:', event.data)
       }
     }
 
-    socket.onclose = () => {
+    socket.onclose = (event) => {
+      if (import.meta.env.DEV) console.log(`[ws] closed (code=${String(event.code)}, reason="${event.reason}")`)
       socket = null
       fsm.send('close')
     }

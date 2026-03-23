@@ -1,4 +1,4 @@
-{ pkgs, craneLib, sqlx-cli }:
+{ pkgs, craneLib }:
 
 let
   # Requires --impure. Submodules must be checked out and prepSolArtifacts
@@ -67,11 +67,16 @@ let
 
     inherit cargoVendorDir;
 
-    nativeBuildInputs = [ sqlx-cli pkgs.pkg-config ];
+    nativeBuildInputs = [ pkgs.pkg-config ];
 
     buildInputs = [ pkgs.openssl pkgs.sqlite ]
       ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin
       [ pkgs.apple-sdk_15 ];
+
+    # Use offline sqlx query verification so builds don't need a live database.
+    # Each crate (ours + apalis-sqlite) ships its own .sqlx/ with prepared data.
+    # Run `cargo sqlx prepare` after changing sqlx macros to regenerate.
+    SQLX_OFFLINE = "true";
 
     # Submodules with path dependencies need lib/ symlinked early
     postUnpack = ''
@@ -82,16 +87,6 @@ let
 
   # Build only dependencies (cached separately from source changes)
   cargoArtifacts = craneLib.buildDepsOnly (commonArgs // { src = depsSrc; });
-
-  # sqlx needs DATABASE_URL at compile time for query checking
-  # Only needed for final build and clippy, not deps
-  sqlxSetup = ''
-    set -eo pipefail
-
-    export DATABASE_URL="sqlite:$TMPDIR/build.db"
-    sqlx db create
-    sqlx migrate run --source migrations
-  '';
 
 in {
   # DTO crate for TypeScript codegen - no sqlx deps needed
@@ -109,8 +104,8 @@ in {
   # Server binary for deployment
   package = craneLib.buildPackage (commonArgs // {
     inherit cargoArtifacts;
-    preBuild = sqlxSetup;
-    cargoExtraArgs = "--bin server --features wallet-private-key";
+
+    cargoExtraArgs = "--bin server";
     doCheck = false;
 
     meta = {
@@ -123,8 +118,8 @@ in {
   cli = craneLib.buildPackage (commonArgs // {
     pname = "st0x-cli";
     inherit cargoArtifacts;
-    preBuild = sqlxSetup;
-    cargoExtraArgs = "--bin cli --features wallet-private-key";
+
+    cargoExtraArgs = "--bin cli";
     doCheck = false;
 
     meta = {
