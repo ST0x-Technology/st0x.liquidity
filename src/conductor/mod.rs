@@ -525,7 +525,8 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             wrapper,
         ));
 
-        let event_broadcaster = Arc::new(EventBroadcaster::new(deps.event_sender));
+        let event_broadcaster =
+            Arc::new(EventBroadcaster::new(deps.event_sender, deps.pool.clone()));
         let manifest = QueryManifest::new(rebalancing_trigger, event_broadcaster);
 
         let built = manifest

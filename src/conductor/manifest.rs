@@ -171,7 +171,7 @@ mod tests {
             Arc::new(MockWrapper::new()),
         ));
 
-        let event_broadcaster = Arc::new(EventBroadcaster::new(event_sender));
+        let event_broadcaster = Arc::new(EventBroadcaster::new(event_sender, pool.clone()));
         let manifest = QueryManifest::new(rebalancing_trigger, event_broadcaster);
 
         let services = EquityTransferServices {

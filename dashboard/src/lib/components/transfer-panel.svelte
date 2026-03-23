@@ -8,6 +8,7 @@
   import { matcher } from '$lib/fp'
   import { formatDecimal } from '$lib/decimal'
   import { warningMessage } from '$lib/warnings'
+  import { transferKey } from '$lib/websocket.svelte'
 
   const activeQuery = createQuery<TransferOperation[]>(() => ({
     queryKey: ['transfers', 'active'],
@@ -28,11 +29,12 @@
   const recentTransfers = $derived(recentQuery.data ?? [])
   const warnings = $derived(warningsQuery.data ?? [])
   const allTransfers = $derived.by(() => {
-    const byId = new Map(activeTransfers.map((transfer) => [transfer.id, transfer]))
+    const byKey = new Map(activeTransfers.map((transfer) => [transferKey(transfer), transfer]))
     for (const transfer of recentTransfers) {
-      if (!byId.has(transfer.id)) byId.set(transfer.id, transfer)
+      const key = transferKey(transfer)
+      if (!byKey.has(key)) byKey.set(key, transfer)
     }
-    return [...byId.values()]
+    return [...byKey.values()]
   })
 
   const matchKind = matcher<TransferOperation>()('kind')
@@ -94,7 +96,7 @@
           </Table.Row>
         </Table.Header>
         <Table.Body>
-          {#each allTransfers as transfer (transfer.id)}
+          {#each allTransfers as transfer (transferKey(transfer))}
             <Table.Row>
               <Table.Cell class="font-mono text-xs font-medium">
                 {transferAsset(transfer)}

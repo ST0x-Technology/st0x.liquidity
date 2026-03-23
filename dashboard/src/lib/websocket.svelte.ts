@@ -7,6 +7,8 @@ import type { TransferOperation } from '$lib/api/TransferOperation'
 import { matcher } from '$lib/fp'
 import { reactive } from '$lib/frp.svelte'
 
+export const transferKey = (transfer: TransferOperation): string => `${transfer.kind}:${transfer.id}`
+
 export type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'error'
 type ConnectionEvent = 'connect' | 'open' | 'close' | 'error' | 'disconnect'
 
@@ -124,15 +126,17 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
       },
 
       transfer: ({ data }) => {
+        const key = transferKey(data)
+
         queryClient.setQueryData<TransferOperation[]>(['transfers', 'active'], (old) => {
           const existing = old ?? []
-          const index = existing.findIndex((transfer) => transfer.id === data.id)
+          const index = existing.findIndex((transfer) => transferKey(transfer) === key)
 
           if (data.status.status === 'completed' || data.status.status === 'failed') {
             const filtered = index >= 0 ? existing.filter((_, idx) => idx !== index) : existing
             queryClient.setQueryData<TransferOperation[]>(
               ['transfers', 'recent'],
-              (recent) => [data, ...(recent ?? []).filter((transfer) => transfer.id !== data.id)].slice(0, MAX_EVENTS)
+              (recent) => [data, ...(recent ?? []).filter((transfer) => transferKey(transfer) !== key)].slice(0, MAX_EVENTS)
             )
             return filtered
           }
