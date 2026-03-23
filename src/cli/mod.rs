@@ -175,6 +175,13 @@ pub enum Commands {
     /// Shows all whitelist entries with their status, asset, and creation date.
     AlpacaWhitelistList,
 
+    /// Patch travel rule info on all existing whitelisted addresses
+    ///
+    /// Updates all whitelisted addresses with the beneficiary identity
+    /// from [broker.travel_rule] in the config. Required for addresses
+    /// whitelisted before the March 27 2026 travel rule deadline.
+    AlpacaWhitelistPatchTravelRule,
+
     /// Remove an address from Alpaca withdrawal whitelist
     ///
     /// Deletes all whitelist entries matching the given address.
@@ -446,6 +453,7 @@ enum SimpleCommand {
         address: Option<Address>,
     },
     AlpacaWhitelistList,
+    AlpacaWhitelistPatchTravelRule,
     AlpacaUnwhitelist {
         address: Address,
     },
@@ -564,6 +572,9 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
         }
         Commands::AlpacaWhitelist { address } => Ok(SimpleCommand::AlpacaWhitelist { address }),
         Commands::AlpacaWhitelistList => Ok(SimpleCommand::AlpacaWhitelistList),
+        Commands::AlpacaWhitelistPatchTravelRule => {
+            Ok(SimpleCommand::AlpacaWhitelistPatchTravelRule)
+        }
         Commands::AlpacaUnwhitelist { address } => Ok(SimpleCommand::AlpacaUnwhitelist { address }),
         Commands::AlpacaTransfers { pending } => Ok(SimpleCommand::AlpacaTransfers { pending }),
         Commands::AlpacaConvert { direction, amount } => {
@@ -687,6 +698,9 @@ async fn run_simple_command<W: Write>(
         }
         SimpleCommand::AlpacaWhitelistList => {
             alpaca_wallet::alpaca_whitelist_list_command(stdout, ctx).await
+        }
+        SimpleCommand::AlpacaWhitelistPatchTravelRule => {
+            alpaca_wallet::alpaca_whitelist_patch_travel_rule_command(stdout, ctx).await
         }
         SimpleCommand::AlpacaUnwhitelist { address } => {
             alpaca_wallet::alpaca_unwhitelist_command(stdout, address, ctx).await
@@ -1340,6 +1354,7 @@ mod tests {
                 },
                 cash: None,
             },
+            travel_rule: None,
         }
     }
 

@@ -9,7 +9,7 @@ use tracing::debug;
 use st0x_execution::AlpacaAccountId;
 
 use super::transfer::{AlpacaTransferId, Network, TokenSymbol, TransferStatus};
-use super::whitelist::{WhitelistEntry, WhitelistStatus};
+use super::whitelist::{TravelRuleInfo, WhitelistEntry, WhitelistStatus};
 
 #[derive(Debug, Error)]
 pub enum AlpacaWalletError {
@@ -172,6 +172,37 @@ impl AlpacaWalletClient {
         Ok(response)
     }
 
+    pub(super) async fn patch<T: serde::Serialize + Sync>(
+        &self,
+        path: &str,
+        body: &T,
+    ) -> Result<Response, AlpacaWalletError> {
+        let url = format!("{}{}", self.base_url, path);
+        debug!("PATCH {url}");
+
+        let response = self
+            .client
+            .patch(&url)
+            .basic_auth(&self.api_key, Some(&self.api_secret))
+            .header("APCA-API-KEY-ID", &self.api_key)
+            .header("APCA-API-SECRET-KEY", &self.api_secret)
+            .json(body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+
+            return Err(AlpacaWalletError::ApiError { status, message });
+        }
+
+        Ok(response)
+    }
+
     pub(super) fn account_id(&self) -> &AlpacaAccountId {
         &self.account_id
     }
@@ -209,16 +240,20 @@ impl AlpacaWalletClient {
     ///
     /// The address will be in PENDING status initially and must be approved
     /// before withdrawals can be made (typically within 24 hours).
+    /// Alpaca requires `travel_rule_info` on all whitelist creation requests,
+    /// effective 2026-03-27.
     pub(super) async fn create_whitelist_entry(
         &self,
         address: &Address,
         asset: &TokenSymbol,
         _network: &Network,
+        travel_rule_info: &TravelRuleInfo,
     ) -> Result<WhitelistEntry, AlpacaWalletError> {
         #[derive(serde::Serialize)]
         struct Request<'a> {
             address: String,
             asset: &'a str,
+            travel_rule_info: &'a TravelRuleInfo,
         }
 
         let path = format!("/v1/accounts/{}/wallets/whitelists", self.account_id);
@@ -228,6 +263,7 @@ impl AlpacaWalletClient {
             // Fine for now since this system only handles Ethereum mainnet.
             address: address.to_checksum(None),
             asset: asset.as_ref(),
+            travel_rule_info,
         };
 
         let response = self.post(&path, &request).await?;
@@ -250,6 +286,31 @@ impl AlpacaWalletClient {
         self.delete(&path).await?;
         Ok(())
     }
+
+    /// Updates travel rule info on an existing whitelisted address.
+    ///
+    /// Uses the PATCH endpoint added by Alpaca for the March 2026 travel
+    /// rule requirement. Existing whitelists that were created without
+    /// travel rule info must be patched before they can be used for
+    /// withdrawals.
+    pub(super) async fn patch_whitelist_travel_rule(
+        &self,
+        whitelist_id: &str,
+        travel_rule_info: &TravelRuleInfo,
+    ) -> Result<(), AlpacaWalletError> {
+        #[derive(serde::Serialize)]
+        struct Request<'a> {
+            travel_rule_info: &'a TravelRuleInfo,
+        }
+
+        let path = format!(
+            "/v1/accounts/{}/wallets/whitelists/{}/travel-rule-info",
+            self.account_id, whitelist_id
+        );
+
+        self.patch(&path, &Request { travel_rule_info }).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -257,6 +318,8 @@ mod tests {
     use httpmock::prelude::*;
     use serde_json::json;
     use uuid::uuid;
+
+    use crate::config::TravelRuleConfig;
 
     use super::*;
 
@@ -414,5 +477,46 @@ mod tests {
         ));
 
         error_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_patch_whitelist_travel_rule_sends_expected_body() {
+        let server = MockServer::start();
+
+        let travel_rule = TravelRuleInfo::from_config(&TravelRuleConfig {
+            beneficiary_entity_name: "Acme Corp".to_string(),
+        });
+
+        let whitelist_id = "wl-abc-123";
+
+        let patch_mock = server.mock(|when, then| {
+            when.method(PATCH)
+                .path(format!(
+                    "/v1/accounts/{TEST_ACCOUNT_ID}/wallets/whitelists/{whitelist_id}/travel-rule-info"
+                ))
+                .header("APCA-API-KEY-ID", "test_key_id")
+                .header("APCA-API-SECRET-KEY", "test_secret_key")
+                .json_body(json!({
+                    "travel_rule_info": {
+                        "beneficiary_is_self_hosted": true,
+                        "beneficiary_entity_name": "Acme Corp"
+                    }
+                }));
+            then.status(204);
+        });
+
+        let client = AlpacaWalletClient::new(
+            server.base_url(),
+            TEST_ACCOUNT_ID,
+            "test_key_id".to_string(),
+            "test_secret_key".to_string(),
+        );
+
+        client
+            .patch_whitelist_travel_rule(whitelist_id, &travel_rule)
+            .await
+            .unwrap();
+
+        patch_mock.assert();
     }
 }
