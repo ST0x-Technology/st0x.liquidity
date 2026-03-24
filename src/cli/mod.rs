@@ -1537,22 +1537,22 @@ mod tests {
 
     #[test]
     fn test_buy_command_accepts_fractional_quantity() {
-        let parsed = Cli::try_parse_from(["schwab", "buy", "-s", "SPYM", "-q", "6.15"]);
+        let cli = Cli::try_parse_from(["schwab", "buy", "-s", "SPYM", "-q", "6.15"]).unwrap();
+        let Commands::Buy { quantity, .. } = cli.command else {
+            panic!("expected buy command");
+        };
 
-        assert!(
-            parsed.is_ok(),
-            "buy should accept fractional quantities, got: {parsed:?}"
-        );
+        assert_eq!(quantity, positive_shares("6.15"));
     }
 
     #[test]
     fn test_sell_command_accepts_fractional_quantity() {
-        let parsed = Cli::try_parse_from(["schwab", "sell", "-s", "SPYM", "-q", "6.15"]);
+        let cli = Cli::try_parse_from(["schwab", "sell", "-s", "SPYM", "-q", "6.15"]).unwrap();
+        let Commands::Sell { quantity, .. } = cli.command else {
+            panic!("expected sell command");
+        };
 
-        assert!(
-            parsed.is_ok(),
-            "sell should accept fractional quantities, got: {parsed:?}"
-        );
+        assert_eq!(quantity, positive_shares("6.15"));
     }
 
     #[tokio::test]
