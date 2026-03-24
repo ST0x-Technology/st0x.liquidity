@@ -98,6 +98,31 @@ pub enum SharesConversionError {
     FloatConversion(#[from] FloatError),
 }
 
+/// Alpaca supports a maximum of 9 decimal places for order quantities.
+pub(crate) const ALPACA_MAX_DECIMAL_PLACES: usize = 9;
+
+/// Truncates a decimal string to at most `max_decimals` decimal places.
+///
+/// Truncation (floor) is used rather than rounding because rounding up could
+/// cause an order for more shares than we actually have.
+pub(crate) fn truncate_decimal_places(formatted: &str, max_decimals: usize) -> String {
+    let Some(dot_index) = formatted.find('.') else {
+        return formatted.to_string();
+    };
+
+    let decimal_digits = formatted.len() - dot_index - 1;
+
+    if decimal_digits <= max_decimals {
+        return formatted.to_string();
+    }
+
+    let truncated = &formatted[..dot_index + 1 + max_decimals];
+
+    // Strip trailing zeros after truncation (e.g., "1.500000000" -> "1.5")
+    let trimmed = truncated.trim_end_matches('0').trim_end_matches('.');
+    trimmed.to_string()
+}
+
 #[async_trait]
 pub trait Executor: Send + Sync + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
@@ -583,5 +608,35 @@ mod tests {
     #[test]
     fn dry_run_supports_fractional_shares() {
         assert!(SupportedExecutor::DryRun.supports_fractional_shares());
+    }
+
+    #[test]
+    fn truncate_no_decimal_point_unchanged() {
+        assert_eq!(truncate_decimal_places("100", 9), "100");
+    }
+
+    #[test]
+    fn truncate_fewer_decimals_unchanged() {
+        assert_eq!(truncate_decimal_places("1.5", 9), "1.5");
+        assert_eq!(truncate_decimal_places("0.123456789", 9), "0.123456789");
+    }
+
+    #[test]
+    fn truncate_excess_decimals() {
+        assert_eq!(
+            truncate_decimal_places("0.996350331351928059", 9),
+            "0.996350331"
+        );
+    }
+
+    #[test]
+    fn truncate_strips_trailing_zeros() {
+        assert_eq!(truncate_decimal_places("1.500000000000000000", 9), "1.5");
+        assert_eq!(truncate_decimal_places("2.000000000000000000", 9), "2");
+    }
+
+    #[test]
+    fn truncate_zero_decimal_places() {
+        assert_eq!(truncate_decimal_places("1.234", 0), "1");
     }
 }

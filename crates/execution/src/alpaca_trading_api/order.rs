@@ -3,7 +3,7 @@ use apca::api::v2::order;
 use chrono::Utc;
 use num_decimal::Num;
 use rain_math_float::Float;
-use tracing::debug;
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use super::AlpacaTradingApiError;
@@ -35,14 +35,30 @@ pub(super) async fn place_market_order(
     };
 
     // Convert FractionalShares -> string -> Num for the apca crate.
+    // Alpaca supports max 9 decimal places; truncate to avoid rejection.
     let formatted = market_order
         .shares
         .inner()
         .inner()
         .format_with_scientific(false)?;
-    let quantity: Num = formatted
-        .parse()
-        .map_err(|source| AlpacaTradingApiError::NumConversion { formatted, source })?;
+    let truncated = crate::truncate_decimal_places(&formatted, crate::ALPACA_MAX_DECIMAL_PLACES);
+
+    if truncated != formatted {
+        info!(
+            original = %formatted,
+            truncated = %truncated,
+            "Truncated order quantity to {} decimal places for Alpaca",
+            crate::ALPACA_MAX_DECIMAL_PLACES,
+        );
+    }
+
+    let quantity: Num =
+        truncated
+            .parse()
+            .map_err(|source| AlpacaTradingApiError::NumConversion {
+                formatted: truncated,
+                source,
+            })?;
 
     let order_request = order_init.init(
         market_order.symbol.to_string(),

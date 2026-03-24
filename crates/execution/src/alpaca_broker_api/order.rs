@@ -1,9 +1,8 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use tracing::debug;
-use uuid::Uuid;
-
 use rain_math_float::Float;
+use serde::{Deserialize, Serialize};
+use tracing::{debug, info};
+use uuid::Uuid;
 
 use super::client::AlpacaBrokerApiClient;
 use super::{AlpacaBrokerApiError, TimeInForce};
@@ -87,7 +86,18 @@ where
         .inner()
         .format_with_scientific(false)
         .map_err(serde::ser::Error::custom)?;
-    serializer.serialize_str(&formatted)
+    let truncated = crate::truncate_decimal_places(&formatted, crate::ALPACA_MAX_DECIMAL_PLACES);
+
+    if truncated != formatted {
+        info!(
+            original = %formatted,
+            truncated = %truncated,
+            "Truncated order quantity to {} decimal places for Alpaca",
+            crate::ALPACA_MAX_DECIMAL_PLACES,
+        );
+    }
+
+    serializer.serialize_str(&truncated)
 }
 
 /// Order response from the Alpaca Broker API
@@ -688,6 +698,53 @@ mod tests {
         assert_eq!(order.symbol, "USDCUSD");
         assert!(order.quantity.eq(float!(500)).unwrap());
         assert_eq!(order.status_display(), "filled");
+    }
+
+    #[tokio::test]
+    async fn truncates_18_decimal_quantity_to_9() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
+                .json_body(json!({
+                    "symbol": "RKLB",
+                    "qty": "0.996350331",
+                    "side": "sell",
+                    "type": "market",
+                    "time_in_force": "day",
+                    "extended_hours": false
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "symbol": "RKLB",
+                    "qty": "0.996350331",
+                    "side": "sell",
+                    "status": "new",
+                    "filled_avg_price": null
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        // Simulate an onchain value with 18 decimal places
+        let onchain_shares = Float::parse("0.996350331351928059".to_string()).unwrap();
+        let market_order = MarketOrder {
+            symbol: Symbol::new("RKLB").unwrap(),
+            shares: Positive::new(FractionalShares::new(onchain_shares)).unwrap(),
+            direction: Direction::Sell,
+        };
+
+        let placement = place_market_order(&client, market_order, TimeInForce::Day)
+            .await
+            .unwrap();
+
+        mock.assert();
+        assert_eq!(placement.symbol.to_string(), "RKLB");
+        assert_eq!(placement.direction, Direction::Sell);
     }
 
     #[test]
