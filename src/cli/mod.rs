@@ -390,25 +390,6 @@ async fn execute_order<W: Write>(
     pool: &SqlitePool,
     stdout: &mut W,
 ) -> anyhow::Result<()> {
-    reject_fractional_quantity_for_schwab(quantity, ctx, stdout)?;
-    info!("Processing {direction:?} order: symbol={symbol}, quantity={quantity}");
-    trading::execute_order_with_writers(
-        symbol,
-        quantity,
-        direction,
-        time_in_force,
-        ctx,
-        pool,
-        stdout,
-    )
-    .await
-}
-
-fn reject_fractional_quantity_for_schwab<W: Write>(
-    quantity: Positive<FractionalShares>,
-    ctx: &Ctx,
-    stdout: &mut W,
-) -> anyhow::Result<()> {
     let broker_rejects_fractional = match &ctx.broker {
         BrokerCtx::Schwab(_) => true,
         BrokerCtx::AlpacaTradingApi(_) | BrokerCtx::AlpacaBrokerApi(_) | BrokerCtx::DryRun => false,
@@ -423,7 +404,17 @@ fn reject_fractional_quantity_for_schwab<W: Write>(
         anyhow::bail!("Schwab does not accept fractional shares for buy/sell orders");
     }
 
-    Ok(())
+    info!("Processing {direction:?} order: symbol={symbol}, quantity={quantity}");
+    trading::execute_order_with_writers(
+        symbol,
+        quantity,
+        direction,
+        time_in_force,
+        ctx,
+        pool,
+        stdout,
+    )
+    .await
 }
 
 /// Commands that don't require a WebSocket provider.

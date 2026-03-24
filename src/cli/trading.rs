@@ -141,7 +141,7 @@ async fn get_broker_order_status<W: Write>(
 
 pub(super) async fn execute_order_with_writers<W: Write>(
     symbol: Symbol,
-    quantity: Positive<FractionalShares>,
+    shares: Positive<FractionalShares>,
     direction: Direction,
     time_in_force: Option<TimeInForce>,
     ctx: &Ctx,
@@ -150,31 +150,31 @@ pub(super) async fn execute_order_with_writers<W: Write>(
 ) -> anyhow::Result<()> {
     let market_order = MarketOrder {
         symbol: symbol.clone(),
-        shares: quantity,
+        shares,
         direction,
     };
 
-    info!("Created order: symbol={symbol}, direction={direction:?}, quantity={quantity}");
+    info!("Created order: symbol={symbol}, direction={direction:?}, quantity={shares}");
 
     match execute_broker_order(ctx, pool, market_order, time_in_force, stdout).await {
         Ok(placement) => {
             info!(
                 symbol = %symbol,
                 direction = ?direction,
-                quantity = %quantity,
+                quantity = %shares,
                 order_id = %placement.order_id,
                 "Order placed successfully"
             );
             writeln!(stdout, "✅ Order placed successfully")?;
             writeln!(stdout, "   Symbol: {symbol}")?;
             writeln!(stdout, "   Action: {direction:?}")?;
-            writeln!(stdout, "   Quantity: {quantity}")?;
+            writeln!(stdout, "   Quantity: {shares}")?;
         }
         Err(error) => {
             error!(
                 symbol = %symbol,
                 direction = ?direction,
-                quantity = %quantity,
+                quantity = %shares,
                 error = ?error,
                 "Failed to place order"
             );
