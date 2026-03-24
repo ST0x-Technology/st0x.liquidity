@@ -191,9 +191,9 @@ impl Conductor {
                 .await?;
 
                 let wallet_polling = crate::inventory::WalletPollingCtx {
-                    ethereum: Arc::new(ethereum_wallet),
-                    base: Arc::new(base_wallet),
-                    alpaca_wallet: infra.alpaca_wallet,
+                    ethereum: Some(Arc::new(ethereum_wallet)),
+                    base: Some(Arc::new(base_wallet)),
+                    alpaca_wallet: Some(infra.alpaca_wallet),
                     unwrapped_equity_token_addresses: base_wallet_unwrapped_equity_token_addresses(
                         &ctx,
                     ),

@@ -13,6 +13,7 @@ use st0x_evm::ReadOnlyEvm;
 use st0x_execution::Executor;
 use st0x_finance::{HasZero, Positive, Usd};
 
+
 use super::job::work;
 use super::order_fill_monitor::{DexEventStreams, OrderFillMonitor};
 use super::{
@@ -86,14 +87,27 @@ where
         order_owner,
     ));
 
+    let reserved_cash = context
+        .ctx
+        .assets
+        .cash
+        .as_ref()
+        .and_then(|cash| cash.reserved)
+        .map_or(Usd::ZERO, Positive::inner);
+
+    let snapshot_id = InventorySnapshotId {
+        orderbook: context.ctx.evm.orderbook,
+        owner: order_owner,
+    };
+
     let polling_service = InventoryPollingService::new(
         raindex_service,
         context.executor.clone(),
         context.frameworks.vault_registry.clone(),
-        context.ctx.evm.orderbook,
-        order_owner,
+        snapshot_id,
         context.frameworks.snapshot,
-        context.wallet_polling,
+        context.wallet_polling.unwrap_or_default(),
+        reserved_cash,
     );
 
     let inventory_poller = Some(spawn_inventory_poller(
