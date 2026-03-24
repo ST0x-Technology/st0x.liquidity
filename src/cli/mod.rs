@@ -409,7 +409,12 @@ fn reject_fractional_quantity_for_schwab<W: Write>(
     ctx: &Ctx,
     stdout: &mut W,
 ) -> anyhow::Result<()> {
-    if matches!(&ctx.broker, BrokerCtx::Schwab(_)) && !quantity.inner().is_whole()? {
+    let broker_rejects_fractional = match &ctx.broker {
+        BrokerCtx::Schwab(_) => true,
+        BrokerCtx::AlpacaTradingApi(_) | BrokerCtx::AlpacaBrokerApi(_) | BrokerCtx::DryRun => false,
+    };
+
+    if broker_rejects_fractional && !quantity.inner().is_whole()? {
         warn!(quantity = %quantity, "Rejecting fractional CLI order for Schwab");
         writeln!(
             stdout,
