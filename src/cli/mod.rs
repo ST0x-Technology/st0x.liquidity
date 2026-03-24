@@ -395,7 +395,7 @@ async fn execute_order<W: Write>(
         BrokerCtx::AlpacaTradingApi(_) | BrokerCtx::AlpacaBrokerApi(_) | BrokerCtx::DryRun => false,
     };
 
-    if broker_rejects_fractional && !quantity.inner().is_whole()? {
+    if broker_rejects_fractional && quantity.to_whole_shares().is_err() {
         warn!(quantity = %quantity, "Rejecting fractional CLI order for Schwab");
         writeln!(
             stdout,
@@ -1595,11 +1595,10 @@ mod tests {
         let mut stdout = Vec::new();
 
         let result = run_command_with_writers(ctx, command, &pool, &mut stdout).await;
-
-        assert!(result.is_err(), "fractional Schwab order should fail");
-        assert!(
-            format!("{}", result.unwrap_err()).contains("Schwab does not accept fractional shares"),
-            "unexpected error for fractional Schwab order"
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Schwab does not accept fractional shares for buy/sell orders"
         );
         account_mock.assert_calls(0);
         order_mock.assert_calls(0);
