@@ -1370,17 +1370,48 @@ async fn place_offchain_order(
 
     execute_create_offchain_order(execution, cqrs, offchain_order_id).await;
 
-    let aggregate = cqrs.offchain_order.load(&offchain_order_id).await;
-
-    if let Ok(Some(OffchainOrder::Failed { error, .. })) = aggregate {
-        warn!(
-            %offchain_order_id,
-            symbol = %execution.symbol,
-            %error,
-            "Broker rejected order, clearing position pending state"
-        );
-        execute_fail_offchain_order_position(&cqrs.position, offchain_order_id, execution, error)
+    match cqrs.offchain_order.load(&offchain_order_id).await {
+        Ok(Some(OffchainOrder::Failed { error, .. })) => {
+            warn!(
+                %offchain_order_id,
+                symbol = %execution.symbol,
+                %error,
+                "Broker rejected order, clearing position pending state"
+            );
+            execute_fail_offchain_order_position(
+                &cqrs.position,
+                offchain_order_id,
+                execution,
+                error,
+            )
             .await;
+        }
+
+        Ok(Some(OffchainOrder::Submitted { .. })) => {
+            info!(
+                %offchain_order_id,
+                symbol = %execution.symbol,
+                "Order submitted to broker"
+            );
+        }
+
+        Ok(other) => {
+            warn!(
+                %offchain_order_id,
+                symbol = %execution.symbol,
+                state = ?other,
+                "Unexpected offchain order state after placement"
+            );
+        }
+
+        Err(error) => {
+            error!(
+                %offchain_order_id,
+                symbol = %execution.symbol,
+                ?error,
+                "Failed to load offchain order after placement"
+            );
+        }
     }
 
     Ok(Some(offchain_order_id))
@@ -1431,7 +1462,7 @@ async fn execute_place_offchain_order(
             info!(
                 %offchain_order_id,
                 symbol = %execution.symbol,
-                "Position::PlaceOffChainOrder succeeded"
+                "Position marked as pending execution"
             );
             true
         }
@@ -1459,15 +1490,15 @@ async fn execute_create_offchain_order(
     };
 
     match cqrs.offchain_order.send(&offchain_order_id, command).await {
-        Ok(()) => info!(
+        Ok(()) => debug!(
             %offchain_order_id,
             symbol = %execution.symbol,
-            "OffchainOrder::Place succeeded"
+            "Offchain order command processed, checking broker result"
         ),
         Err(error) => error!(
             %offchain_order_id,
             symbol = %execution.symbol,
-            "OffchainOrder::Place failed: {error}"
+            "Offchain order command failed: {error}"
         ),
     }
 }
@@ -1566,7 +1597,7 @@ where
         info!(
             %offchain_order_id,
             symbol = %execution.symbol,
-            "Position::PlaceOffChainOrder succeeded"
+            "Position marked as pending execution"
         );
 
         let command = OffchainOrderCommand::Place {
@@ -1577,29 +1608,60 @@ where
         };
 
         match offchain_order.send(&offchain_order_id, command).await {
-            Ok(()) => info!(
+            Ok(()) => debug!(
                 %offchain_order_id,
                 symbol = %execution.symbol,
-                "OffchainOrder::Place succeeded"
+                "Offchain order command processed, checking broker result"
             ),
             Err(error) => error!(
                 %offchain_order_id,
                 symbol = %execution.symbol,
-                "OffchainOrder::Place failed: {error}"
+                "Offchain order command failed: {error}"
             ),
         }
 
-        if let Ok(Some(OffchainOrder::Failed { error, .. })) =
-            offchain_order.load(&offchain_order_id).await
-        {
-            warn!(
-                %offchain_order_id,
-                symbol = %execution.symbol,
-                %error,
-                "Broker rejected order, clearing position pending state"
-            );
-            execute_fail_offchain_order_position(position, offchain_order_id, &execution, error)
+        match offchain_order.load(&offchain_order_id).await {
+            Ok(Some(OffchainOrder::Failed { error, .. })) => {
+                warn!(
+                    %offchain_order_id,
+                    symbol = %execution.symbol,
+                    %error,
+                    "Broker rejected order, clearing position pending state"
+                );
+                execute_fail_offchain_order_position(
+                    position,
+                    offchain_order_id,
+                    &execution,
+                    error,
+                )
                 .await;
+            }
+
+            Ok(Some(OffchainOrder::Submitted { .. })) => {
+                info!(
+                    %offchain_order_id,
+                    symbol = %execution.symbol,
+                    "Order submitted to broker"
+                );
+            }
+
+            Ok(other) => {
+                warn!(
+                    %offchain_order_id,
+                    symbol = %execution.symbol,
+                    state = ?other,
+                    "Unexpected offchain order state after placement"
+                );
+            }
+
+            Err(error) => {
+                error!(
+                    %offchain_order_id,
+                    symbol = %execution.symbol,
+                    ?error,
+                    "Failed to load offchain order after placement"
+                );
+            }
         }
     }
 

@@ -108,10 +108,13 @@ pub enum AlpacaBrokerApiError {
     #[error("Invalid header value: {0}")]
     InvalidHeader(#[from] reqwest::header::InvalidHeaderValue),
 
-    #[error("API error ({status}): {body}")]
+    #[error("{}", format_api_error(status, alpaca_code, message))]
     ApiError {
         status: reqwest::StatusCode,
-        body: String,
+        /// Alpaca error code (e.g., 40310000 for PDT restriction)
+        alpaca_code: Option<u64>,
+        /// Human-readable error message from Alpaca
+        message: String,
     },
 
     #[error("Invalid order ID: {0}")]
@@ -152,4 +155,15 @@ pub enum AlpacaBrokerApiError {
 
     #[error("Float conversion error: {0}")]
     FloatConversion(#[from] FloatError),
+}
+
+fn format_api_error(
+    status: &reqwest::StatusCode,
+    alpaca_code: &Option<u64>,
+    message: &String,
+) -> String {
+    match alpaca_code {
+        Some(code) => format!("Alpaca API error {code} ({status}): {message}"),
+        None => format!("Alpaca API error ({status}): {message}"),
+    }
 }
