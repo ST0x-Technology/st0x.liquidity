@@ -1258,6 +1258,22 @@ mod tests {
         assert!(error.contains("positive"), "unexpected error: {error}");
     }
 
+    #[test]
+    fn test_buy_command_rejects_zero_quantity() {
+        let error = Cli::try_parse_from(["schwab", "buy", "-s", "AAPL", "-q", "0"]).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("positive"), "unexpected error: {message}");
+    }
+
+    #[test]
+    fn test_sell_command_rejects_zero_quantity() {
+        let error = Cli::try_parse_from(["schwab", "sell", "-s", "AAPL", "-q", "0"]).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("positive"), "unexpected error: {message}");
+    }
+
     const TEST_ORDERBOOK: Address = address!("0x1234567890123456789012345678901234567890");
 
     fn enabled_equity() -> EquityAssetConfig {
