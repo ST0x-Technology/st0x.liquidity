@@ -13,14 +13,14 @@ use clap::{Parser, Subcommand, ValueEnum};
 use sqlx::SqlitePool;
 use std::io::Write;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 use rain_math_float::Float;
 use st0x_evm::OpenChainErrorRegistry;
 use st0x_execution::{AlpacaAccountId, Direction, FractionalShares, Positive, Symbol, TimeInForce};
 use st0x_finance::Usdc;
 
-use crate::config::{Ctx, Env};
+use crate::config::{BrokerCtx, Ctx, Env};
 use crate::offchain_order::OrderPlacer;
 use crate::symbol::cache::SymbolCache;
 
@@ -76,7 +76,7 @@ pub enum Commands {
         /// Stock symbol (e.g., AAPL, TSLA)
         #[arg(short = 's', long = "symbol")]
         symbol: Symbol,
-        /// Number of shares to buy (must be positive, supports fractional)
+        /// Number of shares to buy (must be positive)
         #[arg(short = 'q', long = "quantity", value_parser = parse_positive_shares)]
         quantity: Positive<FractionalShares>,
         /// Time-in-force for the order (day, market-on-close)
@@ -88,7 +88,7 @@ pub enum Commands {
         /// Stock symbol (e.g., AAPL, TSLA)
         #[arg(short = 's', long = "symbol")]
         symbol: Symbol,
-        /// Number of shares to sell (must be positive, supports fractional)
+        /// Number of shares to sell (must be positive)
         #[arg(short = 'q', long = "quantity", value_parser = parse_positive_shares)]
         quantity: Positive<FractionalShares>,
         /// Time-in-force for the order (day, market-on-close)
@@ -390,6 +390,7 @@ async fn execute_order<W: Write>(
     pool: &SqlitePool,
     stdout: &mut W,
 ) -> anyhow::Result<()> {
+    reject_fractional_quantity_for_schwab(quantity, ctx, stdout)?;
     info!("Processing {direction:?} order: symbol={symbol}, quantity={quantity}");
     trading::execute_order_with_writers(
         symbol,
@@ -401,6 +402,23 @@ async fn execute_order<W: Write>(
         stdout,
     )
     .await
+}
+
+fn reject_fractional_quantity_for_schwab<W: Write>(
+    quantity: Positive<FractionalShares>,
+    ctx: &Ctx,
+    stdout: &mut W,
+) -> anyhow::Result<()> {
+    if matches!(&ctx.broker, BrokerCtx::Schwab(_)) && !quantity.inner().is_whole()? {
+        warn!(quantity = %quantity, "Rejecting fractional CLI order for Schwab");
+        writeln!(
+            stdout,
+            "❌ Schwab does not accept fractional shares for buy/sell orders"
+        )?;
+        anyhow::bail!("Schwab does not accept fractional shares for buy/sell orders");
+    }
+
+    Ok(())
 }
 
 /// Commands that don't require a WebSocket provider.
@@ -1552,7 +1570,7 @@ mod tests {
     }
 
     #[test]
-    fn test_buy_command_accepts_fractional_quantity() {
+    fn test_buy_command_parses_fractional_quantity() {
         let cli = Cli::try_parse_from(["schwab", "buy", "-s", "SPYM", "-q", "6.15"]).unwrap();
         let Commands::Buy { quantity, .. } = cli.command else {
             panic!("expected buy command");
@@ -1562,13 +1580,59 @@ mod tests {
     }
 
     #[test]
-    fn test_sell_command_accepts_fractional_quantity() {
+    fn test_sell_command_parses_fractional_quantity() {
         let cli = Cli::try_parse_from(["schwab", "sell", "-s", "SPYM", "-q", "6.15"]).unwrap();
         let Commands::Sell { quantity, .. } = cli.command else {
             panic!("expected sell command");
         };
 
         assert_eq!(quantity, positive_shares("6.15"));
+    }
+
+    async fn assert_fractional_order_rejected_before_schwab_request(command: Commands) {
+        let server = MockServer::start();
+        let ctx = create_test_ctx_for_cli(&server, Address::ZERO);
+        let pool = setup_test_db().await;
+        setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
+
+        let (account_mock, order_mock) = setup_schwab_api_mocks(&server);
+        let mut stdout = Vec::new();
+
+        let result = run_command_with_writers(ctx, command, &pool, &mut stdout).await;
+
+        assert!(result.is_err(), "fractional Schwab order should fail");
+        assert!(
+            format!("{}", result.unwrap_err()).contains("Schwab does not accept fractional shares"),
+            "unexpected error for fractional Schwab order"
+        );
+        account_mock.assert_calls(0);
+        order_mock.assert_calls(0);
+
+        let stdout_str = String::from_utf8(stdout).unwrap();
+        assert!(
+            stdout_str.contains("Schwab does not accept fractional shares"),
+            "expected Schwab fractional-share rejection output, got: {stdout_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_buy_command_rejects_fractional_quantity_for_schwab_before_execution() {
+        assert_fractional_order_rejected_before_schwab_request(Commands::Buy {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: positive_shares("6.15"),
+            time_in_force: None,
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_sell_command_rejects_fractional_quantity_for_schwab_before_execution() {
+        assert_fractional_order_rejected_before_schwab_request(Commands::Sell {
+            symbol: Symbol::new("TSLA").unwrap(),
+            quantity: positive_shares("6.15"),
+            time_in_force: None,
+        })
+        .await;
     }
 
     #[tokio::test]
