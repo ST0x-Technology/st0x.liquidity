@@ -12,7 +12,7 @@ use sqlx::SqlitePool;
 use std::sync::Arc;
 
 use st0x_evm::{Evm, EvmError, Wallet};
-use st0x_execution::{Direction, FractionalShares, SchwabTokens};
+use st0x_execution::{Direction, FractionalShares, Positive, SchwabTokens};
 
 use crate::bindings::IOrderBookV6::{EvaluableV4, IOV2, OrderV4};
 use crate::config::SchwabAuth;
@@ -145,6 +145,14 @@ pub(crate) async fn setup_test_tokens(pool: &SqlitePool, auth: &SchwabAuth) {
         refresh_token_fetched_at: Utc::now(),
     };
     tokens.store(pool, &auth.encryption_key).await.unwrap();
+}
+
+/// Shared constructor for positive share quantities in tests.
+pub(crate) fn positive_shares(value: &str) -> Positive<FractionalShares> {
+    Positive::new(FractionalShares::new(
+        Float::parse(value.to_string()).unwrap(),
+    ))
+    .unwrap()
 }
 
 /// Builder for creating OnchainTrade test instances with sensible defaults.

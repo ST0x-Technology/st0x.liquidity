@@ -141,7 +141,7 @@ async fn get_broker_order_status<W: Write>(
 
 pub(super) async fn execute_order_with_writers<W: Write>(
     symbol: Symbol,
-    quantity: u64,
+    quantity: Positive<FractionalShares>,
     direction: Direction,
     time_in_force: Option<TimeInForce>,
     ctx: &Ctx,
@@ -150,7 +150,7 @@ pub(super) async fn execute_order_with_writers<W: Write>(
 ) -> anyhow::Result<()> {
     let market_order = MarketOrder {
         symbol: symbol.clone(),
-        shares: Positive::new(FractionalShares::new(Float::parse(quantity.to_string())?))?,
+        shares: quantity,
         direction,
     };
 
@@ -161,7 +161,7 @@ pub(super) async fn execute_order_with_writers<W: Write>(
             info!(
                 symbol = %symbol,
                 direction = ?direction,
-                quantity = quantity,
+                quantity = %quantity,
                 order_id = %placement.order_id,
                 "Order placed successfully"
             );
@@ -174,7 +174,7 @@ pub(super) async fn execute_order_with_writers<W: Write>(
             error!(
                 symbol = %symbol,
                 direction = ?direction,
-                quantity = quantity,
+                quantity = %quantity,
                 error = ?error,
                 "Failed to place order"
             );
@@ -523,7 +523,7 @@ mod tests {
     use super::*;
     use crate::config::{AssetsConfig, EquitiesConfig, LogLevel, SchwabAuth, TradingMode};
     use crate::onchain::EvmCtx;
-    use crate::test_utils::{setup_test_db, setup_test_tokens};
+    use crate::test_utils::{positive_shares, setup_test_db, setup_test_tokens};
     use crate::threshold::ExecutionThreshold;
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
@@ -603,7 +603,7 @@ mod tests {
 
         execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            positive_shares("100"),
             Direction::Buy,
             None,
             &ctx,
@@ -628,7 +628,7 @@ mod tests {
 
         execute_order_with_writers(
             Symbol::new("TSLA").unwrap(),
-            50,
+            positive_shares("50"),
             Direction::Sell,
             None,
             &ctx,
@@ -670,7 +670,7 @@ mod tests {
 
         execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            positive_shares("100"),
             Direction::Buy,
             None,
             &ctx,
@@ -693,7 +693,7 @@ mod tests {
         let mut stdout_buffer = Vec::new();
         execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            positive_shares("100"),
             Direction::Buy,
             None,
             &ctx,
@@ -737,7 +737,7 @@ mod tests {
         let mut stdout_buffer = Vec::new();
         execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            positive_shares("100"),
             Direction::Buy,
             None,
             &ctx,
@@ -765,7 +765,7 @@ mod tests {
         let mut stdout_buffer = Vec::new();
         execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            positive_shares("100"),
             Direction::Buy,
             Some(TimeInForce::Day),
             &ctx,
