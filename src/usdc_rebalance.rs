@@ -353,6 +353,8 @@ impl DomainEvent for UsdcRebalanceEvent {
 ///
 /// Uses the typestate pattern via enum variants to make invalid states unrepresentable.
 /// Each variant contains exactly the data valid for that state.
+/// `started_at` is the immutable business-operation start time, while
+/// `initiated_at` tracks the most recent phase boundary when needed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum UsdcRebalance {
     /// USD/USDC conversion has been initiated (AlpacaToBase: USD->USDC, BaseToAlpaca: USDC->USD)
@@ -360,6 +362,7 @@ pub(crate) enum UsdcRebalance {
         direction: RebalanceDirection,
         amount: Usdc,
         order_id: Uuid,
+        started_at: DateTime<Utc>,
         initiated_at: DateTime<Utc>,
     },
     /// Conversion has completed, ready for next phase
@@ -369,6 +372,7 @@ pub(crate) enum UsdcRebalance {
         amount: Usdc,
         /// Actual USDC amount from the conversion (may differ due to slippage)
         filled_amount: Usdc,
+        started_at: DateTime<Utc>,
         initiated_at: DateTime<Utc>,
         converted_at: DateTime<Utc>,
     },
@@ -378,6 +382,7 @@ pub(crate) enum UsdcRebalance {
         amount: Usdc,
         order_id: Uuid,
         reason: String,
+        started_at: DateTime<Utc>,
         initiated_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
     },
@@ -386,12 +391,14 @@ pub(crate) enum UsdcRebalance {
         direction: RebalanceDirection,
         amount: Usdc,
         withdrawal_ref: TransferRef,
+        started_at: DateTime<Utc>,
         initiated_at: DateTime<Utc>,
     },
     /// Withdrawal from source has been confirmed, ready for bridging
     WithdrawalComplete {
         direction: RebalanceDirection,
         amount: Usdc,
+        started_at: DateTime<Utc>,
         initiated_at: DateTime<Utc>,
         confirmed_at: DateTime<Utc>,
     },
@@ -401,6 +408,7 @@ pub(crate) enum UsdcRebalance {
         amount: Usdc,
         withdrawal_ref: TransferRef,
         reason: String,
+        started_at: DateTime<Utc>,
         initiated_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
     },
@@ -410,6 +418,7 @@ pub(crate) enum UsdcRebalance {
         direction: RebalanceDirection,
         amount: Usdc,
         burn_tx_hash: TxHash,
+        started_at: DateTime<Utc>,
         initiated_at: DateTime<Utc>,
         burned_at: DateTime<Utc>,
     },
@@ -420,6 +429,7 @@ pub(crate) enum UsdcRebalance {
         burn_tx_hash: TxHash,
         cctp_nonce: u64,
         attestation: Vec<u8>,
+        started_at: DateTime<Utc>,
         initiated_at: DateTime<Utc>,
         attested_at: DateTime<Utc>,
     },
@@ -434,6 +444,7 @@ pub(crate) enum UsdcRebalance {
         fee_collected: Usdc,
         burn_tx_hash: TxHash,
         mint_tx_hash: TxHash,
+        started_at: DateTime<Utc>,
         initiated_at: DateTime<Utc>,
         minted_at: DateTime<Utc>,
     },
@@ -444,6 +455,7 @@ pub(crate) enum UsdcRebalance {
         burn_tx_hash: Option<TxHash>,
         cctp_nonce: Option<u64>,
         reason: String,
+        started_at: DateTime<Utc>,
         initiated_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
     },
@@ -454,6 +466,7 @@ pub(crate) enum UsdcRebalance {
         burn_tx_hash: TxHash,
         mint_tx_hash: TxHash,
         deposit_ref: TransferRef,
+        started_at: DateTime<Utc>,
         initiated_at: DateTime<Utc>,
         deposit_initiated_at: DateTime<Utc>,
     },
@@ -463,6 +476,7 @@ pub(crate) enum UsdcRebalance {
         amount: Usdc,
         burn_tx_hash: TxHash,
         mint_tx_hash: TxHash,
+        started_at: DateTime<Utc>,
         initiated_at: DateTime<Utc>,
         deposit_confirmed_at: DateTime<Utc>,
     },
@@ -474,6 +488,7 @@ pub(crate) enum UsdcRebalance {
         mint_tx_hash: TxHash,
         deposit_ref: Option<TransferRef>,
         reason: String,
+        started_at: DateTime<Utc>,
         initiated_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
     },
@@ -485,20 +500,21 @@ impl UsdcRebalance {
             Self::Converting {
                 direction,
                 amount,
+                started_at,
                 initiated_at,
                 ..
             } => (
                 direction,
                 *amount,
                 UsdcBridgeStatus::Converting,
-                *initiated_at,
+                *started_at,
                 *initiated_at,
             ),
 
             Self::ConversionComplete {
                 direction,
                 filled_amount,
-                initiated_at,
+                started_at,
                 converted_at,
                 ..
             } => {
@@ -515,7 +531,7 @@ impl UsdcRebalance {
                     direction,
                     *filled_amount,
                     status,
-                    *initiated_at,
+                    *started_at,
                     *converted_at,
                 )
             }
@@ -523,28 +539,28 @@ impl UsdcRebalance {
             Self::ConversionFailed {
                 direction,
                 amount,
-                initiated_at,
+                started_at,
                 failed_at,
                 ..
             }
             | Self::WithdrawalFailed {
                 direction,
                 amount,
-                initiated_at,
+                started_at,
                 failed_at,
                 ..
             }
             | Self::BridgingFailed {
                 direction,
                 amount,
-                initiated_at,
+                started_at,
                 failed_at,
                 ..
             }
             | Self::DepositFailed {
                 direction,
                 amount,
-                initiated_at,
+                started_at,
                 failed_at,
                 ..
             } => (
@@ -553,97 +569,98 @@ impl UsdcRebalance {
                 UsdcBridgeStatus::Failed {
                     failed_at: *failed_at,
                 },
-                *initiated_at,
+                *started_at,
                 *failed_at,
             ),
 
             Self::Withdrawing {
                 direction,
                 amount,
+                started_at,
                 initiated_at,
                 ..
             } => (
                 direction,
                 *amount,
                 UsdcBridgeStatus::Withdrawing,
-                *initiated_at,
+                *started_at,
                 *initiated_at,
             ),
 
             Self::WithdrawalComplete {
                 direction,
                 amount,
-                initiated_at,
+                started_at,
                 confirmed_at,
                 ..
             } => (
                 direction,
                 *amount,
                 UsdcBridgeStatus::Withdrawing,
-                *initiated_at,
+                *started_at,
                 *confirmed_at,
             ),
 
             Self::Bridging {
                 direction,
                 amount,
-                initiated_at,
+                started_at,
                 burned_at,
                 ..
             } => (
                 direction,
                 *amount,
                 UsdcBridgeStatus::Bridging,
-                *initiated_at,
+                *started_at,
                 *burned_at,
             ),
 
             Self::Attested {
                 direction,
                 amount,
-                initiated_at,
+                started_at,
                 attested_at,
                 ..
             } => (
                 direction,
                 *amount,
                 UsdcBridgeStatus::Bridging,
-                *initiated_at,
+                *started_at,
                 *attested_at,
             ),
 
             Self::Bridged {
                 direction,
                 amount_received,
-                initiated_at,
+                started_at,
                 minted_at,
                 ..
             } => (
                 direction,
                 *amount_received,
                 UsdcBridgeStatus::Bridging,
-                *initiated_at,
+                *started_at,
                 *minted_at,
             ),
 
             Self::DepositInitiated {
                 direction,
                 amount,
-                initiated_at,
+                started_at,
                 deposit_initiated_at,
                 ..
             } => (
                 direction,
                 *amount,
                 UsdcBridgeStatus::Depositing,
-                *initiated_at,
+                *started_at,
                 *deposit_initiated_at,
             ),
 
             Self::DepositConfirmed {
                 direction,
                 amount,
-                initiated_at,
+                started_at,
                 deposit_confirmed_at,
                 ..
             } => {
@@ -660,7 +677,7 @@ impl UsdcRebalance {
                     direction,
                     *amount,
                     status,
-                    *initiated_at,
+                    *started_at,
                     *deposit_confirmed_at,
                 )
             }
@@ -691,7 +708,7 @@ impl EventSourced for UsdcRebalance {
 
     const AGGREGATE_TYPE: &'static str = "UsdcRebalance";
     const PROJECTION: Nil = Nil;
-    const SCHEMA_VERSION: u64 = 1;
+    const SCHEMA_VERSION: u64 = 2;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use UsdcRebalanceEvent::*;
@@ -705,6 +722,7 @@ impl EventSourced for UsdcRebalance {
                 direction: direction.clone(),
                 amount: *amount,
                 order_id: *order_id,
+                started_at: *initiated_at,
                 initiated_at: *initiated_at,
             }),
 
@@ -717,6 +735,7 @@ impl EventSourced for UsdcRebalance {
                 direction: direction.clone(),
                 amount: *amount,
                 withdrawal_ref: withdrawal_ref.clone(),
+                started_at: *initiated_at,
                 initiated_at: *initiated_at,
             }),
 
@@ -739,11 +758,12 @@ impl EventSourced for UsdcRebalance {
                     order_id,
                     initiated_at,
                 },
-                Self::DepositConfirmed { .. },
+                Self::DepositConfirmed { started_at, .. },
             ) => Self::Converting {
                 direction: direction.clone(),
                 amount: *amount,
                 order_id: *order_id,
+                started_at: *started_at,
                 initiated_at: *initiated_at,
             },
 
@@ -756,6 +776,7 @@ impl EventSourced for UsdcRebalance {
                 Self::Converting {
                     direction,
                     amount,
+                    started_at,
                     initiated_at,
                     ..
                 },
@@ -763,6 +784,7 @@ impl EventSourced for UsdcRebalance {
                 direction: direction.clone(),
                 amount: *amount,
                 filled_amount: *filled_amount,
+                started_at: *started_at,
                 initiated_at: *initiated_at,
                 converted_at: *converted_at,
             },
@@ -773,6 +795,7 @@ impl EventSourced for UsdcRebalance {
                     direction,
                     amount,
                     order_id,
+                    started_at,
                     initiated_at,
                 },
             ) => Self::ConversionFailed {
@@ -780,6 +803,7 @@ impl EventSourced for UsdcRebalance {
                 amount: *amount,
                 order_id: *order_id,
                 reason: reason.clone(),
+                started_at: *started_at,
                 initiated_at: *initiated_at,
                 failed_at: *failed_at,
             },
@@ -793,12 +817,14 @@ impl EventSourced for UsdcRebalance {
                 Self::ConversionComplete {
                     direction,
                     filled_amount,
+                    started_at,
                     ..
                 },
             ) => Self::Withdrawing {
                 direction: direction.clone(),
                 amount: *filled_amount,
                 withdrawal_ref: withdrawal_ref.clone(),
+                started_at: *started_at,
                 initiated_at: *initiated_at,
             },
 
@@ -807,12 +833,14 @@ impl EventSourced for UsdcRebalance {
                 Self::Withdrawing {
                     direction,
                     amount,
+                    started_at,
                     initiated_at,
                     ..
                 },
             ) => Self::WithdrawalComplete {
                 direction: direction.clone(),
                 amount: *amount,
+                started_at: *started_at,
                 initiated_at: *initiated_at,
                 confirmed_at: *confirmed_at,
             },
@@ -823,6 +851,7 @@ impl EventSourced for UsdcRebalance {
                     direction,
                     amount,
                     withdrawal_ref,
+                    started_at,
                     initiated_at,
                 },
             ) => Self::WithdrawalFailed {
@@ -830,6 +859,7 @@ impl EventSourced for UsdcRebalance {
                 amount: *amount,
                 withdrawal_ref: withdrawal_ref.clone(),
                 reason: reason.clone(),
+                started_at: *started_at,
                 initiated_at: *initiated_at,
                 failed_at: *failed_at,
             },
@@ -842,6 +872,7 @@ impl EventSourced for UsdcRebalance {
                 Self::WithdrawalComplete {
                     direction,
                     amount,
+                    started_at,
                     initiated_at,
                     ..
                 },
@@ -849,6 +880,7 @@ impl EventSourced for UsdcRebalance {
                 direction: direction.clone(),
                 amount: *amount,
                 burn_tx_hash: *burn_tx_hash,
+                started_at: *started_at,
                 initiated_at: *initiated_at,
                 burned_at: *burned_at,
             },
@@ -863,6 +895,7 @@ impl EventSourced for UsdcRebalance {
                     direction,
                     amount,
                     burn_tx_hash,
+                    started_at,
                     initiated_at,
                     ..
                 },
@@ -872,6 +905,7 @@ impl EventSourced for UsdcRebalance {
                 burn_tx_hash: *burn_tx_hash,
                 cctp_nonce: *cctp_nonce,
                 attestation: attestation.clone(),
+                started_at: *started_at,
                 initiated_at: *initiated_at,
                 attested_at: *attested_at,
             },
@@ -887,6 +921,7 @@ impl EventSourced for UsdcRebalance {
                     direction,
                     amount,
                     burn_tx_hash,
+                    started_at,
                     initiated_at,
                     ..
                 },
@@ -897,6 +932,7 @@ impl EventSourced for UsdcRebalance {
                 fee_collected: *fee_collected,
                 burn_tx_hash: *burn_tx_hash,
                 mint_tx_hash: *mint_tx_hash,
+                started_at: *started_at,
                 initiated_at: *initiated_at,
                 minted_at: *minted_at,
             },
@@ -911,18 +947,21 @@ impl EventSourced for UsdcRebalance {
                 Self::WithdrawalComplete {
                     direction,
                     amount,
+                    started_at,
                     initiated_at,
                     ..
                 }
                 | Self::Bridging {
                     direction,
                     amount,
+                    started_at,
                     initiated_at,
                     ..
                 }
                 | Self::Attested {
                     direction,
                     amount,
+                    started_at,
                     initiated_at,
                     ..
                 },
@@ -932,6 +971,7 @@ impl EventSourced for UsdcRebalance {
                 burn_tx_hash: *burn_tx_hash,
                 cctp_nonce: *cctp_nonce,
                 reason: reason.clone(),
+                started_at: *started_at,
                 initiated_at: *initiated_at,
                 failed_at: *failed_at,
             },
@@ -946,6 +986,7 @@ impl EventSourced for UsdcRebalance {
                     amount_received,
                     burn_tx_hash,
                     mint_tx_hash,
+                    started_at,
                     initiated_at,
                     ..
                 },
@@ -955,6 +996,7 @@ impl EventSourced for UsdcRebalance {
                 burn_tx_hash: *burn_tx_hash,
                 mint_tx_hash: *mint_tx_hash,
                 deposit_ref: deposit_ref.clone(),
+                started_at: *started_at,
                 initiated_at: *initiated_at,
                 deposit_initiated_at: *deposit_initiated_at,
             },
@@ -969,6 +1011,7 @@ impl EventSourced for UsdcRebalance {
                     amount,
                     burn_tx_hash,
                     mint_tx_hash,
+                    started_at,
                     initiated_at,
                     ..
                 },
@@ -977,6 +1020,7 @@ impl EventSourced for UsdcRebalance {
                 amount: *amount,
                 burn_tx_hash: *burn_tx_hash,
                 mint_tx_hash: *mint_tx_hash,
+                started_at: *started_at,
                 initiated_at: *initiated_at,
                 deposit_confirmed_at: *deposit_confirmed_at,
             },
@@ -992,6 +1036,7 @@ impl EventSourced for UsdcRebalance {
                     amount,
                     burn_tx_hash,
                     mint_tx_hash,
+                    started_at,
                     initiated_at,
                     ..
                 },
@@ -1002,6 +1047,7 @@ impl EventSourced for UsdcRebalance {
                 mint_tx_hash: *mint_tx_hash,
                 deposit_ref: deposit_ref.clone(),
                 reason: reason.clone(),
+                started_at: *started_at,
                 initiated_at: *initiated_at,
                 failed_at: *failed_at,
             },
@@ -3796,6 +3842,124 @@ mod tests {
     }
 
     #[test]
+    fn to_dto_preserves_original_started_at_when_post_deposit_conversion_begins() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let order_id = Uuid::new_v4();
+        let original_initiated_at = Utc::now();
+        let withdrawal_confirmed_at = original_initiated_at + chrono::Duration::seconds(30);
+        let bridged_at = original_initiated_at + chrono::Duration::seconds(90);
+        let deposit_initiated_at = original_initiated_at + chrono::Duration::seconds(120);
+        let deposit_confirmed_at = original_initiated_at + chrono::Duration::seconds(150);
+        let conversion_initiated_at = original_initiated_at + chrono::Duration::seconds(180);
+        let burn_tx =
+            fixed_bytes!("0x000000000000000000000000000000000000000000000000000000000000000c");
+        let mint_tx =
+            fixed_bytes!("0x000000000000000000000000000000000000000000000000000000000000000d");
+
+        let state = replay::<UsdcRebalance>(vec![
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(1000.00)),
+                withdrawal_ref: TransferRef::OnchainTx(burn_tx),
+                initiated_at: original_initiated_at,
+            },
+            UsdcRebalanceEvent::WithdrawalConfirmed {
+                confirmed_at: withdrawal_confirmed_at,
+            },
+            UsdcRebalanceEvent::BridgingInitiated {
+                burn_tx_hash: burn_tx,
+                burned_at: withdrawal_confirmed_at,
+            },
+            UsdcRebalanceEvent::BridgeAttestationReceived {
+                attestation: vec![0x01],
+                cctp_nonce: 12345,
+                attested_at: withdrawal_confirmed_at + chrono::Duration::seconds(15),
+            },
+            UsdcRebalanceEvent::Bridged {
+                mint_tx_hash: mint_tx,
+                amount_received: Usdc::new(float!(999.99)),
+                fee_collected: Usdc::new(float!(0.01)),
+                minted_at: bridged_at,
+            },
+            UsdcRebalanceEvent::DepositInitiated {
+                deposit_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                deposit_initiated_at,
+            },
+            UsdcRebalanceEvent::DepositConfirmed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                deposit_confirmed_at,
+            },
+            UsdcRebalanceEvent::ConversionInitiated {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(999.99)),
+                order_id,
+                initiated_at: conversion_initiated_at,
+            },
+        ])
+        .expect("event stream should replay into post-deposit conversion state");
+        let state = state.expect("event stream should materialize a UsdcRebalance state");
+
+        let dto = state.to_dto(&id);
+        let TransferOperation::UsdcBridge(bridge) = dto else {
+            panic!("expected UsdcBridge variant");
+        };
+
+        assert!(
+            matches!(bridge.status, UsdcBridgeStatus::Converting),
+            "expected dashboard to show post-deposit conversion as converting, got: {:?}",
+            bridge.status
+        );
+        assert_eq!(
+            bridge.started_at, original_initiated_at,
+            "started_at should remain anchored to the original rebalance initiation time"
+        );
+        assert_eq!(bridge.updated_at, conversion_initiated_at);
+    }
+
+    #[test]
+    fn to_dto_preserves_original_started_at_when_withdrawal_begins_after_conversion() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let order_id = Uuid::new_v4();
+        let original_initiated_at = Utc::now();
+        let conversion_completed_at = original_initiated_at + chrono::Duration::seconds(30);
+        let withdrawal_initiated_at = original_initiated_at + chrono::Duration::seconds(60);
+
+        let state = replay::<UsdcRebalance>(vec![
+            UsdcRebalanceEvent::ConversionInitiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc::new(float!(1000.00)),
+                order_id,
+                initiated_at: original_initiated_at,
+            },
+            UsdcRebalanceEvent::ConversionConfirmed {
+                direction: RebalanceDirection::AlpacaToBase,
+                filled_amount: Usdc::new(float!(999.99)),
+                converted_at: conversion_completed_at,
+            },
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc::new(float!(999.99)),
+                withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                initiated_at: withdrawal_initiated_at,
+            },
+        ])
+        .expect("event stream should replay into withdrawing state");
+        let state = state.expect("event stream should materialize a UsdcRebalance state");
+
+        let dto = state.to_dto(&id);
+        let TransferOperation::UsdcBridge(bridge) = dto else {
+            panic!("expected UsdcBridge variant");
+        };
+
+        assert!(matches!(bridge.status, UsdcBridgeStatus::Withdrawing));
+        assert_eq!(
+            bridge.started_at, original_initiated_at,
+            "started_at should remain anchored to the original rebalance initiation time"
+        );
+        assert_eq!(bridge.updated_at, withdrawal_initiated_at);
+    }
+
+    #[test]
     fn conversion_confirmed_on_uninitialized_produces_failed_state() {
         let error = replay::<UsdcRebalance>(vec![UsdcRebalanceEvent::ConversionConfirmed {
             direction: RebalanceDirection::BaseToAlpaca,
@@ -3836,6 +4000,7 @@ mod tests {
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(500)),
             order_id: Uuid::new_v4(),
+            started_at: initiated_at,
             initiated_at,
         };
 
@@ -3866,6 +4031,7 @@ mod tests {
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(2000)),
             burn_tx_hash: burn_tx,
+            started_at: initiated_at,
             initiated_at,
             burned_at,
         };
@@ -3899,6 +4065,7 @@ mod tests {
             amount: Usdc::new(float!(1000)),
             burn_tx_hash: burn_tx,
             mint_tx_hash: mint_tx,
+            started_at: initiated_at,
             initiated_at,
             deposit_confirmed_at: confirmed_at,
         };
@@ -3930,6 +4097,7 @@ mod tests {
             amount: Usdc::new(float!(1000)),
             burn_tx_hash: burn_tx,
             mint_tx_hash: mint_tx,
+            started_at: initiated_at,
             initiated_at,
             deposit_confirmed_at: confirmed_at,
         };
@@ -3953,6 +4121,7 @@ mod tests {
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(500)),
             filled_amount: Usdc::new(float!(499)),
+            started_at: initiated_at,
             initiated_at,
             converted_at,
         };
@@ -3977,6 +4146,7 @@ mod tests {
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(500)),
             filled_amount: Usdc::new(float!(499)),
+            started_at: initiated_at,
             initiated_at,
             converted_at,
         };
@@ -4011,6 +4181,7 @@ mod tests {
             mint_tx_hash: mint_tx,
             deposit_ref: None,
             reason: "deposit timeout".to_string(),
+            started_at: initiated_at,
             initiated_at,
             failed_at,
         };
@@ -4036,6 +4207,7 @@ mod tests {
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(1000)),
             withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            started_at: initiated_at,
             initiated_at,
         };
 
@@ -4062,6 +4234,7 @@ mod tests {
         let state = UsdcRebalance::WithdrawalComplete {
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(800)),
+            started_at: initiated_at,
             initiated_at,
             confirmed_at,
         };
@@ -4090,6 +4263,7 @@ mod tests {
             burn_tx_hash: burn_tx,
             cctp_nonce: 42,
             attestation: vec![0xAA, 0xBB],
+            started_at: initiated_at,
             initiated_at,
             attested_at,
         };
@@ -4125,6 +4299,7 @@ mod tests {
             fee_collected: Usdc::new(float!(2)),
             burn_tx_hash: burn_tx,
             mint_tx_hash: mint_tx,
+            started_at: initiated_at,
             initiated_at,
             minted_at,
         };
@@ -4159,6 +4334,7 @@ mod tests {
             burn_tx_hash: burn_tx,
             mint_tx_hash: mint_tx,
             deposit_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            started_at: initiated_at,
             initiated_at,
             deposit_initiated_at,
         };
