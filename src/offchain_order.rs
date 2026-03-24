@@ -275,24 +275,28 @@ impl EventSourced for OffchainOrder {
                     direction,
                 };
 
-                let placed = OffchainOrderEvent::Placed {
-                    symbol,
-                    shares,
-                    direction,
-                    executor,
-                    placed_at: now,
-                };
-
                 match services.place_market_order(market_order).await {
-                    Ok(executor_order_id) => Ok(vec![
-                        placed,
+                    Ok(result) => Ok(vec![
+                        OffchainOrderEvent::Placed {
+                            symbol,
+                            shares: result.placed_shares,
+                            direction,
+                            executor,
+                            placed_at: now,
+                        },
                         OffchainOrderEvent::Submitted {
-                            executor_order_id,
+                            executor_order_id: result.executor_order_id,
                             submitted_at: now,
                         },
                     ]),
                     Err(error) => Ok(vec![
-                        placed,
+                        OffchainOrderEvent::Placed {
+                            symbol,
+                            shares,
+                            direction,
+                            executor,
+                            placed_at: now,
+                        },
                         OffchainOrderEvent::Failed {
                             error: error.to_string(),
                             failed_at: now,
@@ -421,6 +425,14 @@ impl OffchainOrder {
     }
 }
 
+/// Result of a successful order placement, with the executor-assigned ID
+/// and the actual quantity placed (which may differ from the requested
+/// quantity due to broker precision limits).
+pub struct OrderPlacementResult {
+    pub executor_order_id: ExecutorOrderId,
+    pub placed_shares: Positive<FractionalShares>,
+}
+
 /// Type-erased order placement capability injected into the OffchainOrder
 /// aggregate via cqrs-es Services.
 ///
@@ -435,7 +447,7 @@ pub trait OrderPlacer: Send + Sync {
     async fn place_market_order(
         &self,
         order: MarketOrder,
-    ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>>;
+    ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// Bridges `Executor` (which has associated types and is not object-safe)
@@ -447,9 +459,12 @@ impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
     async fn place_market_order(
         &self,
         order: MarketOrder,
-    ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
         let placement = self.0.place_market_order(order).await?;
-        Ok(ExecutorOrderId::new(&placement.order_id))
+        Ok(OrderPlacementResult {
+            executor_order_id: ExecutorOrderId::new(&placement.order_id),
+            placed_shares: placement.shares,
+        })
     }
 }
 
@@ -461,9 +476,12 @@ pub(crate) fn noop_order_placer() -> Arc<dyn OrderPlacer> {
     impl OrderPlacer for Noop {
         async fn place_market_order(
             &self,
-            _order: MarketOrder,
-        ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>> {
-            Ok(ExecutorOrderId::new("noop"))
+            order: MarketOrder,
+        ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(OrderPlacementResult {
+                executor_order_id: ExecutorOrderId::new("noop"),
+                placed_shares: order.shares,
+            })
         }
     }
 
@@ -588,7 +606,8 @@ mod tests {
             async fn place_market_order(
                 &self,
                 _order: MarketOrder,
-            ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>> {
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
                 Err("Broker rejected order".into())
             }
         }

@@ -252,7 +252,7 @@ mod tests {
     use crate::bindings::IOrderBookV6::{ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4};
     use crate::config::{AssetsConfig, EquitiesConfig};
     use crate::offchain_order::noop_order_placer;
-    use crate::offchain_order::{OffchainOrder, OrderPlacer};
+    use crate::offchain_order::{OffchainOrder, OrderPlacementResult, OrderPlacer};
     use crate::onchain_trade::OnChainTrade;
     use crate::position::Position;
     use crate::test_utils::{OnchainTradeBuilder, setup_test_db};
@@ -274,9 +274,12 @@ mod tests {
         impl OrderPlacer for TestOrderPlacer {
             async fn place_market_order(
                 &self,
-                _order: MarketOrder,
-            ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>> {
-                Ok(ExecutorOrderId::new("TEST_BROKER_ORD"))
+                order: MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("TEST_BROKER_ORD"),
+                    placed_shares: order.shares,
+                })
             }
         }
 

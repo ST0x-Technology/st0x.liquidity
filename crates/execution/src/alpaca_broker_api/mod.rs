@@ -7,7 +7,7 @@ use std::str::FromStr;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::Symbol;
+use crate::{FractionalShares, Positive, Symbol};
 
 /// Time-in-force specifies how long an order remains active before it expires.
 ///
@@ -108,10 +108,13 @@ pub enum AlpacaBrokerApiError {
     #[error("Invalid header value: {0}")]
     InvalidHeader(#[from] reqwest::header::InvalidHeaderValue),
 
-    #[error("API error ({status}): {body}")]
+    #[error("{}", format_api_error(*status, alpaca_code.as_ref(), message))]
     ApiError {
         status: reqwest::StatusCode,
-        body: String,
+        /// Alpaca error code (e.g., 40310000 for PDT restriction)
+        alpaca_code: Option<u64>,
+        /// Human-readable error message from Alpaca
+        message: String,
     },
 
     #[error("Invalid order ID: {0}")]
@@ -150,6 +153,29 @@ pub enum AlpacaBrokerApiError {
     #[error("Invalid symbol in position: {0}")]
     InvalidSymbol(#[from] crate::EmptySymbolError),
 
+    #[error(
+        "Order quantity {shares} is below Alpaca's \
+         {max_decimals}-decimal-place precision"
+    )]
+    BelowPrecision {
+        shares: Positive<FractionalShares>,
+        max_decimals: u8,
+    },
+
+    #[error(transparent)]
+    NotPositive(#[from] st0x_finance::NotPositive<FractionalShares>),
+
     #[error("Float conversion error: {0}")]
     FloatConversion(#[from] FloatError),
+}
+
+fn format_api_error(
+    status: reqwest::StatusCode,
+    alpaca_code: Option<&u64>,
+    message: &str,
+) -> String {
+    alpaca_code.map_or_else(
+        || format!("Alpaca API error ({status}): {message}"),
+        |code| format!("Alpaca API error {code} ({status}): {message}"),
+    )
 }

@@ -191,10 +191,18 @@ fn assert_total_broker_order_qty(
             (acc + order.quantity).unwrap()
         });
 
+    // Alpaca order quantities are truncated to 9 decimal places, so each order
+    // can lose up to 1e-9 of precision. Scale the epsilon by the number of
+    // orders to accommodate the cumulative truncation error.
+    let per_order_epsilon =
+        Float::parse("0.000000001".to_string()).expect("per_order_epsilon parse");
+    let order_count = Float::parse(symbol_orders.len().to_string()).expect("order_count parse");
+    let truncation_epsilon = (per_order_epsilon * order_count).expect("epsilon mul");
+
     assert_decimal_eq!(
         total_quantity,
         expected_position.amount,
-        *DEFAULT_EPSILON,
+        truncation_epsilon,
         "Total broker order quantity for {} should match expected hedge amount",
         expected_position.symbol
     );
@@ -736,8 +744,11 @@ macro_rules! assert_decimal_eq {
         }
     };
 }
+/// Position epsilon accounts for Alpaca's 9-decimal-place truncation.
+/// Broker orders truncate to 9 decimal places, so any position involving
+/// a broker fill can have up to ~1e-9 residual from the truncation remainder.
 pub(crate) static DEFAULT_EPSILON: std::sync::LazyLock<Float> = std::sync::LazyLock::new(|| {
-    Float::parse("0.000000000000001".to_string())
+    Float::parse("0.000000001".to_string())
         .unwrap_or_else(|error| panic!("DEFAULT_EPSILON parse failed: {error:?}"))
 });
 
