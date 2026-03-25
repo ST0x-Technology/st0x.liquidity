@@ -36,6 +36,7 @@ pub fn init_tracing() {
             .compact()
             .with_env_filter(filter)
             .with_target(true)
+            .with_test_writer()
             .without_time()
             .try_init()
             .ok();
