@@ -75,6 +75,7 @@ impl QueryManifest {
 
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .with(rebalancing_trigger.clone())
+            .with(event_broadcaster.clone())
             .build(())
             .await?;
 

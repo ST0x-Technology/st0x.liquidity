@@ -154,7 +154,10 @@ impl Conductor {
             .await?;
         }
 
+        let event_broadcaster = Arc::new(EventBroadcaster::new(event_sender.clone(), pool.clone()));
+
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .with(event_broadcaster.clone())
             .build(())
             .await?;
 
@@ -183,7 +186,7 @@ impl Conductor {
                         pool: pool.clone(),
                         ctx: ctx.clone(),
                         inventory: inventory.clone(),
-                        event_sender,
+                        event_broadcaster: event_broadcaster.clone(),
                         vault_registry: vault_registry.clone(),
                         vault_registry_projection: vault_registry_projection.clone(),
                     },
@@ -221,6 +224,7 @@ impl Conductor {
 
         let (offchain_order, offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .with(event_broadcaster.clone())
                 .build(order_placer)
                 .await?;
 
@@ -318,7 +322,7 @@ struct RebalancingDeps {
     pool: SqlitePool,
     ctx: Ctx,
     inventory: Arc<BroadcastingInventory>,
-    event_sender: broadcast::Sender<ServerMessage>,
+    event_broadcaster: Arc<EventBroadcaster>,
     vault_registry: Arc<Store<VaultRegistry>>,
     vault_registry_projection: Arc<Projection<VaultRegistry>>,
 }
@@ -458,9 +462,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             wrapper,
         ));
 
-        let event_broadcaster =
-            Arc::new(EventBroadcaster::new(deps.event_sender, deps.pool.clone()));
-        let manifest = QueryManifest::new(rebalancing_trigger, event_broadcaster);
+        let manifest = QueryManifest::new(rebalancing_trigger, deps.event_broadcaster);
 
         let built = manifest
             .build(deps.pool.clone(), equity_transfer_services)
