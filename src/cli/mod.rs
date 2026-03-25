@@ -13,15 +13,14 @@ use clap::{Parser, Subcommand, ValueEnum};
 use sqlx::SqlitePool;
 use std::io::Write;
 use std::sync::Arc;
-use thiserror::Error;
-use tracing::info;
+use tracing::{info, warn};
 
 use rain_math_float::Float;
 use st0x_evm::OpenChainErrorRegistry;
 use st0x_execution::{AlpacaAccountId, Direction, FractionalShares, Positive, Symbol, TimeInForce};
 use st0x_finance::Usdc;
 
-use crate::config::{Ctx, Env};
+use crate::config::{BrokerCtx, Ctx, Env};
 use crate::offchain_order::OrderPlacer;
 use crate::symbol::cache::SymbolCache;
 
@@ -52,12 +51,6 @@ pub enum CctpChain {
     Base,
 }
 
-#[derive(Debug, Error)]
-pub enum CliError {
-    #[error("Invalid quantity: {value}. Quantity must be greater than zero")]
-    InvalidQuantity { value: u64 },
-}
-
 fn parse_float(input: &str) -> Result<Float, String> {
     Float::parse(input.to_string()).map_err(|err| format!("{err}"))
 }
@@ -83,9 +76,9 @@ pub enum Commands {
         /// Stock symbol (e.g., AAPL, TSLA)
         #[arg(short = 's', long = "symbol")]
         symbol: Symbol,
-        /// Number of shares to buy (whole shares only)
-        #[arg(short = 'q', long = "quantity")]
-        quantity: u64,
+        /// Number of shares to buy (must be positive)
+        #[arg(short = 'q', long = "quantity", value_parser = parse_positive_shares)]
+        quantity: Positive<FractionalShares>,
         /// Time-in-force for the order (day, market-on-close)
         #[arg(long = "time-in-force")]
         time_in_force: Option<TimeInForce>,
@@ -95,9 +88,9 @@ pub enum Commands {
         /// Stock symbol (e.g., AAPL, TSLA)
         #[arg(short = 's', long = "symbol")]
         symbol: Symbol,
-        /// Number of shares to sell (whole shares only)
-        #[arg(short = 'q', long = "quantity")]
-        quantity: u64,
+        /// Number of shares to sell (must be positive)
+        #[arg(short = 'q', long = "quantity", value_parser = parse_positive_shares)]
+        quantity: Positive<FractionalShares>,
         /// Time-in-force for the order (day, market-on-close)
         #[arg(long = "time-in-force")]
         time_in_force: Option<TimeInForce>,
@@ -390,16 +383,27 @@ pub async fn run_command(ctx: Ctx, command: Commands) -> anyhow::Result<()> {
 
 async fn execute_order<W: Write>(
     symbol: Symbol,
-    quantity: u64,
+    quantity: Positive<FractionalShares>,
     direction: Direction,
     time_in_force: Option<TimeInForce>,
     ctx: &Ctx,
     pool: &SqlitePool,
     stdout: &mut W,
 ) -> anyhow::Result<()> {
-    if quantity == 0 {
-        return Err(CliError::InvalidQuantity { value: quantity }.into());
+    let broker_rejects_fractional = match &ctx.broker {
+        BrokerCtx::Schwab(_) => true,
+        BrokerCtx::AlpacaTradingApi(_) | BrokerCtx::AlpacaBrokerApi(_) | BrokerCtx::DryRun => false,
+    };
+
+    if broker_rejects_fractional && quantity.to_whole_shares().is_err() {
+        warn!(quantity = %quantity, "Rejecting fractional CLI order for Schwab");
+        writeln!(
+            stdout,
+            "❌ Schwab does not accept fractional shares for buy/sell orders"
+        )?;
+        anyhow::bail!("Schwab does not accept fractional shares for buy/sell orders");
     }
+
     info!("Processing {direction:?} order: symbol={symbol}, quantity={quantity}");
     trading::execute_order_with_writers(
         symbol,
@@ -417,12 +421,12 @@ async fn execute_order<W: Write>(
 enum SimpleCommand {
     Buy {
         symbol: Symbol,
-        quantity: u64,
+        quantity: Positive<FractionalShares>,
         time_in_force: Option<TimeInForce>,
     },
     Sell {
         symbol: Symbol,
-        quantity: u64,
+        quantity: Positive<FractionalShares>,
         time_in_force: Option<TimeInForce>,
     },
     Auth,
@@ -798,7 +802,7 @@ mod tests {
     use alloy::providers::Provider;
     use alloy::providers::mock::Asserter;
     use alloy::sol_types::{SolCall, SolEvent};
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
     use httpmock::MockServer;
     use rain_math_float::Float;
     use serde_json::json;
@@ -820,7 +824,7 @@ mod tests {
     };
     use crate::offchain_order::OffchainOrder;
     use crate::onchain::EvmCtx;
-    use crate::test_utils::{get_test_order, setup_test_db, setup_test_tokens};
+    use crate::test_utils::{get_test_order, positive_shares, setup_test_db, setup_test_tokens};
     use crate::threshold::ExecutionThreshold;
 
     const STATUS: Column = Column("status");
@@ -864,7 +868,7 @@ mod tests {
 
         trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            positive_shares("100"),
             Direction::Buy,
             None,
             &ctx,
@@ -908,7 +912,7 @@ mod tests {
 
         trading::execute_order_with_writers(
             Symbol::new("TSLA").unwrap(),
-            50,
+            positive_shares("50"),
             Direction::Sell,
             None,
             &ctx,
@@ -953,7 +957,7 @@ mod tests {
 
         trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            positive_shares("100"),
             Direction::Buy,
             None,
             &ctx,
@@ -985,7 +989,7 @@ mod tests {
 
         let result = trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            positive_shares("100"),
             Direction::Buy,
             None,
             &ctx,
@@ -1055,7 +1059,7 @@ mod tests {
 
         let result = trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            positive_shares("100"),
             Direction::Buy,
             None,
             &ctx,
@@ -1109,7 +1113,7 @@ mod tests {
 
         trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            positive_shares("100"),
             Direction::Buy,
             None,
             &ctx,
@@ -1150,7 +1154,7 @@ mod tests {
         let mut stdout_buffer = Vec::new();
         trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            positive_shares("100"),
             Direction::Buy,
             None,
             &ctx,
@@ -1198,7 +1202,7 @@ mod tests {
         let mut stdout_buffer = Vec::new();
         trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            positive_shares("100"),
             Direction::Buy,
             None,
             &ctx,
@@ -1262,11 +1266,26 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_error_display_messages() {
-        let quantity_error = CliError::InvalidQuantity { value: 0 };
-        let error_msg = quantity_error.to_string();
-        assert!(error_msg.contains("Invalid quantity: 0"));
-        assert!(error_msg.contains("greater than zero"));
+    fn test_parse_positive_shares_rejects_zero() {
+        let error = parse_positive_shares("0").unwrap_err();
+
+        assert!(error.contains("positive"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn test_buy_command_rejects_zero_quantity() {
+        let error = Cli::try_parse_from(["schwab", "buy", "-s", "AAPL", "-q", "0"]).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("positive"), "unexpected error: {message}");
+    }
+
+    #[test]
+    fn test_sell_command_rejects_zero_quantity() {
+        let error = Cli::try_parse_from(["schwab", "sell", "-s", "AAPL", "-q", "0"]).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("positive"), "unexpected error: {message}");
     }
 
     const TEST_ORDERBOOK: Address = address!("0x1234567890123456789012345678901234567890");
@@ -1546,6 +1565,71 @@ mod tests {
         .unwrap_err();
     }
 
+    #[test]
+    fn test_buy_command_parses_fractional_quantity() {
+        let cli = Cli::try_parse_from(["schwab", "buy", "-s", "SPYM", "-q", "6.15"]).unwrap();
+        let Commands::Buy { quantity, .. } = cli.command else {
+            panic!("expected buy command");
+        };
+
+        assert_eq!(quantity, positive_shares("6.15"));
+    }
+
+    #[test]
+    fn test_sell_command_parses_fractional_quantity() {
+        let cli = Cli::try_parse_from(["schwab", "sell", "-s", "SPYM", "-q", "6.15"]).unwrap();
+        let Commands::Sell { quantity, .. } = cli.command else {
+            panic!("expected sell command");
+        };
+
+        assert_eq!(quantity, positive_shares("6.15"));
+    }
+
+    async fn assert_fractional_order_rejected_before_schwab_request(command: Commands) {
+        let server = MockServer::start();
+        let ctx = create_test_ctx_for_cli(&server, Address::ZERO);
+        let pool = setup_test_db().await;
+        setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
+
+        let (account_mock, order_mock) = setup_schwab_api_mocks(&server);
+        let mut stdout = Vec::new();
+
+        let result = run_command_with_writers(ctx, command, &pool, &mut stdout).await;
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Schwab does not accept fractional shares for buy/sell orders"
+        );
+        account_mock.assert_calls(0);
+        order_mock.assert_calls(0);
+
+        let stdout_str = String::from_utf8(stdout).unwrap();
+        assert!(
+            stdout_str.contains("Schwab does not accept fractional shares"),
+            "expected Schwab fractional-share rejection output, got: {stdout_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_buy_command_rejects_fractional_quantity_for_schwab_before_execution() {
+        assert_fractional_order_rejected_before_schwab_request(Commands::Buy {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: positive_shares("6.15"),
+            time_in_force: None,
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_sell_command_rejects_fractional_quantity_for_schwab_before_execution() {
+        assert_fractional_order_rejected_before_schwab_request(Commands::Sell {
+            symbol: Symbol::new("TSLA").unwrap(),
+            quantity: positive_shares("6.15"),
+            time_in_force: None,
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn test_integration_buy_command_end_to_end() {
         let server = MockServer::start();
@@ -1578,7 +1662,7 @@ mod tests {
 
         let buy_command = Commands::Buy {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: 100,
+            quantity: positive_shares("100"),
             time_in_force: None,
         };
 
@@ -1627,7 +1711,7 @@ mod tests {
 
         let sell_command = Commands::Sell {
             symbol: Symbol::new("TSLA").unwrap(),
-            quantity: 50,
+            quantity: positive_shares("50"),
             time_in_force: None,
         };
 
@@ -1677,7 +1761,7 @@ mod tests {
 
         let result = trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            positive_shares("100"),
             Direction::Buy,
             None,
             &ctx,
@@ -1752,7 +1836,7 @@ mod tests {
 
         let result = trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            positive_shares("100"),
             Direction::Buy,
             None,
             &ctx,
@@ -1787,7 +1871,7 @@ mod tests {
 
         let result = trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            positive_shares("100"),
             Direction::Buy,
             None,
             &ctx,
@@ -1824,7 +1908,7 @@ mod tests {
 
         let result2 = trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            positive_shares("100"),
             Direction::Buy,
             None,
             &ctx,
@@ -1860,7 +1944,7 @@ mod tests {
 
         let result = trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            positive_shares("100"),
             Direction::Buy,
             None,
             &ctx,
@@ -1951,7 +2035,7 @@ mod tests {
 
         let result = trading::execute_order_with_writers(
             Symbol::new("INVALID").unwrap(),
-            999_999,
+            positive_shares("999999"),
             Direction::Buy,
             None,
             &ctx,
