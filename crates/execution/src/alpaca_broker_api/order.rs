@@ -768,6 +768,35 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn tiny_shares_below_precision_returns_error() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        let tiny = Float::parse("0.0000000001".to_string()).unwrap();
+        let market_order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(tiny)).unwrap(),
+            direction: Direction::Buy,
+        };
+
+        let err = place_market_order(&client, market_order, TimeInForce::Day)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                AlpacaBrokerApiError::BelowPrecision {
+                    max_decimals,
+                    ..
+                } if max_decimals == crate::ALPACA_MAX_DECIMAL_PLACES
+            ),
+            "Expected BelowPrecision error, got: {err:?}"
+        );
+    }
+
     #[test]
     fn test_crypto_order_response_status_display() {
         let make_order = |status: BrokerOrderStatus| CryptoOrderResponse {

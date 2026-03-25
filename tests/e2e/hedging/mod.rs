@@ -327,7 +327,6 @@ async fn backfilling() -> anyhow::Result<()> {
         .expected_accumulated_long(float!(0))
         .expected_accumulated_short(float!(13.5))
         .expected_net(float!(0))
-        .order_count(trade_count)
         .build();
 
     assert_full_hedging_flow(

@@ -53,10 +53,6 @@ pub struct ExpectedPosition {
     pub expected_accumulated_long: Float,
     pub expected_accumulated_short: Float,
     pub expected_net: Float,
-    /// Number of broker orders expected for this symbol. Used to scale
-    /// the epsilon for cumulative fields (net, accumulated_long/short)
-    /// by the per-order truncation error (1e-9).
-    pub order_count: usize,
 }
 
 #[bon::bon]
@@ -71,7 +67,6 @@ impl ExpectedPosition {
         expected_accumulated_long: Float,
         expected_accumulated_short: Float,
         expected_net: Float,
-        #[builder(default = 1)] order_count: usize,
     ) -> Self {
         Self {
             symbol,
@@ -82,7 +77,6 @@ impl ExpectedPosition {
             expected_accumulated_long,
             expected_accumulated_short,
             expected_net,
-            order_count,
         }
     }
 
@@ -231,7 +225,7 @@ pub async fn assert_cqrs_state(
     assert_offchain_order_events(expected_positions, &events);
 
     for expected_position in expected_positions {
-        assert_position_view(expected_position, &pool).await?;
+        assert_position_view(expected_position, &pool, &events).await?;
     }
 
     assert_offchain_order_views(expected_positions, &pool).await?;
@@ -476,9 +470,26 @@ fn truncation_epsilon(order_count: usize) -> Float {
     (per_order * count).expect("epsilon mul")
 }
 
+/// Counts the number of OffchainOrderEvent::Placed events for a given symbol.
+fn count_offchain_orders_for_symbol(events: &[StoredEvent], symbol: &str) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            event.event_type == "OffchainOrderEvent::Placed"
+                && event
+                    .payload
+                    .get("Placed")
+                    .and_then(|placed| placed.get("symbol"))
+                    .and_then(|sym| sym.as_str())
+                    == Some(symbol)
+        })
+        .count()
+}
+
 async fn assert_position_view(
     expected_position: &ExpectedPosition,
     pool: &SqlitePool,
+    events: &[StoredEvent],
 ) -> anyhow::Result<()> {
     let projection = Projection::<Position>::sqlite(pool.clone());
     let symbol = Symbol::new(expected_position.symbol)?;
@@ -493,7 +504,8 @@ async fn assert_position_view(
     let expected_net = expected_position.expected_net;
     let expected_long = expected_position.expected_accumulated_long;
     let expected_short = expected_position.expected_accumulated_short;
-    let epsilon = truncation_epsilon(expected_position.order_count);
+    let order_count = count_offchain_orders_for_symbol(events, expected_position.symbol).max(1);
+    let epsilon = truncation_epsilon(order_count);
 
     assert_eq!(position.symbol, symbol);
     assert_decimal_eq!(
