@@ -6907,6 +6907,7 @@ dependencies = [
  "anyhow",
  "apalis",
  "apalis-codec",
+ "apalis-core",
  "apalis-sqlite",
  "approx",
  "async-trait",

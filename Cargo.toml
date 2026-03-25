@@ -79,7 +79,6 @@ reqwest = { version = "0.12.4", features = [
   "gzip",
   "blocking",
 ] }
-revm = { version = "=25.0.0", default-features = false }
 rocket = { version = "0.5.1", features = ["json"] }
 rocket_ws = "0.1.1"
 rsa = { version = "0.9.10", features = ["pem"] }
@@ -197,6 +196,7 @@ urlencoding.workspace = true
 uuid.workspace = true
 # Force transitive wasm-bindgen to match rain.wasm's expected version
 wasm-bindgen.workspace = true
+apalis-core = "1.0.0-rc.4"
 
 [dev-dependencies]
 approx.workspace = true
