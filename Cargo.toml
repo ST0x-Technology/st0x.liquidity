@@ -205,6 +205,7 @@ bon.workspace = true
 httpmock.workspace = true
 proptest.workspace = true
 rain-math-float.workspace = true
+rand.workspace = true
 rsa.workspace = true
 serial_test.workspace = true
 st0x-bridge = { workspace = true, features = ["mock"] }
