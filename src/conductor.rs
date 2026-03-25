@@ -19,12 +19,10 @@ use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
-use st0x_dto::Statement;
 use st0x_event_sorcery::{Projection, Store, StoreBuilder};
 use st0x_evm::{Evm, Wallet};
 use st0x_execution::{Executor, FractionalShares, Symbol};
@@ -32,7 +30,6 @@ use st0x_execution::{Executor, FractionalShares, Symbol};
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::bindings::IOrderBookV6::{ClearV3, IOrderBookV6Instance, TakeOrderV3};
 use crate::config::{AssetsConfig, Ctx, CtxError, OperationMode};
-use crate::dashboard::Broadcaster;
 use crate::inventory::{
     BroadcastingInventory, InventoryPollingService, InventorySnapshot, WalletPollingCtx,
 };
@@ -120,25 +117,16 @@ pub(crate) async fn run_market_hours_loop<E>(
     ctx: Ctx,
     pool: SqlitePool,
     executor_maintenance: Option<JoinHandle<()>>,
-    event_sender: broadcast::Sender<Statement>,
     inventory: Arc<BroadcastingInventory>,
 ) -> anyhow::Result<()>
 where
     E: Executor + Clone + Send + Sync + 'static,
     TradeAccountingError: From<E::Error>,
 {
-    let mut conductor = Conductor::start(
-        ctx,
-        pool,
-        executor,
-        executor_maintenance,
-        event_sender,
-        inventory,
-    )
-    .await?;
-======= end
+    let mut conductor =
 
-<<<<<<< variant A
+        Conductor::start(ctx, pool, executor, executor_maintenance, inventory).await?;
+
 fn base_wallet_wrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Address> {
     ctx.assets
         .equities
@@ -147,12 +135,6 @@ fn base_wallet_wrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Addr
         .filter(|(symbol, _)| ctx.is_trading_enabled(symbol) || ctx.is_rebalancing_enabled(symbol))
         .map(|(symbol, config)| (symbol.clone(), config.tokenized_equity_derivative))
         .collect()
->>>>>>> variant B
-    info!("Conductor running");
-    let result = conductor.wait_for_completion().await;
-    conductor.abort_all();
-    result
-======= end
 }
 
 /// Context for vault discovery operations during trade processing.
@@ -168,15 +150,10 @@ impl Conductor {
         ctx: Ctx,
         pool: SqlitePool,
         executor_maintenance: Option<JoinHandle<()>>,
-        event_sender: broadcast::Sender<Statement>,
         inventory: Arc<BroadcastingInventory>,
     ) -> anyhow::Result<()>
     where
-<<<<<<< variant A
-        E: Executor + Clone + Send + 'static,
->>>>>>> variant B
         E: Executor + Clone + Send + Sync + 'static,
-======= end
         TradeAccountingError: From<E::Error>,
     {
         // Phase 1: connect WS and set up apalis tables (parallel)
@@ -185,50 +162,14 @@ impl Conductor {
         let cache = SymbolCache::default();
         let orderbook = IOrderBookV6Instance::new(ctx.evm.orderbook, &provider);
 
-<<<<<<< variant A
         setup_apalis_tables(&pool).await?;
         let job_queue: DexTradeAccountingJobQueue = SqliteStorage::new(&pool);
->>>>>>> variant B
-            setup_apalis_tables(&pool).await?;
-            let mut job_queue: DexTradeAccountingJobQueue = SqliteStorage::new(&pool);
-======= end
 
-<<<<<<< variant A
         let mut clear_stream = orderbook.ClearV3_filter().watch().await?.into_stream();
         let mut take_stream = orderbook.TakeOrderV3_filter().watch().await?.into_stream();
->>>>>>> variant B
-            let mut clear_stream = orderbook.ClearV3_filter().watch().await?.into_stream();
-            let mut take_stream = orderbook.TakeOrderV3_filter().watch().await?.into_stream();
-======= end
 
-<<<<<<< variant A
         // Phase 2: determine cutoff block from WS subscription
         let cutoff_block = get_cutoff_block(&mut clear_stream, &mut take_stream, &provider).await?;
->>>>>>> variant B
-            let cutoff_block = get_cutoff_block(
-                &mut clear_stream,
-                &mut take_stream,
-                &provider,
-                &mut job_queue,
-            )
-            .await?;
-
-            let dex_streams = order_fill_monitor::DexEventStreams {
-                clear: Box::pin(clear_stream),
-                take: Box::pin(take_stream),
-            };
-
-            if let Some(end_block) = cutoff_block.checked_sub(1) {
-                backfill_events(
-                    &provider,
-                    &ctx.evm,
-                    end_block,
-                    crate::onchain::backfill::get_backfill_retry_strat(),
-                    job_queue.clone(),
-                )
-                .await?;
-            }
-======= end
 
         // Phase 3: backfill historical events to the job queue
         if let Some(end_block) = cutoff_block.checked_sub(1) {
@@ -259,7 +200,6 @@ impl Conductor {
             Err(error) => return Err(error.into()),
         };
 
-<<<<<<< variant A
         let (position, position_projection, snapshot, rebalancer, wallet_polling) =
             if let Some(rebalancing_ctx) = rebalancing {
                 let ethereum_wallet = rebalancing_ctx.ethereum_wallet().clone();
@@ -290,15 +230,7 @@ impl Conductor {
                         &ctx,
                     ),
                 };
->>>>>>> variant B
-            let rebalancing = match ctx.rebalancing_ctx() {
-                Ok(ctx) => Some(ctx.clone()),
-                Err(CtxError::NotRebalancing) => None,
-                Err(error) => return Err(error.into()),
-            };
-======= end
 
-<<<<<<< variant A
                 (
                     infra.position,
                     infra.position_projection,
@@ -310,57 +242,9 @@ impl Conductor {
                 let (position, position_projection) = build_position_cqrs(&pool).await?;
                 let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
                     .build(())
->>>>>>> variant B
-            let (position, position_projection, snapshot, rebalancer, wallet_polling) =
-                if let Some(rebalancing_ctx) = rebalancing {
-                    let ethereum_wallet = rebalancing_ctx.ethereum_wallet().clone();
-                    let base_wallet = rebalancing_ctx.base_wallet().clone();
-                    let infra = spawn_rebalancing_infrastructure(
-                        rebalancing_ctx,
-                        ethereum_wallet.clone(),
-                        base_wallet.clone(),
-                        RebalancingDeps {
-                            pool: pool.clone(),
-                            ctx: ctx.clone(),
-                            inventory: inventory.clone(),
-                            event_sender,
-                            vault_registry: vault_registry.clone(),
-                            vault_registry_projection: vault_registry_projection.clone(),
-                        },
-                    )
-======= end
                     .await?;
-<<<<<<< variant A
                 (position, position_projection, snapshot, None, None)
             };
->>>>>>> variant B
-
-                    let wallet_polling = WalletPollingCtx {
-                        ethereum: Some(ethereum_wallet),
-                        base: Some(base_wallet),
-                        alpaca_wallet: Some(infra.alpaca_wallet),
-                        unwrapped_equity_token_addresses:
-                            base_wallet_unwrapped_equity_token_addresses(&ctx),
-                        wrapped_equity_token_addresses: base_wallet_wrapped_equity_token_addresses(
-                            &ctx,
-                        ),
-                    };
-
-                    (
-                        infra.position,
-                        infra.position_projection,
-                        infra.snapshot,
-                        Some(infra.rebalancer),
-                        Some(wallet_polling),
-                    )
-                } else {
-                    let (position, position_projection) = build_position_cqrs(&pool).await?;
-                    let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
-                        .build(())
-                        .await?;
-                    (position, position_projection, snapshot, None, None)
-                };
-======= end
 
         let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer(executor.clone()));
 
@@ -380,26 +264,10 @@ impl Conductor {
             snapshot,
         };
 
-<<<<<<< variant A
         let dex_streams = order_fill_monitor::DexEventStreams {
             clear: Box::pin(clear_stream),
             take: Box::pin(take_stream),
         };
->>>>>>> variant B
-            let conductor_ctx = ConductorCtx {
-                ctx: ctx.clone(),
-                cache,
-                provider,
-                executor,
-                execution_threshold: ctx.execution_threshold,
-                frameworks,
-                poll_notify: Arc::new(tokio::sync::Notify::new()),
-                wallet_polling,
-            };
-
-            let mut builder = ConductorBuilder::new(conductor_ctx, job_queue, dex_streams)
-                .with_executor_maintenance(executor_maintenance);
-======= end
 
         let conductor_ctx = builder::ConductorCtx {
             ctx: ctx.clone(),
@@ -412,7 +280,6 @@ impl Conductor {
             wallet_polling,
         };
 
-<<<<<<< variant A
         let mut conductor = builder::spawn()
             .context(conductor_ctx)
             .job_queue(job_queue)
@@ -425,95 +292,35 @@ impl Conductor {
         let result = conductor.wait_for_completion().await;
         conductor.abort_all();
         result
->>>>>>> variant B
-            Ok(builder.spawn())
-        })
-======= end
     }
 }
 
 impl Conductor {
-<<<<<<< variant A
     pub(crate) async fn wait_for_completion(&mut self) -> anyhow::Result<()> {
->>>>>>> variant B
-    pub(crate) async fn wait_for_completion(&mut self) -> Result<(), anyhow::Error> {
-======= end
         tokio::select! {
             result = self.supervisor.wait() => {
                 result?;
                 info!("Supervisor exited");
             }
             result = &mut self.monitor => {
-<<<<<<< variant A
                 if let Err(join_error) = result
                     && !join_error.is_cancelled()
                 {
                     return Err(anyhow::anyhow!("Apalis monitor failed: {join_error}"));
                 }
                 info!("Apalis monitor exited");
->>>>>>> variant B
-                check_task_result(result, "Apalis monitor")?;
-            }
-            result = &mut self.order_poller => {
-                check_task_result(result, "Order poller")?;
-            }
-            result = &mut self.position_checker => {
-                check_task_result(result, "Position checker")?;
-======= end
             }
         }
 
         Ok(())
     }
-<<<<<<< variant A
->>>>>>> variant B
-}
 
-fn check_task_result(
-    result: Result<(), tokio::task::JoinError>,
-    task_name: &str,
-) -> Result<(), anyhow::Error> {
-    if let Err(join_error) = result
-        && !join_error.is_cancelled()
-    {
-        return Err(anyhow::anyhow!("{task_name} failed: {join_error}"));
-    }
-
-    info!("{task_name} exited");
-    Ok(())
-}
-
-impl Conductor {
-    pub(crate) fn abort_trading_tasks(&self) {
-        info!(
-            "Aborting trading tasks (keeping rebalancer, inventory poller, and broker maintenance alive)"
-        );
-======= end
-
-<<<<<<< variant A
     pub(crate) fn abort_all(&self) {
         info!("Aborting all conductor tasks");
->>>>>>> variant B
-======= end
         if let Err(error) = self.supervisor.shutdown() {
-<<<<<<< variant A
             error!(%error, "Failed to shutdown supervisor");
->>>>>>> variant B
-            error!(%error, "Supervisor shutdown failed");
-======= end
         }
         self.monitor.abort();
-<<<<<<< variant A
->>>>>>> variant B
-        self.order_poller.abort();
-        self.position_checker.abort();
-
-        info!("Trading tasks aborted successfully");
-    }
-
-    pub(crate) fn abort_all(&self) {
-        self.abort_trading_tasks();
-======= end
 
         if let Some(ref handle) = self.rebalancer {
             handle.abort();
@@ -540,7 +347,6 @@ struct RebalancingDeps {
     pool: SqlitePool,
     ctx: Ctx,
     inventory: Arc<BroadcastingInventory>,
-    event_sender: broadcast::Sender<Statement>,
     vault_registry: Arc<Store<VaultRegistry>>,
     vault_registry_projection: Arc<Projection<VaultRegistry>>,
 }
@@ -705,8 +511,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             wrapper,
         ));
 
-        let event_broadcaster = Arc::new(Broadcaster::new(deps.event_sender));
-        let manifest = QueryManifest::new(rebalancing_trigger, event_broadcaster);
+        let manifest = QueryManifest::new(rebalancing_trigger);
 
         let built = manifest
             .build(deps.pool.clone(), equity_transfer_services)

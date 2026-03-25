@@ -110,12 +110,9 @@ impl TestInfra<()> {
         // Seed Pyth prices for each equity symbol so the bot's
         // trace-based price extraction finds valid price data.
         for (symbol, price) in &equity_prices {
-            // Convert Decimal price to Pyth format: price * 10^(-expo).
-            // Use expo=-8 (8 decimal places) which is standard for Pyth.
-            let pyth_price = (*price * Decimal::from(100_000_000i64))
-                .to_string()
-                .parse::<i64>()
-                .unwrap_or(0);
+            // Convert Float price to Pyth format: price * 10^8 (expo=-8).
+            let pyth_u256 = price.to_fixed_decimal(8)?;
+            let pyth_price = i64::try_from(pyth_u256.to::<u64>()).expect("pyth price fits i64");
 
             base_chain
                 .set_pyth_price(symbol, pyth_price, 100_000, -8)

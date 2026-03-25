@@ -4025,12 +4025,13 @@ mod tests {
             .unwrap();
 
         // Now start post-deposit conversion (USDC to USD)
+        // Amount must match the bridging amount_received (99.99)
         store
             .send(
                 &id,
                 UsdcRebalanceCommand::InitiatePostDepositConversion {
                     order_id: uuid::Uuid::new_v4(),
-                    amount: Usdc::new(float!(500)),
+                    amount: Usdc::new(float!(99.99)),
                 },
             )
             .await

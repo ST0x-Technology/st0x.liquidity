@@ -18,7 +18,6 @@ use std::sync::Arc;
 
 use st0x_event_sorcery::{Projection, Store, StoreBuilder};
 
-use crate::dashboard::Broadcaster;
 use crate::equity_redemption::EquityRedemption;
 use crate::inventory::InventorySnapshot;
 use crate::position::Position;
@@ -34,7 +33,6 @@ use crate::usdc_rebalance::UsdcRebalance;
 /// ensures every field is handled.
 pub(super) struct QueryManifest {
     rebalancing_trigger: Arc<RebalancingTrigger>,
-    event_broadcaster: Arc<Broadcaster>,
 }
 
 /// Built CQRS frameworks from the wiring process.
@@ -48,13 +46,9 @@ pub(super) struct BuiltFrameworks {
 }
 
 impl QueryManifest {
-    pub(super) fn new(
-        rebalancing_trigger: Arc<RebalancingTrigger>,
-        event_broadcaster: Arc<Broadcaster>,
-    ) -> Self {
+    pub(super) fn new(rebalancing_trigger: Arc<RebalancingTrigger>) -> Self {
         Self {
             rebalancing_trigger,
-            event_broadcaster,
         }
     }
 
@@ -70,7 +64,6 @@ impl QueryManifest {
     ) -> anyhow::Result<BuiltFrameworks> {
         let Self {
             rebalancing_trigger,
-            event_broadcaster,
         } = self;
 
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
@@ -80,19 +73,16 @@ impl QueryManifest {
 
         let mint = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
             .with(rebalancing_trigger.clone())
-            // .with(event_broadcaster.clone())
             .build(services.clone())
             .await?;
 
         let redemption = StoreBuilder::<EquityRedemption>::new(pool.clone())
             .with(rebalancing_trigger.clone())
-            // .with(event_broadcaster.clone())
             .build(services)
             .await?;
 
         let usdc = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .with(rebalancing_trigger.clone())
-            // .with(event_broadcaster)
             .build(())
             .await?;
 
@@ -116,7 +106,7 @@ impl QueryManifest {
 mod tests {
     use alloy::primitives::Address;
     use std::collections::HashSet;
-    use tokio::sync::{broadcast, mpsc};
+    use tokio::sync::mpsc;
 
     use st0x_event_sorcery::test_store;
     use st0x_execution::Symbol;
@@ -154,8 +144,6 @@ mod tests {
     async fn build_frameworks_produces_working_stores() {
         let pool = setup_test_db().await;
         let (operation_sender, _operation_receiver) = mpsc::channel(10);
-        let (event_sender, _event_receiver) = broadcast::channel(10);
-
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
 
         let rebalancing_trigger = Arc::new(RebalancingTrigger::new(
@@ -170,8 +158,7 @@ mod tests {
             Arc::new(MockWrapper::new()),
         ));
 
-        let event_broadcaster = Arc::new(Broadcaster::new(event_sender));
-        let manifest = QueryManifest::new(rebalancing_trigger, event_broadcaster);
+        let manifest = QueryManifest::new(rebalancing_trigger);
 
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),

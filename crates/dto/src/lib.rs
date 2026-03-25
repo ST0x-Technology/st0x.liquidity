@@ -607,47 +607,6 @@ mod tests {
         std::fs::remove_file(&test_file).unwrap();
     }
 
-    // #[test]
-    // fn server_message_initial_serializes_with_type_tag() {
-    //     let msg = Statement::Initial(Box::new(InitialState::stub()));
-    //     let json = serde_json::to_string(&msg).expect("serialization should succeed");
-    //     assert!(json.contains(r#""type":"initial""#));
-    //     assert!(json.contains(r#""data":"#));
-    // }
-
-    #[test]
-    fn server_message_snapshot_serializes_with_type_tag() {
-        let msg = ServerMessage::Snapshot(Box::new(InventorySnapshot {
-            inventory: Inventory::empty(),
-            fetched_at: Utc::now(),
-        }));
-        let json = serde_json::to_string(&msg).expect("serialization should succeed");
-        assert!(
-            json.contains(r#""type":"snapshot""#),
-            "expected snapshot tag, got: {json}"
-        );
-        assert!(json.contains(r#""data":"#));
-    }
-
-    #[test]
-    fn server_message_transfer_serializes_with_type_tag() {
-        let msg = ServerMessage::Transfer(TransferOperation::EquityMint(EquityMintOperation {
-            id: Id::new("mint-001"),
-            symbol: Symbol::new("AAPL").unwrap(),
-            quantity: FractionalShares::new(float!(10)),
-            status: EquityMintStatus::Minting,
-            started_at: Utc::now(),
-            updated_at: Utc::now(),
-        }));
-        let json = serde_json::to_string(&msg).expect("serialization should succeed");
-        assert!(
-            json.contains(r#""type":"transfer""#),
-            "expected transfer tag, got: {json}"
-        );
-        assert!(json.contains(r#""data":"#));
-        assert!(json.contains(r#""kind":"equity_mint""#));
-    }
-
     #[test]
     fn transfer_operation_equity_mint_serializes_with_kind_tag() {
         let operation = TransferOperation::EquityMint(EquityMintOperation {
