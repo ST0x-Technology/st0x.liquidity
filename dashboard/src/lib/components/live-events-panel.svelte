@@ -122,11 +122,6 @@
               </button>
             </Table.Head>
 
-            <Table.Head aria-sort={ariaSort(eventSort.current, 'event')}>
-              <button class={sortBtnClass} onclick={sortEvent('event')}>
-                Event{sortIndicator(eventSort.current, 'event')}
-              </button>
-            </Table.Head>
           </Table.Row>
         </Table.Header>
         <Table.Body>
@@ -136,14 +131,11 @@
               <Table.Cell class="font-mono text-xs" title={event.aggregate_id}>
                 {truncateId(event.aggregate_id)}
               </Table.Cell>
-              <Table.Cell class="font-mono text-xs opacity-90">
-                {parsed.type}
+              <Table.Cell class="font-mono text-xs opacity-90" title={event.event_type}>
+                {parsed.event}
               </Table.Cell>
               <Table.Cell class="font-mono text-xs opacity-90">
                 {event.sequence}
-              </Table.Cell>
-              <Table.Cell class="font-mono text-xs">
-                {parsed.event}
               </Table.Cell>
             </Table.Row>
           {/each}
