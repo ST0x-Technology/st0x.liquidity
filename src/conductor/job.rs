@@ -11,8 +11,9 @@ use backon::{ExponentialBuilder, Retryable};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sqlx::SqlitePool;
+use std::fmt;
 use std::sync::Arc;
-use tracing::{debug, error, warn};
+use tracing::{error, info, warn};
 
 type Storage<Task> = SqliteStorage<
     Task,
@@ -68,6 +69,21 @@ where
     async fn perform(&self, ctx: &Ctx) -> Result<(), Self::Error>;
 }
 
+/// Human-readable identifier for an enqueued job, used in structured logging.
+pub(crate) struct Label(String);
+
+impl Label {
+    pub(crate) fn new(label: impl Into<String>) -> Self {
+        Self(label.into())
+    }
+}
+
+impl fmt::Display for Label {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
 /// Generic apalis handler that bridges [`Job`] implementations
 /// with apalis's function-based worker API.
 ///
@@ -83,12 +99,12 @@ where
     Ctx: Send + Sync + 'static,
     J: Job<Ctx> + Sync,
 {
+    const MAX_RETRIES: usize = 3;
     let label = job.label();
-
-    debug!(%label, "Processing job");
+    info!(%label, max_retries = MAX_RETRIES, "Starting job");
 
     let result = (|| job.perform(&ctx))
-        .retry(ExponentialBuilder::default().with_max_times(3))
+        .retry(ExponentialBuilder::default().with_max_times(MAX_RETRIES))
         .notify(|error, duration| {
             warn!(%label, %error, ?duration, "Retrying job after transient failure");
         })
@@ -98,20 +114,3 @@ where
         error!(%label, %error, "Job failed after retries");
     }
 }
-
-/// Human-readable identifier for a job, used in structured logging.
-pub(crate) struct Label(String);
-
-impl Label {
-    pub(crate) fn new(label: impl Into<String>) -> Self {
-        Self(label.into())
-    }
-}
-
-impl std::fmt::Display for Label {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}", self.0)
-    }
-}
-
-// TODO: add missing test coverage

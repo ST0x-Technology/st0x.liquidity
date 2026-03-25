@@ -177,8 +177,8 @@ fn truncate_for_alpaca(
     if truncated != quantity {
         warn!(
             %symbol,
-            original = ?quantity.inner(),
-            truncated = ?truncated.inner(),
+            original = %quantity,
+            truncated = %truncated,
             "Truncated quantity to {} decimal places for Alpaca API",
             ALPACA_QUANTITY_MAX_DECIMAL_PLACES
         );
@@ -194,7 +194,7 @@ mod tests {
     use rain_math_float::Float;
     use tokio::sync::broadcast;
 
-    use st0x_dto::ServerMessage;
+    use st0x_dto::Statement;
     use st0x_execution::FractionalShares;
 
     use super::*;
@@ -231,7 +231,7 @@ mod tests {
             )
             .unwrap();
 
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
         Arc::new(BroadcastingInventory::new(view, event_sender))
     }
 
@@ -281,7 +281,7 @@ mod tests {
     async fn test_balanced_inventory_returns_no_imbalance() {
         let symbol = Symbol::new("AAPL").unwrap();
         let view = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(view, event_sender));
         let threshold = ImbalanceThreshold {
             target: float!(0.5),
@@ -434,7 +434,7 @@ mod tests {
             )
             .unwrap();
 
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
         Arc::new(BroadcastingInventory::new(view, event_sender))
     }
 

@@ -715,6 +715,7 @@ pub fn assert_single_clean_aggregate(events: &[StoredEvent], error_substrings: &
 macro_rules! assert_decimal_eq {
     ($left:expr, $right:expr, $epsilon:expr $(,)?) => {
         let (l, r, eps) = ($left, $right, $epsilon);
+        let fmt = st0x_float_serde::format_float_with_fallback;
         let diff = match (l - r) {
             Ok(sub) => sub,
             Err(error) => panic!("Float subtraction failed: {error:?}"),
@@ -725,14 +726,15 @@ macro_rules! assert_decimal_eq {
         };
         if abs_diff.gt(eps).unwrap_or(false) {
             panic!(
-                "assertion failed: `(left == right)` (within epsilon {:?})\n  \
-                 left: `{:?}`\n right: `{:?}`\n delta: `{:?}`",
-                eps, l, r, abs_diff
+                "assertion failed: `(left == right)` (within epsilon {})\n  \
+                 left: `{}`\n right: `{}`\n delta: `{}`",
+                fmt(&eps), fmt(&l), fmt(&r), fmt(&abs_diff)
             );
         }
     };
     ($left:expr, $right:expr, $epsilon:expr, $($arg:tt)+) => {
         let (l, r, eps) = ($left, $right, $epsilon);
+        let fmt = st0x_float_serde::format_float_with_fallback;
         let diff = match (l - r) {
             Ok(sub) => sub,
             Err(error) => panic!("Float subtraction failed: {error:?}"),
@@ -743,9 +745,9 @@ macro_rules! assert_decimal_eq {
         };
         if abs_diff.gt(eps).unwrap_or(false) {
             panic!(
-                "assertion failed: `(left == right)` (within epsilon {:?})\n  \
-                 left: `{:?}`\n right: `{:?}`\n delta: `{:?}`\n{}",
-                eps, l, r, abs_diff, format_args!($($arg)+)
+                "assertion failed: `(left == right)` (within epsilon {})\n  \
+                 left: `{}`\n right: `{}`\n delta: `{}`\n{}",
+                fmt(&eps), fmt(&l), fmt(&r), fmt(&abs_diff), format_args!($($arg)+)
             );
         }
     };

@@ -4,7 +4,7 @@ use alloy::primitives::{Address, TxHash, hex::FromHexError};
 use rain_math_float::{Float, FloatError};
 use reqwest::{Client, Response, StatusCode};
 use thiserror::Error;
-use tracing::debug;
+use tracing::trace;
 
 use st0x_execution::AlpacaAccountId;
 
@@ -91,7 +91,7 @@ impl AlpacaWalletClient {
 
     pub(super) async fn get(&self, path: &str) -> Result<Response, AlpacaWalletError> {
         let url = format!("{}{}", self.base_url, path);
-        debug!("GET {url}");
+        trace!("GET {url}");
 
         let response = self
             .client
@@ -148,7 +148,7 @@ impl AlpacaWalletClient {
 
     pub(super) async fn delete(&self, path: &str) -> Result<Response, AlpacaWalletError> {
         let url = format!("{}{}", self.base_url, path);
-        debug!("DELETE {url}");
+        trace!("DELETE {url}");
 
         let response = self
             .client
@@ -178,7 +178,7 @@ impl AlpacaWalletClient {
         body: &T,
     ) -> Result<Response, AlpacaWalletError> {
         let url = format!("{}{}", self.base_url, path);
-        debug!("PATCH {url}");
+        trace!("PATCH {url}");
 
         let response = self
             .client
@@ -269,7 +269,10 @@ impl AlpacaWalletClient {
         let response = self.post(&path, &request).await?;
         let text = response.text().await?;
 
-        debug!("Whitelist creation response: {text}");
+        trace!(
+            response_bytes = text.len(),
+            "Whitelist creation response received"
+        );
 
         Ok(serde_json::from_str::<WhitelistEntry>(&text)?)
     }

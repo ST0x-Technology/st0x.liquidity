@@ -772,6 +772,8 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
 
     let total_amount = (amount_per_trade * float!(3)).unwrap();
 
+    poll_for_hedge_completion(&mut bot, &infra.db_path, "AAPL", Duration::from_secs(30)).await;
+
     let expected_positions = [ExpectedPosition::builder()
         .symbol("AAPL")
         .amount(total_amount)
@@ -931,6 +933,12 @@ async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
             .await?;
 
     let total_amount = (amount_per_trade * float!(3)).unwrap();
+
+    // The PositionMonitor batches hedges across scan cycles. The
+    // last onchain fill may arrive during the USDC rebalance, so
+    // its hedge completes after the rebalance event. Wait for all
+    // hedges to fill by polling until the position net reaches zero.
+    poll_for_hedge_completion(&mut bot, &infra.db_path, "AAPL", Duration::from_secs(30)).await;
 
     let expected_positions = [ExpectedPosition::builder()
         .symbol("AAPL")

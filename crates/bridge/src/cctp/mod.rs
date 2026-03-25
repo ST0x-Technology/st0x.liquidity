@@ -81,7 +81,7 @@ use st0x_float_macro::float;
 use tracing::{debug, info, warn};
 
 use st0x_evm::{EvmError, IntoErrorRegistry, OpenChainErrorRegistry, Wallet};
-use st0x_float_serde::deserialize_float_from_number_or_string;
+use st0x_float_serde::{deserialize_float_from_number_or_string, format_float_with_fallback};
 
 use crate::BridgeDirection;
 use evm::CctpEndpoint;
@@ -444,7 +444,11 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
             .ok_or(CctpError::FastTransferFeeNotAvailable { direction })?
             .minimum_fee;
 
-        debug!(?direction, ?fast_fee, "Retrieved fast transfer fee (bps)");
+        debug!(
+            ?direction,
+            fast_fee = %format_float_with_fallback(&fast_fee),
+            "Retrieved fast transfer fee (bps)"
+        );
 
         // Calculate maxFee: amount * fee_bps / 10000, ceiling
         let amount_ed = Float::from_fixed_decimal(amount, 0)?;

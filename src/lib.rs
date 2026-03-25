@@ -11,7 +11,7 @@ use tokio::sync::broadcast;
 use tokio::task::{AbortHandle, JoinError, JoinHandle};
 use tracing::{error, info};
 
-use st0x_dto::ServerMessage;
+use st0x_dto::Statement;
 use st0x_execution::{Executor, MockExecutorCtx, TryIntoExecutor};
 
 use crate::config::{BrokerCtx, Ctx};
@@ -75,14 +75,14 @@ pub mod test_utils;
 
 #[tracing::instrument(skip_all, level = tracing::Level::INFO)]
 pub async fn run_bot_session(ctx: Ctx) -> anyhow::Result<()> {
-    let (event_sender, _) = broadcast::channel::<ServerMessage>(256);
+    let (event_sender, _) = broadcast::channel::<Statement>(256);
     run_bot_session_with_event_channel(ctx, event_sender).await
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::INFO)]
 pub async fn run_bot_session_with_event_channel(
     ctx: Ctx,
-    event_sender: broadcast::Sender<ServerMessage>,
+    event_sender: broadcast::Sender<Statement>,
 ) -> anyhow::Result<()> {
     let pool = ctx.get_sqlite_pool().await?;
     sqlx::migrate!().set_ignore_missing(true).run(&pool).await?;
@@ -109,7 +109,7 @@ pub async fn run_bot_session_with_event_channel(
 fn spawn_server_task(
     ctx: &Ctx,
     pool: &SqlitePool,
-    event_sender: broadcast::Sender<ServerMessage>,
+    event_sender: broadcast::Sender<Statement>,
     inventory: Arc<inventory::BroadcastingInventory>,
 ) -> JoinHandle<Result<Rocket<Ignite>, rocket::Error>> {
     let rocket_config = rocket::Config::figment()
@@ -127,6 +127,7 @@ fn spawn_server_task(
         .manage(dashboard::DashboardState {
             inventory,
             pool: pool.clone(),
+            settings: dashboard::settings_from_ctx(ctx),
         });
 
     tokio::spawn(rocket.launch())
@@ -207,7 +208,7 @@ fn check_bot_result(result: Result<anyhow::Result<()>, JoinError>) -> anyhow::Re
 async fn run_conductor_session(
     ctx: Ctx,
     pool: SqlitePool,
-    event_sender: broadcast::Sender<ServerMessage>,
+    event_sender: broadcast::Sender<Statement>,
     inventory: Arc<inventory::BroadcastingInventory>,
 ) -> anyhow::Result<()> {
     let result = dispatch_to_executor(ctx, pool, event_sender, inventory).await;
@@ -227,7 +228,7 @@ async fn run_conductor_session(
 async fn dispatch_to_executor(
     ctx: Ctx,
     pool: SqlitePool,
-    event_sender: broadcast::Sender<ServerMessage>,
+    event_sender: broadcast::Sender<Statement>,
     inventory: Arc<inventory::BroadcastingInventory>,
 ) -> anyhow::Result<()> {
     match ctx.broker.clone() {
@@ -267,7 +268,7 @@ mod tests {
         pool
     }
 
-    fn create_test_event_sender() -> broadcast::Sender<ServerMessage> {
+    fn create_test_event_sender() -> broadcast::Sender<Statement> {
         let (sender, _) = broadcast::channel(16);
         sender
     }

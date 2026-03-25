@@ -48,6 +48,10 @@ the limit:
 constraints (file size limits apply to entire file). No warnings/errors pass
 through. Work until all tasks complete unless blocked needing user input.
 
+**CRITICAL: If you know you caused a problem and know how to fix it, fix it
+immediately.** Do not restate the request, ask for confirmation, or wait for
+permission to do the obvious corrective work.
+
 ## Communication
 
 - **Do not run commands to "show" output to the user.** The CLI truncates
@@ -109,17 +113,34 @@ An epic is a roadmap subsection grouping related issues toward a single goal.
 
 ## Plan & Review
 
+### Task management
+
+- Keep a granular task list for the current request and update it as work
+  progresses.
+- Clear completed tasks from the active list so the remaining work is always
+  obvious.
+
 ### While implementing
 
 - **CRITICAL: All new or modified logic MUST have corresponding test coverage.**
   Do not move on from a piece of code until tests are written. This is
   non-negotiable.
 
+### Before deciding on an implementation
+
+Before making changes, deeply understand the task: read the relevant repo docs,
+read the relevant source code, form an initial approach, criticize it, and
+improve it until the plan is coherent with the repo architecture. Keep the
+resulting diff as small and reviewable as possible.
+
 ### Handling questions and approach changes
 
 Answer the question first. Don't silently change approach - ask confirmation. If
 new approach fails, state what went wrong and ask before reverting. Explicit
 confirmation required before changing direction.
+
+When the user has already clearly told you what to do, start doing it
+immediately. Do not paraphrase the request back as a confirmation step.
 
 ### When issues are pointed out
 
@@ -146,6 +167,13 @@ check output, provide input), you must ensure they see the request:
 
 The user checks your output when they see you've stopped. If you give them a
 command mid-response and keep working, they will miss it.
+
+Significant architectural decisions are a special case. When existing docs do
+not already answer an architectural choice and the decision is important enough
+to record, write an ADR under `adrs/$INDEX-$PROPOSAL_NAME.md`, give the user a
+brief summary, and stop for review before continuing with that direction. Once
+the ADR is approved, treat it as the standing decision and do not ask the same
+question again.
 
 ### Before handing over
 
@@ -419,6 +447,12 @@ is the source of truth for terminology and naming conventions.
   `handle()` to ensure atomicity with events. **Naming:** `{Action}er` trait ->
   `{Domain}Service` implements -> `{Domain}Manager` orchestrates. See
   `OffchainOrder`/`OrderPlacer`
+- **Log in command handlers, not callers**: All logging for command execution
+  belongs in the aggregate's `handle()` method, not at the call site. The
+  handler has full aggregate state (symbol, net position, thresholds, etc.)
+  making log messages rich without the caller needing to load or pass extra
+  context. This keeps logging consistent and centralized — one place per
+  command, not scattered across every caller
 - **Type Modeling**: Make invalid states unrepresentable through the type
   system. Use ADTs and enums to encode business rules and state transitions
   directly in types rather than runtime validation. See "Type modeling" in Code

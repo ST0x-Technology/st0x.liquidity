@@ -1708,7 +1708,7 @@ mod tests {
     use tokio::sync::mpsc::error::TryRecvError;
     use uuid::Uuid;
 
-    use st0x_dto::ServerMessage;
+    use st0x_dto::Statement;
 
     use super::*;
 
@@ -1760,7 +1760,7 @@ mod tests {
 
     async fn make_trigger() -> (Arc<RebalancingTrigger>, mpsc::Receiver<TriggeredOperation>) {
         let (sender, receiver) = mpsc::channel(10);
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default(),
             event_sender,
@@ -1838,7 +1838,7 @@ mod tests {
     #[tokio::test]
     async fn test_usdc_disabled_via_cash_config_does_not_send() {
         let (sender, mut receiver) = mpsc::channel(10);
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default(),
             event_sender,
@@ -1880,7 +1880,7 @@ mod tests {
     async fn disabled_asset_skips_equity_trigger() {
         let symbol = Symbol::new("AAPL").unwrap();
         let (sender, mut receiver) = mpsc::channel(10);
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default(),
             event_sender,
@@ -2033,7 +2033,7 @@ mod tests {
         config: RebalancingTriggerConfig,
     ) -> (Arc<RebalancingTrigger>, mpsc::Receiver<TriggeredOperation>) {
         let (sender, receiver) = mpsc::channel(10);
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
         let pool = crate::test_utils::setup_test_db().await;
 
@@ -2079,7 +2079,7 @@ mod tests {
         config: RebalancingTriggerConfig,
     ) -> (Arc<RebalancingTrigger>, mpsc::Receiver<TriggeredOperation>) {
         let (sender, receiver) = mpsc::channel(10);
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
         let pool = crate::test_utils::setup_test_db().await;
 
@@ -2150,7 +2150,7 @@ mod tests {
         // inventory update failure from the rebalancing check).
         let symbol = Symbol::new("AAPL").unwrap();
         let (sender, mut receiver) = mpsc::channel(10);
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default().with_usdc(usdc(1_000_000), usdc(1_000_000)),
             event_sender,
@@ -5234,7 +5234,7 @@ mod tests {
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             {
-                let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
+                let (event_sender, _) = broadcast::channel::<Statement>(16);
                 Arc::new(BroadcastingInventory::new(
                     InventoryView::default(),
                     event_sender,
@@ -5618,7 +5618,7 @@ mod tests {
     async fn trigger_clears_in_progress_flag_when_terminal_event_received() {
         let (sender, _receiver) = mpsc::channel(10);
         let pool = crate::test_utils::setup_test_db().await;
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default().with_usdc(usdc(5000), usdc(5000)),
             event_sender,
@@ -5829,7 +5829,7 @@ mod tests {
         let symbol = Symbol::new("RKLB").unwrap();
 
         // Empty inventory - simulates startup state before polling completes
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default(),
             event_sender,
@@ -5895,7 +5895,7 @@ mod tests {
     async fn trigger_fires_when_both_venues_have_data() {
         let pool = crate::test_utils::setup_test_db().await;
         let symbol = Symbol::new("RKLB").unwrap();
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default(),
             event_sender,
@@ -5973,7 +5973,7 @@ mod tests {
     async fn logs_show_partial_data_skips_imbalance_check() {
         let pool = crate::test_utils::setup_test_db().await;
         let symbol = Symbol::new("RKLB").unwrap();
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default(),
             event_sender,
@@ -6033,7 +6033,7 @@ mod tests {
     async fn logs_show_trigger_fires_with_complete_data() {
         let pool = crate::test_utils::setup_test_db().await;
         let symbol = Symbol::new("RKLB").unwrap();
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default(),
             event_sender,

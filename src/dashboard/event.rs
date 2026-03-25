@@ -1,70 +1,83 @@
-//! Reactor that broadcasts aggregate events to WebSocket dashboard clients.
+//! Reactor that broadcasts aggregate events to WebSocket dashboard
+//! clients as [`Trade`] fills and [`TransferOperation`] updates.
 
 use async_trait::async_trait;
-use chrono::Utc;
 use sqlx::SqlitePool;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::broadcast;
 use tracing::warn;
 
-use st0x_dto::{EventStoreEntry, ServerMessage};
-use st0x_event_sorcery::{
-    DomainEvent, EntityList, EventSourced, Never, Reactor, deps, load_entity,
-};
+use st0x_dto::{Statement, Trade, TradeDirection, TradingVenue};
+use st0x_event_sorcery::{EntityList, Never, Reactor, deps, load_entity};
+use st0x_execution::SupportedExecutor;
 
 use crate::equity_redemption::EquityRedemption;
+use crate::offchain_order::OffchainOrder;
+use crate::onchain_trade::{OnChainTrade, OnChainTradeEvent};
+use crate::position::Position;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
 
 deps!(
-    EventBroadcaster,
-    [TokenizedEquityMint, EquityRedemption, UsdcRebalance,]
+    Broadcaster,
+    [
+        OnChainTrade,
+        Position,
+        OffchainOrder,
+        TokenizedEquityMint,
+        EquityRedemption,
+        UsdcRebalance,
+    ]
 );
 
-/// Reactor that broadcasts events to connected WebSocket clients.
-///
-/// Implements [`Reactor`] with exhaustive handling for all
-/// broadcast-eligible aggregate types.
-pub(crate) struct EventBroadcaster {
-    sender: broadcast::Sender<ServerMessage>,
-    sequence: AtomicU64,
+/// Reactor that broadcasts notifications and trade fills to connected
+/// WebSocket clients.
+pub(crate) struct Broadcaster {
+    sender: broadcast::Sender<Statement>,
     pool: SqlitePool,
 }
 
-impl EventBroadcaster {
-    pub(crate) fn new(sender: broadcast::Sender<ServerMessage>, pool: SqlitePool) -> Self {
-        Self {
-            sender,
-            sequence: AtomicU64::new(0),
-            pool,
+impl Broadcaster {
+    pub(crate) fn new(sender: broadcast::Sender<Statement>, pool: SqlitePool) -> Self {
+        Self { sender, pool }
+    }
+
+    fn broadcast_fill(&self, trade: Trade) {
+        if let Err(error) = self.sender.send(Statement::TradeFill(trade)) {
+            warn!("Failed to broadcast trade fill (no receivers): {error}");
         }
     }
 
-    fn broadcast_event<Entity: EventSourced>(&self, id: &Entity::Id, event: &Entity::Event) {
-        let entry = EventStoreEntry {
-            aggregate_type: Entity::AGGREGATE_TYPE.to_string(),
-            aggregate_id: id.to_string(),
-            sequence: self.sequence.fetch_add(1, Ordering::Relaxed),
-            event_type: event.event_type(),
-            timestamp: Utc::now(),
-        };
-
-        let msg = ServerMessage::Event(entry);
-
-        if let Err(error) = self.sender.send(msg) {
-            warn!("Failed to broadcast event (no receivers): {error}");
+    fn broadcast_position(&self, position: st0x_dto::Position) {
+        if let Err(error) = self.sender.send(Statement::PositionUpdate(position)) {
+            warn!("Failed to broadcast position update (no receivers): {error}");
         }
     }
 
     fn broadcast_transfer(&self, transfer: st0x_dto::TransferOperation) {
-        if let Err(error) = self.sender.send(ServerMessage::Transfer(transfer)) {
+        if let Err(error) = self.sender.send(Statement::TransferUpdate(transfer)) {
             warn!("Failed to broadcast transfer update (no receivers): {error}");
         }
     }
 }
 
+/// Convert a [`SupportedExecutor`] to a [`TradingVenue`] for the dashboard.
+pub(crate) fn executor_to_venue(executor: SupportedExecutor) -> TradingVenue {
+    match executor {
+        SupportedExecutor::AlpacaBrokerApi => TradingVenue::Alpaca,
+        SupportedExecutor::DryRun => TradingVenue::DryRun,
+    }
+}
+
+/// Convert an execution [`Direction`] to a [`TradeDirection`] for the dashboard.
+pub(crate) fn direction_to_dto(direction: st0x_execution::Direction) -> TradeDirection {
+    match direction {
+        st0x_execution::Direction::Buy => TradeDirection::Buy,
+        st0x_execution::Direction::Sell => TradeDirection::Sell,
+    }
+}
+
 #[async_trait]
-impl Reactor for EventBroadcaster {
+impl Reactor for Broadcaster {
     type Error = Never;
 
     async fn react(
@@ -73,34 +86,87 @@ impl Reactor for EventBroadcaster {
     ) -> Result<(), Self::Error> {
         event
             .on(|id, event| async move {
-                self.broadcast_event::<TokenizedEquityMint>(&id, &event);
-
+                if let OnChainTradeEvent::Filled {
+                    symbol,
+                    amount,
+                    direction,
+                    filled_at,
+                    ..
+                } = &event
+                {
+                    self.broadcast_fill(Trade {
+                        id: id.to_string(),
+                        filled_at: *filled_at,
+                        venue: TradingVenue::Raindex,
+                        direction: direction_to_dto(*direction),
+                        symbol: symbol.clone(),
+                        shares: st0x_finance::FractionalShares::new(*amount),
+                    });
+                }
+            })
+            .on(|id, _event| async move {
+                match load_entity::<Position>(&self.pool, &id).await {
+                    Ok(Some(position)) => {
+                        self.broadcast_position(st0x_dto::Position {
+                            symbol: position.symbol,
+                            net: position.net.inner(),
+                        });
+                    }
+                    Ok(None) => warn!(%id, "Position not found after event"),
+                    Err(error) => warn!(%id, ?error, "Failed to load position for broadcast"),
+                }
+            })
+            .on(|id, event| async move {
+                if matches!(
+                    event,
+                    crate::offchain_order::OffchainOrderEvent::Filled { .. }
+                ) {
+                    match load_entity::<OffchainOrder>(&self.pool, &id).await {
+                        Ok(Some(OffchainOrder::Filled {
+                            symbol,
+                            shares,
+                            direction,
+                            executor,
+                            filled_at,
+                            ..
+                        })) => {
+                            self.broadcast_fill(Trade {
+                                id: id.to_string(),
+                                filled_at,
+                                venue: executor_to_venue(executor),
+                                direction: direction_to_dto(direction),
+                                symbol,
+                                shares: st0x_finance::FractionalShares::new(shares.inner().inner()),
+                            });
+                        }
+                        Ok(_) => {
+                            warn!(%id, "OffchainOrder not in Filled state after Filled event");
+                        }
+                        Err(error) => {
+                            warn!(%id, ?error, "Failed to load OffchainOrder for fill broadcast");
+                        }
+                    }
+                }
+            })
+            .on(|id, _event| async move {
                 match load_entity::<TokenizedEquityMint>(&self.pool, &id).await {
                     Ok(Some(entity)) => self.broadcast_transfer(entity.to_dto(&id)),
                     Ok(None) => warn!(%id, "Mint entity not found for transfer broadcast"),
-                    Err(error) => warn!(%id, ?error, "Failed to load mint entity for broadcast"),
+                    Err(error) => warn!(%id, ?error, "Failed to load mint for broadcast"),
                 }
             })
-            .on(|id, event| async move {
-                self.broadcast_event::<EquityRedemption>(&id, &event);
-
+            .on(|id, _event| async move {
                 match load_entity::<EquityRedemption>(&self.pool, &id).await {
                     Ok(Some(entity)) => self.broadcast_transfer(entity.to_dto(&id)),
-                    Ok(None) => warn!(%id, "Redemption entity not found for transfer broadcast"),
-                    Err(error) => {
-                        warn!(%id, ?error, "Failed to load redemption entity for broadcast");
-                    }
+                    Ok(None) => warn!(%id, "Redemption entity not found for broadcast"),
+                    Err(error) => warn!(%id, ?error, "Failed to load redemption for broadcast"),
                 }
             })
-            .on(|id, event| async move {
-                self.broadcast_event::<UsdcRebalance>(&id, &event);
-
+            .on(|id, _event| async move {
                 match load_entity::<UsdcRebalance>(&self.pool, &id).await {
                     Ok(Some(entity)) => self.broadcast_transfer(entity.to_dto(&id)),
                     Ok(None) => warn!(%id, "USDC rebalance entity not found for broadcast"),
-                    Err(error) => {
-                        warn!(%id, ?error, "Failed to load USDC rebalance entity for broadcast");
-                    }
+                    Err(error) => warn!(%id, ?error, "Failed to load rebalance for broadcast"),
                 }
             })
             .exhaustive()
@@ -112,197 +178,23 @@ impl Reactor for EventBroadcaster {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::Address;
-    use rain_math_float::Float;
-    use uuid::Uuid;
-
     use st0x_event_sorcery::ReactorHarness;
     use st0x_execution::Symbol;
 
     use super::*;
-    use crate::equity_redemption::{EquityRedemptionEvent, RedemptionAggregateId};
     use crate::test_utils::setup_test_db;
-    use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMintEvent};
-    use crate::usdc_rebalance::{UsdcRebalanceEvent, UsdcRebalanceId};
 
-    fn make_mint_requested_float(symbol: &str, quantity: Float) -> TokenizedEquityMintEvent {
-        TokenizedEquityMintEvent::MintRequested {
-            symbol: Symbol::new(symbol).unwrap(),
-            quantity,
-            wallet: Address::ZERO,
-            requested_at: chrono::Utc::now(),
-        }
-    }
-
-    fn make_mint_requested(symbol: &str, quantity: u64) -> TokenizedEquityMintEvent {
-        make_mint_requested_float(symbol, Float::parse(quantity.to_string()).unwrap())
-    }
-
-    fn make_redemption_completed() -> EquityRedemptionEvent {
-        EquityRedemptionEvent::Completed {
-            completed_at: chrono::Utc::now(),
-        }
-    }
-
-    fn make_usdc_withdrawal_confirmed() -> UsdcRebalanceEvent {
-        UsdcRebalanceEvent::WithdrawalConfirmed {
-            confirmed_at: chrono::Utc::now(),
-        }
+    fn test_broadcaster(pool: SqlitePool) -> (Broadcaster, broadcast::Receiver<Statement>) {
+        let (sender, receiver) = broadcast::channel(16);
+        let broadcaster = Broadcaster::new(sender, pool);
+        (broadcaster, receiver)
     }
 
     #[tokio::test]
-    async fn event_broadcaster_sends_to_channel() {
+    async fn no_broadcast_without_events() {
         let pool = setup_test_db().await;
         let (sender, mut receiver) = broadcast::channel(16);
-        let broadcaster = EventBroadcaster::new(sender, pool);
-
-        let id = IssuerRequestId::new("mint-123".to_string());
-
-        broadcaster.broadcast_event::<TokenizedEquityMint>(&id, &make_mint_requested("TSLA", 50));
-
-        let msg = receiver.recv().await.expect("should receive message");
-
-        match msg {
-            ServerMessage::Event(entry) => {
-                assert_eq!(entry.aggregate_type, "TokenizedEquityMint");
-                assert_eq!(entry.aggregate_id, "mint-123");
-                assert_eq!(entry.event_type, "TokenizedEquityMintEvent::MintRequested");
-            }
-            other => panic!("expected Event message, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn event_broadcaster_handles_no_receivers() {
-        let pool = setup_test_db().await;
-        let (sender, _) = broadcast::channel::<ServerMessage>(16);
-        let broadcaster = EventBroadcaster::new(sender, pool);
-
-        let id = IssuerRequestId::new("mint-456".to_string());
-
-        broadcaster.broadcast_event::<TokenizedEquityMint>(&id, &make_mint_requested("GOOG", 10));
-    }
-
-    #[tokio::test]
-    async fn reactor_receive_broadcasts_mint_event() {
-        let pool = setup_test_db().await;
-        let (sender, mut receiver) = broadcast::channel(16);
-        let harness = ReactorHarness::new(EventBroadcaster::new(sender, pool));
-
-        let id = IssuerRequestId::new("mint-multi".to_string());
-
-        harness
-            .receive::<TokenizedEquityMint>(id, make_mint_requested("NVDA", 25))
-            .await
-            .unwrap();
-
-        let msg = receiver.recv().await.expect("should receive message");
-
-        match msg {
-            ServerMessage::Event(entry) => {
-                assert_eq!(entry.event_type, "TokenizedEquityMintEvent::MintRequested");
-            }
-            other => panic!("expected Event message, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn reactor_receive_works_for_equity_redemption() {
-        let pool = setup_test_db().await;
-        let (sender, mut receiver) = broadcast::channel(16);
-        let harness = ReactorHarness::new(EventBroadcaster::new(sender, pool));
-
-        let id = RedemptionAggregateId::new("redemption-123".to_string());
-
-        harness
-            .receive::<EquityRedemption>(id, make_redemption_completed())
-            .await
-            .unwrap();
-
-        let msg = receiver.recv().await.expect("should receive message");
-
-        match msg {
-            ServerMessage::Event(entry) => {
-                assert_eq!(entry.aggregate_type, "EquityRedemption");
-                assert_eq!(entry.aggregate_id, "redemption-123");
-                assert_eq!(entry.event_type, "EquityRedemptionEvent::Completed");
-            }
-            other => panic!("expected Event message, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn reactor_receive_works_for_usdc_rebalance() {
-        let pool = setup_test_db().await;
-        let (sender, mut receiver) = broadcast::channel(16);
-        let harness = ReactorHarness::new(EventBroadcaster::new(sender, pool));
-
-        let id = UsdcRebalanceId(Uuid::new_v4());
-
-        harness
-            .receive::<UsdcRebalance>(id.clone(), make_usdc_withdrawal_confirmed())
-            .await
-            .unwrap();
-
-        let msg = receiver.recv().await.expect("should receive message");
-
-        match msg {
-            ServerMessage::Event(entry) => {
-                assert_eq!(entry.aggregate_type, "UsdcRebalance");
-                assert_eq!(entry.aggregate_id, id.to_string());
-                assert_eq!(entry.event_type, "UsdcRebalanceEvent::WithdrawalConfirmed");
-            }
-            other => panic!("expected Event message, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn multiple_subscribers_receive_same_event() {
-        let (sender, mut receiver1) = broadcast::channel(16);
-        let mut receiver2 = sender.subscribe();
-        let mut receiver3 = sender.subscribe();
-        let pool = setup_test_db().await;
-        let broadcaster = EventBroadcaster::new(sender, pool);
-
-        let id = IssuerRequestId::new("multi-sub".to_string());
-
-        broadcaster.broadcast_event::<TokenizedEquityMint>(&id, &make_mint_requested("MSFT", 100));
-
-        let msg1 = receiver1
-            .recv()
-            .await
-            .expect("receiver1 should get message");
-        let msg2 = receiver2
-            .recv()
-            .await
-            .expect("receiver2 should get message");
-        let msg3 = receiver3
-            .recv()
-            .await
-            .expect("receiver3 should get message");
-
-        for (i, msg) in [msg1, msg2, msg3].into_iter().enumerate() {
-            match msg {
-                ServerMessage::Event(entry) => {
-                    assert_eq!(
-                        entry.aggregate_id,
-                        "multi-sub",
-                        "receiver {} got wrong aggregate_id",
-                        i + 1
-                    );
-                }
-                other => {
-                    panic!("receiver {} expected Event message, got {other:?}", i + 1)
-                }
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn broadcast_empty_does_nothing() {
-        let pool = setup_test_db().await;
-        let (sender, mut receiver) = broadcast::channel(16);
-        let _broadcaster = EventBroadcaster::new(sender, pool);
+        let _broadcaster = Broadcaster::new(sender, pool);
 
         let result =
             tokio::time::timeout(std::time::Duration::from_millis(10), receiver.recv()).await;
@@ -311,54 +203,191 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn event_store_entry_serializes_correctly() {
+    async fn onchain_trade_filled_broadcasts_fill() {
         let pool = setup_test_db().await;
-        let (sender, _) = broadcast::channel(16);
-        let broadcaster = EventBroadcaster::new(sender, pool);
+        let (broadcaster, mut receiver) = test_broadcaster(pool);
+        let harness = ReactorHarness::new(broadcaster);
 
-        let id = IssuerRequestId::new("serialize-test".to_string());
-
-        broadcaster.broadcast_event::<TokenizedEquityMint>(&id, &make_mint_requested("GOOG", 10));
-
-        // Verify the entry via JSON (can't get the msg since receiver was dropped,
-        // but we can test the entry construction directly)
-        let entry = EventStoreEntry {
-            aggregate_type: "TokenizedEquityMint".to_string(),
-            aggregate_id: "serialize-test".to_string(),
-            sequence: 42,
-            event_type: "TokenizedEquityMintEvent::MintRequested".to_string(),
-            timestamp: Utc::now(),
+        let now = chrono::Utc::now();
+        let id = crate::onchain_trade::OnChainTradeId {
+            tx_hash: alloy::primitives::TxHash::ZERO,
+            log_index: 0,
         };
-        let json = serde_json::to_string(&entry).expect("serialization should succeed");
-
-        assert!(json.contains("\"aggregate_type\":\"TokenizedEquityMint\""));
-        assert!(json.contains("\"aggregate_id\":\"serialize-test\""));
-        assert!(json.contains("\"sequence\":42"));
-        assert!(json.contains("\"event_type\":\"TokenizedEquityMintEvent::MintRequested\""));
-        assert!(json.contains("\"timestamp\""));
-    }
-
-    #[tokio::test]
-    async fn reactor_broadcasts_mint_event_with_fractional_quantity() {
-        let pool = setup_test_db().await;
-        let (sender, mut receiver) = broadcast::channel(16);
-        let harness = ReactorHarness::new(EventBroadcaster::new(sender, pool));
-
-        let id = IssuerRequestId::new("mint-frac".to_string());
-        let fractional_qty = Float::parse("25.5".to_string()).unwrap();
 
         harness
-            .receive::<TokenizedEquityMint>(id, make_mint_requested_float("TSLA", fractional_qty))
+            .receive::<OnChainTrade>(
+                id,
+                OnChainTradeEvent::Filled {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    amount: st0x_float_macro::float!(10),
+                    direction: st0x_execution::Direction::Buy,
+                    price_usdc: st0x_float_macro::float!(150),
+                    block_number: 12345,
+                    block_timestamp: now,
+                    filled_at: now,
+                },
+            )
             .await
             .unwrap();
 
-        let msg = receiver.recv().await.expect("should receive message");
+        let msg = receiver.recv().await.expect("should receive fill");
 
         match msg {
-            ServerMessage::Event(entry) => {
-                assert_eq!(entry.event_type, "TokenizedEquityMintEvent::MintRequested");
+            Statement::TradeFill(trade) => {
+                assert!(matches!(trade.venue, TradingVenue::Raindex));
+                assert!(matches!(trade.direction, TradeDirection::Buy));
+                assert_eq!(trade.symbol, Symbol::new("AAPL").unwrap());
             }
-            other => panic!("expected Event message, got {other:?}"),
+            other => panic!("expected TradeFill message, got {other:?}"),
+        }
+    }
+
+    async fn insert_event(
+        pool: &SqlitePool,
+        aggregate_type: &str,
+        aggregate_id: &str,
+        sequence: i64,
+        event_type: &str,
+        payload: serde_json::Value,
+    ) {
+        sqlx::query(
+            "INSERT INTO events (aggregate_type, aggregate_id, sequence,
+             event_type, event_version, payload, metadata)
+             VALUES (?1, ?2, ?3, ?4, '1.0', ?5, '{}')",
+        )
+        .bind(aggregate_type)
+        .bind(aggregate_id)
+        .bind(sequence)
+        .bind(event_type)
+        .bind(serde_json::to_string(&payload).unwrap())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn offchain_order_filled_broadcasts_fill() {
+        use crate::offchain_order::OffchainOrderEvent;
+
+        let pool = setup_test_db().await;
+        let (broadcaster, mut receiver) = test_broadcaster(pool.clone());
+        let harness = ReactorHarness::new(broadcaster);
+
+        let now = chrono::Utc::now();
+        let id = crate::offchain_order::OffchainOrderId::new();
+
+        // Seed OffchainOrder aggregate to Filled state via direct event insertion
+        let placed = OffchainOrderEvent::Placed {
+            symbol: Symbol::new("TSLA").unwrap(),
+            shares: st0x_execution::Positive::new(st0x_execution::FractionalShares::new(
+                st0x_float_macro::float!(5),
+            ))
+            .unwrap(),
+            direction: st0x_execution::Direction::Sell,
+            executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+            placed_at: now,
+        };
+        let submitted = OffchainOrderEvent::Submitted {
+            executor_order_id: st0x_execution::ExecutorOrderId::new("test-order"),
+            submitted_at: now,
+        };
+        let filled = OffchainOrderEvent::Filled {
+            price: st0x_finance::Usd::new(st0x_float_macro::float!(245)),
+            filled_at: now,
+        };
+
+        let id_str = id.to_string();
+        insert_event(
+            &pool,
+            "OffchainOrder",
+            &id_str,
+            0,
+            "OffchainOrderEvent::Placed",
+            serde_json::to_value(&placed).unwrap(),
+        )
+        .await;
+        insert_event(
+            &pool,
+            "OffchainOrder",
+            &id_str,
+            1,
+            "OffchainOrderEvent::Submitted",
+            serde_json::to_value(&submitted).unwrap(),
+        )
+        .await;
+        insert_event(
+            &pool,
+            "OffchainOrder",
+            &id_str,
+            2,
+            "OffchainOrderEvent::Filled",
+            serde_json::to_value(&filled).unwrap(),
+        )
+        .await;
+
+        // Fire the Filled event through the reactor
+        harness.receive::<OffchainOrder>(id, filled).await.unwrap();
+
+        let msg = receiver.recv().await.expect("should receive fill");
+
+        match msg {
+            Statement::TradeFill(trade) => {
+                assert!(matches!(trade.venue, TradingVenue::Alpaca));
+                assert!(matches!(trade.direction, TradeDirection::Sell));
+                assert_eq!(trade.symbol, Symbol::new("TSLA").unwrap());
+            }
+            other => panic!("expected TradeFill message, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn position_update_broadcasts_net_position() {
+        use crate::position::PositionEvent;
+
+        let pool = setup_test_db().await;
+        let (broadcaster, mut receiver) = test_broadcaster(pool.clone());
+        let harness = ReactorHarness::new(broadcaster);
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = chrono::Utc::now();
+
+        // Seed a Position aggregate via direct event insertion
+        let initialized = PositionEvent::Initialized {
+            symbol: symbol.clone(),
+            threshold: crate::threshold::ExecutionThreshold::Shares(
+                st0x_execution::Positive::new(st0x_execution::FractionalShares::new(
+                    st0x_float_macro::float!(1),
+                ))
+                .unwrap(),
+            ),
+            initialized_at: now,
+        };
+
+        insert_event(
+            &pool,
+            "Position",
+            &symbol.to_string(),
+            0,
+            "PositionEvent::Initialized",
+            serde_json::to_value(&initialized).unwrap(),
+        )
+        .await;
+
+        harness
+            .receive::<Position>(symbol.clone(), initialized)
+            .await
+            .unwrap();
+
+        let msg = receiver
+            .recv()
+            .await
+            .expect("should receive position update");
+
+        match msg {
+            Statement::PositionUpdate(position) => {
+                assert_eq!(position.symbol, symbol);
+            }
+            other => panic!("expected PositionUpdate message, got {other:?}"),
         }
     }
 }

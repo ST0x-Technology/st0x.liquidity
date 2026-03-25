@@ -67,7 +67,7 @@ impl JournalRequest {
 }
 
 /// Response from the Alpaca Broker API when creating a journal.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct JournalResponse {
     pub id: Uuid,
     pub status: JournalStatus,
@@ -87,6 +87,23 @@ pub struct JournalResponse {
     pub settle_date: Option<NaiveDate>,
     pub system_date: Option<NaiveDate>,
     pub description: Option<String>,
+}
+
+impl std::fmt::Debug for JournalResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JournalResponse")
+            .field("id", &self.id)
+            .field("status", &self.status)
+            .field("symbol", &self.symbol)
+            .field("quantity", &self.quantity)
+            .field("price", &st0x_float_serde::DebugOptionFloat(&self.price))
+            .field("from_account", &self.from_account)
+            .field("to_account", &self.to_account)
+            .field("settle_date", &self.settle_date)
+            .field("system_date", &self.system_date)
+            .field("description", &self.description)
+            .finish()
+    }
 }
 
 fn deserialize_positive_fractional_shares<'de, D>(
@@ -231,5 +248,23 @@ mod tests {
 
         assert_eq!(response.settle_date, NaiveDate::from_ymd_opt(2026, 2, 28));
         assert_eq!(response.system_date, NaiveDate::from_ymd_opt(2026, 2, 26));
+    }
+
+    #[test]
+    fn debug_output_shows_price_as_decimal() {
+        let mut json = journal_json("5.25");
+        json["price"] = serde_json::json!("149.99");
+
+        let response: JournalResponse = serde_json::from_value(json).unwrap();
+        let debug = format!("{response:?}");
+
+        assert!(
+            debug.contains("149.99"),
+            "Debug output should show price as decimal, got: {debug}"
+        );
+        assert!(
+            !debug.contains("0x"),
+            "Debug output should not show raw hex for price, got: {debug}"
+        );
     }
 }
