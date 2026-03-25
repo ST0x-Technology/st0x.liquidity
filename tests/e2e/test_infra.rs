@@ -12,7 +12,7 @@ use alloy::primitives::{Address, U256, utils::parse_units};
 use alloy::providers::Provider;
 use rain_math_float::Float;
 use tempfile::TempDir;
-use tracing::info;
+use tracing::{debug, info};
 
 use st0x_bridge::cctp::CctpAttestationMock;
 use st0x_execution::Symbol;
@@ -101,19 +101,20 @@ impl TestInfra<()> {
         let mut equity_addresses = Vec::new();
         for (symbol, _price) in &equity_prices {
             let (vault_addr, underlying_addr) = base_chain.deploy_equity_vault(symbol).await?;
+            debug!(%symbol, %vault_addr, %underlying_addr, "Deployed equity vault");
             equity_addresses.push(((*symbol).to_owned(), vault_addr, underlying_addr));
         }
 
-        // Fund taker with equity vault shares so it can take BuyEquity
-        // orders (where the taker pays equity tokens to the order).
+        debug!("Funding taker with equity vault shares");
         let taker_equity: U256 = parse_units("100000", 18)?.into();
-        for (_symbol, vault_addr, _underlying_addr) in &equity_addresses {
+        for (symbol, vault_addr, _underlying_addr) in &equity_addresses {
             DeployableERC20::new(*vault_addr, &base_chain.provider)
                 .transfer(base_chain.taker, taker_equity)
                 .send()
                 .await?
                 .get_receipt()
                 .await?;
+            debug!(%symbol, "Funded taker");
         }
 
         let symbol_prices: Vec<(Symbol, Float)> = equity_prices
@@ -149,6 +150,8 @@ impl TestInfra<()> {
             .symbol_positions(symbol_positions)
             .call()
             .await;
+        debug!(broker_url = %broker_service.base_url(), "Broker mock started");
+
         let mut tokenization_service = AlpacaTokenizationMock::start(broker_service.server());
         // Map both vault and underlying token addresses to symbol so the
         // redemption watcher can resolve the symbol regardless of which
@@ -169,16 +172,17 @@ impl TestInfra<()> {
                 token_symbols,
             )
             .await?;
+        debug!("Redemption watcher started");
 
-        // Map symbol -> underlying token address so the mint executor can
-        // transfer real ERC-20 tokens on Anvil when a mint request completes.
         let mint_token_addresses: HashMap<String, Address> = equity_addresses
             .iter()
             .map(|(symbol, _vault_addr, underlying_addr)| (symbol.clone(), *underlying_addr))
             .collect();
         tokenization_service.start_mint_executor(base_chain.provider.clone(), mint_token_addresses);
+        debug!("Mint executor started");
 
         let attestation_service = CctpAttestationMock::start().await;
+        debug!("CCTP attestation mock started");
         info!("Test infrastructure ready");
 
         Ok(TestInfra {
