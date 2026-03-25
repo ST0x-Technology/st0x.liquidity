@@ -276,19 +276,28 @@ impl EventSourced for OffchainOrder {
                 };
 
                 match services.place_market_order(market_order).await {
-                    Ok(result) => Ok(vec![
-                        OffchainOrderEvent::Placed {
-                            symbol,
-                            shares: result.placed_shares,
-                            direction,
-                            executor,
-                            placed_at: now,
-                        },
-                        OffchainOrderEvent::Submitted {
-                            executor_order_id: result.executor_order_id,
-                            submitted_at: now,
-                        },
-                    ]),
+                    Ok(result) => {
+                        if result.placed_shares > shares {
+                            return Err(OffchainOrderError::PlacedExceedsRequested {
+                                placed: result.placed_shares,
+                                requested: shares,
+                            });
+                        }
+
+                        Ok(vec![
+                            OffchainOrderEvent::Placed {
+                                symbol,
+                                shares: result.placed_shares,
+                                direction,
+                                executor,
+                                placed_at: now,
+                            },
+                            OffchainOrderEvent::Submitted {
+                                executor_order_id: result.executor_order_id,
+                                submitted_at: now,
+                            },
+                        ])
+                    }
                     Err(error) => Ok(vec![
                         OffchainOrderEvent::Placed {
                             symbol,
@@ -480,12 +489,26 @@ pub(crate) fn noop_order_placer() -> Arc<dyn OrderPlacer> {
         ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
             Ok(OrderPlacementResult {
                 executor_order_id: ExecutorOrderId::new("noop"),
-                placed_shares: order.shares,
+                placed_shares: noop_placed_shares(order.shares),
             })
         }
     }
 
     Arc::new(Noop)
+}
+
+/// Returns a placed_shares value distinct from the requested shares,
+/// simulating broker truncation. Used so tests can verify the system
+/// persists the broker-accepted quantity, not the original request.
+#[cfg(test)]
+pub(crate) fn noop_placed_shares(
+    requested: Positive<FractionalShares>,
+) -> Positive<FractionalShares> {
+    let original = requested.inner().inner();
+    let offset = st0x_float_macro::float!(0.001);
+    let truncated = (original - offset).expect("subtraction should not fail");
+
+    Positive::new(FractionalShares::new(truncated)).expect("truncated shares should be positive")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -589,6 +612,14 @@ pub enum OffchainOrderError {
     AlreadyCompleted,
     #[error("Order has not been placed yet")]
     NotPlaced,
+    #[error(
+        "Broker placed {placed} shares, exceeding the \
+         requested {requested}"
+    )]
+    PlacedExceedsRequested {
+        placed: Positive<FractionalShares>,
+        requested: Positive<FractionalShares>,
+    },
 }
 
 #[cfg(test)]
@@ -633,6 +664,14 @@ mod tests {
 
         let inner = store.load(&id).await.unwrap().unwrap();
         assert!(matches!(inner, OffchainOrder::Submitted { .. }));
+
+        let expected =
+            noop_placed_shares(Positive::new(FractionalShares::new(float!(100))).unwrap());
+        assert_eq!(
+            inner.shares(),
+            expected,
+            "Persisted shares should reflect the broker-accepted quantity, not the original request"
+        );
     }
 
     #[tokio::test]
@@ -646,6 +685,47 @@ mod tests {
         assert!(
             matches!(&inner, OffchainOrder::Failed { error, .. } if error.contains("Broker rejected")),
             "Expected Failed with broker error, got: {inner:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn place_rejects_when_placed_shares_exceed_requested() {
+        fn overfilling_order_placer() -> Arc<dyn OrderPlacer> {
+            struct Overfill;
+
+            #[async_trait]
+            impl OrderPlacer for Overfill {
+                async fn place_market_order(
+                    &self,
+                    order: MarketOrder,
+                ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+                {
+                    let original = order.shares.inner().inner();
+                    let extra = st0x_float_macro::float!(1);
+                    let overfilled = (original + extra).expect("addition should not fail");
+
+                    Ok(OrderPlacementResult {
+                        executor_order_id: ExecutorOrderId::new("OVERFILL"),
+                        placed_shares: Positive::new(FractionalShares::new(overfilled)).unwrap(),
+                    })
+                }
+            }
+
+            Arc::new(Overfill)
+        }
+
+        let store = TestStore::<OffchainOrder>::new(overfilling_order_placer());
+        let id = OffchainOrderId::new();
+
+        let err = store.send(&id, place_command()).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AggregateError::UserError(LifecycleError::Apply(
+                    OffchainOrderError::PlacedExceedsRequested { .. }
+                ))
+            ),
+            "Expected PlacedExceedsRequested error, got: {err:?}"
         );
     }
 

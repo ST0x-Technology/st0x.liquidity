@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::client::AlpacaBrokerApiClient;
@@ -207,7 +207,7 @@ pub(super) async fn place_market_order(
         )?;
 
     if !truncated_float.eq(original)? {
-        info!(
+        warn!(
             original = %market_order.shares,
             truncated = %FractionalShares::new(truncated_float),
             "Truncated order quantity to {} decimal places for Alpaca",

@@ -261,7 +261,7 @@ async fn backfilling() -> anyhow::Result<()> {
     let onchain_price = float!(155.00);
     let broker_fill_price = float!(150.00);
     let sell_amount = float!(4.5);
-    let trade_count: i64 = 3;
+    let trade_count: usize = 3;
 
     let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
 
@@ -310,7 +310,8 @@ async fn backfilling() -> anyhow::Result<()> {
     let pool = connect_db(&infra.db_path).await?;
     let queued = count_queued_events(&pool).await?;
     assert_eq!(
-        queued, trade_count,
+        queued,
+        i64::try_from(trade_count).unwrap(),
         "Expected exact queued event count from backfill",
     );
     let processed = count_processed_queue_events(&pool).await?;
@@ -326,6 +327,7 @@ async fn backfilling() -> anyhow::Result<()> {
         .expected_accumulated_long(float!(0))
         .expected_accumulated_short(float!(13.5))
         .expected_net(float!(0))
+        .order_count(trade_count)
         .build();
 
     assert_full_hedging_flow(

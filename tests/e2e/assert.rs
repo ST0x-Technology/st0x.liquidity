@@ -53,6 +53,10 @@ pub struct ExpectedPosition {
     pub expected_accumulated_long: Float,
     pub expected_accumulated_short: Float,
     pub expected_net: Float,
+    /// Number of broker orders expected for this symbol. Used to scale
+    /// the epsilon for cumulative fields (net, accumulated_long/short)
+    /// by the per-order truncation error (1e-9).
+    pub order_count: usize,
 }
 
 #[bon::bon]
@@ -67,6 +71,7 @@ impl ExpectedPosition {
         expected_accumulated_long: Float,
         expected_accumulated_short: Float,
         expected_net: Float,
+        #[builder(default = 1)] order_count: usize,
     ) -> Self {
         Self {
             symbol,
@@ -77,6 +82,7 @@ impl ExpectedPosition {
             expected_accumulated_long,
             expected_accumulated_short,
             expected_net,
+            order_count,
         }
     }
 
@@ -191,18 +197,12 @@ fn assert_total_broker_order_qty(
             (acc + order.quantity).unwrap()
         });
 
-    // Alpaca order quantities are truncated to 9 decimal places, so each order
-    // can lose up to 1e-9 of precision. Scale the epsilon by the number of
-    // orders to accommodate the cumulative truncation error.
-    let per_order_epsilon =
-        Float::parse("0.000000001".to_string()).expect("per_order_epsilon parse");
-    let order_count = Float::parse(symbol_orders.len().to_string()).expect("order_count parse");
-    let truncation_epsilon = (per_order_epsilon * order_count).expect("epsilon mul");
+    let epsilon = truncation_epsilon(symbol_orders.len());
 
     assert_decimal_eq!(
         total_quantity,
         expected_position.amount,
-        truncation_epsilon,
+        epsilon,
         "Total broker order quantity for {} should match expected hedge amount",
         expected_position.symbol
     );
@@ -467,6 +467,15 @@ fn assert_offchain_order_events(expected_positions: &[ExpectedPosition], events:
     }
 }
 
+/// Computes a truncation-aware epsilon scaled by the number of broker orders.
+/// Each order can lose up to 1e-9 of precision from Alpaca's 9-decimal-place
+/// truncation; cumulative fields need epsilon proportional to order count.
+fn truncation_epsilon(order_count: usize) -> Float {
+    let per_order = Float::parse("0.000000001".to_string()).expect("per_order_epsilon parse");
+    let count = Float::parse(order_count.to_string()).expect("order_count parse");
+    (per_order * count).expect("epsilon mul")
+}
+
 async fn assert_position_view(
     expected_position: &ExpectedPosition,
     pool: &SqlitePool,
@@ -484,26 +493,27 @@ async fn assert_position_view(
     let expected_net = expected_position.expected_net;
     let expected_long = expected_position.expected_accumulated_long;
     let expected_short = expected_position.expected_accumulated_short;
+    let epsilon = truncation_epsilon(expected_position.order_count);
 
     assert_eq!(position.symbol, symbol);
     assert_decimal_eq!(
         position.net.inner(),
         expected_net,
-        *DEFAULT_EPSILON,
+        epsilon,
         "net position mismatch for {}",
         expected_position.symbol
     );
     assert_decimal_eq!(
         position.accumulated_long.inner(),
         expected_long,
-        *DEFAULT_EPSILON,
+        epsilon,
         "accumulated_long mismatch for {}",
         expected_position.symbol
     );
     assert_decimal_eq!(
         position.accumulated_short.inner(),
         expected_short,
-        *DEFAULT_EPSILON,
+        epsilon,
         "accumulated_short mismatch for {}",
         expected_position.symbol
     );
@@ -744,13 +754,6 @@ macro_rules! assert_decimal_eq {
         }
     };
 }
-/// Position epsilon accounts for Alpaca's 9-decimal-place truncation.
-/// Broker orders truncate to 9 decimal places, so any position involving
-/// a broker fill can have up to ~1e-9 residual from the truncation remainder.
-pub(crate) static DEFAULT_EPSILON: std::sync::LazyLock<Float> = std::sync::LazyLock::new(|| {
-    Float::parse("0.000000001".to_string())
-        .unwrap_or_else(|error| panic!("DEFAULT_EPSILON parse failed: {error:?}"))
-});
 
 #[cfg(test)]
 mod tests {

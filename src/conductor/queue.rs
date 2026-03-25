@@ -246,7 +246,9 @@ mod tests {
     use std::sync::Arc;
 
     use st0x_event_sorcery::{Projection, StoreBuilder, test_store};
-    use st0x_execution::{ExecutorOrderId, MarketOrder, MockExecutor, Symbol};
+    use st0x_execution::{
+        ExecutorOrderId, FractionalShares, MarketOrder, MockExecutor, Positive, Symbol,
+    };
 
     use super::*;
     use crate::bindings::IOrderBookV6::{ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4};
@@ -267,6 +269,9 @@ mod tests {
         offchain_order_projection: Arc<Projection<OffchainOrder>>,
     }
 
+    /// Mock order placer that returns a distinct `placed_shares` value
+    /// (different from the requested quantity) so tests can verify the
+    /// system persists the broker-accepted quantity, not the original request.
     fn succeeding_order_placer() -> Arc<dyn OrderPlacer> {
         struct TestOrderPlacer;
 
@@ -274,16 +279,20 @@ mod tests {
         impl OrderPlacer for TestOrderPlacer {
             async fn place_market_order(
                 &self,
-                order: MarketOrder,
+                _order: MarketOrder,
             ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("TEST_BROKER_ORD"),
-                    placed_shares: order.shares,
+                    placed_shares: mock_placed_shares(),
                 })
             }
         }
 
         Arc::new(TestOrderPlacer)
+    }
+
+    fn mock_placed_shares() -> Positive<FractionalShares> {
+        Positive::new(FractionalShares::new(float!(0.999))).unwrap()
     }
 
     async fn create_test_cqrs_frameworks(
@@ -499,6 +508,12 @@ mod tests {
         assert!(
             matches!(offchain_order, OffchainOrder::Submitted { .. }),
             "Offchain order should be Submitted after successful placement, got: {offchain_order:?}"
+        );
+
+        assert_eq!(
+            offchain_order.shares(),
+            mock_placed_shares(),
+            "Offchain order shares should reflect the broker-accepted quantity, not the original request"
         );
     }
 
