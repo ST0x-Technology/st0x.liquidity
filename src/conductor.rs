@@ -1,6 +1,8 @@
 //! Orchestrates the bot lifecycle: startup sequencing, runtime task management,
 //! and trade processing. [`Conductor::run`] is the entry point.
 
+pub(crate) mod job;
+
 mod builder;
 pub(crate) mod job;
 mod manifest;
@@ -8,27 +10,32 @@ mod order_fill_monitor;
 
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
+use alloy::rpc::types::Log;
+use alloy::sol_types;
+use apalis::prelude::TaskSink;
 use apalis_sqlite::SqliteStorage;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use task_supervisor::SupervisorHandle;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
-use st0x_dto::ServerMessage;
+use st0x_dto::Statement;
 use st0x_event_sorcery::{Projection, Store, StoreBuilder};
-use st0x_evm::Wallet;
+use st0x_evm::{Evm, Wallet};
 use st0x_execution::{Executor, FractionalShares, Symbol};
 
 use crate::alpaca_wallet::AlpacaWalletService;
-use crate::bindings::IOrderBookV6::{self, IOrderBookV6Instance};
-use crate::config::{AssetsConfig, Ctx, CtxError};
-use crate::dashboard::EventBroadcaster;
-use crate::inventory::{BroadcastingInventory, InventoryPollingService, InventorySnapshot};
+use crate::bindings::IOrderBookV6::{ClearV3, IOrderBookV6Instance, TakeOrderV3};
+use crate::config::{AssetsConfig, Ctx, CtxError, OperationMode};
+use crate::dashboard::Broadcaster;
+use crate::inventory::{
+    BroadcastingInventory, InventoryPollingService, InventorySnapshot, WalletPollingCtx,
+};
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer,
@@ -36,7 +43,7 @@ use crate::offchain_order::{
 use crate::onchain::OnchainTrade;
 use crate::onchain::USDC_BASE;
 use crate::onchain::accumulator::{ExecutionCtx, check_all_positions, check_execution_readiness};
-use crate::onchain::backfill::{backfill_events, get_backfill_retry_strat};
+use crate::onchain::backfill::backfill_events;
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::onchain::trade::{RaindexTradeEvent, extract_owned_vaults, extract_vaults_from_clear};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
@@ -55,11 +62,19 @@ use crate::trading::onchain::trade_accountant::{DexTradeAccountingJobQueue, Trad
 use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryId};
 use crate::wrapper::WrapperService;
 
-pub(crate) use builder::CqrsFrameworks;
-use manifest::QueryManifest;
+use self::manifest::QueryManifest;
+use crate::trading::onchain::inclusion::ChainIncluded;
+use crate::trading::onchain::trade_accountant::{
+    AccountForDexTrade, DexTradeAccountingJobQueue, TradeAccountingError,
+};
+pub(crate) use builder::{ConductorBuilder, ConductorCtx, CqrsFrameworks};
 
-/// Sets up apalis SQLite storage tables, tolerating pre-existing
+/// Sets up apalis `SQLite` storage tables, tolerating pre-existing
 /// application migrations in the shared `_sqlx_migrations` table.
+///
+/// # Errors
+///
+/// Returns an error if the migration fails.
 pub(crate) async fn setup_apalis_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     apalis_sqlite::SqliteStorage::migrations()
         .set_ignore_missing(true)
@@ -80,13 +95,16 @@ pub(crate) struct TradeProcessingCqrs {
 }
 
 pub(crate) struct Conductor {
-    supervisor: SupervisorHandle,
-    monitor: JoinHandle<()>,
-    executor_maintenance: Option<JoinHandle<()>>,
-    rebalancer: Option<JoinHandle<()>>,
-    inventory_poller: Option<JoinHandle<()>>,
+    pub(crate) supervisor: task_supervisor::SupervisorHandle,
+    pub(crate) monitor: JoinHandle<()>,
+    pub(crate) order_poller: JoinHandle<()>,
+    pub(crate) position_checker: JoinHandle<()>,
+    pub(crate) executor_maintenance: Option<JoinHandle<()>>,
+    pub(crate) rebalancer: Option<JoinHandle<()>>,
+    pub(crate) inventory_poller: Option<JoinHandle<()>>,
 }
 
+<<<<<<< variant A
 fn base_wallet_unwrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Address> {
     ctx.assets
         .equities
@@ -96,7 +114,31 @@ fn base_wallet_unwrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Ad
         .map(|(symbol, config)| (symbol.clone(), config.tokenized_equity))
         .collect()
 }
+>>>>>>> variant B
+pub(crate) async fn run_market_hours_loop<E>(
+    executor: E,
+    ctx: Ctx,
+    pool: SqlitePool,
+    executor_maintenance: Option<JoinHandle<()>>,
+    event_sender: broadcast::Sender<Statement>,
+    inventory: Arc<BroadcastingInventory>,
+) -> anyhow::Result<()>
+where
+    E: Executor + Clone + Send + Sync + 'static,
+    TradeAccountingError: From<E::Error>,
+{
+    let mut conductor = Conductor::start(
+        ctx,
+        pool,
+        executor,
+        executor_maintenance,
+        event_sender,
+        inventory,
+    )
+    .await?;
+======= end
 
+<<<<<<< variant A
 fn base_wallet_wrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Address> {
     ctx.assets
         .equities
@@ -105,6 +147,12 @@ fn base_wallet_wrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Addr
         .filter(|(symbol, _)| ctx.is_trading_enabled(symbol) || ctx.is_rebalancing_enabled(symbol))
         .map(|(symbol, config)| (symbol.clone(), config.tokenized_equity_derivative))
         .collect()
+>>>>>>> variant B
+    info!("Conductor running");
+    let result = conductor.wait_for_completion().await;
+    conductor.abort_all();
+    result
+======= end
 }
 
 /// Context for vault discovery operations during trade processing.
@@ -120,11 +168,15 @@ impl Conductor {
         ctx: Ctx,
         pool: SqlitePool,
         executor_maintenance: Option<JoinHandle<()>>,
-        event_sender: broadcast::Sender<ServerMessage>,
+        event_sender: broadcast::Sender<Statement>,
         inventory: Arc<BroadcastingInventory>,
     ) -> anyhow::Result<()>
     where
+<<<<<<< variant A
         E: Executor + Clone + Send + 'static,
+>>>>>>> variant B
+        E: Executor + Clone + Send + Sync + 'static,
+======= end
         TradeAccountingError: From<E::Error>,
     {
         // Phase 1: connect WS and set up apalis tables (parallel)
@@ -133,14 +185,50 @@ impl Conductor {
         let cache = SymbolCache::default();
         let orderbook = IOrderBookV6Instance::new(ctx.evm.orderbook, &provider);
 
+<<<<<<< variant A
         setup_apalis_tables(&pool).await?;
         let job_queue: DexTradeAccountingJobQueue = SqliteStorage::new(&pool);
+>>>>>>> variant B
+            setup_apalis_tables(&pool).await?;
+            let mut job_queue: DexTradeAccountingJobQueue = SqliteStorage::new(&pool);
+======= end
 
+<<<<<<< variant A
         let mut clear_stream = orderbook.ClearV3_filter().watch().await?.into_stream();
         let mut take_stream = orderbook.TakeOrderV3_filter().watch().await?.into_stream();
+>>>>>>> variant B
+            let mut clear_stream = orderbook.ClearV3_filter().watch().await?.into_stream();
+            let mut take_stream = orderbook.TakeOrderV3_filter().watch().await?.into_stream();
+======= end
 
+<<<<<<< variant A
         // Phase 2: determine cutoff block from WS subscription
         let cutoff_block = get_cutoff_block(&mut clear_stream, &mut take_stream, &provider).await?;
+>>>>>>> variant B
+            let cutoff_block = get_cutoff_block(
+                &mut clear_stream,
+                &mut take_stream,
+                &provider,
+                &mut job_queue,
+            )
+            .await?;
+
+            let dex_streams = order_fill_monitor::DexEventStreams {
+                clear: Box::pin(clear_stream),
+                take: Box::pin(take_stream),
+            };
+
+            if let Some(end_block) = cutoff_block.checked_sub(1) {
+                backfill_events(
+                    &provider,
+                    &ctx.evm,
+                    end_block,
+                    crate::onchain::backfill::get_backfill_retry_strat(),
+                    job_queue.clone(),
+                )
+                .await?;
+            }
+======= end
 
         // Phase 3: backfill historical events to the job queue
         if let Some(end_block) = cutoff_block.checked_sub(1) {
@@ -171,6 +259,7 @@ impl Conductor {
             Err(error) => return Err(error.into()),
         };
 
+<<<<<<< variant A
         let (position, position_projection, snapshot, rebalancer, wallet_polling) =
             if let Some(rebalancing_ctx) = rebalancing {
                 let ethereum_wallet = rebalancing_ctx.ethereum_wallet().clone();
@@ -201,7 +290,15 @@ impl Conductor {
                         &ctx,
                     ),
                 };
+>>>>>>> variant B
+            let rebalancing = match ctx.rebalancing_ctx() {
+                Ok(ctx) => Some(ctx.clone()),
+                Err(CtxError::NotRebalancing) => None,
+                Err(error) => return Err(error.into()),
+            };
+======= end
 
+<<<<<<< variant A
                 (
                     infra.position,
                     infra.position_projection,
@@ -213,9 +310,57 @@ impl Conductor {
                 let (position, position_projection) = build_position_cqrs(&pool).await?;
                 let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
                     .build(())
+>>>>>>> variant B
+            let (position, position_projection, snapshot, rebalancer, wallet_polling) =
+                if let Some(rebalancing_ctx) = rebalancing {
+                    let ethereum_wallet = rebalancing_ctx.ethereum_wallet().clone();
+                    let base_wallet = rebalancing_ctx.base_wallet().clone();
+                    let infra = spawn_rebalancing_infrastructure(
+                        rebalancing_ctx,
+                        ethereum_wallet.clone(),
+                        base_wallet.clone(),
+                        RebalancingDeps {
+                            pool: pool.clone(),
+                            ctx: ctx.clone(),
+                            inventory: inventory.clone(),
+                            event_sender,
+                            vault_registry: vault_registry.clone(),
+                            vault_registry_projection: vault_registry_projection.clone(),
+                        },
+                    )
+======= end
                     .await?;
+<<<<<<< variant A
                 (position, position_projection, snapshot, None, None)
             };
+>>>>>>> variant B
+
+                    let wallet_polling = WalletPollingCtx {
+                        ethereum: Some(ethereum_wallet),
+                        base: Some(base_wallet),
+                        alpaca_wallet: Some(infra.alpaca_wallet),
+                        unwrapped_equity_token_addresses:
+                            base_wallet_unwrapped_equity_token_addresses(&ctx),
+                        wrapped_equity_token_addresses: base_wallet_wrapped_equity_token_addresses(
+                            &ctx,
+                        ),
+                    };
+
+                    (
+                        infra.position,
+                        infra.position_projection,
+                        infra.snapshot,
+                        Some(infra.rebalancer),
+                        Some(wallet_polling),
+                    )
+                } else {
+                    let (position, position_projection) = build_position_cqrs(&pool).await?;
+                    let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
+                        .build(())
+                        .await?;
+                    (position, position_projection, snapshot, None, None)
+                };
+======= end
 
         let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer(executor.clone()));
 
@@ -235,10 +380,26 @@ impl Conductor {
             snapshot,
         };
 
+<<<<<<< variant A
         let dex_streams = order_fill_monitor::DexEventStreams {
             clear: Box::pin(clear_stream),
             take: Box::pin(take_stream),
         };
+>>>>>>> variant B
+            let conductor_ctx = ConductorCtx {
+                ctx: ctx.clone(),
+                cache,
+                provider,
+                executor,
+                execution_threshold: ctx.execution_threshold,
+                frameworks,
+                poll_notify: Arc::new(tokio::sync::Notify::new()),
+                wallet_polling,
+            };
+
+            let mut builder = ConductorBuilder::new(conductor_ctx, job_queue, dex_streams)
+                .with_executor_maintenance(executor_maintenance);
+======= end
 
         let conductor_ctx = builder::ConductorCtx {
             ctx: ctx.clone(),
@@ -251,6 +412,7 @@ impl Conductor {
             wallet_polling,
         };
 
+<<<<<<< variant A
         let mut conductor = builder::spawn()
             .context(conductor_ctx)
             .job_queue(job_queue)
@@ -263,35 +425,95 @@ impl Conductor {
         let result = conductor.wait_for_completion().await;
         conductor.abort_all();
         result
+>>>>>>> variant B
+            Ok(builder.spawn())
+        })
+======= end
     }
 }
 
 impl Conductor {
+<<<<<<< variant A
     pub(crate) async fn wait_for_completion(&mut self) -> anyhow::Result<()> {
+>>>>>>> variant B
+    pub(crate) async fn wait_for_completion(&mut self) -> Result<(), anyhow::Error> {
+======= end
         tokio::select! {
             result = self.supervisor.wait() => {
                 result?;
                 info!("Supervisor exited");
             }
             result = &mut self.monitor => {
+<<<<<<< variant A
                 if let Err(join_error) = result
                     && !join_error.is_cancelled()
                 {
                     return Err(anyhow::anyhow!("Apalis monitor failed: {join_error}"));
                 }
                 info!("Apalis monitor exited");
+>>>>>>> variant B
+                check_task_result(result, "Apalis monitor")?;
+            }
+            result = &mut self.order_poller => {
+                check_task_result(result, "Order poller")?;
+            }
+            result = &mut self.position_checker => {
+                check_task_result(result, "Position checker")?;
+======= end
             }
         }
 
         Ok(())
     }
+<<<<<<< variant A
+>>>>>>> variant B
+}
 
+fn check_task_result(
+    result: Result<(), tokio::task::JoinError>,
+    task_name: &str,
+) -> Result<(), anyhow::Error> {
+    if let Err(join_error) = result
+        && !join_error.is_cancelled()
+    {
+        return Err(anyhow::anyhow!("{task_name} failed: {join_error}"));
+    }
+
+    info!("{task_name} exited");
+    Ok(())
+}
+
+impl Conductor {
+    pub(crate) fn abort_trading_tasks(&self) {
+        info!(
+            "Aborting trading tasks (keeping rebalancer, inventory poller, and broker maintenance alive)"
+        );
+======= end
+
+<<<<<<< variant A
     pub(crate) fn abort_all(&self) {
         info!("Aborting all conductor tasks");
+>>>>>>> variant B
+======= end
         if let Err(error) = self.supervisor.shutdown() {
+<<<<<<< variant A
             error!(%error, "Failed to shutdown supervisor");
+>>>>>>> variant B
+            error!(%error, "Supervisor shutdown failed");
+======= end
         }
         self.monitor.abort();
+<<<<<<< variant A
+>>>>>>> variant B
+        self.order_poller.abort();
+        self.position_checker.abort();
+
+        info!("Trading tasks aborted successfully");
+    }
+
+    pub(crate) fn abort_all(&self) {
+        self.abort_trading_tasks();
+======= end
 
         if let Some(ref handle) = self.rebalancer {
             handle.abort();
@@ -318,7 +540,7 @@ struct RebalancingDeps {
     pool: SqlitePool,
     ctx: Ctx,
     inventory: Arc<BroadcastingInventory>,
-    event_sender: broadcast::Sender<ServerMessage>,
+    event_sender: broadcast::Sender<Statement>,
     vault_registry: Arc<Store<VaultRegistry>>,
     vault_registry_projection: Arc<Projection<VaultRegistry>>,
 }
@@ -332,17 +554,6 @@ async fn seed_vault_registry_from_config(
     vault_registry: &Store<VaultRegistry>,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    // Pre-flight validation: ensure every rebalancing-enabled equity has a
-    // vault_id before performing any writes to the vault registry.
-    for (symbol, equity_config) in &ctx.assets.equities.symbols {
-        if equity_config.vault_id.is_none() && ctx.is_rebalancing_enabled(symbol) {
-            return Err(CtxError::MissingEquityVaultId {
-                symbol: symbol.clone(),
-            }
-            .into());
-        }
-    }
-
     let vault_registry_id = VaultRegistryId {
         orderbook: ctx.evm.orderbook,
         owner: ctx.order_owner(),
@@ -350,6 +561,12 @@ async fn seed_vault_registry_from_config(
 
     for (symbol, equity_config) in &ctx.assets.equities.symbols {
         let Some(vault_id) = equity_config.vault_id else {
+            if ctx.is_rebalancing_enabled(symbol) {
+                return Err(CtxError::MissingEquityVaultId {
+                    symbol: symbol.clone(),
+                }
+                .into());
+            }
             continue;
         };
 
@@ -388,6 +605,35 @@ async fn seed_vault_registry_from_config(
     Ok(())
 }
 
+/// Returns `tokenized_equity` addresses for assets that have at least one
+/// operation (trading or rebalancing) enabled — i.e. assets we should poll
+/// Base-wallet balances for.
+fn base_wallet_unwrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Address> {
+    ctx.assets
+        .equities
+        .symbols
+        .iter()
+        .filter(|(_, config)| {
+            config.trading == OperationMode::Enabled || config.rebalancing == OperationMode::Enabled
+        })
+        .map(|(symbol, config)| (symbol.clone(), config.tokenized_equity))
+        .collect()
+}
+
+/// Returns `tokenized_equity_derivative` (wrapped) addresses for assets that
+/// have at least one operation enabled.
+fn base_wallet_wrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Address> {
+    ctx.assets
+        .equities
+        .symbols
+        .iter()
+        .filter(|(_, config)| {
+            config.trading == OperationMode::Enabled || config.rebalancing == OperationMode::Enabled
+        })
+        .map(|(symbol, config)| (symbol.clone(), config.tokenized_equity_derivative))
+        .collect()
+}
+
 fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
     rebalancing_ctx: RebalancingCtx,
     ethereum_wallet: Chain,
@@ -397,11 +643,12 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
     Box<dyn std::future::Future<Output = anyhow::Result<RebalancingInfrastructure>> + Send>,
 > {
     Box::pin(async move {
+        const OPERATION_CHANNEL_CAPACITY: usize = 100;
+
         info!("Initializing rebalancing infrastructure");
 
         let market_maker_wallet = base_wallet.address();
 
-        const OPERATION_CHANNEL_CAPACITY: usize = 100;
         let (operation_sender, operation_receiver) = mpsc::channel(OPERATION_CHANNEL_CAPACITY);
 
         let raindex_service = Arc::new(RaindexService::new(
@@ -458,8 +705,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             wrapper,
         ));
 
-        let event_broadcaster =
-            Arc::new(EventBroadcaster::new(deps.event_sender, deps.pool.clone()));
+        let event_broadcaster = Arc::new(Broadcaster::new(deps.event_sender));
         let manifest = QueryManifest::new(rebalancing_trigger, event_broadcaster);
 
         let built = manifest
@@ -490,17 +736,23 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         )
         .await?;
 
-        let usdc_vault_id = deps
-            .ctx
-            .assets
-            .cash
-            .as_ref()
-            .and_then(|cash| cash.vault_id)
-            .ok_or(CtxError::MissingCashVaultId)?;
+        let usdc_vault_id = if rebalancing_ctx.usdc.is_some() {
+            let vault_id = deps
+                .ctx
+                .assets
+                .cash
+                .as_ref()
+                .and_then(|cash| cash.vault_id)
+                .ok_or(CtxError::MissingCashVaultId)?;
+
+            RaindexVaultId(vault_id)
+        } else {
+            RaindexVaultId(alloy::primitives::B256::ZERO)
+        };
 
         let handle = services.spawn(
             market_maker_wallet,
-            RaindexVaultId(usdc_vault_id),
+            usdc_vault_id,
             operation_receiver,
             frameworks,
         );
@@ -658,7 +910,7 @@ where
 
         loop {
             interval.tick().await;
-            debug!("Running periodic accumulated position check");
+            trace!("Running periodic accumulated position check");
             if let Err(error) = check_and_execute_accumulated_positions(
                 &executor,
                 &position,
@@ -676,15 +928,11 @@ where
     })
 }
 
-fn spawn_inventory_poller<Chain, Exe>(
+fn spawn_inventory_poller<Chain: Evm, Exe: Executor + Send + 'static>(
     service: InventoryPollingService<Chain, Exe>,
     poll_interval: std::time::Duration,
     poll_notify: Arc<tokio::sync::Notify>,
-) -> JoinHandle<()>
-where
-    Chain: st0x_evm::Evm,
-    Exe: Executor + Clone + Send + 'static,
-{
+) -> JoinHandle<()> {
     info!("Starting inventory poller");
 
     tokio::spawn(async move {
@@ -695,11 +943,11 @@ where
             tokio::select! {
                 _ = interval.tick() => {}
                 () = poll_notify.notified() => {
-                    debug!("Inventory poll triggered by notification");
+                    trace!("Inventory poll triggered by notification");
                 }
             }
 
-            debug!("Running inventory poll");
+            trace!("Running inventory poll");
             if let Err(error) = service.poll_and_record().await {
                 error!(%error, "Inventory polling failed");
             }
@@ -707,14 +955,76 @@ where
     })
 }
 
-/// Discovers vaults from a trade and emits VaultRegistryCommands.
+pub(crate) async fn get_cutoff_block<S1, S2, P>(
+    clear_stream: &mut S1,
+    take_stream: &mut S2,
+    provider: &P,
+    job_queue: &mut DexTradeAccountingJobQueue,
+) -> anyhow::Result<u64>
+where
+    S1: Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin,
+    S2: Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>> + Unpin,
+    P: Provider + Clone,
+{
+    info!("Starting WebSocket subscriptions and waiting for first event...");
+
+    let first_event_result = wait_for_first_event_with_timeout(
+        clear_stream,
+        take_stream,
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+
+    let Some((mut event_buffer, block_number)) = first_event_result else {
+        let current_block = provider.get_block_number().await?;
+        info!(
+            "No subscription events within timeout, \
+             using current block {current_block} as cutoff"
+        );
+        return Ok(current_block);
+    };
+
+    buffer_live_events(clear_stream, take_stream, &mut event_buffer, block_number).await;
+
+    enqueue_buffered_events(job_queue, event_buffer).await;
+
+    Ok(block_number)
+}
+
+/// Pushes buffered events from the coordination phase into apalis storage.
+async fn enqueue_buffered_events(
+    job_queue: &mut DexTradeAccountingJobQueue,
+    event_buffer: Vec<(RaindexTradeEvent, Log)>,
+) {
+    info!(
+        "Coordination Phase: Processing {} buffered events from subscription",
+        event_buffer.len()
+    );
+
+    let trade_events = event_buffer.into_iter().filter_map(|(event, log)| {
+        ChainIncluded::<RaindexTradeEvent>::from_log(event, &log)
+            .inspect_err(|error| error!(%error, "Failed to extract block inclusion metadata"))
+            .ok()
+    });
+
+    for trade_event in trade_events {
+        if let Err(error) = job_queue
+            .push(AccountForDexTrade { trade: trade_event })
+            .await
+        {
+            error!(%error, "Failed to push buffered event into apalis storage");
+        }
+    }
+}
+
+/// Discovers vaults from a trade and emits `VaultRegistryCommand`s.
 ///
 /// This function is called AFTER trade conversion succeeds, using the trade's
 /// already-resolved symbol. It extracts vault information from the queued event
-/// and registers vaults owned by the specified order_owner.
+/// and registers vaults owned by the specified `order_owner`.
 ///
 /// Vaults are classified as:
-/// - USDC vault: token == USDC_BASE
+/// - USDC vault: token == `USDC_BASE`
 /// - Equity vault: token matches the trade's symbol (via cache lookup)
 pub(crate) async fn discover_vaults_for_trade(
     trade_event: &EmittedOnChain<RaindexTradeEvent>,
@@ -778,7 +1088,8 @@ pub(crate) async fn discover_vaults_for_trade(
     Ok(())
 }
 
-/// Returns `true` if the witness was accepted, `false` if rejected.
+/// Witnesses the trade in the OnChainTrade aggregate. Returns `true` if this
+/// is a new trade, `false` if it was already witnessed (duplicate).
 async fn execute_witness_trade(
     onchain_trade: &Store<OnChainTrade>,
     trade: &OnchainTrade,
@@ -818,8 +1129,8 @@ async fn execute_witness_trade(
             true
         }
         Err(error) => {
-            warn!(
-                "OnChainTrade::Witness rejected: {error}, tx_hash={:?}, log_index={}, symbol={}",
+            error!(
+                "Failed to execute OnChainTrade::Witness command: {error}, tx_hash={:?}, log_index={}, symbol={}",
                 trade.tx_hash, trade.log_index, trade.symbol
             );
             false
@@ -827,19 +1138,18 @@ async fn execute_witness_trade(
     }
 }
 
+/// Enriches the OnChainTrade aggregate with gas and pyth price data extracted
+/// from the transaction receipt and trace. Runs after a successful Witness.
 async fn execute_enrich_trade(onchain_trade: &Store<OnChainTrade>, trade: &OnchainTrade) {
     let (Some(gas_used), Some(effective_gas_price), Some(pyth_price)) = (
         trade.gas_used,
         trade.effective_gas_price,
         trade.pyth_price.clone(),
     ) else {
-        warn!(
+        debug!(
             tx_hash = ?trade.tx_hash,
             log_index = trade.log_index,
-            gas_used = ?trade.gas_used,
-            effective_gas_price = ?trade.effective_gas_price,
-            pyth_price = ?trade.pyth_price,
-            "Cannot enrich trade: missing gas_used, effective_gas_price, or pyth_price"
+            "Skipping enrichment: missing gas or pyth data"
         );
         return;
     };
@@ -855,15 +1165,13 @@ async fn execute_enrich_trade(onchain_trade: &Store<OnChainTrade>, trade: &Oncha
         pyth_price,
     };
 
-    match onchain_trade.send(&trade_id, command).await {
-        Ok(()) => info!(
-            "Successfully executed OnChainTrade::Enrich command: tx_hash={:?}, log_index={}",
-            trade.tx_hash, trade.log_index
-        ),
-        Err(error) => error!(
-            "Failed to execute OnChainTrade::Enrich command: {error}, tx_hash={:?}, log_index={}",
-            trade.tx_hash, trade.log_index
-        ),
+    if let Err(error) = onchain_trade.send(&trade_id, command).await {
+        error!(
+            tx_hash = ?trade.tx_hash,
+            log_index = trade.log_index,
+            %error,
+            "Failed to enrich OnChainTrade"
+        );
     }
 }
 
@@ -917,27 +1225,23 @@ pub(crate) async fn process_queued_trade<E: Executor>(
     cqrs: &TradeProcessingCqrs,
     asset_enabled: bool,
 ) -> Result<Option<OffchainOrderId>, TradeAccountingError> {
-    let trade_id = OnChainTradeId {
-        tx_hash: trade.tx_hash,
-        log_index: trade.log_index,
-    };
+    // Witness first — the OnChainTrade aggregate is keyed by (tx_hash, log_index)
+    // and rejects duplicates. Only acknowledge the fill on the Position aggregate
+    // if this is a genuinely new trade, preventing double-counting.
+    let is_new_trade =
+        execute_witness_trade(&cqrs.onchain_trade, &trade, trade_event.block_number).await;
 
-    if let Ok(Some(_)) = cqrs.onchain_trade.load(&trade_id).await {
+    if is_new_trade {
+        execute_enrich_trade(&cqrs.onchain_trade, &trade).await;
+    }
+
+    if !is_new_trade {
         info!(
-            ?trade_id,
-            "Trade already processed (duplicate event), skipping"
+            "Skipping duplicate trade: tx_hash={:?}, log_index={}",
+            trade_event.tx_hash, trade_event.log_index
         );
         return Ok(None);
     }
-
-    let witnessed =
-        execute_witness_trade(&cqrs.onchain_trade, &trade, trade_event.block_number).await;
-
-    if !witnessed {
-        return Ok(None);
-    }
-
-    execute_enrich_trade(&cqrs.onchain_trade, &trade).await;
 
     execute_acknowledge_fill(&cqrs.position, &trade, cqrs.execution_threshold).await;
 
@@ -1100,7 +1404,7 @@ where
     .await?;
 
     if ready_positions.is_empty() {
-        debug!("No accumulated positions ready for execution");
+        trace!("No accumulated positions ready for execution");
         return Ok(());
     }
 
@@ -1181,6 +1485,78 @@ where
     Ok(())
 }
 
+/// Maps database symbols to current executor-recognized tickers.
+async fn wait_for_first_event_with_timeout<S1, S2>(
+    clear_stream: &mut S1,
+    take_stream: &mut S2,
+    timeout: std::time::Duration,
+) -> Option<(Vec<(RaindexTradeEvent, Log)>, u64)>
+where
+    S1: Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin,
+    S2: Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>> + Unpin,
+{
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+
+    let mut events = Vec::new();
+
+    loop {
+        let event_result = tokio::select! {
+            Some(result) = clear_stream.next() => {
+                result.map(|(event, log)| (RaindexTradeEvent::ClearV3(Box::new(event)), log))
+            }
+            Some(result) = take_stream.next() => {
+                result.map(|(event, log)| (RaindexTradeEvent::TakeOrderV3(Box::new(event)), log))
+            }
+            () = &mut deadline => return None,
+        };
+
+        match event_result {
+            Ok((event, log)) => {
+                let Some(block_number) = log.block_number else {
+                    error!("Event missing block number during startup");
+                    continue;
+                };
+                events.push((event, log));
+                return Some((std::mem::take(&mut events), block_number));
+            }
+            Err(error) => {
+                error!("Error in event stream during startup: {error}");
+            }
+        }
+    }
+}
+
+async fn buffer_live_events<S1, S2>(
+    clear_stream: &mut S1,
+    take_stream: &mut S2,
+    event_buffer: &mut Vec<(RaindexTradeEvent, Log)>,
+    cutoff_block: u64,
+) where
+    S1: Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin,
+    S2: Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>> + Unpin,
+{
+    loop {
+        tokio::select! {
+            Some(result) = clear_stream.next() => match result {
+                Ok((event, log)) if log.block_number.unwrap_or(0) >= cutoff_block => {
+                    event_buffer.push((RaindexTradeEvent::ClearV3(Box::new(event)), log));
+                }
+                Err(error) => error!("Error in clear event stream during backfill: {error}"),
+                _ => {}
+            },
+            Some(result) = take_stream.next() => match result {
+                Ok((event, log)) if log.block_number.unwrap_or(0) >= cutoff_block => {
+                    event_buffer.push((RaindexTradeEvent::TakeOrderV3(Box::new(event)), log));
+                }
+                Err(error) => error!("Error in take event stream during backfill: {error}"),
+                _ => {}
+            },
+            else => break,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, B256, TxHash, U256, address, bytes, fixed_bytes};
@@ -1189,9 +1565,7 @@ mod tests {
     use rain_math_float::Float;
     use std::collections::HashSet;
     use std::sync::Arc;
-    use tokio::sync::broadcast;
 
-    use st0x_dto::ServerMessage;
     use st0x_event_sorcery::{StoreBuilder, test_store};
     use st0x_execution::{Direction, ExecutorOrderId, MarketOrder, MockExecutor, Positive, Symbol};
     use st0x_finance::{Usd, Usdc};
@@ -1206,6 +1580,7 @@ mod tests {
     use crate::inventory::view::Operator;
     use crate::inventory::{ImbalanceThreshold, Inventory, InventoryView, Venue};
     use crate::onchain::trade::OnchainTrade;
+    use crate::onchain_trade::PythPrice;
     use crate::rebalancing::{RebalancingTrigger, TriggeredOperation};
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
     use crate::threshold::ExecutionThreshold;
@@ -1216,6 +1591,13 @@ mod tests {
 
     fn one_to_one_ratio() -> UnderlyingPerWrapped {
         UnderlyingPerWrapped::new(RATIO_ONE).unwrap()
+    }
+
+    fn empty_dex_streams() -> super::order_fill_monitor::DexEventStreams {
+        super::order_fill_monitor::DexEventStreams {
+            clear: Box::pin(stream::empty()),
+            take: Box::pin(stream::empty()),
+        }
     }
 
     #[test]
@@ -1362,8 +1744,158 @@ mod tests {
         );
     }
 
+    async fn build_test_conductor(pool: &SqlitePool) -> Conductor {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let cache = SymbolCache::default();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(pool, succeeding_order_placer()).await;
+
+        setup_apalis_tables(pool).await.unwrap();
+        let job_queue: DexTradeAccountingJobQueue = SqliteStorage::new(pool);
+
+        ConductorBuilder::new(
+            ConductorCtx {
+                ctx,
+                cache,
+                provider,
+                executor,
+                execution_threshold: ExecutionThreshold::whole_share(),
+                frameworks,
+                poll_notify: Arc::new(tokio::sync::Notify::new()),
+                wallet_polling: None,
+            },
+            job_queue,
+            empty_dex_streams(),
+        )
+        .with_executor_maintenance(None)
+        .spawn()
+    }
+
+    #[tokio::test]
+    async fn test_conductor_abort_all() {
+        let pool = setup_test_db().await;
+        let conductor = build_test_conductor(&pool).await;
+        conductor.abort_all();
+    }
+
+    #[tokio::test]
+    async fn test_conductor_builder_returns_immediately() {
+        let pool = setup_test_db().await;
+        let conductor = build_test_conductor(&pool).await;
+
+        assert!(!conductor.order_poller.is_finished());
+        assert!(!conductor.position_checker.is_finished());
+
+        conductor.abort_all();
+    }
+
+    #[tokio::test]
+    async fn test_conductor_without_rebalancer() {
+        let pool = setup_test_db().await;
+        let conductor = build_test_conductor(&pool).await;
+
+        assert!(conductor.rebalancer.is_none());
+
+        conductor.abort_all();
+    }
+
+    #[tokio::test]
+    async fn test_conductor_with_rebalancer() {
+        let pool = setup_test_db().await;
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let cache = SymbolCache::default();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+
+        setup_apalis_tables(&pool).await.unwrap();
+        let job_queue: DexTradeAccountingJobQueue = SqliteStorage::new(&pool);
+
+        let fake_rebalancer = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+
+        let conductor = ConductorBuilder::new(
+            ConductorCtx {
+                ctx,
+                cache,
+                provider,
+                executor,
+                execution_threshold: ExecutionThreshold::whole_share(),
+                frameworks,
+                poll_notify: Arc::new(tokio::sync::Notify::new()),
+                wallet_polling: None,
+            },
+            job_queue,
+            empty_dex_streams(),
+        )
+        .with_executor_maintenance(None)
+        .with_rebalancer(fake_rebalancer)
+        .spawn();
+
+        assert!(conductor.rebalancer.is_some());
+
+        conductor.abort_all();
+    }
+
+    #[tokio::test]
+    async fn test_conductor_rebalancer_survives_abort_trading_tasks() {
+        let pool = setup_test_db().await;
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let cache = SymbolCache::default();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+
+        setup_apalis_tables(&pool).await.unwrap();
+        let job_queue: DexTradeAccountingJobQueue = SqliteStorage::new(&pool);
+
+        let fake_rebalancer = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+
+        let conductor = ConductorBuilder::new(
+            ConductorCtx {
+                ctx,
+                cache,
+                provider,
+                executor,
+                execution_threshold: ExecutionThreshold::whole_share(),
+                frameworks,
+                poll_notify: Arc::new(tokio::sync::Notify::new()),
+                wallet_polling: None,
+            },
+            job_queue,
+            empty_dex_streams(),
+        )
+        .with_executor_maintenance(None)
+        .with_rebalancer(fake_rebalancer)
+        .spawn();
+
+        conductor.abort_trading_tasks();
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!conductor.rebalancer.as_ref().unwrap().is_finished());
+
+        conductor.abort_all();
+    }
+
     #[tokio::test]
     async fn test_get_cutoff_block_with_timeout() {
+        let pool = setup_test_db().await;
+        setup_apalis_tables(&pool).await.unwrap();
+        let mut job_queue: DexTradeAccountingJobQueue = SqliteStorage::new(&pool);
         let asserter = Asserter::new();
 
         asserter.push_success(&serde_json::Value::from(12345u64));
@@ -1372,11 +1904,135 @@ mod tests {
         let mut clear_stream = futures_util::stream::empty();
         let mut take_stream = futures_util::stream::empty();
 
-        let cutoff_block = get_cutoff_block(&mut clear_stream, &mut take_stream, &provider)
-            .await
-            .unwrap();
+        let cutoff_block = get_cutoff_block(
+            &mut clear_stream,
+            &mut take_stream,
+            &provider,
+            &mut job_queue,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(cutoff_block, 12345);
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_first_event_with_timeout_no_events() {
+        let mut clear_stream = stream::empty();
+        let mut take_stream = stream::empty();
+
+        let result = wait_for_first_event_with_timeout(
+            &mut clear_stream,
+            &mut take_stream,
+            std::time::Duration::from_millis(10),
+        )
+        .await;
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_first_event_with_clear_event() {
+        let clear_event = ClearV3 {
+            sender: address!("0x1111111111111111111111111111111111111111"),
+            alice: get_test_order(),
+            bob: get_test_order(),
+            clearConfig: ClearConfigV2 {
+                aliceInputIOIndex: U256::from(0),
+                aliceOutputIOIndex: U256::from(1),
+                bobInputIOIndex: U256::from(1),
+                bobOutputIOIndex: U256::from(0),
+                aliceBountyVaultId: B256::ZERO,
+                bobBountyVaultId: B256::ZERO,
+            },
+        };
+
+        let mut log = get_test_log();
+        log.block_number = Some(1000);
+
+        let mut clear_stream = stream::iter(vec![Ok((clear_event, log.clone()))]);
+        let mut take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
+
+        let (events, block_number) = wait_for_first_event_with_timeout(
+            &mut clear_stream,
+            &mut take_stream,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(block_number, 1000);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0].0, RaindexTradeEvent::ClearV3(_)));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_first_event_missing_block_number() {
+        let clear_event = ClearV3 {
+            sender: address!("0x1111111111111111111111111111111111111111"),
+            alice: get_test_order(),
+            bob: get_test_order(),
+            clearConfig: ClearConfigV2 {
+                aliceInputIOIndex: U256::from(0),
+                aliceOutputIOIndex: U256::from(1),
+                bobInputIOIndex: U256::from(1),
+                bobOutputIOIndex: U256::from(0),
+                aliceBountyVaultId: B256::ZERO,
+                bobBountyVaultId: B256::ZERO,
+            },
+        };
+
+        let mut log = get_test_log();
+        log.block_number = None;
+
+        let mut clear_stream = stream::iter(vec![Ok((clear_event, log))]);
+        let mut take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
+
+        assert!(
+            wait_for_first_event_with_timeout(
+                &mut clear_stream,
+                &mut take_stream,
+                std::time::Duration::from_millis(100),
+            )
+            .await
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_buffer_live_events_filtering() {
+        let clear_event = ClearV3 {
+            sender: address!("0x1111111111111111111111111111111111111111"),
+            alice: get_test_order(),
+            bob: get_test_order(),
+            clearConfig: ClearConfigV2 {
+                aliceInputIOIndex: U256::from(0),
+                aliceOutputIOIndex: U256::from(1),
+                bobInputIOIndex: U256::from(1),
+                bobOutputIOIndex: U256::from(0),
+                aliceBountyVaultId: B256::ZERO,
+                bobBountyVaultId: B256::ZERO,
+            },
+        };
+
+        let mut early_log = get_test_log();
+        early_log.block_number = Some(99);
+
+        let mut late_log = get_test_log();
+        late_log.block_number = Some(101);
+
+        let events = vec![
+            Ok((clear_event.clone(), early_log)),
+            Ok((clear_event, late_log)),
+        ];
+
+        let mut clear_stream = stream::iter(events);
+        let mut take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
+        let mut event_buffer = Vec::new();
+
+        buffer_live_events(&mut clear_stream, &mut take_stream, &mut event_buffer, 100).await;
+
+        assert_eq!(event_buffer.len(), 1);
+        assert_eq!(event_buffer[0].1.block_number.unwrap(), 101);
     }
 
     const TEST_ORDERBOOK: Address = address!("0x1234567890123456789012345678901234567890");
@@ -1488,6 +2144,16 @@ mod tests {
             .with_equity_token(TEST_EQUITY_TOKEN)
             .with_amount(amount)
             .with_log_index(log_index)
+            .with_enrichment(
+                50_000,
+                1_000_000_000,
+                PythPrice {
+                    value: "15000000000".to_string(),
+                    expo: -8,
+                    conf: "10000000".to_string(),
+                    publish_time: chrono::Utc::now(),
+                },
+            )
             .build()
     }
 
@@ -1512,7 +2178,7 @@ mod tests {
         let trade = create_test_trade("AAPL");
 
         let context = create_vault_discovery_context(&vault_registry);
-        discover_vaults_for_trade(&queued_event, &trade, &context)
+        discover_vaults_for_trade(&trade_event, &trade, &context)
             .await
             .expect("Should succeed when cache is populated");
 
@@ -1537,7 +2203,7 @@ mod tests {
         let trade = create_test_trade("AAPL");
 
         let context = create_vault_discovery_context(&vault_registry);
-        discover_vaults_for_trade(&queued_event, &trade, &context)
+        discover_vaults_for_trade(&trade_event, &trade, &context)
             .await
             .expect("Should succeed when cache is populated");
 
@@ -1561,7 +2227,7 @@ mod tests {
         let trade = create_test_trade("MSFT");
 
         let context = create_vault_discovery_context(&vault_registry);
-        discover_vaults_for_trade(&queued_event, &trade, &context)
+        discover_vaults_for_trade(&trade_event, &trade, &context)
             .await
             .expect("Should succeed when cache is populated");
 
@@ -1590,7 +2256,7 @@ mod tests {
         let trade = create_test_trade("AAPL");
 
         let context = create_vault_discovery_context(&vault_registry);
-        discover_vaults_for_trade(&queued_event, &trade, &context)
+        discover_vaults_for_trade(&trade_event, &trade, &context)
             .await
             .expect("Should succeed even when no vaults match");
 
@@ -1613,7 +2279,7 @@ mod tests {
         let trade = create_test_trade("AAPL");
 
         let context = create_vault_discovery_context(&vault_registry);
-        discover_vaults_for_trade(&queued_event, &trade, &context)
+        discover_vaults_for_trade(&trade_event, &trade, &context)
             .await
             .expect("Should succeed");
 
@@ -1636,7 +2302,7 @@ mod tests {
         let trade = create_test_trade("GOOG");
 
         let context = create_vault_discovery_context(&vault_registry);
-        discover_vaults_for_trade(&queued_event, &trade, &context)
+        discover_vaults_for_trade(&trade_event, &trade, &context)
             .await
             .expect("Should succeed");
 
@@ -1755,11 +2421,8 @@ mod tests {
             },
         };
 
-        let mut log = get_test_log();
-        log.log_index = Some(log_index);
         let mut hash_bytes = [0u8; 32];
         hash_bytes[31] = u8::try_from(log_index).unwrap_or(0);
-        log.transaction_hash = Some(B256::from(hash_bytes));
 
         EmittedOnChain::from_log(RaindexTradeEvent::ClearV3(Box::new(event)), &log).unwrap()
     }
@@ -2024,8 +2687,38 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn trade_above_threshold_triggers_execution() {
+        let pool = setup_test_db().await;
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs =
+            trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+
+        let trade_event = included_trade_event(60);
+        let trade = test_trade_with_amount(float!(2.0), 60);
+
+        let result =
+            process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true).await;
+
+        assert!(
+            result.unwrap().is_some(),
+            "2.0 shares should trigger execution with 1-share threshold"
+        );
+
+        let position = cqrs
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .expect("position should exist");
+
+        assert!(position.net.inner().eq(float!(2.0)).unwrap());
+        assert!(position.pending_offchain_order_id.is_some());
+    }
+
     /// Builds an `InventoryView` with an equity imbalance: 20% onchain, 80% offchain.
-    /// With a 50% target +/- 20% deviation, 20% < 30% lower bound -> TooMuchOffchain.
+    /// With a 50% target +/- 20% deviation, 20% < 30% lower bound -> `TooMuchOffchain`.
     fn imbalanced_inventory(symbol: &Symbol) -> InventoryView {
         InventoryView::default()
             .with_equity(
@@ -2084,10 +2777,8 @@ mod tests {
             .await
             .unwrap();
 
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(
+        let inventory = Arc::new(BroadcastingInventory::new_without_broadcast(
             imbalanced_inventory(&symbol),
-            event_sender,
         ));
         let (operation_sender, mut operation_receiver) = mpsc::channel(10);
 
@@ -2183,8 +2874,9 @@ mod tests {
             )
             .unwrap();
 
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(initial_inventory, event_sender));
+        let inventory = Arc::new(BroadcastingInventory::new_without_broadcast(
+            initial_inventory,
+        ));
         let (operation_sender, _operation_receiver) = mpsc::channel(10);
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
@@ -2296,8 +2988,9 @@ mod tests {
             )
             .unwrap();
 
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(initial_inventory, event_sender));
+        let inventory = Arc::new(BroadcastingInventory::new_without_broadcast(
+            initial_inventory,
+        ));
         let (operation_sender, mut receiver) = mpsc::channel(10);
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
@@ -2424,8 +3117,9 @@ mod tests {
             )
             .unwrap();
 
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(initial_inventory, event_sender));
+        let inventory = Arc::new(BroadcastingInventory::new_without_broadcast(
+            initial_inventory,
+        ));
         let (operation_sender, receiver) = mpsc::channel(10);
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
