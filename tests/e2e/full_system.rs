@@ -40,7 +40,7 @@ use crate::base_chain::{self, TakeDirection};
 use crate::cctp::{CctpInfra, CctpOverrides, USDC_ETHEREUM};
 use crate::hedging::assertions::assert_full_hedging_flow;
 use crate::poll::{
-    await_dashboard_disconnect, connect_db, count_events, poll_for_broker_fills, poll_for_events,
+    connect_db, count_events, free_port, poll_for_broker_fills, poll_for_events,
     poll_for_events_with_timeout, poll_for_ready, spawn_bot_with_event_channel,
 };
 use crate::rebalancing::assertions::TestWallet;
@@ -242,9 +242,8 @@ async fn full_system() -> anyhow::Result<()> {
     let current_block = infra.base_chain.provider.get_block_number().await?;
 
     let (event_sender, _) = broadcast::channel::<ServerMessage>(256);
-    let dashboard_sender = event_sender.clone();
 
-    let port = 8001;
+    let port = free_port();
     let ctx = build_full_system_ctx()
         .chain(&infra.base_chain)
         .ethereum_endpoint(&cctp.ethereum_endpoint)
@@ -424,9 +423,6 @@ async fn full_system() -> anyhow::Result<()> {
     );
     pool.close().await;
 
-    // === Dashboard auto-detect ===
-    await_dashboard_disconnect(&dashboard_sender, Duration::from_secs(3)).await;
-
     bot.abort();
     Ok(())
 }
@@ -512,9 +508,8 @@ async fn full_system_concurrent() -> anyhow::Result<()> {
     let current_block = infra.base_chain.provider.get_block_number().await?;
 
     let (event_sender, _) = broadcast::channel::<ServerMessage>(256);
-    let dashboard_sender = event_sender.clone();
 
-    let port = 8002;
+    let port = free_port();
     let ctx = build_full_system_ctx()
         .chain(&infra.base_chain)
         .ethereum_endpoint(&cctp.ethereum_endpoint)
@@ -664,8 +659,6 @@ async fn full_system_concurrent() -> anyhow::Result<()> {
     );
 
     pool.close().await;
-
-    await_dashboard_disconnect(&dashboard_sender, Duration::from_secs(3)).await;
 
     bot.abort();
     Ok(())

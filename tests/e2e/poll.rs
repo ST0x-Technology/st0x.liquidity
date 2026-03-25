@@ -16,6 +16,17 @@ use st0x_execution::alpaca_broker_api::OrderStatus;
 use st0x_hedge::config::Ctx;
 use st0x_hedge::{launch, launch_with_event_channel};
 
+/// Returns an available TCP port by binding to port 0 and reading the
+/// assigned port. The socket is dropped immediately, freeing the port
+/// for the caller to use.
+pub fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("failed to bind ephemeral port")
+        .local_addr()
+        .expect("failed to get local addr")
+        .port()
+}
+
 /// Spawns the full bot as a background task.
 pub fn spawn_bot(ctx: Ctx) -> JoinHandle<anyhow::Result<()>> {
     tokio::spawn(launch(ctx))
@@ -33,24 +44,6 @@ pub fn spawn_bot_with_event_channel(
 /// After assertions complete, keeps the server alive while dashboard
 /// clients are connected. Waits up to `grace` for a client to connect,
 /// then stays alive until all clients disconnect.
-pub async fn await_dashboard_disconnect(
-    sender: &broadcast::Sender<ServerMessage>,
-    grace: Duration,
-) {
-    let deadline = tokio::time::Instant::now() + grace;
-
-    while sender.receiver_count() == 0 && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    if sender.receiver_count() > 0 {
-        eprintln!("Dashboard connected -- keeping server alive until disconnect");
-        while sender.receiver_count() > 0 {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-    }
-}
-
 /// Polls the bot's health endpoint until it responds, panicking if the
 /// bot crashes or the timeout (30s) expires before it becomes ready.
 pub async fn poll_for_ready(bot: &mut JoinHandle<anyhow::Result<()>>, port: u16) {
