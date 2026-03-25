@@ -128,7 +128,7 @@
               trap 'kill $dev_pid 2>/dev/null' EXIT
               sleep 2
               open http://localhost:5173 || true
-              cargo nextest run --test e2e full_system --nocapture
+              cargo nextest run --test e2e full_system --no-capture
             '';
           };
 

@@ -13,11 +13,14 @@ filter = "test(compile_fail_tests)"
 slow-timeout = { period = "120s", terminate-after = 3 }
 
 # E2e tests are slow and prone to hangs — limit threads and allow more time
+# Stream output immediately so progress is visible during long runs
 [[profile.default.overrides]]
 filter = "binary(=e2e)"
 test-group = "e2e"
 slow-timeout = { period = "120s", terminate-after = 3 }
 retries = { backoff = "exponential", count = 1, delay = "5s", jitter = true }
+success-output = "immediate"
+failure-output = "immediate"
 
 # Dev profile: fast feedback, skip e2e and slow tests
 [profile.dev]

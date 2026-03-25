@@ -12,6 +12,7 @@ use alloy::primitives::{Address, U256, utils::parse_units};
 use alloy::providers::Provider;
 use rain_math_float::Float;
 use tempfile::TempDir;
+use tracing::info;
 
 use st0x_bridge::cctp::CctpAttestationMock;
 use st0x_execution::Symbol;
@@ -29,17 +30,17 @@ static TRACING_INIT: Once = Once::new();
 pub fn init_tracing() {
     TRACING_INIT.call_once(|| {
         let level = tracing::Level::TRACE;
-        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| mk_env_filter(level));
+        let base_filter = mk_env_filter(level);
+        let filter = base_filter.add_directive(format!("e2e={level}").parse().unwrap());
 
         tracing_subscriber::fmt()
             .compact()
             .with_env_filter(filter)
             .with_target(true)
-            .with_test_writer()
             .without_time()
+            .with_writer(std::io::stderr)
             .try_init()
-            .ok();
+            .expect("Failed to initialize tracing subscriber");
     });
 }
 
@@ -94,7 +95,9 @@ impl TestInfra<()> {
         let db_dir = tempfile::tempdir()?;
         let db_path = db_dir.path().join("e2e.sqlite");
 
+        info!("Starting Anvil base chain");
         let mut base_chain = BaseChain::start().await?;
+        info!("Anvil started, deploying equity vaults");
         let mut equity_addresses = Vec::new();
         for (symbol, _price) in &equity_prices {
             let (vault_addr, underlying_addr) = base_chain.deploy_equity_vault(symbol).await?;
@@ -140,6 +143,7 @@ impl TestInfra<()> {
             })
             .collect::<anyhow::Result<_>>()?;
 
+        info!("Starting mock services");
         let broker_service = AlpacaBrokerMock::start()
             .symbol_fill_prices(symbol_prices)
             .symbol_positions(symbol_positions)
@@ -175,6 +179,7 @@ impl TestInfra<()> {
         tokenization_service.start_mint_executor(base_chain.provider.clone(), mint_token_addresses);
 
         let attestation_service = CctpAttestationMock::start().await;
+        info!("Test infrastructure ready");
 
         Ok(TestInfra {
             _db_dir: db_dir,
