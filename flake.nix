@@ -2,26 +2,23 @@
   description = "Flake to rule the world";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-
     rainix.url =
       "github:rainprotocol/rainix?rev=6e14de54456eb33821c2f334cf4d250bcc22c121";
-    rainix.inputs.nixpkgs.follows = "nixpkgs";
 
     flake-utils.url = "github:numtide/flake-utils";
     ragenix.url = "github:yaxitech/ragenix";
     deploy-rs.url = "github:serokell/deploy-rs";
 
     bun2nix.url = "github:nix-community/bun2nix?tag=2.0.7";
-    bun2nix.inputs.nixpkgs.follows = "nixpkgs";
+    bun2nix.inputs.nixpkgs.follows = "rainix/nixpkgs";
 
     crane.url = "github:ipetkov/crane";
 
     disko.url = "github:nix-community/disko";
-    disko.inputs.nixpkgs.follows = "nixpkgs";
+    disko.inputs.nixpkgs.follows = "rainix/nixpkgs";
 
     nixos-anywhere.url = "github:nix-community/nixos-anywhere";
-    nixos-anywhere.inputs.nixpkgs.follows = "nixpkgs";
+    nixos-anywhere.inputs.nixpkgs.follows = "rainix/nixpkgs";
   };
 
   outputs = { self, flake-utils, rainix, bun2nix, ragenix, deploy-rs, disko
@@ -30,13 +27,18 @@
       nixosConfigurations.st0x-liquidity =
         rainix.inputs.nixpkgs.lib.nixosSystem {
           system = "x86_64-linux";
-          specialArgs = { inherit (self.packages.x86_64-linux) st0x-cli; };
+          specialArgs = {
+            dashboard = self.packages.x86_64-linux.st0x-dashboard;
+            inherit (self.packages.x86_64-linux) st0x-liquidity;
+          };
 
           modules =
             [ disko.nixosModules.disko ragenix.nixosModules.default ./os.nix ];
         };
 
       deploy = (import ./deploy.nix { inherit deploy-rs self; }).config;
+
+      checks.x86_64-linux = deploy-rs.lib.x86_64-linux.deployChecks self.deploy;
     } // flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import rainix.inputs.nixpkgs {
@@ -60,13 +62,17 @@
               localSystem = system;
             };
 
-          st0xRust = pkgs.callPackage ./rust.nix { inherit craneLib; };
+          st0xRust = pkgs.callPackage ./rust.nix {
+            inherit craneLib;
+            inherit (pkgs) sqlx-cli;
+            sol-build-inputs = rainix.sol-build-inputs.${system};
+          };
         in rainixPkgs // deployPkgs // {
           inherit (infraPkgs) tfInit tfPlan tfApply tfDestroy tfEditVars;
 
           st0x-dto = st0xRust.dto;
           st0x-liquidity = st0xRust.package;
-          st0x-cli = st0xRust.cli;
+          st0x-clippy = st0xRust.clippy;
 
           st0x-dashboard = pkgs.callPackage ./dashboard {
             bun2nix = bun2nix.packages.${system}.default;
@@ -85,27 +91,6 @@
             '';
           };
 
-          quickCheck = rainix.mkTask.${system} {
-            name = "chequick";
-            body = ''
-              set -euxo pipefail
-
-              rm -v ./dashboard/src/lib/api/* || true
-
-              cargo check
-              cargo check --workspace --all-features
-              cargo nextest run --workspace --all-features --profile dev
-              cargo clippy --workspace --all-targets --all-features
-              cargo fmt
-
-              cd ./dashboard/
-              bun install
-              bun run check
-              bun run test:run
-              bun run lint:fix
-            '';
-          };
-
           prepSolArtifacts = rainix.mkTask.${system} {
             name = "prep-sol-artifacts";
             additionalBuildInputs = rainix.sol-build-inputs.${system};
@@ -116,19 +101,6 @@
               (cd lib/rain.orderbook/lib/rain.interpreter/ && forge build)
               (cd lib/forge-std/ && forge build)
               (cd lib/pyth-crosschain/target_chains/ethereum/sdk/solidity/ && forge build)
-            '';
-          };
-
-          e2e = rainix.mkTask.${system} {
-            name = "e2e";
-            body = ''
-              set -euxo pipefail
-              (cd dashboard && bun run dev) &
-              dev_pid=$!
-              trap 'kill $dev_pid 2>/dev/null' EXIT
-              sleep 2
-              open http://localhost:5173
-              cargo nextest run --test e2e full_system --nocapture
             '';
           };
 
@@ -220,9 +192,9 @@
 
           remote = pkgs.writeShellApplication {
             name = "remote";
-            runtimeInputs = infraPkgs.sshBuildInputs ++ [ pkgs.openssh ];
+            runtimeInputs = infraPkgs.buildInputs ++ [ pkgs.openssh ];
             text = ''
-              ${infraPkgs.resolveHost}
+              ${infraPkgs.resolveIp}
               exec ssh -i "$identity" "root@$host_ip" "$@"
             '';
           };
@@ -234,29 +206,25 @@
         devShells.default = pkgs.mkShell {
           inherit (rainix.devShells.${system}.default) nativeBuildInputs;
           inherit (rainix.devShells.${system}.default) shellHook;
-
-          SQLX_OFFLINE = true;
-          DATABASE_URL = "sqlite:dev.db";
-          FOUNDRY_DISABLE_NIGHTLY_WARNING = true;
-
-          buildInputs = (with pkgs; [
-            bacon
-            bun
-            sqlx-cli
-            cargo-expand
-            cargo-nextest
-            ragenix.packages.${system}.default
-          ]) ++ (with packages; [
-            ci
-            quickCheck
-            prepSolArtifacts
-            secret
-            rekey
-            remote
-            deployNixos
-            deployService
-            deployAll
-          ]) ++ rainix.devShells.${system}.default.buildInputs;
+          DATABASE_URL = "sqlite:liquidity.db";
+          buildInputs = with pkgs;
+            [
+              bacon
+              bun
+              sqlx-cli
+              cargo-expand
+              cargo-nextest
+              terraform
+              ragenix.packages.${system}.default
+              packages.ci
+              packages.prepSolArtifacts
+              packages.secret
+              packages.rekey
+              packages.remote
+              packages.deployNixos
+              packages.deployService
+              packages.deployAll
+            ] ++ rainix.devShells.${system}.default.buildInputs;
         };
       });
 

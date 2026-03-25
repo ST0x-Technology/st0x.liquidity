@@ -11,6 +11,7 @@ tarpaulin-report.html
 .pre-commit-config.yaml
 .claude/*
 !.claude/skills
+.sqlx/
 .idea/
 .worktrees/
 out/

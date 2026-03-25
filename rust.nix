@@ -1,4 +1,4 @@
-{ pkgs, craneLib }:
+{ pkgs, craneLib, sqlx-cli, sol-build-inputs }:
 
 let
   # Requires --impure. Submodules must be checked out and prepSolArtifacts
@@ -67,16 +67,11 @@ let
 
     inherit cargoVendorDir;
 
-    nativeBuildInputs = [ pkgs.pkg-config ];
+    nativeBuildInputs = [ sqlx-cli pkgs.pkg-config ];
 
     buildInputs = [ pkgs.openssl pkgs.sqlite ]
       ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin
       [ pkgs.apple-sdk_15 ];
-
-    # Use offline sqlx query verification so builds don't need a live database.
-    # Each crate (ours + apalis-sqlite) ships its own .sqlx/ with prepared data.
-    # Run `cargo sqlx prepare` after changing sqlx macros to regenerate.
-    SQLX_OFFLINE = "true";
 
     # Submodules with path dependencies need lib/ symlinked early
     postUnpack = ''
@@ -87,6 +82,16 @@ let
 
   # Build only dependencies (cached separately from source changes)
   cargoArtifacts = craneLib.buildDepsOnly (commonArgs // { src = depsSrc; });
+
+  # sqlx needs DATABASE_URL at compile time for query checking
+  # Only needed for final build and clippy, not deps
+  sqlxSetup = ''
+    set -eo pipefail
+
+    export DATABASE_URL="sqlite:$TMPDIR/build.db"
+    sqlx db create
+    sqlx migrate run --source migrations
+  '';
 
 in {
   # DTO crate for TypeScript codegen - no sqlx deps needed
@@ -101,30 +106,25 @@ in {
     };
   });
 
-  # Server binary for deployment
+  # Main package with all binaries
   package = craneLib.buildPackage (commonArgs // {
     inherit cargoArtifacts;
-
-    cargoExtraArgs = "--bin server";
-    doCheck = false;
+    preBuild = sqlxSetup;
+    nativeCheckInputs = sol-build-inputs;
+    doCheck = true;
+    cargoTestExtraArgs = "--workspace --all-targets --all-features";
 
     meta = {
-      description = "st0x liquidity market making server";
+      description = "st0x liquidity market making system";
       homepage = "https://github.com/ST0x-Technology/st0x.liquidity";
     };
   });
 
-  # CLI binary for remote operations
-  cli = craneLib.buildPackage (commonArgs // {
-    pname = "st0x-cli";
+  # Clippy check (reuses cached deps)
+  clippy = craneLib.cargoClippy (commonArgs // {
     inherit cargoArtifacts;
-
-    cargoExtraArgs = "--bin cli";
-    doCheck = false;
-
-    meta = {
-      description = "st0x liquidity CLI";
-      homepage = "https://github.com/ST0x-Technology/st0x.liquidity";
-    };
+    preBuild = sqlxSetup;
+    cargoClippyExtraArgs =
+      "--workspace --all-targets --all-features -- -D warnings";
   });
 }
