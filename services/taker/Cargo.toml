@@ -1,0 +1,34 @@
+[package]
+name = "st0x-taker"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+test-support = ["st0x-shared/test-support"]
+
+[dependencies]
+alloy.workspace = true
+async-trait.workspace = true
+clap.workspace = true
+serde.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+url.workspace = true
+
+st0x-evm = { workspace = true }
+st0x-execution.workspace = true
+st0x-shared = { workspace = true }
+anyhow.workspace = true
+st0x-finance.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+st0x-shared = { workspace = true, features = ["test-support"] }
+
+[lints]
+workspace = true

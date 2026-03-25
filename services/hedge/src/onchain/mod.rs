@@ -108,6 +108,8 @@ pub(crate) enum OnChainError {
     #[error(transparent)]
     EmptySymbol(#[from] EmptySymbolError),
     #[error(transparent)]
+    TokenizedSymbol(#[from] st0x_shared::TokenizedSymbolError),
+    #[error(transparent)]
     InvalidShares(#[from] InvalidSharesError),
     #[error(transparent)]
     InvalidDirection(#[from] InvalidDirectionError),

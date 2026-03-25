@@ -491,7 +491,21 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
 
         let wrapper = Arc::new(WrapperService::new(
             base_wallet.clone(),
-            deps.ctx.assets.equities.symbols.clone(),
+            deps.ctx
+                .assets
+                .equities
+                .symbols
+                .iter()
+                .map(|(symbol, config)| {
+                    (
+                        symbol.clone(),
+                        st0x_shared::EquityTokenAddresses {
+                            wrapped: config.tokenized_equity_derivative,
+                            unwrapped: config.tokenized_equity,
+                        },
+                    )
+                })
+                .collect(),
         ));
 
         let equity_transfer_services = EquityTransferServices {

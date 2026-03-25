@@ -153,10 +153,8 @@ pub fn decode_pyth_price(output: &Bytes) -> Result<Price, PythError> {
 }
 
 #[cfg(test)]
-impl Price {
-    fn to_float(&self) -> Result<Float, FloatError> {
-        scale_with_exponent(&self.price, self.expo)
-    }
+fn price_to_float(price: &Price) -> Result<Float, FloatError> {
+    scale_with_exponent(&price.price, price.expo)
 }
 
 pub async fn extract_pyth_price<P>(
@@ -577,7 +575,7 @@ mod tests {
             publishTime: U256::from(1_700_000_000u64),
         };
 
-        let exact = price.to_float().unwrap();
+        let exact = price_to_float(&price).unwrap();
 
         assert_eq!(format_float_with_fallback(&exact), "1.23456789");
     }
@@ -591,7 +589,7 @@ mod tests {
             publishTime: U256::from(1_700_000_000u64),
         };
 
-        let exact = price.to_float().unwrap();
+        let exact = price_to_float(&price).unwrap();
 
         assert_eq!(format_float_with_fallback(&exact), "42");
     }
@@ -605,7 +603,7 @@ mod tests {
             publishTime: U256::from(1_700_000_000u64),
         };
 
-        let exact = price.to_float().unwrap();
+        let exact = price_to_float(&price).unwrap();
 
         assert_eq!(format_float_with_fallback(&exact), "123000");
     }
@@ -629,7 +627,7 @@ mod tests {
                 publishTime: U256::from(1_700_000_000u64),
             };
 
-            let exact = price.to_float().unwrap();
+            let exact = price_to_float(&price).unwrap();
 
             assert_eq!(
                 format_float_with_fallback(&exact),
@@ -648,7 +646,7 @@ mod tests {
             publishTime: U256::from(1_700_000_000u64),
         };
 
-        let exact = price.to_float().unwrap();
+        let exact = price_to_float(&price).unwrap();
 
         assert_eq!(format_float_with_fallback(&exact), "-50");
     }
@@ -662,7 +660,7 @@ mod tests {
             publishTime: U256::from(1_700_000_000u64),
         };
 
-        let exact = price.to_float().unwrap();
+        let exact = price_to_float(&price).unwrap();
 
         assert_eq!(format_float_with_fallback(&exact), "182.5");
     }
@@ -680,7 +678,7 @@ mod tests {
         let encoded_bytes = Bytes::from(encoded);
 
         let decoded = decode_pyth_price(&encoded_bytes).unwrap();
-        let exact = decoded.to_float().unwrap();
+        let exact = price_to_float(&decoded).unwrap();
 
         assert_eq!(decoded.price, original_price.price);
         assert_eq!(decoded.conf, original_price.conf);

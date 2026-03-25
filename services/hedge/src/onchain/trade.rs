@@ -402,11 +402,6 @@ pub(crate) enum TradeValidationError {
     NegativeUsdc(Float),
     #[error("Float error: {0}")]
     Float(#[from] FloatError),
-    #[error(
-        "symbol '{symbol_provided}' is not a tokenized equity \
-         (must have 't' or 'wt' prefix, e.g. tAAPL, wtCOIN)"
-    )]
-    NotTokenizedEquity { symbol_provided: String },
 }
 
 #[cfg(test)]

@@ -323,7 +323,10 @@ mod tests {
     #[tokio::test]
     async fn reconciler_detects_version_change() {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+        sqlx::migrate!("../../services/hedge/migrations")
+            .run(&pool)
+            .await
+            .unwrap();
 
         let reconciler = Reconciler::new(pool);
 
@@ -339,7 +342,10 @@ mod tests {
     #[tokio::test]
     async fn load_registry_replays_from_events() {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+        sqlx::migrate!("../../services/hedge/migrations")
+            .run(&pool)
+            .await
+            .unwrap();
 
         let reconciler = Reconciler::new(pool);
 

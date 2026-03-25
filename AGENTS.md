@@ -182,8 +182,10 @@ minimize delta exposure through automated hedging.
 
 This project uses a Cargo workspace with:
 
-- **Root crate (`st0x-hedge`)**: Main arbitrage bot application
-- **Execution crate (`st0x-execution`)**: Trade execution abstraction library
+- **Services** (`services/`): Executable crates — `st0x-hedge`, `st0x-taker`
+- **Libraries** (`crates/`): Shared library crates — `st0x-execution`,
+  `st0x-bridge`, `st0x-dto`, `st0x-event-sorcery`, `st0x-evm`, `st0x-finance`,
+  `st0x-float-macro`, `st0x-float-serde`, `st0x-shared`
 
 ### Building & Running
 
@@ -388,9 +390,10 @@ For detailed implementation requirements, see @crates/execution/AGENTS.md
 
 ### Core Flow
 
-The main event loop (`src/lib.rs`) monitors WebSocket streams (`ClearV2`,
-`TakeOrderV2`) from Raindex, converts events to `Trade` objects, and spawns
-async execution flows per event. Idempotency via `(tx_hash, log_index)` keys.
+The main event loop (`services/hedge/src/lib.rs`) monitors WebSocket streams
+(`ClearV2`, `TakeOrderV2`) from Raindex, converts events to `Trade` objects, and
+spawns async execution flows per event. Idempotency via `(tx_hash, log_index)`
+keys.
 
 ### Configuration
 

@@ -555,7 +555,10 @@ mod tests {
 
     async fn test_pool() -> SqlitePool {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+        sqlx::migrate!("../../services/hedge/migrations")
+            .run(&pool)
+            .await
+            .unwrap();
         pool
     }
 

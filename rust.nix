@@ -90,7 +90,7 @@ let
 
     export DATABASE_URL="sqlite:$TMPDIR/build.db"
     sqlx db create
-    sqlx migrate run --source migrations
+    sqlx migrate run --source services/hedge/migrations
   '';
 
 in {

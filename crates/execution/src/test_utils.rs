@@ -7,7 +7,10 @@ pub(crate) const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
 pub(crate) async fn setup_test_db() -> SqlitePool {
     let pool = SqlitePool::connect(":memory:").await.unwrap();
-    sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+    sqlx::migrate!("../../services/hedge/migrations")
+        .run(&pool)
+        .await
+        .unwrap();
     pool
 }
 
