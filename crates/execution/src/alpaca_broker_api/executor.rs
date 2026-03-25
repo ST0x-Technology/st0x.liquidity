@@ -8,6 +8,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use rain_math_float::Float;
+use st0x_float_serde::format_float_with_fallback;
 
 use super::auth::{AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx};
 use super::client::AlpacaBrokerApiClient;
@@ -212,7 +213,7 @@ impl AlpacaBrokerApi {
 
         info!(
             order_id = %order.id,
-            amount = ?amount,
+            amount = %format_float_with_fallback(&amount),
             direction = ?direction,
             "USDC/USD conversion order placed, polling for completion..."
         );

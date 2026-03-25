@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
+use st0x_float_serde::format_float_with_fallback;
+use std::fmt;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -120,7 +122,7 @@ pub(super) struct OrderResponse {
 
 /// Order request for crypto trading (e.g., USDC/USD conversion).
 /// Uses decimal quantity and trading pair symbol format.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub(crate) struct CryptoOrderRequest {
     /// Trading pair symbol (e.g., "USDCUSD" for USDC/USD)
     pub symbol: String,
@@ -131,6 +133,18 @@ pub(crate) struct CryptoOrderRequest {
     #[serde(rename = "type")]
     pub order_type: &'static str,
     pub time_in_force: &'static str,
+}
+
+impl fmt::Debug for CryptoOrderRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CryptoOrderRequest")
+            .field("symbol", &self.symbol)
+            .field("quantity", &format_float_with_fallback(&self.quantity))
+            .field("side", &self.side)
+            .field("order_type", &self.order_type)
+            .field("time_in_force", &self.time_in_force)
+            .finish()
+    }
 }
 
 /// Response from a crypto order placement
@@ -325,7 +339,7 @@ pub(crate) async fn convert_usdc_usd(
         ConversionDirection::UsdToUsdc => OrderSide::Buy,
     };
 
-    debug!(?side, ?amount, "Placing USDC/USD conversion order");
+    debug!(?side, amount = %format_float_with_fallback(&amount), "Placing USDC/USD conversion order");
 
     let request = CryptoOrderRequest {
         symbol: "USDCUSD".to_string(),

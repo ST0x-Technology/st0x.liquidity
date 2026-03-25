@@ -18,14 +18,12 @@ impl<T: HasZero> Default for VenueBalance<T> {
 
 /// Error type for inventory operations.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum InventoryError<T> {
+pub(crate) enum InventoryError<T: std::fmt::Display> {
     #[error(
-        "insufficient available balance: requested {requested:?}, but only {available:?} available"
+        "insufficient available balance: requested {requested}, but only {available} available"
     )]
     InsufficientAvailable { requested: T, available: T },
-    #[error(
-        "insufficient inflight balance: requested {requested:?}, but only {inflight:?} inflight"
-    )]
+    #[error("insufficient inflight balance: requested {requested}, but only {inflight} inflight")]
     InsufficientInflight { requested: T, inflight: T },
     #[error("arithmetic error: {0}")]
     Arithmetic(#[from] FloatError),
@@ -44,7 +42,10 @@ pub(super) struct VenueBalance<T> {
 
 impl<T> VenueBalance<T>
 where
-    T: Add<Output = Result<T, FloatError>> + Sub<Output = Result<T, FloatError>> + Copy,
+    T: Add<Output = Result<T, FloatError>>
+        + Sub<Output = Result<T, FloatError>>
+        + Copy
+        + std::fmt::Display,
 {
     pub(super) fn total(self) -> Result<T, FloatError> {
         self.available + self.inflight
@@ -72,6 +73,7 @@ where
         + Sub<Output = Result<T, FloatError>>
         + Copy
         + HasZero
+        + std::fmt::Display
         + std::fmt::Debug,
 {
     pub(super) fn has_inflight(self) -> Result<bool, FloatError> {

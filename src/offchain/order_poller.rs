@@ -207,7 +207,7 @@ impl<E: Executor> OrderStatusPoller<E> {
 
         info!(
             %offchain_order_id,
-            ?price,
+            %price,
             %symbol,
             "Order filled"
         );

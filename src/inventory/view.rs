@@ -216,6 +216,7 @@ where
         + Sub<Output = Result<T, FloatError>>
         + Copy
         + HasZero
+        + std::fmt::Display
         + std::fmt::Debug,
 {
     fn has_inflight(&self) -> Result<bool, FloatError> {
@@ -265,6 +266,7 @@ where
         + Copy
         + HasZero
         + Into<Float>
+        + std::fmt::Display
         + std::fmt::Debug,
 {
     /// Returns the ratio of onchain to total inventory.
@@ -415,6 +417,7 @@ where
         + Sub<Output = Result<T, FloatError>>
         + Copy
         + HasZero
+        + std::fmt::Display
         + std::fmt::Debug
         + Send
         + 'static,
@@ -650,7 +653,11 @@ impl InventoryView {
 
 fn venue_balances<T>(venue: Option<VenueBalance<T>>) -> (T, T)
 where
-    T: Add<Output = Result<T, FloatError>> + Sub<Output = Result<T, FloatError>> + Copy + HasZero,
+    T: Add<Output = Result<T, FloatError>>
+        + Sub<Output = Result<T, FloatError>>
+        + Copy
+        + HasZero
+        + std::fmt::Display,
 {
     venue.map_or((T::ZERO, T::ZERO), |balance| {
         (balance.available(), balance.inflight())

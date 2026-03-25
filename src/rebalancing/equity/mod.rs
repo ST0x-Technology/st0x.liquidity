@@ -13,6 +13,7 @@ pub(crate) mod mock;
 
 use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
+use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, info, instrument, warn};
@@ -41,6 +42,12 @@ use crate::wrapper::{Wrapper, WrapperError};
 pub(crate) struct Equity {
     pub(crate) symbol: Symbol,
     pub(crate) quantity: FractionalShares,
+}
+
+impl fmt::Display for Equity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Equity({}, {})", self.symbol, self.quantity)
+    }
 }
 
 /// Data extracted from the TokensReceived aggregate state for
@@ -353,7 +360,7 @@ impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTra
     type Asset = Equity;
     type Error = MintError;
 
-    #[instrument(skip(self), fields(symbol = %asset.symbol, quantity = ?asset.quantity))]
+    #[instrument(skip(self), fields(symbol = %asset.symbol, quantity = %asset.quantity))]
     async fn transfer(&self, asset: Self::Asset) -> Result<(), Self::Error> {
         let Equity { symbol, quantity } = asset;
         let issuer_request_id = IssuerRequestId::new(Uuid::new_v4().to_string());
@@ -451,7 +458,7 @@ impl CrossVenueTransfer<MarketMakingVenue, HedgingVenue> for CrossVenueEquityTra
     type Asset = Equity;
     type Error = RedemptionError;
 
-    #[instrument(skip(self), fields(symbol = %asset.symbol, quantity = ?asset.quantity))]
+    #[instrument(skip(self), fields(symbol = %asset.symbol, quantity = %asset.quantity))]
     async fn transfer(&self, asset: Self::Asset) -> Result<(), Self::Error> {
         let Equity { symbol, quantity } = asset;
 
