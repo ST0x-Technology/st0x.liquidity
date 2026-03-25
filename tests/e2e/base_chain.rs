@@ -127,6 +127,11 @@ pub struct BaseChain<P> {
     /// collisions with the bot's concurrent transactions from the owner.
     pub taker: Address,
     taker_provider: P,
+    /// Separate minter account (Anvil account #2) used by the mock
+    /// tokenization mint executor to transfer underlying tokens without
+    /// nonce collisions with the bot's concurrent owner transactions.
+    pub minter: Address,
+    pub minter_provider: P,
     pub orderbook: Address,
     deployer: Address,
     interpreter: Address,
@@ -214,6 +219,18 @@ impl BaseChain<()> {
         let million_usdc: U256 = parse_units("1000000", 6)?.into();
         mint_usdc(&provider, taker, million_usdc).await?;
 
+        let minter_key = B256::from_slice(&anvil.keys()[2].to_bytes());
+        let minter_signer = PrivateKeySigner::from_bytes(&minter_key)?;
+        let minter = minter_signer.address();
+        let minter_wallet = EthereumWallet::from(minter_signer);
+
+        let minter_provider = ProviderBuilder::new()
+            .wallet(minter_wallet)
+            .connect(&anvil.endpoint())
+            .await?;
+
+        provider.anvil_set_balance(minter, hundred_eth).await?;
+
         Ok(BaseChain {
             anvil,
             provider,
@@ -221,6 +238,8 @@ impl BaseChain<()> {
             owner_key: key,
             taker,
             taker_provider,
+            minter,
+            minter_provider,
             orderbook,
             deployer,
             interpreter,
@@ -285,12 +304,21 @@ impl<P: Provider + Clone> BaseChain<P> {
             .get_receipt()
             .await?;
 
-        // Deposit half the supply into the vault so the owner has vault
-        // shares for orderbook orders. The remaining underlying stays
-        // available for the wrapping step after tokenization mints.
+        // Split supply: 1/2 into vault (owner gets vault shares for orders),
+        // 1/4 stays with owner (wrapping after redemption), 1/4 to minter
+        // (mock mint executor needs its own tokens to avoid nonce collisions).
         let half_supply = supply / U256::from(2);
+        let quarter_supply = supply / U256::from(4);
+
         vault
             .deposit(half_supply, self.owner)
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        underlying
+            .transfer(self.minter, quarter_supply)
             .send()
             .await?
             .get_receipt()

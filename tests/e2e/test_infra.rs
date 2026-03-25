@@ -178,7 +178,8 @@ impl TestInfra<()> {
             .iter()
             .map(|(symbol, _vault_addr, underlying_addr)| (symbol.clone(), *underlying_addr))
             .collect();
-        tokenization_service.start_mint_executor(base_chain.provider.clone(), mint_token_addresses);
+        tokenization_service
+            .start_mint_executor(base_chain.minter_provider.clone(), mint_token_addresses);
         debug!("Mint executor started");
 
         let attestation_service = CctpAttestationMock::start().await;
