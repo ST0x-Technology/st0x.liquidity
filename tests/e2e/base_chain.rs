@@ -13,7 +13,7 @@ use alloy::providers::ext::AnvilApi as _;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
-use alloy::sol_types::SolEvent as _;
+use alloy::sol_types::{SolCall as _, SolEvent as _};
 use rain_math_float::Float;
 use std::collections::HashMap;
 use url::Url;
@@ -50,10 +50,23 @@ fn format_float(value: Float) -> anyhow::Result<String> {
 /// need `st0x_hedge` to export the constant.
 pub const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
 
+/// Pyth contract address on Base mainnet, mirrored from `st0x_hedge::onchain::pyth`.
+const BASE_PYTH_CONTRACT_ADDRESS: Address = address!("0x8250f4aF4B972684F7b336503E2D6dFeDeB1487a");
+
 sol!(
     #![sol(all_derives = true, rpc)]
     #[derive(serde::Serialize, serde::Deserialize)]
     TestVault, "tests/e2e/TestVault.json"
+);
+
+sol!(
+    #![sol(all_derives = true, rpc)]
+    MockPyth, "tests/e2e/MockPyth.json"
+);
+
+sol!(
+    #![sol(all_derives = true, rpc)]
+    TakeOrdersWithPyth, "tests/e2e/TakeOrdersWithPyth.json"
 );
 
 /// OpenZeppelin ERC20 `_balances` mapping storage slot.
@@ -110,6 +123,7 @@ pub struct PreparedOrder {
     pub output_vault_id: B256,
     pub input_token: Address,
     pub output_token: Address,
+    pub symbol: String,
 }
 
 /// A local Anvil chain with a freshly deployed OrderBook, USDC, and Rain
@@ -132,6 +146,13 @@ pub struct BaseChain<P> {
     interpreter: Address,
     store: Address,
     equity_tokens: HashMap<String, Address>,
+    /// Address of the TakeOrdersWithPyth proxy that injects Pyth calls
+    /// into take-order transactions so the bot can extract prices from
+    /// traces.
+    take_orders_proxy: Address,
+    /// Pyth feed IDs assigned per equity symbol. Used by the proxy
+    /// to call `MockPyth.getPriceNoOlderThan(feedId, ...)`.
+    pyth_feed_ids: HashMap<String, B256>,
 }
 
 impl BaseChain<()> {
@@ -214,6 +235,24 @@ impl BaseChain<()> {
         let million_usdc: U256 = parse_units("1000000", 6)?.into();
         mint_usdc(&provider, taker, million_usdc).await?;
 
+        // Place MockPyth bytecode at the canonical Pyth address so the
+        // bot's trace-based price extraction finds valid Pyth calls.
+        // Prices are seeded per-symbol via `set_pyth_price` after
+        // equity tokens are deployed.
+        provider
+            .anvil_set_code(
+                BASE_PYTH_CONTRACT_ADDRESS,
+                MockPyth::DEPLOYED_BYTECODE.clone(),
+            )
+            .await?;
+
+        // Deploy TakeOrdersWithPyth proxy that injects a Pyth
+        // STATICCALL before forwarding to the OrderBook.
+        let proxy =
+            TakeOrdersWithPyth::deploy(&taker_provider, BASE_PYTH_CONTRACT_ADDRESS, orderbook)
+                .await?;
+        let take_orders_proxy = *proxy.address();
+
         Ok(BaseChain {
             anvil,
             provider,
@@ -226,8 +265,48 @@ impl BaseChain<()> {
             interpreter,
             store,
             equity_tokens: HashMap::new(),
+            take_orders_proxy,
+            pyth_feed_ids: HashMap::new(),
         })
     }
+}
+
+impl<P: Provider + Clone> BaseChain<P> {
+    /// Seeds a Pyth price feed for an equity symbol on the mock Pyth
+    /// contract. Assigns a deterministic feed ID per symbol. Must be
+    /// called after `deploy_equity_vault` for each symbol.
+    pub async fn set_pyth_price(
+        &mut self,
+        symbol: &str,
+        price: i64,
+        conf: u64,
+        expo: i32,
+    ) -> anyhow::Result<()> {
+        let feed_id = pyth_feed_id_for_symbol(symbol);
+        self.pyth_feed_ids.insert(symbol.to_string(), feed_id);
+
+        let mock_pyth = MockPyth::MockPythInstance::new(BASE_PYTH_CONTRACT_ADDRESS, &self.provider);
+
+        mock_pyth
+            .setPrice(feed_id, price, conf, expo)
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        Ok(())
+    }
+
+    /// Returns the Pyth feed ID assigned to a symbol, if any.
+    fn pyth_feed_id(&self, symbol: &str) -> Option<B256> {
+        self.pyth_feed_ids.get(symbol).copied()
+    }
+}
+
+/// Generates a deterministic Pyth feed ID from a symbol name.
+fn pyth_feed_id_for_symbol(symbol: &str) -> B256 {
+    use alloy::primitives::keccak256;
+    keccak256(format!("pyth-feed-id:{symbol}"))
 }
 
 #[bon::bon]
@@ -526,6 +605,7 @@ impl<P: Provider + Clone> BaseChain<P> {
             output_vault_id,
             input_token,
             output_token,
+            symbol: symbol.to_string(),
         })
     }
 
@@ -541,14 +621,6 @@ impl<P: Provider + Clone> BaseChain<P> {
     ) -> anyhow::Result<TakeOrderResult> {
         let orderbook =
             IOrderBookV6::IOrderBookV6Instance::new(self.orderbook, &self.taker_provider);
-
-        // Approve taker's input token payment (taker pays input_token)
-        DeployableERC20::new(prepared.input_token, &self.taker_provider)
-            .approve(*orderbook.address(), U256::MAX / U256::from(2))
-            .send()
-            .await?
-            .get_receipt()
-            .await?;
 
         let input_vault_balance_before_take = orderbook
             .vaultBalance2(self.owner, prepared.input_token, prepared.input_vault_id)
@@ -579,12 +651,32 @@ impl<P: Provider + Clone> BaseChain<P> {
             data: Bytes::new(),
         };
 
-        let take_receipt = orderbook
-            .takeOrders4(take_config)
-            .send()
+        let take_receipt = if let Some(feed_id) = self.pyth_feed_id(&prepared.symbol) {
+            take_via_pyth_proxy(
+                &self.taker_provider,
+                self.take_orders_proxy,
+                feed_id,
+                prepared.input_token,
+                prepared.output_token,
+                &take_config,
+            )
             .await?
-            .get_receipt()
-            .await?;
+        } else {
+            // No Pyth price configured - call orderbook directly
+            DeployableERC20::new(prepared.input_token, &self.taker_provider)
+                .approve(self.orderbook, U256::MAX / U256::from(2))
+                .send()
+                .await?
+                .get_receipt()
+                .await?;
+
+            orderbook
+                .takeOrders4(take_config)
+                .send()
+                .await?
+                .get_receipt()
+                .await?
+        };
 
         anyhow::ensure!(take_receipt.status(), "takeOrders4 reverted");
 
@@ -756,22 +848,6 @@ impl<P: Provider + Clone> BaseChain<P> {
             .get_receipt()
             .await?;
 
-        // Over-approve taker's payment for the same Rain float precision reason
-        let taker_approve: U256 = if is_sell {
-            let base: U256 = parse_units(&usdc_total_str, 6)?.into();
-            base * U256::from(2)
-        } else {
-            let base: U256 = parse_units(&amount_str, 18)?.into();
-            base * U256::from(2)
-        };
-
-        DeployableERC20::new(input_token, &self.provider)
-            .approve(*orderbook.address(), taker_approve)
-            .send()
-            .await?
-            .get_receipt()
-            .await?;
-
         let input_vault_balance_before_take = orderbook
             .vaultBalance2(self.owner, input_token, input_vault_id)
             .call()
@@ -801,12 +877,40 @@ impl<P: Provider + Clone> BaseChain<P> {
             data: Bytes::new(),
         };
 
-        let take_receipt = orderbook
-            .takeOrders4(take_config)
-            .send()
+        let take_receipt = if let Some(feed_id) = self.pyth_feed_id(symbol) {
+            take_via_pyth_proxy(
+                &self.provider,
+                self.take_orders_proxy,
+                feed_id,
+                input_token,
+                output_token,
+                &take_config,
+            )
             .await?
-            .get_receipt()
-            .await?;
+        } else {
+            // No Pyth price configured - approve and call orderbook directly
+            let taker_approve: U256 = if is_sell {
+                let base: U256 = parse_units(&usdc_total_str, 6)?.into();
+                base * U256::from(2)
+            } else {
+                let base: U256 = parse_units(&amount_str, 18)?.into();
+                base * U256::from(2)
+            };
+
+            DeployableERC20::new(input_token, &self.provider)
+                .approve(self.orderbook, taker_approve)
+                .send()
+                .await?
+                .get_receipt()
+                .await?;
+
+            orderbook
+                .takeOrders4(take_config)
+                .send()
+                .await?
+                .get_receipt()
+                .await?
+        };
 
         anyhow::ensure!(take_receipt.status(), "takeOrders4 reverted");
 
@@ -845,6 +949,60 @@ impl<P: Provider + Clone> BaseChain<P> {
             output_vault_balance_after_take,
         })
     }
+}
+
+/// Takes orders through the `TakeOrdersWithPyth` proxy, which injects a
+/// Pyth `getPriceNoOlderThan` STATICCALL into the transaction trace before
+/// forwarding to the OrderBook. This lets the bot's trace-based Pyth price
+/// extraction find valid price data.
+async fn take_via_pyth_proxy<P: Provider>(
+    provider: &P,
+    proxy: Address,
+    feed_id: B256,
+    input_token: Address,
+    output_token: Address,
+    take_config: &IOrderBookV6::TakeOrdersConfigV5,
+) -> anyhow::Result<alloy::rpc::types::TransactionReceipt> {
+    // Encode the takeOrders4 call as raw calldata for the proxy to forward.
+    let take_calldata = IOrderBookV6::takeOrders4Call {
+        config: take_config.clone(),
+    }
+    .abi_encode();
+
+    // Approve the proxy (not the orderbook) to spend the taker's input tokens.
+    // The proxy pulls tokens, approves the orderbook, and forwards the call.
+    DeployableERC20::new(input_token, provider)
+        .approve(proxy, U256::MAX / U256::from(2))
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+
+    // Also approve proxy to spend output tokens in case the orderbook
+    // sends surplus back through the proxy.
+    DeployableERC20::new(output_token, provider)
+        .approve(proxy, U256::MAX / U256::from(2))
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+
+    let proxy_instance = TakeOrdersWithPyth::TakeOrdersWithPythInstance::new(proxy, provider);
+
+    let receipt = proxy_instance
+        .takeOrders(
+            feed_id,
+            input_token,
+            U256::MAX / U256::from(2),
+            output_token,
+            Bytes::from(take_calldata),
+        )
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+
+    Ok(receipt)
 }
 
 /// Deploys a USDC ERC20 at the given address using `anvil_set_code` with

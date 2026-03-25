@@ -11,7 +11,7 @@ use alloy::providers::RootProvider;
 use futures_util::future::try_join_all;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{info, trace};
 
 use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::{Evm, EvmError, OpenChainErrorRegistry, Wallet};
@@ -134,7 +134,7 @@ where
         let vault_registry = self.load_vault_registry().await?;
 
         let Some(registry) = vault_registry else {
-            debug!("Vault registry not initialized, skipping onchain polling");
+            trace!("Vault registry not initialized, skipping onchain polling");
             return Ok(());
         };
 
@@ -165,7 +165,7 @@ where
         registry: &VaultRegistry,
     ) -> Result<(), InventoryPollingError<Exe::Error>> {
         if registry.equity_vaults.is_empty() {
-            debug!("No equity vaults discovered, skipping onchain equity polling");
+            trace!("No equity vaults discovered, skipping onchain equity polling");
             return Ok(());
         }
 
@@ -214,7 +214,7 @@ where
         registry: &VaultRegistry,
     ) -> Result<(), InventoryPollingError<Exe::Error>> {
         let Some(usdc_vault) = &registry.usdc_vault else {
-            debug!("No USDC vault discovered, skipping onchain cash polling");
+            trace!("No USDC vault discovered, skipping onchain cash polling");
             return Ok(());
         };
 
@@ -241,7 +241,7 @@ where
         snapshot_id: &InventorySnapshotId,
     ) -> Result<(), InventoryPollingError<Exe::Error>> {
         let Some(wallet) = &self.wallet_polling.ethereum else {
-            debug!("No Ethereum wallet configured, skipping Ethereum cash polling");
+            trace!("No Ethereum wallet configured, skipping Ethereum cash polling");
             return Ok(());
         };
 
@@ -271,7 +271,7 @@ where
         snapshot_id: &InventorySnapshotId,
     ) -> Result<(), InventoryPollingError<Exe::Error>> {
         let Some(wallet) = &self.wallet_polling.base else {
-            debug!("No Base wallet configured, skipping Base cash polling");
+            trace!("No Base wallet configured, skipping Base cash polling");
             return Ok(());
         };
 
@@ -426,7 +426,7 @@ where
             .map_err(InventoryPollingError::Executor)?;
 
         let InventoryResult::Fetched(inventory) = inventory_result else {
-            debug!("Executor returned non-fetched inventory result, skipping offchain polling");
+            trace!("Executor returned non-fetched inventory result, skipping offchain polling");
             return Ok(());
         };
 

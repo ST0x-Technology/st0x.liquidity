@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{RwLock, mpsc};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use url::Url;
 
 use rain_math_float::Float;
@@ -526,7 +526,7 @@ impl RebalancingTrigger {
         *inventory = updated;
         drop(inventory);
 
-        debug!("Applied inventory snapshot event");
+        trace!("Applied inventory snapshot event");
 
         self.check_and_trigger_after_snapshot(&event).await
     }
@@ -841,7 +841,7 @@ impl RebalancingTrigger {
             return Ok(());
         }
 
-        debug!(%symbol, ?operation, "Triggered equity rebalancing");
+        info!(%symbol, ?operation, "Triggered equity rebalancing");
         guard.defuse();
         Ok(())
     }
@@ -904,7 +904,7 @@ impl RebalancingTrigger {
             return;
         }
 
-        debug!(?operation, "Triggered USDC rebalancing");
+        info!(?operation, "Triggered USDC rebalancing");
         guard.defuse();
     }
 
