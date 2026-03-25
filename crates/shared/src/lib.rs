@@ -6,6 +6,9 @@
 
 pub mod bindings;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+
 pub mod equity_token;
 pub mod tokenized_symbol;
 pub mod wrapper;

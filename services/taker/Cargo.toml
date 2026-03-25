@@ -24,11 +24,16 @@ st0x-evm = { workspace = true }
 st0x-execution.workspace = true
 st0x-shared = { workspace = true }
 anyhow.workspace = true
+st0x-event-sorcery.workspace = true
 st0x-finance.workspace = true
+chrono = { workspace = true, features = ["serde"] }
+serde_json.workspace = true
+futures-util.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 st0x-shared = { workspace = true, features = ["test-support"] }
+st0x-event-sorcery = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

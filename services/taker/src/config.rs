@@ -174,6 +174,14 @@ pub(crate) struct EvmCtx {
     pub(crate) excluded_owner: Address,
 }
 
+impl EvmCtx {
+    /// Derives the bot's wallet address from its private key.
+    pub(crate) fn wallet_address(&self) -> Result<Address, anyhow::Error> {
+        let signer: alloy::signers::local::PrivateKeySigner = self.private_key.parse()?;
+        Ok(signer.address())
+    }
+}
+
 impl std::fmt::Debug for EvmCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EvmCtx")
