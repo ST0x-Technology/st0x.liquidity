@@ -1358,6 +1358,7 @@ pub(crate) async fn process_queued_trade<E: Executor>(
     place_offchain_order(&execution, cqrs).await
 }
 
+#[allow(clippy::cognitive_complexity)] // conductor is getting refactored in pr #483
 async fn place_offchain_order(
     execution: &ExecutionCtx,
     cqrs: &TradeProcessingCqrs,
@@ -1370,17 +1371,78 @@ async fn place_offchain_order(
 
     execute_create_offchain_order(execution, cqrs, offchain_order_id).await;
 
-    let aggregate = cqrs.offchain_order.load(&offchain_order_id).await;
-
-    if let Ok(Some(OffchainOrder::Failed { error, .. })) = aggregate {
-        warn!(
-            %offchain_order_id,
-            symbol = %execution.symbol,
-            %error,
-            "Broker rejected order, clearing position pending state"
-        );
-        execute_fail_offchain_order_position(&cqrs.position, offchain_order_id, execution, error)
+    match cqrs.offchain_order.load(&offchain_order_id).await {
+        Ok(Some(OffchainOrder::Failed { error, .. })) => {
+            warn!(
+                %offchain_order_id,
+                symbol = %execution.symbol,
+                %error,
+                "Broker rejected order, clearing position pending state"
+            );
+            execute_fail_offchain_order_position(
+                &cqrs.position,
+                offchain_order_id,
+                execution,
+                error,
+            )
             .await;
+        }
+
+        Ok(Some(OffchainOrder::Submitted { .. })) => {
+            info!(
+                %offchain_order_id,
+                symbol = %execution.symbol,
+                "Order submitted to broker"
+            );
+        }
+
+        Ok(Some(OffchainOrder::PartiallyFilled { .. })) => {
+            info!(
+                %offchain_order_id,
+                symbol = %execution.symbol,
+                "Order partially filled by broker"
+            );
+        }
+
+        Ok(Some(OffchainOrder::Filled { .. })) => {
+            info!(
+                %offchain_order_id,
+                symbol = %execution.symbol,
+                "Order filled by broker"
+            );
+        }
+
+        Ok(other) => {
+            error!(
+                %offchain_order_id,
+                symbol = %execution.symbol,
+                state = ?other,
+                "Unexpected offchain order state after placement"
+            );
+            execute_fail_offchain_order_position(
+                &cqrs.position,
+                offchain_order_id,
+                execution,
+                format!("Unexpected offchain order state: {other:?}"),
+            )
+            .await;
+        }
+
+        Err(error) => {
+            error!(
+                %offchain_order_id,
+                symbol = %execution.symbol,
+                ?error,
+                "Failed to load offchain order after placement"
+            );
+            execute_fail_offchain_order_position(
+                &cqrs.position,
+                offchain_order_id,
+                execution,
+                format!("Failed to load offchain order: {error}"),
+            )
+            .await;
+        }
     }
 
     Ok(Some(offchain_order_id))
@@ -1431,7 +1493,7 @@ async fn execute_place_offchain_order(
             info!(
                 %offchain_order_id,
                 symbol = %execution.symbol,
-                "Position::PlaceOffChainOrder succeeded"
+                "Position marked as pending execution"
             );
             true
         }
@@ -1459,15 +1521,15 @@ async fn execute_create_offchain_order(
     };
 
     match cqrs.offchain_order.send(&offchain_order_id, command).await {
-        Ok(()) => info!(
+        Ok(()) => debug!(
             %offchain_order_id,
             symbol = %execution.symbol,
-            "OffchainOrder::Place succeeded"
+            "Offchain order command processed, checking broker result"
         ),
         Err(error) => error!(
             %offchain_order_id,
             symbol = %execution.symbol,
-            "OffchainOrder::Place failed: {error}"
+            "Offchain order command failed: {error}"
         ),
     }
 }
@@ -1566,7 +1628,7 @@ where
         info!(
             %offchain_order_id,
             symbol = %execution.symbol,
-            "Position::PlaceOffChainOrder succeeded"
+            "Position marked as pending execution"
         );
 
         let command = OffchainOrderCommand::Place {
@@ -1577,29 +1639,90 @@ where
         };
 
         match offchain_order.send(&offchain_order_id, command).await {
-            Ok(()) => info!(
+            Ok(()) => debug!(
                 %offchain_order_id,
                 symbol = %execution.symbol,
-                "OffchainOrder::Place succeeded"
+                "Offchain order command processed, checking broker result"
             ),
             Err(error) => error!(
                 %offchain_order_id,
                 symbol = %execution.symbol,
-                "OffchainOrder::Place failed: {error}"
+                "Offchain order command failed: {error}"
             ),
         }
 
-        if let Ok(Some(OffchainOrder::Failed { error, .. })) =
-            offchain_order.load(&offchain_order_id).await
-        {
-            warn!(
-                %offchain_order_id,
-                symbol = %execution.symbol,
-                %error,
-                "Broker rejected order, clearing position pending state"
-            );
-            execute_fail_offchain_order_position(position, offchain_order_id, &execution, error)
+        match offchain_order.load(&offchain_order_id).await {
+            Ok(Some(OffchainOrder::Failed { error, .. })) => {
+                warn!(
+                    %offchain_order_id,
+                    symbol = %execution.symbol,
+                    %error,
+                    "Broker rejected order, clearing position pending state"
+                );
+                execute_fail_offchain_order_position(
+                    position,
+                    offchain_order_id,
+                    &execution,
+                    error,
+                )
                 .await;
+            }
+
+            Ok(Some(OffchainOrder::Submitted { .. })) => {
+                info!(
+                    %offchain_order_id,
+                    symbol = %execution.symbol,
+                    "Order submitted to broker"
+                );
+            }
+
+            Ok(Some(OffchainOrder::PartiallyFilled { .. })) => {
+                info!(
+                    %offchain_order_id,
+                    symbol = %execution.symbol,
+                    "Order partially filled by broker"
+                );
+            }
+
+            Ok(Some(OffchainOrder::Filled { .. })) => {
+                info!(
+                    %offchain_order_id,
+                    symbol = %execution.symbol,
+                    "Order filled by broker"
+                );
+            }
+
+            Ok(other) => {
+                error!(
+                    %offchain_order_id,
+                    symbol = %execution.symbol,
+                    state = ?other,
+                    "Unexpected offchain order state after placement"
+                );
+                execute_fail_offchain_order_position(
+                    position,
+                    offchain_order_id,
+                    &execution,
+                    format!("Unexpected offchain order state: {other:?}"),
+                )
+                .await;
+            }
+
+            Err(error) => {
+                error!(
+                    %offchain_order_id,
+                    symbol = %execution.symbol,
+                    ?error,
+                    "Failed to load offchain order after placement"
+                );
+                execute_fail_offchain_order_position(
+                    position,
+                    offchain_order_id,
+                    &execution,
+                    format!("Failed to load offchain order: {error}"),
+                )
+                .await;
+            }
         }
     }
 
@@ -1707,6 +1830,7 @@ mod tests {
     use crate::conductor::builder::CqrsFrameworks;
     use crate::config::tests::create_test_ctx_with_order_owner;
     use crate::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
+    use crate::offchain_order::OrderPlacementResult;
 
     use crate::inventory::view::Operator;
     use crate::inventory::{ImbalanceThreshold, Inventory, InventoryView, Venue};
@@ -3086,9 +3210,13 @@ mod tests {
         impl OrderPlacer for TestOrderPlacer {
             async fn place_market_order(
                 &self,
-                _order: MarketOrder,
-            ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>> {
-                Ok(ExecutorOrderId::new("TEST_BROKER_ORD"))
+                order: MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("TEST_BROKER_ORD"),
+                    placed_shares: order.shares,
+                })
             }
         }
 
@@ -4252,7 +4380,7 @@ mod tests {
                 async fn place_market_order(
                     &self,
                     _order: MarketOrder,
-                ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>>
+                ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
                 {
                     Err("API error (403 Forbidden): trade denied due to pattern day trading protection".into())
                 }
@@ -4344,7 +4472,7 @@ mod tests {
                 async fn place_market_order(
                     &self,
                     _order: MarketOrder,
-                ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>>
+                ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
                 {
                     Err("Broker rejected: insufficient buying power".into())
                 }

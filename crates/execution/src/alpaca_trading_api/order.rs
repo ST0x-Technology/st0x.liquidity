@@ -3,7 +3,7 @@ use apca::api::v2::order;
 use chrono::Utc;
 use num_decimal::Num;
 use rain_math_float::Float;
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::AlpacaTradingApiError;
@@ -34,12 +34,26 @@ pub(super) async fn place_market_order(
         ..Default::default()
     };
 
-    // Convert FractionalShares -> string -> Num for the apca crate.
-    let formatted = market_order
-        .shares
-        .inner()
-        .inner()
-        .format_with_scientific(false)?;
+    // Alpaca supports max 9 decimal places; truncate to avoid rejection.
+    let original = market_order.shares.inner().inner();
+    let truncated_float =
+        crate::truncate_to_decimal_places(original, crate::ALPACA_MAX_DECIMAL_PLACES)?.ok_or(
+            AlpacaTradingApiError::BelowPrecision {
+                shares: market_order.shares,
+                max_decimals: crate::ALPACA_MAX_DECIMAL_PLACES,
+            },
+        )?;
+
+    if !truncated_float.eq(original)? {
+        warn!(
+            original = %original.format_with_scientific(false)?,
+            truncated = %truncated_float.format_with_scientific(false)?,
+            "Truncated order quantity to {} decimal places for Alpaca",
+            crate::ALPACA_MAX_DECIMAL_PLACES,
+        );
+    }
+
+    let formatted = truncated_float.format_with_scientific(false)?;
     let quantity: Num = formatted
         .parse()
         .map_err(|source| AlpacaTradingApiError::NumConversion { formatted, source })?;
@@ -54,10 +68,12 @@ pub(super) async fn place_market_order(
 
     let order_id = order_response.id.to_string();
 
+    let placed_shares = Positive::new(FractionalShares::new(truncated_float))?;
+
     Ok(OrderPlacement {
         order_id,
         symbol: market_order.symbol,
-        shares: market_order.shares,
+        shares: placed_shares,
         direction: market_order.direction,
         placed_at: chrono::Utc::now(),
     })
@@ -645,5 +661,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn tiny_shares_below_precision_returns_error() {
+        let server = MockServer::start();
+        let client = create_test_client(&server);
+
+        let tiny = Float::parse("0.0000000001".to_string()).unwrap();
+        let market_order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(tiny)).unwrap(),
+            direction: Direction::Buy,
+        };
+
+        let err = place_market_order(&client, market_order).await.unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                AlpacaTradingApiError::BelowPrecision {
+                    max_decimals,
+                    ..
+                } if max_decimals == crate::ALPACA_MAX_DECIMAL_PLACES
+            ),
+            "Expected BelowPrecision error, got: {err:?}"
+        );
     }
 }

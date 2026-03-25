@@ -1,6 +1,8 @@
 use rain_math_float::FloatError;
 use thiserror::Error;
 
+use crate::{FractionalShares, Positive};
+
 mod auth;
 mod executor;
 mod market_hours;
@@ -42,6 +44,14 @@ pub enum AlpacaTradingApiError {
     NumConversion {
         formatted: String,
         source: num_decimal::ParseNumError,
+    },
+    #[error(
+        "Order quantity {shares} is below Alpaca's \
+         {max_decimals}-decimal-place precision"
+    )]
+    BelowPrecision {
+        shares: Positive<FractionalShares>,
+        max_decimals: u8,
     },
     #[error("Float conversion error: {0}")]
     FloatConversion(#[from] FloatError),

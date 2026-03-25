@@ -20,7 +20,8 @@ use st0x_execution::{
 use super::auth::ensure_schwab_authentication;
 use crate::config::{BrokerCtx, Ctx};
 use crate::offchain_order::{
-    OffchainOrderCommand, OffchainOrderId, OrderPlacer, build_offchain_order_cqrs,
+    OffchainOrderCommand, OffchainOrderId, OrderPlacementResult, OrderPlacer,
+    build_offchain_order_cqrs,
 };
 use crate::onchain::accumulator::check_execution_readiness;
 use crate::onchain::pyth::FeedIdCache;
@@ -42,10 +43,13 @@ impl OrderPlacer for CliOrderPlacer {
     async fn place_market_order(
         &self,
         order: MarketOrder,
-    ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
         let placement =
             execute_broker_order(&self.ctx, &self.pool, order, None, &mut std::io::sink()).await?;
-        Ok(ExecutorOrderId::new(&placement.order_id))
+        Ok(OrderPlacementResult {
+            executor_order_id: ExecutorOrderId::new(&placement.order_id),
+            placed_shares: placement.shares,
+        })
     }
 }
 

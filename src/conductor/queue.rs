@@ -246,13 +246,15 @@ mod tests {
     use std::sync::Arc;
 
     use st0x_event_sorcery::{Projection, StoreBuilder, test_store};
-    use st0x_execution::{ExecutorOrderId, MarketOrder, MockExecutor, Symbol};
+    use st0x_execution::{
+        ExecutorOrderId, FractionalShares, MarketOrder, MockExecutor, Positive, Symbol,
+    };
 
     use super::*;
     use crate::bindings::IOrderBookV6::{ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4};
     use crate::config::{AssetsConfig, EquitiesConfig};
     use crate::offchain_order::noop_order_placer;
-    use crate::offchain_order::{OffchainOrder, OrderPlacer};
+    use crate::offchain_order::{OffchainOrder, OrderPlacementResult, OrderPlacer};
     use crate::onchain_trade::OnChainTrade;
     use crate::position::Position;
     use crate::test_utils::{OnchainTradeBuilder, setup_test_db};
@@ -267,6 +269,9 @@ mod tests {
         offchain_order_projection: Arc<Projection<OffchainOrder>>,
     }
 
+    /// Mock order placer that returns a distinct `placed_shares` value
+    /// (different from the requested quantity) so tests can verify the
+    /// system persists the broker-accepted quantity, not the original request.
     fn succeeding_order_placer() -> Arc<dyn OrderPlacer> {
         struct TestOrderPlacer;
 
@@ -275,12 +280,19 @@ mod tests {
             async fn place_market_order(
                 &self,
                 _order: MarketOrder,
-            ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>> {
-                Ok(ExecutorOrderId::new("TEST_BROKER_ORD"))
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("TEST_BROKER_ORD"),
+                    placed_shares: mock_placed_shares(),
+                })
             }
         }
 
         Arc::new(TestOrderPlacer)
+    }
+
+    fn mock_placed_shares() -> Positive<FractionalShares> {
+        Positive::new(FractionalShares::new(float!(0.999))).unwrap()
     }
 
     async fn create_test_cqrs_frameworks(
@@ -496,6 +508,12 @@ mod tests {
         assert!(
             matches!(offchain_order, OffchainOrder::Submitted { .. }),
             "Offchain order should be Submitted after successful placement, got: {offchain_order:?}"
+        );
+
+        assert_eq!(
+            offchain_order.shares(),
+            mock_placed_shares(),
+            "Offchain order shares should reflect the broker-accepted quantity, not the original request"
         );
     }
 

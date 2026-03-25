@@ -1,9 +1,8 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use tracing::debug;
-use uuid::Uuid;
-
 use rain_math_float::Float;
+use serde::{Deserialize, Serialize};
+use tracing::{debug, warn};
+use uuid::Uuid;
 
 use super::client::AlpacaBrokerApiClient;
 use super::{AlpacaBrokerApiError, TimeInForce};
@@ -52,12 +51,15 @@ pub enum ConversionDirection {
     UsdToUsdc,
 }
 
-/// Order request for placing market orders
+/// Order request for placing market orders.
+///
+/// The `quantity` field must already be truncated to Alpaca's decimal precision
+/// before constructing this struct.
 #[derive(Debug, Serialize)]
 pub(super) struct OrderRequest {
     #[serde(serialize_with = "serialize_symbol")]
     pub symbol: Symbol,
-    #[serde(rename = "qty", serialize_with = "serialize_positive_shares")]
+    #[serde(rename = "qty", serialize_with = "serialize_shares_as_string")]
     pub quantity: Positive<FractionalShares>,
     pub side: OrderSide,
     #[serde(rename = "type")]
@@ -75,7 +77,7 @@ where
 
 // serde's serialize_with requires the field to be passed by reference
 #[allow(clippy::trivially_copy_pass_by_ref)]
-fn serialize_positive_shares<S>(
+fn serialize_shares_as_string<S>(
     shares: &Positive<FractionalShares>,
     serializer: S,
 ) -> Result<S::Ok, S::Error>
@@ -194,6 +196,27 @@ pub(super) async fn place_market_order(
         market_order.direction, market_order.shares, market_order.symbol, time_in_force
     );
 
+    // Alpaca supports max 9 decimal places; truncate to avoid rejection.
+    let original = market_order.shares.inner().inner();
+    let truncated_float =
+        crate::truncate_to_decimal_places(original, crate::ALPACA_MAX_DECIMAL_PLACES)?.ok_or(
+            AlpacaBrokerApiError::BelowPrecision {
+                shares: market_order.shares,
+                max_decimals: crate::ALPACA_MAX_DECIMAL_PLACES,
+            },
+        )?;
+
+    if !truncated_float.eq(original)? {
+        warn!(
+            original = %market_order.shares,
+            truncated = %FractionalShares::new(truncated_float),
+            "Truncated order quantity to {} decimal places for Alpaca",
+            crate::ALPACA_MAX_DECIMAL_PLACES,
+        );
+    }
+
+    let placed_shares = Positive::new(FractionalShares::new(truncated_float))?;
+
     let side = match market_order.direction {
         Direction::Buy => OrderSide::Buy,
         Direction::Sell => OrderSide::Sell,
@@ -201,7 +224,7 @@ pub(super) async fn place_market_order(
 
     let request = OrderRequest {
         symbol: market_order.symbol.clone(),
-        quantity: market_order.shares,
+        quantity: placed_shares,
         side,
         order_type: "market",
         time_in_force: time_in_force.as_api_str(),
@@ -214,7 +237,7 @@ pub(super) async fn place_market_order(
     Ok(OrderPlacement {
         order_id: response.id.to_string(),
         symbol: market_order.symbol,
-        shares: market_order.shares,
+        shares: placed_shares,
         direction: market_order.direction,
         placed_at: Utc::now(),
     })
@@ -688,6 +711,90 @@ mod tests {
         assert_eq!(order.symbol, "USDCUSD");
         assert!(order.quantity.eq(float!(500)).unwrap());
         assert_eq!(order.status_display(), "filled");
+    }
+
+    #[tokio::test]
+    async fn truncates_18_decimal_quantity_to_9() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
+                .json_body(json!({
+                    "symbol": "RKLB",
+                    "qty": "0.996350331",
+                    "side": "sell",
+                    "type": "market",
+                    "time_in_force": "day",
+                    "extended_hours": false
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "symbol": "RKLB",
+                    "qty": "0.996350331",
+                    "side": "sell",
+                    "status": "new",
+                    "filled_avg_price": null
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        // Simulate an onchain value with 18 decimal places
+        let onchain_shares = Float::parse("0.996350331351928059".to_string()).unwrap();
+        let market_order = MarketOrder {
+            symbol: Symbol::new("RKLB").unwrap(),
+            shares: Positive::new(FractionalShares::new(onchain_shares)).unwrap(),
+            direction: Direction::Sell,
+        };
+
+        let placement = place_market_order(&client, market_order, TimeInForce::Day)
+            .await
+            .unwrap();
+
+        mock.assert();
+        assert_eq!(placement.symbol.to_string(), "RKLB");
+        assert_eq!(placement.direction, Direction::Sell);
+        assert!(
+            placement
+                .shares
+                .inner()
+                .inner()
+                .eq(float!(0.996350331))
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn tiny_shares_below_precision_returns_error() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        let tiny = Float::parse("0.0000000001".to_string()).unwrap();
+        let market_order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(tiny)).unwrap(),
+            direction: Direction::Buy,
+        };
+
+        let err = place_market_order(&client, market_order, TimeInForce::Day)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                AlpacaBrokerApiError::BelowPrecision {
+                    max_decimals,
+                    ..
+                } if max_decimals == crate::ALPACA_MAX_DECIMAL_PLACES
+            ),
+            "Expected BelowPrecision error, got: {err:?}"
+        );
     }
 
     #[test]

@@ -191,10 +191,12 @@ fn assert_total_broker_order_qty(
             (acc + order.quantity).unwrap()
         });
 
+    let epsilon = truncation_epsilon(symbol_orders.len());
+
     assert_decimal_eq!(
         total_quantity,
         expected_position.amount,
-        *DEFAULT_EPSILON,
+        epsilon,
         "Total broker order quantity for {} should match expected hedge amount",
         expected_position.symbol
     );
@@ -223,7 +225,7 @@ pub async fn assert_cqrs_state(
     assert_offchain_order_events(expected_positions, &events);
 
     for expected_position in expected_positions {
-        assert_position_view(expected_position, &pool).await?;
+        assert_position_view(expected_position, &pool, &events).await?;
     }
 
     assert_offchain_order_views(expected_positions, &pool).await?;
@@ -459,9 +461,35 @@ fn assert_offchain_order_events(expected_positions: &[ExpectedPosition], events:
     }
 }
 
+/// Computes a truncation-aware epsilon scaled by the number of broker orders.
+/// Each order can lose up to 1e-9 of precision from Alpaca's 9-decimal-place
+/// truncation; cumulative fields need epsilon proportional to order count.
+fn truncation_epsilon(order_count: usize) -> Float {
+    let per_order = Float::parse("0.000000001".to_string()).expect("per_order_epsilon parse");
+    let count = Float::parse(order_count.to_string()).expect("order_count parse");
+    (per_order * count).expect("epsilon mul")
+}
+
+/// Counts the number of OffchainOrderEvent::Placed events for a given symbol.
+fn count_offchain_orders_for_symbol(events: &[StoredEvent], symbol: &str) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            event.event_type == "OffchainOrderEvent::Placed"
+                && event
+                    .payload
+                    .get("Placed")
+                    .and_then(|placed| placed.get("symbol"))
+                    .and_then(|sym| sym.as_str())
+                    == Some(symbol)
+        })
+        .count()
+}
+
 async fn assert_position_view(
     expected_position: &ExpectedPosition,
     pool: &SqlitePool,
+    events: &[StoredEvent],
 ) -> anyhow::Result<()> {
     let projection = Projection::<Position>::sqlite(pool.clone());
     let symbol = Symbol::new(expected_position.symbol)?;
@@ -476,26 +504,28 @@ async fn assert_position_view(
     let expected_net = expected_position.expected_net;
     let expected_long = expected_position.expected_accumulated_long;
     let expected_short = expected_position.expected_accumulated_short;
+    let order_count = count_offchain_orders_for_symbol(events, expected_position.symbol).max(1);
+    let epsilon = truncation_epsilon(order_count);
 
     assert_eq!(position.symbol, symbol);
     assert_decimal_eq!(
         position.net.inner(),
         expected_net,
-        *DEFAULT_EPSILON,
+        epsilon,
         "net position mismatch for {}",
         expected_position.symbol
     );
     assert_decimal_eq!(
         position.accumulated_long.inner(),
         expected_long,
-        *DEFAULT_EPSILON,
+        epsilon,
         "accumulated_long mismatch for {}",
         expected_position.symbol
     );
     assert_decimal_eq!(
         position.accumulated_short.inner(),
         expected_short,
-        *DEFAULT_EPSILON,
+        epsilon,
         "accumulated_short mismatch for {}",
         expected_position.symbol
     );
@@ -736,10 +766,6 @@ macro_rules! assert_decimal_eq {
         }
     };
 }
-pub(crate) static DEFAULT_EPSILON: std::sync::LazyLock<Float> = std::sync::LazyLock::new(|| {
-    Float::parse("0.000000000000001".to_string())
-        .unwrap_or_else(|error| panic!("DEFAULT_EPSILON parse failed: {error:?}"))
-});
 
 #[cfg(test)]
 mod tests {

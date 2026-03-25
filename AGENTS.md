@@ -29,7 +29,8 @@ the limit:
   `::random()`, mocks, encoding, compile-time macros
 - [docs/cqrs.md](docs/cqrs.md) - Event sourcing with st0x-event-sorcery
 - [docs/float.md](docs/float.md) - Float type, precision-safe financial
-  arithmetic
+  arithmetic, Solidity-backed operations for guaranteed compatibility with smart
+  contracts
 
 **Update at the end:**
 

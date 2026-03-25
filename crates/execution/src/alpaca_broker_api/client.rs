@@ -3,7 +3,7 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::debug;
 use uuid::Uuid;
 
@@ -91,7 +91,13 @@ impl AlpacaBrokerApiClient {
             self.base_url, self.account_id
         );
 
-        debug!("Placing order at {}: {:?}", url, request);
+        debug!(
+            symbol = %request.symbol,
+            quantity = %request.quantity,
+            side = ?request.side,
+            time_in_force = request.time_in_force,
+            "Placing Alpaca Broker API order"
+        );
 
         self.post(&url, request).await
     }
@@ -201,11 +207,24 @@ impl AlpacaBrokerApiClient {
 
         let error_body = response.text().await.unwrap_or_default();
 
+        let (alpaca_code, message) = match serde_json::from_str::<AlpacaApiErrorBody>(&error_body) {
+            Ok(parsed) => (parsed.code, parsed.message),
+            Err(_) => (None, error_body),
+        };
+
         Err(AlpacaBrokerApiError::ApiError {
             status,
-            body: error_body,
+            alpaca_code,
+            message,
         })
     }
+}
+
+/// Alpaca API error response body structure
+#[derive(Deserialize)]
+struct AlpacaApiErrorBody {
+    code: Option<u64>,
+    message: String,
 }
 
 #[cfg(test)]
