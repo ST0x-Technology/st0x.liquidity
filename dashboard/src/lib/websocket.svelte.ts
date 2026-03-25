@@ -168,7 +168,7 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
         }
 
         const { type } = parsed
-        if (import.meta.env.DEV) console.log(`[ws] received "${type}"`)
+        if (import.meta.env.DEV) console.log(`[ws] received "${type}"`, parsed)
 
         handleMessage(parsed)
       } catch (e) {
