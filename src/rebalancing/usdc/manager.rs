@@ -84,7 +84,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
     ///
     /// The `order_id` in `InitiateConversion` is a correlation UUID
     /// generated upfront, not the actual Alpaca order ID.
-    #[instrument(skip(self), fields(?id, ?amount))]
+    #[instrument(skip(self), fields(%id, %amount))]
     pub(crate) async fn execute_usd_to_usdc_conversion(
         &self,
         id: &UsdcRebalanceId,
@@ -92,7 +92,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
     ) -> Result<Usdc, UsdcTransferError> {
         let correlation_id = Uuid::new_v4();
 
-        info!(?amount, %correlation_id, "Starting USD to USDC conversion");
+        info!(%amount, %correlation_id, "Starting USD to USDC conversion");
 
         // Record intent BEFORE placing order so we can track failures
         self.cqrs
@@ -142,7 +142,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
 
         info!(
             order_id = %order.id,
-            requested = ?amount,
+            requested = %amount,
             filled = ?filled_qty,
             "USD to USDC conversion completed"
         );
@@ -169,7 +169,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
     ///
     /// The `order_id` in `InitiatePostDepositConversion` is a correlation
     /// UUID generated upfront, not the actual Alpaca order ID.
-    #[instrument(skip(self), fields(?id, ?amount))]
+    #[instrument(skip(self), fields(%id, %amount))]
     pub(crate) async fn execute_usdc_to_usd_conversion(
         &self,
         id: &UsdcRebalanceId,
@@ -177,7 +177,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
     ) -> Result<Usdc, UsdcTransferError> {
         let correlation_id = Uuid::new_v4();
 
-        info!(?amount, %correlation_id, "Starting USDC to USD conversion");
+        info!(%amount, %correlation_id, "Starting USDC to USD conversion");
 
         // Record intent BEFORE placing order so we can track failures
         self.cqrs
@@ -228,7 +228,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
 
         info!(
             order_id = %order.id,
-            requested = ?amount,
+            requested = %amount,
             filled = ?filled_amount,
             "USDC to USD conversion completed"
         );
@@ -249,13 +249,13 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
     ///
     /// On errors, sends appropriate `Fail*` command to transition
     /// aggregate to failed state.
-    #[instrument(skip(self), fields(?id, ?amount))]
+    #[instrument(skip(self), fields(%id, %amount))]
     pub(crate) async fn execute_alpaca_to_base(
         &self,
         id: &UsdcRebalanceId,
         amount: Usdc,
     ) -> Result<(), UsdcTransferError> {
-        info!(?amount, "Starting Alpaca to Base rebalance");
+        info!(%amount, "Starting Alpaca to Base rebalance");
 
         // Convert USD to USDC - use actual filled amount for subsequent steps
         let usdc_amount = self.execute_usd_to_usdc_conversion(id, amount).await?;
@@ -294,7 +294,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(?id, ?amount))]
+    #[instrument(skip(self), fields(%id, %amount))]
     async fn initiate_alpaca_withdrawal(
         &self,
         id: &UsdcRebalanceId,
@@ -330,7 +330,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
         Ok(transfer)
     }
 
-    #[instrument(skip(self), fields(?id, %transfer_id))]
+    #[instrument(skip(self), fields(%id, %transfer_id))]
     async fn poll_and_confirm_withdrawal(
         &self,
         id: &UsdcRebalanceId,
@@ -377,7 +377,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(?id, %amount))]
+    #[instrument(skip(self), fields(%id, %amount))]
     async fn execute_cctp_burn(
         &self,
         id: &UsdcRebalanceId,
@@ -420,7 +420,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
         Ok(burn_receipt)
     }
 
-    #[instrument(skip(self, burn_receipt), fields(?id, burn_tx = %burn_receipt.tx))]
+    #[instrument(skip(self, burn_receipt), fields(%id, burn_tx = %burn_receipt.tx))]
     async fn poll_attestation(
         &self,
         id: &UsdcRebalanceId,
@@ -460,7 +460,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
         Ok(response)
     }
 
-    #[instrument(skip(self, attestation_response), fields(?id))]
+    #[instrument(skip(self, attestation_response), fields(%id))]
     async fn execute_cctp_mint(
         &self,
         id: &UsdcRebalanceId,
@@ -506,7 +506,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
         Ok(mint_receipt)
     }
 
-    #[instrument(skip(self), fields(?id, ?amount))]
+    #[instrument(skip(self), fields(%id, %amount))]
     async fn deposit_to_vault(
         &self,
         id: &UsdcRebalanceId,
@@ -541,7 +541,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(?id))]
+    #[instrument(skip(self), fields(%id))]
     async fn confirm_deposit(&self, id: &UsdcRebalanceId) -> Result<(), UsdcTransferError> {
         self.cqrs
             .send(id, UsdcRebalanceCommand::ConfirmDeposit)
@@ -566,13 +566,13 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
     ///
     /// On errors, sends appropriate `Fail*` command to transition
     /// aggregate to failed state.
-    #[instrument(skip(self), fields(?id, ?amount))]
+    #[instrument(skip(self), fields(%id, %amount))]
     pub(crate) async fn execute_base_to_alpaca(
         &self,
         id: &UsdcRebalanceId,
         amount: Usdc,
     ) -> Result<(), UsdcTransferError> {
-        info!(?amount, "Starting Base to Alpaca rebalance");
+        info!(%amount, "Starting Base to Alpaca rebalance");
 
         let amount_u256 = usdc_to_u256(amount)?;
 
@@ -601,7 +601,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(?id, ?amount))]
+    #[instrument(skip(self), fields(%id, %amount))]
     async fn withdraw_from_vault(
         &self,
         id: &UsdcRebalanceId,
@@ -636,7 +636,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(?id, ?amount))]
+    #[instrument(skip(self), fields(%id, %amount))]
     async fn execute_cctp_burn_on_base(
         &self,
         id: &UsdcRebalanceId,
@@ -679,7 +679,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
         Ok(burn_receipt)
     }
 
-    #[instrument(skip(self, burn_receipt), fields(?id, burn_tx = %burn_receipt.tx))]
+    #[instrument(skip(self, burn_receipt), fields(%id, burn_tx = %burn_receipt.tx))]
     async fn poll_attestation_for_base_burn(
         &self,
         id: &UsdcRebalanceId,
@@ -719,7 +719,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
         Ok(response)
     }
 
-    #[instrument(skip(self, attestation_response), fields(?id))]
+    #[instrument(skip(self, attestation_response), fields(%id))]
     async fn execute_cctp_mint_on_ethereum(
         &self,
         id: &UsdcRebalanceId,
@@ -765,7 +765,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
         Ok(mint_receipt)
     }
 
-    #[instrument(skip(self), fields(?id, %mint_tx))]
+    #[instrument(skip(self), fields(%id, %mint_tx))]
     async fn poll_and_confirm_alpaca_deposit(
         &self,
         id: &UsdcRebalanceId,

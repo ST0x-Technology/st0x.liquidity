@@ -30,6 +30,17 @@ pub enum ServerMessage {
     Transfer(TransferOperation),
 }
 
+impl ServerMessage {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Initial(_) => "Initial",
+            Self::Event(_) => "Event",
+            Self::Snapshot(_) => "Snapshot",
+            Self::Transfer(_) => "Transfer",
+        }
+    }
+}
+
 /// Full dashboard snapshot sent to the frontend on connection.
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]

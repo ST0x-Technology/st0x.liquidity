@@ -126,8 +126,8 @@ fn cap_usdc(amount: Usdc, usdc_limit: Option<Usdc>) -> Usdc {
 
     if amount.gt(&cap).unwrap_or(false) {
         warn!(
-            computed = ?amount,
-            limit = ?cap,
+            computed = %amount,
+            limit = %cap,
             "USDC rebalancing amount capped by operational limit"
         );
         cap

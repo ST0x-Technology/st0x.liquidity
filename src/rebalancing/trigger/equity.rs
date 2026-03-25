@@ -177,8 +177,8 @@ fn truncate_for_alpaca(
     if truncated != quantity {
         warn!(
             %symbol,
-            original = ?quantity.inner(),
-            truncated = ?truncated.inner(),
+            original = %quantity,
+            truncated = %truncated,
             "Truncated quantity to {} decimal places for Alpaca API",
             ALPACA_QUANTITY_MAX_DECIMAL_PLACES
         );

@@ -413,6 +413,21 @@ pub(crate) enum TriggeredOperation {
     UsdcBaseToAlpaca { amount: Usdc },
 }
 
+impl std::fmt::Display for TriggeredOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Mint { symbol, quantity } => write!(f, "Mint({symbol}, {quantity})"),
+            Self::Redemption {
+                symbol, quantity, ..
+            } => {
+                write!(f, "Redemption({symbol}, {quantity})")
+            }
+            Self::UsdcAlpacaToBase { amount } => write!(f, "UsdcAlpacaToBase({amount})"),
+            Self::UsdcBaseToAlpaca { amount } => write!(f, "UsdcBaseToAlpaca({amount})"),
+        }
+    }
+}
+
 /// Trigger that monitors inventory and sends rebalancing operations.
 pub(crate) struct RebalancingTrigger {
     config: RebalancingTriggerConfig,
@@ -828,7 +843,7 @@ impl RebalancingTrigger {
             return Ok(());
         }
 
-        debug!(%symbol, ?operation, "Triggered equity rebalancing");
+        debug!(%symbol, %operation, "Triggered equity rebalancing");
         guard.defuse();
         Ok(())
     }
@@ -891,7 +906,7 @@ impl RebalancingTrigger {
             return;
         }
 
-        debug!(?operation, "Triggered USDC rebalancing");
+        debug!(%operation, "Triggered USDC rebalancing");
         guard.defuse();
     }
 

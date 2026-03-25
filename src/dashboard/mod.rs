@@ -66,7 +66,7 @@ fn ws_endpoint<'r>(
             loop {
                 match receiver.recv().await {
                     Ok(msg) => {
-                        debug!(?msg, "Broadcasting to dashboard client");
+                        debug!(msg = %msg.kind(), "Broadcasting to dashboard client");
                         let json = match serde_json::to_string(&msg) {
                             Ok(serialized) => serialized,
                             Err(error) => {
