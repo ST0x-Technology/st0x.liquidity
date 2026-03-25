@@ -421,14 +421,12 @@ impl<P: Provider + Clone> BaseChain<P> {
         };
 
         let price_str = format_float(price)?;
-        let (max_amount_base, io_ratio_str) = if is_sell {
-            let base: U256 = parse_units(&amount_str, 18)?.into();
-            (base, price_str)
+        let (max_output_str, io_ratio_str) = if is_sell {
+            (amount_str.clone(), price_str)
         } else {
-            let base: U256 = parse_units(&usdc_total_str, 6)?.into();
-            (base, format!("inv({price_str})"))
+            (usdc_total_str.clone(), format!("inv({price_str})"))
         };
-        let default_expression = format!("_ _: {max_amount_base} {io_ratio_str};:;");
+        let default_expression = format!("_ _: {max_output_str} {io_ratio_str};:;");
         let expression = rain_expression_override.unwrap_or(default_expression);
         let parsed_bytecode = deployer_instance
             .parse2(Bytes::copy_from_slice(expression.as_bytes()))
@@ -669,14 +667,12 @@ impl<P: Provider + Clone> BaseChain<P> {
         // Buy:  output = USDC, input = equity, ioRatio = inv(price)
         // Keep the reciprocal inside Rainlang to avoid precomputing it in Rust.
         let price_str = format_float(price)?;
-        let (max_amount_base, io_ratio_str) = if is_sell {
-            let base: U256 = parse_units(&amount_str, 18)?.into();
-            (base, price_str)
+        let (max_output_str, io_ratio_str) = if is_sell {
+            (amount_str.clone(), price_str)
         } else {
-            let base: U256 = parse_units(&usdc_total_str, 6)?.into();
-            (base, format!("inv({price_str})"))
+            (usdc_total_str.clone(), format!("inv({price_str})"))
         };
-        let default_expression = format!("_ _: {max_amount_base} {io_ratio_str};:;");
+        let default_expression = format!("_ _: {max_output_str} {io_ratio_str};:;");
         let expression = rain_expression_override.unwrap_or(default_expression);
 
         let parsed_bytecode = deployer_instance
