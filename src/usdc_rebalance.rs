@@ -737,9 +737,9 @@ impl EventSourced for UsdcRebalance {
                     direction,
                     amount,
                     order_id,
-                    initiated_at,
+                    ..
                 },
-                Self::DepositConfirmed { .. },
+                Self::DepositConfirmed { initiated_at, .. },
             ) => Self::Converting {
                 direction: direction.clone(),
                 amount: *amount,
@@ -785,14 +785,11 @@ impl EventSourced for UsdcRebalance {
             },
 
             (
-                Initiated {
-                    withdrawal_ref,
-                    initiated_at,
-                    ..
-                },
+                Initiated { withdrawal_ref, .. },
                 Self::ConversionComplete {
                     direction,
                     filled_amount,
+                    initiated_at,
                     ..
                 },
             ) => Self::Withdrawing {
@@ -3793,6 +3790,121 @@ mod tests {
             events[0],
             UsdcRebalanceEvent::ConversionConfirmed { .. }
         ));
+    }
+
+    #[test]
+    fn to_dto_preserves_original_initiated_at_when_post_deposit_conversion_begins() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let order_id = Uuid::new_v4();
+        let original_initiated_at = Utc::now();
+        let withdrawal_confirmed_at = original_initiated_at + chrono::Duration::seconds(30);
+        let bridged_at = original_initiated_at + chrono::Duration::seconds(90);
+        let deposit_initiated_at = original_initiated_at + chrono::Duration::seconds(120);
+        let deposit_confirmed_at = original_initiated_at + chrono::Duration::seconds(150);
+        let burn_tx =
+            fixed_bytes!("0x000000000000000000000000000000000000000000000000000000000000000c");
+        let mint_tx =
+            fixed_bytes!("0x000000000000000000000000000000000000000000000000000000000000000d");
+
+        let state = replay::<UsdcRebalance>(vec![
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(1000.00)),
+                withdrawal_ref: TransferRef::OnchainTx(burn_tx),
+                initiated_at: original_initiated_at,
+            },
+            UsdcRebalanceEvent::WithdrawalConfirmed {
+                confirmed_at: withdrawal_confirmed_at,
+            },
+            UsdcRebalanceEvent::BridgingInitiated {
+                burn_tx_hash: burn_tx,
+                burned_at: withdrawal_confirmed_at,
+            },
+            UsdcRebalanceEvent::BridgeAttestationReceived {
+                attestation: vec![0x01],
+                cctp_nonce: 12345,
+                attested_at: withdrawal_confirmed_at + chrono::Duration::seconds(15),
+            },
+            UsdcRebalanceEvent::Bridged {
+                mint_tx_hash: mint_tx,
+                amount_received: Usdc::new(float!(999.99)),
+                fee_collected: Usdc::new(float!(0.01)),
+                minted_at: bridged_at,
+            },
+            UsdcRebalanceEvent::DepositInitiated {
+                deposit_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                deposit_initiated_at,
+            },
+            UsdcRebalanceEvent::DepositConfirmed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                deposit_confirmed_at,
+            },
+            UsdcRebalanceEvent::ConversionInitiated {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(999.99)),
+                order_id,
+                initiated_at: original_initiated_at + chrono::Duration::seconds(180),
+            },
+        ])
+        .expect("event stream should replay into post-deposit conversion state");
+        let state = state.expect("event stream should materialize a UsdcRebalance state");
+
+        let dto = state.to_dto(&id);
+        let TransferOperation::UsdcBridge(bridge) = dto else {
+            panic!("expected UsdcBridge variant");
+        };
+
+        assert!(
+            matches!(bridge.status, UsdcBridgeStatus::Converting),
+            "expected dashboard to show post-deposit conversion as converting, got: {:?}",
+            bridge.status
+        );
+        assert_eq!(
+            bridge.started_at, original_initiated_at,
+            "initiated_at should remain anchored to the original rebalance initiation time"
+        );
+        assert_eq!(bridge.updated_at, original_initiated_at);
+    }
+
+    #[test]
+    fn to_dto_preserves_original_initiated_at_when_withdrawal_begins_after_conversion() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let order_id = Uuid::new_v4();
+        let original_initiated_at = Utc::now();
+        let conversion_completed_at = original_initiated_at + chrono::Duration::seconds(30);
+        let state = replay::<UsdcRebalance>(vec![
+            UsdcRebalanceEvent::ConversionInitiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc::new(float!(1000.00)),
+                order_id,
+                initiated_at: original_initiated_at,
+            },
+            UsdcRebalanceEvent::ConversionConfirmed {
+                direction: RebalanceDirection::AlpacaToBase,
+                filled_amount: Usdc::new(float!(999.99)),
+                converted_at: conversion_completed_at,
+            },
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc::new(float!(999.99)),
+                withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                initiated_at: original_initiated_at + chrono::Duration::seconds(60),
+            },
+        ])
+        .expect("event stream should replay into withdrawing state");
+        let state = state.expect("event stream should materialize a UsdcRebalance state");
+
+        let dto = state.to_dto(&id);
+        let TransferOperation::UsdcBridge(bridge) = dto else {
+            panic!("expected UsdcBridge variant");
+        };
+
+        assert!(matches!(bridge.status, UsdcBridgeStatus::Withdrawing));
+        assert_eq!(
+            bridge.started_at, original_initiated_at,
+            "initiated_at should remain anchored to the original rebalance initiation time"
+        );
+        assert_eq!(bridge.updated_at, original_initiated_at);
     }
 
     #[test]
