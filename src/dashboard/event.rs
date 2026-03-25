@@ -13,12 +13,22 @@ use st0x_event_sorcery::{
 };
 
 use crate::equity_redemption::EquityRedemption;
+use crate::offchain_order::OffchainOrder;
+use crate::onchain_trade::OnChainTrade;
+use crate::position::Position;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
 
 deps!(
     EventBroadcaster,
-    [TokenizedEquityMint, EquityRedemption, UsdcRebalance,]
+    [
+        OnChainTrade,
+        Position,
+        OffchainOrder,
+        TokenizedEquityMint,
+        EquityRedemption,
+        UsdcRebalance,
+    ]
 );
 
 /// Reactor that broadcasts events to connected WebSocket clients.
@@ -72,6 +82,15 @@ impl Reactor for EventBroadcaster {
         event: <Self::Dependencies as EntityList>::Event,
     ) -> Result<(), Self::Error> {
         event
+            .on(|id, event| async move {
+                self.broadcast_event::<OnChainTrade>(&id, &event);
+            })
+            .on(|id, event| async move {
+                self.broadcast_event::<Position>(&id, &event);
+            })
+            .on(|id, event| async move {
+                self.broadcast_event::<OffchainOrder>(&id, &event);
+            })
             .on(|id, event| async move {
                 self.broadcast_event::<TokenizedEquityMint>(&id, &event);
 
