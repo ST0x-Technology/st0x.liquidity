@@ -105,7 +105,8 @@ fn spawn_server_task(
 ) -> JoinHandle<Result<Rocket<Ignite>, rocket::Error>> {
     let rocket_config = rocket::Config::figment()
         .merge(("port", ctx.server_port))
-        .merge(("address", "0.0.0.0"));
+        .merge(("address", "0.0.0.0"))
+        .merge(("cli_colors", false));
 
     let rocket = rocket::custom(rocket_config)
         .mount("/", api::routes())
