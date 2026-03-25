@@ -1,9 +1,9 @@
-//! Mega e2e test exercising hedging, equity rebalancing, and USDC rebalancing
+//! E2e tests exercising hedging, equity rebalancing, and USDC rebalancing
 //! together in a single bot instance with shared state.
 //!
-//! Phases run sequentially, each building on accumulated state from prior
-//! phases. This validates that the systems compose correctly under realistic
-//! multi-asset, multi-feature conditions.
+//! - `full_system`: Sequential phases, each building on accumulated state.
+//! - `full_system_concurrent`: All trades fired at once in random order,
+//!   asserting the system reaches the correct final state eventually.
 //!
 //! When a dashboard WebSocket client is connected, the test stays alive after
 //! assertions complete so the dashboard can visualize the full event stream.
@@ -15,8 +15,11 @@ use std::time::Duration;
 
 use alloy::primitives::{Address, B256, U256, utils::parse_units};
 use alloy::providers::{Provider, RootProvider};
+use rand::Rng;
+use rand::seq::SliceRandom;
 use st0x_float_macro::float;
 use tokio::sync::broadcast;
+use tracing::info;
 
 use st0x_dto::ServerMessage;
 use st0x_event_sorcery::Projection;
@@ -37,7 +40,7 @@ use crate::base_chain::{self, TakeDirection};
 use crate::cctp::{CctpInfra, CctpOverrides, USDC_ETHEREUM};
 use crate::hedging::assertions::assert_full_hedging_flow;
 use crate::poll::{
-    await_dashboard_disconnect, connect_db, count_events, poll_for_broker_fills, poll_for_events,
+    connect_db, count_events, free_port, poll_for_broker_fills, poll_for_events,
     poll_for_events_with_timeout, poll_for_ready, spawn_bot_with_event_channel,
 };
 use crate::rebalancing::assertions::TestWallet;
@@ -56,6 +59,7 @@ fn build_full_system_ctx<P: Provider + Clone>(
     equity_vault_ids: &HashMap<String, B256>,
     cash_vault_id: B256,
     cctp: CctpOverrides,
+    server_port: u16,
 ) -> anyhow::Result<Ctx> {
     let alpaca_auth = AlpacaBrokerApiCtx {
         api_key: TEST_API_KEY.to_owned(),
@@ -129,7 +133,7 @@ fn build_full_system_ctx<P: Provider + Clone>(
             }),
         })
         .inventory_poll_interval(15)
-        .server_port(8001)
+        .server_port(server_port)
         .call()
         .map_err(Into::into)
 }
@@ -238,8 +242,8 @@ async fn full_system() -> anyhow::Result<()> {
     let current_block = infra.base_chain.provider.get_block_number().await?;
 
     let (event_sender, _) = broadcast::channel::<ServerMessage>(256);
-    let dashboard_sender = event_sender.clone();
 
+    let port = free_port();
     let ctx = build_full_system_ctx()
         .chain(&infra.base_chain)
         .ethereum_endpoint(&cctp.ethereum_endpoint)
@@ -250,13 +254,12 @@ async fn full_system() -> anyhow::Result<()> {
         .equity_vault_ids(&equity_vault_ids)
         .cash_vault_id(usdc_vault_id)
         .cctp(cctp.cctp_overrides())
+        .server_port(port)
         .call()?;
 
     let mut bot = spawn_bot_with_event_channel(ctx, event_sender);
 
-    // Wait for Rocket to be serving, then allow conductor to finish
-    // initialization (WebSocket subscription timeout + backfill + vault seeding).
-    poll_for_ready(&mut bot, 8001).await;
+    poll_for_ready(&mut bot, port).await;
     tokio::time::sleep(Duration::from_secs(6)).await;
 
     // === Phase 1: AAPL sell hedge ===
@@ -420,8 +423,242 @@ async fn full_system() -> anyhow::Result<()> {
     );
     pool.close().await;
 
-    // === Dashboard auto-detect ===
-    await_dashboard_disconnect(&dashboard_sender, Duration::from_secs(3)).await;
+    bot.abort();
+    Ok(())
+}
+
+/// Same scenario as `full_system` but with chaos: trades fire in random
+/// order with random delays, and broker fills are artificially delayed
+/// for some symbols. Asserts the system reaches the correct final state
+/// regardless of timing and processing order — eventual consistency.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn full_system_concurrent() -> anyhow::Result<()> {
+    crate::test_infra::init_tracing();
+
+    let aapl_broker_price = float!(150.25);
+    let tsla_broker_price = float!(245.00);
+
+    let infra = TestInfra::start(
+        vec![("AAPL", aapl_broker_price), ("TSLA", tsla_broker_price)],
+        vec![],
+    )
+    .await?;
+    let cctp = CctpInfra::start(&infra).await?;
+
+    let usdc_amount: U256 = parse_units("300000", 6)?.into();
+    let usdc_vault_id = infra.base_chain.create_usdc_vault(usdc_amount).await?;
+
+    // Prepare ALL orders upfront before the bot starts (nonce safety).
+    // 1 AAPL sell + 3 AAPL sells (mint trigger) + 1 TSLA buy = 5 orders.
+    let aapl_sell_prepared = infra
+        .base_chain
+        .setup_order()
+        .symbol("AAPL")
+        .amount(float!(10.75))
+        .price(float!(155.00))
+        .direction(TakeDirection::SellEquity)
+        .usdc_vault_id(usdc_vault_id)
+        .call()
+        .await?;
+
+    let aapl_equity_vault_id = aapl_sell_prepared.output_vault_id;
+
+    let tsla_buy_prepared = infra
+        .base_chain
+        .setup_order()
+        .symbol("TSLA")
+        .amount(float!(5.0))
+        .price(float!(250.00))
+        .direction(TakeDirection::BuyEquity)
+        .usdc_vault_id(usdc_vault_id)
+        .call()
+        .await?;
+
+    let mut mint_prepared_orders = Vec::new();
+    for _ in 0..3 {
+        mint_prepared_orders.push(
+            infra
+                .base_chain
+                .setup_order()
+                .symbol("AAPL")
+                .amount(float!(7.5))
+                .price(float!(150.00))
+                .direction(TakeDirection::SellEquity)
+                .usdc_vault_id(usdc_vault_id)
+                .call()
+                .await?,
+        );
+    }
+
+    let tsla_equity_vault_id = tsla_buy_prepared.input_vault_id;
+    let equity_vault_ids = HashMap::from([
+        ("AAPL".to_owned(), aapl_equity_vault_id),
+        ("TSLA".to_owned(), tsla_equity_vault_id),
+    ]);
+
+    let eth_deposit_provider = alloy::providers::ProviderBuilder::new()
+        .connect(&cctp.ethereum_endpoint)
+        .await?;
+    let _deposit_watcher = infra
+        .broker_service
+        .start_deposit_watcher(eth_deposit_provider, USDC_ETHEREUM, infra.base_chain.owner)
+        .await?;
+
+    let current_block = infra.base_chain.provider.get_block_number().await?;
+
+    let (event_sender, _) = broadcast::channel::<ServerMessage>(256);
+
+    let port = free_port();
+    let ctx = build_full_system_ctx()
+        .chain(&infra.base_chain)
+        .ethereum_endpoint(&cctp.ethereum_endpoint)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .equity_tokens(&infra.equity_addresses)
+        .equity_vault_ids(&equity_vault_ids)
+        .cash_vault_id(usdc_vault_id)
+        .cctp(cctp.cctp_overrides())
+        .server_port(port)
+        .call()?;
+
+    let mut bot = spawn_bot_with_event_channel(ctx, event_sender);
+
+    poll_for_ready(&mut bot, port).await;
+    tokio::time::sleep(Duration::from_secs(6)).await;
+
+    // --- Chaos: delayed broker fills ---
+    // TSLA fills take 3 polls instead of instant, simulating real broker
+    // latency where the order stays "new" before eventually filling.
+    infra
+        .broker_service
+        .set_symbol_fill_delay(Symbol::new("TSLA")?, 3);
+
+    // Collect all prepared orders and shuffle them randomly.
+    let mut all_prepared = vec![&aapl_sell_prepared, &tsla_buy_prepared];
+    all_prepared.extend(mint_prepared_orders.iter());
+
+    let mut rng = rand::thread_rng();
+    all_prepared.shuffle(&mut rng);
+
+    info!(
+        count = all_prepared.len(),
+        "Firing trades in randomized order with chaos (delayed TSLA fills)",
+    );
+
+    // Fire takes with random delays between them (0-500ms) to create
+    // timing variety. Sequential because the taker has one nonce.
+    for (idx, prepared) in all_prepared.iter().enumerate() {
+        if idx > 0 {
+            let delay_ms = rng.gen_range(0..500);
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+        infra.base_chain.take_prepared_order(prepared).await?;
+    }
+
+    // === Assert eventual consistency ===
+    // Total expected: 4 AAPL sells (10.75 + 3*7.5 = 33.25) hedged as buys,
+    // 1 TSLA buy (5.0) hedged as sell, at least 1 mint cycle, USDC rebalance.
+
+    // All offchain hedge fills: 4 AAPL + 1 TSLA = 5 fills
+    poll_for_events_with_timeout(
+        &mut bot,
+        &infra.db_path,
+        "OffchainOrderEvent::Filled",
+        5,
+        Duration::from_secs(120),
+    )
+    .await;
+
+    // AAPL: total broker buy quantity = 33.25
+    poll_for_broker_fills(
+        &mut bot,
+        &infra.broker_service,
+        "AAPL",
+        st0x_execution::alpaca_broker_api::OrderSide::Buy,
+        FractionalShares::new(float!(33.25)),
+        Duration::from_secs(30),
+    )
+    .await;
+
+    // TSLA: total broker sell quantity = 5
+    poll_for_broker_fills(
+        &mut bot,
+        &infra.broker_service,
+        "TSLA",
+        st0x_execution::alpaca_broker_api::OrderSide::Sell,
+        FractionalShares::new(float!(5)),
+        Duration::from_secs(30),
+    )
+    .await;
+
+    // Mint should complete (equity imbalance from 33.25 AAPL sells)
+    poll_for_events_with_timeout(
+        &mut bot,
+        &infra.db_path,
+        "TokenizedEquityMintEvent::DepositedIntoRaindex",
+        1,
+        Duration::from_secs(120),
+    )
+    .await;
+
+    // USDC rebalance should complete
+    poll_for_events_with_timeout(
+        &mut bot,
+        &infra.db_path,
+        "UsdcRebalanceEvent::ConversionConfirmed",
+        1,
+        Duration::from_secs(120),
+    )
+    .await;
+
+    // Verify final state
+    let pool = connect_db(&infra.db_path).await?;
+
+    let aapl_position = Projection::<Position>::sqlite(pool.clone())
+        .load(&Symbol::new("AAPL")?)
+        .await?
+        .expect("AAPL position should exist");
+    assert_eq!(
+        aapl_position.net,
+        FractionalShares::ZERO,
+        "AAPL should be fully hedged (net zero)",
+    );
+    assert_eq!(
+        aapl_position.accumulated_short,
+        FractionalShares::new(float!(33.25)),
+        "AAPL accumulated short should reflect all 4 sell trades",
+    );
+
+    let tsla_position = Projection::<Position>::sqlite(pool.clone())
+        .load(&Symbol::new("TSLA")?)
+        .await?
+        .expect("TSLA position should exist");
+    assert_eq!(
+        tsla_position.net,
+        FractionalShares::ZERO,
+        "TSLA should be fully hedged (net zero)",
+    );
+    assert_eq!(
+        tsla_position.accumulated_long,
+        FractionalShares::new(float!(5)),
+        "TSLA accumulated long should reflect buy trade",
+    );
+
+    let mint_events = count_events(&pool, "TokenizedEquityMint").await?;
+    assert!(
+        mint_events >= 5,
+        "Expected at least 5 mint events, got {mint_events}",
+    );
+
+    let usdc_events = count_events(&pool, "UsdcRebalance").await?;
+    assert!(
+        usdc_events >= 9,
+        "Expected at least 9 USDC rebalance events, got {usdc_events}",
+    );
+
+    pool.close().await;
 
     bot.abort();
     Ok(())
