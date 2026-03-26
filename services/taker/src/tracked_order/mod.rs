@@ -64,13 +64,41 @@ impl FromStr for OrderHash {
     }
 }
 
-/// Classification of an order's pricing mechanism.
-/// Populated later by the Order Classification step; for now
-/// all discovered orders start as `Unknown`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Classification of an order's pricing mechanism, determined by
+/// pattern-matching the Rainlang source extracted from order metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum OrderType {
-    /// Not yet classified (classification is a separate step).
+    /// Not yet classified (metadata not available or not yet processed).
+    #[default]
     Unknown,
+
+    /// Fixed-price order: the Rainlang expression evaluates to constant
+    /// literal values. The IO ratio is known at order creation time and
+    /// never changes.
+    // TODO: Extract structured IO ratio from the Rainlang expression
+    // and store it here as a typed field (e.g., `io_ratio: Float`)
+    // so downstream profitability code doesn't re-parse raw Rainlang.
+    FixedPrice {
+        /// The Rainlang source text for this order.
+        rainlang: String,
+    },
+
+    /// Pyth oracle order: the Rainlang expression reads a Pyth price
+    /// feed to compute the IO ratio. The price changes with oracle
+    /// updates.
+    // TODO: Extract the Pyth feed ID from the Rainlang expression
+    // and store it here as a typed field (e.g., `feed_id: B256`)
+    // so downstream profitability code doesn't re-parse raw Rainlang.
+    PythOracle {
+        /// The Rainlang source text for this order.
+        rainlang: String,
+    },
+
+    /// Order with unsupported Rainlang patterns. Not safe to target.
+    Unsupported {
+        /// Why this order was classified as unsupported.
+        reason: String,
+    },
 }
 
 /// Which side of the order involves USDC, determining the
@@ -121,6 +149,19 @@ pub(crate) enum TrackedOrder {
     },
 }
 
+impl TrackedOrder {
+    /// Returns the order's classification type.
+    ///
+    /// Only meaningful for `Active` orders; terminal states don't
+    /// track classification.
+    pub(crate) fn order_type(&self) -> &OrderType {
+        match self {
+            Self::Active { order_type, .. } => order_type,
+            Self::Exhausted { .. } | Self::Removed { .. } => &OrderType::Unknown,
+        }
+    }
+}
+
 /// Commands that drive TrackedOrder state transitions.
 #[derive(Debug, Clone)]
 pub(crate) enum TrackedOrderCommand {
@@ -131,6 +172,7 @@ pub(crate) enum TrackedOrderCommand {
         scenario: Scenario,
         output_token: Address,
         input_token: Address,
+        order_type: OrderType,
         max_output: U256,
         block: u64,
         discovered_at: DateTime<Utc>,
@@ -145,6 +187,11 @@ pub(crate) enum TrackedOrderCommand {
 
     /// Mark order as removed (from RemoveOrderV3 event).
     MarkRemoved { removed_at: DateTime<Utc> },
+
+    /// Update classification when metadata arrives after discovery.
+    /// This handles the live event loop race where AddOrderV3 arrives
+    /// before MetaV1_2, leaving the order as `OrderType::Unknown`.
+    Classify { order_type: OrderType },
 }
 
 /// Events emitted by TrackedOrder command handling.
@@ -176,6 +223,10 @@ pub(crate) enum TrackedOrderEvent {
     Removed {
         removed_at: DateTime<Utc>,
     },
+
+    Classified {
+        order_type: OrderType,
+    },
 }
 
 impl DomainEvent for TrackedOrderEvent {
@@ -185,6 +236,7 @@ impl DomainEvent for TrackedOrderEvent {
             Self::Filled { .. } => "TrackedOrderEvent::Filled",
             Self::Exhausted { .. } => "TrackedOrderEvent::Exhausted",
             Self::Removed { .. } => "TrackedOrderEvent::Removed",
+            Self::Classified { .. } => "TrackedOrderEvent::Classified",
         }
         .to_string()
     }
@@ -333,6 +385,38 @@ impl EventSourced for TrackedOrder {
                 }))
             }
 
+            // Classification update: replace order_type on Active orders
+            (Self::Active { .. }, TrackedOrderEvent::Classified { order_type }) => {
+                let Self::Active {
+                    owner,
+                    symbol,
+                    scenario,
+                    output_token,
+                    input_token,
+                    max_output,
+                    remaining_output,
+                    discovered_block,
+                    discovered_at,
+                    ..
+                } = entity
+                else {
+                    return Ok(None);
+                };
+
+                Ok(Some(Self::Active {
+                    owner: *owner,
+                    symbol: symbol.clone(),
+                    scenario: *scenario,
+                    output_token: *output_token,
+                    input_token: *input_token,
+                    order_type: order_type.clone(),
+                    max_output: *max_output,
+                    remaining_output: *remaining_output,
+                    discovered_block: *discovered_block,
+                    discovered_at: *discovered_at,
+                }))
+            }
+
             // Exhausted on already-Exhausted is idempotent.
             // This happens because RecordFill emitting remaining=0
             // triggers evolve -> Exhausted, then the subsequent
@@ -357,6 +441,7 @@ impl EventSourced for TrackedOrder {
                 scenario,
                 output_token,
                 input_token,
+                order_type,
                 max_output,
                 block,
                 discovered_at,
@@ -366,16 +451,16 @@ impl EventSourced for TrackedOrder {
                 scenario,
                 output_token,
                 input_token,
-                order_type: OrderType::Unknown,
+                order_type,
                 max_output,
                 discovered_block: block,
                 discovered_at,
             }]),
 
-            // Cannot record fill or remove for non-existent order
-            TrackedOrderCommand::RecordFill { .. } | TrackedOrderCommand::MarkRemoved { .. } => {
-                Ok(vec![])
-            }
+            // Cannot record fill, remove, or classify non-existent order
+            TrackedOrderCommand::RecordFill { .. }
+            | TrackedOrderCommand::MarkRemoved { .. }
+            | TrackedOrderCommand::Classify { .. } => Ok(vec![]),
         }
     }
 
@@ -426,6 +511,26 @@ impl EventSourced for TrackedOrder {
                 Ok(vec![TrackedOrderEvent::Removed { removed_at }])
             }
 
+            // Classification update: only applies to Active orders with Unknown type
+            (
+                Self::Active { order_type, .. },
+                TrackedOrderCommand::Classify {
+                    order_type: new_type,
+                },
+            ) => {
+                match order_type {
+                    OrderType::Unknown => Ok(vec![TrackedOrderEvent::Classified {
+                        order_type: new_type,
+                    }]),
+                    OrderType::FixedPrice { .. }
+                    | OrderType::PythOracle { .. }
+                    | OrderType::Unsupported { .. } => {
+                        // Already classified, no-op
+                        Ok(vec![])
+                    }
+                }
+            }
+
             // Terminal states reject all commands
             (Self::Exhausted { .. } | Self::Removed { .. }, _) => {
                 Err(TrackedOrderError::AlreadyTerminal)
@@ -461,6 +566,7 @@ mod tests {
             scenario,
             output_token: Address::repeat_byte(0xAA),
             input_token: Address::repeat_byte(0xBB),
+            order_type: OrderType::Unknown,
             max_output,
             block: 100,
             discovered_at: Utc::now(),
@@ -516,6 +622,7 @@ mod tests {
                     scenario: Scenario::B,
                     output_token: Address::repeat_byte(0xCC),
                     input_token: Address::repeat_byte(0xDD),
+                    order_type: OrderType::Unknown,
                     max_output: U256::from(500u64),
                     block: 42,
                     discovered_at: Utc::now(),

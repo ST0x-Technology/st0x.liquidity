@@ -6,7 +6,7 @@
 //! - `RemoveOrderV3`: dispatch `MarkRemoved`
 //! - `TakeOrderV3`: compute order hash, dispatch `RecordFill`
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::rpc::types::Log;
 use chrono::Utc;
 use std::sync::Arc;
@@ -15,8 +15,10 @@ use tracing::{debug, info, trace};
 use st0x_event_sorcery::{SendError, Store};
 use st0x_shared::bindings::IOrderBookV6;
 
+use crate::classification::classify_order_metadata;
 use crate::tracked_order::{
-    OrderFilter, OrderHash, Scenario, SupportedDirection, TrackedOrder, TrackedOrderCommand,
+    OrderFilter, OrderHash, OrderType, Scenario, SupportedDirection, TrackedOrder,
+    TrackedOrderCommand,
 };
 
 /// Processes decoded onchain events into TrackedOrder commands.
@@ -39,6 +41,18 @@ pub(crate) enum EventProcessorError {
     Send(#[from] SendError<TrackedOrder>),
 }
 
+/// Result of attempting late classification when MetaV1_2 arrives.
+pub(crate) enum ClassificationOutcome {
+    /// Order existed with Unknown type, now classified.
+    Classified,
+
+    /// Order existed but was already classified — no-op.
+    AlreadyClassified,
+
+    /// Aggregate doesn't exist yet (AddOrderV3 hasn't arrived).
+    OrderNotFound,
+}
+
 impl EventProcessor {
     pub(crate) fn new(
         store: Arc<Store<TrackedOrder>>,
@@ -55,11 +69,17 @@ impl EventProcessor {
     /// Processes an `AddOrderV3` event.
     ///
     /// Filters out excluded owners and unsupported token pairs,
-    /// then dispatches a `Discover` command.
+    /// classifies the order from its metadata, then dispatches
+    /// a `Discover` command.
+    ///
+    /// `meta` is the raw bytes from the corresponding `MetaV1_2`
+    /// event (same transaction). If `None`, the order is discovered
+    /// with `OrderType::Unknown`.
     pub(crate) async fn process_add_order(
         &self,
         event: &IOrderBookV6::AddOrderV3,
         log: &Log,
+        meta: Option<&Bytes>,
     ) -> Result<(), EventProcessorError> {
         let owner = event.order.owner;
 
@@ -97,10 +117,13 @@ impl EventProcessor {
         let order_hash = OrderHash::new(event.orderHash);
         let block = log.block_number.unwrap_or(0);
 
+        let order_type = meta.map(classify_order_metadata).unwrap_or_default();
+
         info!(
             %order_hash,
             %symbol,
             ?scenario,
+            ?order_type,
             block,
             "Discovered new order"
         );
@@ -114,6 +137,7 @@ impl EventProcessor {
                     scenario,
                     output_token,
                     input_token,
+                    order_type,
                     max_output: max_output_from_order(&event.order, scenario, output_token),
                     block,
                     discovered_at: Utc::now(),
@@ -192,6 +216,55 @@ impl EventProcessor {
             .await?;
 
         Ok(())
+    }
+
+    /// Classifies an already-discovered order when MetaV1_2 arrives
+    /// after AddOrderV3 in the live event loop.
+    ///
+    /// Pre-checks aggregate existence to distinguish "order not found"
+    /// (MetaV1_2 arrived before AddOrderV3) from "already classified"
+    /// (order exists but is already non-Unknown). The caller uses this
+    /// to decide whether to cache metadata for later use.
+    pub(crate) async fn classify_order(
+        &self,
+        order_hash_bytes: B256,
+        meta: &Bytes,
+    ) -> Result<ClassificationOutcome, EventProcessorError> {
+        let order_hash = OrderHash::new(order_hash_bytes);
+
+        // Check if the aggregate exists before attempting classification.
+        // This distinguishes "MetaV1_2 arrived first" from "order already classified".
+        let order = self.store.load(&order_hash).await?;
+
+        let Some(order) = order else {
+            debug!(
+                %order_hash,
+                "Late MetaV1_2: order not yet discovered, deferring"
+            );
+            return Ok(ClassificationOutcome::OrderNotFound);
+        };
+
+        if !matches!(order.order_type(), OrderType::Unknown) {
+            debug!(
+                %order_hash,
+                "Late MetaV1_2: order already classified"
+            );
+            return Ok(ClassificationOutcome::AlreadyClassified);
+        }
+
+        let order_type = classify_order_metadata(meta);
+
+        debug!(
+            %order_hash,
+            ?order_type,
+            "Late MetaV1_2: classifying existing order"
+        );
+
+        self.store
+            .send(&order_hash, TrackedOrderCommand::Classify { order_type })
+            .await?;
+
+        Ok(ClassificationOutcome::Classified)
     }
 }
 
@@ -292,7 +365,7 @@ mod tests {
         };
 
         processor
-            .process_add_order(&event, &mock_log(100))
+            .process_add_order(&event, &mock_log(100), None)
             .await
             .unwrap();
 
@@ -335,7 +408,7 @@ mod tests {
         };
 
         processor
-            .process_add_order(&event, &mock_log(100))
+            .process_add_order(&event, &mock_log(100), None)
             .await
             .unwrap();
 
@@ -366,7 +439,7 @@ mod tests {
         };
 
         processor
-            .process_add_order(&event, &mock_log(100))
+            .process_add_order(&event, &mock_log(100), None)
             .await
             .unwrap();
 
@@ -393,7 +466,7 @@ mod tests {
             order: order.clone(),
         };
         processor
-            .process_add_order(&add_event, &mock_log(100))
+            .process_add_order(&add_event, &mock_log(100), None)
             .await
             .unwrap();
 
@@ -451,7 +524,7 @@ mod tests {
             order: order.clone(),
         };
         processor
-            .process_add_order(&add_event, &mock_log(100))
+            .process_add_order(&add_event, &mock_log(100), None)
             .await
             .unwrap();
 
@@ -499,7 +572,7 @@ mod tests {
             order: order.clone(),
         };
         processor
-            .process_add_order(&add_event, &mock_log(100))
+            .process_add_order(&add_event, &mock_log(100), None)
             .await
             .unwrap();
 
