@@ -594,7 +594,7 @@ async fn simulate() -> anyhow::Result<()> {
         round += 1;
 
         let mut rng = rand::thread_rng();
-        let amount: f64 = rng.gen_range(0.1..10.0);
+        let amount: f64 = rng.gen_range(1.0..10.0);
         let amount_str = format!("{amount:.3}");
         let max_amount = Float::parse(amount_str.clone()).ok();
 
