@@ -437,6 +437,7 @@ pub(crate) struct RebalancingTrigger {
     inventory: Arc<BroadcastingInventory>,
     pub(crate) equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
     pub(crate) usdc_in_progress: Arc<AtomicBool>,
+    usdc_transfer_context: Arc<RwLock<Option<(RebalanceDirection, Usdc)>>>,
     sender: mpsc::Sender<TriggeredOperation>,
     wrapper: Arc<dyn Wrapper>,
     /// Tracks symbol/quantity for in-flight mints. The initial `MintRequested`
@@ -465,6 +466,7 @@ impl RebalancingTrigger {
             order_owner,
             inventory,
             equity_in_progress,
+            usdc_transfer_context: Arc::new(RwLock::new(None)),
             usdc_in_progress: Arc::new(AtomicBool::new(false)),
             sender,
             wrapper,
@@ -771,9 +773,24 @@ impl Reactor for RebalancingTrigger {
 
                     let mut inventory = self.inventory.write().await;
                     *inventory = inventory.clone().update_usdc(update, Utc::now())?;
+
+                    *self.usdc_transfer_context.write().await = Some((direction.clone(), *amount));
                 }
 
                 if Self::is_terminal_usdc_rebalance_event(&event) {
+                    if let Some((direction, amount)) =
+                        self.usdc_transfer_context.write().await.take()
+                    {
+                        let venue = match direction {
+                            RebalanceDirection::AlpacaToBase => Venue::Hedging,
+                            RebalanceDirection::BaseToAlpaca => Venue::MarketMaking,
+                        };
+                        let update = Inventory::transfer(venue, TransferOp::Complete, amount);
+
+                        let mut inventory = self.inventory.write().await;
+                        *inventory = inventory.clone().update_usdc(update, Utc::now())?;
+                    }
+
                     self.clear_usdc_in_progress();
                     debug!("Cleared USDC in-progress flag after rebalance terminal event");
 

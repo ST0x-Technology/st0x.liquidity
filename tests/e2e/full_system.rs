@@ -19,6 +19,8 @@ use std::time::Duration;
 
 use alloy::primitives::{Address, B256, U256, utils::parse_units};
 use alloy::providers::{Provider, RootProvider};
+use rain_math_float::Float;
+use rand::Rng;
 use st0x_float_macro::float;
 use tokio::sync::broadcast;
 use tracing::{debug, info};
@@ -587,10 +589,19 @@ async fn simulate() -> anyhow::Result<()> {
         let (order, symbol, direction) = orders[round as usize % orders.len()];
         round += 1;
 
-        info!(round, symbol, direction, "Simulating user trade");
+        let mut rng = rand::thread_rng();
+        let amount: f64 = rng.gen_range(0.1..10.0);
+        let amount_str = format!("{amount:.3}");
+        let max_amount = Float::parse(amount_str.clone()).ok();
 
-        match infra.base_chain.take_prepared_order(order).await {
-            Ok(_) => info!(round, symbol, direction, "Trade executed"),
+        info!(round, symbol, direction, amount = %amount_str, "Simulating user trade");
+
+        match infra
+            .base_chain
+            .take_prepared_order_with_max(order, max_amount)
+            .await
+        {
+            Ok(_) => info!(round, symbol, direction, amount = %amount_str, "Trade executed"),
             Err(error) => {
                 info!(
                     round, symbol, direction, %error,

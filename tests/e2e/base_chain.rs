@@ -576,6 +576,14 @@ impl<P: Provider + Clone> BaseChain<P> {
         &self,
         prepared: &PreparedOrder,
     ) -> anyhow::Result<TakeOrderResult> {
+        self.take_prepared_order_with_max(prepared, None).await
+    }
+
+    pub async fn take_prepared_order_with_max(
+        &self,
+        prepared: &PreparedOrder,
+        max_amount: Option<Float>,
+    ) -> anyhow::Result<TakeOrderResult> {
         let orderbook =
             IOrderBookV6::IOrderBookV6Instance::new(self.orderbook, &self.taker_provider);
 
@@ -596,12 +604,15 @@ impl<P: Provider + Clone> BaseChain<P> {
             .call()
             .await?;
 
+        let default_max = Float::from_fixed_decimal_lossy(U256::from(1_000_000), 0)
+            .map_err(|err| anyhow::anyhow!("Float conversion: {err:?}"))?
+            .0
+            .get_inner();
+        let max_io = max_amount.map_or(default_max, |f| f.get_inner());
+
         let take_config = IOrderBookV6::TakeOrdersConfigV5 {
             minimumIO: B256::ZERO,
-            maximumIO: Float::from_fixed_decimal_lossy(U256::from(1_000_000), 0)
-                .map_err(|err| anyhow::anyhow!("Float conversion: {err:?}"))?
-                .0
-                .get_inner(),
+            maximumIO: max_io,
             maximumIORatio: Float::from_fixed_decimal_lossy(U256::from(1_000_000), 0)
                 .map_err(|err| anyhow::anyhow!("Float conversion: {err:?}"))?
                 .0
