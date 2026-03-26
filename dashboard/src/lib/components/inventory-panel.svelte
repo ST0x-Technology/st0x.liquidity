@@ -1,6 +1,7 @@
 <script lang="ts">
   import { browser } from '$app/environment'
   import { createQuery } from '@tanstack/svelte-query'
+  import AvailableInventory from '$lib/components/available-inventory.svelte'
   import * as Card from '$lib/components/ui/card'
   import * as Table from '$lib/components/ui/table'
   import * as Separator from '$lib/components/ui/separator'
@@ -9,7 +10,7 @@
   import type { Warning } from '$lib/api/Warning'
   import { matcher } from '$lib/fp'
   import { warningMessage } from '$lib/warnings'
-  import { decimalAdd, decimalCompare, decimalIsZero, formatDecimal } from '$lib/decimal'
+  import { decimalCompare, formatDecimal } from '$lib/decimal'
   import { reactive } from '$lib/frp.svelte'
 
   const inventoryQuery = createQuery<Inventory>(() => ({
@@ -47,72 +48,24 @@
     return [...byId.values()]
   })
 
-  const MAX_DECIMAL_PLACES = 6
-
-  const actualDecimalPlaces = (value: string): number => {
-    const dotIdx = value.indexOf('.')
-    if (dotIdx === -1) return 0
-    return value.length - dotIdx - 1
-  }
-
-  const trimTrailingZeros = (formatted: string): string => {
-    if (!formatted.includes('.')) return formatted
-    const trimmed = formatted.replace(/0+$/, '').replace(/\.$/, '')
-    return trimmed
-  }
-
-  type Formatted = { display: string; full: string; truncated: boolean }
-
-  const fmtValue = (value: string): Formatted => {
-    const actual = actualDecimalPlaces(value)
-    const display = Math.min(MAX_DECIMAL_PLACES, Math.max(2, actual))
-    const truncated = actual > display
-    const formatted = trimTrailingZeros(formatDecimal(value, display))
-    return {
-      display: truncated ? `~${formatted}` : formatted,
-      full: value,
-      truncated,
-    }
-  }
-
-  const fmt = (value: string): Formatted => {
-    if (decimalIsZero(value)) return { display: '-', full: value, truncated: false }
-    return fmtValue(value)
-  }
-
-  const fmtNum = (value: string): Formatted => fmtValue(value)
-
-  type CashRow = { label: string; value: string; decimals: number }
-
-  const cashRows = $derived.by((): CashRow[] => {
-    if (!usdc) return []
-    return [
-      { label: 'Total', value: decimalAdd(usdc.onchainAvailable, usdc.offchainAvailable), decimals: 6 },
-      { label: 'USDC', value: usdc.onchainAvailable, decimals: 6 },
-      { label: 'USD', value: usdc.offchainAvailable, decimals: 2 }
-    ]
-  })
-
-  const maxDecimals = 6
-
-  const fmtCashAligned = (value: string, decimals: number): string => {
-    if (decimalIsZero(value)) return '-'
-    const formatted = formatDecimal(value, decimals)
-    const trailingPad = maxDecimals - decimals
-    return formatted + '\u00A0'.repeat(trailingPad)
-  }
-
   const stripPrefix = (symbol: string): string =>
     symbol.startsWith('t') ? symbol.slice(1) : symbol
 
+  type Formatted = { display: string; full: string; truncated: boolean }
+
+  const fmtTransferAmount = (value: string): Formatted => {
+    const formatted = formatDecimal(value, 2).replace(/0+$/, '').replace(/\.$/, '')
+    return { display: formatted, full: value, truncated: false }
+  }
+
   const matchKind = matcher<TransferOperation>()('kind')
 
-  const transferPurpose = (transfer: TransferOperation): string =>
+  const transferDestination = (transfer: TransferOperation): string =>
     matchKind(transfer, {
-      equity_mint: () => 'Providing Liquidity',
-      equity_redemption: () => 'Hedging Risk',
+      equity_mint: () => 'Raindex',
+      equity_redemption: () => 'Alpaca',
       usdc_bridge: ({ direction }) =>
-        direction === 'alpaca_to_base' ? 'Providing Liquidity' : 'Hedging Risk'
+        direction === 'alpaca_to_base' ? 'Raindex' : 'Alpaca'
     })
 
   const transferUnderlying = (transfer: TransferOperation): string =>
@@ -131,9 +84,9 @@
 
   const transferAmount = (transfer: TransferOperation): Formatted =>
     matchKind(transfer, {
-      equity_mint: ({ quantity }) => fmtNum(quantity),
-      equity_redemption: ({ quantity }) => fmtNum(quantity),
-      usdc_bridge: ({ amount }) => fmtNum(amount),
+      equity_mint: ({ quantity }) => fmtTransferAmount(quantity),
+      equity_redemption: ({ quantity }) => fmtTransferAmount(quantity),
+      usdc_bridge: ({ amount }) => fmtTransferAmount(amount),
     })
 
   const formatTime = (timestamp: string): string => {
@@ -203,44 +156,15 @@
     return state.dir === 'asc' ? 'ascending' : 'descending'
   }
 
-  type EquityCol = 'underlying' | 'raindex' | 'alpaca' | 'total'
-  const equitySort = reactive<SortState<EquityCol>>(null)
-  const sortEquity = (col: EquityCol) => () => { equitySort.update((current) => toggleSort(current, col)) }
-
-  type SymbolInventory = Inventory['perSymbol'][number]
-
-  const equityComparators: Record<EquityCol, (lhs: SymbolInventory, rhs: SymbolInventory) => number> = {
-    underlying: (lhs, rhs) =>
-      stripPrefix(lhs.symbol).localeCompare(stripPrefix(rhs.symbol)),
-    raindex: (lhs, rhs) =>
-      decimalCompare(lhs.onchainAvailable, rhs.onchainAvailable),
-    alpaca: (lhs, rhs) =>
-      decimalCompare(lhs.offchainAvailable, rhs.offchainAvailable),
-    total: (lhs, rhs) =>
-      decimalCompare(
-        decimalAdd(lhs.onchainAvailable, lhs.offchainAvailable),
-        decimalAdd(rhs.onchainAvailable, rhs.offchainAvailable)
-      )
-  }
-
-  const sortedSymbols = $derived.by(() => {
-    if (!equitySort.current) return symbols
-    const { column, dir } = equitySort.current
-    const cmp = equityComparators[column]
-    return [...symbols].sort((lhs, rhs) =>
-      dir === 'desc' ? -cmp(lhs, rhs) : cmp(lhs, rhs)
-    )
-  })
-
-  type TransferCol = 'time' | 'purpose' | 'amount' | 'underlying' | 'status'
+  type TransferCol = 'time' | 'destination' | 'amount' | 'underlying' | 'status'
   const transferSort = reactive<SortState<TransferCol>>(null)
   const sortTransfer = (col: TransferCol) => () => { transferSort.update((current) => toggleSort(current, col)) }
 
   const transferComparators: Record<TransferCol, (lhs: TransferOperation, rhs: TransferOperation) => number> = {
     time: (lhs, rhs) =>
       lhs.startedAt.localeCompare(rhs.startedAt),
-    purpose: (lhs, rhs) =>
-      transferPurpose(lhs).localeCompare(transferPurpose(rhs)),
+    destination: (lhs, rhs) =>
+      transferDestination(lhs).localeCompare(transferDestination(rhs)),
     amount: (lhs, rhs) =>
       decimalCompare(transferAmountRaw(lhs), transferAmountRaw(rhs)),
     underlying: (lhs, rhs) =>
@@ -269,89 +193,7 @@
         Waiting for inventory data…
       </div>
     {:else}
-      <div class="flex gap-0">
-        <div class="flex-[2] pr-6">
-          <Table.Root>
-            <Table.Header>
-              <Table.Row>
-                <Table.Head aria-sort={ariaSort(equitySort.current, 'underlying')}>
-                  <button class="{sortBtnClass} text-left" onclick={sortEquity('underlying')}>
-                    Equity{sortIndicator(equitySort.current, 'underlying')}
-                  </button>
-                </Table.Head>
-
-                <Table.Head class="text-right" aria-sort={ariaSort(equitySort.current, 'raindex')}>
-                  <button class="{sortBtnClass} text-right" onclick={sortEquity('raindex')}>
-                    Raindex{sortIndicator(equitySort.current, 'raindex')}
-                  </button>
-                </Table.Head>
-
-                <Table.Head class="text-right" aria-sort={ariaSort(equitySort.current, 'alpaca')}>
-                  <button class="{sortBtnClass} text-right" onclick={sortEquity('alpaca')}>
-                    Alpaca{sortIndicator(equitySort.current, 'alpaca')}
-                  </button>
-                </Table.Head>
-
-                <Table.Head class="text-right" aria-sort={ariaSort(equitySort.current, 'total')}>
-                  <button class="{sortBtnClass} text-right" onclick={sortEquity('total')}>
-                    Total{sortIndicator(equitySort.current, 'total')}
-                  </button>
-                </Table.Head>
-              </Table.Row>
-            </Table.Header>
-            <Table.Body>
-              {#each sortedSymbols as item (item.symbol)}
-                <Table.Row>
-                  <Table.Cell class="font-mono font-medium">
-                    {stripPrefix(item.symbol)}
-                  </Table.Cell>
-                  {@const onchain = fmt(item.onchainAvailable)}
-                  {@const offchain = fmt(item.offchainAvailable)}
-                  {@const total = fmtNum(decimalAdd(item.onchainAvailable, item.offchainAvailable))}
-                  <Table.Cell class="text-right font-mono opacity-90" title={onchain.truncated ? onchain.full : undefined}>
-                    {onchain.display}
-                  </Table.Cell>
-                  <Table.Cell class="text-right font-mono opacity-90" title={offchain.truncated ? offchain.full : undefined}>
-                    {offchain.display}
-                  </Table.Cell>
-                  <Table.Cell class="text-right font-mono font-semibold" title={total.truncated ? total.full : undefined}>
-                    {total.display}
-                  </Table.Cell>
-                </Table.Row>
-              {/each}
-            </Table.Body>
-          </Table.Root>
-        </div>
-
-        {#if usdc}
-          <div class="flex-1 border-l pl-6">
-            <Table.Root>
-              <Table.Header>
-                <Table.Row>
-                  <Table.Head>Currency</Table.Head>
-                  <Table.Head>Balance</Table.Head>
-                </Table.Row>
-              </Table.Header>
-              <Table.Body>
-                {#each cashRows as row (row.label)}
-                  <Table.Row>
-                    <Table.Cell
-                      class="font-mono {row.label === 'Total' ? 'font-semibold' : 'font-medium'}"
-                    >
-                      {row.label}
-                    </Table.Cell>
-                    <Table.Cell
-                      class="font-mono whitespace-pre {row.label === 'Total' ? 'font-semibold' : ''}"
-                    >
-                      {fmtCashAligned(row.value, row.decimals)}
-                    </Table.Cell>
-                  </Table.Row>
-                {/each}
-              </Table.Body>
-            </Table.Root>
-          </div>
-        {/if}
-      </div>
+      <AvailableInventory {symbols} {usdc} />
 
       {#if allTransfers.length > 0 || warnings.length > 0}
         <Separator.Root class="my-6" />
@@ -375,9 +217,9 @@
                 </button>
               </Table.Head>
 
-              <Table.Head aria-sort={ariaSort(transferSort.current, 'purpose')}>
-                <button class="{sortBtnClass} text-left" onclick={sortTransfer('purpose')}>
-                  Purpose{sortIndicator(transferSort.current, 'purpose')}
+              <Table.Head aria-sort={ariaSort(transferSort.current, 'destination')}>
+                <button class="{sortBtnClass} text-left" onclick={sortTransfer('destination')}>
+                  Destination{sortIndicator(transferSort.current, 'destination')}
                 </button>
               </Table.Head>
 
@@ -408,7 +250,7 @@
                   {formatTime(transfer.startedAt)}
                 </Table.Cell>
                 <Table.Cell>
-                  {transferPurpose(transfer)}
+                  {transferDestination(transfer)}
                 </Table.Cell>
                 {@const amt = transferAmount(transfer)}
                 <Table.Cell class="text-right font-mono pr-6" title={amt.truncated ? amt.full : undefined}>
