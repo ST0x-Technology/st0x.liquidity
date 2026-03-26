@@ -55,6 +55,20 @@ fn parse_float(input: &str) -> Result<Float, String> {
     Float::parse(input.to_string()).map_err(|err| format!("{err}"))
 }
 
+fn parse_positive_price(input: &str) -> Result<Float, String> {
+    let price = parse_float(input)?;
+
+    if price.is_negative().map_err(|err| format!("{err}"))? {
+        return Err("limit price must be positive".to_string());
+    }
+
+    if price.is_zero().map_err(|err| format!("{err}"))? {
+        return Err("limit price must be positive".to_string());
+    }
+
+    Ok(price)
+}
+
 fn parse_positive_shares(input: &str) -> Result<Positive<FractionalShares>, String> {
     let shares: FractionalShares = input.parse().map_err(|err| format!("{err}"))?;
     Positive::new(shares).map_err(|err| format!("{err}"))
@@ -82,6 +96,12 @@ pub enum Commands {
         /// Time-in-force for the order (day, market-on-close)
         #[arg(long = "time-in-force")]
         time_in_force: Option<TimeInForce>,
+        /// Limit price for a manual Alpaca Broker API limit order
+        #[arg(long = "limit-price", value_parser = parse_positive_price)]
+        limit_price: Option<Float>,
+        /// Submit the limit order as extended-hours eligible
+        #[arg(long = "extended-hours")]
+        extended_hours: bool,
     },
     /// Sell shares of a stock
     Sell {
@@ -94,6 +114,12 @@ pub enum Commands {
         /// Time-in-force for the order (day, market-on-close)
         #[arg(long = "time-in-force")]
         time_in_force: Option<TimeInForce>,
+        /// Limit price for a manual Alpaca Broker API limit order
+        #[arg(long = "limit-price", value_parser = parse_positive_price)]
+        limit_price: Option<Float>,
+        /// Submit the limit order as extended-hours eligible
+        #[arg(long = "extended-hours")]
+        extended_hours: bool,
     },
     /// Process a transaction hash to execute opposite-side trade
     ProcessTx {
@@ -386,6 +412,8 @@ async fn execute_order<W: Write>(
     quantity: Positive<FractionalShares>,
     direction: Direction,
     time_in_force: Option<TimeInForce>,
+    limit_price: Option<Float>,
+    extended_hours: bool,
     ctx: &Ctx,
     pool: &SqlitePool,
     stdout: &mut W,
@@ -410,6 +438,8 @@ async fn execute_order<W: Write>(
         quantity,
         direction,
         time_in_force,
+        limit_price,
+        extended_hours,
         ctx,
         pool,
         stdout,
@@ -423,11 +453,15 @@ enum SimpleCommand {
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
         time_in_force: Option<TimeInForce>,
+        limit_price: Option<Float>,
+        extended_hours: bool,
     },
     Sell {
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
         time_in_force: Option<TimeInForce>,
+        limit_price: Option<Float>,
+        extended_hours: bool,
     },
     Auth,
     TransferEquity {
@@ -534,19 +568,27 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             symbol,
             quantity,
             time_in_force,
+            limit_price,
+            extended_hours,
         } => Ok(SimpleCommand::Buy {
             symbol,
             quantity,
             time_in_force,
+            limit_price,
+            extended_hours,
         }),
         Commands::Sell {
             symbol,
             quantity,
             time_in_force,
+            limit_price,
+            extended_hours,
         } => Ok(SimpleCommand::Sell {
             symbol,
             quantity,
             time_in_force,
+            limit_price,
+            extended_hours,
         }),
         Commands::Auth => Ok(SimpleCommand::Auth),
         Commands::TransferEquity {
@@ -641,12 +683,16 @@ async fn run_simple_command<W: Write>(
             symbol,
             quantity,
             time_in_force,
+            limit_price,
+            extended_hours,
         } => {
             execute_order(
                 symbol,
                 quantity,
                 Direction::Buy,
                 time_in_force,
+                limit_price,
+                extended_hours,
                 ctx,
                 pool,
                 stdout,
@@ -657,12 +703,16 @@ async fn run_simple_command<W: Write>(
             symbol,
             quantity,
             time_in_force,
+            limit_price,
+            extended_hours,
         } => {
             execute_order(
                 symbol,
                 quantity,
                 Direction::Sell,
                 time_in_force,
+                limit_price,
+                extended_hours,
                 ctx,
                 pool,
                 stdout,
@@ -871,6 +921,8 @@ mod tests {
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -915,6 +967,8 @@ mod tests {
             positive_shares("50"),
             Direction::Sell,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -960,6 +1014,8 @@ mod tests {
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -992,6 +1048,8 @@ mod tests {
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -1062,6 +1120,8 @@ mod tests {
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -1116,6 +1176,8 @@ mod tests {
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -1157,6 +1219,8 @@ mod tests {
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut stdout_buffer,
@@ -1205,6 +1269,8 @@ mod tests {
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut stdout_buffer,
@@ -1270,6 +1336,13 @@ mod tests {
         let error = parse_positive_shares("0").unwrap_err();
 
         assert!(error.contains("positive"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn test_parse_positive_price_rejects_zero() {
+        let error = parse_positive_price("0").unwrap_err();
+
+        assert_eq!(error, "limit price must be positive");
     }
 
     #[test]
@@ -1585,6 +1658,59 @@ mod tests {
         assert_eq!(quantity, positive_shares("6.15"));
     }
 
+    #[test]
+    fn test_buy_command_parses_limit_price_and_extended_hours() {
+        let cli = Cli::try_parse_from([
+            "schwab",
+            "buy",
+            "-s",
+            "COIN",
+            "-q",
+            "10",
+            "--limit-price",
+            "195.25",
+            "--extended-hours",
+        ])
+        .unwrap();
+        let Commands::Buy {
+            limit_price,
+            extended_hours,
+            ..
+        } = cli.command
+        else {
+            panic!("expected buy command");
+        };
+
+        assert!(extended_hours);
+        assert!(
+            limit_price
+                .unwrap()
+                .eq(Float::parse("195.25".to_string()).unwrap())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_buy_command_rejects_non_positive_limit_price() {
+        let error = Cli::try_parse_from([
+            "schwab",
+            "buy",
+            "-s",
+            "AAPL",
+            "-q",
+            "1",
+            "--limit-price",
+            "0",
+        ])
+        .unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("limit price must be positive"),
+            "unexpected error: {message}"
+        );
+    }
+
     async fn assert_fractional_order_rejected_before_schwab_request(command: Commands) {
         let server = MockServer::start();
         let ctx = create_test_ctx_for_cli(&server, Address::ZERO);
@@ -1616,6 +1742,8 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: positive_shares("6.15"),
             time_in_force: None,
+            limit_price: None,
+            extended_hours: false,
         })
         .await;
     }
@@ -1626,6 +1754,8 @@ mod tests {
             symbol: Symbol::new("TSLA").unwrap(),
             quantity: positive_shares("6.15"),
             time_in_force: None,
+            limit_price: None,
+            extended_hours: false,
         })
         .await;
     }
@@ -1664,6 +1794,8 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: positive_shares("100"),
             time_in_force: None,
+            limit_price: None,
+            extended_hours: false,
         };
 
         let result = run_command_with_writers(ctx, buy_command, &pool, &mut stdout).await;
@@ -1713,6 +1845,8 @@ mod tests {
             symbol: Symbol::new("TSLA").unwrap(),
             quantity: positive_shares("50"),
             time_in_force: None,
+            limit_price: None,
+            extended_hours: false,
         };
 
         let result = run_command_with_writers(ctx, sell_command, &pool, &mut stdout).await;
@@ -1764,6 +1898,8 @@ mod tests {
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut stdout,
@@ -1839,6 +1975,8 @@ mod tests {
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut stdout,
@@ -1874,6 +2012,8 @@ mod tests {
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut stdout,
@@ -1911,6 +2051,8 @@ mod tests {
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut stdout2,
@@ -1947,6 +2089,8 @@ mod tests {
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut stdout,
@@ -2038,6 +2182,8 @@ mod tests {
             positive_shares("999999"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut stdout,

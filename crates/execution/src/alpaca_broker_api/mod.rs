@@ -51,7 +51,7 @@ pub enum AssetStatus {
 pub use auth::{AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
 pub use executor::AlpacaBrokerApi;
 pub use journal::{JournalResponse, JournalStatus};
-pub use order::{ConversionDirection, CryptoOrderResponse};
+pub use order::{AlpacaLimitOrder, ConversionDirection, CryptoOrderResponse};
 
 impl fmt::Display for TimeInForce {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -143,6 +143,12 @@ pub enum AlpacaBrokerApiError {
 
     #[error("Asset {symbol} is not tradable on Alpaca")]
     AssetNotTradable { symbol: Symbol },
+
+    #[error("Asset {symbol} is not overnight-tradable for extended-hours Alpaca orders")]
+    AssetNotOvernightTradable { symbol: Symbol },
+
+    #[error("limit orders only support day time-in-force, got {time_in_force}")]
+    InvalidLimitOrderTimeInForce { time_in_force: TimeInForce },
 
     #[error("Cash balance {} cannot be converted to cents", format_float_with_fallback(.0))]
     CashBalanceConversion(Float),

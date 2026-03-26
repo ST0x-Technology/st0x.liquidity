@@ -12,7 +12,7 @@ use rain_math_float::Float;
 use super::auth::{AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx};
 use super::client::AlpacaBrokerApiClient;
 use super::journal::JournalResponse;
-use super::order::{ConversionDirection, CryptoOrderResponse};
+use super::order::{AlpacaLimitOrder, ConversionDirection, CryptoOrderResponse};
 use super::{AlpacaBrokerApiError, AssetStatus, TimeInForce};
 use crate::{
     Executor, FractionalShares, MarketOrder, OrderPlacement, OrderState, OrderStatus, Positive,
@@ -24,6 +24,8 @@ use crate::{
 pub(super) struct AssetResponse {
     pub status: AssetStatus,
     pub tradable: bool,
+    #[serde(default)]
+    pub overnight_tradable: bool,
 }
 
 /// Cached asset information with expiration tracking
@@ -31,6 +33,7 @@ pub(super) struct AssetResponse {
 struct CachedAsset {
     status: AssetStatus,
     tradable: bool,
+    overnight_tradable: bool,
     cached_at: Instant,
 }
 
@@ -39,6 +42,7 @@ impl CachedAsset {
         Self {
             status: response.status,
             tradable: response.tradable,
+            overnight_tradable: response.overnight_tradable,
             cached_at: Instant::now(),
         }
     }
@@ -119,19 +123,7 @@ impl Executor for AlpacaBrokerApi {
         order: MarketOrder,
     ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
         let asset = self.get_asset_cached(&order.symbol).await?;
-
-        if asset.status != AssetStatus::Active {
-            return Err(AlpacaBrokerApiError::AssetNotActive {
-                symbol: order.symbol,
-                status: asset.status,
-            });
-        }
-
-        if !asset.tradable {
-            return Err(AlpacaBrokerApiError::AssetNotTradable {
-                symbol: order.symbol,
-            });
-        }
+        self.validate_asset(&order.symbol, &asset, false)?;
 
         super::order::place_market_order(&self.client, order, self.time_in_force).await
     }
@@ -233,6 +225,16 @@ impl AlpacaBrokerApi {
             .await
     }
 
+    pub async fn place_limit_order(
+        &self,
+        order: AlpacaLimitOrder,
+    ) -> Result<OrderPlacement<String>, AlpacaBrokerApiError> {
+        let asset = self.get_asset_cached(&order.symbol).await?;
+        self.validate_asset(&order.symbol, &asset, order.extended_hours)?;
+
+        super::order::place_limit_order(&self.client, order).await
+    }
+
     async fn get_asset_cached(&self, symbol: &Symbol) -> Result<CachedAsset, AlpacaBrokerApiError> {
         let symbol_str = symbol.to_string();
 
@@ -254,6 +256,34 @@ impl AlpacaBrokerApi {
         }
 
         Ok(cached)
+    }
+
+    fn validate_asset(
+        &self,
+        symbol: &Symbol,
+        asset: &CachedAsset,
+        extended_hours: bool,
+    ) -> Result<(), AlpacaBrokerApiError> {
+        if asset.status != AssetStatus::Active {
+            return Err(AlpacaBrokerApiError::AssetNotActive {
+                symbol: symbol.clone(),
+                status: asset.status,
+            });
+        }
+
+        if !asset.tradable {
+            return Err(AlpacaBrokerApiError::AssetNotTradable {
+                symbol: symbol.clone(),
+            });
+        }
+
+        if extended_hours && !asset.overnight_tradable {
+            return Err(AlpacaBrokerApiError::AssetNotOvernightTradable {
+                symbol: symbol.clone(),
+            });
+        }
+
+        Ok(())
     }
 }
 
@@ -303,12 +333,14 @@ mod tests {
             "id": "904837e3-3b76-47ec-b432-046db621571b",
             "symbol": "AAPL",
             "status": "active",
-            "tradable": true
+            "tradable": true,
+            "overnight_tradable": true
         });
 
         let response: AssetResponse = serde_json::from_value(json).unwrap();
         assert_eq!(response.status, AssetStatus::Active);
         assert!(response.tradable);
+        assert!(response.overnight_tradable);
     }
 
     #[test]
@@ -316,12 +348,14 @@ mod tests {
         let response = AssetResponse {
             status: AssetStatus::Active,
             tradable: true,
+            overnight_tradable: true,
         };
 
         let cached = CachedAsset::from_response(&response);
 
         assert_eq!(cached.status, AssetStatus::Active);
         assert!(cached.tradable);
+        assert!(cached.overnight_tradable);
         // cached_at should be very recent (within last second)
         assert!(cached.cached_at.elapsed() < Duration::from_secs(1));
     }
@@ -579,6 +613,7 @@ mod tests {
         symbol: &str,
         status: &str,
         tradable: bool,
+        overnight_tradable: bool,
     ) -> httpmock::Mock<'a> {
         server.mock(|when, then| {
             when.method(GET).path(format!("/v1/assets/{symbol}"));
@@ -588,7 +623,8 @@ mod tests {
                     "id": "904837e3-3b76-47ec-b432-046db621571b",
                     "symbol": symbol,
                     "status": status,
-                    "tradable": tradable
+                    "tradable": tradable,
+                    "overnight_tradable": overnight_tradable
                 }));
         })
     }
@@ -616,7 +652,7 @@ mod tests {
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let account_mock = create_account_mock(&server);
-        let asset_mock = create_asset_mock(&server, "AAPL", "inactive", true);
+        let asset_mock = create_asset_mock(&server, "AAPL", "inactive", true, true);
 
         let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
         account_mock.assert();
@@ -650,7 +686,7 @@ mod tests {
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let account_mock = create_account_mock(&server);
-        let asset_mock = create_asset_mock(&server, "AAPL", "active", false);
+        let asset_mock = create_asset_mock(&server, "AAPL", "active", false, true);
 
         let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
         account_mock.assert();
@@ -683,7 +719,7 @@ mod tests {
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let account_mock = create_account_mock(&server);
-        let asset_mock = create_asset_mock(&server, "AAPL", "active", true);
+        let asset_mock = create_asset_mock(&server, "AAPL", "active", true, true);
         let order_mock = create_order_mock(&server);
 
         let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
@@ -723,7 +759,8 @@ mod tests {
                     "id": "904837e3-3b76-47ec-b432-046db621571b",
                     "symbol": "AAPL",
                     "status": "active",
-                    "tradable": true
+                    "tradable": true,
+                    "overnight_tradable": true
                 }));
         });
 
@@ -799,7 +836,8 @@ mod tests {
                     "id": "904837e3-3b76-47ec-b432-046db621571b",
                     "symbol": "AAPL",
                     "status": "active",
-                    "tradable": true
+                    "tradable": true,
+                    "overnight_tradable": true
                 }));
         });
 
@@ -849,5 +887,42 @@ mod tests {
         // Asset endpoint should be called twice due to cache expiration
         asset_mock.assert_calls(2);
         order_mock.assert_calls(2);
+    }
+
+    #[tokio::test]
+    async fn test_place_limit_order_fails_for_non_overnight_tradable_asset() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let account_mock = create_account_mock(&server);
+        let asset_mock = create_asset_mock(&server, "AAPL", "active", true, false);
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let order = AlpacaLimitOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(
+                Float::parse("100".to_string()).unwrap(),
+            ))
+            .unwrap(),
+            direction: Direction::Buy,
+            limit_price: Float::parse("195.25".to_string()).unwrap(),
+            time_in_force: TimeInForce::Day,
+            extended_hours: true,
+        };
+
+        let result = executor.place_limit_order(order).await;
+
+        asset_mock.assert();
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                AlpacaBrokerApiError::AssetNotOvernightTradable { symbol }
+                    if *symbol == Symbol::new("AAPL").unwrap()
+            ),
+            "Expected AssetNotOvernightTradable error, got: {err:?}"
+        );
     }
 }

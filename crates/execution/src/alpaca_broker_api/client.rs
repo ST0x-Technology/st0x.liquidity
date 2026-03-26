@@ -11,7 +11,9 @@ use super::AlpacaBrokerApiError;
 use super::auth::{AccountResponse, AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
 use super::executor::AssetResponse;
 use super::journal::{JournalRequest, JournalResponse};
-use super::order::{CryptoOrderRequest, CryptoOrderResponse, OrderRequest, OrderResponse};
+use super::order::{
+    CryptoOrderRequest, CryptoOrderResponse, LimitOrderRequest, OrderRequest, OrderResponse,
+};
 use crate::{FractionalShares, Positive, Symbol};
 
 /// Alpaca Broker API HTTP client with Basic authentication
@@ -97,6 +99,29 @@ impl AlpacaBrokerApiClient {
             side = ?request.side,
             time_in_force = request.time_in_force,
             "Placing Alpaca Broker API order"
+        );
+
+        self.post(&url, request).await
+    }
+
+    /// Place a limit order
+    pub(super) async fn place_limit_order(
+        &self,
+        request: &LimitOrderRequest,
+    ) -> Result<OrderResponse, AlpacaBrokerApiError> {
+        let url = format!(
+            "{}/v1/trading/accounts/{}/orders",
+            self.base_url, self.account_id
+        );
+
+        debug!(
+            symbol = %request.symbol,
+            quantity = %request.quantity,
+            side = ?request.side,
+            limit_price = ?request.limit_price,
+            time_in_force = request.time_in_force,
+            extended_hours = request.extended_hours,
+            "Placing Alpaca Broker API limit order"
         );
 
         self.post(&url, request).await

@@ -13,8 +13,9 @@ use tracing::{error, info};
 use st0x_event_sorcery::{Store, StoreBuilder};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::{
-    Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder, MockExecutor,
-    MockExecutorCtx, OrderPlacement, OrderState, Positive, Symbol, TimeInForce, TryIntoExecutor,
+    AlpacaLimitOrder, Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder,
+    MockExecutor, MockExecutorCtx, OrderPlacement, OrderState, Positive, Symbol, TimeInForce,
+    TryIntoExecutor,
 };
 
 use super::auth::ensure_schwab_authentication;
@@ -148,37 +149,89 @@ pub(super) async fn execute_order_with_writers<W: Write>(
     shares: Positive<FractionalShares>,
     direction: Direction,
     time_in_force: Option<TimeInForce>,
+    limit_price: Option<Float>,
+    extended_hours: bool,
     ctx: &Ctx,
     pool: &SqlitePool,
     stdout: &mut W,
 ) -> anyhow::Result<()> {
-    let market_order = MarketOrder {
-        symbol: symbol.clone(),
-        shares,
-        direction,
+    let symbol_display = symbol.to_string();
+    let quantity_display = shares.to_string();
+    let limit_price_output = limit_price.clone();
+
+    info!(
+        symbol = %symbol_display,
+        direction = ?direction,
+        quantity = %quantity_display,
+        limit_price = ?limit_price,
+        extended_hours,
+        "Created order"
+    );
+
+    if extended_hours && limit_price.is_none() {
+        let error = anyhow::anyhow!("--extended-hours requires --limit-price");
+        writeln!(stdout, "❌ Failed to place order: {error}")?;
+        return Err(error);
+    }
+
+    let execution = match limit_price {
+        Some(limit_price) => {
+            execute_alpaca_limit_order(
+                symbol,
+                shares,
+                direction,
+                limit_price,
+                time_in_force,
+                extended_hours,
+                ctx,
+                stdout,
+            )
+            .await
+        }
+        None => {
+            let market_order = MarketOrder {
+                symbol,
+                shares,
+                direction,
+            };
+
+            execute_broker_order(ctx, pool, market_order, time_in_force, stdout).await
+        }
     };
 
-    info!("Created order: symbol={symbol}, direction={direction:?}, quantity={shares}");
-
-    match execute_broker_order(ctx, pool, market_order, time_in_force, stdout).await {
+    match execution {
         Ok(placement) => {
             info!(
-                symbol = %symbol,
-                direction = ?direction,
-                quantity = %shares,
+                symbol = %placement.symbol,
+                direction = ?placement.direction,
+                quantity = %placement.shares,
                 order_id = %placement.order_id,
                 "Order placed successfully"
             );
             writeln!(stdout, "✅ Order placed successfully")?;
-            writeln!(stdout, "   Symbol: {symbol}")?;
-            writeln!(stdout, "   Action: {direction:?}")?;
-            writeln!(stdout, "   Quantity: {shares}")?;
+            writeln!(stdout, "   Symbol: {}", placement.symbol)?;
+            writeln!(stdout, "   Action: {:?}", placement.direction)?;
+            writeln!(stdout, "   Quantity: {}", placement.shares)?;
+            if let Some(limit_price) = limit_price_output {
+                writeln!(stdout, "   Order Type: limit")?;
+                writeln!(
+                    stdout,
+                    "   Limit Price: ${}",
+                    format_float_with_fallback(&limit_price)
+                )?;
+                writeln!(
+                    stdout,
+                    "   Extended Hours: {}",
+                    if extended_hours { "yes" } else { "no" }
+                )?;
+                writeln!(stdout, "   Order ID: {}", placement.order_id)?;
+            }
         }
         Err(error) => {
             error!(
-                symbol = %symbol,
+                symbol = %symbol_display,
                 direction = ?direction,
-                quantity = %shares,
+                quantity = %quantity_display,
                 error = ?error,
                 "Failed to place order"
             );
@@ -188,6 +241,49 @@ pub(super) async fn execute_order_with_writers<W: Write>(
     }
 
     Ok(())
+}
+
+async fn execute_alpaca_limit_order<W: Write>(
+    symbol: Symbol,
+    shares: Positive<FractionalShares>,
+    direction: Direction,
+    limit_price: Float,
+    time_in_force: Option<TimeInForce>,
+    extended_hours: bool,
+    ctx: &Ctx,
+    stdout: &mut W,
+) -> anyhow::Result<OrderPlacement<String>> {
+    let time_in_force = time_in_force.unwrap_or(TimeInForce::Day);
+
+    if time_in_force != TimeInForce::Day {
+        anyhow::bail!("--limit-price only supports --time-in-force day");
+    }
+
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
+        anyhow::bail!("--limit-price is only supported with alpaca-broker-api");
+    };
+
+    writeln!(stdout, "🔄 Executing Alpaca Broker API limit order...")?;
+
+    let broker = alpaca_auth.clone().try_into_executor().await?;
+    let placement = broker
+        .place_limit_order(AlpacaLimitOrder {
+            symbol,
+            shares,
+            direction,
+            limit_price,
+            time_in_force,
+            extended_hours,
+        })
+        .await?;
+
+    writeln!(
+        stdout,
+        "✅ Alpaca Broker API limit order placed with ID: {}",
+        placement.order_id
+    )?;
+
+    Ok(placement)
 }
 
 pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'static>(
@@ -525,14 +621,20 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::config::{AssetsConfig, EquitiesConfig, LogLevel, SchwabAuth, TradingMode};
+    use crate::config::{AssetsConfig, BrokerCtx, EquitiesConfig, LogLevel, SchwabAuth, TradingMode};
     use crate::onchain::EvmCtx;
     use crate::test_utils::{positive_shares, setup_test_db, setup_test_tokens};
     use crate::threshold::ExecutionThreshold;
+    use st0x_execution::{
+        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaTradingApiCtx,
+        AlpacaTradingApiMode,
+    };
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
+    const TEST_ACCOUNT_ID: AlpacaAccountId =
+        AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
-    fn create_schwab_test_ctx(mock_server: &MockServer) -> Ctx {
+    fn create_base_test_ctx() -> Ctx {
         Ctx {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
@@ -546,14 +648,7 @@ mod tests {
             order_polling_max_jitter: 5,
             position_check_interval: 60,
             inventory_poll_interval: 60,
-            broker: BrokerCtx::Schwab(SchwabAuth {
-                app_key: "test_app_key".to_string(),
-                app_secret: "test_app_secret".to_string(),
-                redirect_uri: Some(Url::parse("https://127.0.0.1").expect("valid test URL")),
-                base_url: Some(Url::parse(&mock_server.base_url()).expect("valid mock URL")),
-                account_index: Some(0),
-                encryption_key: TEST_ENCRYPTION_KEY,
-            }),
+            broker: BrokerCtx::DryRun,
             telemetry: None,
             trading_mode: TradingMode::Standalone {
                 order_owner: Address::ZERO,
@@ -564,6 +659,44 @@ mod tests {
                 cash: None,
             },
         }
+    }
+
+    fn create_schwab_test_ctx(mock_server: &MockServer) -> Ctx {
+        let mut ctx = create_base_test_ctx();
+        ctx.broker = BrokerCtx::Schwab(SchwabAuth {
+            app_key: "test_app_key".to_string(),
+            app_secret: "test_app_secret".to_string(),
+            redirect_uri: Some(Url::parse("https://127.0.0.1").expect("valid test URL")),
+            base_url: Some(Url::parse(&mock_server.base_url()).expect("valid mock URL")),
+            account_index: Some(0),
+            encryption_key: TEST_ENCRYPTION_KEY,
+        });
+        ctx
+    }
+
+    fn create_alpaca_broker_api_test_ctx(mock_server: &MockServer) -> Ctx {
+        let mut ctx = create_base_test_ctx();
+        ctx.broker = BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
+            api_key: "test_key".to_string(),
+            api_secret: "test_secret".to_string(),
+            account_id: TEST_ACCOUNT_ID,
+            mode: Some(AlpacaBrokerApiMode::Mock(mock_server.base_url())),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::Day,
+        });
+        ctx
+    }
+
+    fn create_alpaca_trading_api_test_ctx() -> Ctx {
+        let mut ctx = create_base_test_ctx();
+        ctx.broker = BrokerCtx::AlpacaTradingApi(AlpacaTradingApiCtx {
+            api_key: "test_key".to_string(),
+            api_secret: "test_secret".to_string(),
+            trading_mode: Some(AlpacaTradingApiMode::Mock(
+                "http://127.0.0.1:1".to_string(),
+            )),
+        });
+        ctx
     }
 
     fn get_schwab_auth(ctx: &Ctx) -> &SchwabAuth {
@@ -596,6 +729,64 @@ mod tests {
         (account_mock, order_mock)
     }
 
+    fn setup_alpaca_broker_limit_order_mocks(
+        server: &MockServer,
+    ) -> (
+        httpmock::Mock<'_>,
+        httpmock::Mock<'_>,
+        httpmock::Mock<'_>,
+    ) {
+        let account_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "status": "ACTIVE"
+                }));
+        });
+
+        let asset_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/v1/assets/AAPL");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "symbol": "AAPL",
+                    "status": "active",
+                    "tradable": true,
+                    "overnight_tradable": true
+                }));
+        });
+
+        let order_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
+                .json_body(json!({
+                    "symbol": "AAPL",
+                    "qty": "10",
+                    "side": "buy",
+                    "type": "limit",
+                    "limit_price": "195.25",
+                    "time_in_force": "day",
+                    "extended_hours": true
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "symbol": "AAPL",
+                    "qty": "10",
+                    "side": "buy",
+                    "status": "new",
+                    "filled_avg_price": null
+                }));
+        });
+
+        (account_mock, asset_mock, order_mock)
+    }
+
     #[tokio::test]
     async fn test_execute_order_buy_success() {
         let server = MockServer::start();
@@ -610,6 +801,8 @@ mod tests {
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -635,6 +828,8 @@ mod tests {
             positive_shares("50"),
             Direction::Sell,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -677,6 +872,8 @@ mod tests {
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -700,6 +897,8 @@ mod tests {
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut stdout_buffer,
@@ -744,6 +943,8 @@ mod tests {
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut stdout_buffer,
@@ -772,6 +973,8 @@ mod tests {
             positive_shares("100"),
             Direction::Buy,
             Some(TimeInForce::Day),
+            None,
+            false,
             &ctx,
             &pool,
             &mut stdout_buffer,
@@ -783,6 +986,169 @@ mod tests {
         assert!(
             output.contains("--time-in-force is ignored"),
             "Expected warning about ignored --time-in-force, got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_limit_order_uses_alpaca_broker_api_path() {
+        let server = MockServer::start();
+        let ctx = create_alpaca_broker_api_test_ctx(&server);
+        let pool = setup_test_db().await;
+        let (account_mock, asset_mock, order_mock) = setup_alpaca_broker_limit_order_mocks(&server);
+
+        let mut stdout_buffer = Vec::new();
+        execute_order_with_writers(
+            Symbol::new("AAPL").unwrap(),
+            positive_shares("10"),
+            Direction::Buy,
+            None,
+            Some(Float::parse("195.25".to_string()).unwrap()),
+            true,
+            &ctx,
+            &pool,
+            &mut stdout_buffer,
+        )
+        .await
+        .unwrap();
+
+        account_mock.assert();
+        asset_mock.assert();
+        order_mock.assert();
+
+        let output = String::from_utf8(stdout_buffer).unwrap();
+        assert!(output.contains("Order Type: limit"), "unexpected output: {output}");
+        assert!(output.contains("Extended Hours: yes"), "unexpected output: {output}");
+        assert!(output.contains("Order ID:"), "unexpected output: {output}");
+    }
+
+    #[tokio::test]
+    async fn test_extended_hours_requires_limit_price() {
+        let server = MockServer::start();
+        let ctx = create_schwab_test_ctx(&server);
+        let pool = setup_test_db().await;
+        setup_test_tokens(&pool, get_schwab_auth(&ctx)).await;
+
+        let mut stdout_buffer = Vec::new();
+        let error = execute_order_with_writers(
+            Symbol::new("AAPL").unwrap(),
+            positive_shares("10"),
+            Direction::Buy,
+            None,
+            None,
+            true,
+            &ctx,
+            &pool,
+            &mut stdout_buffer,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "--extended-hours requires --limit-price");
+    }
+
+    #[tokio::test]
+    async fn test_limit_order_rejected_for_schwab() {
+        let server = MockServer::start();
+        let ctx = create_schwab_test_ctx(&server);
+        let pool = setup_test_db().await;
+
+        let mut stdout_buffer = Vec::new();
+        let error = execute_order_with_writers(
+            Symbol::new("AAPL").unwrap(),
+            positive_shares("10"),
+            Direction::Buy,
+            None,
+            Some(Float::parse("195.25".to_string()).unwrap()),
+            false,
+            &ctx,
+            &pool,
+            &mut stdout_buffer,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "--limit-price is only supported with alpaca-broker-api"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_limit_order_rejected_for_dry_run() {
+        let ctx = create_base_test_ctx();
+        let pool = setup_test_db().await;
+
+        let mut stdout_buffer = Vec::new();
+        let error = execute_order_with_writers(
+            Symbol::new("AAPL").unwrap(),
+            positive_shares("10"),
+            Direction::Buy,
+            None,
+            Some(Float::parse("195.25".to_string()).unwrap()),
+            false,
+            &ctx,
+            &pool,
+            &mut stdout_buffer,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "--limit-price is only supported with alpaca-broker-api"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_limit_order_rejected_for_alpaca_trading_api() {
+        let ctx = create_alpaca_trading_api_test_ctx();
+        let pool = setup_test_db().await;
+
+        let mut stdout_buffer = Vec::new();
+        let error = execute_order_with_writers(
+            Symbol::new("AAPL").unwrap(),
+            positive_shares("10"),
+            Direction::Buy,
+            None,
+            Some(Float::parse("195.25".to_string()).unwrap()),
+            false,
+            &ctx,
+            &pool,
+            &mut stdout_buffer,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "--limit-price is only supported with alpaca-broker-api"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_limit_order_rejects_market_on_close() {
+        let server = MockServer::start();
+        let ctx = create_alpaca_broker_api_test_ctx(&server);
+        let pool = setup_test_db().await;
+
+        let mut stdout_buffer = Vec::new();
+        let error = execute_order_with_writers(
+            Symbol::new("AAPL").unwrap(),
+            positive_shares("10"),
+            Direction::Buy,
+            Some(TimeInForce::MarketOnClose),
+            Some(Float::parse("195.25".to_string()).unwrap()),
+            false,
+            &ctx,
+            &pool,
+            &mut stdout_buffer,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "--limit-price only supports --time-in-force day"
         );
     }
 }
