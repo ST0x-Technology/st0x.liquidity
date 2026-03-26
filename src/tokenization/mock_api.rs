@@ -308,7 +308,8 @@ impl AlpacaTokenizationMock {
                             // Minting locks shares on the broker side — deduct
                             // from the offchain position so totals are conserved.
                             if let Ok(symbol) = Symbol::new(&req.underlying_symbol) {
-                                let neg_qty = Float::from_raw(alloy::primitives::B256::ZERO) - quantity;
+                                let neg_qty =
+                                    Float::from_raw(alloy::primitives::B256::ZERO) - quantity;
                                 if let Ok(delta) = neg_qty {
                                     if let Err(error) = broker.adjust_position(&symbol, delta) {
                                         warn!(%error, "failed to adjust broker position after mint");

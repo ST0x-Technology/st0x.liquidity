@@ -10,7 +10,7 @@ use tracing::{error, info};
 
 use st0x_event_sorcery::{Projection, Store};
 use st0x_evm::ReadOnlyEvm;
-use st0x_execution::Executor;
+use st0x_execution::{Executor, Symbol};
 
 use super::job::work;
 use super::order_fill_monitor::{DexEventStreams, OrderFillMonitor};
@@ -53,6 +53,8 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
     pub(crate) frameworks: CqrsFrameworks,
     pub(crate) poll_notify: Arc<tokio::sync::Notify>,
     pub(crate) wallet_polling: Option<WalletPollingCtx>,
+    pub(crate) equity_transfers_in_progress:
+        Arc<std::sync::RwLock<std::collections::HashSet<Symbol>>>,
 }
 
 /// Wires all runtime components and returns a running [`Conductor`].
@@ -118,6 +120,7 @@ where
             context.ctx.position_check_interval,
         ))
         .ctx(context.ctx.clone())
+        .equity_transfers_in_progress(context.equity_transfers_in_progress.clone())
         .call();
 
     let trade_cqrs = super::TradeProcessingCqrs {

@@ -558,17 +558,34 @@ async fn simulate() -> anyhow::Result<()> {
         (&tsla_buy, "TSLA", "BuyEquity"),
     ];
 
+    let trade_duration = Duration::from_secs(180);
+    let started = tokio::time::Instant::now();
     let mut round = 0u64;
-    loop {
-        let (order, symbol, direction) = orders[round as usize % orders.len()];
-        round += 1;
 
+    loop {
         tokio::time::sleep(Duration::from_secs(10)).await;
 
         if bot.is_finished() {
             let result = (&mut bot).await;
             panic!("Bot exited during simulation: {result:?}");
         }
+
+        if started.elapsed() >= trade_duration {
+            if round > 0 {
+                // Only log once when transitioning to idle
+                info!("Trade phase complete. Bot still running — observe the system settling.");
+                loop {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    if bot.is_finished() {
+                        let result = (&mut bot).await;
+                        panic!("Bot exited during idle phase: {result:?}");
+                    }
+                }
+            }
+        }
+
+        let (order, symbol, direction) = orders[round as usize % orders.len()];
+        round += 1;
 
         info!(round, symbol, direction, "Simulating user trade");
 

@@ -456,6 +456,7 @@ impl RebalancingTrigger {
         inventory: Arc<BroadcastingInventory>,
         sender: mpsc::Sender<TriggeredOperation>,
         wrapper: Arc<dyn Wrapper>,
+        equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
     ) -> Self {
         Self {
             config,
@@ -463,7 +464,7 @@ impl RebalancingTrigger {
             orderbook,
             order_owner,
             inventory,
-            equity_in_progress: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            equity_in_progress,
             usdc_in_progress: Arc::new(AtomicBool::new(false)),
             sender,
             wrapper,

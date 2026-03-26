@@ -11,7 +11,7 @@ use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use apalis_sqlite::SqliteStorage;
 use futures_util::StreamExt;
 use sqlx::SqlitePool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use task_supervisor::SupervisorHandle;
@@ -168,6 +168,9 @@ impl Conductor {
 
         seed_vault_registry_from_config(&vault_registry, &ctx).await?;
 
+        let equity_transfers_in_progress =
+            Arc::new(std::sync::RwLock::new(HashSet::<Symbol>::new()));
+
         let rebalancing = match ctx.rebalancing_ctx() {
             Ok(ctx) => Some(ctx.clone()),
             Err(CtxError::NotRebalancing) => None,
@@ -189,6 +192,7 @@ impl Conductor {
                         event_broadcaster: event_broadcaster.clone(),
                         vault_registry: vault_registry.clone(),
                         vault_registry_projection: vault_registry_projection.clone(),
+                        equity_transfers_in_progress: equity_transfers_in_progress.clone(),
                     },
                 )
                 .await?;
@@ -253,6 +257,7 @@ impl Conductor {
             frameworks,
             poll_notify: Arc::new(tokio::sync::Notify::new()),
             wallet_polling,
+            equity_transfers_in_progress: equity_transfers_in_progress.clone(),
         };
 
         let mut conductor = builder::spawn()
@@ -325,6 +330,7 @@ struct RebalancingDeps {
     event_broadcaster: Arc<EventBroadcaster>,
     vault_registry: Arc<Store<VaultRegistry>>,
     vault_registry_projection: Arc<Projection<VaultRegistry>>,
+    equity_transfers_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
 }
 
 /// Pre-seeds the vault registry with vault IDs from config.
@@ -460,6 +466,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             deps.inventory.clone(),
             operation_sender,
             wrapper,
+            deps.equity_transfers_in_progress,
         ));
 
         let manifest = QueryManifest::new(rebalancing_trigger, deps.event_broadcaster);
@@ -647,6 +654,7 @@ fn spawn_periodic_accumulated_position_check<E>(
     execution_threshold: ExecutionThreshold,
     check_interval: Duration,
     ctx: Ctx,
+    equity_transfers_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
 ) -> JoinHandle<()>
 where
     E: Executor + Clone + Send + 'static,
@@ -669,6 +677,12 @@ where
                 &execution_threshold,
                 &ctx.assets,
                 |symbol| ctx.is_trading_enabled(symbol),
+                |symbol| {
+                    equity_transfers_in_progress
+                        .read()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .contains(symbol)
+                },
             )
             .await
             {
@@ -1086,6 +1100,7 @@ pub(crate) async fn check_and_execute_accumulated_positions<E>(
     threshold: &ExecutionThreshold,
     assets: &AssetsConfig,
     is_trading_enabled: impl Fn(&Symbol) -> bool,
+    is_transfer_active: impl Fn(&Symbol) -> bool,
 ) -> Result<(), TradeAccountingError>
 where
     E: Executor + Clone + Send + 'static,
@@ -1103,6 +1118,26 @@ where
 
     if ready_positions.is_empty() {
         debug!("No accumulated positions ready for execution");
+        return Ok(());
+    }
+
+    let ready_positions: Vec<_> = ready_positions
+        .into_iter()
+        .filter(|execution| {
+            if is_transfer_active(&execution.symbol) {
+                info!(
+                    symbol = %execution.symbol,
+                    "Skipping hedge: equity transfer in progress",
+                );
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    if ready_positions.is_empty() {
+        debug!("All ready positions deferred due to active transfers");
         return Ok(());
     }
 
