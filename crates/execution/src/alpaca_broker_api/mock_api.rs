@@ -441,6 +441,7 @@ impl AlpacaBrokerMock {
                 position.market_value = (position.quantity * price)?;
             }
         }
+        drop(state);
         Ok(())
     }
 

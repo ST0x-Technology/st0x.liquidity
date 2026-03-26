@@ -307,14 +307,12 @@ impl AlpacaTokenizationMock {
 
                             // Minting locks shares on the broker side — deduct
                             // from the offchain position so totals are conserved.
-                            if let Ok(symbol) = Symbol::new(&req.underlying_symbol) {
-                                let neg_qty =
-                                    Float::from_raw(alloy::primitives::B256::ZERO) - quantity;
-                                if let Ok(delta) = neg_qty {
-                                    if let Err(error) = broker.adjust_position(&symbol, delta) {
-                                        warn!(%error, "failed to adjust broker position after mint");
-                                    }
-                                }
+                            if let Ok(symbol) = Symbol::new(&req.underlying_symbol)
+                                && let Ok(delta) =
+                                    Float::from_raw(alloy::primitives::B256::ZERO) - quantity
+                                && let Err(error) = broker.adjust_position(&symbol, delta)
+                            {
+                                warn!(%error, "failed to adjust broker position after mint");
                             }
                         } else {
                             warn!(%token_addr, "mint transfer reverted on-chain");
@@ -571,10 +569,11 @@ fn register_tokenization_requests_with_filter_endpoint(
 
                                 // Redemption completed: shares return to the
                                 // broker (unlocked from tokenization backing).
-                                if let Ok(symbol) = Symbol::new(&req.underlying_symbol) {
-                                    if let Err(error) = broker.adjust_position(&symbol, req.quantity) {
-                                        warn!(%error, "failed to adjust broker position after redemption");
-                                    }
+                                if let Ok(symbol) = Symbol::new(&req.underlying_symbol)
+                                    && let Err(error) =
+                                        broker.adjust_position(&symbol, req.quantity)
+                                {
+                                    warn!(%error, "failed to adjust broker position after redemption");
                                 }
                             }
                         }

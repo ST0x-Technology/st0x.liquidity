@@ -232,12 +232,18 @@ impl EventSourced for Position {
                     });
                 }
 
-                let trigger_reason = self.create_trigger_reason(&self.threshold)?.ok_or(
-                    PositionError::ThresholdNotMet {
+                let trigger_reason = self
+                    .create_trigger_reason(&self.threshold)?
+                    .ok_or(PositionError::ThresholdNotMet {
                         net_position: self.net,
                         threshold: self.threshold,
-                    },
-                )?;
+                    })
+                    .inspect_err(|error| {
+                        warn!(
+                            %offchain_order_id, %self.symbol,
+                            "Order placement rejected: {error}",
+                        );
+                    })?;
 
                 Ok(vec![PositionEvent::OffChainOrderPlaced {
                     offchain_order_id,
@@ -274,6 +280,11 @@ impl EventSourced for Position {
                 error,
             } => {
                 self.validate_pending_execution(offchain_order_id)?;
+
+                warn!(
+                    %offchain_order_id, symbol = %self.symbol, %error,
+                    "Offchain venue rejected"
+                );
 
                 Ok(vec![PositionEvent::OffChainOrderFailed {
                     offchain_order_id,

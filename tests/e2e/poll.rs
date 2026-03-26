@@ -30,8 +30,6 @@ pub fn spawn_bot_with_event_channel(
     tokio::spawn(launch_with_event_channel(ctx, event_sender))
 }
 
-/// After assertions complete, keeps the server alive while dashboard
-
 /// Polls the bot's health endpoint until it responds, panicking if the
 /// bot crashes or the timeout (30s) expires before it becomes ready.
 pub async fn poll_for_ready(bot: &mut JoinHandle<anyhow::Result<()>>, port: u16) {

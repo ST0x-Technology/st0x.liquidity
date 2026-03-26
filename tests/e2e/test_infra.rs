@@ -29,15 +29,15 @@ static TRACING_INIT: Once = Once::new();
 /// Safe to call multiple times -- only the first call takes effect.
 pub fn init_tracing() {
     TRACING_INIT.call_once(|| {
-        let level = tracing::Level::INFO;
-        let base_filter = mk_env_filter(level);
-        let filter = base_filter.add_directive(format!("e2e={level}").parse().unwrap());
+        let base_filter = mk_env_filter(tracing::Level::DEBUG);
+        let directive = format!("e2e={tracing::Level::TRACE}").parse().unwrap();
+        let filter = base_filter.add_directive(directive);
 
         tracing_subscriber::fmt()
             .compact()
             .with_env_filter(filter)
             .with_target(true)
-            .without_time()
+            .with_line_number(true)
             .with_writer(std::io::stderr)
             .try_init()
             .expect("Failed to initialize tracing subscriber");
@@ -104,54 +104,10 @@ impl TestInfra<()> {
         let db_dir = tempfile::tempdir()?;
         let db_path = db_path_override.unwrap_or_else(|| db_dir.path().join("e2e.sqlite"));
 
-        info!("Starting Anvil base chain");
-        let mut base_chain = BaseChain::start().await?;
-        info!("Anvil started, deploying equity vaults");
-        let mut equity_addresses = Vec::new();
-        for (symbol, _price) in &equity_prices {
-            let (vault_addr, underlying_addr) = base_chain.deploy_equity_vault(symbol).await?;
-            debug!(%symbol, %vault_addr, %underlying_addr, "Deployed equity vault");
-            equity_addresses.push(((*symbol).to_owned(), vault_addr, underlying_addr));
-        }
+        let (mut base_chain, equity_addresses) = deploy_chain_and_vaults(&equity_prices).await?;
 
-        debug!("Funding taker with equity vault shares");
-        let taker_equity: U256 = parse_units("100000", 18)?.into();
-        for (symbol, vault_addr, _underlying_addr) in &equity_addresses {
-            DeployableERC20::new(*vault_addr, &base_chain.provider)
-                .transfer(base_chain.taker, taker_equity)
-                .send()
-                .await?
-                .get_receipt()
-                .await?;
-            debug!(%symbol, "Funded taker");
-        }
-
-        let symbol_prices: Vec<(Symbol, Float)> = equity_prices
-            .iter()
-            .map(|(symbol, price)| Ok((Symbol::new(*symbol)?, *price)))
-            .collect::<anyhow::Result<_>>()?;
-
-        let price_lookup: HashMap<Symbol, Float> = equity_prices
-            .iter()
-            .map(|(symbol, price)| Ok((Symbol::new(*symbol)?, *price)))
-            .collect::<anyhow::Result<_>>()?;
-
-        let symbol_positions: Vec<MockPosition> = equity_positions
-            .iter()
-            .map(|(symbol, quantity)| {
-                let sym = Symbol::new(*symbol)?;
-                let price = price_lookup.get(&sym).ok_or_else(|| {
-                    anyhow::anyhow!("no price configured for position symbol {symbol}")
-                })?;
-                let market_value = (*quantity * *price)
-                    .map_err(|err| anyhow::anyhow!("Float mul failed: {err:?}"))?;
-                Ok(MockPosition {
-                    symbol: sym,
-                    quantity: *quantity,
-                    market_value,
-                })
-            })
-            .collect::<anyhow::Result<_>>()?;
+        let (symbol_prices, symbol_positions) =
+            build_mock_positions(&equity_prices, &equity_positions)?;
 
         info!("Starting mock services");
         let broker_service = Arc::new(
@@ -164,36 +120,8 @@ impl TestInfra<()> {
         );
         debug!(broker_url = %broker_service.base_url(), "Broker mock started");
 
-        let mut tokenization_service =
-            AlpacaTokenizationMock::start(broker_service.server(), broker_service.clone());
-        // Map both vault and underlying token addresses to symbol so the
-        // redemption watcher can resolve the symbol regardless of which
-        // ERC-20 contract emits the Transfer event.
-        let token_symbols: HashMap<Address, String> = equity_addresses
-            .iter()
-            .flat_map(|(symbol, vault_addr, underlying_addr)| {
-                [
-                    (*vault_addr, symbol.clone()),
-                    (*underlying_addr, symbol.clone()),
-                ]
-            })
-            .collect();
-        tokenization_service
-            .start_redemption_watcher(
-                base_chain.provider.clone(),
-                REDEMPTION_WALLET,
-                token_symbols,
-            )
-            .await?;
-        debug!("Redemption watcher started");
-
-        let mint_token_addresses: HashMap<String, Address> = equity_addresses
-            .iter()
-            .map(|(symbol, _vault_addr, underlying_addr)| (symbol.clone(), *underlying_addr))
-            .collect();
-        tokenization_service
-            .start_mint_executor(base_chain.minter_provider.clone(), mint_token_addresses);
-        debug!("Mint executor started");
+        let tokenization_service =
+            start_tokenization_mock(&broker_service, &equity_addresses, &mut base_chain).await?;
 
         let attestation_service = CctpAttestationMock::start().await;
         debug!("CCTP attestation mock started");
@@ -209,4 +137,110 @@ impl TestInfra<()> {
             equity_addresses,
         })
     }
+}
+
+async fn deploy_chain_and_vaults(
+    equity_prices: &[(&str, Float)],
+) -> anyhow::Result<(
+    BaseChain<impl Provider + Clone>,
+    Vec<(String, Address, Address)>,
+)> {
+    info!("Starting Anvil base chain");
+    let mut base_chain = BaseChain::start().await?;
+    info!("Anvil started, deploying equity vaults");
+
+    let mut equity_addresses = Vec::new();
+    for (symbol, _price) in equity_prices {
+        let (vault_addr, underlying_addr) = base_chain.deploy_equity_vault(symbol).await?;
+        debug!(%symbol, %vault_addr, %underlying_addr, "Deployed equity vault");
+        equity_addresses.push(((*symbol).to_owned(), vault_addr, underlying_addr));
+    }
+
+    debug!("Funding taker with equity vault shares");
+    let taker_equity: U256 = parse_units("100000", 18)?.into();
+    for (symbol, vault_addr, _underlying_addr) in &equity_addresses {
+        DeployableERC20::new(*vault_addr, &base_chain.provider)
+            .transfer(base_chain.taker, taker_equity)
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+        debug!(%symbol, "Funded taker");
+    }
+
+    Ok((base_chain, equity_addresses))
+}
+
+fn build_mock_positions(
+    equity_prices: &[(&str, Float)],
+    equity_positions: &[(&str, Float)],
+) -> anyhow::Result<(Vec<(Symbol, Float)>, Vec<MockPosition>)> {
+    let symbol_prices: Vec<(Symbol, Float)> = equity_prices
+        .iter()
+        .map(|(symbol, price)| Ok((Symbol::new(*symbol)?, *price)))
+        .collect::<anyhow::Result<_>>()?;
+
+    let price_lookup: HashMap<Symbol, Float> = equity_prices
+        .iter()
+        .map(|(symbol, price)| Ok((Symbol::new(*symbol)?, *price)))
+        .collect::<anyhow::Result<_>>()?;
+
+    let symbol_positions: Vec<MockPosition> = equity_positions
+        .iter()
+        .map(|(symbol, quantity)| {
+            let sym = Symbol::new(*symbol)?;
+            let price = price_lookup.get(&sym).ok_or_else(|| {
+                anyhow::anyhow!("no price configured for position symbol {symbol}")
+            })?;
+            let market_value =
+                (*quantity * *price).map_err(|err| anyhow::anyhow!("Float mul failed: {err:?}"))?;
+            Ok(MockPosition {
+                symbol: sym,
+                quantity: *quantity,
+                market_value,
+            })
+        })
+        .collect::<anyhow::Result<_>>()?;
+
+    Ok((symbol_prices, symbol_positions))
+}
+
+async fn start_tokenization_mock<P: Provider + Clone>(
+    broker_service: &Arc<AlpacaBrokerMock>,
+    equity_addresses: &[(String, Address, Address)],
+    base_chain: &mut BaseChain<P>,
+) -> anyhow::Result<AlpacaTokenizationMock> {
+    let mut tokenization_service =
+        AlpacaTokenizationMock::start(broker_service.server(), broker_service.clone());
+
+    // Map both vault and underlying token addresses to symbol so the
+    // redemption watcher can resolve the symbol regardless of which
+    // ERC-20 contract emits the Transfer event.
+    let token_symbols: HashMap<Address, String> = equity_addresses
+        .iter()
+        .flat_map(|(symbol, vault_addr, underlying_addr)| {
+            [
+                (*vault_addr, symbol.clone()),
+                (*underlying_addr, symbol.clone()),
+            ]
+        })
+        .collect();
+    tokenization_service
+        .start_redemption_watcher(
+            base_chain.provider.clone(),
+            REDEMPTION_WALLET,
+            token_symbols,
+        )
+        .await?;
+    debug!("Redemption watcher started");
+
+    let mint_token_addresses: HashMap<String, Address> = equity_addresses
+        .iter()
+        .map(|(symbol, _vault_addr, underlying_addr)| (symbol.clone(), *underlying_addr))
+        .collect();
+    tokenization_service
+        .start_mint_executor(base_chain.minter_provider.clone(), mint_token_addresses);
+    debug!("Mint executor started");
+
+    Ok(tokenization_service)
 }

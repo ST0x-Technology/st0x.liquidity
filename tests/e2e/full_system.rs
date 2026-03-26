@@ -577,21 +577,19 @@ async fn simulate() -> anyhow::Result<()> {
             panic!("Bot exited during simulation: {result:?}");
         }
 
-        if started.elapsed() >= trade_duration {
-            if round > 0 {
-                // Only log once when transitioning to idle
-                info!("Trade phase complete. Bot still running — observe the system settling.");
-                loop {
-                    tokio::time::sleep(Duration::from_secs(30)).await;
-                    if bot.is_finished() {
-                        let result = (&mut bot).await;
-                        panic!("Bot exited during idle phase: {result:?}");
-                    }
+        if started.elapsed() >= trade_duration && round > 0 {
+            // Only log once when transitioning to idle
+            info!("Trade phase complete. Bot still running — observe the system settling.");
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                if bot.is_finished() {
+                    let result = (&mut bot).await;
+                    panic!("Bot exited during idle phase: {result:?}");
                 }
             }
         }
 
-        let (order, symbol, direction) = orders[round as usize % orders.len()];
+        let (order, symbol, direction) = orders[usize::try_from(round).unwrap() % orders.len()];
         round += 1;
 
         let mut rng = rand::thread_rng();

@@ -117,6 +117,7 @@ impl QueryManifest {
 mod tests {
     use alloy::primitives::Address;
     use std::collections::HashSet;
+    use std::sync::RwLock;
     use tokio::sync::{broadcast, mpsc};
 
     use st0x_event_sorcery::test_store;
@@ -129,6 +130,7 @@ mod tests {
     use crate::rebalancing::RebalancingTriggerConfig;
     use crate::test_utils::setup_test_db;
     use crate::tokenization::mock::MockTokenizer;
+    use crate::vault_registry::VaultRegistryId;
     use crate::wrapper::mock::MockWrapper;
     use st0x_float_macro::float;
 
@@ -162,14 +164,17 @@ mod tests {
         let rebalancing_trigger = Arc::new(RebalancingTrigger::new(
             test_trigger_config(),
             vault_registry,
-            Address::ZERO,
-            Address::ZERO,
+            VaultRegistryId {
+                orderbook: Address::ZERO,
+                owner: Address::ZERO,
+            },
             Arc::new(BroadcastingInventory::new(
                 InventoryView::default(),
                 event_sender.clone(),
             )),
             operation_sender,
             Arc::new(MockWrapper::new()),
+            Arc::new(RwLock::new(HashSet::new())),
         ));
 
         let event_broadcaster = Arc::new(EventBroadcaster::new(event_sender, pool.clone()));

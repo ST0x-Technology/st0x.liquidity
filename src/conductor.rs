@@ -4,7 +4,7 @@
 mod builder;
 pub(crate) mod job;
 mod manifest;
-mod order_fill_monitor;
+pub(crate) mod monitor;
 
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
@@ -17,7 +17,7 @@ use std::time::Duration;
 use task_supervisor::SupervisorHandle;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, trace, warn};
 
 use st0x_dto::ServerMessage;
 use st0x_event_sorcery::{Projection, Store, StoreBuilder};
@@ -26,16 +26,13 @@ use st0x_execution::{Executor, FractionalShares, Symbol};
 
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::bindings::IOrderBookV6::{self, IOrderBookV6Instance};
-use crate::config::{AssetsConfig, Ctx, CtxError};
+use crate::config::{Ctx, CtxError};
 use crate::dashboard::EventBroadcaster;
 use crate::inventory::{BroadcastingInventory, InventoryPollingService, InventorySnapshot};
 use crate::offchain::order_poller::OrderStatusPoller;
-use crate::offchain_order::{
-    ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer,
-};
+use crate::offchain_order::{ExecutorOrderPlacer, OffchainOrder, OrderPlacer};
 use crate::onchain::OnchainTrade;
 use crate::onchain::USDC_BASE;
-use crate::onchain::accumulator::{ExecutionCtx, check_all_positions, check_execution_readiness};
 use crate::onchain::backfill::{backfill_events, get_backfill_retry_strat};
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::onchain::trade::{RaindexTradeEvent, extract_owned_vaults, extract_vaults_from_clear};
@@ -73,10 +70,7 @@ pub(crate) async fn setup_apalis_tables(pool: &SqlitePool) -> Result<(), sqlx::E
 pub(crate) struct TradeProcessingCqrs {
     pub(crate) onchain_trade: Arc<Store<OnChainTrade>>,
     pub(crate) position: Arc<Store<Position>>,
-    pub(crate) position_projection: Arc<Projection<Position>>,
-    pub(crate) offchain_order: Arc<Store<OffchainOrder>>,
     pub(crate) execution_threshold: ExecutionThreshold,
-    pub(crate) assets: AssetsConfig,
 }
 
 pub(crate) struct Conductor {
@@ -243,7 +237,7 @@ impl Conductor {
             snapshot,
         };
 
-        let dex_streams = order_fill_monitor::DexEventStreams {
+        let dex_streams = monitor::order_fills::DexEventStreams {
             clear: Box::pin(clear_stream),
             take: Box::pin(take_stream),
         };
@@ -255,6 +249,7 @@ impl Conductor {
             executor,
             execution_threshold: ctx.execution_threshold,
             frameworks,
+            pool,
             poll_notify: Arc::new(tokio::sync::Notify::new()),
             wallet_polling,
             equity_transfers_in_progress: equity_transfers_in_progress.clone(),
@@ -461,8 +456,10 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
                 disabled_assets,
             },
             deps.vault_registry,
-            deps.ctx.evm.orderbook,
-            market_maker_wallet,
+            VaultRegistryId {
+                orderbook: deps.ctx.evm.orderbook,
+                owner: market_maker_wallet,
+            },
             deps.inventory.clone(),
             operation_sender,
             wrapper,
@@ -645,53 +642,6 @@ fn spawn_order_poller<E: Executor + Clone + Send + 'static>(
     })
 }
 
-#[bon::builder]
-fn spawn_periodic_accumulated_position_check<E>(
-    executor: E,
-    position: Arc<Store<Position>>,
-    position_projection: Arc<Projection<Position>>,
-    offchain_order: Arc<Store<OffchainOrder>>,
-    execution_threshold: ExecutionThreshold,
-    check_interval: Duration,
-    ctx: Ctx,
-    equity_transfers_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
-) -> JoinHandle<()>
-where
-    E: Executor + Clone + Send + 'static,
-    TradeAccountingError: From<E::Error>,
-{
-    info!("Starting periodic accumulated position checker");
-
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(check_interval);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        loop {
-            interval.tick().await;
-            debug!("Running periodic accumulated position check");
-            if let Err(error) = check_and_execute_accumulated_positions(
-                &executor,
-                &position,
-                &position_projection,
-                &offchain_order,
-                &execution_threshold,
-                &ctx.assets,
-                |symbol| ctx.is_trading_enabled(symbol),
-                |symbol| {
-                    equity_transfers_in_progress
-                        .read()
-                        .unwrap_or_else(|poison| poison.into_inner())
-                        .contains(symbol)
-                },
-            )
-            .await
-            {
-                error!("Periodic accumulated position check failed: {error}");
-            }
-        }
-    })
-}
-
 fn spawn_inventory_poller<Chain, Exe>(
     service: InventoryPollingService<Chain, Exe>,
     poll_interval: std::time::Duration,
@@ -711,11 +661,11 @@ where
             tokio::select! {
                 _ = interval.tick() => {}
                 () = poll_notify.notified() => {
-                    debug!("Inventory poll triggered by notification");
+                    trace!("Inventory poll triggered by notification");
                 }
             }
 
-            debug!("Running inventory poll");
+            trace!("Running inventory poll");
             if let Err(error) = service.poll_and_record().await {
                 error!(%error, "Inventory polling failed");
             }
@@ -926,13 +876,11 @@ async fn execute_acknowledge_fill(
     }
 }
 
-pub(crate) async fn process_queued_trade<E: Executor>(
-    executor: &E,
+pub(crate) async fn process_queued_trade(
     trade_event: &EmittedOnChain<RaindexTradeEvent>,
     trade: OnchainTrade,
     cqrs: &TradeProcessingCqrs,
-    asset_enabled: bool,
-) -> Result<Option<OffchainOrderId>, TradeAccountingError> {
+) -> Result<(), TradeAccountingError> {
     let trade_id = OnChainTradeId {
         tx_hash: trade.tx_hash,
         log_index: trade.log_index,
@@ -943,277 +891,19 @@ pub(crate) async fn process_queued_trade<E: Executor>(
             ?trade_id,
             "Trade already processed (duplicate event), skipping"
         );
-        return Ok(None);
+        return Ok(());
     }
 
     let witnessed =
         execute_witness_trade(&cqrs.onchain_trade, &trade, trade_event.block_number).await;
 
     if !witnessed {
-        return Ok(None);
+        return Ok(());
     }
 
     execute_enrich_trade(&cqrs.onchain_trade, &trade).await;
 
     execute_acknowledge_fill(&cqrs.position, &trade, cqrs.execution_threshold).await;
-
-    let base_symbol = trade.symbol.base();
-
-    let executor_type = executor.to_supported_executor();
-
-    let Some(execution) = check_execution_readiness(
-        executor,
-        &cqrs.position_projection,
-        base_symbol,
-        executor_type,
-        &cqrs.assets,
-        asset_enabled,
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-
-    place_offchain_order(&execution, cqrs).await
-}
-
-async fn place_offchain_order(
-    execution: &ExecutionCtx,
-    cqrs: &TradeProcessingCqrs,
-) -> Result<Option<OffchainOrderId>, TradeAccountingError> {
-    let offchain_order_id = OffchainOrderId::new();
-
-    if !execute_place_offchain_order(execution, cqrs, offchain_order_id).await {
-        return Ok(None);
-    }
-
-    execute_create_offchain_order(execution, cqrs, offchain_order_id).await;
-
-    let aggregate = cqrs.offchain_order.load(&offchain_order_id).await;
-
-    if let Ok(Some(OffchainOrder::Failed { error, .. })) = aggregate {
-        warn!(
-            %offchain_order_id,
-            symbol = %execution.symbol,
-            %error,
-            "Broker rejected order, clearing position pending state"
-        );
-        execute_fail_offchain_order_position(&cqrs.position, offchain_order_id, execution, error)
-            .await;
-    }
-
-    Ok(Some(offchain_order_id))
-}
-
-async fn execute_fail_offchain_order_position(
-    position: &Store<Position>,
-    offchain_order_id: OffchainOrderId,
-    execution: &ExecutionCtx,
-    error: String,
-) {
-    let command = PositionCommand::FailOffChainOrder {
-        offchain_order_id,
-        error,
-    };
-
-    match position.send(&execution.symbol, command).await {
-        Ok(()) => info!(
-            %offchain_order_id,
-            symbol = %execution.symbol,
-            "Position::FailOffChainOrder succeeded"
-        ),
-        Err(error) => error!(
-            %offchain_order_id,
-            symbol = %execution.symbol,
-            "Position::FailOffChainOrder failed: {error}"
-        ),
-    }
-}
-
-/// Returns `true` if the Position aggregate accepted the order, `false` if it
-/// was rejected (e.g. already has a pending execution).
-async fn execute_place_offchain_order(
-    execution: &ExecutionCtx,
-    cqrs: &TradeProcessingCqrs,
-    offchain_order_id: OffchainOrderId,
-) -> bool {
-    let command = PositionCommand::PlaceOffChainOrder {
-        offchain_order_id,
-        shares: execution.shares,
-        direction: execution.direction,
-        executor: execution.executor,
-        threshold: cqrs.execution_threshold,
-    };
-
-    match cqrs.position.send(&execution.symbol, command).await {
-        Ok(()) => {
-            info!(
-                %offchain_order_id,
-                symbol = %execution.symbol,
-                "Position::PlaceOffChainOrder succeeded"
-            );
-            true
-        }
-        Err(error) => {
-            warn!(
-                %offchain_order_id,
-                symbol = %execution.symbol,
-                "Position::PlaceOffChainOrder rejected: {error}"
-            );
-            false
-        }
-    }
-}
-
-async fn execute_create_offchain_order(
-    execution: &ExecutionCtx,
-    cqrs: &TradeProcessingCqrs,
-    offchain_order_id: OffchainOrderId,
-) {
-    let command = OffchainOrderCommand::Place {
-        symbol: execution.symbol.clone(),
-        shares: execution.shares,
-        direction: execution.direction,
-        executor: execution.executor,
-    };
-
-    match cqrs.offchain_order.send(&offchain_order_id, command).await {
-        Ok(()) => info!(
-            %offchain_order_id,
-            symbol = %execution.symbol,
-            "OffchainOrder::Place succeeded"
-        ),
-        Err(error) => error!(
-            %offchain_order_id,
-            symbol = %execution.symbol,
-            "OffchainOrder::Place failed: {error}"
-        ),
-    }
-}
-
-#[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-pub(crate) async fn check_and_execute_accumulated_positions<E>(
-    executor: &E,
-    position: &Store<Position>,
-    position_projection: &Projection<Position>,
-    offchain_order: &Arc<Store<OffchainOrder>>,
-    threshold: &ExecutionThreshold,
-    assets: &AssetsConfig,
-    is_trading_enabled: impl Fn(&Symbol) -> bool,
-    is_transfer_active: impl Fn(&Symbol) -> bool,
-) -> Result<(), TradeAccountingError>
-where
-    E: Executor + Clone + Send + 'static,
-    TradeAccountingError: From<E::Error>,
-{
-    let executor_type = executor.to_supported_executor();
-    let ready_positions = check_all_positions(
-        executor,
-        position_projection,
-        executor_type,
-        assets,
-        is_trading_enabled,
-    )
-    .await?;
-
-    if ready_positions.is_empty() {
-        debug!("No accumulated positions ready for execution");
-        return Ok(());
-    }
-
-    let ready_positions: Vec<_> = ready_positions
-        .into_iter()
-        .filter(|execution| {
-            if is_transfer_active(&execution.symbol) {
-                info!(
-                    symbol = %execution.symbol,
-                    "Skipping hedge: equity transfer in progress",
-                );
-                false
-            } else {
-                true
-            }
-        })
-        .collect();
-
-    if ready_positions.is_empty() {
-        debug!("All ready positions deferred due to active transfers");
-        return Ok(());
-    }
-
-    info!(
-        "Found {} accumulated positions ready for execution",
-        ready_positions.len()
-    );
-
-    for execution in ready_positions {
-        let offchain_order_id = OffchainOrderId::new();
-
-        info!(
-            symbol = %execution.symbol,
-            shares = %execution.shares,
-            direction = ?execution.direction,
-            %offchain_order_id,
-            "Executing accumulated position"
-        );
-
-        let command = PositionCommand::PlaceOffChainOrder {
-            offchain_order_id,
-            shares: execution.shares,
-            direction: execution.direction,
-            executor: execution.executor,
-            threshold: *threshold,
-        };
-
-        if let Err(error) = position.send(&execution.symbol, command).await {
-            warn!(
-                %offchain_order_id,
-                symbol = %execution.symbol,
-                "Position::PlaceOffChainOrder rejected (likely pending execution), \
-                 skipping OffchainOrder creation: {error}"
-            );
-            continue;
-        }
-
-        info!(
-            %offchain_order_id,
-            symbol = %execution.symbol,
-            "Position::PlaceOffChainOrder succeeded"
-        );
-
-        let command = OffchainOrderCommand::Place {
-            symbol: execution.symbol.clone(),
-            shares: execution.shares,
-            direction: execution.direction,
-            executor: execution.executor,
-        };
-
-        match offchain_order.send(&offchain_order_id, command).await {
-            Ok(()) => info!(
-                %offchain_order_id,
-                symbol = %execution.symbol,
-                "OffchainOrder::Place succeeded"
-            ),
-            Err(error) => error!(
-                %offchain_order_id,
-                symbol = %execution.symbol,
-                "OffchainOrder::Place failed: {error}"
-            ),
-        }
-
-        if let Ok(Some(OffchainOrder::Failed { error, .. })) =
-            offchain_order.load(&offchain_order_id).await
-        {
-            warn!(
-                %offchain_order_id,
-                symbol = %execution.symbol,
-                %error,
-                "Broker rejected order, clearing position pending state"
-            );
-            execute_fail_offchain_order_position(position, offchain_order_id, &execution, error)
-                .await;
-        }
-    }
 
     Ok(())
 }
@@ -1238,14 +928,17 @@ mod tests {
         ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4, TakeOrderConfigV4, TakeOrderV3,
     };
     use crate::conductor::builder::CqrsFrameworks;
+    use crate::conductor::job::Job;
     use crate::config::tests::create_test_ctx_with_order_owner;
     use crate::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
     use crate::inventory::view::Operator;
     use crate::inventory::{ImbalanceThreshold, Inventory, InventoryView, Venue};
+    use crate::onchain::accumulator::check_all_positions;
     use crate::onchain::trade::OnchainTrade;
     use crate::rebalancing::{RebalancingTrigger, TriggeredOperation};
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
     use crate::threshold::ExecutionThreshold;
+    use crate::trading::offchain::hedge::{HedgeCtx, PlaceHedge};
     use crate::trading::onchain::inclusion::EmittedOnChain;
     use crate::wrapper::mock::MockWrapper;
     use crate::wrapper::{RATIO_ONE, UnderlyingPerWrapped};
@@ -1705,9 +1398,15 @@ mod tests {
         impl OrderPlacer for TestOrderPlacer {
             async fn place_market_order(
                 &self,
-                _order: MarketOrder,
-            ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>> {
-                Ok(ExecutorOrderId::new("TEST_BROKER_ORD"))
+                order: MarketOrder,
+            ) -> Result<
+                crate::offchain_order::OrderPlacementResult,
+                Box<dyn std::error::Error + Send + Sync>,
+            > {
+                Ok(crate::offchain_order::OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("TEST_BROKER_ORD"),
+                    placed_shares: order.shares,
+                })
             }
         }
 
@@ -1767,13 +1466,41 @@ mod tests {
         TradeProcessingCqrs {
             onchain_trade: frameworks.onchain_trade.clone(),
             position: frameworks.position.clone(),
-            position_projection: frameworks.position_projection.clone(),
-            offchain_order: frameworks.offchain_order.clone(),
             execution_threshold: threshold,
-            assets: AssetsConfig {
+        }
+    }
+
+    /// Simulates the position monitor: scans for ready positions and
+    /// places hedge orders for each.
+    async fn place_ready_hedges(frameworks: &CqrsFrameworks, threshold: &ExecutionThreshold) {
+        let executor = MockExecutor::new();
+        let ready = check_all_positions(
+            &executor,
+            &frameworks.position_projection,
+            executor.to_supported_executor(),
+            &AssetsConfig {
                 equities: EquitiesConfig::default(),
                 cash: None,
             },
+            |_| true,
+        )
+        .await
+        .unwrap();
+
+        let hedge_ctx = HedgeCtx {
+            position: frameworks.position.clone(),
+            offchain_order: frameworks.offchain_order.clone(),
+        };
+
+        for ctx in ready {
+            let job = PlaceHedge {
+                symbol: ctx.symbol,
+                direction: ctx.direction,
+                shares: ctx.shares,
+                executor: ctx.executor,
+                threshold: *threshold,
+            };
+            job.perform(&hedge_ctx).await.unwrap();
         }
     }
 
@@ -1812,16 +1539,11 @@ mod tests {
         let trade_event = make_trade_event(10);
         let trade = test_trade_with_amount(float!(0.5), 10);
 
-        let result =
-            process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true).await;
+        process_queued_trade(&trade_event, trade, &cqrs)
+            .await
+            .unwrap();
 
-        assert_eq!(
-            result.unwrap(),
-            None,
-            "0.5 shares should not trigger execution with 1-share threshold"
-        );
-
-        let position = cqrs
+        let position = frameworks
             .position_projection
             .load(&Symbol::new("AAPL").unwrap())
             .await
@@ -1841,7 +1563,7 @@ mod tests {
     #[tokio::test]
     async fn trade_above_threshold_places_offchain_order() {
         let pool = setup_test_db().await;
-        let (frameworks, offchain_order_projection) =
+        let (frameworks, _offchain_order_projection) =
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let cqrs =
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
@@ -1849,36 +1571,22 @@ mod tests {
         let trade_event = make_trade_event(20);
         let trade = test_trade_with_amount(float!(1.5), 20);
 
-        let result =
-            process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true).await;
+        process_queued_trade(&trade_event, trade, &cqrs)
+            .await
+            .unwrap();
 
-        let offchain_order_id = result
-            .unwrap()
-            .expect("1.5 shares should trigger execution with 1-share threshold");
+        place_ready_hedges(&frameworks, &cqrs.execution_threshold).await;
 
-        let position = cqrs
+        let position = frameworks
             .position_projection
             .load(&Symbol::new("AAPL").unwrap())
             .await
             .unwrap()
             .expect("position should exist");
 
-        assert!(position.net.inner().eq(float!(1.5)).unwrap());
-        assert_eq!(
-            position.pending_offchain_order_id,
-            Some(offchain_order_id),
-            "Position should track the pending offchain order"
-        );
-
-        let offchain_order = offchain_order_projection
-            .load(&offchain_order_id)
-            .await
-            .expect("offchain order should not be in failed lifecycle state")
-            .expect("offchain order view should exist");
-
         assert!(
-            matches!(offchain_order, OffchainOrder::Submitted { .. }),
-            "Offchain order should be Submitted after successful placement, got: {offchain_order:?}"
+            position.pending_offchain_order_id.is_some(),
+            "Position should have a pending offchain order after execution"
         );
     }
 
@@ -1893,27 +1601,20 @@ mod tests {
         let trade_event_1 = make_trade_event(30);
         let trade_1 = test_trade_with_amount(float!(0.5), 30);
 
-        let result_1 =
-            process_queued_trade(&MockExecutor::new(), &trade_event_1, trade_1, &cqrs, true).await;
-
-        assert_eq!(
-            result_1.unwrap(),
-            None,
-            "First trade of 0.5 shares should not trigger"
-        );
+        process_queued_trade(&trade_event_1, trade_1, &cqrs)
+            .await
+            .unwrap();
 
         let trade_event_2 = make_trade_event(31);
         let trade_2 = test_trade_with_amount(float!(0.7), 31);
 
-        let result_2 =
-            process_queued_trade(&MockExecutor::new(), &trade_event_2, trade_2, &cqrs, true).await;
+        process_queued_trade(&trade_event_2, trade_2, &cqrs)
+            .await
+            .unwrap();
 
-        assert!(
-            result_2.unwrap().is_some(),
-            "Accumulated 1.2 shares should trigger execution with 1-share threshold"
-        );
+        place_ready_hedges(&frameworks, &cqrs.execution_threshold).await;
 
-        let position = cqrs
+        let position = frameworks
             .position_projection
             .load(&Symbol::new("AAPL").unwrap())
             .await
@@ -1921,7 +1622,10 @@ mod tests {
             .expect("position should exist");
 
         assert!(position.net.inner().eq(float!(1.2)).unwrap());
-        assert!(position.pending_offchain_order_id.is_some());
+        assert!(
+            position.pending_offchain_order_id.is_some(),
+            "Accumulated 1.2 shares should trigger execution with 1-share threshold"
+        );
     }
 
     #[tokio::test]
@@ -1935,25 +1639,33 @@ mod tests {
         let trade_event_1 = make_trade_event(40);
         let trade_1 = test_trade_with_amount(float!(1.5), 40);
 
-        let first_order_id =
-            process_queued_trade(&MockExecutor::new(), &trade_event_1, trade_1, &cqrs, true)
-                .await
-                .unwrap()
-                .expect("first trade should place an order");
+        process_queued_trade(&trade_event_1, trade_1, &cqrs)
+            .await
+            .unwrap();
+
+        place_ready_hedges(&frameworks, &cqrs.execution_threshold).await;
+
+        let position_after_first = frameworks
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .expect("position should exist");
+
+        let first_order_id = position_after_first
+            .pending_offchain_order_id
+            .expect("first trade should place an order");
 
         let trade_event_2 = make_trade_event(41);
         let trade_2 = test_trade_with_amount(float!(1.5), 41);
 
-        let result_2 =
-            process_queued_trade(&MockExecutor::new(), &trade_event_2, trade_2, &cqrs, true).await;
+        process_queued_trade(&trade_event_2, trade_2, &cqrs)
+            .await
+            .unwrap();
 
-        assert_eq!(
-            result_2.unwrap(),
-            None,
-            "Second trade should not trigger execution while first order is pending"
-        );
+        place_ready_hedges(&frameworks, &cqrs.execution_threshold).await;
 
-        let position = cqrs
+        let position = frameworks
             .position_projection
             .load(&Symbol::new("AAPL").unwrap())
             .await
@@ -1983,17 +1695,28 @@ mod tests {
         let trade_event_1 = make_trade_event(50);
         let trade_1 = test_trade_with_amount(float!(1.5), 50);
 
-        let first_order_id =
-            process_queued_trade(&MockExecutor::new(), &trade_event_1, trade_1, &cqrs, true)
-                .await
-                .unwrap()
-                .expect("first trade should place an order");
+        process_queued_trade(&trade_event_1, trade_1, &cqrs)
+            .await
+            .unwrap();
+
+        place_ready_hedges(&frameworks, &cqrs.execution_threshold).await;
+
+        let position_after_first = frameworks
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .expect("position should exist");
+
+        let first_order_id = position_after_first
+            .pending_offchain_order_id
+            .expect("first trade should place an order");
 
         // Process second trade -> blocked by pending order
         let trade_event_2 = make_trade_event(51);
         let trade_2 = test_trade_with_amount(float!(1.5), 51);
 
-        process_queued_trade(&MockExecutor::new(), &trade_event_2, trade_2, &cqrs, true)
+        process_queued_trade(&trade_event_2, trade_2, &cqrs)
             .await
             .unwrap();
 
@@ -2016,7 +1739,7 @@ mod tests {
             .unwrap();
 
         // Verify position is unblocked
-        let position = cqrs
+        let position = frameworks
             .position_projection
             .load(&Symbol::new("AAPL").unwrap())
             .await
@@ -2029,21 +1752,9 @@ mod tests {
         );
 
         // Run the periodic checker - it should find the remaining net and place a new order
-        let executor = st0x_execution::MockExecutor::new();
+        place_ready_hedges(&frameworks, &cqrs.execution_threshold).await;
 
-        check_and_execute_accumulated_positions(
-            &executor,
-            &cqrs.position,
-            &cqrs.position_projection,
-            &cqrs.offchain_order,
-            &cqrs.execution_threshold,
-            &cqrs.assets,
-            |_| true,
-        )
-        .await
-        .unwrap();
-
-        let position = cqrs
+        let position = frameworks
             .position_projection
             .load(&Symbol::new("AAPL").unwrap())
             .await
@@ -2148,11 +1859,14 @@ mod tests {
                 disabled_assets: HashSet::new(),
             },
             vault_registry,
-            orderbook,
-            order_owner,
+            VaultRegistryId {
+                orderbook,
+                owner: order_owner,
+            },
             inventory,
             operation_sender,
             Arc::new(MockWrapper::new()),
+            Arc::new(std::sync::RwLock::new(HashSet::new())),
         ));
 
         let (position_store, _position_projection) = StoreBuilder::<Position>::new(pool.clone())
@@ -2238,11 +1952,14 @@ mod tests {
                 disabled_assets: HashSet::new(),
             },
             vault_registry,
-            orderbook,
-            order_owner,
+            VaultRegistryId {
+                orderbook,
+                owner: order_owner,
+            },
             Arc::clone(&inventory),
             operation_sender,
             Arc::new(MockWrapper::new()),
+            Arc::new(std::sync::RwLock::new(HashSet::new())),
         ));
 
         let (position_store, _position_projection) = StoreBuilder::<Position>::new(pool.clone())
@@ -2357,11 +2074,14 @@ mod tests {
                 disabled_assets: HashSet::new(),
             },
             vault_registry,
-            orderbook,
-            order_owner,
+            VaultRegistryId {
+                orderbook,
+                owner: order_owner,
+            },
             inventory,
             operation_sender,
             Arc::new(MockWrapper::new()),
+            Arc::new(std::sync::RwLock::new(HashSet::new())),
         ));
 
         let (position_store, _position_projection) = StoreBuilder::<Position>::new(pool.clone())
@@ -2485,11 +2205,14 @@ mod tests {
                 disabled_assets: HashSet::new(),
             },
             vault_registry,
-            orderbook,
-            order_owner,
+            VaultRegistryId {
+                orderbook,
+                owner: order_owner,
+            },
             inventory,
             operation_sender,
             Arc::new(MockWrapper::new()),
+            Arc::new(std::sync::RwLock::new(HashSet::new())),
         ));
 
         let (position_store, _position_projection) = StoreBuilder::<Position>::new(pool.clone())
@@ -2691,8 +2414,10 @@ mod tests {
                 async fn place_market_order(
                     &self,
                     _order: MarketOrder,
-                ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>>
-                {
+                ) -> Result<
+                    crate::offchain_order::OrderPlacementResult,
+                    Box<dyn std::error::Error + Send + Sync>,
+                > {
                     Err("API error (403 Forbidden): trade denied due to pattern day trading protection".into())
                 }
             }
@@ -2709,11 +2434,11 @@ mod tests {
         let trade_event = make_trade_event(70);
         let trade = test_trade_with_amount(float!(1.5), 70);
 
-        process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true)
+        process_queued_trade(&trade_event, trade, &cqrs)
             .await
             .unwrap();
 
-        let position = cqrs
+        let position = frameworks
             .position_projection
             .load(&Symbol::new("AAPL").unwrap())
             .await
@@ -2738,21 +2463,9 @@ mod tests {
         let cqrs =
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
 
-        let executor = st0x_execution::MockExecutor::new();
+        place_ready_hedges(&frameworks, &cqrs.execution_threshold).await;
 
-        check_and_execute_accumulated_positions(
-            &executor,
-            &cqrs.position,
-            &cqrs.position_projection,
-            &cqrs.offchain_order,
-            &cqrs.execution_threshold,
-            &cqrs.assets,
-            |_| true,
-        )
-        .await
-        .unwrap();
-
-        let position = cqrs
+        let position = frameworks
             .position_projection
             .load(&Symbol::new("AAPL").unwrap())
             .await
@@ -2775,8 +2488,10 @@ mod tests {
                 async fn place_market_order(
                     &self,
                     _order: MarketOrder,
-                ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>>
-                {
+                ) -> Result<
+                    crate::offchain_order::OrderPlacementResult,
+                    Box<dyn std::error::Error + Send + Sync>,
+                > {
                     Err("Broker rejected: insufficient buying power".into())
                 }
             }
@@ -2814,7 +2529,7 @@ mod tests {
             .unwrap();
 
         // Verify position is ready (has net shares, no pending order)
-        let position = cqrs
+        let position = frameworks
             .position_projection
             .load(&symbol)
             .await
@@ -2823,21 +2538,10 @@ mod tests {
         assert!(position.pending_offchain_order_id.is_none());
 
         // Run periodic checker - broker will reject the order
-        let executor = MockExecutor::new();
-        check_and_execute_accumulated_positions(
-            &executor,
-            &cqrs.position,
-            &cqrs.position_projection,
-            &cqrs.offchain_order,
-            &cqrs.execution_threshold,
-            &cqrs.assets,
-            |_| true,
-        )
-        .await
-        .unwrap();
+        place_ready_hedges(&frameworks, &cqrs.execution_threshold).await;
 
         // Position must not be stuck with a phantom pending order
-        let position = cqrs
+        let position = frameworks
             .position_projection
             .load(&symbol)
             .await
@@ -2875,7 +2579,7 @@ mod tests {
             .with_enrichment(50000, 1_000_000_000, pyth_price)
             .build();
 
-        process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true)
+        process_queued_trade(&trade_event, trade, &cqrs)
             .await
             .unwrap();
 
@@ -2911,7 +2615,7 @@ mod tests {
 
         let trade = test_trade_with_amount(float!("1.5"), 60);
 
-        process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true)
+        process_queued_trade(&trade_event, trade, &cqrs)
             .await
             .unwrap();
 

@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use alloy::providers::Provider;
 use apalis::prelude::{Monitor, WorkerBuilder};
+use apalis_sqlite::SqliteStorage;
 use task_supervisor::SupervisorBuilder;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
@@ -13,11 +14,9 @@ use st0x_evm::ReadOnlyEvm;
 use st0x_execution::{Executor, Symbol};
 
 use super::job::work;
-use super::order_fill_monitor::{DexEventStreams, OrderFillMonitor};
-use super::{
-    Conductor, spawn_inventory_poller, spawn_order_poller,
-    spawn_periodic_accumulated_position_check,
-};
+use super::monitor::order_fills::{DexEventStreams, OrderFillMonitor};
+use super::monitor::positions::PositionMonitor;
+use super::{Conductor, spawn_inventory_poller, spawn_order_poller};
 use crate::config::Ctx;
 use crate::inventory::{InventoryPollingService, InventorySnapshot, WalletPollingCtx};
 use crate::offchain_order::OffchainOrder;
@@ -27,6 +26,7 @@ use crate::onchain_trade::OnChainTrade;
 use crate::position::Position;
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::ExecutionThreshold;
+use crate::trading::offchain::hedge::{HedgeCtx, HedgeJobQueue};
 use crate::trading::onchain::trade_accountant::{
     AccountantCtx, DexTradeAccountingJobQueue, TradeAccountingError,
 };
@@ -51,6 +51,7 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
     pub(crate) executor: Exec,
     pub(crate) execution_threshold: ExecutionThreshold,
     pub(crate) frameworks: CqrsFrameworks,
+    pub(crate) pool: sqlx::SqlitePool,
     pub(crate) poll_notify: Arc<tokio::sync::Notify>,
     pub(crate) wallet_polling: Option<WalletPollingCtx>,
     pub(crate) equity_transfers_in_progress:
@@ -110,26 +111,21 @@ where
         context.frameworks.position.clone(),
     );
 
-    let position_checker_handle = spawn_periodic_accumulated_position_check()
-        .executor(context.executor.clone())
-        .position(context.frameworks.position.clone())
-        .position_projection(context.frameworks.position_projection.clone())
-        .offchain_order(context.frameworks.offchain_order.clone())
-        .execution_threshold(context.execution_threshold)
-        .check_interval(std::time::Duration::from_secs(
-            context.ctx.position_check_interval,
-        ))
-        .ctx(context.ctx.clone())
-        .equity_transfers_in_progress(context.equity_transfers_in_progress.clone())
-        .call();
+    let hedge_queue: HedgeJobQueue = SqliteStorage::new(&context.pool);
+
+    let position_monitor = PositionMonitor::new(
+        context.executor.clone(),
+        context.frameworks.position_projection.clone(),
+        hedge_queue.clone(),
+        std::time::Duration::from_secs(context.ctx.position_check_interval),
+        context.ctx.clone(),
+        context.equity_transfers_in_progress.clone(),
+    );
 
     let trade_cqrs = super::TradeProcessingCqrs {
         onchain_trade: context.frameworks.onchain_trade,
-        position: context.frameworks.position,
-        position_projection: context.frameworks.position_projection,
-        offchain_order: context.frameworks.offchain_order,
+        position: context.frameworks.position.clone(),
         execution_threshold: context.execution_threshold,
-        assets: context.ctx.assets.clone(),
     };
 
     let accountant_ctx = Arc::new(AccountantCtx {
@@ -140,7 +136,11 @@ where
         evm: ReadOnlyEvm::new(context.provider),
         cqrs: trade_cqrs,
         vault_registry: context.frameworks.vault_registry,
-        executor: context.executor,
+    });
+
+    let hedge_ctx = Arc::new(HedgeCtx {
+        position: context.frameworks.position,
+        offchain_order: context.frameworks.offchain_order.clone(),
     });
 
     let order_fill_monitor = OrderFillMonitor::new(
@@ -152,20 +152,31 @@ where
 
     let supervisor = SupervisorBuilder::default()
         .with_task("order-fill-monitor", order_fill_monitor)
+        .with_task("position-monitor", position_monitor)
         .build()
         .run();
 
     let monitor = tokio::spawn(async move {
         let apalis_monitor = Monitor::new()
             .should_restart(|_ctx, _error, attempt| {
-                info!(attempt, "Restarting order fill worker");
+                info!(attempt, "Restarting worker");
                 true
             })
+            .register({
+                let job_queue = job_queue.clone();
+                let accountant_ctx = accountant_ctx.clone();
+                move |index| {
+                    WorkerBuilder::new(format!("trade-accountant-{index}"))
+                        .backend(job_queue.clone())
+                        .data(accountant_ctx.clone())
+                        .build(work::<AccountantCtx<Prov>, _>)
+                }
+            })
             .register(move |index| {
-                WorkerBuilder::new(format!("order-fill-worker-{index}"))
-                    .backend(job_queue.clone())
-                    .data(accountant_ctx.clone())
-                    .build(work::<AccountantCtx<Prov, Exec>, _>)
+                WorkerBuilder::new(format!("hedge-placer-{index}"))
+                    .backend(hedge_queue.clone())
+                    .data(hedge_ctx.clone())
+                    .build(work::<HedgeCtx, _>)
             });
 
         tokio::select! {
@@ -176,9 +187,6 @@ where
             }
             _ = order_poller_handle => {
                 error!("Order poller exited unexpectedly");
-            }
-            _ = position_checker_handle => {
-                error!("Position checker exited unexpectedly");
             }
         }
     });

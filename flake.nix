@@ -48,6 +48,8 @@
         craneLib =
           (crane.mkLib pkgs).overrideToolchain rainix.rust-toolchain.${system};
       in rec {
+        formatter = pkgs.nixfmt;
+
         packages = let
           rainixPkgs = rainix.packages.${system};
           infraPkgs = import ./infra { inherit pkgs ragenix rainix system; };
@@ -85,27 +87,6 @@
             '';
           };
 
-          quickCheck = rainix.mkTask.${system} {
-            name = "chequick";
-            body = ''
-              set -euxo pipefail
-
-              rm -v ./dashboard/src/lib/api/* || true
-
-              cargo check
-              cargo check --workspace --all-features
-              cargo nextest run --workspace --all-features --profile dev
-              cargo clippy --workspace --all-targets --all-features
-              cargo fmt
-
-              cd ./dashboard/
-              bun install
-              bun run check
-              bun run test:run
-              bun run lint:fix
-            '';
-          };
-
           prepSolArtifacts = rainix.mkTask.${system} {
             name = "prep-sol-artifacts";
             additionalBuildInputs = rainix.sol-build-inputs.${system};
@@ -120,14 +101,18 @@
           };
 
           # Mock infra + bot + dashboard + continuous user trades.
-          # Run with `nix run .#simulate`, Ctrl-C to stop.
+          # Run with `nix run .#simulate`, press `q` to exit
           simulate = pkgs.writeShellApplication {
             name = "simulate";
             runtimeInputs = [ pkgs.mprocs ];
-            text = ''
-              exec mprocs \
-                "cd dashboard && bun run dev" \
-                "cargo nextest run --test e2e -E 'test(=full_system::simulate)' --no-capture"
+            text = let
+              backend =
+                "cargo nextest run --test e2e -E 'test(=full_system::simulate)' --no-capture";
+
+              dadshboard = "cd dashboard && bun run dev";
+
+            in ''
+              exec mprocs "${backend}" "${dadshboard}" 
             '';
           };
 
@@ -225,10 +210,7 @@
               exec ssh -i "$identity" "root@$host_ip" "$@"
             '';
           };
-
         };
-
-        formatter = pkgs.nixfmt-classic;
 
         devShells.default = pkgs.mkShell {
           inherit (rainix.devShells.${system}.default) nativeBuildInputs;
@@ -239,15 +221,12 @@
           FOUNDRY_DISABLE_NIGHTLY_WARNING = true;
 
           buildInputs = (with pkgs; [
-            bacon
             bun
             sqlx-cli
-            cargo-expand
             cargo-nextest
             ragenix.packages.${system}.default
           ]) ++ (with packages; [
             ci
-            quickCheck
             prepSolArtifacts
             secret
             rekey

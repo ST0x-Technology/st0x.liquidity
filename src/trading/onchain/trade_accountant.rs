@@ -14,13 +14,13 @@ use apalis_sqlite::fetcher::SqliteFetcher;
 use apalis_sqlite::{CompactType, SqliteStorage};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{info, trace};
 
 use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::ReadOnlyEvm;
+use st0x_execution::ExecutionError;
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
 use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
-use st0x_execution::{ExecutionError, Executor};
 
 use super::inclusion::EmittedOnChain;
 use crate::conductor::job::{Job, Label};
@@ -49,7 +49,7 @@ pub(crate) struct AccountForDexTrade {
 }
 
 /// Bundles the shared dependencies needed by the trade accounting job.
-pub(crate) struct AccountantCtx<Node, Exec> {
+pub(crate) struct AccountantCtx<Node> {
     pub(crate) ctx: Ctx,
     pub(crate) cache: SymbolCache,
     pub(crate) feed_id_cache: FeedIdCache,
@@ -57,14 +57,11 @@ pub(crate) struct AccountantCtx<Node, Exec> {
     pub(crate) evm: ReadOnlyEvm<Node>,
     pub(crate) cqrs: TradeProcessingCqrs,
     pub(crate) vault_registry: Arc<Store<VaultRegistry>>,
-    pub(crate) executor: Exec,
 }
 
-impl<Node, Exec> Job<AccountantCtx<Node, Exec>> for AccountForDexTrade
+impl<Node> Job<AccountantCtx<Node>> for AccountForDexTrade
 where
     Node: Provider + Clone + Send + Sync + 'static,
-    Exec: Executor + Clone + Send + 'static,
-    TradeAccountingError: From<Exec::Error>,
 {
     type Error = TradeAccountingError;
 
@@ -79,7 +76,7 @@ where
         Label::new(format!("{}:{block_number}:{log_index}", event.kind()))
     }
 
-    async fn perform(&self, ctx: &AccountantCtx<Node, Exec>) -> Result<(), Self::Error> {
+    async fn perform(&self, ctx: &AccountantCtx<Node>) -> Result<(), Self::Error> {
         use RaindexTradeEvent::{ClearV3, TakeOrderV3};
 
         let trade_event = &self.trade;
@@ -130,7 +127,7 @@ where
             order_owner,
         };
 
-        debug!(
+        trace!(
             tx_hash = ?trade_event.tx_hash,
             log_index = trade_event.log_index,
             symbol = %trade.symbol,
@@ -144,16 +141,7 @@ where
         let symbol_lock = get_symbol_lock(trade.symbol.base()).await;
         let _guard = symbol_lock.lock().await;
 
-        let trading_enabled = ctx.ctx.is_trading_enabled(trade.symbol.base());
-
-        process_queued_trade(
-            &ctx.executor,
-            trade_event,
-            trade,
-            &ctx.cqrs,
-            trading_enabled,
-        )
-        .await?;
+        process_queued_trade(trade_event, trade, &ctx.cqrs).await?;
 
         Ok(())
     }
@@ -200,6 +188,12 @@ pub(crate) enum TradeAccountingError {
     AlpacaTradingApi(#[from] AlpacaTradingApiError),
     #[error("Alpaca broker API error: {0}")]
     AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
+    #[error("Position projection error: {0}")]
+    PositionProjection(#[from] st0x_event_sorcery::ProjectionError<crate::position::Position>),
+    #[error("Position error: {0}")]
+    Position(#[from] crate::position::PositionError),
+    #[error(transparent)]
+    InvalidShares(#[from] st0x_execution::NotPositive<st0x_execution::FractionalShares>),
 }
 
 #[cfg(test)]
@@ -207,9 +201,6 @@ mod tests {
     use alloy::primitives::{Address, B256, U256, address};
     use alloy::providers::mock::Asserter;
     use alloy::providers::{ProviderBuilder, RootProvider};
-
-    use st0x_event_sorcery::StoreBuilder;
-    use st0x_execution::{MockExecutor, MockExecutorCtx, TryIntoExecutor};
 
     use super::*;
     use crate::bindings::IOrderBookV6;
@@ -220,6 +211,7 @@ mod tests {
     use crate::position::Position;
     use crate::test_utils::{get_test_log, get_test_order, setup_test_db};
     use crate::threshold::ExecutionThreshold;
+    use st0x_event_sorcery::StoreBuilder;
 
     fn test_job() -> AccountForDexTrade {
         let log = get_test_log();
@@ -245,8 +237,7 @@ mod tests {
     #[test]
     fn label_contains_event_type_and_block_info() {
         let job = test_job();
-        let label: Label =
-            <AccountForDexTrade as Job<AccountantCtx<RootProvider, MockExecutor>>>::label(&job);
+        let label: Label = <AccountForDexTrade as Job<AccountantCtx<RootProvider>>>::label(&job);
 
         let label_str = label.to_string();
         assert_eq!(label_str, "ClearV3:12345:293");
@@ -257,8 +248,6 @@ mod tests {
         let pool = setup_test_db().await;
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
-
         // order_owner = Address::ZERO won't match test orders (owned by 0xdddd...)
         let ctx = create_test_ctx_with_order_owner(Address::ZERO);
 
@@ -267,12 +256,12 @@ mod tests {
             .await
             .unwrap();
 
-        let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+        let (position, _position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .build(())
             .await
             .unwrap();
 
-        let (offchain_order, _offchain_order_projection) =
+        let (_offchain_order, _offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
                 .build(crate::offchain_order::noop_order_placer())
                 .await
@@ -287,10 +276,7 @@ mod tests {
         let cqrs = TradeProcessingCqrs {
             onchain_trade,
             position,
-            position_projection,
-            offchain_order,
             execution_threshold: ExecutionThreshold::whole_share(),
-            assets: ctx.assets.clone(),
         };
 
         let accountant_ctx = AccountantCtx {
@@ -301,7 +287,6 @@ mod tests {
             evm: st0x_evm::ReadOnlyEvm::new(provider),
             cqrs,
             vault_registry,
-            executor,
         };
 
         let job = test_job();

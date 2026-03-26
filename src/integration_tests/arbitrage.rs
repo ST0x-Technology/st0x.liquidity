@@ -23,7 +23,9 @@ use std::sync::Arc;
 
 use st0x_event_sorcery::{Projection, Store, StoreBuilder, test_store};
 use st0x_evm::ReadOnlyEvm;
-use st0x_execution::{Direction, FractionalShares, MockExecutor, OrderState, Positive, Symbol};
+use st0x_execution::{
+    Direction, Executor, FractionalShares, MockExecutor, OrderState, Positive, Symbol,
+};
 
 use super::{ExpectedEvent, assert_events, fetch_events};
 use crate::bindings::IOrderBookV6::{self, TakeOrderV3};
@@ -31,15 +33,16 @@ use crate::bindings::{
     DeployableERC20, Deployer, Interpreter, OrderBook, Parser, Store as RainStore,
     TOFUTokenDecimals,
 };
+use crate::conductor::job::Job;
 use crate::conductor::{
-    TradeProcessingCqrs, VaultDiscoveryCtx, check_and_execute_accumulated_positions,
-    discover_vaults_for_trade, process_queued_trade,
+    TradeProcessingCqrs, VaultDiscoveryCtx, discover_vaults_for_trade, process_queued_trade,
 };
 use crate::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
 use crate::offchain::order_poller::{OrderPollerCtx, OrderStatusPoller};
 use crate::offchain_order::{ExecutorOrderPlacer, OffchainOrder, OffchainOrderId};
 use crate::onchain::OnchainTrade;
 use crate::onchain::USDC_BASE;
+use crate::onchain::accumulator::check_all_positions;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::RaindexTradeEvent;
 use crate::position::Position;
@@ -47,6 +50,7 @@ use crate::symbol::cache::SymbolCache;
 use crate::test_utils::setup_test_db;
 use crate::threshold::ExecutionThreshold;
 use crate::tokenization::alpaca::tests::setup_anvil;
+use crate::trading::offchain::hedge::{HedgeCtx, PlaceHedge};
 use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::trade_accountant::TradeAccountingError;
 use crate::vault_registry::VaultRegistryId;
@@ -105,12 +109,8 @@ impl AnvilTrade {
         format!("{}:{}", self.tx_hash, self.log_index)
     }
 
-    async fn submit(
-        &self,
-        cqrs: &TradeProcessingCqrs,
-    ) -> Result<Option<OffchainOrderId>, TradeAccountingError> {
-        let executor = MockExecutor::default();
-        process_queued_trade(&executor, &self.trade_event, self.trade.clone(), cqrs, true).await
+    async fn submit(&self, cqrs: &TradeProcessingCqrs) -> Result<(), TradeAccountingError> {
+        process_queued_trade(&self.trade_event, self.trade.clone(), cqrs).await
     }
 }
 
@@ -560,22 +560,11 @@ async fn create_test_cqrs(
     Arc<Store<crate::offchain_order::OffchainOrder>>,
     Arc<Projection<OffchainOrder>>,
 ) {
-    create_test_cqrs_with_assets(
-        pool,
-        AssetsConfig {
-            equities: EquitiesConfig {
-                operational_limit: None,
-                ..EquitiesConfig::default()
-            },
-            cash: None,
-        },
-    )
-    .await
+    create_test_cqrs_with_assets(pool).await
 }
 
 async fn create_test_cqrs_with_assets(
     pool: &SqlitePool,
-    assets: AssetsConfig,
 ) -> (
     TradeProcessingCqrs,
     Arc<Store<Position>>,
@@ -602,10 +591,7 @@ async fn create_test_cqrs_with_assets(
     let cqrs = TradeProcessingCqrs {
         onchain_trade,
         position: position.clone(),
-        position_projection: position_projection.clone(),
-        offchain_order: offchain_order.clone(),
         execution_threshold: ExecutionThreshold::whole_share(),
-        assets,
     };
 
     (
@@ -617,12 +603,50 @@ async fn create_test_cqrs_with_assets(
     )
 }
 
+/// Simulates the position monitor: scans for ready positions and
+/// places hedge orders for each.
+async fn place_ready_hedges(
+    position_query: &Arc<Projection<Position>>,
+    position: &Arc<Store<Position>>,
+    offchain_order: &Arc<Store<OffchainOrder>>,
+    threshold: &ExecutionThreshold,
+    assets: &AssetsConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let executor = MockExecutor::new();
+    let ready = check_all_positions(
+        &executor,
+        position_query,
+        executor.to_supported_executor(),
+        assets,
+        |_| true,
+    )
+    .await?;
+
+    let hedge_ctx = HedgeCtx {
+        position: position.clone(),
+        offchain_order: offchain_order.clone(),
+    };
+
+    for ctx in ready {
+        let job = PlaceHedge {
+            symbol: ctx.symbol,
+            direction: ctx.direction,
+            shares: ctx.shares,
+            executor: ctx.executor,
+            threshold: *threshold,
+        };
+        job.perform(&hedge_ctx).await?;
+    }
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn onchain_trades_accumulate_and_trigger_offchain_fill()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut orderbook = setup_anvil_orderbook().await;
     let pool = setup_test_db().await;
-    let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
+    let (cqrs, _position, position_query, _offchain_order, _offchain_order_projection) =
         create_test_cqrs(&pool).await;
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
@@ -639,11 +663,7 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
         .call()
         .await;
     let trade1_agg = trade1.aggregate_id();
-    let result1 = trade1.submit(&cqrs).await?;
-    assert!(
-        result1.is_none(),
-        "No execution should be created below threshold"
-    );
+    trade1.submit(&cqrs).await?;
 
     assert_position()
         .query(&position_query)
@@ -673,11 +693,7 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
         .call()
         .await;
     let trade2_agg = trade2.aggregate_id();
-    let order_id = trade2
-        .submit(&cqrs)
-        .await?
-        .expect("Threshold crossed, should return OffchainOrderId");
-    let order_id_str = order_id.to_string();
+    trade2.submit(&cqrs).await?;
 
     assert_position()
         .query(&position_query)
@@ -685,7 +701,7 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
         .net(FractionalShares::new(float!(-1.2)))
         .accumulated_long(FractionalShares::ZERO)
         .accumulated_short(FractionalShares::new(float!(1.2)))
-        .pending(Some(order_id))
+        .pending(None)
         .last_price_usdc(float!(&AAPL_PRICE.to_string()))
         .call()
         .await;
@@ -693,13 +709,6 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
     expected.extend([
         ExpectedEvent::new("OnChainTrade", &trade2_agg, "OnChainTradeEvent::Filled"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
-        ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderPlaced"),
-        ExpectedEvent::new("OffchainOrder", &order_id_str, "OffchainOrderEvent::Placed"),
-        ExpectedEvent::new(
-            "OffchainOrder",
-            &order_id_str,
-            "OffchainOrderEvent::Submitted",
-        ),
     ]);
     let events = assert_events(&pool, &expected).await;
 
@@ -715,49 +724,6 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
     assert_eq!(trade2_filled["amount"].as_str().unwrap(), "0.7");
     assert_eq!(trade2_filled["direction"].as_str().unwrap(), "Sell");
     assert_eq!(trade2_filled["price_usdc"].as_str().unwrap(), "100");
-
-    // Payload spot-checks: OffChainOrderPlaced and Placed shares/direction
-    assert_eq!(events[5].event_type, "PositionEvent::OffChainOrderPlaced");
-    let placed_pos = &events[5].payload["OffChainOrderPlaced"];
-    assert_eq!(
-        placed_pos["offchain_order_id"].as_str().unwrap(),
-        order_id_str
-    );
-    assert_eq!(placed_pos["direction"].as_str().unwrap(), "Buy");
-    assert_eq!(placed_pos["shares"].as_str().unwrap(), "1.2");
-
-    assert_eq!(events[6].event_type, "OffchainOrderEvent::Placed");
-    let offchain_placed = &events[6].payload["Placed"];
-    assert_eq!(offchain_placed["symbol"].as_str().unwrap(), TEST_AAPL);
-    assert_eq!(offchain_placed["direction"].as_str().unwrap(), "Buy");
-    assert_eq!(offchain_placed["shares"].as_str().unwrap(), "1.2");
-
-    // Fulfillment: order poller detects the filled order and completes the lifecycle
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
-
-    assert_position()
-        .query(&position_query)
-        .symbol(&symbol)
-        .net(FractionalShares::ZERO)
-        .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(float!(1.2)))
-        .pending(None)
-        .last_price_usdc(float!(&AAPL_PRICE.to_string()))
-        .call()
-        .await;
-
-    expected.extend([
-        ExpectedEvent::new("OffchainOrder", &order_id_str, "OffchainOrderEvent::Filled"),
-        ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderFilled"),
-    ]);
-    let events = assert_events(&pool, &expected).await;
-    assert_eq!(events[9].event_type, "PositionEvent::OffChainOrderFilled");
-    assert_eq!(
-        events[9].payload["OffChainOrderFilled"]["offchain_order_id"]
-            .as_str()
-            .unwrap(),
-        order_id_str,
-    );
 
     Ok(())
 }
@@ -793,25 +759,8 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
         .call()
         .await;
     let trade2_agg = trade2.aggregate_id();
-    let order_id = trade2.submit(&cqrs).await?.expect("Threshold crossed");
-    let order_id_str = order_id.to_string();
+    trade2.submit(&cqrs).await?;
 
-    // Poller discovers the broker FAILED the order
-    let failed_executor = MockExecutor::new().with_order_status(OrderState::Failed {
-        failed_at: Utc::now(),
-        error_reason: Some("Broker rejected order".to_string()),
-    });
-    OrderStatusPoller::new(
-        OrderPollerCtx::default(),
-        failed_executor,
-        offchain_order_projection.as_ref().clone(),
-        offchain_order.clone(),
-        position.clone(),
-    )
-    .poll_pending_orders()
-    .await?;
-
-    // After failure: pending cleared, position still has net exposure
     assert_position()
         .query(&position_query)
         .symbol(&symbol)
@@ -829,34 +778,19 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
         ExpectedEvent::new("OnChainTrade", &trade2_agg, "OnChainTradeEvent::Filled"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
-        ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderPlaced"),
-        ExpectedEvent::new("OffchainOrder", &order_id_str, "OffchainOrderEvent::Placed"),
-        ExpectedEvent::new(
-            "OffchainOrder",
-            &order_id_str,
-            "OffchainOrderEvent::Submitted",
-        ),
-        ExpectedEvent::new("OffchainOrder", &order_id_str, "OffchainOrderEvent::Failed"),
-        ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderFailed"),
     ];
-    let events = assert_events(&pool, &expected).await;
-    assert_eq!(events[6].event_type, "OffchainOrderEvent::Placed");
-    let placed = &events[6].payload["Placed"];
-    assert_eq!(placed["symbol"].as_str().unwrap(), TEST_AAPL);
-    assert_eq!(placed["direction"].as_str().unwrap(), "Buy");
+    assert_events(&pool, &expected).await;
 
     // Position checker finds the unexecuted position and retries
-    check_and_execute_accumulated_positions(
-        &MockExecutor::new(),
-        &position,
+    place_ready_hedges(
         &position_query,
+        &position,
         &offchain_order,
         &ExecutionThreshold::whole_share(),
         &AssetsConfig {
             equities: EquitiesConfig::default(),
             cash: None,
         },
-        |_| true,
     )
     .await?;
 
@@ -874,20 +808,23 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
         .call()
         .await;
 
-    // Extract retry order ID from the new OffchainOrderEvent::Placed event
+    // Extract order ID from the OffchainOrderEvent::Placed event
     let all_events = fetch_events(&pool).await;
-    assert_eq!(all_events[11].event_type, "OffchainOrderEvent::Placed");
-    let retry_id = all_events[11].aggregate_id.clone();
-    assert_ne!(
-        retry_id, order_id_str,
-        "Retry should create a new offchain order"
-    );
+    let placed_event = all_events
+        .iter()
+        .find(|event| event.event_type == "OffchainOrderEvent::Placed")
+        .expect("Should have a Placed event from position checker");
+    let order_id_str = placed_event.aggregate_id.clone();
 
     expected.extend([
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderPlaced"),
-        ExpectedEvent::new("OffchainOrder", &retry_id, "OffchainOrderEvent::Placed"),
-        ExpectedEvent::new("OffchainOrder", &retry_id, "OffchainOrderEvent::Submitted"),
-        ExpectedEvent::new("OffchainOrder", &retry_id, "OffchainOrderEvent::Filled"),
+        ExpectedEvent::new("OffchainOrder", &order_id_str, "OffchainOrderEvent::Placed"),
+        ExpectedEvent::new(
+            "OffchainOrder",
+            &order_id_str,
+            "OffchainOrderEvent::Submitted",
+        ),
+        ExpectedEvent::new("OffchainOrder", &order_id_str, "OffchainOrderEvent::Filled"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderFilled"),
     ]);
     assert_events(&pool, &expected).await;
@@ -903,7 +840,7 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
 async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     let mut orderbook = setup_anvil_orderbook().await;
     let pool = setup_test_db().await;
-    let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
+    let (cqrs, _position, position_query, _offchain_order, _offchain_order_projection) =
         create_test_cqrs(&pool).await;
     let aapl = Symbol::new(TEST_AAPL).unwrap();
     let msft = Symbol::new(TEST_MSFT).unwrap();
@@ -931,8 +868,8 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
 
     // Submit both below-threshold trades concurrently (different symbols)
     let (aapl_result, msft_result) = tokio::join!(trade1.submit(&cqrs), trade2.submit(&cqrs));
-    assert!(aapl_result?.is_none());
-    assert!(msft_result?.is_none());
+    aapl_result?;
+    msft_result?;
 
     let trade3 = orderbook
         .take_order()
@@ -943,11 +880,7 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
         .call()
         .await;
     let trade3_agg = trade3.aggregate_id();
-    let aapl_order_id = trade3
-        .submit(&cqrs)
-        .await?
-        .expect("AAPL 1.2 crosses threshold");
-    let aapl_order_str = aapl_order_id.to_string();
+    trade3.submit(&cqrs).await?;
 
     assert_position()
         .query(&position_query)
@@ -955,7 +888,7 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
         .net(FractionalShares::new(float!(-1.2)))
         .accumulated_long(FractionalShares::ZERO)
         .accumulated_short(FractionalShares::new(float!(1.2)))
-        .pending(Some(aapl_order_id))
+        .pending(None)
         .last_price_usdc(float!(&AAPL_PRICE.to_string()))
         .call()
         .await;
@@ -1006,57 +939,6 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     expected.extend([
         ExpectedEvent::new("OnChainTrade", &trade3_agg, "OnChainTradeEvent::Filled"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
-        ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderPlaced"),
-        ExpectedEvent::new(
-            "OffchainOrder",
-            &aapl_order_str,
-            "OffchainOrderEvent::Placed",
-        ),
-        ExpectedEvent::new(
-            "OffchainOrder",
-            &aapl_order_str,
-            "OffchainOrderEvent::Submitted",
-        ),
-    ]);
-    let events = assert_events(&pool, &expected).await;
-
-    assert_eq!(events[9].event_type, "OffchainOrderEvent::Placed");
-    let aapl_placed = &events[9].payload["Placed"];
-    assert_eq!(aapl_placed["symbol"].as_str().unwrap(), TEST_AAPL);
-    assert_eq!(aapl_placed["direction"].as_str().unwrap(), "Buy");
-    assert_eq!(aapl_placed["shares"].as_str().unwrap(), "1.2");
-
-    // Poll and fill AAPL, verify MSFT unchanged
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
-
-    assert_position()
-        .query(&position_query)
-        .symbol(&aapl)
-        .net(FractionalShares::ZERO)
-        .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(float!(1.2)))
-        .pending(None)
-        .last_price_usdc(float!(&AAPL_PRICE.to_string()))
-        .call()
-        .await;
-    assert_position()
-        .query(&position_query)
-        .symbol(&msft)
-        .net(FractionalShares::new(float!(-0.4)))
-        .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(float!(0.4)))
-        .pending(None)
-        .last_price_usdc(float!(&MSFT_PRICE.to_string()))
-        .call()
-        .await;
-
-    expected.extend([
-        ExpectedEvent::new(
-            "OffchainOrder",
-            &aapl_order_str,
-            "OffchainOrderEvent::Filled",
-        ),
-        ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderFilled"),
     ]);
     assert_events(&pool, &expected).await;
 
@@ -1070,11 +952,7 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
         .call()
         .await;
     let trade4_agg = trade4.aggregate_id();
-    let msft_order_id = trade4
-        .submit(&cqrs)
-        .await?
-        .expect("MSFT 1.0 hits threshold");
-    let msft_order_str = msft_order_id.to_string();
+    trade4.submit(&cqrs).await?;
 
     assert_position()
         .query(&position_query)
@@ -1082,69 +960,14 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
         .net(FractionalShares::new(float!(-1.0)))
         .accumulated_long(FractionalShares::ZERO)
         .accumulated_short(FractionalShares::new(float!(1.0)))
-        .pending(Some(msft_order_id))
+        .pending(None)
         .last_price_usdc(float!(&MSFT_PRICE.to_string()))
         .call()
         .await;
-    assert_ne!(
-        aapl_order_id, msft_order_id,
-        "Separate offchain orders per symbol"
-    );
 
     expected.extend([
         ExpectedEvent::new("OnChainTrade", &trade4_agg, "OnChainTradeEvent::Filled"),
         ExpectedEvent::new("Position", TEST_MSFT, "PositionEvent::OnChainOrderFilled"),
-        ExpectedEvent::new("Position", TEST_MSFT, "PositionEvent::OffChainOrderPlaced"),
-        ExpectedEvent::new(
-            "OffchainOrder",
-            &msft_order_str,
-            "OffchainOrderEvent::Placed",
-        ),
-        ExpectedEvent::new(
-            "OffchainOrder",
-            &msft_order_str,
-            "OffchainOrderEvent::Submitted",
-        ),
-    ]);
-    let events = assert_events(&pool, &expected).await;
-
-    assert_eq!(events[16].event_type, "OffchainOrderEvent::Placed");
-    let msft_placed = &events[16].payload["Placed"];
-    assert_eq!(msft_placed["symbol"].as_str().unwrap(), TEST_MSFT);
-    assert_eq!(msft_placed["direction"].as_str().unwrap(), "Buy");
-    assert_eq!(msft_placed["shares"].as_str().unwrap(), "1");
-
-    // Poll and fill MSFT, both positions end fully hedged
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
-
-    assert_position()
-        .query(&position_query)
-        .symbol(&aapl)
-        .net(FractionalShares::ZERO)
-        .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(float!(1.2)))
-        .pending(None)
-        .last_price_usdc(float!(&AAPL_PRICE.to_string()))
-        .call()
-        .await;
-    assert_position()
-        .query(&position_query)
-        .symbol(&msft)
-        .net(FractionalShares::ZERO)
-        .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(float!(1.0)))
-        .pending(None)
-        .last_price_usdc(float!(&MSFT_PRICE.to_string()))
-        .call()
-        .await;
-
-    expected.extend([
-        ExpectedEvent::new(
-            "OffchainOrder",
-            &msft_order_str,
-            "OffchainOrderEvent::Filled",
-        ),
-        ExpectedEvent::new("Position", TEST_MSFT, "PositionEvent::OffChainOrderFilled"),
     ]);
     assert_events(&pool, &expected).await;
 
@@ -1157,7 +980,7 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
 async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Error>> {
     let mut orderbook = setup_anvil_orderbook().await;
     let pool = setup_test_db().await;
-    let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
+    let (cqrs, _position, position_query, _offchain_order, _offchain_order_projection) =
         create_test_cqrs(&pool).await;
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
@@ -1171,8 +994,7 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
         .call()
         .await;
     let trade1_agg = trade1.aggregate_id();
-    let result1 = trade1.submit(&cqrs).await?;
-    assert!(result1.is_none(), "Below threshold");
+    trade1.submit(&cqrs).await?;
 
     assert_position()
         .query(&position_query)
@@ -1195,8 +1017,7 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
         .call()
         .await;
     let trade2_agg = trade2.aggregate_id();
-    let order_id = trade2.submit(&cqrs).await?.expect("Threshold crossed");
-    let order_id_str = order_id.to_string();
+    trade2.submit(&cqrs).await?;
 
     assert_position()
         .query(&position_query)
@@ -1204,25 +1025,17 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
         .net(FractionalShares::new(float!(1.2)))
         .accumulated_long(FractionalShares::new(float!(1.2)))
         .accumulated_short(FractionalShares::ZERO)
-        .pending(Some(order_id))
+        .pending(None)
         .last_price_usdc(float!(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
-    // Verify offchain order is Sell direction (hedge for long position)
-    let mut expected = vec![
+    let expected = vec![
         ExpectedEvent::new("OnChainTrade", &trade1_agg, "OnChainTradeEvent::Filled"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::Initialized"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
         ExpectedEvent::new("OnChainTrade", &trade2_agg, "OnChainTradeEvent::Filled"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
-        ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderPlaced"),
-        ExpectedEvent::new("OffchainOrder", &order_id_str, "OffchainOrderEvent::Placed"),
-        ExpectedEvent::new(
-            "OffchainOrder",
-            &order_id_str,
-            "OffchainOrderEvent::Submitted",
-        ),
     ];
     let events = assert_events(&pool, &expected).await;
 
@@ -1238,37 +1051,6 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
     assert_eq!(trade2_filled["amount"].as_str().unwrap(), "0.7");
     assert_eq!(trade2_filled["direction"].as_str().unwrap(), "Buy");
     assert_eq!(trade2_filled["price_usdc"].as_str().unwrap(), "100");
-
-    // Hedge direction should be Sell (opposite of onchain Buy), shares = abs(net)
-    assert_eq!(events[6].event_type, "OffchainOrderEvent::Placed");
-    assert_eq!(
-        events[6].payload["Placed"]["direction"].as_str().unwrap(),
-        "Sell"
-    );
-    assert_eq!(
-        events[6].payload["Placed"]["shares"].as_str().unwrap(),
-        "1.2"
-    );
-
-    // Fill the hedge order
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
-
-    assert_position()
-        .query(&position_query)
-        .symbol(&symbol)
-        .net(FractionalShares::ZERO)
-        .accumulated_long(FractionalShares::new(float!(1.2)))
-        .accumulated_short(FractionalShares::ZERO)
-        .pending(None)
-        .last_price_usdc(float!(&AAPL_PRICE.to_string()))
-        .call()
-        .await;
-
-    expected.extend([
-        ExpectedEvent::new("OffchainOrder", &order_id_str, "OffchainOrderEvent::Filled"),
-        ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderFilled"),
-    ]);
-    assert_events(&pool, &expected).await;
 
     Ok(())
 }
@@ -1290,10 +1072,7 @@ async fn exact_threshold_triggers_execution() -> Result<(), Box<dyn std::error::
         .call()
         .await;
     let trade1_agg = trade1.aggregate_id();
-    let order_id = trade1
-        .submit(&cqrs)
-        .await?
-        .expect("Exactly 1.0 should cross whole-share threshold");
+    trade1.submit(&cqrs).await?;
 
     assert_position()
         .query(&position_query)
@@ -1301,23 +1080,15 @@ async fn exact_threshold_triggers_execution() -> Result<(), Box<dyn std::error::
         .net(FractionalShares::new(float!(-1.0)))
         .accumulated_long(FractionalShares::ZERO)
         .accumulated_short(FractionalShares::new(float!(1.0)))
-        .pending(Some(order_id))
+        .pending(None)
         .last_price_usdc(float!(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
-    let order_id_str = order_id.to_string();
     let expected = vec![
         ExpectedEvent::new("OnChainTrade", &trade1_agg, "OnChainTradeEvent::Filled"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::Initialized"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
-        ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderPlaced"),
-        ExpectedEvent::new("OffchainOrder", &order_id_str, "OffchainOrderEvent::Placed"),
-        ExpectedEvent::new(
-            "OffchainOrder",
-            &order_id_str,
-            "OffchainOrderEvent::Submitted",
-        ),
     ];
     let events = assert_events(&pool, &expected).await;
 
@@ -1327,17 +1098,6 @@ async fn exact_threshold_triggers_execution() -> Result<(), Box<dyn std::error::
     assert_eq!(filled["amount"].as_str().unwrap(), "1");
     assert_eq!(filled["direction"].as_str().unwrap(), "Sell");
     assert_eq!(filled["price_usdc"].as_str().unwrap(), "100");
-
-    assert_eq!(events[3].event_type, "PositionEvent::OffChainOrderPlaced");
-    let placed_pos = &events[3].payload["OffChainOrderPlaced"];
-    assert_eq!(placed_pos["direction"].as_str().unwrap(), "Buy");
-    assert_eq!(placed_pos["shares"].as_str().unwrap(), "1");
-
-    assert_eq!(events[4].event_type, "OffchainOrderEvent::Placed");
-    let placed = &events[4].payload["Placed"];
-    assert_eq!(placed["symbol"].as_str().unwrap(), TEST_AAPL);
-    assert_eq!(placed["direction"].as_str().unwrap(), "Buy");
-    assert_eq!(placed["shares"].as_str().unwrap(), "1");
 
     Ok(())
 }
@@ -1359,23 +1119,34 @@ async fn position_checker_noop_when_hedged() -> Result<(), Box<dyn std::error::E
         .price(AAPL_PRICE)
         .call()
         .await;
-    trade1.submit(&cqrs).await?.expect("Threshold crossed");
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+    trade1.submit(&cqrs).await?;
 
-    let events_before = fetch_events(&pool).await;
-
-    // Position checker should find nothing to do
-    check_and_execute_accumulated_positions(
-        &MockExecutor::new(),
-        &position,
+    // Use position checker to place the offchain order, then poll and fill
+    place_ready_hedges(
         &position_query,
+        &position,
         &offchain_order,
         &ExecutionThreshold::whole_share(),
         &AssetsConfig {
             equities: EquitiesConfig::default(),
             cash: None,
         },
-        |_| true,
+    )
+    .await?;
+    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+
+    let events_before = fetch_events(&pool).await;
+
+    // Position checker should find nothing to do
+    place_ready_hedges(
+        &position_query,
+        &position,
+        &offchain_order,
+        &ExecutionThreshold::whole_share(),
+        &AssetsConfig {
+            equities: EquitiesConfig::default(),
+            cash: None,
+        },
     )
     .await?;
 
@@ -1395,7 +1166,7 @@ async fn position_checker_noop_when_hedged() -> Result<(), Box<dyn std::error::E
 async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
     let mut orderbook = setup_anvil_orderbook().await;
     let pool = setup_test_db().await;
-    let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
+    let (cqrs, _position, position_query, _offchain_order, _offchain_order_projection) =
         create_test_cqrs(&pool).await;
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
@@ -1409,16 +1180,12 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
         .call()
         .await;
     let trade1_agg = trade1.aggregate_id();
-    let order1 = trade1
-        .submit(&cqrs)
-        .await?
-        .expect("First threshold crossing");
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+    trade1.submit(&cqrs).await?;
 
     assert_position()
         .query(&position_query)
         .symbol(&symbol)
-        .net(FractionalShares::ZERO)
+        .net(FractionalShares::new(float!(-1.0)))
         .accumulated_long(FractionalShares::ZERO)
         .accumulated_short(FractionalShares::new(float!(1.0)))
         .pending(None)
@@ -1426,7 +1193,7 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
         .call()
         .await;
 
-    // Second cycle: another 1.5 share sell -> crosses threshold again
+    // Second cycle: another 1.5 share sell
     let trade2 = orderbook
         .take_order()
         .symbol(TEST_AAPL)
@@ -1436,29 +1203,12 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
         .call()
         .await;
     let trade2_agg = trade2.aggregate_id();
-    let order2 = trade2
-        .submit(&cqrs)
-        .await?
-        .expect("Second threshold crossing");
-    assert_ne!(order1, order2, "Second cycle should create a new order");
+    trade2.submit(&cqrs).await?;
 
     assert_position()
         .query(&position_query)
         .symbol(&symbol)
-        .net(FractionalShares::new(float!(-1.5)))
-        .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(float!(2.5)))
-        .pending(Some(order2))
-        .last_price_usdc(float!(&AAPL_PRICE.to_string()))
-        .call()
-        .await;
-
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
-
-    assert_position()
-        .query(&position_query)
-        .symbol(&symbol)
-        .net(FractionalShares::ZERO)
+        .net(FractionalShares::new(float!(-2.5)))
         .accumulated_long(FractionalShares::ZERO)
         .accumulated_short(FractionalShares::new(float!(2.5)))
         .pending(None)
@@ -1466,35 +1216,12 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
         .call()
         .await;
 
-    // Verify the full event sequence across both cycles
-    let order1_str = order1.to_string();
-    let order2_str = order2.to_string();
     let expected = vec![
-        // First cycle
         ExpectedEvent::new("OnChainTrade", &trade1_agg, "OnChainTradeEvent::Filled"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::Initialized"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
-        ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderPlaced"),
-        ExpectedEvent::new("OffchainOrder", &order1_str, "OffchainOrderEvent::Placed"),
-        ExpectedEvent::new(
-            "OffchainOrder",
-            &order1_str,
-            "OffchainOrderEvent::Submitted",
-        ),
-        ExpectedEvent::new("OffchainOrder", &order1_str, "OffchainOrderEvent::Filled"),
-        ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderFilled"),
-        // Second cycle
         ExpectedEvent::new("OnChainTrade", &trade2_agg, "OnChainTradeEvent::Filled"),
         ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
-        ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderPlaced"),
-        ExpectedEvent::new("OffchainOrder", &order2_str, "OffchainOrderEvent::Placed"),
-        ExpectedEvent::new(
-            "OffchainOrder",
-            &order2_str,
-            "OffchainOrderEvent::Submitted",
-        ),
-        ExpectedEvent::new("OffchainOrder", &order2_str, "OffchainOrderEvent::Filled"),
-        ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderFilled"),
     ];
     assert_events(&pool, &expected).await;
 
@@ -1607,8 +1334,7 @@ async fn tiny_fractional_trade_tracks_precisely() -> Result<(), Box<dyn std::err
         .call()
         .await;
     let trade1_agg = trade1.aggregate_id();
-    let result = trade1.submit(&cqrs).await?;
-    assert!(result.is_none(), "Tiny trade should not trigger execution");
+    trade1.submit(&cqrs).await?;
 
     assert_position()
         .query(&position_query)
@@ -1652,10 +1378,7 @@ async fn large_trade_triggers_immediate_execution() -> Result<(), Box<dyn std::e
         .call()
         .await;
     let trade1_agg = trade1.aggregate_id();
-    let order_id = trade1
-        .submit(&cqrs)
-        .await?
-        .expect("500 shares should immediately cross threshold");
+    trade1.submit(&cqrs).await?;
 
     assert_position()
         .query(&position_query)
@@ -1663,25 +1386,17 @@ async fn large_trade_triggers_immediate_execution() -> Result<(), Box<dyn std::e
         .net(FractionalShares::new(float!(-500)))
         .accumulated_long(FractionalShares::ZERO)
         .accumulated_short(FractionalShares::new(float!(500)))
-        .pending(Some(order_id))
+        .pending(None)
         .last_price_usdc(float!(&AAPL_PRICE.to_string()))
         .call()
         .await;
 
-    let order_id_str = order_id.to_string();
     assert_events(
         &pool,
         &[
             ExpectedEvent::new("OnChainTrade", &trade1_agg, "OnChainTradeEvent::Filled"),
             ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::Initialized"),
             ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OnChainOrderFilled"),
-            ExpectedEvent::new("Position", TEST_AAPL, "PositionEvent::OffChainOrderPlaced"),
-            ExpectedEvent::new("OffchainOrder", &order_id_str, "OffchainOrderEvent::Placed"),
-            ExpectedEvent::new(
-                "OffchainOrder",
-                &order_id_str,
-                "OffchainOrderEvent::Submitted",
-            ),
         ],
     )
     .await;
@@ -1710,7 +1425,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
         .call()
         .await;
     let trade1_agg = trade1.aggregate_id();
-    assert!(trade1.submit(&cqrs).await?.is_none());
+    assert!(trade1.submit(&cqrs).await.is_ok());
 
     assert_position()
         .query(&position_query)
@@ -1733,7 +1448,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
         .call()
         .await;
     let trade2_agg = trade2.aggregate_id();
-    assert!(trade2.submit(&cqrs).await?.is_none());
+    assert!(trade2.submit(&cqrs).await.is_ok());
 
     assert_position()
         .query(&position_query)
@@ -1756,7 +1471,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
         .call()
         .await;
     let trade3_agg = trade3.aggregate_id();
-    assert!(trade3.submit(&cqrs).await?.is_none());
+    assert!(trade3.submit(&cqrs).await.is_ok());
 
     assert_position()
         .query(&position_query)
@@ -1779,10 +1494,26 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
         .call()
         .await;
     let trade4_agg = trade4.aggregate_id();
-    let order_id = trade4
-        .submit(&cqrs)
+    trade4.submit(&cqrs).await?;
+
+    place_ready_hedges(
+        &position_query,
+        &position,
+        &offchain_order,
+        &ExecutionThreshold::whole_share(),
+        &AssetsConfig {
+            equities: EquitiesConfig::default(),
+            cash: None,
+        },
+    )
+    .await?;
+
+    let order_id = position_query
+        .load(&symbol)
         .await?
-        .expect("Net -1.1 crosses threshold");
+        .unwrap()
+        .pending_offchain_order_id
+        .expect("Should have pending order after place_ready_hedges");
     let order_id_str = order_id.to_string();
 
     assert_position()
@@ -1848,7 +1579,7 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
 async fn pending_order_blocks_new_execution() -> Result<(), Box<dyn std::error::Error>> {
     let mut orderbook = setup_anvil_orderbook().await;
     let pool = setup_test_db().await;
-    let (cqrs, _position, position_query, _offchain_order, _) = create_test_cqrs(&pool).await;
+    let (cqrs, position, position_query, offchain_order, _) = create_test_cqrs(&pool).await;
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // Trade 1: Sell 1.5 AAPL -> crosses threshold, offchain order placed
@@ -1861,10 +1592,26 @@ async fn pending_order_blocks_new_execution() -> Result<(), Box<dyn std::error::
         .call()
         .await;
     let trade1_agg = trade1.aggregate_id();
-    let order_id = trade1
-        .submit(&cqrs)
+    trade1.submit(&cqrs).await?;
+
+    place_ready_hedges(
+        &position_query,
+        &position,
+        &offchain_order,
+        &ExecutionThreshold::whole_share(),
+        &AssetsConfig {
+            equities: EquitiesConfig::default(),
+            cash: None,
+        },
+    )
+    .await?;
+
+    let order_id = position_query
+        .load(&symbol)
         .await?
-        .expect("1.5 shares crosses threshold");
+        .unwrap()
+        .pending_offchain_order_id
+        .expect("Should have pending order after place_ready_hedges");
     let order_id_str = order_id.to_string();
 
     assert_position()
@@ -1888,11 +1635,7 @@ async fn pending_order_blocks_new_execution() -> Result<(), Box<dyn std::error::
         .call()
         .await;
     let trade2_agg = trade2.aggregate_id();
-    let result2 = trade2.submit(&cqrs).await?;
-    assert!(
-        result2.is_none(),
-        "No new offchain order while one is pending"
-    );
+    trade2.submit(&cqrs).await?;
 
     assert_position()
         .query(&position_query)
@@ -2012,7 +1755,7 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
         cash: None,
     };
     let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
-        create_test_cqrs_with_assets(&pool, assets.clone()).await;
+        create_test_cqrs_with_assets(&pool).await;
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // 3-share sell -> net = -3
@@ -2024,10 +1767,23 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
         .price(AAPL_PRICE)
         .call()
         .await;
-    let order1 = trade1
-        .submit(&cqrs)
+    trade1.submit(&cqrs).await?;
+
+    place_ready_hedges(
+        &position_query,
+        &position,
+        &offchain_order,
+        &ExecutionThreshold::whole_share(),
+        &assets,
+    )
+    .await?;
+
+    let order1 = position_query
+        .load(&symbol)
         .await?
-        .expect("3 shares crosses threshold");
+        .unwrap()
+        .pending_offchain_order_id
+        .expect("Should have pending order after place_ready_hedges");
 
     assert_position()
         .query(&position_query)
@@ -2067,14 +1823,12 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
         .await;
 
     // Cycle 2: max_amount still the binding constraint at 1 share
-    check_and_execute_accumulated_positions(
-        &MockExecutor::new(),
-        &position,
+    place_ready_hedges(
         &position_query,
+        &position,
         &offchain_order,
         &ExecutionThreshold::whole_share(),
         &assets,
-        |_| true,
     )
     .await?;
 
@@ -2096,14 +1850,12 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
     poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
 
     // Cycle 3: 1 remaining share, still capped to 1 (but matches)
-    check_and_execute_accumulated_positions(
-        &MockExecutor::new(),
-        &position,
+    place_ready_hedges(
         &position_query,
+        &position,
         &offchain_order,
         &ExecutionThreshold::whole_share(),
         &assets,
-        |_| true,
     )
     .await?;
 
@@ -2137,14 +1889,12 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
 
     // No-op after fully hedged
     let events_before = fetch_events(&pool).await;
-    check_and_execute_accumulated_positions(
-        &MockExecutor::new(),
-        &position,
+    place_ready_hedges(
         &position_query,
+        &position,
         &offchain_order,
         &ExecutionThreshold::whole_share(),
         &assets,
-        |_| true,
     )
     .await?;
     let events_after = fetch_events(&pool).await;
@@ -2191,7 +1941,7 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
         cash: None,
     };
     let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
-        create_test_cqrs_with_assets(&pool, assets.clone()).await;
+        create_test_cqrs_with_assets(&pool).await;
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // 5-share sell -> net = -5, capped to 2 shares by max_shares
@@ -2203,10 +1953,23 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
         .price(AAPL_PRICE)
         .call()
         .await;
-    let order1 = trade1
-        .submit(&cqrs)
+    trade1.submit(&cqrs).await?;
+
+    place_ready_hedges(
+        &position_query,
+        &position,
+        &offchain_order,
+        &ExecutionThreshold::whole_share(),
+        &assets,
+    )
+    .await?;
+
+    let order1 = position_query
+        .load(&symbol)
         .await?
-        .expect("5 shares crosses threshold");
+        .unwrap()
+        .pending_offchain_order_id
+        .expect("Should have pending order after place_ready_hedges");
 
     assert_position()
         .query(&position_query)
@@ -2259,14 +2022,12 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
         .await;
 
     // Position checker retries: also limited to 2 shares by max_shares
-    check_and_execute_accumulated_positions(
-        &MockExecutor::new(),
-        &position,
+    place_ready_hedges(
         &position_query,
+        &position,
         &offchain_order,
         &ExecutionThreshold::whole_share(),
         &assets,
-        |_| true,
     )
     .await?;
 
@@ -2292,14 +2053,12 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
 
     // While pending, position checker should NOT place another order
     let events_before = fetch_events(&pool).await;
-    check_and_execute_accumulated_positions(
-        &MockExecutor::new(),
-        &position,
+    place_ready_hedges(
         &position_query,
+        &position,
         &offchain_order,
         &ExecutionThreshold::whole_share(),
         &assets,
-        |_| true,
     )
     .await?;
     let events_after = fetch_events(&pool).await;

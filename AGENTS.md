@@ -449,6 +449,12 @@ is the source of truth for terminology and naming conventions.
   `handle()` to ensure atomicity with events. **Naming:** `{Action}er` trait ->
   `{Domain}Service` implements -> `{Domain}Manager` orchestrates. See
   `OffchainOrder`/`OrderPlacer`
+- **Log in command handlers, not callers**: All logging for command execution
+  belongs in the aggregate's `handle()` method, not at the call site. The
+  handler has full aggregate state (symbol, net position, thresholds, etc.)
+  making log messages rich without the caller needing to load or pass extra
+  context. This keeps logging consistent and centralized — one place per
+  command, not scattered across every caller
 - **Type Modeling**: Make invalid states unrepresentable through the type
   system. Use ADTs and enums to encode business rules and state transitions
   directly in types rather than runtime validation. See "Type modeling" in Code

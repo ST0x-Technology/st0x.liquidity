@@ -91,11 +91,8 @@ async fn check_market_open<E: Executor>(
     Ok(is_open)
 }
 
-/// Checks all positions for execution readiness.
-///
-/// Loads all active positions from the view, then checks each
-/// against its configured threshold. Skips disabled assets.
-/// Returns execution parameters for positions that are ready.
+/// Scans all positions and returns which are ready for offchain execution.
+#[cfg(test)]
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 pub(crate) async fn check_all_positions<E: Executor>(
     executor: &E,
@@ -105,12 +102,10 @@ pub(crate) async fn check_all_positions<E: Executor>(
     is_trading_enabled: impl Fn(&Symbol) -> bool,
 ) -> Result<Vec<ExecutionCtx>, OnChainError> {
     let all_positions = position_projection.load_all().await?;
-
     let mut ready = Vec::new();
 
     for (symbol, position) in &all_positions {
         if !is_trading_enabled(symbol) {
-            debug!(symbol = %symbol, "Asset disabled, skipping periodic check");
             continue;
         }
 
@@ -121,35 +116,25 @@ pub(crate) async fn check_all_positions<E: Executor>(
             .and_then(|config| config.operational_limit)
             .or(assets.equities.operational_limit);
 
-        if let Some((direction, shares)) =
+        let Some((direction, shares)) =
             position.is_ready_for_execution(executor_type, shares_limit)?
-        {
-            if !check_market_open(executor, symbol).await? {
-                continue;
-            }
+        else {
+            continue;
+        };
 
-            let shares = Positive::new(shares)?;
-
-            info!(
-                symbol = %symbol,
-                shares = %shares,
-                direction = ?direction,
-                "Position ready for execution"
-            );
-
-            ready.push(ExecutionCtx {
-                symbol: symbol.clone(),
-                direction,
-                shares,
-                executor: executor_type,
-            });
+        if !check_market_open(executor, symbol).await? {
+            continue;
         }
-    }
 
-    if ready.is_empty() {
-        debug!("No positions ready for execution");
-    } else {
-        info!("Found {} positions ready for execution", ready.len());
+        let shares = Positive::new(shares)?;
+        info!(%symbol, %shares, ?direction, "Position ready for execution");
+
+        ready.push(ExecutionCtx {
+            symbol: symbol.clone(),
+            direction,
+            shares,
+            executor: executor_type,
+        });
     }
 
     Ok(ready)

@@ -15,7 +15,7 @@ use httpmock::prelude::*;
 use serde_json::json;
 use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::sync::{broadcast, mpsc};
 
 use rain_math_float::Float;
@@ -194,11 +194,14 @@ async fn setup_equity_trigger() -> EquityTriggerFixture {
     let trigger = Arc::new(RebalancingTrigger::new(
         test_trigger_config(),
         vault_registry,
-        TEST_ORDERBOOK,
-        TEST_ORDER_OWNER,
+        VaultRegistryId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        },
         Arc::clone(&inventory),
         sender,
         wrapper,
+        Arc::new(RwLock::new(HashSet::new())),
     ));
 
     let position_cqrs = build_position_cqrs_with_trigger(&pool, &trigger).await;
@@ -899,11 +902,14 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
     let trigger = RebalancingTrigger::new(
         test_trigger_config(),
         vault_registry,
-        TEST_ORDERBOOK,
-        TEST_ORDER_OWNER,
+        VaultRegistryId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        },
         Arc::clone(&inventory),
         sender,
         wrapper,
+        Arc::new(RwLock::new(HashSet::new())),
     );
 
     let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
@@ -976,11 +982,14 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
     let trigger = RebalancingTrigger::new(
         test_trigger_config(),
         vault_registry,
-        TEST_ORDERBOOK,
-        TEST_ORDER_OWNER,
+        VaultRegistryId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        },
         Arc::clone(&inventory),
         sender,
         wrapper,
+        Arc::new(RwLock::new(HashSet::new())),
     );
 
     let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
@@ -1053,11 +1062,14 @@ async fn usdc_none_disables_usdc_rebalancing() {
             ..test_trigger_config()
         },
         vault_registry,
-        TEST_ORDERBOOK,
-        TEST_ORDER_OWNER,
+        VaultRegistryId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        },
         Arc::clone(&inventory),
         sender,
         wrapper,
+        Arc::new(RwLock::new(HashSet::new())),
     );
 
     trigger.check_and_trigger_usdc().await;
@@ -1251,11 +1263,14 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
     let trigger = RebalancingTrigger::new(
         config,
         vault_registry,
-        TEST_ORDERBOOK,
-        TEST_ORDER_OWNER,
+        VaultRegistryId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        },
         Arc::clone(&inventory),
         sender,
         wrapper,
+        Arc::new(RwLock::new(HashSet::new())),
     );
 
     // Cycle 1: excess = 450, capped to 100
@@ -1380,11 +1395,14 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
     let trigger = RebalancingTrigger::new(
         config,
         vault_registry,
-        TEST_ORDERBOOK,
-        TEST_ORDER_OWNER,
+        VaultRegistryId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        },
         Arc::clone(&inventory),
         sender,
         wrapper,
+        Arc::new(RwLock::new(HashSet::new())),
     );
 
     // First trigger fires: excess = 400, capped to 100
@@ -1485,11 +1503,14 @@ async fn threshold_config_controls_trigger_sensitivity() {
         let trigger = RebalancingTrigger::new(
             wide_config,
             vault_registry,
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
             Arc::clone(&inventory),
             sender,
             wrapper,
+            Arc::new(RwLock::new(HashSet::new())),
         );
 
         trigger.check_and_trigger_usdc().await;
@@ -1544,11 +1565,14 @@ async fn threshold_config_controls_trigger_sensitivity() {
         let trigger = RebalancingTrigger::new(
             tight_config,
             vault_registry,
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
             Arc::clone(&inventory),
             sender,
             wrapper,
+            Arc::new(RwLock::new(HashSet::new())),
         );
 
         trigger.check_and_trigger_usdc().await;

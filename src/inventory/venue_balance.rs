@@ -18,7 +18,7 @@ impl<T: HasZero> Default for VenueBalance<T> {
 
 /// Error type for inventory operations.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum InventoryError<T: std::fmt::Display> {
+pub(crate) enum InventoryError<T> {
     #[error(
         "insufficient available balance: requested {requested}, but only {available} available"
     )]

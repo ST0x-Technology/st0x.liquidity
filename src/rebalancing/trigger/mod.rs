@@ -432,8 +432,7 @@ impl std::fmt::Display for TriggeredOperation {
 pub(crate) struct RebalancingTrigger {
     config: RebalancingTriggerConfig,
     vault_registry: Arc<Store<VaultRegistry>>,
-    orderbook: Address,
-    order_owner: Address,
+    vault_registry_id: VaultRegistryId,
     inventory: Arc<BroadcastingInventory>,
     pub(crate) equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
     pub(crate) usdc_in_progress: Arc<AtomicBool>,
@@ -452,8 +451,7 @@ impl RebalancingTrigger {
     pub(crate) fn new(
         config: RebalancingTriggerConfig,
         vault_registry: Arc<Store<VaultRegistry>>,
-        orderbook: Address,
-        order_owner: Address,
+        vault_registry_id: VaultRegistryId,
         inventory: Arc<BroadcastingInventory>,
         sender: mpsc::Sender<TriggeredOperation>,
         wrapper: Arc<dyn Wrapper>,
@@ -462,8 +460,7 @@ impl RebalancingTrigger {
         Self {
             config,
             vault_registry,
-            orderbook,
-            order_owner,
+            vault_registry_id,
             inventory,
             equity_in_progress,
             usdc_transfer_context: Arc::new(RwLock::new(None)),
@@ -773,14 +770,15 @@ impl Reactor for RebalancingTrigger {
 
                     let mut inventory = self.inventory.write().await;
                     *inventory = inventory.clone().update_usdc(update, Utc::now())?;
+                    drop(inventory);
 
                     *self.usdc_transfer_context.write().await = Some((direction.clone(), *amount));
                 }
 
                 if Self::is_terminal_usdc_rebalance_event(&event) {
-                    if let Some((direction, amount)) =
-                        self.usdc_transfer_context.write().await.take()
-                    {
+                    let transfer_context = self.usdc_transfer_context.write().await.take();
+
+                    if let Some((direction, amount)) = transfer_context {
                         let venue = match direction {
                             RebalanceDirection::AlpacaToBase => Venue::Hedging,
                             RebalanceDirection::BaseToAlpaca => Venue::MarketMaking,
@@ -870,14 +868,9 @@ impl RebalancingTrigger {
         &self,
         symbol: &Symbol,
     ) -> Result<Option<Address>, TokenAddressError> {
-        let vault_registry_id = VaultRegistryId {
-            orderbook: self.orderbook,
-            owner: self.order_owner,
-        };
-
         let registry = self
             .vault_registry
-            .load(&vault_registry_id)
+            .load(&self.vault_registry_id)
             .await?
             .ok_or(TokenAddressError::Uninitialized)?;
 
@@ -1188,8 +1181,8 @@ mod tests {
     use st0x_execution::{Direction, ExecutorOrderId, Positive};
     use st0x_finance::{Usd, Usdc};
     use std::collections::{BTreeMap, HashSet};
-    use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use std::sync::{Arc, RwLock};
     use tokio::sync::broadcast;
     use tokio::sync::mpsc;
     use tokio::sync::mpsc::error::TryRecvError;
@@ -1250,11 +1243,14 @@ mod tests {
             Arc::new(RebalancingTrigger::new(
                 test_config(),
                 Arc::new(test_store::<VaultRegistry>(pool, ())),
-                TEST_ORDERBOOK,
-                TEST_ORDER_OWNER,
+                VaultRegistryId {
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
                 inventory,
                 sender,
                 wrapper,
+                Arc::new(RwLock::new(HashSet::new())),
             )),
             receiver,
         )
@@ -1318,11 +1314,14 @@ mod tests {
                 disabled_assets: HashSet::new(),
             },
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
             inventory,
             sender,
             wrapper,
+            Arc::new(RwLock::new(HashSet::new())),
         );
 
         trigger.check_and_trigger_usdc().await;
@@ -1359,11 +1358,14 @@ mod tests {
                 disabled_assets: HashSet::from([symbol.clone()]),
             },
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
             inventory,
             sender,
             wrapper,
+            Arc::new(RwLock::new(HashSet::new())),
         );
 
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
@@ -1493,11 +1495,14 @@ mod tests {
             Arc::new(RebalancingTrigger::new(
                 test_config(),
                 Arc::new(test_store::<VaultRegistry>(pool, ())),
-                TEST_ORDERBOOK,
-                TEST_ORDER_OWNER,
+                VaultRegistryId {
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
                 inventory,
                 sender,
                 Arc::new(MockWrapper::new()),
+                Arc::new(RwLock::new(HashSet::new())),
             )),
             receiver,
         )
@@ -1531,11 +1536,14 @@ mod tests {
             Arc::new(RebalancingTrigger::new(
                 test_config(),
                 Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-                TEST_ORDERBOOK,
-                TEST_ORDER_OWNER,
+                VaultRegistryId {
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
                 inventory,
                 sender,
                 wrapper,
+                Arc::new(RwLock::new(HashSet::new())),
             )),
             receiver,
         )
@@ -1604,11 +1612,14 @@ mod tests {
         let trigger = Arc::new(RebalancingTrigger::new(
             test_config(),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
             inventory,
             sender,
             Arc::new(MockWrapper::new()),
+            Arc::new(RwLock::new(HashSet::new())),
         ));
 
         let harness = ReactorHarness::new(trigger.clone());
@@ -3525,8 +3536,10 @@ mod tests {
                 disabled_assets: HashSet::new(),
             },
             Arc::new(test_store::<VaultRegistry>(pool, ())),
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
             {
                 let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
                 Arc::new(BroadcastingInventory::new(
@@ -3536,6 +3549,7 @@ mod tests {
             },
             sender,
             wrapper,
+            Arc::new(RwLock::new(HashSet::new())),
         );
 
         assert!(
@@ -3924,11 +3938,14 @@ mod tests {
         let trigger = Arc::new(RebalancingTrigger::new(
             test_config(),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            Address::ZERO,
-            Address::ZERO,
+            VaultRegistryId {
+                orderbook: Address::ZERO,
+                owner: Address::ZERO,
+            },
             inventory,
             sender,
             Arc::new(MockWrapper::new()),
+            Arc::new(RwLock::new(HashSet::new())),
         ));
 
         // Set in_progress flag
@@ -4128,11 +4145,14 @@ mod tests {
         let trigger = Arc::new(RebalancingTrigger::new(
             test_config(),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
             inventory.clone(),
             sender,
             Arc::new(MockWrapper::new()),
+            Arc::new(RwLock::new(HashSet::new())),
         ));
 
         let harness = ReactorHarness::new(trigger.clone());
@@ -4193,11 +4213,14 @@ mod tests {
         let trigger = Arc::new(RebalancingTrigger::new(
             test_config(),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
             inventory.clone(),
             sender,
             Arc::new(MockWrapper::new()),
+            Arc::new(RwLock::new(HashSet::new())),
         ));
 
         let harness = ReactorHarness::new(trigger.clone());
@@ -4274,11 +4297,14 @@ mod tests {
         let trigger = Arc::new(RebalancingTrigger::new(
             test_config(),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
             inventory.clone(),
             sender,
             Arc::new(MockWrapper::new()),
+            Arc::new(RwLock::new(HashSet::new())),
         ));
 
         let harness = ReactorHarness::new(trigger.clone());
@@ -4336,11 +4362,14 @@ mod tests {
         let trigger = Arc::new(RebalancingTrigger::new(
             test_config(),
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
+            VaultRegistryId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
             inventory.clone(),
             sender,
             Arc::new(MockWrapper::new()),
+            Arc::new(RwLock::new(HashSet::new())),
         ));
 
         let harness = ReactorHarness::new(trigger.clone());

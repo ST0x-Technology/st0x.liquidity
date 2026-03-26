@@ -11,7 +11,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fmt;
 use std::sync::Arc;
-use tracing::{debug, error, warn};
+use tracing::{error, info, warn};
 
 /// A persistent, retryable unit of work backed by apalis storage.
 ///
@@ -33,6 +33,21 @@ where
     async fn perform(&self, ctx: &Ctx) -> Result<(), Self::Error>;
 }
 
+/// Human-readable identifier for an enqueued job, used in structured logging.
+pub(crate) struct Label(String);
+
+impl Label {
+    pub(crate) fn new(label: impl Into<String>) -> Self {
+        Self(label.into())
+    }
+}
+
+impl fmt::Display for Label {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
 /// Generic apalis handler that bridges [`Job`] implementations
 /// with apalis's function-based worker API.
 ///
@@ -48,12 +63,12 @@ where
     Ctx: Send + Sync + 'static,
     J: Job<Ctx> + Sync,
 {
+    const MAX_RETRIES: usize = 3;
     let label = job.label();
-
-    debug!(%label, "Processing job");
+    info!(%label, "Starting {label} with {MAX_RETRIES} retries...");
 
     let result = (|| job.perform(&ctx))
-        .retry(ExponentialBuilder::default().with_max_times(3))
+        .retry(ExponentialBuilder::default().with_max_times(MAX_RETRIES))
         .notify(|error, duration| {
             warn!(%label, %error, ?duration, "Retrying job after transient failure");
         })
@@ -61,20 +76,5 @@ where
 
     if let Err(error) = result {
         error!(%label, %error, "Job failed after retries");
-    }
-}
-
-/// Human-readable identifier for a job, used in structured logging.
-pub(crate) struct Label(String);
-
-impl Label {
-    pub(crate) fn new(label: impl Into<String>) -> Self {
-        Self(label.into())
-    }
-}
-
-impl fmt::Display for Label {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}", self.0)
     }
 }
