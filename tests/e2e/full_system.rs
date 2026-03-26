@@ -453,10 +453,14 @@ async fn simulate() -> anyhow::Result<()> {
     let aapl_broker_price = float!(150.25);
     let tsla_broker_price = float!(245.00);
 
+    let db_path = std::path::PathBuf::from("/tmp/st0x-liquidity-simulate.sqlite");
+    let _ = std::fs::remove_file(&db_path);
+
     let infra = TestInfra::start_with_cash(
         vec![("AAPL", aapl_broker_price), ("TSLA", tsla_broker_price)],
         vec![("TSLA", float!(400))],
         Some(float!(20000)),
+        Some(db_path),
     )
     .await?;
     debug!("Starting CCTP mock infrastructure");

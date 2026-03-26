@@ -92,16 +92,17 @@ impl TestInfra<()> {
         equity_prices: Vec<(&str, Float)>,
         equity_positions: Vec<(&str, Float)>,
     ) -> anyhow::Result<TestInfra<impl Provider + Clone>> {
-        Self::start_with_cash(equity_prices, equity_positions, None).await
+        Self::start_with_cash(equity_prices, equity_positions, None, None).await
     }
 
     pub async fn start_with_cash(
         equity_prices: Vec<(&str, Float)>,
         equity_positions: Vec<(&str, Float)>,
         initial_cash: Option<Float>,
+        db_path_override: Option<std::path::PathBuf>,
     ) -> anyhow::Result<TestInfra<impl Provider + Clone>> {
         let db_dir = tempfile::tempdir()?;
-        let db_path = db_dir.path().join("e2e.sqlite");
+        let db_path = db_path_override.unwrap_or_else(|| db_dir.path().join("e2e.sqlite"));
 
         info!("Starting Anvil base chain");
         let mut base_chain = BaseChain::start().await?;
