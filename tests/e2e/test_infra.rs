@@ -29,7 +29,7 @@ static TRACING_INIT: Once = Once::new();
 /// Safe to call multiple times -- only the first call takes effect.
 pub fn init_tracing() {
     TRACING_INIT.call_once(|| {
-        let level = tracing::Level::TRACE;
+        let level = tracing::Level::INFO;
         let base_filter = mk_env_filter(level);
         let filter = base_filter.add_directive(format!("e2e={level}").parse().unwrap());
 
