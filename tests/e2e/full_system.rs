@@ -21,7 +21,7 @@ use alloy::primitives::{Address, B256, U256, utils::parse_units};
 use alloy::providers::{Provider, RootProvider};
 use st0x_float_macro::float;
 use tokio::sync::broadcast;
-use tracing::info;
+use tracing::{debug, info};
 
 use st0x_dto::ServerMessage;
 use st0x_event_sorcery::Projection;
@@ -453,26 +453,23 @@ async fn simulate() -> anyhow::Result<()> {
 
     let infra = TestInfra::start_with_cash(
         vec![("AAPL", aapl_broker_price), ("TSLA", tsla_broker_price)],
-        vec![("TSLA", float!(420))],
+        vec![("TSLA", float!(400))],
         Some(float!(20000)),
     )
     .await?;
+    debug!("Starting CCTP mock infrastructure");
     let cctp = CctpInfra::start(&infra).await?;
 
-    let usdc_amount: U256 = parse_units("100000", 6)?.into();
+    debug!("Creating USDC vault");
+    let usdc_amount: U256 = parse_units("80000", 6)?.into();
     let usdc_vault_id = infra.base_chain.create_usdc_vault(usdc_amount).await?;
 
-    // One SellEquity and one BuyEquity order per symbol. All share the
-    // USDC vault and each symbol shares a single equity vault across both
-    // directions. This is critical: when the bot mints equity and deposits
-    // it back into the vault, both the sell and buy orders draw from the
-    // same pool. Without shared equity vaults, the bot would refill one
-    // side but the other would stay drained.
+    debug!("Setting up Raindex orders");
     let aapl_sell = infra
         .base_chain
         .setup_order()
         .symbol("AAPL")
-        .amount(float!(10))
+        .amount(float!(67))
         .price(float!(155.00))
         .direction(TakeDirection::SellEquity)
         .usdc_vault_id(usdc_vault_id)
@@ -485,7 +482,7 @@ async fn simulate() -> anyhow::Result<()> {
         .base_chain
         .setup_order()
         .symbol("AAPL")
-        .amount(float!(10))
+        .amount(float!(67))
         .price(float!(155.00))
         .direction(TakeDirection::BuyEquity)
         .usdc_vault_id(usdc_vault_id)
@@ -497,7 +494,7 @@ async fn simulate() -> anyhow::Result<()> {
         .base_chain
         .setup_order()
         .symbol("TSLA")
-        .amount(float!(5))
+        .amount(float!(20))
         .price(float!(250.00))
         .direction(TakeDirection::SellEquity)
         .usdc_vault_id(usdc_vault_id)
@@ -510,7 +507,7 @@ async fn simulate() -> anyhow::Result<()> {
         .base_chain
         .setup_order()
         .symbol("TSLA")
-        .amount(float!(5))
+        .amount(float!(20))
         .price(float!(250.00))
         .direction(TakeDirection::BuyEquity)
         .usdc_vault_id(usdc_vault_id)
@@ -523,6 +520,7 @@ async fn simulate() -> anyhow::Result<()> {
         ("TSLA".to_owned(), tsla_equity_vault_id),
     ]);
 
+    debug!("Starting deposit watcher");
     let eth_deposit_provider = alloy::providers::ProviderBuilder::new()
         .connect(&cctp.ethereum_endpoint)
         .await?;
@@ -531,6 +529,7 @@ async fn simulate() -> anyhow::Result<()> {
         .start_deposit_watcher(eth_deposit_provider, USDC_ETHEREUM, infra.base_chain.owner)
         .await?;
 
+    debug!("Building bot context");
     let current_block = infra.base_chain.provider.get_block_number().await?;
     let (event_sender, _) = broadcast::channel::<ServerMessage>(256);
 
@@ -546,11 +545,10 @@ async fn simulate() -> anyhow::Result<()> {
         .cctp(cctp.cctp_overrides())
         .call()?;
 
+    debug!("Starting bot");
     let mut bot = spawn_bot_with_event_channel(ctx, event_sender);
 
     poll_for_ready(&mut bot, 8001).await;
-    tokio::time::sleep(Duration::from_secs(6)).await;
-
     info!("Bot ready. Starting continuous trade simulation.");
 
     let orders = [

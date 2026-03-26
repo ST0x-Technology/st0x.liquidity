@@ -425,6 +425,25 @@ impl AlpacaBrokerMock {
             .collect()
     }
 
+    /// Adjusts a position's quantity by `delta`. Positive delta adds shares,
+    /// negative removes. Used by the mock tokenizer to reflect that minting
+    /// locks shares (deducts from position) and redeeming releases them.
+    pub fn adjust_position(
+        &self,
+        symbol: &Symbol,
+        delta: Float,
+    ) -> Result<(), rain_math_float::FloatError> {
+        let mut state = lock(&self.state);
+        let price = state.symbol_fill_prices.get(symbol).copied();
+        if let Some(position) = state.account.positions.get_mut(symbol) {
+            position.quantity = (position.quantity + delta)?;
+            if let Some(price) = price {
+                position.market_value = (position.quantity * price)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Starts a background watcher that monitors the Ethereum chain for USDC
     /// mints to the bot's wallet. When detected, it auto-creates INCOMING
     /// wallet transfer records in mock state so the bot's deposit polling

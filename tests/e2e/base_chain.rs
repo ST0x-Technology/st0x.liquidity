@@ -513,39 +513,49 @@ impl<P: Provider + Clone> BaseChain<P> {
             .ok_or_else(|| anyhow::anyhow!("AddOrderV3 event not found"))?;
         let order = add_event.data().order.clone();
 
-        let deposit_amount_str = if is_sell {
-            &amount_str
+        // Only deposit into the output vault if it wasn't pre-funded.
+        // SellEquity outputs equity: skip if equity_vault_id was provided.
+        // BuyEquity outputs USDC: skip if usdc_vault_id was provided.
+        let output_vault_pre_funded = if is_sell {
+            equity_vault_id.is_some()
         } else {
-            &usdc_total_str
-        };
-        let deposit_micro: U256 = parse_units(deposit_amount_str, 6)?.into();
-        let deposit_float = Float::from_fixed_decimal_lossy(deposit_micro, 6)
-            .map_err(|err| anyhow::anyhow!("Float conversion: {err:?}"))?
-            .0
-            .get_inner();
-
-        // Over-approve for Rain float precision rounding
-        let deposit_approve: U256 = if is_sell {
-            let base: U256 = parse_units(&amount_str, 18)?.into();
-            base * U256::from(2)
-        } else {
-            let base: U256 = parse_units(&usdc_total_str, 6)?.into();
-            base * U256::from(2)
+            usdc_vault_id.is_some()
         };
 
-        DeployableERC20::new(output_token, &self.provider)
-            .approve(*orderbook.address(), deposit_approve)
-            .send()
-            .await?
-            .get_receipt()
-            .await?;
+        if !output_vault_pre_funded {
+            let deposit_amount_str = if is_sell {
+                &amount_str
+            } else {
+                &usdc_total_str
+            };
+            let deposit_micro: U256 = parse_units(deposit_amount_str, 6)?.into();
+            let deposit_float = Float::from_fixed_decimal_lossy(deposit_micro, 6)
+                .map_err(|err| anyhow::anyhow!("Float conversion: {err:?}"))?
+                .0
+                .get_inner();
 
-        orderbook
-            .deposit4(output_token, output_vault_id, deposit_float, vec![])
-            .send()
-            .await?
-            .get_receipt()
-            .await?;
+            let deposit_approve: U256 = if is_sell {
+                let base: U256 = parse_units(&amount_str, 18)?.into();
+                base * U256::from(2)
+            } else {
+                let base: U256 = parse_units(&usdc_total_str, 6)?.into();
+                base * U256::from(2)
+            };
+
+            DeployableERC20::new(output_token, &self.provider)
+                .approve(*orderbook.address(), deposit_approve)
+                .send()
+                .await?
+                .get_receipt()
+                .await?;
+
+            orderbook
+                .deposit4(output_token, output_vault_id, deposit_float, vec![])
+                .send()
+                .await?
+                .get_receipt()
+                .await?;
+        }
 
         Ok(PreparedOrder {
             order,

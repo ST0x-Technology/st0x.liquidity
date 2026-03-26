@@ -25,8 +25,8 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 use uuid::Uuid;
 
-use st0x_execution::alpaca_broker_api::TEST_ACCOUNT_ID;
-use st0x_execution::{FractionalShares, SharesBlockchain};
+use st0x_execution::alpaca_broker_api::{AlpacaBrokerMock, TEST_ACCOUNT_ID};
+use st0x_execution::{FractionalShares, SharesBlockchain, Symbol};
 
 use crate::bindings::DeployableERC20;
 use st0x_float_serde::format_float_with_fallback;
@@ -115,6 +115,7 @@ pub struct MockTokenizationRequestSnapshot {
 /// which updates as mint/redeem requests are created and polled.
 pub struct AlpacaTokenizationMock {
     state: Arc<Mutex<TokenizationState>>,
+    broker: Arc<AlpacaBrokerMock>,
     redemption_watcher: Option<JoinHandle<()>>,
     mint_executor: Option<JoinHandle<()>>,
 }
@@ -132,17 +133,19 @@ impl Drop for AlpacaTokenizationMock {
 
 impl AlpacaTokenizationMock {
     /// Creates the tokenization mock and registers mint + request polling
-    /// endpoints on the given server.
-    pub fn start(server: &MockServer) -> Self {
+    /// endpoints on the given server. The broker reference is used to
+    /// adjust position quantities when mints/redemptions complete.
+    pub fn start(server: &MockServer, broker: Arc<AlpacaBrokerMock>) -> Self {
         let state = Arc::new(Mutex::new(TokenizationState {
             requests: Vec::new(),
             polls_until_complete: 2,
         }));
 
         register_mint_endpoint(server, &state);
-        register_tokenization_requests_with_filter_endpoint(server, &state);
+        register_tokenization_requests_with_filter_endpoint(server, &state, &broker);
 
         Self {
+            broker,
             state,
             redemption_watcher: None,
             mint_executor: None,
@@ -228,6 +231,7 @@ impl AlpacaTokenizationMock {
         token_addresses: HashMap<String, Address>,
     ) {
         let state = self.state.clone();
+        let broker = self.broker.clone();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -300,6 +304,17 @@ impl AlpacaTokenizationMock {
                         req.tx_hash = real_tx_hash;
                         if receipt.status() {
                             req.status = TokenizationStatus::Completed;
+
+                            // Minting locks shares on the broker side — deduct
+                            // from the offchain position so totals are conserved.
+                            if let Ok(symbol) = Symbol::new(&req.underlying_symbol) {
+                                let neg_qty = Float::from_raw(alloy::primitives::B256::ZERO) - quantity;
+                                if let Ok(delta) = neg_qty {
+                                    if let Err(error) = broker.adjust_position(&symbol, delta) {
+                                        warn!(%error, "failed to adjust broker position after mint");
+                                    }
+                                }
+                            }
                         } else {
                             warn!(%token_addr, "mint transfer reverted on-chain");
                             req.status = TokenizationStatus::Failed;
@@ -521,8 +536,10 @@ fn register_mint_endpoint(server: &MockServer, state: &Arc<Mutex<TokenizationSta
 fn register_tokenization_requests_with_filter_endpoint(
     server: &MockServer,
     state: &Arc<Mutex<TokenizationState>>,
+    broker: &Arc<AlpacaBrokerMock>,
 ) {
     let state = Arc::clone(state);
+    let broker = Arc::clone(broker);
 
     server.mock(|when, then| {
         when.method(GET).path(format!(
@@ -550,6 +567,14 @@ fn register_tokenization_requests_with_filter_endpoint(
                                 req.needs_mint_execution = true;
                             } else {
                                 req.status = TokenizationStatus::Completed;
+
+                                // Redemption completed: shares return to the
+                                // broker (unlocked from tokenization backing).
+                                if let Ok(symbol) = Symbol::new(&req.underlying_symbol) {
+                                    if let Err(error) = broker.adjust_position(&symbol, req.quantity) {
+                                        warn!(%error, "failed to adjust broker position after redemption");
+                                    }
+                                }
                             }
                         }
                     }

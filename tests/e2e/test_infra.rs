@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Once;
+use std::sync::{Arc, Once};
 
 use alloy::primitives::{Address, U256, utils::parse_units};
 use alloy::providers::Provider;
@@ -49,7 +49,7 @@ pub struct TestInfra<P> {
     _db_dir: TempDir,
     pub db_path: PathBuf,
     pub base_chain: BaseChain<P>,
-    pub broker_service: AlpacaBrokerMock,
+    pub broker_service: Arc<AlpacaBrokerMock>,
     pub tokenization_service: AlpacaTokenizationMock,
     pub attestation_service: CctpAttestationMock,
     /// `(symbol, vault_address, underlying_address)` per deployed equity vault.
@@ -153,15 +153,18 @@ impl TestInfra<()> {
             .collect::<anyhow::Result<_>>()?;
 
         info!("Starting mock services");
-        let broker_service = AlpacaBrokerMock::start()
-            .symbol_fill_prices(symbol_prices)
-            .symbol_positions(symbol_positions)
-            .maybe_initial_cash(initial_cash)
-            .call()
-            .await;
+        let broker_service = Arc::new(
+            AlpacaBrokerMock::start()
+                .symbol_fill_prices(symbol_prices)
+                .symbol_positions(symbol_positions)
+                .maybe_initial_cash(initial_cash)
+                .call()
+                .await,
+        );
         debug!(broker_url = %broker_service.base_url(), "Broker mock started");
 
-        let mut tokenization_service = AlpacaTokenizationMock::start(broker_service.server());
+        let mut tokenization_service =
+            AlpacaTokenizationMock::start(broker_service.server(), broker_service.clone());
         // Map both vault and underlying token addresses to symbol so the
         // redemption watcher can resolve the symbol regardless of which
         // ERC-20 contract emits the Transfer event.

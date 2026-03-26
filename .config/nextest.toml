@@ -15,18 +15,21 @@ slow-timeout = { period = "120s", terminate-after = 3 }
 # E2e tests are slow and prone to hangs — limit threads and allow more time
 # Stream output immediately so progress is visible during long runs
 [[profile.default.overrides]]
-filter = "binary(=e2e)"
+filter = "binary(=e2e) & not test(=full_system::simulate)"
 test-group = "e2e"
 slow-timeout = { period = "120s", terminate-after = 3 }
 retries = { backoff = "exponential", count = 1, delay = "5s", jitter = true }
 success-output = "immediate"
 failure-output = "immediate"
 
-# Long-running simulation — no timeout, no retries
+# Long-running simulation — effectively infinite timeout, no retries
 [[profile.default.overrides]]
 filter = "test(=full_system::simulate)"
-slow-timeout = "30y"
+test-group = "e2e"
+slow-timeout = { period = "1y", terminate-after = 100 }
 retries = 0
+success-output = "immediate"
+failure-output = "immediate"
 
 # Dev profile: fast feedback, skip e2e and slow tests
 [profile.dev]
