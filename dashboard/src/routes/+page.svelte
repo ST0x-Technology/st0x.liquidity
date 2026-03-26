@@ -31,6 +31,22 @@
 
   const connectionState = $derived(ws.current?.state ?? 'disconnected')
   const errorContext = $derived(ws.current?.error ?? null)
+
+  let countdown = $state(0)
+
+  $effect(() => {
+    if (!errorContext) {
+      countdown = 0
+      return
+    }
+
+    countdown = Math.round(errorContext.nextRetryMs / 1000)
+    const interval = setInterval(() => {
+      countdown = Math.max(0, countdown - 1)
+    }, 1000)
+
+    return () => clearInterval(interval)
+  })
 </script>
 
 <div class="flex h-screen flex-col bg-background">
@@ -45,7 +61,7 @@
       class="mx-2 mt-2 rounded-md border border-destructive bg-destructive/10
         px-4 py-2 text-sm text-destructive md:mx-4"
     >
-      Connection error. Reconnecting in {Math.round(errorContext.nextRetryMs / 1000)}s
+      Connection error. Reconnecting in {countdown}s
       (attempt {errorContext.attempts})...
     </div>
   {/if}

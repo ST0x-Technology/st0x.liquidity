@@ -360,7 +360,7 @@ impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTra
     type Asset = Equity;
     type Error = MintError;
 
-    #[instrument(skip(self), fields(symbol = %asset.symbol, quantity = %asset.quantity))]
+    #[instrument(skip_all, fields(symbol = %asset.symbol, quantity = %asset.quantity))]
     async fn transfer(&self, asset: Self::Asset) -> Result<(), Self::Error> {
         let Equity { symbol, quantity } = asset;
         let issuer_request_id = IssuerRequestId::new(Uuid::new_v4().to_string());
@@ -458,7 +458,7 @@ impl CrossVenueTransfer<MarketMakingVenue, HedgingVenue> for CrossVenueEquityTra
     type Asset = Equity;
     type Error = RedemptionError;
 
-    #[instrument(skip(self), fields(symbol = %asset.symbol, quantity = %asset.quantity))]
+    #[instrument(skip_all, fields(symbol = %asset.symbol, quantity = %asset.quantity))]
     async fn transfer(&self, asset: Self::Asset) -> Result<(), Self::Error> {
         let Equity { symbol, quantity } = asset;
 

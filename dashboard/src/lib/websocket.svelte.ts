@@ -13,7 +13,7 @@ export type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'err
 type ConnectionEvent = 'connect' | 'open' | 'close' | 'error' | 'disconnect'
 
 const RECONNECT_DELAY_MS = 1000
-const MAX_RECONNECT_DELAY_MS = 30000
+const MAX_RECONNECT_DELAY_MS = 10000
 const MAX_EVENTS = 100
 
 const isObject = (value: unknown): value is Record<string, unknown> =>

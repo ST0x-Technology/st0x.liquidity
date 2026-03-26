@@ -31,25 +31,6 @@ pub fn spawn_bot_with_event_channel(
 }
 
 /// After assertions complete, keeps the server alive while dashboard
-/// clients are connected. Waits up to `grace` for a client to connect,
-/// then stays alive until all clients disconnect.
-pub async fn await_dashboard_disconnect(
-    sender: &broadcast::Sender<ServerMessage>,
-    grace: Duration,
-) {
-    let deadline = tokio::time::Instant::now() + grace;
-
-    while sender.receiver_count() == 0 && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    if sender.receiver_count() > 0 {
-        eprintln!("Dashboard connected -- keeping server alive until disconnect");
-        while sender.receiver_count() > 0 {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-    }
-}
 
 /// Polls the bot's health endpoint until it responds, panicking if the
 /// bot crashes or the timeout (30s) expires before it becomes ready.

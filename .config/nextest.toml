@@ -22,6 +22,12 @@ retries = { backoff = "exponential", count = 1, delay = "5s", jitter = true }
 success-output = "immediate"
 failure-output = "immediate"
 
+# Long-running simulation — no timeout, no retries
+[[profile.default.overrides]]
+filter = "test(=full_system::simulate)"
+slow-timeout = "30y"
+retries = 0
+
 # Dev profile: fast feedback, skip e2e and slow tests
 [profile.dev]
 default-filter = "not binary(=e2e) & not test(slow)"

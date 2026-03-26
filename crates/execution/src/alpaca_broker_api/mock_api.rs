@@ -248,6 +248,7 @@ impl AlpacaBrokerMock {
     pub async fn start(
         symbol_fill_prices: Vec<(Symbol, Float)>,
         symbol_positions: Vec<MockPosition>,
+        initial_cash: Option<Float>,
     ) -> Self {
         let today = Utc::now().format("%Y-%m-%d").to_string();
 
@@ -263,10 +264,12 @@ impl AlpacaBrokerMock {
             .map(|pos| (pos.symbol.clone(), pos))
             .collect();
 
+        let cash = initial_cash.unwrap_or(float!(100000));
+
         let state = Arc::new(Mutex::new(MockState {
             account: MockAccount {
-                cash: float!(100000),
-                buying_power: float!(100000),
+                cash,
+                buying_power: cash,
                 positions,
             },
             orders: HashMap::new(),

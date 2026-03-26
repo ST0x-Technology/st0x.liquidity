@@ -47,19 +47,40 @@
     return [...byId.values()]
   })
 
-  const decimalPlaces = (value: string): number => {
+  const MAX_DECIMAL_PLACES = 6
+
+  const actualDecimalPlaces = (value: string): number => {
     const dotIdx = value.indexOf('.')
     if (dotIdx === -1) return 0
-    return Math.max(2, value.length - dotIdx - 1)
+    return value.length - dotIdx - 1
   }
 
-  const fmt = (value: string): string => {
-    if (decimalIsZero(value)) return '-'
-    return formatDecimal(value, decimalPlaces(value))
+  const trimTrailingZeros = (formatted: string): string => {
+    if (!formatted.includes('.')) return formatted
+    const trimmed = formatted.replace(/0+$/, '').replace(/\.$/, '')
+    return trimmed
   }
 
-  const fmtNum = (value: string): string =>
-    formatDecimal(value, decimalPlaces(value))
+  type Formatted = { display: string; full: string; truncated: boolean }
+
+  const fmtValue = (value: string): Formatted => {
+    const actual = actualDecimalPlaces(value)
+    const display = Math.min(MAX_DECIMAL_PLACES, Math.max(2, actual))
+    const truncated = actual > display
+    const formatted = trimTrailingZeros(formatDecimal(value, display))
+    return {
+      display: truncated ? `~${formatted}` : formatted,
+      full: value,
+      truncated,
+    }
+  }
+
+  const fmt = (value: string): Formatted => {
+    if (decimalIsZero(value)) return { display: '-', full: value, truncated: false }
+    return fmtValue(value)
+  }
+
+  const fmtNum = (value: string): Formatted => fmtValue(value)
 
   type CashRow = { label: string; value: string; decimals: number }
 
@@ -108,11 +129,11 @@
       usdc_bridge: ({ amount }) => amount
     })
 
-  const transferAmount = (transfer: TransferOperation): string =>
+  const transferAmount = (transfer: TransferOperation): Formatted =>
     matchKind(transfer, {
       equity_mint: ({ quantity }) => fmtNum(quantity),
       equity_redemption: ({ quantity }) => fmtNum(quantity),
-      usdc_bridge: ({ amount }) => fmtNum(amount)
+      usdc_bridge: ({ amount }) => fmtNum(amount),
     })
 
   const formatTime = (timestamp: string): string => {
@@ -284,14 +305,17 @@
                   <Table.Cell class="font-mono font-medium">
                     {stripPrefix(item.symbol)}
                   </Table.Cell>
-                  <Table.Cell class="text-right font-mono opacity-90">
-                    {fmt(item.onchainAvailable)}
+                  {@const onchain = fmt(item.onchainAvailable)}
+                  {@const offchain = fmt(item.offchainAvailable)}
+                  {@const total = fmtNum(decimalAdd(item.onchainAvailable, item.offchainAvailable))}
+                  <Table.Cell class="text-right font-mono opacity-90" title={onchain.truncated ? onchain.full : undefined}>
+                    {onchain.display}
                   </Table.Cell>
-                  <Table.Cell class="text-right font-mono opacity-90">
-                    {fmt(item.offchainAvailable)}
+                  <Table.Cell class="text-right font-mono opacity-90" title={offchain.truncated ? offchain.full : undefined}>
+                    {offchain.display}
                   </Table.Cell>
-                  <Table.Cell class="text-right font-mono font-semibold">
-                    {fmtNum(decimalAdd(item.onchainAvailable, item.offchainAvailable))}
+                  <Table.Cell class="text-right font-mono font-semibold" title={total.truncated ? total.full : undefined}>
+                    {total.display}
                   </Table.Cell>
                 </Table.Row>
               {/each}
@@ -386,8 +410,9 @@
                 <Table.Cell>
                   {transferPurpose(transfer)}
                 </Table.Cell>
-                <Table.Cell class="text-right font-mono pr-6">
-                  {transferAmount(transfer)}
+                {@const amt = transferAmount(transfer)}
+                <Table.Cell class="text-right font-mono pr-6" title={amt.truncated ? amt.full : undefined}>
+                  {amt.display}
                 </Table.Cell>
                 <Table.Cell class="font-mono font-medium">
                   {transferUnderlying(transfer)}

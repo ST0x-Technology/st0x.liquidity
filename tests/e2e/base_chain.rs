@@ -426,6 +426,7 @@ impl<P: Provider + Clone> BaseChain<P> {
         price: Float,
         direction: TakeDirection,
         usdc_vault_id: Option<B256>,
+        equity_vault_id: Option<B256>,
         rain_expression_override: Option<String>,
     ) -> anyhow::Result<PreparedOrder> {
         let equity_vault_addr = *self
@@ -470,10 +471,10 @@ impl<P: Provider + Clone> BaseChain<P> {
         let input_vault_id = if is_usdc_input {
             usdc_vault_id.unwrap_or_else(B256::random)
         } else {
-            B256::random()
+            equity_vault_id.unwrap_or_else(B256::random)
         };
         let output_vault_id = if is_usdc_input {
-            B256::random()
+            equity_vault_id.unwrap_or_else(B256::random)
         } else {
             usdc_vault_id.unwrap_or_else(B256::random)
         };

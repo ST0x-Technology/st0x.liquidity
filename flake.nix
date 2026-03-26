@@ -119,18 +119,15 @@
             '';
           };
 
-          e2e = rainix.mkTask.${system} {
-            name = "e2e";
-            body = ''
-              set -euxo pipefail
-              (cd dashboard && bun run dev) &
-              dev_pid=$!
-              trap 'kill $dev_pid 2>/dev/null' EXIT
-              sleep 2
-              open http://localhost:5173 || true
-              cargo nextest run --test e2e full_system --no-capture || true
-              echo "Test finished. Infra still running at http://localhost:5173 — Ctrl-C to stop."
-              wait
+          # Mock infra + bot + dashboard + continuous user trades.
+          # Run with `nix run .#simulate`, Ctrl-C to stop.
+          simulate = pkgs.writeShellApplication {
+            name = "simulate";
+            runtimeInputs = [ pkgs.mprocs ];
+            text = ''
+              exec mprocs \
+                "cd dashboard && bun run dev" \
+                "cargo nextest run --test e2e -E 'test(=full_system::simulate)' --no-capture"
             '';
           };
 

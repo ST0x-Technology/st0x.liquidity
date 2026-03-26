@@ -217,6 +217,30 @@ nix build --impure .#st0x-liquidity   # build + tests
 nix build --impure .#st0x-clippy      # clippy
 ```
 
+## Local Simulation
+
+`nix run .#simulate` launches a full local simulation of the market making
+system using [mprocs](https://github.com/pvolok/mprocs) to run the dashboard and
+the bot side-by-side.
+
+What it does:
+
+1. Starts a local Anvil blockchain with deployed Raindex orderbook contracts
+2. Deploys mock services: Alpaca broker, tokenization API, CCTP attestation
+3. Creates Raindex liquidity orders — one buy and one sell per symbol (AAPL,
+   TSLA) — all sharing a single USDC vault, with per-symbol equity vaults
+4. Starts the bot (hedging, equity rebalancing, USDC bridging all enabled)
+5. Starts the dashboard dev server
+6. Continuously takes orders at 10-second intervals, simulating users buying and
+   selling tokenized equities
+
+The bot counter-trades each fill on the mock broker, mints/redeems to rebalance
+equity supply between venues, and bridges USDC via mock CCTP to keep cash
+balanced. If the system works correctly, the vaults never permanently drain —
+the bot cycles liquidity back through hedging and rebalancing.
+
+Open `http://localhost:5173` to watch the dashboard. Press `Ctrl-C` to stop.
+
 ## P&L Tracking
 
 The P&L reporter (`cargo run --bin reporter`) calculates realized profit/loss

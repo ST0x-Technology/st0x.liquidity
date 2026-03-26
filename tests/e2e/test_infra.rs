@@ -92,6 +92,14 @@ impl TestInfra<()> {
         equity_prices: Vec<(&str, Float)>,
         equity_positions: Vec<(&str, Float)>,
     ) -> anyhow::Result<TestInfra<impl Provider + Clone>> {
+        Self::start_with_cash(equity_prices, equity_positions, None).await
+    }
+
+    pub async fn start_with_cash(
+        equity_prices: Vec<(&str, Float)>,
+        equity_positions: Vec<(&str, Float)>,
+        initial_cash: Option<Float>,
+    ) -> anyhow::Result<TestInfra<impl Provider + Clone>> {
         let db_dir = tempfile::tempdir()?;
         let db_path = db_dir.path().join("e2e.sqlite");
 
@@ -148,6 +156,7 @@ impl TestInfra<()> {
         let broker_service = AlpacaBrokerMock::start()
             .symbol_fill_prices(symbol_prices)
             .symbol_positions(symbol_positions)
+            .maybe_initial_cash(initial_cash)
             .call()
             .await;
         debug!(broker_url = %broker_service.base_url(), "Broker mock started");
