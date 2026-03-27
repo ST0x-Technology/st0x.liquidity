@@ -13,6 +13,7 @@ use st0x_dto::{InitialState, ServerMessage};
 use crate::inventory::BroadcastingInventory;
 
 mod event;
+mod trade_loader;
 mod transfer_loader;
 pub(crate) use event::Broadcaster;
 
@@ -39,12 +40,13 @@ fn ws_endpoint<'r>(
         Box::pin(async move {
             let inventory_dto = inventory.read().await.to_dto();
             let transfers = transfer_loader::load_transfers(&pool).await;
+            let trades = trade_loader::load_trades(&pool).await;
 
             let initial_state = InitialState {
+                trades,
                 inventory: inventory_dto,
                 active_transfers: transfers.active,
                 recent_transfers: transfers.recent,
-                ..InitialState::default()
             };
 
             let initial = ServerMessage::Initial(Box::new(initial_state));
