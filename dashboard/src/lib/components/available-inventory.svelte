@@ -173,14 +173,24 @@
   const approxClass = (val: Formatted): string =>
     val.truncated ? 'cursor-help opacity-80 hover:underline hover:decoration-dotted hover:decoration-muted-foreground hover:underline-offset-4' : ''
 
-  const ratioDeviation = (ratio: number, isCash: boolean): { text: string; warning: boolean } => {
+  type DeviationStyle = 'normal' | 'high' | 'low'
+
+  const ratioDeviation = (ratio: number, isCash: boolean): { text: string; style: DeviationStyle } => {
     const target = isCash ? (config?.usdcTarget ?? config?.equityTarget ?? 0.5) : (config?.equityTarget ?? 0.5)
     const deviation = isCash ? (config?.usdcDeviation ?? config?.equityDeviation ?? 0.2) : (config?.equityDeviation ?? 0.2)
     const diff = ratio - target
     const sign = diff >= 0 ? '+' : ''
     const text = `${sign}${(diff * 100).toFixed(1)}%`
-    const warning = Math.abs(diff) > deviation
-    return { text, warning }
+
+    if (diff > deviation) return { text, style: 'high' }
+    if (diff < -deviation) return { text, style: 'low' }
+    return { text, style: 'normal' }
+  }
+
+  const deviationColor = (style: DeviationStyle): string => {
+    if (style === 'high') return 'text-green-500'
+    if (style === 'low') return 'text-red-500'
+    return 'text-muted-foreground'
   }
 
   const fmtDislocation = (value: number): string => {
@@ -265,7 +275,7 @@
         </Table.Cell>
         <Table.Cell class="font-mono">
           {formatRatio(cashRow.ratio)}
-          <span class={dev.warning ? 'text-destructive' : 'text-muted-foreground'}>
+          <span class={deviationColor(dev.style)}>
             ({dev.text})
           </span>
         </Table.Cell>
@@ -298,7 +308,7 @@
         </Table.Cell>
         <Table.Cell class="font-mono">
           {formatRatio(row.ratio)}
-          <span class={dev.warning ? 'text-destructive' : 'text-muted-foreground'}>
+          <span class={deviationColor(dev.style)}>
             ({dev.text})
           </span>
         </Table.Cell>
