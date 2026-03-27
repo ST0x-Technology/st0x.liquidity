@@ -194,9 +194,13 @@
         </button>
       </Table.Head>
 
-      <Table.Head class="text-right w-[14%]" aria-sort={ariaSort(sort.current, 'ratio')}>
-        <button class="{sortBtnClass} text-right" onclick={toggleSort('ratio')}>
-          Raindex Ratio{sortIndicator(sort.current, 'ratio')}
+      <Table.Head class="w-[14%]" aria-sort={ariaSort(sort.current, 'ratio')}>
+        <button
+          class="{sortBtnClass} text-left"
+          onclick={toggleSort('ratio')}
+          title="Proportion of total holdings on Raindex (onchain / total)"
+        >
+          Ratio{sortIndicator(sort.current, 'ratio')}
         </button>
       </Table.Head>
     </Table.Row>
@@ -217,7 +221,7 @@
         <Table.Cell class="text-right font-mono font-semibold">
           <span class={approxClass(cashRow.total)} title={cashRow.total.truncated ? cashRow.total.full : undefined}>{cashRow.total.display}</span>
         </Table.Cell>
-        <Table.Cell class="text-right font-mono text-muted-foreground">
+        <Table.Cell class="font-mono text-muted-foreground">
           {formatRatio(cashRow.ratio)}
         </Table.Cell>
       </Table.Row>
@@ -245,7 +249,7 @@
         <Table.Cell class="text-right font-mono font-semibold">
           <span class={approxClass(row.total)} title={row.total.truncated ? row.total.full : undefined}>{row.total.display}</span>
         </Table.Cell>
-        <Table.Cell class="text-right font-mono text-muted-foreground">
+        <Table.Cell class="font-mono text-muted-foreground">
           {formatRatio(row.ratio)}
         </Table.Cell>
       </Table.Row>

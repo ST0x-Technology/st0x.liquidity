@@ -201,15 +201,15 @@
               </button>
             </Table.Head>
 
-            <Table.Head class="text-right pr-6" aria-sort={ariaSort(transferSort.current, 'amount')}>
-              <button class="{sortBtnClass} text-right" onclick={sortTransfer('amount')}>
-                Amount{sortIndicator(transferSort.current, 'amount')}
-              </button>
-            </Table.Head>
-
             <Table.Head aria-sort={ariaSort(transferSort.current, 'underlying')}>
               <button class="{sortBtnClass} text-left" onclick={sortTransfer('underlying')}>
                 Underlying{sortIndicator(transferSort.current, 'underlying')}
+              </button>
+            </Table.Head>
+
+            <Table.Head class="text-right" aria-sort={ariaSort(transferSort.current, 'amount')}>
+              <button class="{sortBtnClass} text-right" onclick={sortTransfer('amount')}>
+                Size{sortIndicator(transferSort.current, 'amount')}
               </button>
             </Table.Head>
 
@@ -224,20 +224,20 @@
           {#each sortedTransfers as transfer (transfer.id)}
             {@const style = statusStyle(transfer.status.status)}
             <Table.Row>
-              <Table.Cell class="font-mono text-muted-foreground">
+              <Table.Cell class="font-mono text-xs text-muted-foreground">
                 {formatTime(transfer.startedAt)}
               </Table.Cell>
-              <Table.Cell>
+              <Table.Cell class="text-xs">
                 {transferDestination(transfer)}
               </Table.Cell>
-              {@const amt = transferAmount(transfer)}
-              <Table.Cell class="text-right font-mono pr-6" title={amt.truncated ? amt.full : undefined}>
-                {amt.display}
-              </Table.Cell>
-              <Table.Cell class="font-mono font-medium">
+              <Table.Cell class="font-mono text-xs font-medium">
                 {transferUnderlying(transfer)}
               </Table.Cell>
-              <Table.Cell class={style.text}>
+              {@const amt = transferAmount(transfer)}
+              <Table.Cell class="text-right font-mono text-xs" title={amt.truncated ? amt.full : undefined}>
+                {amt.display}
+              </Table.Cell>
+              <Table.Cell class="text-xs {style.text}">
                 <span class="inline-flex items-center gap-1.5">
                   <span class="inline-block h-1.5 w-1.5 rounded-full {style.dot}"></span>
                   {transfer.status.status}

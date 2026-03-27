@@ -28,28 +28,11 @@
   const directionColor = (direction: Trade['direction']): string =>
     direction === 'buy' ? 'text-green-500' : 'text-red-500'
 
-  const tradesWithDislocation = $derived.by(() => {
-    const net = new Map<string, number>()
-    const sorted = [...trades].sort(
-      (lhs, rhs) => new Date(lhs.filledAt).getTime() - new Date(rhs.filledAt).getTime()
-    )
-
-    return sorted.map((trade) => {
-      const shares = parseFloat(trade.shares)
-      const delta = trade.direction === 'buy' ? shares : -shares
-      const prev = net.get(trade.symbol) ?? 0
-      const updated = prev + delta
-      net.set(trade.symbol, updated)
-
-      return { ...trade, delta, netDislocation: updated }
-    }).reverse()
-  })
-
-  const fmtSigned = (value: number): string => {
-    const abs = Math.abs(value)
-    const sign = value >= 0 ? '+' : '-'
-    const formatted = abs === 0 ? '0' : abs >= 1 ? abs.toFixed(2) : abs.toPrecision(4)
-    return `${sign}${formatted}`
+  const fmtSize = (value: string): string => {
+    const num = parseFloat(value)
+    if (num === 0) return '0'
+    if (num >= 1) return num.toFixed(2)
+    return num.toPrecision(4)
   }
 </script>
 
@@ -74,12 +57,12 @@
             <Table.Head>Time</Table.Head>
             <Table.Head>Venue</Table.Head>
             <Table.Head>Side</Table.Head>
-            <Table.Head class="text-right">Dislocation</Table.Head>
             <Table.Head>Underlying</Table.Head>
+            <Table.Head class="text-right">Size</Table.Head>
           </Table.Row>
         </Table.Header>
         <Table.Body>
-          {#each tradesWithDislocation as trade (trade.filledAt + trade.symbol + trade.venue)}
+          {#each trades as trade (trade.filledAt + trade.symbol + trade.venue)}
             <Table.Row>
               <Table.Cell class="font-mono text-xs text-muted-foreground">
                 {formatTime(trade.filledAt)}
@@ -93,18 +76,12 @@
                 {trade.direction === 'buy' ? 'Buy' : 'Sell'}
               </Table.Cell>
 
-              <Table.Cell class="text-right font-mono text-xs">
-                <span class={directionColor(trade.direction)}>
-                  {fmtSigned(trade.delta)}
-                </span>
-                {' '}
-                <span class="text-muted-foreground">
-                  (net: {fmtSigned(trade.netDislocation)})
-                </span>
-              </Table.Cell>
-
               <Table.Cell class="font-mono text-xs font-medium">
                 {trade.symbol}
+              </Table.Cell>
+
+              <Table.Cell class="text-right font-mono text-xs">
+                {fmtSize(trade.shares)}
               </Table.Cell>
             </Table.Row>
           {/each}
