@@ -259,11 +259,13 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
                     }
                 };
 
-                if let Lifecycle::Live(entity) = lifecycle {
-                    Some((id, entity))
-                } else {
-                    debug!(%id, "Skipping non-live aggregate in view");
-                    None
+                match lifecycle {
+                    Lifecycle::Live(entity) => Some((id, entity)),
+                    lifecycle => {
+                        // TODO: is this correct? is this a sign that it better be re-projected?!
+                        debug!(%id, ?lifecycle, "Skipping non-live aggregate in view");
+                        None
+                    }
                 }
             })
             .collect()

@@ -192,40 +192,40 @@
   }
 </script>
 
-<Table.Root class="table-fixed">
+<Table.Root>
   <Table.Header>
     <Table.Row>
-      <Table.Head class="w-[10%]" aria-sort={ariaSort(sort.current, 'asset')}>
+      <Table.Head aria-sort={ariaSort(sort.current, 'asset')}>
         <button class="{sortBtnClass} text-left" onclick={toggleSort('asset')}>
           Asset{sortIndicator(sort.current, 'asset')}
         </button>
       </Table.Head>
 
-      <Table.Head class="text-right w-[15%]" aria-sort={ariaSort(sort.current, 'alpaca')}>
+      <Table.Head class="text-right" aria-sort={ariaSort(sort.current, 'alpaca')}>
         <button class="{sortBtnClass} text-right" onclick={toggleSort('alpaca')}>
           Alpaca{sortIndicator(sort.current, 'alpaca')}
         </button>
       </Table.Head>
 
-      <Table.Head class="text-right w-[12%]" aria-sort={ariaSort(sort.current, 'inflight')}>
+      <Table.Head class="text-right" aria-sort={ariaSort(sort.current, 'inflight')}>
         <button class="{sortBtnClass} text-right" onclick={toggleSort('inflight')}>
           Inflight{sortIndicator(sort.current, 'inflight')}
         </button>
       </Table.Head>
 
-      <Table.Head class="text-right w-[15%]" aria-sort={ariaSort(sort.current, 'raindex')}>
+      <Table.Head class="text-right" aria-sort={ariaSort(sort.current, 'raindex')}>
         <button class="{sortBtnClass} text-right" onclick={toggleSort('raindex')}>
           Raindex{sortIndicator(sort.current, 'raindex')}
         </button>
       </Table.Head>
 
-      <Table.Head class="text-right w-[15%]" aria-sort={ariaSort(sort.current, 'total')}>
+      <Table.Head class="text-right" aria-sort={ariaSort(sort.current, 'total')}>
         <button class="{sortBtnClass} text-right" onclick={toggleSort('total')}>
           Total{sortIndicator(sort.current, 'total')}
         </button>
       </Table.Head>
 
-      <Table.Head class="w-[18%]" aria-sort={ariaSort(sort.current, 'ratio')}>
+      <Table.Head aria-sort={ariaSort(sort.current, 'ratio')}>
         <button
           class="{sortBtnClass} text-left"
           onclick={toggleSort('ratio')}
@@ -235,7 +235,7 @@
         </button>
       </Table.Head>
 
-      <Table.Head class="w-[15%]" aria-sort={ariaSort(sort.current, 'dislocation')}>
+      <Table.Head aria-sort={ariaSort(sort.current, 'dislocation')}>
         <button
           class="{sortBtnClass} text-left"
           onclick={toggleSort('dislocation')}
