@@ -214,18 +214,6 @@ fn validate_order_request<W: Write>(
         return Err(error);
     }
 
-    let time_in_force = request.time_in_force.unwrap_or(TimeInForce::Day);
-
-    if request.limit_price.is_some()
-        && request.shares.to_whole_shares().is_err()
-        && time_in_force != TimeInForce::Day
-    {
-        let error =
-            anyhow::anyhow!("fractional --limit-price orders only support --time-in-force day");
-        writeln!(stdout, "❌ Failed to place order: {error}")?;
-        return Err(error);
-    }
-
     Ok(())
 }
 
@@ -254,8 +242,8 @@ async fn execute_alpaca_limit_order<W: Write>(
         anyhow::bail!("--limit-price is required for limit orders");
     };
 
-    if !matches!(time_in_force, TimeInForce::Day | TimeInForce::Gtc) {
-        anyhow::bail!("--limit-price only supports --time-in-force day or gtc");
+    if time_in_force != TimeInForce::Day {
+        anyhow::bail!("--limit-price only supports --time-in-force day");
     }
 
     let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
@@ -813,14 +801,6 @@ mod tests {
     fn setup_alpaca_broker_limit_order_mocks(
         server: &MockServer,
     ) -> (httpmock::Mock<'_>, httpmock::Mock<'_>, httpmock::Mock<'_>) {
-        setup_alpaca_broker_limit_order_mocks_with_request(server, "10", "day")
-    }
-
-    fn setup_alpaca_broker_limit_order_mocks_with_request<'a>(
-        server: &'a MockServer,
-        quantity: &'a str,
-        time_in_force: &'a str,
-    ) -> (httpmock::Mock<'a>, httpmock::Mock<'a>, httpmock::Mock<'a>) {
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
                 .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
@@ -850,11 +830,11 @@ mod tests {
                 .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
                 .json_body(json!({
                     "symbol": "AAPL",
-                    "qty": quantity,
+                    "qty": "10",
                     "side": "buy",
                     "type": "limit",
                     "limit_price": "195.25",
-                    "time_in_force": time_in_force,
+                    "time_in_force": "day",
                     "extended_hours": true
                 }));
             then.status(200)
@@ -862,7 +842,7 @@ mod tests {
                 .json_body(json!({
                     "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
                     "symbol": "AAPL",
-                    "qty": quantity,
+                    "qty": "10",
                     "side": "buy",
                     "status": "new",
                     "filled_avg_price": null
@@ -1113,34 +1093,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_limit_order_accepts_gtc_for_whole_shares() {
-        let server = MockServer::start();
-        let ctx = create_alpaca_broker_api_test_ctx(&server);
-        let pool = setup_test_db().await;
-        let (account_mock, asset_mock, order_mock) =
-            setup_alpaca_broker_limit_order_mocks_with_request(&server, "10", "gtc");
-
-        let mut stdout_buffer = Vec::new();
-        execute_order_with_writers!(
-            Symbol::new("AAPL").unwrap(),
-            positive_shares("10"),
-            Direction::Buy,
-            Some(TimeInForce::Gtc),
-            Some(Float::parse("195.25".to_string()).unwrap()),
-            true,
-            &ctx,
-            &pool,
-            &mut stdout_buffer,
-        )
-        .await
-        .unwrap();
-
-        account_mock.assert();
-        asset_mock.assert();
-        order_mock.assert();
-    }
-
-    #[tokio::test]
     async fn test_extended_hours_requires_limit_price() {
         let server = MockServer::start();
         let ctx = create_schwab_test_ctx(&server);
@@ -1267,34 +1219,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "--limit-price only supports --time-in-force day or gtc"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_limit_order_rejects_fractional_gtc() {
-        let server = MockServer::start();
-        let ctx = create_alpaca_broker_api_test_ctx(&server);
-        let pool = setup_test_db().await;
-
-        let mut stdout_buffer = Vec::new();
-        let error = execute_order_with_writers!(
-            Symbol::new("AAPL").unwrap(),
-            positive_shares("1.5"),
-            Direction::Buy,
-            Some(TimeInForce::Gtc),
-            Some(Float::parse("195.25".to_string()).unwrap()),
-            true,
-            &ctx,
-            &pool,
-            &mut stdout_buffer,
-        )
-        .await
-        .unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "fractional --limit-price orders only support --time-in-force day"
+            "--limit-price only supports --time-in-force day"
         );
     }
 }
