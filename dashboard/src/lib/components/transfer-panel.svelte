@@ -168,11 +168,13 @@
   <Card.Header class="shrink-0 pb-0">
     <Card.Title class="flex items-center justify-between">
       <span>Inventory Transfers</span>
-      {#if activeTransfers.length > 0}
-        <span class="text-sm font-normal text-muted-foreground">
-          {activeTransfers.length} active
-        </span>
-      {/if}
+      <span class="text-sm font-normal text-muted-foreground">
+        {#if activeTransfers.length > 0}
+          [{activeTransfers.length}/{allTransfers.length}] in-flight
+        {:else}
+          {allTransfers.length} transfers
+        {/if}
+      </span>
     </Card.Title>
   </Card.Header>
   <Card.Content class="relative min-h-0 flex-1 overflow-auto px-6 pt-0">
