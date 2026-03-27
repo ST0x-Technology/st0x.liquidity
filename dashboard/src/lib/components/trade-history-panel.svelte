@@ -54,34 +54,34 @@
       <Table.Root>
         <Table.Header>
           <Table.Row>
-            <Table.Head>Time</Table.Head>
-            <Table.Head>Venue</Table.Head>
-            <Table.Head>Side</Table.Head>
+            <Table.Head class="text-right">Time</Table.Head>
+            <Table.Head class="text-right">Venue</Table.Head>
+            <Table.Head class="text-right">Side</Table.Head>
+            <Table.Head class="text-center">Size</Table.Head>
             <Table.Head>Underlying</Table.Head>
-            <Table.Head class="text-right">Size</Table.Head>
           </Table.Row>
         </Table.Header>
         <Table.Body>
           {#each trades as trade (trade.filledAt + trade.symbol + trade.venue)}
             <Table.Row>
-              <Table.Cell class="font-mono text-xs text-muted-foreground">
+              <Table.Cell class="text-right font-mono text-xs text-muted-foreground">
                 {formatTime(trade.filledAt)}
               </Table.Cell>
 
-              <Table.Cell class="text-xs">
+              <Table.Cell class="text-right text-xs">
                 {venueLabel(trade.venue)}
               </Table.Cell>
 
-              <Table.Cell class="text-xs font-medium {directionColor(trade.direction)}">
+              <Table.Cell class="text-right text-xs font-medium {directionColor(trade.direction)}">
                 {trade.direction === 'buy' ? 'Buy' : 'Sell'}
+              </Table.Cell>
+
+              <Table.Cell class="text-center font-mono text-xs">
+                {fmtSize(trade.shares)}
               </Table.Cell>
 
               <Table.Cell class="font-mono text-xs font-medium">
                 {trade.symbol}
-              </Table.Cell>
-
-              <Table.Cell class="text-right font-mono text-xs">
-                {fmtSize(trade.shares)}
               </Table.Cell>
             </Table.Row>
           {/each}
