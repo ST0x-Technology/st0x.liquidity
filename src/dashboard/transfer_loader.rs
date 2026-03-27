@@ -7,7 +7,7 @@ use tracing::warn;
 use std::fmt::Debug;
 use std::str::FromStr;
 
-use st0x_dto::{TransferCategory, TransferOperation, Warning};
+use st0x_dto::TransferOperation;
 use st0x_event_sorcery::{EventSourced, load_all_ids, load_entity};
 
 use crate::equity_redemption::EquityRedemption;
@@ -18,7 +18,6 @@ use crate::usdc_rebalance::UsdcRebalance;
 pub(crate) struct LoadedTransfers {
     pub(crate) active: Vec<TransferOperation>,
     pub(crate) recent: Vec<TransferOperation>,
-    pub(crate) warnings: Vec<Warning>,
 }
 
 /// Load all transfer aggregates, classified into active and recent.
@@ -31,25 +30,19 @@ pub(crate) async fn load_transfers(pool: &SqlitePool) -> LoadedTransfers {
     let categories = [
         load_category::<TokenizedEquityMint, _>(
             pool,
-            TransferCategory::EquityMint,
+            "EquityMint",
             &cutoff,
             TokenizedEquityMint::to_dto,
         )
         .await,
         load_category::<EquityRedemption, _>(
             pool,
-            TransferCategory::EquityRedemption,
+            "EquityRedemption",
             &cutoff,
             EquityRedemption::to_dto,
         )
         .await,
-        load_category::<UsdcRebalance, _>(
-            pool,
-            TransferCategory::UsdcBridge,
-            &cutoff,
-            UsdcRebalance::to_dto,
-        )
-        .await,
+        load_category::<UsdcRebalance, _>(pool, "UsdcBridge", &cutoff, UsdcRebalance::to_dto).await,
     ];
 
     let merged = categories
@@ -57,7 +50,6 @@ pub(crate) async fn load_transfers(pool: &SqlitePool) -> LoadedTransfers {
         .fold(CategoryResult::empty(), |mut acc, result| {
             acc.active.extend(result.active);
             acc.recent.extend(result.recent);
-            acc.warnings.extend(result.warnings);
             acc
         });
 
@@ -67,18 +59,13 @@ pub(crate) async fn load_transfers(pool: &SqlitePool) -> LoadedTransfers {
     active.sort_by_key(|transfer| std::cmp::Reverse(transfer.updated_at()));
     recent.sort_by_key(|transfer| std::cmp::Reverse(transfer.updated_at()));
 
-    LoadedTransfers {
-        active,
-        recent,
-        warnings: merged.warnings,
-    }
+    LoadedTransfers { active, recent }
 }
 
 /// Result of loading a single transfer category.
 struct CategoryResult {
     active: Vec<TransferOperation>,
     recent: Vec<TransferOperation>,
-    warnings: Vec<Warning>,
 }
 
 impl CategoryResult {
@@ -86,51 +73,43 @@ impl CategoryResult {
         Self {
             active: Vec::new(),
             recent: Vec::new(),
-            warnings: Vec::new(),
         }
     }
 }
 
-/// Replay an aggregate from the event store, returning the entity on success
-/// or a dashboard warning on failure.
+/// Replay an aggregate from the event store, returning the entity on
+/// success. Logs and returns `None` on failure.
 async fn replay_aggregate<Entity>(
     pool: &SqlitePool,
     id: &Entity::Id,
-    category: &TransferCategory,
-) -> Result<Entity, Warning>
+    category: &str,
+) -> Option<Entity>
 where
     Entity: EventSourced,
     Entity::Id: Debug,
     <Entity::Id as FromStr>::Err: Debug,
 {
     match load_entity::<Entity>(pool, id).await {
-        Ok(Some(entity)) => Ok(entity),
+        Ok(Some(entity)) => Some(entity),
 
         Ok(None) => {
             warn!(
                 ?id,
-                ?category,
-                "Aggregate has events but replayed to empty state"
+                category, "Aggregate has events but replayed to empty state"
             );
-            Err(Warning::AggregateReplayFailed {
-                category: category.clone(),
-                aggregate_id: id.to_string(),
-            })
+            None
         }
 
         Err(error) => {
-            warn!(?error, ?id, ?category, "Failed to load aggregate");
-            Err(Warning::AggregateReplayFailed {
-                category: category.clone(),
-                aggregate_id: id.to_string(),
-            })
+            warn!(?error, ?id, category, "Failed to load aggregate");
+            None
         }
     }
 }
 
 async fn load_category<Entity, Convert>(
     pool: &SqlitePool,
-    category: TransferCategory,
+    category: &str,
     cutoff: &chrono::DateTime<Utc>,
     convert: Convert,
 ) -> CategoryResult
@@ -143,40 +122,29 @@ where
     let ids = match load_all_ids::<Entity>(pool).await {
         Ok(ids) => ids,
         Err(error) => {
-            warn!(?error, ?category, "Failed to load aggregate IDs");
-            return CategoryResult {
-                warnings: vec![Warning::CategoryUnavailable { category }],
-                ..CategoryResult::empty()
-            };
+            warn!(?error, category, "Failed to load aggregate IDs");
+            return CategoryResult::empty();
         }
     };
 
-    let mut replayed = Vec::with_capacity(ids.len());
+    let transfers: Vec<TransferOperation> = {
+        let mut result = Vec::with_capacity(ids.len());
 
-    for id in &ids {
-        replayed.push((id, replay_aggregate::<Entity>(pool, id, &category).await));
-    }
+        for id in &ids {
+            if let Some(entity) = replay_aggregate::<Entity>(pool, id, category).await {
+                result.push(convert(&entity, id));
+            }
+        }
 
-    let warnings: Vec<Warning> = replayed
-        .iter()
-        .filter_map(|(_, result)| result.as_ref().err().cloned())
-        .collect();
-
-    let transfers: Vec<TransferOperation> = replayed
-        .iter()
-        .filter_map(|(id, result)| result.as_ref().ok().map(|entity| convert(entity, id)))
-        .collect();
+        result
+    };
 
     let (active, recent): (Vec<_>, Vec<_>) = transfers
         .into_iter()
         .filter(|transfer| !transfer.is_terminal() || transfer.updated_at() >= *cutoff)
         .partition(|transfer| !transfer.is_terminal());
 
-    CategoryResult {
-        active,
-        recent,
-        warnings,
-    }
+    CategoryResult { active, recent }
 }
 
 #[cfg(test)]
@@ -264,7 +232,6 @@ mod tests {
 
         assert!(loaded.active.is_empty());
         assert!(loaded.recent.is_empty());
-        assert!(loaded.warnings.is_empty());
     }
 
     async fn insert_event(
@@ -575,12 +542,5 @@ mod tests {
                 "failed mint ID should match the aggregate_id"
             );
         }
-
-        // No warnings when all loads succeed
-        assert!(
-            loaded.warnings.is_empty(),
-            "expected no warnings, got: {:?}",
-            loaded.warnings
-        );
     }
 }

@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use st0x_event_sorcery::{Projection, Store, StoreBuilder};
 
-use crate::dashboard::EventBroadcaster;
+use crate::dashboard::Broadcaster;
 use crate::equity_redemption::EquityRedemption;
 use crate::inventory::InventorySnapshot;
 use crate::position::Position;
@@ -34,7 +34,7 @@ use crate::usdc_rebalance::UsdcRebalance;
 /// ensures every field is handled.
 pub(super) struct QueryManifest {
     rebalancing_trigger: Arc<RebalancingTrigger>,
-    event_broadcaster: Arc<EventBroadcaster>,
+    event_broadcaster: Arc<Broadcaster>,
 }
 
 /// Built CQRS frameworks from the wiring process.
@@ -50,7 +50,7 @@ pub(super) struct BuiltFrameworks {
 impl QueryManifest {
     pub(super) fn new(
         rebalancing_trigger: Arc<RebalancingTrigger>,
-        event_broadcaster: Arc<EventBroadcaster>,
+        event_broadcaster: Arc<Broadcaster>,
     ) -> Self {
         Self {
             rebalancing_trigger,
@@ -177,7 +177,7 @@ mod tests {
             Arc::new(RwLock::new(HashSet::new())),
         ));
 
-        let event_broadcaster = Arc::new(EventBroadcaster::new(event_sender, pool.clone()));
+        let event_broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
         let manifest = QueryManifest::new(rebalancing_trigger, event_broadcaster);
 
         let services = EquityTransferServices {

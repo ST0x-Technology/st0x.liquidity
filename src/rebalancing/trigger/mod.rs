@@ -537,7 +537,7 @@ impl RebalancingTrigger {
         *inventory = updated;
         drop(inventory);
 
-        debug!("Applied inventory snapshot event");
+        info!("Applied inventory snapshot event");
 
         self.check_and_trigger_after_snapshot(&event).await
     }
