@@ -86,8 +86,8 @@
   const statusStyle = (status: string): StatusStyle => {
     if (status === 'completed')
       return {
-        text: 'text-muted-foreground',
-        dot: 'bg-muted-foreground'
+        text: 'text-green-500',
+        dot: 'bg-green-500'
       }
 
     if (status === 'failed')
@@ -96,7 +96,10 @@
         dot: 'bg-destructive'
       }
 
-    return { text: '', dot: 'bg-green-500' }
+    return {
+      text: 'text-muted-foreground',
+      dot: 'bg-muted-foreground'
+    }
   }
 
   type SortDir = 'asc' | 'desc'
