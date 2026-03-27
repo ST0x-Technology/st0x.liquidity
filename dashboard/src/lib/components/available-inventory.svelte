@@ -200,7 +200,26 @@
     const formatted = abs >= 1 ? abs.toFixed(2) : abs.toPrecision(4)
     return `${sign}${formatted}`
   }
+
+  const fmtPct = (value: number): string => `${(value * 100).toFixed(0)}%`
+
+  const equityBounds = $derived(config ? `${fmtPct(config.equityTarget - config.equityDeviation)}–${fmtPct(config.equityTarget + config.equityDeviation)}` : '')
+
+  const usdcBounds = $derived(
+    config?.usdcTarget != null && config?.usdcDeviation != null
+      ? `${fmtPct(config.usdcTarget - config.usdcDeviation)}–${fmtPct(config.usdcTarget + config.usdcDeviation)}`
+      : ''
+  )
 </script>
+
+{#if config}
+  <div class="mb-4 flex gap-6 text-xs text-muted-foreground">
+    <span>Equity target: <span class="font-mono">{fmtPct(config.equityTarget)}</span> (allowed: <span class="font-mono">{equityBounds}</span>)</span>
+    {#if config.usdcTarget != null}
+      <span>USDC target: <span class="font-mono">{fmtPct(config.usdcTarget)}</span> (allowed: <span class="font-mono">{usdcBounds}</span>)</span>
+    {/if}
+  </div>
+{/if}
 
 <Table.Root>
   <Table.Header>
