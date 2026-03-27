@@ -58,7 +58,7 @@
             <Table.Head class="text-right">Venue</Table.Head>
             <Table.Head class="text-right">Side</Table.Head>
             <Table.Head class="text-center">Size</Table.Head>
-            <Table.Head>Underlying</Table.Head>
+            <Table.Head>Asset</Table.Head>
           </Table.Row>
         </Table.Header>
         <Table.Body>
