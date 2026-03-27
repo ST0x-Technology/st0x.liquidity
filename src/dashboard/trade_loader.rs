@@ -166,10 +166,11 @@ mod tests {
         let pool = setup_test_db().await;
         let order_placer = noop_order_placer();
 
-        let (store, _projection) = st0x_event_sorcery::StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .build(order_placer.clone())
-            .await
-            .unwrap();
+        let (store, _projection) =
+            st0x_event_sorcery::StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(order_placer.clone())
+                .await
+                .unwrap();
 
         let id = OffchainOrderId::new();
 
@@ -211,10 +212,11 @@ mod tests {
         let pool = setup_test_db().await;
         let order_placer = noop_order_placer();
 
-        let (store, _projection) = st0x_event_sorcery::StoreBuilder::<OffchainOrder>::new(pool.clone())
-            .build(order_placer)
-            .await
-            .unwrap();
+        let (store, _projection) =
+            st0x_event_sorcery::StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(order_placer)
+                .await
+                .unwrap();
 
         let id = OffchainOrderId::new();
 
