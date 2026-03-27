@@ -169,10 +169,6 @@ The bot supports multiple brokers through a unified trait interface:
 - Position querying for inventory management
 - Account balance monitoring for available capital
 
-Manual CLI limit orders are intentionally broker-specific and do not change the
-automated hedging path, conductor behavior, or market-hours gating. Automated
-counter-trading remains market-order based.
-
 #### Idempotency Controls
 
 - Event queue table to track all events with unique (transaction_hash,
