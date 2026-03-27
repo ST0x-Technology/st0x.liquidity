@@ -82,7 +82,7 @@
             <Table.Head>Underlying</Table.Head>
             <Table.Head>Side</Table.Head>
             <Table.Head class="text-right">Exposure Change</Table.Head>
-            <Table.Head class="text-right">Net Exposure</Table.Head>
+            <Table.Head class="text-right">Dislocation</Table.Head>
           </Table.Row>
         </Table.Header>
         <Table.Body>
