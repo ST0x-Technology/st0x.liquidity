@@ -18,6 +18,8 @@ pub enum TimeInForce {
     /// Day order - expires at the end of the regular trading day
     #[default]
     Day,
+    /// Good-til-cancelled order.
+    Gtc,
     /// Market-on-close - executes at or near the market close price.
     /// Orders placed between 3:50pm-7:00pm ET are rejected.
     /// Orders after 7pm ET are queued for the next trading day.
@@ -57,6 +59,7 @@ impl fmt::Display for TimeInForce {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Day => write!(f, "day"),
+            Self::Gtc => write!(f, "gtc"),
             Self::MarketOnClose => write!(f, "market-on-close"),
         }
     }
@@ -74,6 +77,7 @@ impl FromStr for TimeInForce {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "day" => Ok(Self::Day),
+            "gtc" => Ok(Self::Gtc),
             "market-on-close" | "market_on_close" | "cls" => Ok(Self::MarketOnClose),
             _ => Err(ParseTimeInForceError {
                 time_in_force_provided: value.to_string(),
@@ -87,6 +91,7 @@ impl TimeInForce {
     pub(crate) fn as_api_str(self) -> &'static str {
         match self {
             Self::Day => "day",
+            Self::Gtc => "gtc",
             Self::MarketOnClose => "cls",
         }
     }
@@ -144,8 +149,11 @@ pub enum AlpacaBrokerApiError {
     #[error("Asset {symbol} is not tradable on Alpaca")]
     AssetNotTradable { symbol: Symbol },
 
-    #[error("limit orders only support day time-in-force, got {time_in_force}")]
+    #[error("limit orders only support day or gtc time-in-force, got {time_in_force}")]
     InvalidLimitOrderTimeInForce { time_in_force: TimeInForce },
+
+    #[error("fractional limit orders only support day time-in-force, got {time_in_force}")]
+    InvalidFractionalLimitOrderTimeInForce { time_in_force: TimeInForce },
 
     #[error("Cash balance {} cannot be converted to cents", format_float_with_fallback(.0))]
     CashBalanceConversion(Float),

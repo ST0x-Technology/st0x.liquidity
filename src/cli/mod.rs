@@ -96,7 +96,7 @@ pub enum Commands {
         /// Number of shares to buy (must be positive)
         #[arg(short = 'q', long = "quantity", value_parser = parse_positive_shares)]
         quantity: Positive<FractionalShares>,
-        /// Time-in-force for the order (day, market-on-close)
+        /// Time-in-force for the order (day, gtc, market-on-close)
         #[arg(long = "time-in-force")]
         time_in_force: Option<TimeInForce>,
         /// Limit price for a manual Alpaca Broker API limit order
@@ -114,7 +114,7 @@ pub enum Commands {
         /// Number of shares to sell (must be positive)
         #[arg(short = 'q', long = "quantity", value_parser = parse_positive_shares)]
         quantity: Positive<FractionalShares>,
-        /// Time-in-force for the order (day, market-on-close)
+        /// Time-in-force for the order (day, gtc, market-on-close)
         #[arg(long = "time-in-force")]
         time_in_force: Option<TimeInForce>,
         /// Limit price for a manual Alpaca Broker API limit order
@@ -1665,6 +1665,19 @@ mod tests {
                 "50",
                 "--time-in-force",
                 "market-on-close",
+            ])
+            .unwrap();
+
+        cmd.clone()
+            .try_get_matches_from(vec![
+                "schwab",
+                "buy",
+                "-s",
+                "AAPL",
+                "-q",
+                "5",
+                "--time-in-force",
+                "gtc",
             ])
             .unwrap();
 

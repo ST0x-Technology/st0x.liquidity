@@ -267,10 +267,23 @@ pub(super) async fn place_limit_order(
         "Placing Alpaca Broker API limit order"
     );
 
-    if limit_order.time_in_force != TimeInForce::Day {
+    if !matches!(
+        limit_order.time_in_force,
+        TimeInForce::Day | TimeInForce::Gtc
+    ) {
         return Err(AlpacaBrokerApiError::InvalidLimitOrderTimeInForce {
             time_in_force: limit_order.time_in_force,
         });
+    }
+
+    if limit_order.shares.to_whole_shares().is_err()
+        && limit_order.time_in_force != TimeInForce::Day
+    {
+        return Err(
+            AlpacaBrokerApiError::InvalidFractionalLimitOrderTimeInForce {
+                time_in_force: limit_order.time_in_force,
+            },
+        );
     }
 
     let placed_shares = truncate_shares_to_alpaca_precision(limit_order.shares)?;
@@ -698,6 +711,80 @@ mod tests {
                 }
             ),
             "Expected InvalidLimitOrderTimeInForce error, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_place_limit_order_accepts_gtc_for_whole_shares() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
+                .json_body(json!({
+                    "symbol": "AAPL",
+                    "qty": "5",
+                    "side": "buy",
+                    "type": "limit",
+                    "limit_price": "195.25",
+                    "time_in_force": "gtc",
+                    "extended_hours": true
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "4ec4c4cb-9424-4d8f-83fb-83546f9b633d",
+                    "symbol": "AAPL",
+                    "qty": "5",
+                    "side": "buy",
+                    "status": "new",
+                    "filled_avg_price": null
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let limit_order = AlpacaLimitOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(5))).unwrap(),
+            direction: Direction::Buy,
+            limit_price: float!(195.25),
+            time_in_force: TimeInForce::Gtc,
+            extended_hours: true,
+        };
+
+        let placement = place_limit_order(&client, limit_order).await.unwrap();
+
+        mock.assert();
+        assert_eq!(placement.order_id, "4ec4c4cb-9424-4d8f-83fb-83546f9b633d");
+        assert_eq!(placement.shares.inner(), FractionalShares::new(float!(5)));
+    }
+
+    #[tokio::test]
+    async fn test_place_limit_order_rejects_fractional_gtc() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        let limit_order = AlpacaLimitOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(1.5))).unwrap(),
+            direction: Direction::Buy,
+            limit_price: float!(195.25),
+            time_in_force: TimeInForce::Gtc,
+            extended_hours: true,
+        };
+
+        let error = place_limit_order(&client, limit_order).await.unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AlpacaBrokerApiError::InvalidFractionalLimitOrderTimeInForce {
+                    time_in_force: TimeInForce::Gtc,
+                }
+            ),
+            "Expected InvalidFractionalLimitOrderTimeInForce error, got: {error:?}"
         );
     }
 
