@@ -17,8 +17,18 @@ use crate::HasZero;
 /// Represents share quantities that can include fractional amounts (e.g., 1.212 shares).
 /// Can be negative (for position tracking). Use `Positive<FractionalShares>` when
 /// strictly positive values are required (e.g., order quantities).
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct FractionalShares(Float);
+
+impl std::fmt::Debug for FractionalShares {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "FractionalShares({})",
+            format_float_with_fallback(&self.0)
+        )
+    }
+}
 
 impl HasZero for FractionalShares {
     const ZERO: Self = Self(float!(0));

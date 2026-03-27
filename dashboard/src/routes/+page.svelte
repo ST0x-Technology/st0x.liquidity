@@ -45,7 +45,7 @@
       countdown = Math.max(0, countdown - 1)
     }, 1000)
 
-    return () => clearInterval(interval)
+    return () => { clearInterval(interval); }
   })
 </script>
 

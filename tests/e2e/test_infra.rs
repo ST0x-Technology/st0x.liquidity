@@ -30,7 +30,8 @@ static TRACING_INIT: Once = Once::new();
 pub fn init_tracing() {
     TRACING_INIT.call_once(|| {
         let base_filter = mk_env_filter(tracing::Level::DEBUG);
-        let directive = format!("e2e={tracing::Level::TRACE}").parse().unwrap();
+        let trace = tracing::Level::TRACE;
+        let directive = format!("e2e={trace}").parse().unwrap();
         let filter = base_filter.add_directive(directive);
 
         tracing_subscriber::fmt()
@@ -104,24 +105,13 @@ impl TestInfra<()> {
         let db_dir = tempfile::tempdir()?;
         let db_path = db_path_override.unwrap_or_else(|| db_dir.path().join("e2e.sqlite"));
 
-        let (mut base_chain, equity_addresses) = deploy_chain_and_vaults(&equity_prices).await?;
+        let (base_chain, equity_addresses) = deploy_chain_and_vaults(&equity_prices).await?;
 
-        let (symbol_prices, symbol_positions) =
-            build_mock_positions(&equity_prices, &equity_positions)?;
-
-        info!("Starting mock services");
-        let broker_service = Arc::new(
-            AlpacaBrokerMock::start()
-                .symbol_fill_prices(symbol_prices)
-                .symbol_positions(symbol_positions)
-                .maybe_initial_cash(initial_cash)
-                .call()
-                .await,
-        );
-        debug!(broker_url = %broker_service.base_url(), "Broker mock started");
+        let broker_service =
+            start_broker_mock(&equity_prices, &equity_positions, initial_cash).await?;
 
         let tokenization_service =
-            start_tokenization_mock(&broker_service, &equity_addresses, &mut base_chain).await?;
+            start_tokenization_mock(&broker_service, &equity_addresses, &base_chain).await?;
 
         let attestation_service = CctpAttestationMock::start().await;
         debug!("CCTP attestation mock started");
@@ -142,23 +132,42 @@ impl TestInfra<()> {
 async fn deploy_chain_and_vaults(
     equity_prices: &[(&str, Float)],
 ) -> anyhow::Result<(
-    BaseChain<impl Provider + Clone>,
+    BaseChain<impl Provider + Clone + use<>>,
     Vec<(String, Address, Address)>,
 )> {
     info!("Starting Anvil base chain");
     let mut base_chain = BaseChain::start().await?;
     info!("Anvil started, deploying equity vaults");
 
+    let equity_addresses = deploy_equity_vaults(&mut base_chain, equity_prices).await?;
+    fund_taker_with_equity(&base_chain, &equity_addresses).await?;
+
+    Ok((base_chain, equity_addresses))
+}
+
+async fn deploy_equity_vaults<P: Provider + Clone>(
+    base_chain: &mut BaseChain<P>,
+    equity_prices: &[(&str, Float)],
+) -> anyhow::Result<Vec<(String, Address, Address)>> {
     let mut equity_addresses = Vec::new();
+
     for (symbol, _price) in equity_prices {
         let (vault_addr, underlying_addr) = base_chain.deploy_equity_vault(symbol).await?;
         debug!(%symbol, %vault_addr, %underlying_addr, "Deployed equity vault");
         equity_addresses.push(((*symbol).to_owned(), vault_addr, underlying_addr));
     }
 
+    Ok(equity_addresses)
+}
+
+async fn fund_taker_with_equity<P: Provider + Clone>(
+    base_chain: &BaseChain<P>,
+    equity_addresses: &[(String, Address, Address)],
+) -> anyhow::Result<()> {
     debug!("Funding taker with equity vault shares");
     let taker_equity: U256 = parse_units("100000", 18)?.into();
-    for (symbol, vault_addr, _underlying_addr) in &equity_addresses {
+
+    for (symbol, vault_addr, _underlying_addr) in equity_addresses {
         DeployableERC20::new(*vault_addr, &base_chain.provider)
             .transfer(base_chain.taker, taker_equity)
             .send()
@@ -168,13 +177,36 @@ async fn deploy_chain_and_vaults(
         debug!(%symbol, "Funded taker");
     }
 
-    Ok((base_chain, equity_addresses))
+    Ok(())
 }
+
+async fn start_broker_mock(
+    equity_prices: &[(&str, Float)],
+    equity_positions: &[(&str, Float)],
+    initial_cash: Option<Float>,
+) -> anyhow::Result<Arc<AlpacaBrokerMock>> {
+    let (symbol_prices, symbol_positions) = build_mock_positions(equity_prices, equity_positions)?;
+
+    info!("Starting mock services");
+    let broker_service = Arc::new(
+        AlpacaBrokerMock::start()
+            .symbol_fill_prices(symbol_prices)
+            .symbol_positions(symbol_positions)
+            .maybe_initial_cash(initial_cash)
+            .call()
+            .await,
+    );
+    debug!(broker_url = %broker_service.base_url(), "Broker mock started");
+
+    Ok(broker_service)
+}
+
+type MockBrokerState = (Vec<(Symbol, Float)>, Vec<MockPosition>);
 
 fn build_mock_positions(
     equity_prices: &[(&str, Float)],
     equity_positions: &[(&str, Float)],
-) -> anyhow::Result<(Vec<(Symbol, Float)>, Vec<MockPosition>)> {
+) -> anyhow::Result<MockBrokerState> {
     let symbol_prices: Vec<(Symbol, Float)> = equity_prices
         .iter()
         .map(|(symbol, price)| Ok((Symbol::new(*symbol)?, *price)))
@@ -205,10 +237,10 @@ fn build_mock_positions(
     Ok((symbol_prices, symbol_positions))
 }
 
-async fn start_tokenization_mock<P: Provider + Clone>(
+async fn start_tokenization_mock<P: Provider + Clone + 'static>(
     broker_service: &Arc<AlpacaBrokerMock>,
     equity_addresses: &[(String, Address, Address)],
-    base_chain: &mut BaseChain<P>,
+    base_chain: &BaseChain<P>,
 ) -> anyhow::Result<AlpacaTokenizationMock> {
     let mut tokenization_service =
         AlpacaTokenizationMock::start(broker_service.server(), broker_service.clone());

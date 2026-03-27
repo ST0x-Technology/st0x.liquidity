@@ -122,8 +122,6 @@
     }
   })
 
-  const allRows = $derived<Row[]>(cashRow ? [...equityRows, cashRow] : [...equityRows])
-
   const comparators: Record<Col, (lhs: Row, rhs: Row) => number> = {
     asset: (lhs, rhs) => lhs.asset.localeCompare(rhs.asset),
     alpaca: (lhs, rhs) => decimalCompare(lhs.alpaca.full, rhs.alpaca.full),

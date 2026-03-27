@@ -95,7 +95,7 @@ where
 }
 
 /// Order response from the Alpaca Broker API
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub(super) struct OrderResponse {
     pub id: Uuid,
     pub symbol: Symbol,
@@ -118,6 +118,25 @@ pub(super) struct OrderResponse {
         deserialize_with = "deserialize_option_float_from_number_or_string"
     )]
     pub filled_average_price: Option<Float>,
+}
+
+impl fmt::Debug for OrderResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use st0x_float_serde::DebugOptionFloat;
+
+        f.debug_struct("OrderResponse")
+            .field("id", &self.id)
+            .field("symbol", &self.symbol)
+            .field("quantity", &self.quantity)
+            .field("filled_quantity", &DebugOptionFloat(&self.filled_quantity))
+            .field("side", &self.side)
+            .field("status", &self.status)
+            .field(
+                "filled_average_price",
+                &DebugOptionFloat(&self.filled_average_price),
+            )
+            .finish()
+    }
 }
 
 /// Order request for crypto trading (e.g., USDC/USD conversion).
@@ -148,7 +167,7 @@ impl fmt::Debug for CryptoOrderRequest {
 }
 
 /// Response from a crypto order placement
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct CryptoOrderResponse {
     pub id: Uuid,
     pub symbol: String,
@@ -171,6 +190,25 @@ pub struct CryptoOrderResponse {
     )]
     pub filled_quantity: Option<Float>,
     pub created_at: DateTime<Utc>,
+}
+
+impl fmt::Debug for CryptoOrderResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use st0x_float_serde::{DebugFloat, DebugOptionFloat};
+
+        f.debug_struct("CryptoOrderResponse")
+            .field("id", &self.id)
+            .field("symbol", &self.symbol)
+            .field("quantity", &DebugFloat(&self.quantity))
+            .field("status", &self.status)
+            .field(
+                "filled_average_price",
+                &DebugOptionFloat(&self.filled_average_price),
+            )
+            .field("filled_quantity", &DebugOptionFloat(&self.filled_quantity))
+            .field("created_at", &self.created_at)
+            .finish()
+    }
 }
 
 impl CryptoOrderResponse {
