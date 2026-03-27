@@ -213,10 +213,23 @@
 </script>
 
 {#if config}
-  <div class="mb-4 flex gap-6 text-xs text-muted-foreground">
-    <span>Equity target: <span class="font-mono">{fmtPct(config.equityTarget)}</span> (allowed: <span class="font-mono">{equityBounds}</span>)</span>
+  <div class="mb-4 flex flex-wrap gap-x-6 gap-y-1 text-xs text-muted-foreground">
+    <span>Equity ratio: <span class="font-mono">{fmtPct(config.equityTarget)}</span> (allowed: <span class="font-mono">{equityBounds}</span>)</span>
+
     {#if config.usdcTarget != null}
-      <span>USDC target: <span class="font-mono">{fmtPct(config.usdcTarget)}</span> (allowed: <span class="font-mono">{usdcBounds}</span>)</span>
+      <span>USDC ratio: <span class="font-mono">{fmtPct(config.usdcTarget)}</span> (allowed: <span class="font-mono">{usdcBounds}</span>)</span>
+    {/if}
+
+    <span>Execution trigger: <span class="font-mono">{config.executionThreshold}</span></span>
+
+    {#if config.assets.length > 0}
+      <span>
+        Assets:
+        {#each config.assets as asset, idx}
+          <span class="font-mono {asset.trading ? '' : 'line-through opacity-50'}">{asset.symbol}</span>{#if idx < config.assets.length - 1},
+          {/if}
+        {/each}
+      </span>
     {/if}
   </div>
 {/if}

@@ -30,25 +30,80 @@ fn float_to_f64(value: rain_math_float::Float, fallback: f64) -> f64 {
 }
 
 pub(crate) fn overview_config_from_ctx(ctx: &crate::config::Ctx) -> st0x_dto::OverviewConfig {
-    ctx.rebalancing_ctx().map_or_else(
-        |_| st0x_dto::OverviewConfig::default(),
-        |rebalancing| {
-            let (usdc_target, usdc_deviation) =
-                rebalancing.usdc.as_ref().map_or((None, None), |threshold| {
+    use crate::config::OperationMode;
+    use crate::threshold::ExecutionThreshold;
+
+    let (equity_target, equity_deviation, usdc_target, usdc_deviation) =
+        ctx.rebalancing_ctx().map_or_else(
+            |_| (0.5, 0.2, None, None),
+            |rebalancing| {
+                let (ut, ud) = rebalancing.usdc.as_ref().map_or((None, None), |threshold| {
                     (
                         Some(float_to_f64(threshold.target, 0.5)),
                         Some(float_to_f64(threshold.deviation, 0.3)),
                     )
                 });
 
-            st0x_dto::OverviewConfig {
-                equity_target: float_to_f64(rebalancing.equity.target, 0.5),
-                equity_deviation: float_to_f64(rebalancing.equity.deviation, 0.2),
-                usdc_target,
-                usdc_deviation,
+                (
+                    float_to_f64(rebalancing.equity.target, 0.5),
+                    float_to_f64(rebalancing.equity.deviation, 0.2),
+                    ut,
+                    ud,
+                )
+            },
+        );
+
+    let execution_threshold = match &ctx.execution_threshold {
+        ExecutionThreshold::Shares(shares) => {
+            let formatted = shares
+                .inner()
+                .inner()
+                .format()
+                .unwrap_or_else(|_| "?".to_string());
+
+            format!("{formatted} shares")
+        }
+        ExecutionThreshold::DollarValue(usd) => {
+            let formatted = usd
+                .inner()
+                .format()
+                .unwrap_or_else(|_| "?".to_string());
+
+            format!("${formatted}")
+        }
+    };
+
+    let assets = ctx
+        .assets
+        .equities
+        .symbols
+        .iter()
+        .map(|(symbol, config)| {
+            let limit = config.operational_limit.map(|limit| {
+                limit
+                    .inner()
+                    .inner()
+                    .format()
+                    .unwrap_or_else(|_| "?".to_string())
+            });
+
+            st0x_dto::AssetConfig {
+                symbol: symbol.clone(),
+                trading: config.trading == OperationMode::Enabled,
+                rebalancing: config.rebalancing == OperationMode::Enabled,
+                operational_limit: limit,
             }
-        },
-    )
+        })
+        .collect();
+
+    st0x_dto::OverviewConfig {
+        equity_target,
+        equity_deviation,
+        usdc_target,
+        usdc_deviation,
+        execution_threshold,
+        assets,
+    }
 }
 
 pub(crate) struct DashboardState {

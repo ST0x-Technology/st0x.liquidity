@@ -154,7 +154,7 @@ describe('createWebSocket', () => {
           trades: [trade],
           inventory: { perSymbol: [], usdc: { onchainAvailable: '0', onchainInflight: '0', offchainAvailable: '0', offchainInflight: '0' } },
           positions: [],
-          config: { equityTarget: 0.5, equityDeviation: 0.2, usdcTarget: null, usdcDeviation: null },
+          config: { equityTarget: 0.5, equityDeviation: 0.2, usdcTarget: null, usdcDeviation: null, executionThreshold: '$2', assets: [] },
           activeTransfers: [],
           recentTransfers: []
         }

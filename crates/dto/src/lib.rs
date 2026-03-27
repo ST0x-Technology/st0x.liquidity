@@ -95,7 +95,7 @@ impl Default for InitialState {
     }
 }
 
-/// Rebalancing thresholds for the dashboard overview.
+/// Operational configuration for the dashboard overview.
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct OverviewConfig {
@@ -103,6 +103,8 @@ pub struct OverviewConfig {
     pub equity_deviation: f64,
     pub usdc_target: Option<f64>,
     pub usdc_deviation: Option<f64>,
+    pub execution_threshold: String,
+    pub assets: Vec<AssetConfig>,
 }
 
 impl Default for OverviewConfig {
@@ -112,8 +114,21 @@ impl Default for OverviewConfig {
             equity_deviation: 0.2,
             usdc_target: None,
             usdc_deviation: None,
+            execution_threshold: "1 share".to_string(),
+            assets: Vec::new(),
         }
     }
+}
+
+/// Per-asset operational config.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetConfig {
+    #[ts(type = "string")]
+    pub symbol: Symbol,
+    pub trading: bool,
+    pub rebalancing: bool,
+    pub operational_limit: Option<String>,
 }
 
 /// Where a trade was executed.
@@ -530,6 +545,7 @@ pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
     ServerMessage::export_all_to(out_dir)?;
     InitialState::export_all_to(out_dir)?;
     OverviewConfig::export_all_to(out_dir)?;
+    AssetConfig::export_all_to(out_dir)?;
     Statement::export_all_to(out_dir)?;
     Trade::export_all_to(out_dir)?;
     Position::export_all_to(out_dir)?;
