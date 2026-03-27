@@ -287,6 +287,7 @@ mod tests {
     use crate::alpaca_broker_api::auth::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
     };
+    use crate::alpaca_broker_api::order::AlpacaLimitPrice;
     use crate::{Direction, FractionalShares, Positive, Usd};
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
@@ -890,8 +891,10 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Buy,
-            limit_price: Positive::new(Usd::new(Float::parse("195.25".to_string()).unwrap()))
-                .unwrap(),
+            limit_price: AlpacaLimitPrice::try_new(
+                Positive::new(Usd::new(Float::parse("195.25".to_string()).unwrap())).unwrap(),
+            )
+            .unwrap(),
             extended_hours: true,
         };
 
@@ -922,8 +925,10 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Buy,
-            limit_price: Positive::new(Usd::new(Float::parse("195.25".to_string()).unwrap()))
-                .unwrap(),
+            limit_price: AlpacaLimitPrice::try_new(
+                Positive::new(Usd::new(Float::parse("195.25".to_string()).unwrap())).unwrap(),
+            )
+            .unwrap(),
             extended_hours: true,
         };
 
@@ -961,8 +966,10 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Buy,
-            limit_price: Positive::new(Usd::new(Float::parse("195.25".to_string()).unwrap()))
-                .unwrap(),
+            limit_price: AlpacaLimitPrice::try_new(
+                Positive::new(Usd::new(Float::parse("195.25".to_string()).unwrap())).unwrap(),
+            )
+            .unwrap(),
             extended_hours: true,
         };
 

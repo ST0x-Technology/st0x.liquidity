@@ -18,7 +18,7 @@ use tracing::{info, warn};
 use rain_math_float::Float;
 use st0x_evm::OpenChainErrorRegistry;
 use st0x_execution::{
-    AlpacaAccountId, Direction, FractionalShares, Positive, Symbol, TimeInForce, Usd,
+    AlpacaAccountId, AlpacaLimitPrice, Direction, FractionalShares, Positive, Symbol, TimeInForce,
 };
 use st0x_finance::Usdc;
 
@@ -57,9 +57,13 @@ fn parse_float(input: &str) -> Result<Float, String> {
     Float::parse(input.to_string()).map_err(|err| format!("{err}"))
 }
 
-fn parse_positive_price(input: &str) -> Result<Positive<Usd>, String> {
-    let price = input.parse::<Usd>().map_err(|err| format!("{err}"))?;
-    Positive::new(price).map_err(|_| "limit price must be positive".to_string())
+fn parse_positive_price(input: &str) -> Result<AlpacaLimitPrice, String> {
+    let price = input
+        .parse::<st0x_execution::Usd>()
+        .map_err(|err| format!("{err}"))?;
+    let positive_price =
+        Positive::new(price).map_err(|_| "limit price must be positive".to_string())?;
+    AlpacaLimitPrice::try_new(positive_price).map_err(|err| format!("{err}"))
 }
 
 fn parse_positive_shares(input: &str) -> Result<Positive<FractionalShares>, String> {
@@ -91,7 +95,7 @@ pub enum Commands {
         time_in_force: Option<TimeInForce>,
         /// Limit price for a manual Alpaca Broker API limit order
         #[arg(long = "limit-price", value_parser = parse_positive_price)]
-        limit_price: Option<Positive<Usd>>,
+        limit_price: Option<AlpacaLimitPrice>,
         /// Submit the limit order as extended-hours eligible
         #[arg(long = "extended-hours", requires = "limit_price")]
         extended_hours: bool,
@@ -109,7 +113,7 @@ pub enum Commands {
         time_in_force: Option<TimeInForce>,
         /// Limit price for a manual Alpaca Broker API limit order
         #[arg(long = "limit-price", value_parser = parse_positive_price)]
-        limit_price: Option<Positive<Usd>>,
+        limit_price: Option<AlpacaLimitPrice>,
         /// Submit the limit order as extended-hours eligible
         #[arg(long = "extended-hours", requires = "limit_price")]
         extended_hours: bool,
@@ -436,14 +440,14 @@ enum SimpleCommand {
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
         time_in_force: Option<TimeInForce>,
-        limit_price: Option<Positive<Usd>>,
+        limit_price: Option<AlpacaLimitPrice>,
         extended_hours: bool,
     },
     Sell {
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
         time_in_force: Option<TimeInForce>,
-        limit_price: Option<Positive<Usd>>,
+        limit_price: Option<AlpacaLimitPrice>,
         extended_hours: bool,
     },
     Auth,
@@ -669,20 +673,19 @@ async fn run_simple_command<W: Write>(
             limit_price,
             extended_hours,
         } => {
-            execute_order(
-                trading::CliOrderRequest {
-                    symbol,
-                    shares: quantity,
-                    direction: Direction::Buy,
-                    time_in_force,
-                    limit_price,
-                    extended_hours,
-                },
-                ctx,
-                pool,
-                stdout,
+            let request = trading::CliOrderRequest::from_cli_args(
+                symbol,
+                quantity,
+                Direction::Buy,
+                time_in_force,
+                limit_price,
+                extended_hours,
             )
-            .await
+            .map_err(|error| {
+                let _ = writeln!(stdout, "❌ Failed to place order: {error}");
+                error
+            })?;
+            execute_order(request, ctx, pool, stdout).await
         }
         SimpleCommand::Sell {
             symbol,
@@ -691,20 +694,19 @@ async fn run_simple_command<W: Write>(
             limit_price,
             extended_hours,
         } => {
-            execute_order(
-                trading::CliOrderRequest {
-                    symbol,
-                    shares: quantity,
-                    direction: Direction::Sell,
-                    time_in_force,
-                    limit_price,
-                    extended_hours,
-                },
-                ctx,
-                pool,
-                stdout,
+            let request = trading::CliOrderRequest::from_cli_args(
+                symbol,
+                quantity,
+                Direction::Sell,
+                time_in_force,
+                limit_price,
+                extended_hours,
             )
-            .await
+            .map_err(|error| {
+                let _ = writeln!(stdout, "❌ Failed to place order: {error}");
+                error
+            })?;
+            execute_order(request, ctx, pool, stdout).await
         }
         SimpleCommand::Auth => auth::auth_command(stdout, &ctx.broker, pool).await,
         SimpleCommand::TransferEquity {
@@ -849,7 +851,7 @@ mod tests {
 
     use st0x_event_sorcery::{Column, StoreBuilder};
     use st0x_execution::{
-        Direction, FractionalShares, OrderStatus, Positive, SchwabError, SchwabTokens,
+        Direction, FractionalShares, OrderStatus, Positive, SchwabError, SchwabTokens, Usd,
     };
 
     use super::*;
@@ -880,17 +882,17 @@ mod tests {
         shares: Positive<FractionalShares>,
         direction: Direction,
         time_in_force: Option<TimeInForce>,
-        limit_price: Option<Positive<Usd>>,
+        limit_price: Option<AlpacaLimitPrice>,
         extended_hours: bool,
-    ) -> trading::CliOrderRequest {
-        trading::CliOrderRequest {
+    ) -> anyhow::Result<trading::CliOrderRequest> {
+        trading::CliOrderRequest::from_cli_args(
             symbol,
             shares,
             direction,
             time_in_force,
             limit_price,
             extended_hours,
-        }
+        )
     }
 
     macro_rules! execute_cli_order_with_writers {
@@ -905,19 +907,17 @@ mod tests {
             $pool:expr,
             $stdout:expr $(,)?
         ) => {
-            trading::execute_order_with_writers(
-                cli_order_request(
+            async {
+                let request = cli_order_request(
                     $symbol,
                     $shares,
                     $direction,
                     $time_in_force,
                     $limit_price,
                     $extended_hours,
-                ),
-                $ctx,
-                $pool,
-                $stdout,
-            )
+                )?;
+                trading::execute_order_with_writers(request, $ctx, $pool, $stdout).await
+            }
         };
     }
 
@@ -1379,6 +1379,16 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_positive_price_rejects_invalid_precision() {
+        let error = parse_positive_price("195.255").unwrap_err();
+
+        assert!(
+            error.contains("exceeds Alpaca's 2-decimal-place precision"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn test_buy_command_requires_limit_price_for_extended_hours() {
         let error =
             Cli::try_parse_from(["schwab", "buy", "-s", "AAPL", "-q", "1", "--extended-hours"])
@@ -1731,6 +1741,7 @@ mod tests {
         assert!(
             limit_price
                 .unwrap()
+                .as_price()
                 .inner()
                 .eq(&Usd::new(Float::parse("195.25".to_string()).unwrap()))
                 .unwrap()
@@ -1785,6 +1796,7 @@ mod tests {
         assert!(
             limit_price
                 .unwrap()
+                .as_price()
                 .inner()
                 .eq(&Usd::new(Float::parse("195.25".to_string()).unwrap()))
                 .unwrap()
@@ -1808,6 +1820,26 @@ mod tests {
 
         assert!(
             message.contains("limit price must be positive"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn test_sell_command_requires_limit_price_for_extended_hours() {
+        let error = Cli::try_parse_from([
+            "schwab",
+            "sell",
+            "-s",
+            "AAPL",
+            "-q",
+            "1",
+            "--extended-hours",
+        ])
+        .unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("--limit-price"),
             "unexpected error: {message}"
         );
     }

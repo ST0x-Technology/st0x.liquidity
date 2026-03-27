@@ -13,9 +13,9 @@ use tracing::{error, info};
 use st0x_event_sorcery::{Store, StoreBuilder};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::{
-    AlpacaLimitOrder, Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder,
-    MockExecutor, MockExecutorCtx, OrderPlacement, OrderState, Positive, Symbol, TimeInForce,
-    TryIntoExecutor, Usd,
+    AlpacaLimitOrder, AlpacaLimitPrice, Direction, Executor, ExecutorOrderId, FractionalShares,
+    MarketOrder, MockExecutor, MockExecutorCtx, OrderPlacement, OrderState, Positive, Symbol,
+    TimeInForce, TryIntoExecutor,
 };
 
 use super::auth::ensure_schwab_authentication;
@@ -61,13 +61,70 @@ pub(super) fn create_order_placer(ctx: &Ctx, pool: &SqlitePool) -> Arc<dyn Order
     })
 }
 
+pub(super) enum CliOrderKind {
+    Market {
+        time_in_force: Option<TimeInForce>,
+    },
+    AlpacaLimit {
+        limit_price: AlpacaLimitPrice,
+        extended_hours: bool,
+    },
+}
+
 pub(super) struct CliOrderRequest {
     pub(super) symbol: Symbol,
     pub(super) shares: Positive<FractionalShares>,
     pub(super) direction: Direction,
-    pub(super) time_in_force: Option<TimeInForce>,
-    pub(super) limit_price: Option<Positive<Usd>>,
-    pub(super) extended_hours: bool,
+    pub(super) kind: CliOrderKind,
+}
+
+impl CliOrderRequest {
+    pub(super) fn from_cli_args(
+        symbol: Symbol,
+        shares: Positive<FractionalShares>,
+        direction: Direction,
+        time_in_force: Option<TimeInForce>,
+        limit_price: Option<AlpacaLimitPrice>,
+        extended_hours: bool,
+    ) -> anyhow::Result<Self> {
+        let kind = if let Some(limit_price) = limit_price {
+            if time_in_force.is_some() {
+                anyhow::bail!("--time-in-force is not supported with --limit-price");
+            }
+
+            CliOrderKind::AlpacaLimit {
+                limit_price,
+                extended_hours,
+            }
+        } else {
+            if extended_hours {
+                anyhow::bail!("--extended-hours requires --limit-price");
+            }
+
+            CliOrderKind::Market { time_in_force }
+        };
+
+        Ok(Self {
+            symbol,
+            shares,
+            direction,
+            kind,
+        })
+    }
+
+    fn limit_price(&self) -> Option<&AlpacaLimitPrice> {
+        match &self.kind {
+            CliOrderKind::Market { .. } => None,
+            CliOrderKind::AlpacaLimit { limit_price, .. } => Some(limit_price),
+        }
+    }
+
+    fn extended_hours(&self) -> bool {
+        match &self.kind {
+            CliOrderKind::Market { .. } => false,
+            CliOrderKind::AlpacaLimit { extended_hours, .. } => *extended_hours,
+        }
+    }
 }
 
 pub(super) async fn order_status_command<W: Write>(
@@ -166,17 +223,14 @@ pub(super) async fn execute_order_with_writers<W: Write>(
         symbol = %symbol_display,
         direction = ?request.direction,
         quantity = %quantity_display,
-        limit_price = ?request.limit_price,
-        extended_hours = request.extended_hours,
+        limit_price = ?request.limit_price(),
+        extended_hours = request.extended_hours(),
         "Received order request"
     );
 
-    validate_order_request(&request, stdout)?;
-
-    let execution = if request.limit_price.is_some() {
-        execute_alpaca_limit_order(&request, ctx, stdout).await
-    } else {
-        execute_market_order(&request, ctx, pool, stdout).await
+    let execution = match &request.kind {
+        CliOrderKind::AlpacaLimit { .. } => execute_alpaca_limit_order(&request, ctx, stdout).await,
+        CliOrderKind::Market { .. } => execute_market_order(&request, ctx, pool, stdout).await,
     };
 
     match execution {
@@ -184,8 +238,8 @@ pub(super) async fn execute_order_with_writers<W: Write>(
             write_order_success(
                 stdout,
                 &placement,
-                request.limit_price,
-                request.extended_hours,
+                request.limit_price(),
+                request.extended_hours(),
             )?;
         }
         Err(error) => {
@@ -204,32 +258,26 @@ pub(super) async fn execute_order_with_writers<W: Write>(
     Ok(())
 }
 
-fn validate_order_request<W: Write>(
-    request: &CliOrderRequest,
-    stdout: &mut W,
-) -> anyhow::Result<()> {
-    if request.extended_hours && request.limit_price.is_none() {
-        let error = anyhow::anyhow!("--extended-hours requires --limit-price");
-        writeln!(stdout, "❌ Failed to place order: {error}")?;
-        return Err(error);
-    }
-
-    Ok(())
-}
-
 async fn execute_market_order<W: Write>(
     request: &CliOrderRequest,
     ctx: &Ctx,
     pool: &SqlitePool,
     stdout: &mut W,
 ) -> anyhow::Result<OrderPlacement<String>> {
+    let time_in_force = match &request.kind {
+        CliOrderKind::Market { time_in_force } => *time_in_force,
+        CliOrderKind::AlpacaLimit { .. } => {
+            anyhow::bail!("internal error: expected market order request")
+        }
+    };
+
     let market_order = MarketOrder {
         symbol: request.symbol.clone(),
         shares: request.shares,
         direction: request.direction,
     };
 
-    execute_broker_order(ctx, pool, market_order, request.time_in_force, stdout).await
+    execute_broker_order(ctx, pool, market_order, time_in_force, stdout).await
 }
 
 async fn execute_alpaca_limit_order<W: Write>(
@@ -237,14 +285,15 @@ async fn execute_alpaca_limit_order<W: Write>(
     ctx: &Ctx,
     stdout: &mut W,
 ) -> anyhow::Result<OrderPlacement<String>> {
-    let time_in_force = request.time_in_force.unwrap_or(TimeInForce::Day);
-    let Some(limit_price) = request.limit_price else {
-        anyhow::bail!("--limit-price is required for limit orders");
+    let (limit_price, extended_hours) = match &request.kind {
+        CliOrderKind::AlpacaLimit {
+            limit_price,
+            extended_hours,
+        } => (limit_price.clone(), *extended_hours),
+        CliOrderKind::Market { .. } => {
+            anyhow::bail!("internal error: expected Alpaca limit order request")
+        }
     };
-
-    if time_in_force != TimeInForce::Day {
-        anyhow::bail!("--limit-price only supports --time-in-force day");
-    }
 
     let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
         anyhow::bail!("--limit-price is only supported with alpaca-broker-api");
@@ -259,7 +308,7 @@ async fn execute_alpaca_limit_order<W: Write>(
             shares: request.shares,
             direction: request.direction,
             limit_price,
-            extended_hours: request.extended_hours,
+            extended_hours,
         })
         .await?;
 
@@ -275,7 +324,7 @@ async fn execute_alpaca_limit_order<W: Write>(
 fn write_order_success<W: Write>(
     stdout: &mut W,
     placement: &OrderPlacement<String>,
-    limit_price: Option<Positive<Usd>>,
+    limit_price: Option<&AlpacaLimitPrice>,
     extended_hours: bool,
 ) -> anyhow::Result<()> {
     info!(
@@ -295,7 +344,7 @@ fn write_order_success<W: Write>(
         writeln!(
             stdout,
             "   Limit Price: ${}",
-            format_float_with_fallback(&limit_price.inner().inner())
+            format_float_with_fallback(&limit_price.as_price().inner().inner())
         )?;
         writeln!(
             stdout,
@@ -651,7 +700,7 @@ mod tests {
     use crate::threshold::ExecutionThreshold;
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaTradingApiCtx,
-        AlpacaTradingApiMode, Usd,
+        AlpacaTradingApiMode,
     };
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
@@ -726,21 +775,27 @@ mod tests {
         shares: Positive<FractionalShares>,
         direction: Direction,
         time_in_force: Option<TimeInForce>,
-        limit_price: Option<Positive<Usd>>,
+        limit_price: Option<AlpacaLimitPrice>,
         extended_hours: bool,
-    ) -> CliOrderRequest {
-        CliOrderRequest {
+    ) -> anyhow::Result<CliOrderRequest> {
+        CliOrderRequest::from_cli_args(
             symbol,
             shares,
             direction,
             time_in_force,
             limit_price,
             extended_hours,
-        }
+        )
     }
 
-    fn positive_limit_price(value: &str) -> Positive<Usd> {
-        Positive::new(Usd::new(Float::parse(value.to_string()).unwrap())).unwrap()
+    fn positive_limit_price(value: &str) -> AlpacaLimitPrice {
+        AlpacaLimitPrice::try_new(
+            Positive::new(st0x_execution::Usd::new(
+                Float::parse(value.to_string()).unwrap(),
+            ))
+            .unwrap(),
+        )
+        .unwrap()
     }
 
     macro_rules! execute_order_with_writers {
@@ -755,19 +810,17 @@ mod tests {
             $pool:expr,
             $stdout:expr $(,)?
         ) => {
-            super::execute_order_with_writers(
-                cli_order_request(
+            async {
+                let request = cli_order_request(
                     $symbol,
                     $shares,
                     $direction,
                     $time_in_force,
                     $limit_price,
                     $extended_hours,
-                ),
-                $ctx,
-                $pool,
-                $stdout,
-            )
+                )?;
+                super::execute_order_with_writers(request, $ctx, $pool, $stdout).await
+            }
         };
     }
 
@@ -1225,7 +1278,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "--limit-price only supports --time-in-force day"
+            "--time-in-force is not supported with --limit-price"
         );
     }
 }

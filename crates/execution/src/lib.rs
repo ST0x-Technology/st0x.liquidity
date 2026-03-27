@@ -26,8 +26,8 @@ pub mod test_utils;
 
 pub use alpaca_broker_api::{
     AlpacaAccountId, AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiError,
-    AlpacaBrokerApiMode, AlpacaLimitOrder, ConversionDirection, JournalResponse, JournalStatus,
-    TimeInForce,
+    AlpacaBrokerApiMode, AlpacaLimitOrder, AlpacaLimitPrice, ConversionDirection, JournalResponse,
+    JournalStatus, TimeInForce,
 };
 pub use alpaca_trading_api::{
     AlpacaTradingApi, AlpacaTradingApiCtx, AlpacaTradingApiError, AlpacaTradingApiMode,

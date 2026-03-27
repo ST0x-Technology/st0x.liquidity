@@ -57,8 +57,27 @@ pub struct AlpacaLimitOrder {
     pub symbol: Symbol,
     pub shares: Positive<FractionalShares>,
     pub direction: Direction,
-    pub limit_price: Positive<Usd>,
+    pub limit_price: AlpacaLimitPrice,
     pub extended_hours: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(transparent)]
+pub struct AlpacaLimitPrice(Positive<Usd>);
+
+impl AlpacaLimitPrice {
+    pub fn try_new(limit_price: Positive<Usd>) -> Result<Self, AlpacaBrokerApiError> {
+        validate_limit_price_precision(limit_price)?;
+        Ok(Self(limit_price))
+    }
+
+    pub fn as_price(&self) -> &Positive<Usd> {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> Positive<Usd> {
+        self.0
+    }
 }
 
 /// Order request for placing market orders.
@@ -91,7 +110,7 @@ pub(super) struct LimitOrderRequest {
     pub side: OrderSide,
     #[serde(rename = "type")]
     pub order_type: &'static str,
-    pub limit_price: Positive<Usd>,
+    pub limit_price: AlpacaLimitPrice,
     pub time_in_force: &'static str,
     pub extended_hours: bool,
 }
@@ -287,8 +306,6 @@ pub(super) async fn place_limit_order(
         "Placing Alpaca Broker API limit order"
     );
 
-    validate_limit_price_precision(limit_order.limit_price)?;
-
     let placed_shares = truncate_shares_to_alpaca_precision(limit_order.shares)?;
 
     let side = match limit_order.direction {
@@ -301,7 +318,7 @@ pub(super) async fn place_limit_order(
         quantity: placed_shares,
         side,
         order_type: "limit",
-        limit_price: limit_order.limit_price,
+        limit_price: limit_order.limit_price.clone(),
         time_in_force: TimeInForce::Day.as_api_str(),
         extended_hours: limit_order.extended_hours,
     };
@@ -627,7 +644,10 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(100))).unwrap(),
             direction: Direction::Buy,
-            limit_price: Positive::new(Usd::new(float!(195.25))).unwrap(),
+            limit_price: AlpacaLimitPrice::try_new(
+                Positive::new(Usd::new(float!(195.25))).unwrap(),
+            )
+            .unwrap(),
             extended_hours: false,
         };
 
@@ -674,7 +694,8 @@ mod tests {
             symbol: Symbol::new("TSLA").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(50))).unwrap(),
             direction: Direction::Sell,
-            limit_price: Positive::new(Usd::new(float!(210))).unwrap(),
+            limit_price: AlpacaLimitPrice::try_new(Positive::new(Usd::new(float!(210))).unwrap())
+                .unwrap(),
             extended_hours: true,
         };
 
@@ -687,21 +708,10 @@ mod tests {
         assert_eq!(placement.direction, Direction::Sell);
     }
 
-    #[tokio::test]
-    async fn test_place_limit_order_rejects_price_with_more_than_two_decimals_at_or_above_one() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
-        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
-
-        let limit_order = AlpacaLimitOrder {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
-            direction: Direction::Buy,
-            limit_price: Positive::new(Usd::new(float!(195.255))).unwrap(),
-            extended_hours: false,
-        };
-
-        let error = place_limit_order(&client, limit_order).await.unwrap_err();
+    #[test]
+    fn test_alpaca_limit_price_rejects_more_than_two_decimals_at_or_above_one() {
+        let error = AlpacaLimitPrice::try_new(Positive::new(Usd::new(float!(195.255))).unwrap())
+            .unwrap_err();
 
         assert!(
             matches!(
@@ -715,21 +725,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_place_limit_order_rejects_price_with_more_than_four_decimals_below_one() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
-        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
-
-        let limit_order = AlpacaLimitOrder {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
-            direction: Direction::Buy,
-            limit_price: Positive::new(Usd::new(float!(0.12345))).unwrap(),
-            extended_hours: false,
-        };
-
-        let error = place_limit_order(&client, limit_order).await.unwrap_err();
+    #[test]
+    fn test_alpaca_limit_price_rejects_more_than_four_decimals_below_one() {
+        let error = AlpacaLimitPrice::try_new(Positive::new(Usd::new(float!(0.12345))).unwrap())
+            .unwrap_err();
 
         assert!(
             matches!(
@@ -777,7 +776,10 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
             direction: Direction::Buy,
-            limit_price: Positive::new(Usd::new(float!(0.1234))).unwrap(),
+            limit_price: AlpacaLimitPrice::try_new(
+                Positive::new(Usd::new(float!(0.1234))).unwrap(),
+            )
+            .unwrap(),
             extended_hours: false,
         };
 
@@ -1126,7 +1128,8 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Sell,
-            limit_price: Positive::new(Usd::new(float!(17.45))).unwrap(),
+            limit_price: AlpacaLimitPrice::try_new(Positive::new(Usd::new(float!(17.45))).unwrap())
+                .unwrap(),
             extended_hours: false,
         };
 
@@ -1156,7 +1159,10 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Buy,
-            limit_price: Positive::new(Usd::new(float!(195.25))).unwrap(),
+            limit_price: AlpacaLimitPrice::try_new(
+                Positive::new(Usd::new(float!(195.25))).unwrap(),
+            )
+            .unwrap(),
             extended_hours: false,
         };
 
