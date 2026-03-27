@@ -6,7 +6,7 @@ use rocket_ws::{Channel, Message, WebSocket};
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::{debug, info, trace, warn};
+use tracing::{info, trace, warn};
 
 use st0x_dto::{InitialState, ServerMessage};
 
