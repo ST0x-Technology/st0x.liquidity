@@ -167,7 +167,7 @@
 <Card.Root class="flex h-full min-h-56 flex-col overflow-hidden">
   <Card.Header class="shrink-0 pb-0">
     <Card.Title class="flex items-center justify-between">
-      <span>Inventory Transfers</span>
+      <span>Cross-venue Transfers</span>
       <span class="text-sm font-normal text-muted-foreground">
         {#if activeTransfers.length > 0}
           [{activeTransfers.length}/{allTransfers.length}] in-flight

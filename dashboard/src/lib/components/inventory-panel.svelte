@@ -16,7 +16,7 @@
 
 <Card.Root class="flex shrink-0 flex-col overflow-hidden">
   <Card.Header class="shrink-0 pb-3">
-    <Card.Title>Available Inventory</Card.Title>
+    <Card.Title>Overview</Card.Title>
   </Card.Header>
   <Card.Content class="relative min-h-0 flex-1 overflow-auto px-6 pt-0">
     {#if !inventory}
