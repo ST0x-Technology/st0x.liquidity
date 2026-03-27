@@ -7,9 +7,7 @@
   import * as Separator from '$lib/components/ui/separator'
   import type { Inventory } from '$lib/api/Inventory'
   import type { TransferOperation } from '$lib/api/TransferOperation'
-  import type { Warning } from '$lib/api/Warning'
   import { matcher } from '$lib/fp'
-  import { warningMessage } from '$lib/warnings'
   import { decimalCompare, formatDecimal } from '$lib/decimal'
   import { reactive } from '$lib/frp.svelte'
 
@@ -28,18 +26,12 @@
     enabled: false
   }))
 
-  const warningsQuery = createQuery<Warning[]>(() => ({
-    queryKey: ['warnings'],
-    enabled: false
-  }))
-
   const inventory = $derived(inventoryQuery.data)
   const symbols = $derived(inventory?.perSymbol ?? [])
   const usdc = $derived(inventory?.usdc)
 
   const activeTransfers = $derived(activeQuery.data ?? [])
   const recentTransfers = $derived(recentQuery.data ?? [])
-  const warnings = $derived(warningsQuery.data ?? [])
   const allTransfers = $derived.by(() => {
     const byId = new Map(activeTransfers.map((transfer) => [transfer.id, transfer]))
     for (const transfer of recentTransfers) {
@@ -195,18 +187,10 @@
     {:else}
       <AvailableInventory {symbols} {usdc} />
 
-      {#if allTransfers.length > 0 || warnings.length > 0}
+      {#if allTransfers.length > 0}
         <Separator.Root class="my-6" />
 
         <div class="pb-3 text-lg font-semibold leading-none tracking-tight">Inventory Transfers</div>
-
-        {#if warnings.length > 0}
-          <div class="mb-3 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-            {#each warnings as warning, idx (idx)}
-              <p>{warningMessage(warning)}</p>
-            {/each}
-          </div>
-        {/if}
 
         <Table.Root>
           <Table.Header>

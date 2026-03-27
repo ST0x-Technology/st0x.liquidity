@@ -4,10 +4,8 @@
   import * as Table from '$lib/components/ui/table'
   import { Badge, type BadgeVariant } from '$lib/components/ui/badge'
   import type { TransferOperation } from '$lib/api/TransferOperation'
-  import type { Warning } from '$lib/api/Warning'
   import { matcher } from '$lib/fp'
   import { formatDecimal } from '$lib/decimal'
-  import { warningMessage } from '$lib/warnings'
   import { transferKey } from '$lib/websocket.svelte'
 
   const activeQuery = createQuery<TransferOperation[]>(() => ({
@@ -20,14 +18,8 @@
     enabled: false
   }))
 
-  const warningsQuery = createQuery<Warning[]>(() => ({
-    queryKey: ['warnings'],
-    enabled: false
-  }))
-
   const activeTransfers = $derived(activeQuery.data ?? [])
   const recentTransfers = $derived(recentQuery.data ?? [])
-  const warnings = $derived(warningsQuery.data ?? [])
   const allTransfers = $derived.by(() => {
     const byKey = new Map(activeTransfers.map((transfer) => [transferKey(transfer), transfer]))
     for (const transfer of recentTransfers) {
@@ -74,13 +66,6 @@
       {/if}
     </Card.Title>
   </Card.Header>
-  {#if warnings.length > 0}
-    <div class="mx-6 mt-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-      {#each warnings as warning, idx (idx)}
-        <p>{warningMessage(warning)}</p>
-      {/each}
-    </div>
-  {/if}
   <Card.Content class="relative min-h-0 flex-1 overflow-auto px-6 pt-0">
     {#if allTransfers.length === 0}
       <div class="flex h-full items-center justify-center text-muted-foreground">
