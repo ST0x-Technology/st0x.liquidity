@@ -17,7 +17,9 @@ use tracing::{info, warn};
 
 use rain_math_float::Float;
 use st0x_evm::OpenChainErrorRegistry;
-use st0x_execution::{AlpacaAccountId, Direction, FractionalShares, Positive, Symbol, TimeInForce};
+use st0x_execution::{
+    AlpacaAccountId, Direction, FractionalShares, Positive, Symbol, TimeInForce, Usd,
+};
 use st0x_finance::Usdc;
 
 use crate::config::{BrokerCtx, Ctx, Env};
@@ -55,21 +57,9 @@ fn parse_float(input: &str) -> Result<Float, String> {
     Float::parse(input.to_string()).map_err(|err| format!("{err}"))
 }
 
-fn parse_positive_price(input: &str) -> Result<Float, String> {
-    let price = parse_float(input)?;
-
-    if price
-        .lt(Float::zero().map_err(|err| format!("{err}"))?)
-        .map_err(|err| format!("{err}"))?
-    {
-        return Err("limit price must be positive".to_string());
-    }
-
-    if price.is_zero().map_err(|err| format!("{err}"))? {
-        return Err("limit price must be positive".to_string());
-    }
-
-    Ok(price)
+fn parse_positive_price(input: &str) -> Result<Positive<Usd>, String> {
+    let price = input.parse::<Usd>().map_err(|err| format!("{err}"))?;
+    Positive::new(price).map_err(|_| "limit price must be positive".to_string())
 }
 
 fn parse_positive_shares(input: &str) -> Result<Positive<FractionalShares>, String> {
@@ -101,9 +91,9 @@ pub enum Commands {
         time_in_force: Option<TimeInForce>,
         /// Limit price for a manual Alpaca Broker API limit order
         #[arg(long = "limit-price", value_parser = parse_positive_price)]
-        limit_price: Option<Float>,
+        limit_price: Option<Positive<Usd>>,
         /// Submit the limit order as extended-hours eligible
-        #[arg(long = "extended-hours")]
+        #[arg(long = "extended-hours", requires = "limit_price")]
         extended_hours: bool,
     },
     /// Sell shares of a stock
@@ -119,9 +109,9 @@ pub enum Commands {
         time_in_force: Option<TimeInForce>,
         /// Limit price for a manual Alpaca Broker API limit order
         #[arg(long = "limit-price", value_parser = parse_positive_price)]
-        limit_price: Option<Float>,
+        limit_price: Option<Positive<Usd>>,
         /// Submit the limit order as extended-hours eligible
-        #[arg(long = "extended-hours")]
+        #[arg(long = "extended-hours", requires = "limit_price")]
         extended_hours: bool,
     },
     /// Process a transaction hash to execute opposite-side trade
@@ -446,14 +436,14 @@ enum SimpleCommand {
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
         time_in_force: Option<TimeInForce>,
-        limit_price: Option<Float>,
+        limit_price: Option<Positive<Usd>>,
         extended_hours: bool,
     },
     Sell {
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
         time_in_force: Option<TimeInForce>,
-        limit_price: Option<Float>,
+        limit_price: Option<Positive<Usd>>,
         extended_hours: bool,
     },
     Auth,
@@ -890,7 +880,7 @@ mod tests {
         shares: Positive<FractionalShares>,
         direction: Direction,
         time_in_force: Option<TimeInForce>,
-        limit_price: Option<Float>,
+        limit_price: Option<Positive<Usd>>,
         extended_hours: bool,
     ) -> trading::CliOrderRequest {
         trading::CliOrderRequest {
@@ -1389,6 +1379,19 @@ mod tests {
     }
 
     #[test]
+    fn test_buy_command_requires_limit_price_for_extended_hours() {
+        let error =
+            Cli::try_parse_from(["schwab", "buy", "-s", "AAPL", "-q", "1", "--extended-hours"])
+                .unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("--limit-price"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
     fn test_buy_command_rejects_zero_quantity() {
         let error = Cli::try_parse_from(["schwab", "buy", "-s", "AAPL", "-q", "0"]).unwrap_err();
         let message = error.to_string();
@@ -1728,7 +1731,8 @@ mod tests {
         assert!(
             limit_price
                 .unwrap()
-                .eq(Float::parse("195.25".to_string()).unwrap())
+                .inner()
+                .eq(&Usd::new(Float::parse("195.25".to_string()).unwrap()))
                 .unwrap()
         );
     }

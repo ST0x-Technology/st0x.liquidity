@@ -8,7 +8,7 @@ use super::client::AlpacaBrokerApiClient;
 use super::{AlpacaBrokerApiError, TimeInForce};
 use crate::{
     Direction, FractionalShares, MarketOrder, OrderPlacement, OrderStatus, OrderUpdate, Positive,
-    Symbol, deserialize_float_from_number_or_string,
+    Symbol, Usd, deserialize_float_from_number_or_string,
     deserialize_option_float_from_number_or_string, serialize_float_as_string,
 };
 
@@ -56,7 +56,7 @@ pub struct AlpacaLimitOrder {
     pub symbol: Symbol,
     pub shares: Positive<FractionalShares>,
     pub direction: Direction,
-    pub limit_price: Float,
+    pub limit_price: Positive<Usd>,
     pub time_in_force: TimeInForce,
     pub extended_hours: bool,
 }
@@ -91,8 +91,7 @@ pub(super) struct LimitOrderRequest {
     pub side: OrderSide,
     #[serde(rename = "type")]
     pub order_type: &'static str,
-    #[serde(serialize_with = "serialize_float_as_string")]
-    pub limit_price: Float,
+    pub limit_price: Positive<Usd>,
     pub time_in_force: &'static str,
     pub extended_hours: bool,
 }
@@ -611,7 +610,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(100))).unwrap(),
             direction: Direction::Buy,
-            limit_price: float!(195.25),
+            limit_price: Positive::new(Usd::new(float!(195.25))).unwrap(),
             time_in_force: TimeInForce::Day,
             extended_hours: false,
         };
@@ -659,7 +658,7 @@ mod tests {
             symbol: Symbol::new("TSLA").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(50))).unwrap(),
             direction: Direction::Sell,
-            limit_price: float!(210),
+            limit_price: Positive::new(Usd::new(float!(210))).unwrap(),
             time_in_force: TimeInForce::Day,
             extended_hours: true,
         };
@@ -683,7 +682,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
             direction: Direction::Buy,
-            limit_price: float!(195.25),
+            limit_price: Positive::new(Usd::new(float!(195.25))).unwrap(),
             time_in_force: TimeInForce::MarketOnClose,
             extended_hours: false,
         };
@@ -1040,7 +1039,7 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Sell,
-            limit_price: float!(17.45),
+            limit_price: Positive::new(Usd::new(float!(17.45))).unwrap(),
             time_in_force: TimeInForce::Day,
             extended_hours: false,
         };
@@ -1071,7 +1070,7 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Buy,
-            limit_price: float!(195.25),
+            limit_price: Positive::new(Usd::new(float!(195.25))).unwrap(),
             time_in_force: TimeInForce::Day,
             extended_hours: false,
         };

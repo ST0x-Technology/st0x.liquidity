@@ -282,7 +282,7 @@ mod tests {
     use crate::alpaca_broker_api::auth::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
     };
-    use crate::{Direction, FractionalShares, Positive};
+    use crate::{Direction, FractionalShares, Positive, Usd};
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b"));
@@ -889,7 +889,8 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Buy,
-            limit_price: Float::parse("195.25".to_string()).unwrap(),
+            limit_price: Positive::new(Usd::new(Float::parse("195.25".to_string()).unwrap()))
+                .unwrap(),
             time_in_force: TimeInForce::Day,
             extended_hours: true,
         };

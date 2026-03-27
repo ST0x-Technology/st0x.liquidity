@@ -15,7 +15,7 @@ use st0x_evm::ReadOnlyEvm;
 use st0x_execution::{
     AlpacaLimitOrder, Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder,
     MockExecutor, MockExecutorCtx, OrderPlacement, OrderState, Positive, Symbol, TimeInForce,
-    TryIntoExecutor,
+    TryIntoExecutor, Usd,
 };
 
 use super::auth::ensure_schwab_authentication;
@@ -66,7 +66,7 @@ pub(super) struct CliOrderRequest {
     pub(super) shares: Positive<FractionalShares>,
     pub(super) direction: Direction,
     pub(super) time_in_force: Option<TimeInForce>,
-    pub(super) limit_price: Option<Float>,
+    pub(super) limit_price: Option<Positive<Usd>>,
     pub(super) extended_hours: bool,
 }
 
@@ -276,7 +276,7 @@ async fn execute_alpaca_limit_order<W: Write>(
 fn write_order_success<W: Write>(
     stdout: &mut W,
     placement: &OrderPlacement<String>,
-    limit_price: Option<Float>,
+    limit_price: Option<Positive<Usd>>,
     extended_hours: bool,
 ) -> anyhow::Result<()> {
     info!(
@@ -296,7 +296,7 @@ fn write_order_success<W: Write>(
         writeln!(
             stdout,
             "   Limit Price: ${}",
-            format_float_with_fallback(&limit_price)
+            format_float_with_fallback(&limit_price.inner().inner())
         )?;
         writeln!(
             stdout,
@@ -652,7 +652,7 @@ mod tests {
     use crate::threshold::ExecutionThreshold;
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaTradingApiCtx,
-        AlpacaTradingApiMode,
+        AlpacaTradingApiMode, Usd,
     };
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
@@ -727,7 +727,7 @@ mod tests {
         shares: Positive<FractionalShares>,
         direction: Direction,
         time_in_force: Option<TimeInForce>,
-        limit_price: Option<Float>,
+        limit_price: Option<Positive<Usd>>,
         extended_hours: bool,
     ) -> CliOrderRequest {
         CliOrderRequest {
@@ -738,6 +738,10 @@ mod tests {
             limit_price,
             extended_hours,
         }
+    }
+
+    fn positive_limit_price(value: &str) -> Positive<Usd> {
+        Positive::new(Usd::new(Float::parse(value.to_string()).unwrap())).unwrap()
     }
 
     macro_rules! execute_order_with_writers {
@@ -1067,7 +1071,7 @@ mod tests {
             positive_shares("10"),
             Direction::Buy,
             None,
-            Some(Float::parse("195.25".to_string()).unwrap()),
+            Some(positive_limit_price("195.25")),
             true,
             &ctx,
             &pool,
@@ -1129,7 +1133,7 @@ mod tests {
             positive_shares("10"),
             Direction::Buy,
             None,
-            Some(Float::parse("195.25".to_string()).unwrap()),
+            Some(positive_limit_price("195.25")),
             false,
             &ctx,
             &pool,
@@ -1155,7 +1159,7 @@ mod tests {
             positive_shares("10"),
             Direction::Buy,
             None,
-            Some(Float::parse("195.25".to_string()).unwrap()),
+            Some(positive_limit_price("195.25")),
             false,
             &ctx,
             &pool,
@@ -1181,7 +1185,7 @@ mod tests {
             positive_shares("10"),
             Direction::Buy,
             None,
-            Some(Float::parse("195.25".to_string()).unwrap()),
+            Some(positive_limit_price("195.25")),
             false,
             &ctx,
             &pool,
@@ -1208,7 +1212,7 @@ mod tests {
             positive_shares("10"),
             Direction::Buy,
             Some(TimeInForce::MarketOnClose),
-            Some(Float::parse("195.25".to_string()).unwrap()),
+            Some(positive_limit_price("195.25")),
             false,
             &ctx,
             &pool,
