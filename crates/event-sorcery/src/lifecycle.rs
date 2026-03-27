@@ -61,6 +61,14 @@ pub(crate) enum Lifecycle<Entity: EventSourced> {
 }
 
 impl<Entity: EventSourced> Lifecycle<Entity> {
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::Uninitialized => "uninitialized",
+            Self::Live(_) => "live",
+            Self::Failed { .. } => "failed",
+        }
+    }
+
     pub(crate) fn into_result(self) -> Result<Option<Entity>, LifecycleError<Entity>> {
         match self {
             Self::Live(entity) => Ok(Some(entity)),
