@@ -113,6 +113,8 @@ impl Conductor {
         executor: E,
         ctx: Ctx,
         pool: SqlitePool,
+        mut job_queue: DexTradeAccountingJobQueue,
+        executor: E,
         executor_maintenance: Option<JoinHandle<()>>,
         event_sender: broadcast::Sender<ServerMessage>,
         inventory: Arc<BroadcastingInventory>,
