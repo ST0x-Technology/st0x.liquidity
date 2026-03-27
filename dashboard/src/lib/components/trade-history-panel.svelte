@@ -25,13 +25,10 @@
     return date.toLocaleTimeString('en-US', { hour12: false })
   }
 
-  const exposureSign = (direction: Trade['direction']): string =>
-    direction === 'buy' ? '+' : '-'
-
-  const directionClass = (direction: Trade['direction']): string =>
+  const directionColor = (direction: Trade['direction']): string =>
     direction === 'buy' ? 'text-green-500' : 'text-red-500'
 
-  const tradesWithNet = $derived.by(() => {
+  const tradesWithDislocation = $derived.by(() => {
     const net = new Map<string, number>()
     const sorted = [...trades].sort(
       (lhs, rhs) => new Date(lhs.filledAt).getTime() - new Date(rhs.filledAt).getTime()
@@ -44,18 +41,15 @@
       const updated = prev + delta
       net.set(trade.symbol, updated)
 
-      return {
-        ...trade,
-        netExposure: updated
-      }
+      return { ...trade, delta, netDislocation: updated }
     }).reverse()
   })
 
-  const formatShares = (value: number): string => {
+  const fmtSigned = (value: number): string => {
     const abs = Math.abs(value)
-    if (abs === 0) return '0'
-    if (abs >= 1) return abs.toFixed(2)
-    return abs.toPrecision(4)
+    const sign = value >= 0 ? '+' : '-'
+    const formatted = abs === 0 ? '0' : abs >= 1 ? abs.toFixed(2) : abs.toPrecision(4)
+    return `${sign}${formatted}`
   }
 </script>
 
@@ -79,16 +73,15 @@
           <Table.Row>
             <Table.Head>Time</Table.Head>
             <Table.Head>Venue</Table.Head>
-            <Table.Head>Underlying</Table.Head>
             <Table.Head>Side</Table.Head>
-            <Table.Head class="text-right">Exposure Change</Table.Head>
             <Table.Head class="text-right">Dislocation</Table.Head>
+            <Table.Head>Underlying</Table.Head>
           </Table.Row>
         </Table.Header>
         <Table.Body>
-          {#each tradesWithNet as trade (trade.filledAt + trade.symbol + trade.venue)}
+          {#each tradesWithDislocation as trade (trade.filledAt + trade.symbol + trade.venue)}
             <Table.Row>
-              <Table.Cell class="font-mono text-xs">
+              <Table.Cell class="font-mono text-xs text-muted-foreground">
                 {formatTime(trade.filledAt)}
               </Table.Cell>
 
@@ -96,20 +89,22 @@
                 {venueLabel(trade.venue)}
               </Table.Cell>
 
-              <Table.Cell class="text-xs font-mono font-medium">
-                {trade.symbol}
-              </Table.Cell>
-
-              <Table.Cell class="text-xs font-medium {directionClass(trade.direction)}">
+              <Table.Cell class="text-xs font-medium {directionColor(trade.direction)}">
                 {trade.direction === 'buy' ? 'Buy' : 'Sell'}
               </Table.Cell>
 
-              <Table.Cell class="text-right font-mono text-xs {directionClass(trade.direction)}">
-                {exposureSign(trade.direction)}{formatShares(parseFloat(trade.shares))}
+              <Table.Cell class="text-right font-mono text-xs">
+                <span class={directionColor(trade.direction)}>
+                  {fmtSigned(trade.delta)}
+                </span>
+                {' '}
+                <span class="text-muted-foreground">
+                  (net: {fmtSigned(trade.netDislocation)})
+                </span>
               </Table.Cell>
 
-              <Table.Cell class="text-right font-mono text-xs {trade.netExposure >= 0 ? 'text-green-500' : 'text-red-500'}">
-                {trade.netExposure >= 0 ? '+' : ''}{formatShares(trade.netExposure)}
+              <Table.Cell class="font-mono text-xs font-medium">
+                {trade.symbol}
               </Table.Cell>
             </Table.Row>
           {/each}
