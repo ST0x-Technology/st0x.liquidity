@@ -50,7 +50,7 @@
     symbol.startsWith('t') ? symbol.slice(1) : symbol
 
   type SortDir = 'asc' | 'desc'
-  type Col = 'asset' | 'alpaca' | 'inflight' | 'raindex' | 'total'
+  type Col = 'asset' | 'alpaca' | 'inflight' | 'raindex' | 'total' | 'ratio'
   type SortState = { column: Col; dir: SortDir } | null
 
   const sort = reactive<SortState>(null)
@@ -76,12 +76,24 @@
 
   const sortBtnClass = 'w-full cursor-pointer select-none text-nowrap'
 
+  const computeRatio = (raindex: string, alpaca: string): number => {
+    const onchain = parseFloat(raindex)
+    const offchain = parseFloat(alpaca)
+    const total = onchain + offchain
+    if (total === 0) return 0
+    return onchain / total
+  }
+
+  const formatRatio = (ratio: number): string =>
+    `${(ratio * 100).toFixed(1)}%`
+
   type Row = {
     asset: string
     alpaca: Formatted
     inflight: Formatted
     raindex: Formatted
     total: Formatted
+    ratio: number
     isCash: boolean
   }
 
@@ -98,6 +110,7 @@
         inflight: fmt(inflight),
         raindex: fmt(item.onchainAvailable),
         total: fmtValue(totalVal),
+        ratio: computeRatio(item.onchainAvailable, item.offchainAvailable),
         isCash: false,
       }
     })
@@ -118,6 +131,7 @@
       inflight: fmt(inflight),
       raindex: fmt(usdc.onchainAvailable),
       total: fmtValue(total),
+      ratio: computeRatio(usdc.onchainAvailable, usdc.offchainAvailable),
       isCash: true,
     }
   })
@@ -128,6 +142,7 @@
     inflight: (lhs, rhs) => decimalCompare(lhs.inflight.full, rhs.inflight.full),
     raindex: (lhs, rhs) => decimalCompare(lhs.raindex.full, rhs.raindex.full),
     total: (lhs, rhs) => decimalCompare(lhs.total.full, rhs.total.full),
+    ratio: (lhs, rhs) => lhs.ratio - rhs.ratio,
   }
 
   const sortedEquities = $derived.by(() => {
@@ -149,33 +164,39 @@
 <Table.Root class="table-fixed">
   <Table.Header>
     <Table.Row>
-      <Table.Head class="w-[16%]" aria-sort={ariaSort(sort.current, 'asset')}>
+      <Table.Head class="w-[12%]" aria-sort={ariaSort(sort.current, 'asset')}>
         <button class="{sortBtnClass} text-left" onclick={toggleSort('asset')}>
           Asset{sortIndicator(sort.current, 'asset')}
         </button>
       </Table.Head>
 
-      <Table.Head class="text-right w-[21%]" aria-sort={ariaSort(sort.current, 'alpaca')}>
+      <Table.Head class="text-right w-[18%]" aria-sort={ariaSort(sort.current, 'alpaca')}>
         <button class="{sortBtnClass} text-right" onclick={toggleSort('alpaca')}>
           Alpaca{sortIndicator(sort.current, 'alpaca')}
         </button>
       </Table.Head>
 
-      <Table.Head class="text-right w-[21%]" aria-sort={ariaSort(sort.current, 'inflight')}>
+      <Table.Head class="text-right w-[14%]" aria-sort={ariaSort(sort.current, 'inflight')}>
         <button class="{sortBtnClass} text-right" onclick={toggleSort('inflight')}>
           Inflight{sortIndicator(sort.current, 'inflight')}
         </button>
       </Table.Head>
 
-      <Table.Head class="text-right w-[21%]" aria-sort={ariaSort(sort.current, 'raindex')}>
+      <Table.Head class="text-right w-[18%]" aria-sort={ariaSort(sort.current, 'raindex')}>
         <button class="{sortBtnClass} text-right" onclick={toggleSort('raindex')}>
           Raindex{sortIndicator(sort.current, 'raindex')}
         </button>
       </Table.Head>
 
-      <Table.Head class="text-right w-[21%]" aria-sort={ariaSort(sort.current, 'total')}>
+      <Table.Head class="text-right w-[18%]" aria-sort={ariaSort(sort.current, 'total')}>
         <button class="{sortBtnClass} text-right" onclick={toggleSort('total')}>
           Total{sortIndicator(sort.current, 'total')}
+        </button>
+      </Table.Head>
+
+      <Table.Head class="text-right w-[14%]" aria-sort={ariaSort(sort.current, 'ratio')}>
+        <button class="{sortBtnClass} text-right" onclick={toggleSort('ratio')}>
+          Raindex Ratio{sortIndicator(sort.current, 'ratio')}
         </button>
       </Table.Head>
     </Table.Row>
@@ -196,9 +217,12 @@
         <Table.Cell class="text-right font-mono font-semibold">
           <span class={approxClass(cashRow.total)} title={cashRow.total.truncated ? cashRow.total.full : undefined}>{cashRow.total.display}</span>
         </Table.Cell>
+        <Table.Cell class="text-right font-mono text-muted-foreground">
+          {formatRatio(cashRow.ratio)}
+        </Table.Cell>
       </Table.Row>
       <Table.Row>
-        <Table.Cell colspan={5} class="py-3 px-0">
+        <Table.Cell colspan={6} class="py-3 px-0">
           <div class="h-px bg-border"></div>
         </Table.Cell>
       </Table.Row>
@@ -220,6 +244,9 @@
         </Table.Cell>
         <Table.Cell class="text-right font-mono font-semibold">
           <span class={approxClass(row.total)} title={row.total.truncated ? row.total.full : undefined}>{row.total.display}</span>
+        </Table.Cell>
+        <Table.Cell class="text-right font-mono text-muted-foreground">
+          {formatRatio(row.ratio)}
         </Table.Cell>
       </Table.Row>
     {/each}

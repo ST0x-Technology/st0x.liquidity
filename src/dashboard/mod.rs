@@ -6,7 +6,7 @@ use rocket_ws::{Channel, Message, WebSocket};
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use st0x_dto::{InitialState, ServerMessage};
 
@@ -67,7 +67,7 @@ fn ws_endpoint<'r>(
             loop {
                 match receiver.recv().await {
                     Ok(msg) => {
-                        debug!(msg = %msg.kind(), "Broadcasting to dashboard client");
+                        trace!(msg = %msg.kind(), "Broadcasting to dashboard client");
                         let json = match serde_json::to_string(&msg) {
                             Ok(serialized) => serialized,
                             Err(error) => {
