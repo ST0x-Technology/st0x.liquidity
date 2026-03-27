@@ -28,6 +28,38 @@ pub(crate) async fn load_trades(pool: &SqlitePool) -> Vec<Trade> {
     trades
 }
 
+fn onchain_to_trade(entity: &OnChainTrade) -> Trade {
+    Trade {
+        filled_at: entity.filled_at,
+        venue: st0x_dto::TradingVenue::Raindex,
+        direction: direction_to_dto(entity.direction),
+        symbol: entity.symbol.clone(),
+        shares: st0x_finance::FractionalShares::new(entity.amount),
+    }
+}
+
+fn offchain_to_trade(order: &OffchainOrder) -> Option<Trade> {
+    let OffchainOrder::Filled {
+        symbol,
+        shares,
+        direction,
+        executor,
+        filled_at,
+        ..
+    } = order
+    else {
+        return None;
+    };
+
+    Some(Trade {
+        filled_at: *filled_at,
+        venue: executor_to_venue(*executor),
+        direction: direction_to_dto(*direction),
+        symbol: symbol.clone(),
+        shares: st0x_finance::FractionalShares::new(shares.inner().inner()),
+    })
+}
+
 async fn load_onchain_trades(pool: &SqlitePool) -> Vec<Trade> {
     let ids = match load_all_ids::<OnChainTrade>(pool).await {
         Ok(ids) => ids,
@@ -40,26 +72,29 @@ async fn load_onchain_trades(pool: &SqlitePool) -> Vec<Trade> {
     let mut trades = Vec::with_capacity(ids.len());
 
     for id in &ids {
-        match load_entity::<OnChainTrade>(pool, id).await {
-            Ok(Some(entity)) => {
-                trades.push(Trade {
-                    filled_at: entity.filled_at,
-                    venue: st0x_dto::TradingVenue::Raindex,
-                    direction: direction_to_dto(entity.direction),
-                    symbol: entity.symbol,
-                    shares: st0x_finance::FractionalShares::new(entity.amount),
-                });
-            }
-            Ok(None) => {
-                warn!(?id, "OnChainTrade replayed to empty state");
-            }
-            Err(error) => {
-                warn!(?error, ?id, "Failed to load OnChainTrade");
-            }
+        if let Some(trade) = replay_onchain(pool, id).await {
+            trades.push(trade);
         }
     }
 
     trades
+}
+
+async fn replay_onchain(
+    pool: &SqlitePool,
+    id: &crate::onchain_trade::OnChainTradeId,
+) -> Option<Trade> {
+    match load_entity::<OnChainTrade>(pool, id).await {
+        Ok(Some(entity)) => Some(onchain_to_trade(&entity)),
+        Ok(None) => {
+            warn!(?id, "OnChainTrade replayed to empty state");
+            None
+        }
+        Err(error) => {
+            warn!(?error, ?id, "Failed to load OnChainTrade");
+            None
+        }
+    }
 }
 
 async fn load_offchain_trades(pool: &SqlitePool) -> Vec<Trade> {
@@ -74,35 +109,29 @@ async fn load_offchain_trades(pool: &SqlitePool) -> Vec<Trade> {
     let mut trades = Vec::new();
 
     for id in &ids {
-        match load_entity::<OffchainOrder>(pool, id).await {
-            Ok(Some(OffchainOrder::Filled {
-                symbol,
-                shares,
-                direction,
-                executor,
-                filled_at,
-                ..
-            })) => {
-                trades.push(Trade {
-                    filled_at,
-                    venue: executor_to_venue(executor),
-                    direction: direction_to_dto(direction),
-                    symbol,
-                    shares: st0x_finance::FractionalShares::new(shares.inner().inner()),
-                });
-            }
-
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                warn!(?id, "OffchainOrder replayed to empty state");
-            }
-            Err(error) => {
-                warn!(?error, ?id, "Failed to load OffchainOrder");
-            }
+        if let Some(trade) = replay_offchain(pool, id).await {
+            trades.push(trade);
         }
     }
 
     trades
+}
+
+async fn replay_offchain(
+    pool: &SqlitePool,
+    id: &crate::offchain_order::OffchainOrderId,
+) -> Option<Trade> {
+    match load_entity::<OffchainOrder>(pool, id).await {
+        Ok(Some(order)) => offchain_to_trade(&order),
+        Ok(None) => {
+            warn!(?id, "OffchainOrder replayed to empty state");
+            None
+        }
+        Err(error) => {
+            warn!(?error, ?id, "Failed to load OffchainOrder");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
