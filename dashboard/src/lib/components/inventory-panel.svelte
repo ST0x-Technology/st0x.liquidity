@@ -14,7 +14,7 @@
   const usdc = $derived(inventory?.usdc)
 </script>
 
-<Card.Root class="flex h-full min-h-56 flex-col overflow-hidden">
+<Card.Root class="flex shrink-0 flex-col overflow-hidden">
   <Card.Header class="shrink-0 pb-3">
     <Card.Title>Available Inventory</Card.Title>
   </Card.Header>

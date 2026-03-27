@@ -56,14 +56,12 @@
     </div>
   {/if}
 
-  <main class="flex-1 overflow-auto p-2 md:overflow-hidden md:p-4">
-    <div class="flex h-full flex-col gap-2 md:gap-4">
-      <InventoryPanel />
+  <main class="flex min-h-0 flex-1 flex-col gap-2 overflow-hidden p-2 md:gap-4 md:p-4">
+    <InventoryPanel />
 
-      <div class="grid min-h-0 flex-1 grid-cols-1 gap-2 md:grid-cols-2 md:gap-4">
-        <TradeHistoryPanel />
-        <TransferPanel />
-      </div>
+    <div class="grid min-h-0 flex-1 grid-cols-1 gap-2 md:grid-cols-2 md:gap-4">
+      <TradeHistoryPanel />
+      <TransferPanel />
     </div>
   </main>
 </div>
