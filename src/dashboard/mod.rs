@@ -14,7 +14,7 @@ use crate::inventory::BroadcastingInventory;
 
 mod event;
 mod transfer_loader;
-pub(crate) use event::EventBroadcaster;
+pub(crate) use event::Broadcaster;
 
 pub(crate) struct Broadcast {
     pub(crate) sender: broadcast::Sender<ServerMessage>,
@@ -44,7 +44,6 @@ fn ws_endpoint<'r>(
                 inventory: inventory_dto,
                 active_transfers: transfers.active,
                 recent_transfers: transfers.recent,
-                warnings: transfers.warnings,
                 ..InitialState::default()
             };
 
@@ -105,7 +104,7 @@ mod tests {
     use rocket::config::Config;
     use rocket::fairing::AdHoc;
     use serde_json::json;
-    use st0x_dto::EventStoreEntry;
+    use st0x_dto::{Concern, Statement};
     use std::sync::Mutex;
     use tokio::sync::oneshot;
     use tokio_tungstenite::connect_async;
@@ -135,11 +134,10 @@ mod tests {
     async fn initial_state_stub_serializes_correctly() {
         let initial = InitialState::default();
         let json = serde_json::to_string(&initial).expect("serialization should succeed");
-        assert!(json.contains("recentTrades"));
+        assert!(json.contains("trades"));
         assert!(json.contains("inventory"));
-        assert!(json.contains("metrics"));
-        assert!(json.contains("authStatus"));
-        assert!(json.contains("circuitBreaker"));
+        assert!(json.contains("activeTransfers"));
+        assert!(json.contains("recentTransfers"));
     }
 
     #[tokio::test]
@@ -244,7 +242,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("invalid JSON");
 
         assert_eq!(parsed["type"], "initial");
-        assert!(parsed["data"]["recentTrades"].is_array());
+        assert!(parsed["data"]["trades"].is_array());
         assert!(parsed["data"]["inventory"].is_object());
 
         shutdown_handle.notify();
@@ -360,15 +358,11 @@ mod tests {
         client1.next().await.expect("client1 initial").unwrap();
         client2.next().await.expect("client2 initial").unwrap();
 
-        // Broadcast an event message
-        let event = EventStoreEntry {
-            aggregate_type: "TestAggregate".to_string(),
-            aggregate_id: "test-123".to_string(),
-            sequence: 1,
-            event_type: "TestEvent".to_string(),
-            timestamp: chrono::Utc::now(),
-        };
-        let broadcast_msg = ServerMessage::Event(event);
+        // Broadcast a statement message
+        let broadcast_msg = ServerMessage::Statement(Statement {
+            id: "test-123".to_string(),
+            statement: Concern::Trading,
+        });
         server
             .broadcast
             .sender
@@ -388,12 +382,11 @@ mod tests {
 
             assert_eq!(
                 parsed["type"],
-                "event",
-                "client{} should receive event message",
+                "statement",
+                "client{} should receive statement message",
                 i + 1
             );
-            assert_eq!(parsed["data"]["aggregate_type"], "TestAggregate");
-            assert_eq!(parsed["data"]["aggregate_id"], "test-123");
+            assert_eq!(parsed["data"]["id"], "test-123");
         }
 
         server.shutdown.notify();
@@ -421,17 +414,13 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Broadcast a message - should still reach client1
-        let event = EventStoreEntry {
-            aggregate_type: "StillWorking".to_string(),
-            aggregate_id: "after-disconnect".to_string(),
-            sequence: 1,
-            event_type: "TestEvent".to_string(),
-            timestamp: chrono::Utc::now(),
-        };
         server
             .broadcast
             .sender
-            .send(ServerMessage::Event(event))
+            .send(ServerMessage::Statement(Statement {
+                id: "after-disconnect".to_string(),
+                statement: Concern::Trading,
+            }))
             .expect("broadcast send");
 
         // client1 should still receive messages
@@ -444,8 +433,8 @@ mod tests {
         let text = msg.into_text().expect("expected text");
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("invalid JSON");
 
-        assert_eq!(parsed["type"], "event");
-        assert_eq!(parsed["data"]["aggregate_type"], "StillWorking");
+        assert_eq!(parsed["type"], "statement");
+        assert_eq!(parsed["data"]["id"], "after-disconnect");
 
         server.shutdown.notify();
     }
@@ -464,17 +453,13 @@ mod tests {
         client1.next().await.expect("client1 initial").unwrap();
 
         // Broadcast a message (client1 will receive it)
-        let event = EventStoreEntry {
-            aggregate_type: "OldEvent".to_string(),
-            aggregate_id: "before-client2".to_string(),
-            sequence: 1,
-            event_type: "TestEvent".to_string(),
-            timestamp: chrono::Utc::now(),
-        };
         server
             .broadcast
             .sender
-            .send(ServerMessage::Event(event))
+            .send(ServerMessage::Statement(Statement {
+                id: "before-client2".to_string(),
+                statement: Concern::Trading,
+            }))
             .expect("broadcast send");
 
         // Consume the broadcast on client1
