@@ -79,6 +79,7 @@
           <Table.Row>
             <Table.Head>Time</Table.Head>
             <Table.Head>Venue</Table.Head>
+            <Table.Head>Underlying</Table.Head>
             <Table.Head>Side</Table.Head>
             <Table.Head class="text-right">Exposure Change</Table.Head>
             <Table.Head class="text-right">Net Exposure</Table.Head>
@@ -95,16 +96,20 @@
                 {venueLabel(trade.venue)}
               </Table.Cell>
 
+              <Table.Cell class="text-xs font-mono font-medium">
+                {trade.symbol}
+              </Table.Cell>
+
               <Table.Cell class="text-xs font-medium {directionClass(trade.direction)}">
                 {trade.direction === 'buy' ? 'Buy' : 'Sell'}
               </Table.Cell>
 
               <Table.Cell class="text-right font-mono text-xs {directionClass(trade.direction)}">
-                {exposureSign(trade.direction)}{formatShares(parseFloat(trade.shares))} {trade.symbol}
+                {exposureSign(trade.direction)}{formatShares(parseFloat(trade.shares))}
               </Table.Cell>
 
               <Table.Cell class="text-right font-mono text-xs">
-                {trade.netExposure >= 0 ? '+' : ''}{formatShares(trade.netExposure)} {trade.symbol}
+                {trade.netExposure >= 0 ? '+' : ''}{formatShares(trade.netExposure)}
               </Table.Cell>
             </Table.Row>
           {/each}
