@@ -7,7 +7,7 @@ use std::str::FromStr;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{FractionalShares, Positive, Symbol};
+use crate::{FractionalShares, Positive, Symbol, Usd};
 
 /// Time-in-force specifies how long an order remains active before it expires.
 ///
@@ -146,6 +146,15 @@ pub enum AlpacaBrokerApiError {
 
     #[error("limit orders only support day time-in-force, got {time_in_force}")]
     InvalidLimitOrderTimeInForce { time_in_force: TimeInForce },
+
+    #[error(
+        "Limit price {limit_price} exceeds Alpaca's \
+         {max_decimals}-decimal-place precision for this price range"
+    )]
+    InvalidLimitPricePrecision {
+        limit_price: Positive<Usd>,
+        max_decimals: u8,
+    },
 
     #[error("Cash balance {} cannot be converted to cents", format_float_with_fallback(.0))]
     CashBalanceConversion(Float),

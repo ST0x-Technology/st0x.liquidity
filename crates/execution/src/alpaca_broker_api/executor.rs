@@ -221,6 +221,11 @@ impl AlpacaBrokerApi {
             .await
     }
 
+    /// Place a manual Alpaca Broker API limit order for operator intervention.
+    ///
+    /// This stays outside the generic `Executor` trait because automated hedging
+    /// uses market orders only; manual CLI limit orders are an Alpaca-specific
+    /// workflow.
     pub async fn place_limit_order(
         &self,
         order: AlpacaLimitOrder,
@@ -594,7 +599,6 @@ mod tests {
         symbol: &str,
         status: &str,
         tradable: bool,
-        overnight_tradable: bool,
     ) -> httpmock::Mock<'a> {
         server.mock(|when, then| {
             when.method(GET).path(format!("/v1/assets/{symbol}"));
@@ -604,8 +608,7 @@ mod tests {
                     "id": "904837e3-3b76-47ec-b432-046db621571b",
                     "symbol": symbol,
                     "status": status,
-                    "tradable": tradable,
-                    "overnight_tradable": overnight_tradable
+                    "tradable": tradable
                 }));
         })
     }
@@ -633,7 +636,7 @@ mod tests {
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let account_mock = create_account_mock(&server);
-        let asset_mock = create_asset_mock(&server, "AAPL", "inactive", true, true);
+        let asset_mock = create_asset_mock(&server, "AAPL", "inactive", true);
 
         let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
         account_mock.assert();
@@ -667,7 +670,7 @@ mod tests {
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let account_mock = create_account_mock(&server);
-        let asset_mock = create_asset_mock(&server, "AAPL", "active", false, true);
+        let asset_mock = create_asset_mock(&server, "AAPL", "active", false);
 
         let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
         account_mock.assert();
@@ -700,7 +703,7 @@ mod tests {
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let account_mock = create_account_mock(&server);
-        let asset_mock = create_asset_mock(&server, "AAPL", "active", true, true);
+        let asset_mock = create_asset_mock(&server, "AAPL", "active", true);
         let order_mock = create_order_mock(&server);
 
         let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
@@ -740,8 +743,7 @@ mod tests {
                     "id": "904837e3-3b76-47ec-b432-046db621571b",
                     "symbol": "AAPL",
                     "status": "active",
-                    "tradable": true,
-                    "overnight_tradable": true
+                    "tradable": true
                 }));
         });
 
@@ -817,8 +819,7 @@ mod tests {
                     "id": "904837e3-3b76-47ec-b432-046db621571b",
                     "symbol": "AAPL",
                     "status": "active",
-                    "tradable": true,
-                    "overnight_tradable": true
+                    "tradable": true
                 }));
         });
 
@@ -871,12 +872,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_place_limit_order_allows_non_overnight_tradable_asset() {
+    async fn test_place_limit_order_succeeds_for_active_tradable_asset() {
         let server = MockServer::start();
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let account_mock = create_account_mock(&server);
-        let asset_mock = create_asset_mock(&server, "AAPL", "active", true, false);
+        let asset_mock = create_asset_mock(&server, "AAPL", "active", true);
         let order_mock = create_order_mock(&server);
 
         let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();

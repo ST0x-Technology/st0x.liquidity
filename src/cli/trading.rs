@@ -168,7 +168,7 @@ pub(super) async fn execute_order_with_writers<W: Write>(
         quantity = %quantity_display,
         limit_price = ?request.limit_price,
         extended_hours = request.extended_hours,
-        "Created order"
+        "Received order request"
     );
 
     validate_order_request(&request, stdout)?;
