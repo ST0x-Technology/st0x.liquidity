@@ -12,10 +12,10 @@ use tracing::{error, info};
 
 use st0x_event_sorcery::{Store, StoreBuilder};
 use st0x_evm::ReadOnlyEvm;
+use st0x_execution::alpaca_broker_api::{AlpacaLimitOrder, AlpacaLimitPrice};
 use st0x_execution::{
-    AlpacaLimitOrder, AlpacaLimitPrice, Direction, Executor, ExecutorOrderId, FractionalShares,
-    MarketOrder, MockExecutor, MockExecutorCtx, OrderPlacement, OrderState, Positive, Symbol,
-    TimeInForce, TryIntoExecutor,
+    Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder, MockExecutor,
+    MockExecutorCtx, OrderPlacement, OrderState, Positive, Symbol, TimeInForce, TryIntoExecutor,
 };
 
 use super::auth::ensure_schwab_authentication;
@@ -338,6 +338,7 @@ fn write_order_success<W: Write>(
     writeln!(stdout, "   Symbol: {}", placement.symbol)?;
     writeln!(stdout, "   Action: {:?}", placement.direction)?;
     writeln!(stdout, "   Quantity: {}", placement.shares)?;
+    writeln!(stdout, "   Order ID: {}", placement.order_id)?;
 
     if let Some(limit_price) = limit_price {
         writeln!(stdout, "   Order Type: limit")?;
@@ -351,7 +352,6 @@ fn write_order_success<W: Write>(
             "   Extended Hours: {}",
             if extended_hours { "yes" } else { "no" }
         )?;
-        writeln!(stdout, "   Order ID: {}", placement.order_id)?;
     }
 
     Ok(())
@@ -1030,6 +1030,10 @@ mod tests {
         let output = String::from_utf8(stdout_buffer).unwrap();
         assert!(output.contains("AAPL"), "Output should contain symbol");
         assert!(output.contains("100"), "Output should contain quantity");
+        assert!(
+            output.contains("Order ID: 12345"),
+            "Output should contain order ID"
+        );
     }
 
     #[tokio::test]

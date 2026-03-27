@@ -631,6 +631,32 @@ mod tests {
         })
     }
 
+    fn create_limit_order_mock(server: &MockServer) -> httpmock::Mock<'_> {
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
+                .json_body(json!({
+                    "symbol": "AAPL",
+                    "qty": "100",
+                    "side": "buy",
+                    "type": "limit",
+                    "limit_price": "195.25",
+                    "time_in_force": "day",
+                    "extended_hours": true
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "symbol": "AAPL",
+                    "qty": "100",
+                    "side": "buy",
+                    "status": "new",
+                    "filled_avg_price": null
+                }));
+        })
+    }
+
     #[tokio::test]
     async fn test_place_market_order_fails_for_inactive_asset() {
         let server = MockServer::start();
@@ -879,7 +905,7 @@ mod tests {
 
         let account_mock = create_account_mock(&server);
         let asset_mock = create_asset_mock(&server, "AAPL", "active", true);
-        let order_mock = create_order_mock(&server);
+        let order_mock = create_limit_order_mock(&server);
 
         let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
         account_mock.assert();

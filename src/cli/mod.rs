@@ -17,9 +17,8 @@ use tracing::{info, warn};
 
 use rain_math_float::Float;
 use st0x_evm::OpenChainErrorRegistry;
-use st0x_execution::{
-    AlpacaAccountId, AlpacaLimitPrice, Direction, FractionalShares, Positive, Symbol, TimeInForce,
-};
+use st0x_execution::alpaca_broker_api::AlpacaLimitPrice;
+use st0x_execution::{AlpacaAccountId, Direction, FractionalShares, Positive, Symbol, TimeInForce};
 use st0x_finance::Usdc;
 
 use crate::config::{BrokerCtx, Ctx, Env};
