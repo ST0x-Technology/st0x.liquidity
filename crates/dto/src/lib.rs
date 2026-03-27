@@ -53,6 +53,7 @@ pub enum ServerMessage {
     Initial(Box<InitialState>),
     Fill(Trade),
     Snapshot(Box<InventorySnapshot>),
+    Transfer(TransferOperation),
     Statement(Statement),
 }
 
@@ -63,6 +64,7 @@ impl ServerMessage {
             Self::Initial(_) => "Initial",
             Self::Fill(_) => "Fill",
             Self::Snapshot(_) => "Snapshot",
+            Self::Transfer(_) => "Transfer",
             Self::Statement(_) => "Statement",
         }
     }

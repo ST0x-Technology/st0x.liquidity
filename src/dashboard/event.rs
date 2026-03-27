@@ -56,6 +56,12 @@ impl Broadcaster {
             warn!("Failed to broadcast trade fill (no receivers): {error}");
         }
     }
+
+    fn broadcast_transfer(&self, transfer: st0x_dto::TransferOperation) {
+        if let Err(error) = self.sender.send(ServerMessage::Transfer(transfer)) {
+            warn!("Failed to broadcast transfer update (no receivers): {error}");
+        }
+    }
 }
 
 /// Convert a [`SupportedExecutor`] to a [`TradingVenue`] for the dashboard.
@@ -145,13 +151,25 @@ impl Reactor for Broadcaster {
                 self.notify::<OffchainOrder>(&id, Concern::Trading);
             })
             .on(|id, _event| async move {
-                self.notify::<TokenizedEquityMint>(&id, Concern::Transfer);
+                match load_entity::<TokenizedEquityMint>(&self.pool, &id).await {
+                    Ok(Some(entity)) => self.broadcast_transfer(entity.to_dto(&id)),
+                    Ok(None) => warn!(%id, "Mint entity not found for transfer broadcast"),
+                    Err(error) => warn!(%id, ?error, "Failed to load mint for broadcast"),
+                }
             })
             .on(|id, _event| async move {
-                self.notify::<EquityRedemption>(&id, Concern::Transfer);
+                match load_entity::<EquityRedemption>(&self.pool, &id).await {
+                    Ok(Some(entity)) => self.broadcast_transfer(entity.to_dto(&id)),
+                    Ok(None) => warn!(%id, "Redemption entity not found for broadcast"),
+                    Err(error) => warn!(%id, ?error, "Failed to load redemption for broadcast"),
+                }
             })
             .on(|id, _event| async move {
-                self.notify::<UsdcRebalance>(&id, Concern::Transfer);
+                match load_entity::<UsdcRebalance>(&self.pool, &id).await {
+                    Ok(Some(entity)) => self.broadcast_transfer(entity.to_dto(&id)),
+                    Ok(None) => warn!(%id, "USDC rebalance entity not found for broadcast"),
+                    Err(error) => warn!(%id, ?error, "Failed to load rebalance for broadcast"),
+                }
             })
             .exhaustive()
             .await;

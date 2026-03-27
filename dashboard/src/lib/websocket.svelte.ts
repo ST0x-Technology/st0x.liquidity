@@ -24,7 +24,7 @@ const isServerMessage = (value: unknown): value is ServerMessage => {
   if (!('type' in value) || !('data' in value)) return false
 
   const { type } = value
-  return type === 'initial' || type === 'fill' || type === 'snapshot' || type === 'statement'
+  return type === 'initial' || type === 'fill' || type === 'snapshot' || type === 'transfer' || type === 'statement'
 }
 
 const matchMessage = matcher<ServerMessage>()('type')
@@ -60,6 +60,32 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
 
       snapshot: ({ data }) => {
         queryClient.setQueryData<Inventory>(['inventory'], data.inventory)
+      },
+
+      transfer: ({ data }) => {
+        const key = transferKey(data)
+
+        queryClient.setQueryData<TransferOperation[]>(['transfers', 'active'], (old) => {
+          const existing = old ?? []
+          const index = existing.findIndex((transfer) => transferKey(transfer) === key)
+
+          if (data.status.status === 'completed' || data.status.status === 'failed') {
+            const filtered = index >= 0 ? existing.filter((_, idx) => idx !== index) : existing
+
+            queryClient.setQueryData<TransferOperation[]>(
+              ['transfers', 'recent'],
+              (recent) => [data, ...(recent ?? []).filter((transfer) => transferKey(transfer) !== key)].slice(0, MAX_TRADES)
+            )
+
+            return filtered
+          }
+
+          if (index >= 0) {
+            return existing.map((transfer, idx) => (idx === index ? data : transfer))
+          }
+
+          return [data, ...existing]
+        })
       },
 
       statement: () => {
