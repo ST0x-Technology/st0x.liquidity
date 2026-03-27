@@ -108,7 +108,7 @@
                 {exposureSign(trade.direction)}{formatShares(parseFloat(trade.shares))}
               </Table.Cell>
 
-              <Table.Cell class="text-right font-mono text-xs">
+              <Table.Cell class="text-right font-mono text-xs {trade.netExposure >= 0 ? 'text-green-500' : 'text-red-500'}">
                 {trade.netExposure >= 0 ? '+' : ''}{formatShares(trade.netExposure)}
               </Table.Cell>
             </Table.Row>
