@@ -2795,8 +2795,8 @@ Two panels, one per core concern. Both update live via WebSocket statements.
 
 2. **Trade History**: Recent fills across both venues. Columns: time of fill,
    trading venue (Raindex/Alpaca), underlying asset, buy/sell side, exposure
-   change (signed shares), and running dislocation per symbol. This is the
-   core operational view — if the bot detects a trade and places a hedge, the
+   change (signed shares), and running dislocation per symbol. This is the core
+   operational view — if the bot detects a trade and places a hedge, the
    operator sees the dislocation resolve in real time.
 
 ### Architecture

@@ -119,10 +119,10 @@ dislocation (short exposure) -> buy offchain.
 ### Imbalance
 
 The deviation of the current venue allocation ratio from its target. Each asset
-has a target onchain ratio (e.g., 50% on Raindex, 50% on Alpaca) with an
-allowed deviation band. When the actual ratio drifts outside the band, the
-system triggers a cross-venue transfer (mint, redemption, or USDC bridge) to
-restore the target allocation.
+has a target onchain ratio (e.g., 50% on Raindex, 50% on Alpaca) with an allowed
+deviation band. When the actual ratio drifts outside the band, the system
+triggers a cross-venue transfer (mint, redemption, or USDC bridge) to restore
+the target allocation.
 
 Configured via `ImbalanceThreshold { target, deviation }` per asset category
 (equity and USDC independently).
@@ -141,8 +141,8 @@ offchain trade. Two modes:
 
 - **Shares threshold**: Execute when dislocation reaches N shares (used by
   Schwab, which does not support fractional shares, and DryRun).
-- **Dollar value threshold**: Execute when dislocation value reaches $N (used
-  by Alpaca, which requires a $1 minimum for fractional trading).
+- **Dollar value threshold**: Execute when dislocation value reaches $N (used by
+  Alpaca, which requires a $1 minimum for fractional trading).
 
 ### Rebalancing
 
