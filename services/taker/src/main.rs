@@ -10,5 +10,7 @@ async fn main() -> anyhow::Result<()> {
 
     setup_tracing(&ctx.log_level);
 
-    launch(ctx).await
+    let market_data = ctx.build_market_data()?;
+
+    launch(ctx, market_data).await
 }

@@ -6890,10 +6890,12 @@ dependencies = [
  "alloy",
  "anyhow",
  "async-trait",
+ "bon",
  "chrono",
  "ciborium",
  "clap",
  "futures-util",
+ "rain-math-float",
  "serde",
  "serde_json",
  "sqlx",
@@ -6902,6 +6904,7 @@ dependencies = [
  "st0x-execution",
  "st0x-finance",
  "st0x-shared",
+ "st0x-taker",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -6909,6 +6912,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber 0.3.23",
  "url",
+ "uuid",
 ]
 
 [[package]]

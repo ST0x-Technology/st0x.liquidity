@@ -15,6 +15,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use tracing::Level;
 use url::Url;
 
+#[cfg(any(test, feature = "test-support"))]
+use st0x_execution::HasZero;
 use st0x_execution::{
     AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Positive, Symbol,
 };
@@ -425,6 +427,31 @@ impl Ctx {
     pub async fn get_sqlite_pool(&self) -> Result<SqlitePool, sqlx::Error> {
         configure_sqlite_pool(&self.database_url).await
     }
+
+    /// Builds an Alpaca Market Data client from the stored credentials.
+    pub fn build_market_data(
+        &self,
+    ) -> Result<st0x_execution::AlpacaMarketData, st0x_execution::AlpacaMarketDataError> {
+        let base_url = match &self.alpaca.broker.mode {
+            Some(AlpacaBrokerApiMode::Production) => "https://data.alpaca.markets".to_owned(),
+            Some(_) => "https://data.sandbox.alpaca.markets".to_owned(),
+            None => {
+                tracing::warn!(
+                    "Alpaca mode not configured, defaulting to sandbox. \
+                     Set alpaca.mode in secrets to silence this warning."
+                );
+                "https://data.sandbox.alpaca.markets".to_owned()
+            }
+        };
+
+        let ctx = st0x_execution::AlpacaMarketDataCtx::new(
+            self.alpaca.broker.api_key.clone(),
+            self.alpaca.broker.api_secret.clone(),
+            base_url,
+        );
+
+        st0x_execution::AlpacaMarketData::new(&ctx)
+    }
 }
 
 /// Configures a SQLite connection pool with WAL mode and busy timeout.
@@ -436,6 +463,67 @@ async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePool, sqlx::E
         .busy_timeout(std::time::Duration::from_secs(10));
 
     SqlitePool::connect_with(options).await
+}
+
+/// Test-only constructor for [`Ctx`], exposed behind `test-support`
+/// providing a stable construction API for the e2e test crate.
+#[cfg(any(test, feature = "test-support"))]
+#[bon::bon]
+impl Ctx {
+    #[builder]
+    pub fn for_test(
+        database_url: String,
+        ws_rpc_url: Url,
+        orderbook: Address,
+        usdc_address: Address,
+        deployment_block: u64,
+        excluded_owner: Address,
+        private_key: String,
+        equities: HashMap<Symbol, EquityTokenAddresses>,
+        #[builder(default = 50)] min_profit_margin_bps: u32,
+        #[builder(default = 5)] evaluation_interval_secs: u64,
+    ) -> Self {
+        Self {
+            database_url,
+            log_level: LogLevel::Debug,
+            evm: EvmCtx {
+                ws_rpc_url,
+                private_key,
+                orderbook,
+                usdc_address,
+                deployment_block,
+                excluded_owner,
+            },
+            order_taker: OrderTakerCtx {
+                min_profit_margin_bps,
+                max_position_per_symbol: FractionalShares::ZERO,
+                max_total_exposure_usdc: Usdc::ZERO,
+                max_gas_price_gwei: 100,
+                evaluation_interval_secs,
+            },
+            tokenization: TokenizationCtx {
+                alpaca_account_id: AlpacaAccountId::new(uuid::Uuid::nil()),
+                wallet_address: Address::ZERO,
+                redemption_wallet: Address::ZERO,
+            },
+            hold_pool: HoldPoolCtx {
+                retention_window_secs: 300,
+                max_pool_value_usdc: Usdc::ZERO,
+                max_per_symbol: FractionalShares::ZERO,
+            },
+            alpaca: AlpacaCtx {
+                broker: AlpacaBrokerApiCtx {
+                    api_key: "test_key".to_owned(),
+                    api_secret: "test_secret".to_owned(),
+                    account_id: AlpacaAccountId::new(uuid::Uuid::nil()),
+                    mode: None,
+                    asset_cache_ttl: std::time::Duration::from_secs(3600),
+                    time_in_force: st0x_execution::TimeInForce::default(),
+                },
+            },
+            equities,
+        }
+    }
 }
 
 #[cfg(test)]

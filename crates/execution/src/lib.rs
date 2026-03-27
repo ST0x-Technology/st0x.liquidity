@@ -15,6 +15,7 @@ pub(crate) use st0x_float_serde::{
 pub use st0x_float_macro::float;
 
 pub mod alpaca_broker_api;
+pub mod alpaca_market_data;
 pub mod alpaca_trading_api;
 pub mod error;
 pub mod mock;
@@ -27,6 +28,11 @@ pub mod test_utils;
 pub use alpaca_broker_api::{
     AlpacaAccountId, AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiError,
     AlpacaBrokerApiMode, ConversionDirection, JournalResponse, JournalStatus, TimeInForce,
+};
+#[cfg(any(test, feature = "mock"))]
+pub use alpaca_market_data::AlpacaMarketDataMock;
+pub use alpaca_market_data::{
+    AlpacaMarketData, AlpacaMarketDataCtx, AlpacaMarketDataError, MarketDataProvider, MarketQuote,
 };
 pub use alpaca_trading_api::{
     AlpacaTradingApi, AlpacaTradingApiCtx, AlpacaTradingApiError, AlpacaTradingApiMode,
