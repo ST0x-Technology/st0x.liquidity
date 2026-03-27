@@ -156,6 +156,8 @@ impl Reactor for Broadcaster {
                     Ok(None) => warn!(%id, "Mint entity not found for transfer broadcast"),
                     Err(error) => warn!(%id, ?error, "Failed to load mint for broadcast"),
                 }
+
+                self.notify::<TokenizedEquityMint>(&id, Concern::Transfer);
             })
             .on(|id, _event| async move {
                 match load_entity::<EquityRedemption>(&self.pool, &id).await {
@@ -163,6 +165,8 @@ impl Reactor for Broadcaster {
                     Ok(None) => warn!(%id, "Redemption entity not found for broadcast"),
                     Err(error) => warn!(%id, ?error, "Failed to load redemption for broadcast"),
                 }
+
+                self.notify::<EquityRedemption>(&id, Concern::Transfer);
             })
             .on(|id, _event| async move {
                 match load_entity::<UsdcRebalance>(&self.pool, &id).await {
@@ -170,6 +174,8 @@ impl Reactor for Broadcaster {
                     Ok(None) => warn!(%id, "USDC rebalance entity not found for broadcast"),
                     Err(error) => warn!(%id, ?error, "Failed to load rebalance for broadcast"),
                 }
+
+                self.notify::<UsdcRebalance>(&id, Concern::Transfer);
             })
             .exhaustive()
             .await;

@@ -30,15 +30,16 @@ fn float_to_f64(value: rain_math_float::Float, fallback: f64) -> f64 {
 }
 
 pub(crate) fn overview_config_from_ctx(ctx: &crate::config::Ctx) -> st0x_dto::OverviewConfig {
-    match ctx.rebalancing_ctx() {
-        Ok(rebalancing) => {
-            let (usdc_target, usdc_deviation) = match &rebalancing.usdc {
-                Some(threshold) => (
-                    Some(float_to_f64(threshold.target, 0.5)),
-                    Some(float_to_f64(threshold.deviation, 0.3)),
-                ),
-                None => (None, None),
-            };
+    ctx.rebalancing_ctx().map_or_else(
+        |_| st0x_dto::OverviewConfig::default(),
+        |rebalancing| {
+            let (usdc_target, usdc_deviation) =
+                rebalancing.usdc.as_ref().map_or((None, None), |threshold| {
+                    (
+                        Some(float_to_f64(threshold.target, 0.5)),
+                        Some(float_to_f64(threshold.deviation, 0.3)),
+                    )
+                });
 
             st0x_dto::OverviewConfig {
                 equity_target: float_to_f64(rebalancing.equity.target, 0.5),
@@ -46,9 +47,8 @@ pub(crate) fn overview_config_from_ctx(ctx: &crate::config::Ctx) -> st0x_dto::Ov
                 usdc_target,
                 usdc_deviation,
             }
-        }
-        Err(_) => st0x_dto::OverviewConfig::default(),
-    }
+        },
+    )
 }
 
 pub(crate) struct DashboardState {
@@ -58,12 +58,11 @@ pub(crate) struct DashboardState {
 }
 
 async fn load_positions(pool: &SqlitePool) -> Vec<st0x_dto::Position> {
-    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
-        "SELECT symbol, net_position FROM position_view WHERE symbol IS NOT NULL",
-    )
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    let rows: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT symbol, net_position FROM position_view WHERE symbol IS NOT NULL")
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
 
     rows.into_iter()
         .filter_map(|(symbol, net_str)| {
