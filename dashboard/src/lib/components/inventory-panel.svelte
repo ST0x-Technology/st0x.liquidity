@@ -3,15 +3,29 @@
   import AvailableInventory from '$lib/components/available-inventory.svelte'
   import * as Card from '$lib/components/ui/card'
   import type { Inventory } from '$lib/api/Inventory'
+  import type { Position } from '$lib/api/Position'
+  import type { OverviewConfig } from '$lib/api/OverviewConfig'
 
   const inventoryQuery = createQuery<Inventory>(() => ({
     queryKey: ['inventory'],
     enabled: false
   }))
 
+  const positionsQuery = createQuery<Position[]>(() => ({
+    queryKey: ['positions'],
+    enabled: false
+  }))
+
+  const configQuery = createQuery<OverviewConfig>(() => ({
+    queryKey: ['config'],
+    enabled: false
+  }))
+
   const inventory = $derived(inventoryQuery.data)
   const symbols = $derived(inventory?.perSymbol ?? [])
   const usdc = $derived(inventory?.usdc)
+  const positions = $derived(positionsQuery.data ?? [])
+  const config = $derived(configQuery.data)
 </script>
 
 <Card.Root class="flex shrink-0 flex-col overflow-hidden">
@@ -24,7 +38,7 @@
         Waiting for inventory data…
       </div>
     {:else}
-      <AvailableInventory {symbols} {usdc} />
+      <AvailableInventory {symbols} {usdc} {positions} {config} />
     {/if}
   </Card.Content>
 </Card.Root>

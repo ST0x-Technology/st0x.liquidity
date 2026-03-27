@@ -76,6 +76,8 @@ impl ServerMessage {
 pub struct InitialState {
     pub trades: Vec<Trade>,
     pub inventory: Inventory,
+    pub positions: Vec<Position>,
+    pub config: OverviewConfig,
     pub active_transfers: Vec<TransferOperation>,
     pub recent_transfers: Vec<TransferOperation>,
 }
@@ -85,8 +87,31 @@ impl Default for InitialState {
         Self {
             trades: Vec::new(),
             inventory: Inventory::empty(),
+            positions: Vec::new(),
+            config: OverviewConfig::default(),
             active_transfers: Vec::new(),
             recent_transfers: Vec::new(),
+        }
+    }
+}
+
+/// Rebalancing thresholds for the dashboard overview.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct OverviewConfig {
+    pub equity_target: f64,
+    pub equity_deviation: f64,
+    pub usdc_target: Option<f64>,
+    pub usdc_deviation: Option<f64>,
+}
+
+impl Default for OverviewConfig {
+    fn default() -> Self {
+        Self {
+            equity_target: 0.5,
+            equity_deviation: 0.2,
+            usdc_target: None,
+            usdc_deviation: None,
         }
     }
 }
@@ -504,6 +529,7 @@ pub struct SpreadUpdate {
 pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
     ServerMessage::export_all_to(out_dir)?;
     InitialState::export_all_to(out_dir)?;
+    OverviewConfig::export_all_to(out_dir)?;
     Statement::export_all_to(out_dir)?;
     Trade::export_all_to(out_dir)?;
     Position::export_all_to(out_dir)?;

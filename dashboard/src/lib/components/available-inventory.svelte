@@ -2,15 +2,19 @@
   import * as Table from '$lib/components/ui/table'
   import type { SymbolInventory } from '$lib/api/SymbolInventory'
   import type { UsdcInventory } from '$lib/api/UsdcInventory'
+  import type { Position } from '$lib/api/Position'
+  import type { OverviewConfig } from '$lib/api/OverviewConfig'
   import { decimalAdd, decimalCompare, decimalIsZero, formatDecimal } from '$lib/decimal'
   import { reactive } from '$lib/frp.svelte'
 
   interface Props {
     symbols: SymbolInventory[]
     usdc: UsdcInventory | undefined
+    positions: Position[]
+    config: OverviewConfig | undefined
   }
 
-  let { symbols, usdc }: Props = $props()
+  let { symbols, usdc, positions, config }: Props = $props()
 
   const MAX_DECIMAL_PLACES = 6
 
@@ -50,7 +54,7 @@
     symbol.startsWith('t') ? symbol.slice(1) : symbol
 
   type SortDir = 'asc' | 'desc'
-  type Col = 'asset' | 'alpaca' | 'inflight' | 'raindex' | 'total' | 'ratio'
+  type Col = 'asset' | 'alpaca' | 'inflight' | 'raindex' | 'total' | 'ratio' | 'dislocation'
   type SortState = { column: Col; dir: SortDir } | null
 
   const sort = reactive<SortState>(null)
@@ -87,6 +91,10 @@
   const formatRatio = (ratio: number): string =>
     `${(ratio * 100).toFixed(1)}%`
 
+  const positionMap = $derived(
+    new Map(positions.map((position) => [position.symbol, parseFloat(position.net)]))
+  )
+
   type Row = {
     asset: string
     alpaca: Formatted
@@ -94,6 +102,7 @@
     raindex: Formatted
     total: Formatted
     ratio: number
+    dislocation: number
     isCash: boolean
   }
 
@@ -111,6 +120,7 @@
         raindex: fmt(item.onchainAvailable),
         total: fmtValue(totalVal),
         ratio: computeRatio(item.onchainAvailable, item.offchainAvailable),
+        dislocation: positionMap.get(stripPrefix(item.symbol)) ?? 0,
         isCash: false,
       }
     })
@@ -132,6 +142,7 @@
       raindex: fmt(usdc.onchainAvailable),
       total: fmtValue(total),
       ratio: computeRatio(usdc.onchainAvailable, usdc.offchainAvailable),
+      dislocation: 0,
       isCash: true,
     }
   })
@@ -143,6 +154,7 @@
     raindex: (lhs, rhs) => decimalCompare(lhs.raindex.full, rhs.raindex.full),
     total: (lhs, rhs) => decimalCompare(lhs.total.full, rhs.total.full),
     ratio: (lhs, rhs) => lhs.ratio - rhs.ratio,
+    dislocation: (lhs, rhs) => lhs.dislocation - rhs.dislocation,
   }
 
   const sortedEquities = $derived.by(() => {
@@ -157,44 +169,63 @@
 
     return rows
   })
+
   const approxClass = (val: Formatted): string =>
     val.truncated ? 'cursor-help opacity-80 hover:underline hover:decoration-dotted hover:decoration-muted-foreground hover:underline-offset-4' : ''
+
+  const ratioDeviation = (ratio: number, isCash: boolean): { text: string; warning: boolean } => {
+    const target = isCash ? (config?.usdcTarget ?? config?.equityTarget ?? 0.5) : (config?.equityTarget ?? 0.5)
+    const deviation = isCash ? (config?.usdcDeviation ?? config?.equityDeviation ?? 0.2) : (config?.equityDeviation ?? 0.2)
+    const diff = ratio - target
+    const sign = diff >= 0 ? '+' : ''
+    const text = `${sign}${(diff * 100).toFixed(1)}%`
+    const warning = Math.abs(diff) > deviation
+    return { text, warning }
+  }
+
+  const fmtDislocation = (value: number): string => {
+    if (value === 0) return '0'
+    const sign = value >= 0 ? '+' : ''
+    const abs = Math.abs(value)
+    const formatted = abs >= 1 ? abs.toFixed(2) : abs.toPrecision(4)
+    return `${sign}${formatted}`
+  }
 </script>
 
 <Table.Root class="table-fixed">
   <Table.Header>
     <Table.Row>
-      <Table.Head class="w-[12%]" aria-sort={ariaSort(sort.current, 'asset')}>
+      <Table.Head class="w-[10%]" aria-sort={ariaSort(sort.current, 'asset')}>
         <button class="{sortBtnClass} text-left" onclick={toggleSort('asset')}>
           Asset{sortIndicator(sort.current, 'asset')}
         </button>
       </Table.Head>
 
-      <Table.Head class="text-right w-[18%]" aria-sort={ariaSort(sort.current, 'alpaca')}>
+      <Table.Head class="text-right w-[15%]" aria-sort={ariaSort(sort.current, 'alpaca')}>
         <button class="{sortBtnClass} text-right" onclick={toggleSort('alpaca')}>
           Alpaca{sortIndicator(sort.current, 'alpaca')}
         </button>
       </Table.Head>
 
-      <Table.Head class="text-right w-[14%]" aria-sort={ariaSort(sort.current, 'inflight')}>
+      <Table.Head class="text-right w-[12%]" aria-sort={ariaSort(sort.current, 'inflight')}>
         <button class="{sortBtnClass} text-right" onclick={toggleSort('inflight')}>
           Inflight{sortIndicator(sort.current, 'inflight')}
         </button>
       </Table.Head>
 
-      <Table.Head class="text-right w-[18%]" aria-sort={ariaSort(sort.current, 'raindex')}>
+      <Table.Head class="text-right w-[15%]" aria-sort={ariaSort(sort.current, 'raindex')}>
         <button class="{sortBtnClass} text-right" onclick={toggleSort('raindex')}>
           Raindex{sortIndicator(sort.current, 'raindex')}
         </button>
       </Table.Head>
 
-      <Table.Head class="text-right w-[18%]" aria-sort={ariaSort(sort.current, 'total')}>
+      <Table.Head class="text-right w-[15%]" aria-sort={ariaSort(sort.current, 'total')}>
         <button class="{sortBtnClass} text-right" onclick={toggleSort('total')}>
           Total{sortIndicator(sort.current, 'total')}
         </button>
       </Table.Head>
 
-      <Table.Head class="w-[14%]" aria-sort={ariaSort(sort.current, 'ratio')}>
+      <Table.Head class="w-[18%]" aria-sort={ariaSort(sort.current, 'ratio')}>
         <button
           class="{sortBtnClass} text-left"
           onclick={toggleSort('ratio')}
@@ -203,9 +234,20 @@
           Ratio{sortIndicator(sort.current, 'ratio')}
         </button>
       </Table.Head>
+
+      <Table.Head class="w-[15%]" aria-sort={ariaSort(sort.current, 'dislocation')}>
+        <button
+          class="{sortBtnClass} text-left"
+          onclick={toggleSort('dislocation')}
+          title="Net directional exposure from counterparty fills"
+        >
+          Dislocation{sortIndicator(sort.current, 'dislocation')}
+        </button>
+      </Table.Head>
     </Table.Row>
   </Table.Header>
   {#if cashRow}
+    {@const dev = ratioDeviation(cashRow.ratio, true)}
     <Table.Body>
       <Table.Row>
         <Table.Cell class="font-mono font-medium">Cash</Table.Cell>
@@ -221,12 +263,16 @@
         <Table.Cell class="text-right font-mono font-semibold">
           <span class={approxClass(cashRow.total)} title={cashRow.total.truncated ? cashRow.total.full : undefined}>{cashRow.total.display}</span>
         </Table.Cell>
-        <Table.Cell class="font-mono text-muted-foreground">
+        <Table.Cell class="font-mono">
           {formatRatio(cashRow.ratio)}
+          <span class={dev.warning ? 'text-destructive' : 'text-muted-foreground'}>
+            ({dev.text})
+          </span>
         </Table.Cell>
+        <Table.Cell class="font-mono text-muted-foreground">—</Table.Cell>
       </Table.Row>
       <Table.Row>
-        <Table.Cell colspan={6} class="py-3 px-0">
+        <Table.Cell colspan={7} class="py-3 px-0">
           <div class="h-px bg-border"></div>
         </Table.Cell>
       </Table.Row>
@@ -235,6 +281,7 @@
 
   <Table.Body>
     {#each sortedEquities as row (row.asset)}
+      {@const dev = ratioDeviation(row.ratio, false)}
       <Table.Row>
         <Table.Cell class="font-mono font-medium">{row.asset}</Table.Cell>
         <Table.Cell class="text-right font-mono opacity-90">
@@ -249,8 +296,14 @@
         <Table.Cell class="text-right font-mono font-semibold">
           <span class={approxClass(row.total)} title={row.total.truncated ? row.total.full : undefined}>{row.total.display}</span>
         </Table.Cell>
-        <Table.Cell class="font-mono text-muted-foreground">
+        <Table.Cell class="font-mono">
           {formatRatio(row.ratio)}
+          <span class={dev.warning ? 'text-destructive' : 'text-muted-foreground'}>
+            ({dev.text})
+          </span>
+        </Table.Cell>
+        <Table.Cell class="font-mono {row.dislocation === 0 ? 'text-muted-foreground' : row.dislocation > 0 ? 'text-green-500' : 'text-red-500'}">
+          {fmtDislocation(row.dislocation)}
         </Table.Cell>
       </Table.Row>
     {/each}

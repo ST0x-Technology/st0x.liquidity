@@ -21,9 +21,60 @@ pub(crate) struct Broadcast {
     pub(crate) sender: broadcast::Sender<ServerMessage>,
 }
 
+fn float_to_f64(value: rain_math_float::Float, fallback: f64) -> f64 {
+    value
+        .format()
+        .ok()
+        .and_then(|formatted| formatted.parse::<f64>().ok())
+        .unwrap_or(fallback)
+}
+
+pub(crate) fn overview_config_from_ctx(ctx: &crate::config::Ctx) -> st0x_dto::OverviewConfig {
+    match ctx.rebalancing_ctx() {
+        Ok(rebalancing) => {
+            let (usdc_target, usdc_deviation) = match &rebalancing.usdc {
+                Some(threshold) => (
+                    Some(float_to_f64(threshold.target, 0.5)),
+                    Some(float_to_f64(threshold.deviation, 0.3)),
+                ),
+                None => (None, None),
+            };
+
+            st0x_dto::OverviewConfig {
+                equity_target: float_to_f64(rebalancing.equity.target, 0.5),
+                equity_deviation: float_to_f64(rebalancing.equity.deviation, 0.2),
+                usdc_target,
+                usdc_deviation,
+            }
+        }
+        Err(_) => st0x_dto::OverviewConfig::default(),
+    }
+}
+
 pub(crate) struct DashboardState {
     pub(crate) inventory: Arc<BroadcastingInventory>,
     pub(crate) pool: SqlitePool,
+    pub(crate) config: st0x_dto::OverviewConfig,
+}
+
+async fn load_positions(pool: &SqlitePool) -> Vec<st0x_dto::Position> {
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT symbol, net_position FROM position_view WHERE symbol IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    rows.into_iter()
+        .filter_map(|(symbol, net_str)| {
+            let symbol = st0x_execution::Symbol::new(&symbol).ok()?;
+            let net = net_str
+                .and_then(|value| rain_math_float::Float::parse(value).ok())
+                .unwrap_or_else(|| st0x_float_macro::float!(0));
+
+            Some(st0x_dto::Position { symbol, net })
+        })
+        .collect()
 }
 
 #[get("/ws")]
@@ -35,16 +86,20 @@ fn ws_endpoint<'r>(
     let mut receiver = broadcast.sender.subscribe();
     let inventory = Arc::clone(&dashboard.inventory);
     let pool = dashboard.pool.clone();
+    let config = dashboard.config.clone();
 
     ws.channel(move |mut stream| {
         Box::pin(async move {
             let inventory_dto = inventory.read().await.to_dto();
             let transfers = transfer_loader::load_transfers(&pool).await;
             let trades = trade_loader::load_trades(&pool).await;
+            let positions = load_positions(&pool).await;
 
             let initial_state = InitialState {
                 trades,
                 inventory: inventory_dto,
+                positions,
+                config,
                 active_transfers: transfers.active,
                 recent_transfers: transfers.recent,
             };
@@ -129,6 +184,7 @@ mod tests {
                 event_sender,
             )),
             pool,
+            config: st0x_dto::OverviewConfig::default(),
         }
     }
 

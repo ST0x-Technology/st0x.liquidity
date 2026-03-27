@@ -48,6 +48,8 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
       initial: ({ data }) => {
         queryClient.setQueryData<Trade[]>(['trades'], data.trades)
         queryClient.setQueryData(['inventory'], data.inventory)
+        queryClient.setQueryData(['positions'], data.positions)
+        queryClient.setQueryData(['config'], data.config)
         queryClient.setQueryData(['transfers', 'active'], data.activeTransfers)
         queryClient.setQueryData(['transfers', 'recent'], data.recentTransfers)
       },
