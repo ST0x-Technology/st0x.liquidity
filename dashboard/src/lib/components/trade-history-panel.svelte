@@ -79,7 +79,7 @@
           <Table.Row>
             <Table.Head>Time</Table.Head>
             <Table.Head>Venue</Table.Head>
-            <Table.Head>Direction</Table.Head>
+            <Table.Head>Side</Table.Head>
             <Table.Head class="text-right">Exposure Change</Table.Head>
             <Table.Head class="text-right">Net Exposure</Table.Head>
           </Table.Row>

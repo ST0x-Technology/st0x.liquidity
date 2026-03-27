@@ -4,6 +4,7 @@
   import HeaderBar from '$lib/components/header-bar.svelte'
   import InventoryPanel from '$lib/components/inventory-panel.svelte'
   import TradeHistoryPanel from '$lib/components/trade-history-panel.svelte'
+  import TransferPanel from '$lib/components/transfer-panel.svelte'
   import { getWebSocketUrl } from '$lib/env'
   import { reactive } from '$lib/frp.svelte'
   import { createWebSocket, type WebSocketConnection } from '$lib/websocket.svelte'
@@ -56,9 +57,13 @@
   {/if}
 
   <main class="flex-1 overflow-auto p-2 md:overflow-hidden md:p-4">
-    <div class="grid h-full grid-cols-1 gap-2 md:grid-cols-[3fr_2fr] md:gap-4">
+    <div class="flex h-full flex-col gap-2 md:gap-4">
       <InventoryPanel />
-      <TradeHistoryPanel />
+
+      <div class="grid min-h-0 flex-1 grid-cols-1 gap-2 md:grid-cols-2 md:gap-4">
+        <TradeHistoryPanel />
+        <TransferPanel />
+      </div>
     </div>
   </main>
 </div>
