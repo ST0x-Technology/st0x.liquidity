@@ -858,11 +858,17 @@ pub(crate) mod tests {
     }
 
     fn example_config_toml() -> &'static Path {
-        Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/example.config.toml"))
+        Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example.config.toml"
+        ))
     }
 
     fn example_secrets_toml() -> &'static Path {
-        Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/example.secrets.toml"))
+        Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example.secrets.toml"
+        ))
     }
 
     #[test]
@@ -1530,7 +1536,7 @@ pub(crate) mod tests {
 
     #[test]
     fn server_config_toml_is_valid() {
-        let config_str = include_str!("../config/st0x-hedge.toml");
+        let config_str = include_str!("../../../config/st0x-hedge.toml");
         let config: Config = toml::from_str(config_str).unwrap();
 
         let global_limit = config
@@ -1557,31 +1563,31 @@ pub(crate) mod tests {
 
     #[test]
     fn example_config_toml_is_valid() {
-        let config_str = include_str!("../example.config.toml");
+        let config_str = include_str!("../../../example.config.toml");
         let _: Config = toml::from_str(config_str).unwrap();
     }
 
     #[test]
     fn example_secrets_toml_is_valid() {
-        let secrets_str = include_str!("../example.secrets.toml");
+        let secrets_str = include_str!("../../../example.secrets.toml");
         let _: Secrets = toml::from_str(secrets_str).unwrap();
     }
 
     #[test]
     fn e2e_config_toml_is_valid() {
-        let config_str = include_str!("../e2e/config.toml");
+        let config_str = include_str!("../../../e2e/config.toml");
         let _: Config = toml::from_str(config_str).unwrap();
     }
 
     #[test]
     fn e2e_secrets_toml_is_valid() {
-        let secrets_str = include_str!("../e2e/secrets.toml");
+        let secrets_str = include_str!("../../../e2e/secrets.toml");
         let _: Secrets = toml::from_str(secrets_str).unwrap();
     }
 
     #[test]
     fn all_repo_config_tomls_are_valid() {
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut config_paths: Vec<PathBuf> = std::fs::read_dir(repo_root.join("config"))
             .unwrap()
             .filter_map(std::result::Result::ok)
@@ -1604,7 +1610,7 @@ pub(crate) mod tests {
 
     #[test]
     fn all_repo_secrets_tomls_are_valid() {
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let secret_paths = [
             repo_root.join("example.secrets.toml"),
             repo_root.join("e2e/secrets.toml"),

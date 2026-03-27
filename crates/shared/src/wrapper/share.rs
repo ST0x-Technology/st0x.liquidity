@@ -11,7 +11,7 @@ use st0x_execution::Symbol;
 
 use super::{UnderlyingPerWrapped, Wrapper, WrapperError};
 use crate::bindings::{IERC20, IERC4626};
-use crate::config::EquityAssetConfig;
+use crate::equity_token::EquityTokenAddresses;
 
 /// One unit with 18 decimals for ratio queries.
 const RATIO_QUERY_AMOUNT: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
@@ -20,13 +20,13 @@ const RATIO_QUERY_AMOUNT: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0,
 ///
 /// Uses the wallet's embedded provider for read-only view calls (ratio
 /// queries) and the wallet itself for write transactions (deposit/redeem).
-pub(crate) struct WrapperService<W: Wallet> {
+pub struct WrapperService<W: Wallet> {
     wallet: W,
-    config: HashMap<Symbol, EquityAssetConfig>,
+    config: HashMap<Symbol, EquityTokenAddresses>,
 }
 
 impl<W: Wallet> WrapperService<W> {
-    pub(crate) fn new(wallet: W, config: HashMap<Symbol, EquityAssetConfig>) -> Self {
+    pub fn new(wallet: W, config: HashMap<Symbol, EquityTokenAddresses>) -> Self {
         Self { wallet, config }
     }
 
@@ -48,8 +48,8 @@ impl<W: Wallet> WrapperService<W> {
         Ok(UnderlyingPerWrapped::new(assets_per_share)?)
     }
 
-    /// Gets the asset config for a symbol.
-    pub(crate) fn lookup_equity(&self, symbol: &Symbol) -> Option<&EquityAssetConfig> {
+    /// Gets the token addresses for a symbol.
+    fn lookup_equity(&self, symbol: &Symbol) -> Option<&EquityTokenAddresses> {
         self.config.get(symbol)
     }
 }
@@ -60,28 +60,28 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
         &self,
         symbol: &Symbol,
     ) -> Result<UnderlyingPerWrapped, WrapperError> {
-        let asset = self
+        let addresses = self
             .lookup_equity(symbol)
             .ok_or_else(|| WrapperError::SymbolNotConfigured(symbol.clone()))?;
 
-        self.get_ratio::<OpenChainErrorRegistry>(asset.tokenized_equity_derivative)
+        self.get_ratio::<OpenChainErrorRegistry>(addresses.wrapped)
             .await
     }
 
     fn lookup_underlying(&self, symbol: &Symbol) -> Result<Address, WrapperError> {
-        let asset = self
+        let addresses = self
             .lookup_equity(symbol)
             .ok_or_else(|| WrapperError::SymbolNotConfigured(symbol.clone()))?;
 
-        Ok(asset.tokenized_equity)
+        Ok(addresses.unwrapped)
     }
 
     fn lookup_derivative(&self, symbol: &Symbol) -> Result<Address, WrapperError> {
-        let asset = self
+        let addresses = self
             .lookup_equity(symbol)
             .ok_or_else(|| WrapperError::SymbolNotConfigured(symbol.clone()))?;
 
-        Ok(asset.tokenized_equity_derivative)
+        Ok(addresses.wrapped)
     }
 
     async fn to_wrapped(
@@ -201,50 +201,93 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::Address;
+    use alloy::primitives::{Address, Bytes};
+    use alloy::providers::RootProvider;
+    use alloy::rpc::client::RpcClient;
+    use alloy::rpc::types::TransactionReceipt;
+    use async_trait::async_trait;
     use std::collections::HashMap;
 
+    use st0x_evm::{Evm, EvmError, Wallet};
     use st0x_execution::Symbol;
 
     use super::*;
-    use crate::config::{EquityAssetConfig, OperationMode};
-    use crate::test_utils::StubWallet;
 
-    fn test_asset_config() -> EquityAssetConfig {
-        EquityAssetConfig {
-            tokenized_equity: Address::random(),
-            tokenized_equity_derivative: Address::random(),
-            vault_id: None,
-            trading: OperationMode::Enabled,
-            rebalancing: OperationMode::Disabled,
-            operational_limit: None,
+    struct StubWallet {
+        address: Address,
+        provider: RootProvider,
+    }
+
+    impl StubWallet {
+        fn stub(address: Address) -> Self {
+            Self {
+                address,
+                provider: RootProvider::new(
+                    RpcClient::builder().http("http://stub.invalid".parse().unwrap()),
+                ),
+            }
         }
     }
 
-    fn service_with_symbol(symbol: &str, config: EquityAssetConfig) -> WrapperService<impl Wallet> {
+    #[async_trait]
+    impl Evm for StubWallet {
+        type Provider = RootProvider;
+
+        fn provider(&self) -> &RootProvider {
+            &self.provider
+        }
+    }
+
+    #[async_trait]
+    impl Wallet for StubWallet {
+        fn address(&self) -> Address {
+            self.address
+        }
+
+        async fn send(
+            &self,
+            _contract: Address,
+            _calldata: Bytes,
+            _note: &str,
+        ) -> Result<TransactionReceipt, EvmError> {
+            panic!("StubWallet::send should not be called in these tests")
+        }
+    }
+
+    fn test_addresses() -> EquityTokenAddresses {
+        EquityTokenAddresses {
+            wrapped: Address::random(),
+            unwrapped: Address::random(),
+        }
+    }
+
+    fn service_with_symbol(
+        symbol: &str,
+        addresses: EquityTokenAddresses,
+    ) -> WrapperService<StubWallet> {
         let wallet = StubWallet::stub(Address::random());
         let mut equities = HashMap::new();
-        equities.insert(symbol.parse::<Symbol>().unwrap(), config);
+        equities.insert(symbol.parse::<Symbol>().unwrap(), addresses);
         WrapperService::new(wallet, equities)
     }
 
     #[test]
     fn lookup_equity_returns_configured_symbol() {
-        let config = test_asset_config();
-        let expected_tokenized = config.tokenized_equity;
-        let expected_trd = config.tokenized_equity_derivative;
-        let service = service_with_symbol("AAPL", config);
+        let addresses = test_addresses();
+        let expected_wrapped = addresses.wrapped;
+        let expected_unwrapped = addresses.unwrapped;
+        let service = service_with_symbol("AAPL", addresses);
 
         let result = service.lookup_equity(&"AAPL".parse().unwrap());
 
         assert!(result.is_some());
-        assert_eq!(result.unwrap().tokenized_equity_derivative, expected_trd);
-        assert_eq!(result.unwrap().tokenized_equity, expected_tokenized);
+        assert_eq!(result.unwrap().wrapped, expected_wrapped);
+        assert_eq!(result.unwrap().unwrapped, expected_unwrapped);
     }
 
     #[test]
     fn lookup_equity_returns_none_for_unconfigured() {
-        let service = service_with_symbol("AAPL", test_asset_config());
+        let service = service_with_symbol("AAPL", test_addresses());
 
         let result = service.lookup_equity(&"TSLA".parse().unwrap());
 
@@ -252,10 +295,10 @@ mod tests {
     }
 
     #[test]
-    fn lookup_derivative_returns_vault_address() {
-        let config = test_asset_config();
-        let expected = config.tokenized_equity_derivative;
-        let service = service_with_symbol("AAPL", config);
+    fn lookup_derivative_returns_wrapped_address() {
+        let addresses = test_addresses();
+        let expected = addresses.wrapped;
+        let service = service_with_symbol("AAPL", addresses);
 
         let result = service.lookup_derivative(&"AAPL".parse().unwrap()).unwrap();
 
@@ -263,10 +306,10 @@ mod tests {
     }
 
     #[test]
-    fn lookup_underlying_returns_underlying_address() {
-        let config = test_asset_config();
-        let expected = config.tokenized_equity;
-        let service = service_with_symbol("AAPL", config);
+    fn lookup_underlying_returns_unwrapped_address() {
+        let addresses = test_addresses();
+        let expected = addresses.unwrapped;
+        let service = service_with_symbol("AAPL", addresses);
 
         let result = service.lookup_underlying(&"AAPL".parse().unwrap()).unwrap();
 
@@ -275,10 +318,28 @@ mod tests {
 
     #[test]
     fn lookup_derivative_errors_on_unconfigured_symbol() {
-        let service = service_with_symbol("AAPL", test_asset_config());
+        let service = service_with_symbol("AAPL", test_addresses());
 
         let error = service
             .lookup_derivative(&"MSFT".parse().unwrap())
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                WrapperError::SymbolNotConfigured(ref symbol)
+                    if symbol.to_string() == "MSFT"
+            ),
+            "expected SymbolNotConfigured for MSFT, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn lookup_underlying_errors_on_unconfigured_symbol() {
+        let service = service_with_symbol("AAPL", test_addresses());
+
+        let error = service
+            .lookup_underlying(&"MSFT".parse().unwrap())
             .unwrap_err();
 
         assert!(
@@ -302,7 +363,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_ratio_for_symbol_errors_on_unconfigured() {
-        let service = service_with_symbol("AAPL", test_asset_config());
+        let service = service_with_symbol("AAPL", test_addresses());
 
         let error = service
             .get_ratio_for_symbol(&"XYZ".parse().unwrap())

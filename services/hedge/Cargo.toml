@@ -1,0 +1,104 @@
+[package]
+name = "st0x-hedge"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+
+[features]
+default = []
+test-support = [
+  "st0x-bridge/test-support",
+  "st0x-shared/test-support",
+  "wallet-private-key",
+]
+mock = [
+  "st0x-execution/mock",
+  "st0x-evm/mock",
+  "st0x-shared/test-support",
+  "dep:httpmock",
+  "wallet-private-key",
+]
+wallet-turnkey = ["st0x-evm/turnkey"]
+wallet-private-key = ["st0x-evm/local-signer"]
+
+[dependencies]
+aes-gcm.workspace = true
+alloy.workspace = true
+alloy-primitives.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+backon.workspace = true
+base64.workspace = true
+bon.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+clap.workspace = true
+flate2.workspace = true
+futures-util.workspace = true
+httpmock = { workspace = true, optional = true }
+itertools.workspace = true
+lazy_static.workspace = true
+num-traits.workspace = true
+opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
+rain-error-decoding.workspace = true
+rain-math-float.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+rocket.workspace = true
+rocket_ws.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlite-es.workspace = true
+sqlx.workspace = true
+st0x-bridge = { workspace = true, features = ["cctp"] }
+st0x-dto.workspace = true
+st0x-event-sorcery.workspace = true
+st0x-evm.workspace = true
+st0x-execution.workspace = true
+st0x-finance.workspace = true
+st0x-shared.workspace = true
+st0x-float-macro.workspace = true
+st0x-float-serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
+ts-rs.workspace = true
+url.workspace = true
+urlencoding.workspace = true
+uuid.workspace = true
+# Force transitive wasm-bindgen to match rain.wasm's expected version
+wasm-bindgen.workspace = true
+
+[dev-dependencies]
+approx.workspace = true
+async-trait.workspace = true
+bon.workspace = true
+httpmock.workspace = true
+proptest.workspace = true
+rain-math-float.workspace = true
+rsa.workspace = true
+serial_test.workspace = true
+st0x-bridge = { workspace = true, features = ["mock"] }
+st0x-event-sorcery = { workspace = true, features = ["test-support"] }
+st0x-evm = { workspace = true, features = ["mock"] }
+st0x-execution = { workspace = true, features = ["mock", "test-support"] }
+st0x-hedge = { workspace = true, features = ["test-support", "mock"] }
+temp-env.workspace = true
+tempfile.workspace = true
+test-log.workspace = true
+tokio-tungstenite.workspace = true
+tracing-subscriber.workspace = true
+tracing-test.workspace = true
+url.workspace = true
+
+[[test]]
+name = "e2e"
+path = "tests/e2e/main.rs"
+
+[lints]
+workspace = true

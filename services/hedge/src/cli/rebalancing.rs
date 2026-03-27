@@ -74,7 +74,20 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
 
     let wrapper: Arc<dyn Wrapper> = Arc::new(WrapperService::new(
         base_caller.clone(),
-        ctx.assets.equities.symbols.clone(),
+        ctx.assets
+            .equities
+            .symbols
+            .iter()
+            .map(|(symbol, config)| {
+                (
+                    symbol.clone(),
+                    st0x_shared::EquityTokenAddresses {
+                        wrapped: config.tokenized_equity_derivative,
+                        unwrapped: config.tokenized_equity,
+                    },
+                )
+            })
+            .collect(),
     ));
 
     let raindex = Arc::new(RaindexService::new(

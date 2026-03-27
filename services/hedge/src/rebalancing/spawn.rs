@@ -88,7 +88,21 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
             .map_err(Box::new)?,
         );
 
-        let wrapper = Arc::new(WrapperService::new(base_wallet, equities));
+        let wrapper = Arc::new(WrapperService::new(
+            base_wallet,
+            equities
+                .iter()
+                .map(|(symbol, config)| {
+                    (
+                        symbol.clone(),
+                        st0x_shared::EquityTokenAddresses {
+                            wrapped: config.tokenized_equity_derivative,
+                            unwrapped: config.tokenized_equity,
+                        },
+                    )
+                })
+                .collect(),
+        ));
 
         Ok(Self {
             broker,

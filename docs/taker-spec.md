@@ -1334,8 +1334,8 @@ workflow for each issue is:
 
 ### Code Organization
 
-- **`crates/taker/`**: New workspace crate for the taker bot library
-- **`src/bin/taker.rs`** (or similar): Binary entry point
+- **`services/taker/`**: New workspace crate for the taker bot library
+- **`services/taker/src/main.rs`**: Binary entry point
 - **`crates/e2e-tests/`**: Taker e2e tests as a new `[[test]]` binary alongside
   existing hedging and rebalancing binaries
 
