@@ -61,6 +61,15 @@ pub(super) fn create_order_placer(ctx: &Ctx, pool: &SqlitePool) -> Arc<dyn Order
     })
 }
 
+pub(super) struct CliOrderRequest {
+    pub(super) symbol: Symbol,
+    pub(super) shares: Positive<FractionalShares>,
+    pub(super) direction: Direction,
+    pub(super) time_in_force: Option<TimeInForce>,
+    pub(super) limit_price: Option<Float>,
+    pub(super) extended_hours: bool,
+}
+
 pub(super) async fn order_status_command<W: Write>(
     stdout: &mut W,
     order_id: &str,
@@ -145,92 +154,44 @@ async fn get_broker_order_status<W: Write>(
 }
 
 pub(super) async fn execute_order_with_writers<W: Write>(
-    symbol: Symbol,
-    shares: Positive<FractionalShares>,
-    direction: Direction,
-    time_in_force: Option<TimeInForce>,
-    limit_price: Option<Float>,
-    extended_hours: bool,
+    request: CliOrderRequest,
     ctx: &Ctx,
     pool: &SqlitePool,
     stdout: &mut W,
 ) -> anyhow::Result<()> {
-    let symbol_display = symbol.to_string();
-    let quantity_display = shares.to_string();
-    let limit_price_output = limit_price.clone();
+    let symbol_display = request.symbol.to_string();
+    let quantity_display = request.shares.to_string();
 
     info!(
         symbol = %symbol_display,
-        direction = ?direction,
+        direction = ?request.direction,
         quantity = %quantity_display,
-        limit_price = ?limit_price,
-        extended_hours,
+        limit_price = ?request.limit_price,
+        extended_hours = request.extended_hours,
         "Created order"
     );
 
-    if extended_hours && limit_price.is_none() {
-        let error = anyhow::anyhow!("--extended-hours requires --limit-price");
-        writeln!(stdout, "❌ Failed to place order: {error}")?;
-        return Err(error);
-    }
+    validate_order_request(&request, stdout)?;
 
-    let execution = match limit_price {
-        Some(limit_price) => {
-            execute_alpaca_limit_order(
-                symbol,
-                shares,
-                direction,
-                limit_price,
-                time_in_force,
-                extended_hours,
-                ctx,
-                stdout,
-            )
-            .await
-        }
-        None => {
-            let market_order = MarketOrder {
-                symbol,
-                shares,
-                direction,
-            };
-
-            execute_broker_order(ctx, pool, market_order, time_in_force, stdout).await
-        }
+    let execution = if request.limit_price.is_some() {
+        execute_alpaca_limit_order(&request, ctx, stdout).await
+    } else {
+        execute_market_order(&request, ctx, pool, stdout).await
     };
 
     match execution {
         Ok(placement) => {
-            info!(
-                symbol = %placement.symbol,
-                direction = ?placement.direction,
-                quantity = %placement.shares,
-                order_id = %placement.order_id,
-                "Order placed successfully"
-            );
-            writeln!(stdout, "✅ Order placed successfully")?;
-            writeln!(stdout, "   Symbol: {}", placement.symbol)?;
-            writeln!(stdout, "   Action: {:?}", placement.direction)?;
-            writeln!(stdout, "   Quantity: {}", placement.shares)?;
-            if let Some(limit_price) = limit_price_output {
-                writeln!(stdout, "   Order Type: limit")?;
-                writeln!(
-                    stdout,
-                    "   Limit Price: ${}",
-                    format_float_with_fallback(&limit_price)
-                )?;
-                writeln!(
-                    stdout,
-                    "   Extended Hours: {}",
-                    if extended_hours { "yes" } else { "no" }
-                )?;
-                writeln!(stdout, "   Order ID: {}", placement.order_id)?;
-            }
+            write_order_success(
+                stdout,
+                &placement,
+                request.limit_price,
+                request.extended_hours,
+            )?;
         }
         Err(error) => {
             error!(
                 symbol = %symbol_display,
-                direction = ?direction,
+                direction = ?request.direction,
                 quantity = %quantity_display,
                 error = ?error,
                 "Failed to place order"
@@ -243,17 +204,43 @@ pub(super) async fn execute_order_with_writers<W: Write>(
     Ok(())
 }
 
+fn validate_order_request<W: Write>(
+    request: &CliOrderRequest,
+    stdout: &mut W,
+) -> anyhow::Result<()> {
+    if request.extended_hours && request.limit_price.is_none() {
+        let error = anyhow::anyhow!("--extended-hours requires --limit-price");
+        writeln!(stdout, "❌ Failed to place order: {error}")?;
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+async fn execute_market_order<W: Write>(
+    request: &CliOrderRequest,
+    ctx: &Ctx,
+    pool: &SqlitePool,
+    stdout: &mut W,
+) -> anyhow::Result<OrderPlacement<String>> {
+    let market_order = MarketOrder {
+        symbol: request.symbol.clone(),
+        shares: request.shares,
+        direction: request.direction,
+    };
+
+    execute_broker_order(ctx, pool, market_order, request.time_in_force, stdout).await
+}
+
 async fn execute_alpaca_limit_order<W: Write>(
-    symbol: Symbol,
-    shares: Positive<FractionalShares>,
-    direction: Direction,
-    limit_price: Float,
-    time_in_force: Option<TimeInForce>,
-    extended_hours: bool,
+    request: &CliOrderRequest,
     ctx: &Ctx,
     stdout: &mut W,
 ) -> anyhow::Result<OrderPlacement<String>> {
-    let time_in_force = time_in_force.unwrap_or(TimeInForce::Day);
+    let time_in_force = request.time_in_force.unwrap_or(TimeInForce::Day);
+    let Some(limit_price) = request.limit_price else {
+        anyhow::bail!("--limit-price is required for limit orders");
+    };
 
     if time_in_force != TimeInForce::Day {
         anyhow::bail!("--limit-price only supports --time-in-force day");
@@ -268,12 +255,12 @@ async fn execute_alpaca_limit_order<W: Write>(
     let broker = alpaca_auth.clone().try_into_executor().await?;
     let placement = broker
         .place_limit_order(AlpacaLimitOrder {
-            symbol,
-            shares,
-            direction,
+            symbol: request.symbol.clone(),
+            shares: request.shares,
+            direction: request.direction,
             limit_price,
             time_in_force,
-            extended_hours,
+            extended_hours: request.extended_hours,
         })
         .await?;
 
@@ -284,6 +271,42 @@ async fn execute_alpaca_limit_order<W: Write>(
     )?;
 
     Ok(placement)
+}
+
+fn write_order_success<W: Write>(
+    stdout: &mut W,
+    placement: &OrderPlacement<String>,
+    limit_price: Option<Float>,
+    extended_hours: bool,
+) -> anyhow::Result<()> {
+    info!(
+        symbol = %placement.symbol,
+        direction = ?placement.direction,
+        quantity = %placement.shares,
+        order_id = %placement.order_id,
+        "Order placed successfully"
+    );
+    writeln!(stdout, "✅ Order placed successfully")?;
+    writeln!(stdout, "   Symbol: {}", placement.symbol)?;
+    writeln!(stdout, "   Action: {:?}", placement.direction)?;
+    writeln!(stdout, "   Quantity: {}", placement.shares)?;
+
+    if let Some(limit_price) = limit_price {
+        writeln!(stdout, "   Order Type: limit")?;
+        writeln!(
+            stdout,
+            "   Limit Price: ${}",
+            format_float_with_fallback(&limit_price)
+        )?;
+        writeln!(
+            stdout,
+            "   Extended Hours: {}",
+            if extended_hours { "yes" } else { "no" }
+        )?;
+        writeln!(stdout, "   Order ID: {}", placement.order_id)?;
+    }
+
+    Ok(())
 }
 
 pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'static>(
@@ -621,7 +644,9 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::config::{AssetsConfig, BrokerCtx, EquitiesConfig, LogLevel, SchwabAuth, TradingMode};
+    use crate::config::{
+        AssetsConfig, BrokerCtx, EquitiesConfig, LogLevel, SchwabAuth, TradingMode,
+    };
     use crate::onchain::EvmCtx;
     use crate::test_utils::{positive_shares, setup_test_db, setup_test_tokens};
     use crate::threshold::ExecutionThreshold;
@@ -692,11 +717,55 @@ mod tests {
         ctx.broker = BrokerCtx::AlpacaTradingApi(AlpacaTradingApiCtx {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
-            trading_mode: Some(AlpacaTradingApiMode::Mock(
-                "http://127.0.0.1:1".to_string(),
-            )),
+            trading_mode: Some(AlpacaTradingApiMode::Paper),
         });
         ctx
+    }
+
+    fn cli_order_request(
+        symbol: Symbol,
+        shares: Positive<FractionalShares>,
+        direction: Direction,
+        time_in_force: Option<TimeInForce>,
+        limit_price: Option<Float>,
+        extended_hours: bool,
+    ) -> CliOrderRequest {
+        CliOrderRequest {
+            symbol,
+            shares,
+            direction,
+            time_in_force,
+            limit_price,
+            extended_hours,
+        }
+    }
+
+    macro_rules! execute_order_with_writers {
+        (
+            $symbol:expr,
+            $shares:expr,
+            $direction:expr,
+            $time_in_force:expr,
+            $limit_price:expr,
+            $extended_hours:expr,
+            $ctx:expr,
+            $pool:expr,
+            $stdout:expr $(,)?
+        ) => {
+            super::execute_order_with_writers(
+                cli_order_request(
+                    $symbol,
+                    $shares,
+                    $direction,
+                    $time_in_force,
+                    $limit_price,
+                    $extended_hours,
+                ),
+                $ctx,
+                $pool,
+                $stdout,
+            )
+        };
     }
 
     fn get_schwab_auth(ctx: &Ctx) -> &SchwabAuth {
@@ -731,11 +800,7 @@ mod tests {
 
     fn setup_alpaca_broker_limit_order_mocks(
         server: &MockServer,
-    ) -> (
-        httpmock::Mock<'_>,
-        httpmock::Mock<'_>,
-        httpmock::Mock<'_>,
-    ) {
+    ) -> (httpmock::Mock<'_>, httpmock::Mock<'_>, httpmock::Mock<'_>) {
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
                 .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
@@ -796,7 +861,7 @@ mod tests {
 
         let (account_mock, order_mock) = setup_schwab_order_mocks(&server);
 
-        execute_order_with_writers(
+        execute_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
@@ -823,7 +888,7 @@ mod tests {
 
         let (account_mock, order_mock) = setup_schwab_order_mocks(&server);
 
-        execute_order_with_writers(
+        execute_order_with_writers!(
             Symbol::new("TSLA").unwrap(),
             positive_shares("50"),
             Direction::Sell,
@@ -867,7 +932,7 @@ mod tests {
                 .json_body(json!({"error": "Invalid order"}));
         });
 
-        execute_order_with_writers(
+        execute_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
@@ -892,7 +957,7 @@ mod tests {
         setup_schwab_order_mocks(&server);
 
         let mut stdout_buffer = Vec::new();
-        execute_order_with_writers(
+        execute_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
@@ -938,7 +1003,7 @@ mod tests {
         });
 
         let mut stdout_buffer = Vec::new();
-        execute_order_with_writers(
+        execute_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
@@ -968,7 +1033,7 @@ mod tests {
         setup_schwab_order_mocks(&server);
 
         let mut stdout_buffer = Vec::new();
-        execute_order_with_writers(
+        execute_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
@@ -997,7 +1062,7 @@ mod tests {
         let (account_mock, asset_mock, order_mock) = setup_alpaca_broker_limit_order_mocks(&server);
 
         let mut stdout_buffer = Vec::new();
-        execute_order_with_writers(
+        execute_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("10"),
             Direction::Buy,
@@ -1016,8 +1081,14 @@ mod tests {
         order_mock.assert();
 
         let output = String::from_utf8(stdout_buffer).unwrap();
-        assert!(output.contains("Order Type: limit"), "unexpected output: {output}");
-        assert!(output.contains("Extended Hours: yes"), "unexpected output: {output}");
+        assert!(
+            output.contains("Order Type: limit"),
+            "unexpected output: {output}"
+        );
+        assert!(
+            output.contains("Extended Hours: yes"),
+            "unexpected output: {output}"
+        );
         assert!(output.contains("Order ID:"), "unexpected output: {output}");
     }
 
@@ -1029,7 +1100,7 @@ mod tests {
         setup_test_tokens(&pool, get_schwab_auth(&ctx)).await;
 
         let mut stdout_buffer = Vec::new();
-        let error = execute_order_with_writers(
+        let error = execute_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("10"),
             Direction::Buy,
@@ -1053,7 +1124,7 @@ mod tests {
         let pool = setup_test_db().await;
 
         let mut stdout_buffer = Vec::new();
-        let error = execute_order_with_writers(
+        let error = execute_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("10"),
             Direction::Buy,
@@ -1079,7 +1150,7 @@ mod tests {
         let pool = setup_test_db().await;
 
         let mut stdout_buffer = Vec::new();
-        let error = execute_order_with_writers(
+        let error = execute_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("10"),
             Direction::Buy,
@@ -1105,7 +1176,7 @@ mod tests {
         let pool = setup_test_db().await;
 
         let mut stdout_buffer = Vec::new();
-        let error = execute_order_with_writers(
+        let error = execute_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("10"),
             Direction::Buy,
@@ -1132,7 +1203,7 @@ mod tests {
         let pool = setup_test_db().await;
 
         let mut stdout_buffer = Vec::new();
-        let error = execute_order_with_writers(
+        let error = execute_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("10"),
             Direction::Buy,

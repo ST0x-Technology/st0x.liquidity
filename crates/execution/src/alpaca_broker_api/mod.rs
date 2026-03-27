@@ -144,9 +144,6 @@ pub enum AlpacaBrokerApiError {
     #[error("Asset {symbol} is not tradable on Alpaca")]
     AssetNotTradable { symbol: Symbol },
 
-    #[error("Asset {symbol} is not overnight-tradable for extended-hours Alpaca orders")]
-    AssetNotOvernightTradable { symbol: Symbol },
-
     #[error("limit orders only support day time-in-force, got {time_in_force}")]
     InvalidLimitOrderTimeInForce { time_in_force: TimeInForce },
 

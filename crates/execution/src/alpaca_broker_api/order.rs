@@ -258,13 +258,13 @@ pub(super) async fn place_limit_order(
     limit_order: AlpacaLimitOrder,
 ) -> Result<OrderPlacement<String>, AlpacaBrokerApiError> {
     debug!(
-        "Placing Alpaca Broker API limit order: {} {} shares of {} at {} (time_in_force: {:?}, extended_hours: {})",
-        limit_order.direction,
-        limit_order.shares,
-        limit_order.symbol,
-        limit_order.limit_price,
-        limit_order.time_in_force,
-        limit_order.extended_hours,
+        direction = ?limit_order.direction,
+        shares = %limit_order.shares,
+        symbol = %limit_order.symbol,
+        limit_price = ?limit_order.limit_price,
+        time_in_force = ?limit_order.time_in_force,
+        extended_hours = limit_order.extended_hours,
+        "Placing Alpaca Broker API limit order"
     );
 
     if limit_order.time_in_force != TimeInForce::Day {

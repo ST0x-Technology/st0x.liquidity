@@ -58,7 +58,10 @@ fn parse_float(input: &str) -> Result<Float, String> {
 fn parse_positive_price(input: &str) -> Result<Float, String> {
     let price = parse_float(input)?;
 
-    if price.is_negative().map_err(|err| format!("{err}"))? {
+    if price
+        .lt(Float::zero().map_err(|err| format!("{err}"))?)
+        .map_err(|err| format!("{err}"))?
+    {
         return Err("limit price must be positive".to_string());
     }
 
@@ -408,12 +411,7 @@ pub async fn run_command(ctx: Ctx, command: Commands) -> anyhow::Result<()> {
 }
 
 async fn execute_order<W: Write>(
-    symbol: Symbol,
-    quantity: Positive<FractionalShares>,
-    direction: Direction,
-    time_in_force: Option<TimeInForce>,
-    limit_price: Option<Float>,
-    extended_hours: bool,
+    request: trading::CliOrderRequest,
     ctx: &Ctx,
     pool: &SqlitePool,
     stdout: &mut W,
@@ -423,8 +421,11 @@ async fn execute_order<W: Write>(
         BrokerCtx::AlpacaTradingApi(_) | BrokerCtx::AlpacaBrokerApi(_) | BrokerCtx::DryRun => false,
     };
 
-    if broker_rejects_fractional && quantity.to_whole_shares().is_err() {
-        warn!(quantity = %quantity, "Rejecting fractional CLI order for Schwab");
+    if broker_rejects_fractional && request.shares.to_whole_shares().is_err() {
+        warn!(
+            quantity = %request.shares,
+            "Rejecting fractional CLI order for Schwab"
+        );
         writeln!(
             stdout,
             "❌ Schwab does not accept fractional shares for buy/sell orders"
@@ -432,19 +433,11 @@ async fn execute_order<W: Write>(
         anyhow::bail!("Schwab does not accept fractional shares for buy/sell orders");
     }
 
-    info!("Processing {direction:?} order: symbol={symbol}, quantity={quantity}");
-    trading::execute_order_with_writers(
-        symbol,
-        quantity,
-        direction,
-        time_in_force,
-        limit_price,
-        extended_hours,
-        ctx,
-        pool,
-        stdout,
-    )
-    .await
+    info!(
+        "Processing {:?} order: symbol={}, quantity={}",
+        request.direction, request.symbol, request.shares
+    );
+    trading::execute_order_with_writers(request, ctx, pool, stdout).await
 }
 
 /// Commands that don't require a WebSocket provider.
@@ -687,12 +680,14 @@ async fn run_simple_command<W: Write>(
             extended_hours,
         } => {
             execute_order(
-                symbol,
-                quantity,
-                Direction::Buy,
-                time_in_force,
-                limit_price,
-                extended_hours,
+                trading::CliOrderRequest {
+                    symbol,
+                    shares: quantity,
+                    direction: Direction::Buy,
+                    time_in_force,
+                    limit_price,
+                    extended_hours,
+                },
                 ctx,
                 pool,
                 stdout,
@@ -707,12 +702,14 @@ async fn run_simple_command<W: Write>(
             extended_hours,
         } => {
             execute_order(
-                symbol,
-                quantity,
-                Direction::Sell,
-                time_in_force,
-                limit_price,
-                extended_hours,
+                trading::CliOrderRequest {
+                    symbol,
+                    shares: quantity,
+                    direction: Direction::Sell,
+                    time_in_force,
+                    limit_price,
+                    extended_hours,
+                },
                 ctx,
                 pool,
                 stdout,
@@ -888,6 +885,52 @@ mod tests {
         }
     }
 
+    fn cli_order_request(
+        symbol: Symbol,
+        shares: Positive<FractionalShares>,
+        direction: Direction,
+        time_in_force: Option<TimeInForce>,
+        limit_price: Option<Float>,
+        extended_hours: bool,
+    ) -> trading::CliOrderRequest {
+        trading::CliOrderRequest {
+            symbol,
+            shares,
+            direction,
+            time_in_force,
+            limit_price,
+            extended_hours,
+        }
+    }
+
+    macro_rules! execute_cli_order_with_writers {
+        (
+            $symbol:expr,
+            $shares:expr,
+            $direction:expr,
+            $time_in_force:expr,
+            $limit_price:expr,
+            $extended_hours:expr,
+            $ctx:expr,
+            $pool:expr,
+            $stdout:expr $(,)?
+        ) => {
+            trading::execute_order_with_writers(
+                cli_order_request(
+                    $symbol,
+                    $shares,
+                    $direction,
+                    $time_in_force,
+                    $limit_price,
+                    $extended_hours,
+                ),
+                $ctx,
+                $pool,
+                $stdout,
+            )
+        };
+    }
+
     #[tokio::test]
     async fn test_run_buy_order() {
         let server = MockServer::start();
@@ -916,7 +959,7 @@ mod tests {
                 .header("location", "/trader/v1/accounts/ABC123DEF456/orders/12345");
         });
 
-        trading::execute_order_with_writers(
+        execute_cli_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
@@ -962,7 +1005,7 @@ mod tests {
                 .header("location", "/trader/v1/accounts/ABC123DEF456/orders/12345");
         });
 
-        trading::execute_order_with_writers(
+        execute_cli_order_with_writers!(
             Symbol::new("TSLA").unwrap(),
             positive_shares("50"),
             Direction::Sell,
@@ -1009,7 +1052,7 @@ mod tests {
                 }));
         });
 
-        trading::execute_order_with_writers(
+        execute_cli_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
@@ -1043,7 +1086,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = trading::execute_order_with_writers(
+        let result = execute_cli_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
@@ -1115,7 +1158,7 @@ mod tests {
                 .header("location", "/trader/v1/accounts/ABC123DEF456/orders/12345");
         });
 
-        let result = trading::execute_order_with_writers(
+        let result = execute_cli_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
@@ -1171,7 +1214,7 @@ mod tests {
                 .header("location", "/trader/v1/accounts/ABC123DEF456/orders/12345");
         });
 
-        trading::execute_order_with_writers(
+        execute_cli_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
@@ -1214,7 +1257,7 @@ mod tests {
         });
 
         let mut stdout_buffer = Vec::new();
-        trading::execute_order_with_writers(
+        execute_cli_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
@@ -1264,7 +1307,7 @@ mod tests {
         });
 
         let mut stdout_buffer = Vec::new();
-        trading::execute_order_with_writers(
+        execute_cli_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
@@ -1893,7 +1936,7 @@ mod tests {
 
         let mut stdout = Vec::new();
 
-        let result = trading::execute_order_with_writers(
+        let result = execute_cli_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
@@ -1970,7 +2013,7 @@ mod tests {
 
         let mut stdout = Vec::new();
 
-        let result = trading::execute_order_with_writers(
+        let result = execute_cli_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
@@ -2007,7 +2050,7 @@ mod tests {
 
         let mut stdout = Vec::new();
 
-        let result = trading::execute_order_with_writers(
+        let result = execute_cli_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
@@ -2046,7 +2089,7 @@ mod tests {
 
         let mut stdout2 = Vec::new();
 
-        let result2 = trading::execute_order_with_writers(
+        let result2 = execute_cli_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
@@ -2084,7 +2127,7 @@ mod tests {
 
         let mut stdout = Vec::new();
 
-        let result = trading::execute_order_with_writers(
+        let result = execute_cli_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
@@ -2177,7 +2220,7 @@ mod tests {
 
         let mut stdout = Vec::new();
 
-        let result = trading::execute_order_with_writers(
+        let result = execute_cli_order_with_writers!(
             Symbol::new("INVALID").unwrap(),
             positive_shares("999999"),
             Direction::Buy,
