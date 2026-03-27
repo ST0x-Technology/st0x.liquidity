@@ -521,7 +521,11 @@ mod tests {
         };
 
         assert_eq!(filled_symbol, symbol, "Filled symbol mismatch");
-        assert_eq!(filled_shares, shares, "Filled shares mismatch");
+        assert_eq!(
+            filled_shares,
+            crate::offchain_order::noop_placed_shares(shares),
+            "Filled shares should reflect the broker-accepted quantity"
+        );
         assert_eq!(
             filled_direction,
             Direction::Buy,
@@ -627,7 +631,11 @@ mod tests {
         };
 
         assert_eq!(failed_symbol, symbol, "Failed symbol mismatch");
-        assert_eq!(failed_shares, shares, "Failed shares mismatch");
+        assert_eq!(
+            failed_shares,
+            crate::offchain_order::noop_placed_shares(shares),
+            "Failed shares should reflect the broker-accepted quantity"
+        );
         assert_eq!(
             failed_direction,
             Direction::Sell,

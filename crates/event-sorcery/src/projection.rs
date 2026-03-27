@@ -15,7 +15,7 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::EventSourced;
 use crate::dependency::{Cons, Dependent, EntityList, Nil};
@@ -262,7 +262,7 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
                 if let Lifecycle::Live(entity) = lifecycle {
                     Some((id, entity))
                 } else {
-                    warn!(%id, "Skipping non-live aggregate in view");
+                    debug!(%id, "Skipping non-live aggregate in view");
                     None
                 }
             })

@@ -21,7 +21,6 @@ pub struct OrderPlacement<OrderId> {
     pub placed_at: DateTime<Utc>,
 }
 
-#[derive(Debug)]
 pub struct OrderUpdate<OrderId> {
     pub order_id: OrderId,
     pub symbol: Symbol,
@@ -30,6 +29,22 @@ pub struct OrderUpdate<OrderId> {
     pub status: OrderStatus,
     pub updated_at: DateTime<Utc>,
     pub price: Option<Float>,
+}
+
+impl<OrderId: Debug> Debug for OrderUpdate<OrderId> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use st0x_float_serde::DebugOptionFloat;
+
+        f.debug_struct("OrderUpdate")
+            .field("order_id", &self.order_id)
+            .field("symbol", &self.symbol)
+            .field("shares", &self.shares)
+            .field("direction", &self.direction)
+            .field("status", &self.status)
+            .field("updated_at", &self.updated_at)
+            .field("price", &DebugOptionFloat(&self.price))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]

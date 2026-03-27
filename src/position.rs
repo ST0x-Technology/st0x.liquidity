@@ -22,7 +22,7 @@ use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
 use crate::offchain_order::OffchainOrderId;
 use crate::threshold::ExecutionThreshold;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Position {
     pub symbol: Symbol,
     pub net: FractionalShares,
@@ -36,6 +36,23 @@ pub struct Position {
     )]
     pub last_price_usdc: Option<Float>,
     pub last_updated: Option<DateTime<Utc>>,
+}
+
+impl std::fmt::Debug for Position {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use st0x_float_serde::DebugOptionFloat;
+
+        f.debug_struct("Position")
+            .field("symbol", &self.symbol)
+            .field("net", &self.net)
+            .field("accumulated_long", &self.accumulated_long)
+            .field("accumulated_short", &self.accumulated_short)
+            .field("pending_offchain_order_id", &self.pending_offchain_order_id)
+            .field("threshold", &self.threshold)
+            .field("last_price_usdc", &DebugOptionFloat(&self.last_price_usdc))
+            .field("last_updated", &self.last_updated)
+            .finish()
+    }
 }
 
 #[async_trait]
@@ -74,30 +91,37 @@ impl EventSourced for Position {
     }
 
     fn evolve(entity: &Self, event: &Self::Event) -> Result<Option<Self>, Self::Error> {
+        use Direction::{Buy, Sell};
         use PositionEvent::*;
+
         match event {
             OnChainOrderFilled {
                 amount,
-                direction,
+                direction: Buy,
                 price_usdc,
                 seen_at,
                 ..
-            } => match direction {
-                Direction::Buy => Ok(Some(Self {
-                    net: (entity.net + *amount)?,
-                    accumulated_long: (entity.accumulated_long + *amount)?,
-                    last_price_usdc: Some(*price_usdc),
-                    last_updated: Some(*seen_at),
-                    ..entity.clone()
-                })),
-                Direction::Sell => Ok(Some(Self {
-                    net: (entity.net - *amount)?,
-                    accumulated_short: (entity.accumulated_short + *amount)?,
-                    last_price_usdc: Some(*price_usdc),
-                    last_updated: Some(*seen_at),
-                    ..entity.clone()
-                })),
-            },
+            } => Ok(Some(Self {
+                net: (entity.net + *amount)?,
+                accumulated_long: (entity.accumulated_long + *amount)?,
+                last_price_usdc: Some(*price_usdc),
+                last_updated: Some(*seen_at),
+                ..entity.clone()
+            })),
+
+            OnChainOrderFilled {
+                direction: Sell,
+                amount,
+                price_usdc,
+                seen_at,
+                ..
+            } => Ok(Some(Self {
+                net: (entity.net - *amount)?,
+                accumulated_short: (entity.accumulated_short + *amount)?,
+                last_price_usdc: Some(*price_usdc),
+                last_updated: Some(*seen_at),
+                ..entity.clone()
+            })),
 
             OffChainOrderPlaced { .. } if entity.pending_offchain_order_id.is_some() => Ok(None),
 
@@ -116,24 +140,28 @@ impl EventSourced for Position {
             } if entity.pending_offchain_order_id != Some(*offchain_order_id) => Ok(None),
 
             OffChainOrderFilled {
+                direction: Buy,
                 shares_filled,
-                direction,
                 broker_timestamp,
                 ..
-            } => match direction {
-                Direction::Sell => Ok(Some(Self {
-                    net: (entity.net - shares_filled.inner())?,
-                    pending_offchain_order_id: None,
-                    last_updated: Some(*broker_timestamp),
-                    ..entity.clone()
-                })),
-                Direction::Buy => Ok(Some(Self {
-                    net: (entity.net + shares_filled.inner())?,
-                    pending_offchain_order_id: None,
-                    last_updated: Some(*broker_timestamp),
-                    ..entity.clone()
-                })),
-            },
+            } => Ok(Some(Self {
+                net: (entity.net + shares_filled.inner())?,
+                pending_offchain_order_id: None,
+                last_updated: Some(*broker_timestamp),
+                ..entity.clone()
+            })),
+
+            OffChainOrderFilled {
+                direction: Sell,
+                shares_filled,
+                broker_timestamp,
+                ..
+            } => Ok(Some(Self {
+                net: (entity.net - shares_filled.inner())?,
+                pending_offchain_order_id: None,
+                last_updated: Some(*broker_timestamp),
+                ..entity.clone()
+            })),
 
             OffChainOrderFailed {
                 offchain_order_id, ..
@@ -348,11 +376,9 @@ impl Position {
         &self,
         offchain_order_id: OffchainOrderId,
     ) -> Result<(), PositionError> {
-        let Some(pending_id) = self.pending_offchain_order_id else {
-            return Err(PositionError::NoPendingExecution);
-        };
-
-        if pending_id != offchain_order_id {
+        if let Some(pending_id) = self.pending_offchain_order_id
+            && pending_id != offchain_order_id
+        {
             return Err(PositionError::OffchainOrderIdMismatch {
                 expected: pending_id,
                 actual: offchain_order_id,
@@ -471,7 +497,7 @@ impl From<FloatError> for PositionError {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum PositionCommand {
     AcknowledgeOnChainFill {
         symbol: Symbol,
@@ -506,7 +532,7 @@ pub enum PositionCommand {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum PositionEvent {
     Initialized {
         symbol: Symbol,
@@ -707,7 +733,7 @@ impl std::fmt::Display for TradeId {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum TriggerReason {
     SharesThreshold {
         #[serde(
@@ -784,6 +810,191 @@ impl PartialEq for TriggerReason {
 }
 
 impl Eq for TriggerReason {}
+
+impl std::fmt::Debug for PositionCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use st0x_float_serde::DebugFloat;
+
+        match self {
+            Self::AcknowledgeOnChainFill {
+                symbol,
+                threshold,
+                trade_id,
+                amount,
+                direction,
+                price_usdc,
+                block_timestamp,
+            } => f
+                .debug_struct("AcknowledgeOnChainFill")
+                .field("symbol", symbol)
+                .field("threshold", threshold)
+                .field("trade_id", trade_id)
+                .field("amount", amount)
+                .field("direction", direction)
+                .field("price_usdc", &DebugFloat(price_usdc))
+                .field("block_timestamp", block_timestamp)
+                .finish(),
+            Self::PlaceOffChainOrder {
+                offchain_order_id,
+                shares,
+                direction,
+                executor,
+                threshold,
+            } => f
+                .debug_struct("PlaceOffChainOrder")
+                .field("offchain_order_id", offchain_order_id)
+                .field("shares", shares)
+                .field("direction", direction)
+                .field("executor", executor)
+                .field("threshold", threshold)
+                .finish(),
+            Self::CompleteOffChainOrder {
+                offchain_order_id,
+                shares_filled,
+                direction,
+                executor_order_id,
+                price,
+                broker_timestamp,
+            } => f
+                .debug_struct("CompleteOffChainOrder")
+                .field("offchain_order_id", offchain_order_id)
+                .field("shares_filled", shares_filled)
+                .field("direction", direction)
+                .field("executor_order_id", executor_order_id)
+                .field("price", price)
+                .field("broker_timestamp", broker_timestamp)
+                .finish(),
+            Self::FailOffChainOrder {
+                offchain_order_id,
+                error,
+            } => f
+                .debug_struct("FailOffChainOrder")
+                .field("offchain_order_id", offchain_order_id)
+                .field("error", error)
+                .finish(),
+            Self::UpdateThreshold { threshold } => f
+                .debug_struct("UpdateThreshold")
+                .field("threshold", threshold)
+                .finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for PositionEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use st0x_float_serde::DebugFloat;
+
+        match self {
+            Self::Initialized {
+                symbol,
+                threshold,
+                initialized_at,
+            } => f
+                .debug_struct("Initialized")
+                .field("symbol", symbol)
+                .field("threshold", threshold)
+                .field("initialized_at", initialized_at)
+                .finish(),
+            Self::OnChainOrderFilled {
+                trade_id,
+                amount,
+                direction,
+                price_usdc,
+                block_timestamp,
+                seen_at,
+            } => f
+                .debug_struct("OnChainOrderFilled")
+                .field("trade_id", trade_id)
+                .field("amount", amount)
+                .field("direction", direction)
+                .field("price_usdc", &DebugFloat(price_usdc))
+                .field("block_timestamp", block_timestamp)
+                .field("seen_at", seen_at)
+                .finish(),
+            Self::OffChainOrderPlaced {
+                offchain_order_id,
+                shares,
+                direction,
+                executor,
+                trigger_reason,
+                placed_at,
+            } => f
+                .debug_struct("OffChainOrderPlaced")
+                .field("offchain_order_id", offchain_order_id)
+                .field("shares", shares)
+                .field("direction", direction)
+                .field("executor", executor)
+                .field("trigger_reason", trigger_reason)
+                .field("placed_at", placed_at)
+                .finish(),
+            Self::OffChainOrderFilled {
+                offchain_order_id,
+                shares_filled,
+                direction,
+                executor_order_id,
+                price,
+                broker_timestamp,
+            } => f
+                .debug_struct("OffChainOrderFilled")
+                .field("offchain_order_id", offchain_order_id)
+                .field("shares_filled", shares_filled)
+                .field("direction", direction)
+                .field("executor_order_id", executor_order_id)
+                .field("price", price)
+                .field("broker_timestamp", broker_timestamp)
+                .finish(),
+            Self::OffChainOrderFailed {
+                offchain_order_id,
+                error,
+                failed_at,
+            } => f
+                .debug_struct("OffChainOrderFailed")
+                .field("offchain_order_id", offchain_order_id)
+                .field("error", error)
+                .field("failed_at", failed_at)
+                .finish(),
+            Self::ThresholdUpdated {
+                old_threshold,
+                new_threshold,
+                updated_at,
+            } => f
+                .debug_struct("ThresholdUpdated")
+                .field("old_threshold", old_threshold)
+                .field("new_threshold", new_threshold)
+                .field("updated_at", updated_at)
+                .finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for TriggerReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use st0x_float_serde::DebugFloat;
+
+        match self {
+            Self::SharesThreshold {
+                net_position_shares,
+                threshold_shares,
+            } => f
+                .debug_struct("SharesThreshold")
+                .field("net_position_shares", &DebugFloat(net_position_shares))
+                .field("threshold_shares", &DebugFloat(threshold_shares))
+                .finish(),
+            Self::DollarThreshold {
+                net_position_shares,
+                dollar_value,
+                price_usdc,
+                threshold_dollars,
+            } => f
+                .debug_struct("DollarThreshold")
+                .field("net_position_shares", &DebugFloat(net_position_shares))
+                .field("dollar_value", &DebugFloat(dollar_value))
+                .field("price_usdc", &DebugFloat(price_usdc))
+                .field("threshold_dollars", &DebugFloat(threshold_dollars))
+                .finish(),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

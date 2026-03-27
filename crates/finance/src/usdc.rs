@@ -12,8 +12,14 @@ use st0x_float_serde::{
 use crate::HasZero;
 
 /// A USDC dollar amount.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct Usdc(Float);
+
+impl std::fmt::Debug for Usdc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Usdc({})", format_float_with_fallback(&self.0))
+    }
+}
 
 impl Usdc {
     #[must_use]

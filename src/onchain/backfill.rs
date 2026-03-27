@@ -1169,10 +1169,11 @@ mod tests {
         )
         .await;
 
-        // Should succeed at RPC level but fail at database level
-        // The function handles enqueue failures gracefully by continuing
-        let enqueued = result.unwrap();
-        assert_eq!(enqueued, 0); // No events successfully enqueued
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, OnChainError::JobQueue(_)),
+            "Expected JobQueue error when database pool is closed, got: {error}"
+        );
     }
 
     #[tokio::test]

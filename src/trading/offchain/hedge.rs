@@ -10,7 +10,6 @@ use apalis_codec::json::JsonCodec;
 use apalis_sqlite::fetcher::SqliteFetcher;
 use apalis_sqlite::{CompactType, SqliteStorage};
 use serde::{Deserialize, Serialize};
-use tracing::info;
 
 use st0x_event_sorcery::Store;
 use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
