@@ -144,9 +144,6 @@ pub enum AlpacaBrokerApiError {
     #[error("Asset {symbol} is not tradable on Alpaca")]
     AssetNotTradable { symbol: Symbol },
 
-    #[error("limit orders only support day time-in-force, got {time_in_force}")]
-    InvalidLimitOrderTimeInForce { time_in_force: TimeInForce },
-
     #[error(
         "Limit price {limit_price} exceeds Alpaca's \
          {max_decimals}-decimal-place precision for this price range"

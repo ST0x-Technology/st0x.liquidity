@@ -58,7 +58,6 @@ pub struct AlpacaLimitOrder {
     pub shares: Positive<FractionalShares>,
     pub direction: Direction,
     pub limit_price: Positive<Usd>,
-    pub time_in_force: TimeInForce,
     pub extended_hours: bool,
 }
 
@@ -284,16 +283,9 @@ pub(super) async fn place_limit_order(
         shares = %limit_order.shares,
         symbol = %limit_order.symbol,
         limit_price = ?limit_order.limit_price,
-        time_in_force = ?limit_order.time_in_force,
         extended_hours = limit_order.extended_hours,
         "Placing Alpaca Broker API limit order"
     );
-
-    if limit_order.time_in_force != TimeInForce::Day {
-        return Err(AlpacaBrokerApiError::InvalidLimitOrderTimeInForce {
-            time_in_force: limit_order.time_in_force,
-        });
-    }
 
     validate_limit_price_precision(limit_order.limit_price)?;
 
@@ -310,7 +302,7 @@ pub(super) async fn place_limit_order(
         side,
         order_type: "limit",
         limit_price: limit_order.limit_price,
-        time_in_force: limit_order.time_in_force.as_api_str(),
+        time_in_force: TimeInForce::Day.as_api_str(),
         extended_hours: limit_order.extended_hours,
     };
 
@@ -636,7 +628,6 @@ mod tests {
             shares: Positive::new(FractionalShares::new(float!(100))).unwrap(),
             direction: Direction::Buy,
             limit_price: Positive::new(Usd::new(float!(195.25))).unwrap(),
-            time_in_force: TimeInForce::Day,
             extended_hours: false,
         };
 
@@ -684,7 +675,6 @@ mod tests {
             shares: Positive::new(FractionalShares::new(float!(50))).unwrap(),
             direction: Direction::Sell,
             limit_price: Positive::new(Usd::new(float!(210))).unwrap(),
-            time_in_force: TimeInForce::Day,
             extended_hours: true,
         };
 
@@ -698,34 +688,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_place_limit_order_rejects_market_on_close() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
-        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
-
-        let limit_order = AlpacaLimitOrder {
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
-            direction: Direction::Buy,
-            limit_price: Positive::new(Usd::new(float!(195.25))).unwrap(),
-            time_in_force: TimeInForce::MarketOnClose,
-            extended_hours: false,
-        };
-
-        let error = place_limit_order(&client, limit_order).await.unwrap_err();
-
-        assert!(
-            matches!(
-                error,
-                AlpacaBrokerApiError::InvalidLimitOrderTimeInForce {
-                    time_in_force: TimeInForce::MarketOnClose,
-                }
-            ),
-            "Expected InvalidLimitOrderTimeInForce error, got: {error:?}"
-        );
-    }
-
-    #[tokio::test]
     async fn test_place_limit_order_rejects_price_with_more_than_two_decimals_at_or_above_one() {
         let server = MockServer::start();
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
@@ -736,7 +698,6 @@ mod tests {
             shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
             direction: Direction::Buy,
             limit_price: Positive::new(Usd::new(float!(195.255))).unwrap(),
-            time_in_force: TimeInForce::Day,
             extended_hours: false,
         };
 
@@ -765,7 +726,6 @@ mod tests {
             shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
             direction: Direction::Buy,
             limit_price: Positive::new(Usd::new(float!(0.12345))).unwrap(),
-            time_in_force: TimeInForce::Day,
             extended_hours: false,
         };
 
@@ -818,7 +778,6 @@ mod tests {
             shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
             direction: Direction::Buy,
             limit_price: Positive::new(Usd::new(float!(0.1234))).unwrap(),
-            time_in_force: TimeInForce::Day,
             extended_hours: false,
         };
 
@@ -1168,7 +1127,6 @@ mod tests {
             .unwrap(),
             direction: Direction::Sell,
             limit_price: Positive::new(Usd::new(float!(17.45))).unwrap(),
-            time_in_force: TimeInForce::Day,
             extended_hours: false,
         };
 
@@ -1199,7 +1157,6 @@ mod tests {
             .unwrap(),
             direction: Direction::Buy,
             limit_price: Positive::new(Usd::new(float!(195.25))).unwrap(),
-            time_in_force: TimeInForce::Day,
             extended_hours: false,
         };
 

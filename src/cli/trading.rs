@@ -259,7 +259,6 @@ async fn execute_alpaca_limit_order<W: Write>(
             shares: request.shares,
             direction: request.direction,
             limit_price,
-            time_in_force,
             extended_hours: request.extended_hours,
         })
         .await?;
@@ -1093,7 +1092,10 @@ mod tests {
             output.contains("Extended Hours: yes"),
             "unexpected output: {output}"
         );
-        assert!(output.contains("Order ID:"), "unexpected output: {output}");
+        assert!(
+            output.contains("Order ID: 61e7b016-9c91-4a97-b912-615c9d365c9d"),
+            "unexpected output: {output}"
+        );
     }
 
     #[tokio::test]

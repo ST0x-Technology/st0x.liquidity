@@ -1758,6 +1758,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_sell_command_parses_limit_price_and_extended_hours() {
+        let cli = Cli::try_parse_from([
+            "schwab",
+            "sell",
+            "-s",
+            "COIN",
+            "-q",
+            "10",
+            "--limit-price",
+            "195.25",
+            "--extended-hours",
+        ])
+        .unwrap();
+        let Commands::Sell {
+            limit_price,
+            extended_hours,
+            ..
+        } = cli.command
+        else {
+            panic!("expected sell command");
+        };
+
+        assert!(extended_hours);
+        assert!(
+            limit_price
+                .unwrap()
+                .inner()
+                .eq(&Usd::new(Float::parse("195.25".to_string()).unwrap()))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_sell_command_rejects_non_positive_limit_price() {
+        let error = Cli::try_parse_from([
+            "schwab",
+            "sell",
+            "-s",
+            "AAPL",
+            "-q",
+            "1",
+            "--limit-price",
+            "0",
+        ])
+        .unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("limit price must be positive"),
+            "unexpected error: {message}"
+        );
+    }
+
     async fn assert_fractional_order_rejected_before_schwab_request(command: Commands) {
         let server = MockServer::start();
         let ctx = create_test_ctx_for_cli(&server, Address::ZERO);
