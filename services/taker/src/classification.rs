@@ -162,7 +162,7 @@ fn is_pyth_oracle_expression(stripped: &str) -> bool {
 }
 
 /// Strips Rainlang comments (`/* ... */` block and `//` line comments).
-fn strip_comments(source: &str) -> String {
+pub(crate) fn strip_comments(source: &str) -> String {
     let mut result = String::with_capacity(source.len());
     let mut chars = source.chars().peekable();
 

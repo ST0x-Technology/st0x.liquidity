@@ -17,6 +17,7 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use st0x_event_sorcery::{Projection, StoreBuilder};
+use st0x_execution::MarketDataProvider;
 use st0x_shared::bindings::{
     IOrderBookV6::{AddOrderV3, IOrderBookV6Instance, RemoveOrderV3, TakeOrderV3},
     MetaV1_2,
@@ -30,6 +31,7 @@ mod approval;
 mod classification;
 pub mod config;
 mod order_collector;
+mod profitability;
 mod tracked_order;
 
 #[cfg(test)]
@@ -54,7 +56,10 @@ pub fn setup_tracing(log_level: &LogLevel) {
 
 /// Main entry point for the taker bot.
 #[allow(clippy::cognitive_complexity)]
-pub async fn launch(ctx: Ctx) -> anyhow::Result<()> {
+pub async fn launch<M: MarketDataProvider + 'static>(
+    ctx: Ctx,
+    market_data: M,
+) -> anyhow::Result<()> {
     let pool = ctx.get_sqlite_pool().await?;
     sqlx::migrate!().run(&pool).await?;
     info!("taker bot started, database migrated");
@@ -90,6 +95,13 @@ pub async fn launch(ctx: Ctx) -> anyhow::Result<()> {
 
     run_backfill(&provider, &processor, &pool, &ctx).await?;
 
+    // Spawn profitability evaluation loop as a supervised background task
+    let eval_projection = Arc::clone(&projection);
+    let eval_config = ctx.order_taker.clone();
+    let eval_handle = tokio::spawn(async move {
+        profitability::evaluation_loop(eval_projection, market_data, eval_config).await;
+    });
+
     info!(
         "Entering live event loop. Active orders: {}",
         count_active_orders(&projection).await
@@ -111,6 +123,7 @@ pub async fn launch(ctx: Ctx) -> anyhow::Result<()> {
         &mut take_stream,
         &mut meta_stream,
         &mut meta_cache,
+        eval_handle,
     )
     .await?;
 
@@ -127,7 +140,7 @@ pub async fn launch(ctx: Ctx) -> anyhow::Result<()> {
 /// `U256::MAX` placeholder, `RecordFill` duplicates will corrupt
 /// state. Fix by snapshotting the block first, backfilling to it,
 /// then subscribing from snapshot+1.
-#[allow(clippy::cognitive_complexity)]
+#[allow(clippy::cognitive_complexity, clippy::too_many_arguments)]
 async fn run_event_loop(
     processor: &EventProcessor,
     cursor: &BlockCursor<'_>,
@@ -140,9 +153,26 @@ async fn run_event_loop(
          ),
     meta_stream: &mut (impl StreamExt<Item = Log> + Unpin),
     meta_cache: &mut HashMap<B256, Bytes>,
+    mut eval_handle: tokio::task::JoinHandle<()>,
 ) -> anyhow::Result<()> {
     loop {
         tokio::select! {
+            result = &mut eval_handle => {
+                match result {
+                    Ok(()) => {
+                        error!("Profitability evaluation loop exited unexpectedly");
+                        return Err(anyhow::anyhow!(
+                            "Profitability evaluation loop exited unexpectedly"
+                        ));
+                    }
+                    Err(join_error) => {
+                        error!("Profitability evaluation loop panicked: {join_error}");
+                        return Err(anyhow::anyhow!(
+                            "Profitability evaluation loop panicked: {join_error}"
+                        ));
+                    }
+                }
+            }
             Some(log) = meta_stream.next() => {
                 if let Ok(decoded) = log.log_decode::<MetaV1_2>() {
                     let event = decoded.data();
