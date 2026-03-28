@@ -7,10 +7,11 @@ homepage.workspace = true
 
 [features]
 default = []
-test-support = []
+test-support = ["dep:anyhow", "st0x-evm/mock"]
 
 [dependencies]
 alloy.workspace = true
+anyhow = { workspace = true, optional = true }
 async-trait.workspace = true
 serde.workspace = true
 thiserror.workspace = true
@@ -20,6 +21,7 @@ st0x-evm = { path = "../evm" }
 st0x-execution = { path = "../execution" }
 
 [dev-dependencies]
+anyhow.workspace = true
 alloy-primitives.workspace = true
 rain-math-float.workspace = true
 serde_json.workspace = true
