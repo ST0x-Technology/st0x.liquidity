@@ -86,3 +86,15 @@ sol!(
     #![sol(all_derives = true)]
     LibDecimalFloat, "../../lib/rain.orderbook/out/LibDecimalFloat.sol/LibDecimalFloat.json"
 );
+
+// Minimal binding for the MetaV1_2 event emitted by the OrderBook contract.
+// Emitted in the same transaction as AddOrderV3, with `subject` = order hash
+// and `meta` = CBOR-encoded RainMetaDocumentV1 containing the Rainlang source.
+// We define this inline rather than importing the full OrderBook ABI to avoid
+// pulling in deployment logic and keeping it available in production code
+// (the full OrderBook binding is behind test-support).
+sol! {
+    #![sol(all_derives = true)]
+    #[derive(serde::Serialize, serde::Deserialize)]
+    event MetaV1_2(address sender, bytes32 subject, bytes meta);
+}

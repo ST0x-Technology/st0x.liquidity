@@ -29,6 +29,7 @@ st0x-finance.workspace = true
 chrono = { workspace = true, features = ["serde"] }
 serde_json.workspace = true
 futures-util.workspace = true
+ciborium = "0.2.2"
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -12,6 +12,7 @@ use st0x_event_sorcery::{Projection, Store, StoreBuilder};
 use st0x_execution::Symbol;
 use st0x_shared::test_support::RainOrderBook;
 
+use crate::classification::RAIN_META_DOCUMENT_V1_MAGIC;
 use crate::order_collector::{BlockCursor, EventProcessor};
 use crate::tracked_order::{OrderFilter, OrderHash, OrderType, Scenario, TrackedOrder};
 use crate::{fetch_batch_logs, process_backfill_logs};
@@ -135,7 +136,7 @@ async fn backfill_add_order_creates_active_tracked_order() {
 
     let (add_block, order_hash) = add_sell_order(&rain, usdc_addr, wt_aapl_addr).await;
 
-    let (add_logs, remove_logs, take_logs) =
+    let (add_logs, remove_logs, take_logs, meta_logs) =
         fetch_batch_logs(&rain.chain.provider, rain.orderbook, add_block, add_block)
             .await
             .unwrap();
@@ -144,9 +145,10 @@ async fn backfill_add_order_creates_active_tracked_order() {
     assert!(remove_logs.is_empty());
     assert!(take_logs.is_empty());
 
-    let processed = process_backfill_logs(&processor, &add_logs, &remove_logs, &take_logs)
-        .await
-        .unwrap();
+    let processed =
+        process_backfill_logs(&processor, &add_logs, &remove_logs, &take_logs, &meta_logs)
+            .await
+            .unwrap();
     assert_eq!(processed, 1);
 
     let tracked = store.load(&order_hash).await.unwrap();
@@ -211,11 +213,11 @@ async fn backfill_remove_order_transitions_to_removed() {
     let remove_block = rain.remove_order(&add_result.order).await.unwrap();
 
     // Backfill the add event first
-    let (add_logs, remove_logs, take_logs) =
+    let (add_logs, remove_logs, take_logs, meta_logs) =
         fetch_batch_logs(&rain.chain.provider, rain.orderbook, add_block, add_block)
             .await
             .unwrap();
-    process_backfill_logs(&processor, &add_logs, &remove_logs, &take_logs)
+    process_backfill_logs(&processor, &add_logs, &remove_logs, &take_logs, &meta_logs)
         .await
         .unwrap();
 
@@ -235,7 +237,7 @@ async fn backfill_remove_order_transitions_to_removed() {
     assert_eq!(*scenario, Scenario::A);
 
     // Backfill the remove event
-    let (add_logs, remove_logs, take_logs) = fetch_batch_logs(
+    let (add_logs, remove_logs, take_logs, meta_logs) = fetch_batch_logs(
         &rain.chain.provider,
         rain.orderbook,
         remove_block,
@@ -250,7 +252,7 @@ async fn backfill_remove_order_transitions_to_removed() {
         "Expected exactly one RemoveOrderV3 log"
     );
 
-    process_backfill_logs(&processor, &add_logs, &remove_logs, &take_logs)
+    process_backfill_logs(&processor, &add_logs, &remove_logs, &take_logs, &meta_logs)
         .await
         .unwrap();
 
@@ -275,12 +277,12 @@ async fn backfill_excluded_owner_order_is_not_tracked() {
 
     let (add_block, order_hash) = add_sell_order(&rain, usdc_addr, wt_aapl_addr).await;
 
-    let (add_logs, remove_logs, take_logs) =
+    let (add_logs, remove_logs, take_logs, meta_logs) =
         fetch_batch_logs(&rain.chain.provider, rain.orderbook, add_block, add_block)
             .await
             .unwrap();
 
-    process_backfill_logs(&processor, &add_logs, &remove_logs, &take_logs)
+    process_backfill_logs(&processor, &add_logs, &remove_logs, &take_logs, &meta_logs)
         .await
         .unwrap();
 
@@ -314,14 +316,15 @@ async fn order_discovery_reaches_active_state_in_db() {
         "Fresh DB: no cursor"
     );
 
-    let (add_logs, remove_logs, take_logs) =
+    let (add_logs, remove_logs, take_logs, meta_logs) =
         fetch_batch_logs(&rain.chain.provider, rain.orderbook, 0, current_block)
             .await
             .unwrap();
 
-    let processed = process_backfill_logs(&processor, &add_logs, &remove_logs, &take_logs)
-        .await
-        .unwrap();
+    let processed =
+        process_backfill_logs(&processor, &add_logs, &remove_logs, &take_logs, &meta_logs)
+            .await
+            .unwrap();
     assert!(processed >= 1, "Should have processed at least 1 event");
 
     cursor.update(current_block).await.unwrap();
@@ -395,16 +398,17 @@ async fn multiple_orders_all_discovered() {
 
     let current_block = rain.chain.provider.get_block_number().await.unwrap();
 
-    let (add_logs, remove_logs, take_logs) =
+    let (add_logs, remove_logs, take_logs, meta_logs) =
         fetch_batch_logs(&rain.chain.provider, rain.orderbook, 0, current_block)
             .await
             .unwrap();
 
     assert_eq!(add_logs.len(), 2, "Expected two AddOrderV3 logs");
 
-    let processed = process_backfill_logs(&processor, &add_logs, &remove_logs, &take_logs)
-        .await
-        .unwrap();
+    let processed =
+        process_backfill_logs(&processor, &add_logs, &remove_logs, &take_logs, &meta_logs)
+            .await
+            .unwrap();
     assert_eq!(processed, 2);
 
     let tracked1 = store.load(&hash1).await.unwrap();
@@ -469,14 +473,15 @@ async fn scenario_b_buy_order_discovered_with_correct_tokens() {
     let (add_block, order_hash) = add_buy_order(&rain, usdc_addr, wt_aapl_addr).await;
 
     let current_block = rain.chain.provider.get_block_number().await.unwrap();
-    let (add_logs, remove_logs, take_logs) =
+    let (add_logs, remove_logs, take_logs, meta_logs) =
         fetch_batch_logs(&rain.chain.provider, rain.orderbook, 0, current_block)
             .await
             .unwrap();
 
-    let processed = process_backfill_logs(&processor, &add_logs, &remove_logs, &take_logs)
-        .await
-        .unwrap();
+    let processed =
+        process_backfill_logs(&processor, &add_logs, &remove_logs, &take_logs, &meta_logs)
+            .await
+            .unwrap();
     assert_eq!(processed, 1);
 
     let tracked = store.load(&order_hash).await.unwrap();
@@ -512,14 +517,14 @@ async fn unsupported_token_pair_silently_skipped() {
 
     let (add_block, order_hash) = add_order_with_unknown_tokens(&rain).await;
 
-    let (add_logs, remove_logs, take_logs) =
+    let (add_logs, remove_logs, take_logs, meta_logs) =
         fetch_batch_logs(&rain.chain.provider, rain.orderbook, add_block, add_block)
             .await
             .unwrap();
 
     assert_eq!(add_logs.len(), 1, "AddOrderV3 was emitted on chain");
 
-    process_backfill_logs(&processor, &add_logs, &remove_logs, &take_logs)
+    process_backfill_logs(&processor, &add_logs, &remove_logs, &take_logs, &meta_logs)
         .await
         .unwrap();
 
@@ -541,21 +546,23 @@ async fn duplicate_backfill_is_idempotent() {
 
     let (add_block, order_hash) = add_sell_order(&rain, usdc_addr, wt_aapl_addr).await;
 
-    let (add_logs, remove_logs, take_logs) =
+    let (add_logs, remove_logs, take_logs, meta_logs) =
         fetch_batch_logs(&rain.chain.provider, rain.orderbook, add_block, add_block)
             .await
             .unwrap();
 
     // First backfill
-    let processed = process_backfill_logs(&processor, &add_logs, &remove_logs, &take_logs)
-        .await
-        .unwrap();
+    let processed =
+        process_backfill_logs(&processor, &add_logs, &remove_logs, &take_logs, &meta_logs)
+            .await
+            .unwrap();
     assert_eq!(processed, 1);
 
     // Second backfill of the exact same logs (simulates restart overlap)
-    let processed_again = process_backfill_logs(&processor, &add_logs, &remove_logs, &take_logs)
-        .await
-        .unwrap();
+    let processed_again =
+        process_backfill_logs(&processor, &add_logs, &remove_logs, &take_logs, &meta_logs)
+            .await
+            .unwrap();
     assert_eq!(processed_again, 1, "Logs still counted even if idempotent");
 
     let tracked = store.load(&order_hash).await.unwrap();
@@ -587,4 +594,199 @@ async fn duplicate_backfill_is_idempotent() {
         1,
         "Projection should have exactly 1 order, not duplicated"
     );
+}
+
+// ── Classification e2e ───────────────────────────────────────────
+
+/// Builds CBOR-encoded RainMetaDocumentV1 metadata from a Rainlang source.
+///
+/// Includes key 1 (`RainlangSourceV1` magic) and key 2 (content type)
+/// to match the production metadata format that `extract_rainlang_source`
+/// validates against.
+fn encode_rainlang_metadata(rainlang: &str) -> Bytes {
+    use crate::classification::RAINLANG_SOURCE_V1_MAGIC;
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&RAIN_META_DOCUMENT_V1_MAGIC);
+
+    let map = ciborium::Value::Map(vec![
+        (
+            ciborium::Value::Integer(0.into()),
+            ciborium::Value::Bytes(rainlang.as_bytes().to_vec()),
+        ),
+        (
+            ciborium::Value::Integer(1.into()),
+            ciborium::Value::Integer(RAINLANG_SOURCE_V1_MAGIC.into()),
+        ),
+        (
+            ciborium::Value::Integer(2.into()),
+            ciborium::Value::Text("application/octet-stream".to_owned()),
+        ),
+    ]);
+    ciborium::into_writer(&map, &mut buf).unwrap();
+
+    Bytes::from(buf)
+}
+
+/// Adds a sell order with CBOR-encoded Rainlang metadata.
+async fn add_sell_order_with_meta(
+    rain: &RainOrderBook<impl Provider + Clone>,
+    usdc_addr: Address,
+    wt_aapl_addr: Address,
+    rainlang_source: &str,
+) -> (u64, OrderHash) {
+    let max_amount: U256 = parse_units("10", 18).unwrap().into();
+    let expression = format!("_ _: {max_amount} 100;:;");
+    let meta = encode_rainlang_metadata(rainlang_source);
+
+    let result = rain
+        .add_order(&expression, meta, usdc_addr, wt_aapl_addr)
+        .await
+        .unwrap();
+
+    (result.block, OrderHash::new(result.order_hash))
+}
+
+#[tokio::test]
+async fn backfill_with_metadata_classifies_as_fixed_price() {
+    let (rain, usdc_addr, wt_aapl_addr) = setup().await;
+    let (store, _projection, pool) = setup_cqrs().await;
+
+    let bot_address = Address::repeat_byte(0xB0);
+    let filter = test_filter(Address::repeat_byte(0xFF), usdc_addr, wt_aapl_addr);
+    let processor = EventProcessor::new(store.clone(), filter, bot_address);
+
+    let (add_block, order_hash) =
+        add_sell_order_with_meta(&rain, usdc_addr, wt_aapl_addr, "_ _: 1000 185e18;:;").await;
+
+    let (add_logs, remove_logs, take_logs, meta_logs) =
+        fetch_batch_logs(&rain.chain.provider, rain.orderbook, add_block, add_block)
+            .await
+            .unwrap();
+
+    assert!(!meta_logs.is_empty(), "MetaV1_2 should be emitted");
+
+    let processed =
+        process_backfill_logs(&processor, &add_logs, &remove_logs, &take_logs, &meta_logs)
+            .await
+            .unwrap();
+    assert_eq!(processed, 1);
+
+    let tracked = store.load(&order_hash).await.unwrap();
+    let Some(TrackedOrder::Active {
+        owner,
+        symbol,
+        scenario,
+        output_token,
+        input_token,
+        order_type,
+        discovered_block,
+        ..
+    }) = &tracked
+    else {
+        panic!("Expected Active order, got: {tracked:?}");
+    };
+
+    assert_eq!(*owner, rain.chain.owner);
+    assert_eq!(symbol.to_string(), "AAPL");
+    assert_eq!(*scenario, Scenario::A);
+    assert_eq!(*output_token, wt_aapl_addr);
+    assert_eq!(*input_token, usdc_addr);
+    assert_eq!(*discovered_block, add_block);
+    match order_type {
+        OrderType::FixedPrice { rainlang } => {
+            assert_eq!(rainlang, "_ _: 1000 185e18;:;");
+        }
+        other => panic!("Expected FixedPrice, got: {other:?}"),
+    }
+
+    let cursor = BlockCursor::new(&pool);
+    assert_eq!(cursor.last_block().await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn late_classification_updates_unknown_order() {
+    let (rain, usdc_addr, wt_aapl_addr) = setup().await;
+    let (store, _projection, _pool) = setup_cqrs().await;
+
+    let bot_address = Address::repeat_byte(0xB0);
+    let filter = test_filter(Address::repeat_byte(0xFF), usdc_addr, wt_aapl_addr);
+    let processor = EventProcessor::new(store.clone(), filter, bot_address);
+
+    // Add order WITHOUT metadata — gets discovered as Unknown
+    let (add_block, order_hash) = add_sell_order(&rain, usdc_addr, wt_aapl_addr).await;
+
+    let (add_logs, remove_logs, take_logs, meta_logs) =
+        fetch_batch_logs(&rain.chain.provider, rain.orderbook, add_block, add_block)
+            .await
+            .unwrap();
+
+    assert!(meta_logs.is_empty(), "No MetaV1_2 for order without meta");
+
+    process_backfill_logs(&processor, &add_logs, &remove_logs, &take_logs, &meta_logs)
+        .await
+        .unwrap();
+
+    let tracked = store.load(&order_hash).await.unwrap();
+    let Some(TrackedOrder::Active {
+        owner,
+        symbol,
+        scenario,
+        output_token,
+        input_token,
+        order_type,
+        discovered_block,
+        ..
+    }) = &tracked
+    else {
+        panic!("Expected Active order, got: {tracked:?}");
+    };
+
+    assert_eq!(*owner, rain.chain.owner);
+    assert_eq!(symbol.to_string(), "AAPL");
+    assert_eq!(*scenario, Scenario::A);
+    assert_eq!(*output_token, wt_aapl_addr);
+    assert_eq!(*input_token, usdc_addr);
+    assert_eq!(*discovered_block, add_block);
+    assert_eq!(*order_type, OrderType::Unknown);
+
+    // Simulate late MetaV1_2: classify the order after discovery
+    let rainlang_source = "_ _: 1000 185e18;:;";
+    processor
+        .classify_order(
+            order_hash.into_inner(),
+            &encode_rainlang_metadata(rainlang_source),
+        )
+        .await
+        .unwrap();
+
+    // Verify classification updated while all other fields preserved
+    let tracked = store.load(&order_hash).await.unwrap();
+    let Some(TrackedOrder::Active {
+        owner: owner_after,
+        symbol: symbol_after,
+        scenario: scenario_after,
+        output_token: output_after,
+        input_token: input_after,
+        order_type: type_after,
+        discovered_block: block_after,
+        ..
+    }) = &tracked
+    else {
+        panic!("Expected Active order after classification, got: {tracked:?}");
+    };
+
+    match type_after {
+        OrderType::FixedPrice { rainlang } => {
+            assert_eq!(rainlang, rainlang_source);
+        }
+        other => panic!("Expected FixedPrice after late classification, got: {other:?}"),
+    }
+
+    assert_eq!(*owner_after, rain.chain.owner);
+    assert_eq!(symbol_after.to_string(), "AAPL");
+    assert_eq!(*scenario_after, Scenario::A);
+    assert_eq!(*output_after, wt_aapl_addr);
+    assert_eq!(*input_after, usdc_addr);
+    assert_eq!(*block_after, add_block);
 }

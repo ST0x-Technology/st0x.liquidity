@@ -12,4 +12,4 @@ mod block_cursor;
 mod event_processor;
 
 pub(crate) use block_cursor::BlockCursor;
-pub(crate) use event_processor::EventProcessor;
+pub(crate) use event_processor::{ClassificationOutcome, EventProcessor};
