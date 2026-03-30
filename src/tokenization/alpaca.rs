@@ -510,8 +510,10 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
             let tokenization_request: TokenizationRequest = serde_json::from_str(&body)
                 .inspect_err(|error| {
                     error!(
-                        body = %body,
+                        body_len = body.len(),
                         error = %error,
+                        symbol = %request.underlying_symbol,
+                        issuer_request_id = %request.issuer_request_id.0,
                         "Failed to deserialize tokenization response"
                     );
                 })?;
@@ -536,12 +538,18 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         params: ListRequestsParams,
     ) -> Result<Vec<TokenizationRequest>, AlpacaTokenizationError> {
         let body = self.fetch_requests_body(&params).await?;
-        trace!(body = %body, "List requests response body");
+        trace!(
+            body_len = body.len(),
+            "List requests response body received"
+        );
 
         let requests = parse_request_list(&body).inspect_err(|error| {
             error!(
-                body = %body,
+                body_len = body.len(),
                 error = %error,
+                request_type = ?params.request_type,
+                status = ?params.status,
+                underlying_symbol = ?params.underlying_symbol,
                 "Failed to deserialize list requests response"
             );
         })?;
@@ -579,7 +587,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         })
         .inspect_err(|error| {
             error!(
-                body = %body,
+                body_len = body.len(),
                 error = %error,
                 request_id = %id.0,
                 "Failed to scan list requests response for tokenization request"
@@ -656,7 +664,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         })
         .inspect_err(|error| {
             error!(
-                body = %body,
+                body_len = body.len(),
                 error = %error,
                 tx_hash = %expected_tx_hash,
                 "Failed to scan list requests response for redemption request"
