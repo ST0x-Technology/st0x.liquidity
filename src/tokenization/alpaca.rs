@@ -250,6 +250,16 @@ pub(crate) enum TokenizationRequestStatus {
     Rejected,
 }
 
+impl std::fmt::Display for TokenizationRequestStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => write!(f, "pending"),
+            Self::Completed => write!(f, "completed"),
+            Self::Rejected => write!(f, "rejected"),
+        }
+    }
+}
+
 /// Token issuer identifier.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct Issuer(String);
@@ -528,7 +538,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         let body = self.fetch_requests_body(&params).await?;
         trace!(body = %body, "List requests response body");
 
-        let requests: Vec<TokenizationRequest> = serde_json::from_str(&body).inspect_err(|error| {
+        let requests = parse_request_list(&body).inspect_err(|error| {
             error!(
                 body = %body,
                 error = %error,
@@ -552,7 +562,9 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         &self,
         id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
-        let body = self.fetch_requests_body(&ListRequestsParams::default()).await?;
+        let body = self
+            .fetch_requests_body(&ListRequestsParams::default())
+            .await?;
 
         scan_request_list(&body, |request| {
             if string_field(request, "tokenization_request_id") == Some(id.0.as_str()) {
@@ -569,7 +581,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
                 "Failed to scan list requests response for tokenization request"
             );
         })?
-            .ok_or_else(|| AlpacaTokenizationError::RequestNotFound { id: id.clone() })
+        .ok_or_else(|| AlpacaTokenizationError::RequestNotFound { id: id.clone() })
     }
 
     /// Send tokens to the redemption wallet to initiate a redemption.
@@ -766,6 +778,28 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
 
 fn string_field<'a>(request: &'a Value, field_name: &str) -> Option<&'a str> {
     request.get(field_name).and_then(Value::as_str)
+}
+
+fn parse_request_list(body: &str) -> Result<Vec<TokenizationRequest>, serde_json::Error> {
+    let requests: Vec<Value> = serde_json::from_str(body)?;
+    let mut parsed_requests = Vec::with_capacity(requests.len());
+
+    for request in requests {
+        let request_id = string_field(&request, "tokenization_request_id").map(str::to_owned);
+
+        match serde_json::from_value::<TokenizationRequest>(request) {
+            Ok(parsed_request) => parsed_requests.push(parsed_request),
+            Err(error) => {
+                warn!(
+                    request_id,
+                    error = %error,
+                    "Skipping malformed tokenization request entry"
+                );
+            }
+        }
+    }
+
+    Ok(parsed_requests)
 }
 
 fn scan_request_list<T, F>(body: &str, mut matcher: F) -> Result<Option<T>, serde_json::Error>
@@ -1110,6 +1144,34 @@ pub(crate) mod tests {
         assert_eq!(result[0].r#type, Some(TokenizationRequestType::Mint));
         assert_eq!(result[1].id, TokenizationRequestId("req_2".to_string()));
         assert_eq!(result[1].r#type, Some(TokenizationRequestType::Redeem));
+
+        list_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_list_requests_ignores_malformed_entries() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+
+        let list_mock = server.mock(|when, then| {
+            when.method(GET).path(tokenization_requests_path());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    malformed_history_request_json("req_bad_1", "mint"),
+                    sample_tokenization_request_json("req_2", "redeem", "TSLA")
+                ]));
+        });
+
+        let result = client
+            .list_requests(ListRequestsParams::default())
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, TokenizationRequestId("req_2".to_string()));
+        assert_eq!(result[0].r#type, Some(TokenizationRequestType::Redeem));
 
         list_mock.assert();
     }
