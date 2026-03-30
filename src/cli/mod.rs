@@ -484,20 +484,6 @@ enum SimpleCommand {
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
     },
-    OrderStatus {
-        order_id: String,
-    },
-}
-
-/// Commands that require a WebSocket provider.
-enum ProviderCommand {
-    ProcessTx {
-        tx_hash: TxHash,
-    },
-    TransferUsdc {
-        direction: TransferDirection,
-        amount: Usdc,
-    },
     VaultDeposit {
         amount: Float,
         token: Address,
@@ -511,6 +497,20 @@ enum ProviderCommand {
         decimals: u8,
     },
     VaultWithdrawUsdc {
+        amount: Usdc,
+    },
+    OrderStatus {
+        order_id: String,
+    },
+}
+
+/// Commands that require a WebSocket provider.
+enum ProviderCommand {
+    ProcessTx {
+        tx_hash: TxHash,
+    },
+    TransferUsdc {
+        direction: TransferDirection,
         amount: Usdc,
     },
     CctpBridge {
@@ -617,7 +617,7 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             token,
             vault_id,
             decimals,
-        } => Err(ProviderCommand::VaultDeposit {
+        } => Ok(SimpleCommand::VaultDeposit {
             amount,
             token,
             vault_id,
@@ -628,15 +628,13 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             token,
             vault_id,
             decimals,
-        } => Err(ProviderCommand::VaultWithdraw {
+        } => Ok(SimpleCommand::VaultWithdraw {
             amount,
             token,
             vault_id,
             decimals,
         }),
-        Commands::VaultWithdrawUsdc { amount } => {
-            Err(ProviderCommand::VaultWithdrawUsdc { amount })
-        }
+        Commands::VaultWithdrawUsdc { amount } => Ok(SimpleCommand::VaultWithdrawUsdc { amount }),
         Commands::CctpBridge { amount, all, from } => {
             Err(ProviderCommand::CctpBridge { amount, all, from })
         }
@@ -752,6 +750,37 @@ async fn run_simple_command<W: Write>(
         } => {
             alpaca_wallet::alpaca_journal_command(stdout, destination, symbol, quantity, ctx).await
         }
+        SimpleCommand::VaultDeposit {
+            amount,
+            token,
+            vault_id,
+            decimals,
+        } => {
+            let deposit = vault::Deposit {
+                amount,
+                token,
+                vault_id,
+                decimals,
+            };
+            vault::vault_deposit_command(stdout, deposit, ctx, pool).await
+        }
+        SimpleCommand::VaultWithdraw {
+            amount,
+            token,
+            vault_id,
+            decimals,
+        } => {
+            let withdraw = vault::Withdraw {
+                amount,
+                token,
+                vault_id,
+                decimals,
+            };
+            vault::vault_withdraw_command(stdout, withdraw, ctx, pool).await
+        }
+        SimpleCommand::VaultWithdrawUsdc { amount } => {
+            vault::vault_withdraw_usdc_command(stdout, amount, ctx, pool).await
+        }
         SimpleCommand::OrderStatus { order_id } => {
             trading::order_status_command(stdout, &order_id, ctx, pool).await
         }
@@ -786,37 +815,6 @@ async fn run_provider_command<W: Write>(
         }
         ProviderCommand::TransferUsdc { direction, amount } => {
             rebalancing::transfer_usdc_command(stdout, direction, amount, ctx, pool).await
-        }
-        ProviderCommand::VaultDeposit {
-            amount,
-            token,
-            vault_id,
-            decimals,
-        } => {
-            let deposit = vault::Deposit {
-                amount,
-                token,
-                vault_id,
-                decimals,
-            };
-            vault::vault_deposit_command(stdout, deposit, ctx, pool).await
-        }
-        ProviderCommand::VaultWithdraw {
-            amount,
-            token,
-            vault_id,
-            decimals,
-        } => {
-            let withdraw = vault::Withdraw {
-                amount,
-                token,
-                vault_id,
-                decimals,
-            };
-            vault::vault_withdraw_command(stdout, withdraw, ctx, pool).await
-        }
-        ProviderCommand::VaultWithdrawUsdc { amount } => {
-            vault::vault_withdraw_usdc_command(stdout, amount, ctx, pool).await
         }
         ProviderCommand::CctpBridge { amount, all, from } => {
             cctp::cctp_bridge_command::<OpenChainErrorRegistry, _>(stdout, amount, all, from, ctx)
@@ -1693,6 +1691,41 @@ mod tests {
         };
 
         assert_eq!(amount, Usdc::new(float!(250.25)));
+    }
+
+    #[test]
+    fn test_vault_commands_use_simple_command_path() {
+        let vault_id = b256!("0000000000000000000000000000000000000000000000000000000000000001");
+
+        let deposit = classify_command(Commands::VaultDeposit {
+            amount: float!(10),
+            token: address!("0x1234567890123456789012345678901234567890"),
+            vault_id,
+            decimals: 18,
+        });
+        assert!(
+            matches!(deposit, Ok(SimpleCommand::VaultDeposit { .. })),
+            "vault-deposit should use the simple command path"
+        );
+
+        let withdraw = classify_command(Commands::VaultWithdraw {
+            amount: float!(5),
+            token: address!("0x1234567890123456789012345678901234567890"),
+            vault_id,
+            decimals: 18,
+        });
+        assert!(
+            matches!(withdraw, Ok(SimpleCommand::VaultWithdraw { .. })),
+            "vault-withdraw should use the simple command path"
+        );
+
+        let withdraw_usdc = classify_command(Commands::VaultWithdrawUsdc {
+            amount: Usdc::new(float!(25)),
+        });
+        assert!(
+            matches!(withdraw_usdc, Ok(SimpleCommand::VaultWithdrawUsdc { .. })),
+            "vault-withdraw-usdc should use the simple command path"
+        );
     }
 
     async fn assert_fractional_order_rejected_before_schwab_request(command: Commands) {

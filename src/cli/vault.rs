@@ -7,9 +7,10 @@ use std::io::Write;
 use thiserror::Error;
 
 use st0x_event_sorcery::StoreBuilder;
-use st0x_evm::OpenChainErrorRegistry;
+use st0x_evm::{Evm, OpenChainErrorRegistry};
 use st0x_float_serde::format_float_with_fallback;
 
+use crate::bindings::IERC20;
 use crate::config::Ctx;
 use crate::onchain::USDC_BASE;
 use crate::onchain::raindex::{Raindex, RaindexService, RaindexVaultId};
@@ -49,6 +50,25 @@ fn float_to_u256(amount: Float, decimals: u8) -> Result<U256, VaultCliError> {
     Ok(amount.to_fixed_decimal(decimals)?)
 }
 
+async fn validate_token_decimals<E: Evm>(
+    evm: &E,
+    token: Address,
+    provided_decimals: u8,
+) -> anyhow::Result<u8> {
+    let onchain_decimals: u8 = evm
+        .call::<OpenChainErrorRegistry, _>(token, IERC20::decimalsCall {})
+        .await?;
+
+    if onchain_decimals != provided_decimals {
+        anyhow::bail!(
+            "token {token} decimals mismatch: provided {provided_decimals}, onchain \
+             metadata reports {onchain_decimals}"
+        );
+    }
+
+    Ok(onchain_decimals)
+}
+
 pub(super) async fn vault_deposit_command<Writer: Write>(
     stdout: &mut Writer,
     deposit: Deposit,
@@ -73,9 +93,6 @@ pub(super) async fn vault_deposit_command<Writer: Write>(
     writeln!(stdout, "   Orderbook: {}", ctx.evm.orderbook)?;
     writeln!(stdout, "   Vault ID: {vault_id}")?;
 
-    let amount_u256 = float_to_u256(amount, decimals)?;
-    writeln!(stdout, "   Amount (smallest unit): {amount_u256}")?;
-
     let (_vault_store, vault_registry_projection) =
         StoreBuilder::<VaultRegistry>::new(pool.clone())
             .build(())
@@ -88,9 +105,19 @@ pub(super) async fn vault_deposit_command<Writer: Write>(
         sender_address,
     );
 
+    let verified_decimals =
+        validate_token_decimals(rebalancing_ctx.base_wallet(), token, decimals).await?;
+    let amount_u256 = float_to_u256(amount, verified_decimals)?;
+    writeln!(stdout, "   Amount (smallest unit): {amount_u256}")?;
+
     writeln!(stdout, "   Depositing to vault (approve + deposit)...")?;
     let deposit_tx = raindex_service
-        .deposit::<OpenChainErrorRegistry>(token, RaindexVaultId(vault_id), amount_u256, decimals)
+        .deposit::<OpenChainErrorRegistry>(
+            token,
+            RaindexVaultId(vault_id),
+            amount_u256,
+            verified_decimals,
+        )
         .await?;
     writeln!(stdout, "   Deposit tx: {deposit_tx}")?;
 
@@ -136,12 +163,19 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
         sender_address,
     );
 
-    let amount_u256 = float_to_u256(amount, decimals)?;
+    let verified_decimals =
+        validate_token_decimals(rebalancing_ctx.base_wallet(), token, decimals).await?;
+    let amount_u256 = float_to_u256(amount, verified_decimals)?;
     writeln!(stdout, "   Amount (smallest unit): {amount_u256}")?;
 
     writeln!(stdout, "   Withdrawing from vault...")?;
     let withdraw_tx = raindex_service
-        .withdraw(token, RaindexVaultId(vault_id), amount_u256, decimals)
+        .withdraw(
+            token,
+            RaindexVaultId(vault_id),
+            amount_u256,
+            verified_decimals,
+        )
         .await?;
     writeln!(stdout, "   Withdraw tx: {withdraw_tx}")?;
 
@@ -176,12 +210,16 @@ pub(super) async fn vault_withdraw_usdc_command<Writer: Write>(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, address, b256};
+    use alloy::providers::{ProviderBuilder, mock::Asserter};
+    use alloy::sol_types::SolCall;
     use url::Url;
 
+    use st0x_evm::ReadOnlyEvm;
     use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
     use st0x_finance::Usdc;
 
     use super::*;
+    use crate::bindings::IERC20::decimalsCall;
     use crate::config::{
         AssetsConfig, BrokerCtx, CashAssetConfig, EquitiesConfig, LogLevel, OperationMode,
         TradingMode,
@@ -417,6 +455,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validate_token_decimals_accepts_matching_metadata() {
+        let asserter = Asserter::new();
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
+
+        let decimals = validate_token_decimals(&evm, TEST_TOKEN, 18).await.unwrap();
+
+        assert_eq!(decimals, 18);
+    }
+
+    #[tokio::test]
+    async fn validate_token_decimals_rejects_metadata_mismatch() {
+        let asserter = Asserter::new();
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
+
+        let err = validate_token_decimals(&evm, TEST_TOKEN, 6)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains(&TEST_TOKEN.to_string()),
+            "Expected token address in mismatch error, got: {err}"
+        );
+        assert!(
+            err.contains("provided 6"),
+            "Expected provided decimals in mismatch error, got: {err}"
+        );
+        assert!(
+            err.contains("metadata reports 18"),
+            "Expected onchain decimals in mismatch error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn withdraw_usdc_fails_when_cash_vault_id_missing() {
         let ctx = create_ctx_with_rebalancing(Some(CashAssetConfig {
             vault_id: None,
@@ -490,6 +564,14 @@ mod tests {
         assert!(
             output.contains(&TEST_VAULT_ID.to_string()),
             "Expected vault ID in output (proving lookup succeeded), got: {output}"
+        );
+        assert!(
+            output.contains(&crate::onchain::USDC_BASE.to_string()),
+            "Expected USDC token in output, got: {output}"
+        );
+        assert!(
+            output.contains("Decimals: 6"),
+            "Expected USDC decimals in output, got: {output}"
         );
     }
 
