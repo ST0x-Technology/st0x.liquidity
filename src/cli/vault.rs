@@ -8,14 +8,21 @@ use thiserror::Error;
 
 use st0x_event_sorcery::StoreBuilder;
 use st0x_evm::OpenChainErrorRegistry;
-use st0x_finance::Usdc;
 use st0x_float_serde::format_float_with_fallback;
 
 use crate::config::Ctx;
-use crate::onchain::raindex::{RaindexService, RaindexVaultId};
+use crate::onchain::USDC_BASE;
+use crate::onchain::raindex::{Raindex, RaindexService, RaindexVaultId};
 use crate::vault_registry::VaultRegistry;
 
 pub(super) struct Deposit {
+    pub(super) amount: Float,
+    pub(super) token: Address,
+    pub(super) vault_id: B256,
+    pub(super) decimals: u8,
+}
+
+pub(super) struct Withdraw {
     pub(super) amount: Float,
     pub(super) token: Address,
     pub(super) vault_id: B256,
@@ -94,26 +101,28 @@ pub(super) async fn vault_deposit_command<Writer: Write>(
 
 pub(super) async fn vault_withdraw_command<Writer: Write>(
     stdout: &mut Writer,
-    amount: Usdc,
+    withdraw: Withdraw,
     ctx: &Ctx,
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
-    writeln!(stdout, "Withdrawing USDC from Raindex vault")?;
-    writeln!(stdout, "   Amount: {amount} USDC")?;
+    let Withdraw {
+        amount,
+        token,
+        vault_id,
+        decimals,
+    } = withdraw;
+
+    writeln!(stdout, "Withdrawing tokens from Raindex vault")?;
+    writeln!(stdout, "   Amount: {}", format_float_with_fallback(&amount))?;
+    writeln!(stdout, "   Token: {token}")?;
+    writeln!(stdout, "   Decimals: {decimals}")?;
 
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
     let sender_address = rebalancing_ctx.base_wallet().address();
 
     writeln!(stdout, "   Recipient wallet: {sender_address}")?;
     writeln!(stdout, "   Orderbook: {}", ctx.evm.orderbook)?;
-    let usdc_vault_id = ctx
-        .assets
-        .cash
-        .as_ref()
-        .and_then(|cash| cash.vault_id)
-        .ok_or_else(|| anyhow::anyhow!("assets.cash.vault_id is required but not configured"))?;
-
-    writeln!(stdout, "   Vault ID: {usdc_vault_id}")?;
+    writeln!(stdout, "   Vault ID: {vault_id}")?;
 
     let (_vault_store, vault_registry_projection) =
         StoreBuilder::<VaultRegistry>::new(pool.clone())
@@ -127,18 +136,41 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
         sender_address,
     );
 
-    let vault_id = RaindexVaultId(usdc_vault_id);
-
-    let amount_u256 = amount.to_u256_6_decimals()?;
+    let amount_u256 = float_to_u256(amount, decimals)?;
     writeln!(stdout, "   Amount (smallest unit): {amount_u256}")?;
 
     writeln!(stdout, "   Withdrawing from vault...")?;
-    let withdraw_tx = raindex_service.withdraw_usdc(vault_id, amount_u256).await?;
+    let withdraw_tx = raindex_service
+        .withdraw(token, RaindexVaultId(vault_id), amount_u256, decimals)
+        .await?;
     writeln!(stdout, "   Withdraw tx: {withdraw_tx}")?;
 
     writeln!(stdout, "Vault withdrawal completed successfully!")?;
 
     Ok(())
+}
+
+pub(super) async fn vault_withdraw_usdc_command<Writer: Write>(
+    stdout: &mut Writer,
+    amount: st0x_finance::Usdc,
+    ctx: &Ctx,
+    pool: &SqlitePool,
+) -> anyhow::Result<()> {
+    let vault_id = ctx
+        .assets
+        .cash
+        .as_ref()
+        .and_then(|cash| cash.vault_id)
+        .ok_or_else(|| anyhow::anyhow!("assets.cash.vault_id is required but not configured"))?;
+
+    let withdraw = Withdraw {
+        amount: amount.into(),
+        token: USDC_BASE,
+        vault_id,
+        decimals: 6,
+    };
+
+    vault_withdraw_command(stdout, withdraw, ctx, pool).await
 }
 
 #[cfg(test)]
@@ -268,12 +300,17 @@ mod tests {
     #[tokio::test]
     async fn test_vault_withdraw_requires_rebalancing_ctx() {
         let ctx = create_ctx_without_rebalancing();
-        let amount = Usdc::new(float!(100));
+        let withdraw = Withdraw {
+            amount: float!(100),
+            token: TEST_TOKEN,
+            vault_id: TEST_VAULT_ID,
+            decimals: 18,
+        };
 
         let mut stdout = Vec::new();
         let result = vault_withdraw_command(
             &mut stdout,
-            amount,
+            withdraw,
             &ctx,
             &SqlitePool::connect(":memory:").await.unwrap(),
         )
@@ -316,12 +353,17 @@ mod tests {
     #[tokio::test]
     async fn test_vault_withdraw_writes_amount_to_stdout() {
         let ctx = create_ctx_without_rebalancing();
-        let amount = Usdc::new(float!(250.25));
+        let withdraw = Withdraw {
+            amount: float!(250.25),
+            token: TEST_TOKEN,
+            vault_id: TEST_VAULT_ID,
+            decimals: 18,
+        };
 
         let mut stdout = Vec::new();
         vault_withdraw_command(
             &mut stdout,
-            amount,
+            withdraw,
             &ctx,
             &SqlitePool::connect(":memory:").await.unwrap(),
         )
@@ -330,8 +372,16 @@ mod tests {
 
         let output = String::from_utf8(stdout).unwrap();
         assert!(
-            output.contains("250.25 USDC"),
+            output.contains("250.25"),
             "Expected amount in output, got: {output}"
+        );
+        assert!(
+            output.contains(&TEST_TOKEN.to_string()),
+            "Expected token in output, got: {output}"
+        );
+        assert!(
+            output.contains("18"),
+            "Expected decimals in output, got: {output}"
         );
     }
 
@@ -367,7 +417,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn withdraw_fails_when_cash_vault_id_missing() {
+    async fn withdraw_usdc_fails_when_cash_vault_id_missing() {
         let ctx = create_ctx_with_rebalancing(Some(CashAssetConfig {
             vault_id: None,
             rebalancing: OperationMode::Enabled,
@@ -376,7 +426,7 @@ mod tests {
         let amount = Usdc::new(float!(100));
 
         let mut stdout = Vec::new();
-        let err_msg = vault_withdraw_command(
+        let err_msg = vault_withdraw_usdc_command(
             &mut stdout,
             amount,
             &ctx,
@@ -393,12 +443,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn withdraw_fails_when_cash_config_missing() {
+    async fn withdraw_usdc_fails_when_cash_config_missing() {
         let ctx = create_ctx_with_rebalancing(None);
         let amount = Usdc::new(float!(100));
 
         let mut stdout = Vec::new();
-        let err_msg = vault_withdraw_command(
+        let err_msg = vault_withdraw_usdc_command(
             &mut stdout,
             amount,
             &ctx,
@@ -415,7 +465,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn withdraw_passes_cash_vault_lookup_when_vault_id_configured() {
+    async fn withdraw_usdc_passes_cash_vault_lookup_when_vault_id_configured() {
         let ctx = create_ctx_with_rebalancing(Some(CashAssetConfig {
             vault_id: Some(TEST_VAULT_ID),
             rebalancing: OperationMode::Enabled,
@@ -424,7 +474,7 @@ mod tests {
         let amount = Usdc::new(float!(100));
 
         let mut stdout = Vec::new();
-        let result = vault_withdraw_command(
+        let result = vault_withdraw_usdc_command(
             &mut stdout,
             amount,
             &ctx,
@@ -440,6 +490,16 @@ mod tests {
         assert!(
             output.contains(&TEST_VAULT_ID.to_string()),
             "Expected vault ID in output (proving lookup succeeded), got: {output}"
+        );
+    }
+
+    #[test]
+    fn test_float_to_u256_valid_18_decimals_fractional() {
+        let amount = float!(1.25);
+        let result = float_to_u256(amount, 18).unwrap();
+        assert_eq!(
+            result,
+            U256::from_str_radix("1250000000000000000", 10).unwrap()
         );
     }
 }

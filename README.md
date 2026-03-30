@@ -28,6 +28,8 @@ markets by providing continuous two-sided liquidity.
   offchain hedge executions
 - **Exposure Hedging**: Automatically executes offsetting trades to reduce
   directional exposure from onchain fills
+- **Operator Vault Controls**: CLI supports generic ERC20 deposits to and
+  withdrawals from Raindex vaults, with a USDC-specific withdrawal shortcut
 
 ## Getting Started
 

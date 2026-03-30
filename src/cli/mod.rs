@@ -217,10 +217,33 @@ pub enum Commands {
         decimals: u8,
     },
 
-    /// Withdraw USDC from a Raindex vault
+    /// Withdraw tokens from a Raindex vault
     ///
-    /// This command withdraws USDC from a Raindex OrderBook vault to your wallet.
+    /// This command withdraws ERC20 tokens from a Raindex OrderBook vault to your wallet.
     VaultWithdraw {
+        /// Amount of tokens to withdraw (human-readable, e.g., 100 for 100 tokens)
+        #[arg(short = 'a', long = "amount", value_parser = parse_float)]
+        amount: Float,
+
+        /// Token contract address
+        #[arg(short = 't', long = "token")]
+        token: Address,
+
+        /// Vault ID
+        #[arg(short = 'v', long = "vault-id")]
+        vault_id: B256,
+
+        /// Token decimals (e.g., 6 for USDC, 18 for most ERC20s)
+        #[arg(short = 'd', long = "decimals")]
+        decimals: u8,
+    },
+
+    /// Withdraw USDC from the configured Raindex cash vault
+    ///
+    /// This preserves the existing USDC-specific operator flow by resolving
+    /// `assets.cash.vault_id` from config and forwarding into the generic
+    /// vault withdrawal implementation.
+    VaultWithdrawUsdc {
         /// Amount of USDC to withdraw
         #[arg(short = 'a', long = "amount")]
         amount: Usdc,
@@ -482,6 +505,12 @@ enum ProviderCommand {
         decimals: u8,
     },
     VaultWithdraw {
+        amount: Float,
+        token: Address,
+        vault_id: B256,
+        decimals: u8,
+    },
+    VaultWithdrawUsdc {
         amount: Usdc,
     },
     CctpBridge {
@@ -594,7 +623,20 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             vault_id,
             decimals,
         }),
-        Commands::VaultWithdraw { amount } => Err(ProviderCommand::VaultWithdraw { amount }),
+        Commands::VaultWithdraw {
+            amount,
+            token,
+            vault_id,
+            decimals,
+        } => Err(ProviderCommand::VaultWithdraw {
+            amount,
+            token,
+            vault_id,
+            decimals,
+        }),
+        Commands::VaultWithdrawUsdc { amount } => {
+            Err(ProviderCommand::VaultWithdrawUsdc { amount })
+        }
         Commands::CctpBridge { amount, all, from } => {
             Err(ProviderCommand::CctpBridge { amount, all, from })
         }
@@ -759,8 +801,22 @@ async fn run_provider_command<W: Write>(
             };
             vault::vault_deposit_command(stdout, deposit, ctx, pool).await
         }
-        ProviderCommand::VaultWithdraw { amount } => {
-            vault::vault_withdraw_command(stdout, amount, ctx, pool).await
+        ProviderCommand::VaultWithdraw {
+            amount,
+            token,
+            vault_id,
+            decimals,
+        } => {
+            let withdraw = vault::Withdraw {
+                amount,
+                token,
+                vault_id,
+                decimals,
+            };
+            vault::vault_withdraw_command(stdout, withdraw, ctx, pool).await
+        }
+        ProviderCommand::VaultWithdrawUsdc { amount } => {
+            vault::vault_withdraw_usdc_command(stdout, amount, ctx, pool).await
         }
         ProviderCommand::CctpBridge { amount, all, from } => {
             cctp::cctp_bridge_command::<OpenChainErrorRegistry, _>(stdout, amount, all, from, ctx)
@@ -798,7 +854,7 @@ async fn run_provider_command<W: Write>(
 #[cfg(test)]
 mod tests {
     use alloy::hex;
-    use alloy::primitives::{FixedBytes, IntoLogData, U256, address, fixed_bytes};
+    use alloy::primitives::{FixedBytes, IntoLogData, U256, address, b256, fixed_bytes};
     use alloy::providers::Provider;
     use alloy::providers::mock::Asserter;
     use alloy::sol_types::{SolCall, SolEvent};
@@ -814,6 +870,8 @@ mod tests {
     use st0x_execution::{
         Direction, FractionalShares, OrderStatus, Positive, SchwabError, SchwabTokens,
     };
+    use st0x_finance::Usdc;
+    use st0x_float_macro::float;
 
     use super::*;
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
@@ -1583,6 +1641,58 @@ mod tests {
         };
 
         assert_eq!(quantity, positive_shares("6.15"));
+    }
+
+    #[test]
+    fn test_vault_withdraw_command_parses_generic_arguments() {
+        let cli = Cli::try_parse_from([
+            "schwab",
+            "vault-withdraw",
+            "-a",
+            "12.5",
+            "-t",
+            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+            "-v",
+            "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "-d",
+            "18",
+        ])
+        .unwrap();
+
+        let Commands::VaultWithdraw {
+            amount,
+            token,
+            vault_id,
+            decimals,
+        } = cli.command
+        else {
+            panic!("expected generic vault withdraw command");
+        };
+
+        assert!(
+            amount.eq(float!(12.5)).unwrap(),
+            "Expected parsed amount 12.5"
+        );
+        assert_eq!(
+            token,
+            address!("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913")
+        );
+        assert_eq!(
+            vault_id,
+            b256!("0000000000000000000000000000000000000000000000000000000000000001")
+        );
+        assert_eq!(decimals, 18);
+    }
+
+    #[test]
+    fn test_vault_withdraw_usdc_command_parses_compatibility_arguments() {
+        let cli = Cli::try_parse_from(["schwab", "vault-withdraw-usdc", "-a", "250.25"]).unwrap();
+
+        let Commands::VaultWithdrawUsdc { amount } = cli.command else {
+            panic!("expected USDC compatibility vault withdraw command");
+        };
+
+        assert_eq!(amount, Usdc::new(float!(250.25)));
     }
 
     async fn assert_fractional_order_rejected_before_schwab_request(command: Commands) {
