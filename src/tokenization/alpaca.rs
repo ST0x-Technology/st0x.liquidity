@@ -721,46 +721,34 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         }
     }
 
-    fn list_requests_url(&self, params: &ListRequestsParams) -> String {
-        let mut url = format!(
-            "{}/v1/accounts/{}/tokenization/requests",
-            self.base_url, self.account_id
-        );
-        let mut query_params = Vec::new();
-
-        if let Some(ref request_type) = params.request_type {
-            query_params.push(format!("type={request_type}"));
-        }
-
-        if let Some(ref status) = params.status {
-            query_params.push(format!("status={status}"));
-        }
-
-        if let Some(ref symbol) = params.underlying_symbol {
-            query_params.push(format!("underlying_symbol={symbol}"));
-        }
-
-        if !query_params.is_empty() {
-            url.push('?');
-            url.push_str(&query_params.join("&"));
-        }
-
-        url
-    }
-
     async fn fetch_requests_body(
         &self,
         params: &ListRequestsParams,
     ) -> Result<String, AlpacaTokenizationError> {
-        let url = self.list_requests_url(params);
+        let url = format!(
+            "{}/v1/accounts/{}/tokenization/requests",
+            self.base_url, self.account_id
+        );
 
-        let response = self
+        let mut request = self
             .http_client
             .get(&url)
             .header("APCA-API-KEY-ID", &self.api_key)
-            .header("APCA-API-SECRET-KEY", &self.api_secret)
-            .send()
-            .await?;
+            .header("APCA-API-SECRET-KEY", &self.api_secret);
+
+        if let Some(ref request_type) = params.request_type {
+            request = request.query(&[("type", request_type.to_string())]);
+        }
+
+        if let Some(ref status) = params.status {
+            request = request.query(&[("status", status.to_string())]);
+        }
+
+        if let Some(ref symbol) = params.underlying_symbol {
+            request = request.query(&[("underlying_symbol", symbol.to_string())]);
+        }
+
+        let response = request.send().await?;
 
         let status = response.status();
         let body = response.text().await?;
