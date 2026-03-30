@@ -31,6 +31,7 @@ use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::time::{Instant, MissedTickBehavior};
@@ -524,68 +525,20 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         &self,
         params: ListRequestsParams,
     ) -> Result<Vec<TokenizationRequest>, AlpacaTokenizationError> {
-        let mut url = format!(
-            "{}/v1/accounts/{}/tokenization/requests",
-            self.base_url, self.account_id
-        );
-        let mut query_params = Vec::new();
+        let body = self.fetch_requests_body(&params).await?;
+        trace!(body = %body, "List requests response body");
 
-        if let Some(ref request_type) = params.request_type {
-            let type_str = match request_type {
-                TokenizationRequestType::Mint => "mint",
-                TokenizationRequestType::Redeem => "redeem",
-            };
-            query_params.push(format!("type={type_str}"));
-        }
+        let requests: Vec<TokenizationRequest> = serde_json::from_str(&body).inspect_err(|error| {
+            error!(
+                body = %body,
+                error = %error,
+                "Failed to deserialize list requests response"
+            );
+        })?;
 
-        if let Some(ref status) = params.status {
-            let status_str = match status {
-                TokenizationRequestStatus::Pending => "pending",
-                TokenizationRequestStatus::Completed => "completed",
-                TokenizationRequestStatus::Rejected => "rejected",
-            };
-            query_params.push(format!("status={status_str}"));
-        }
+        debug!(count = requests.len(), "Listed tokenization requests");
 
-        if let Some(ref symbol) = params.underlying_symbol {
-            query_params.push(format!("underlying_symbol={symbol}"));
-        }
-
-        if !query_params.is_empty() {
-            url.push('?');
-            url.push_str(&query_params.join("&"));
-        }
-
-        let response = self
-            .http_client
-            .get(&url)
-            .header("APCA-API-KEY-ID", &self.api_key)
-            .header("APCA-API-SECRET-KEY", &self.api_secret)
-            .send()
-            .await?;
-
-        let status = response.status();
-
-        if status.is_success() {
-            let body = response.text().await?;
-            trace!(body = %body, "List requests response body");
-
-            let requests: Vec<TokenizationRequest> =
-                serde_json::from_str(&body).inspect_err(|error| {
-                    error!(
-                        body = %body,
-                        error = %error,
-                        "Failed to deserialize list requests response"
-                    );
-                })?;
-
-            debug!(count = requests.len(), "Listed tokenization requests");
-
-            return Ok(requests);
-        }
-
-        let message = response.text().await?;
-        Err(AlpacaTokenizationError::ApiError { status, message })
+        Ok(requests)
     }
 
     /// Get a single tokenization request by ID.
@@ -599,11 +552,23 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         &self,
         id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
-        let requests = self.list_requests(ListRequestsParams::default()).await?;
+        let body = self.fetch_requests_body(&ListRequestsParams::default()).await?;
 
-        requests
-            .into_iter()
-            .find(|request| request.id == *id)
+        scan_request_list(&body, |request| {
+            if string_field(request, "tokenization_request_id") == Some(id.0.as_str()) {
+                return serde_json::from_value(request.clone()).map(Some);
+            }
+
+            Ok(None)
+        })
+        .inspect_err(|error| {
+            error!(
+                body = %body,
+                error = %error,
+                request_id = %id.0,
+                "Failed to scan list requests response for tokenization request"
+            );
+        })?
             .ok_or_else(|| AlpacaTokenizationError::RequestNotFound { id: id.clone() })
     }
 
@@ -655,11 +620,25 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
             ..Default::default()
         };
 
-        let requests = self.list_requests(params).await?;
+        let body = self.fetch_requests_body(&params).await?;
+        let expected_tx_hash = format!("{tx_hash:#x}");
 
-        Ok(requests
-            .into_iter()
-            .find(|request| request.tx_hash.as_ref() == Some(tx_hash)))
+        scan_request_list(&body, |request| {
+            if string_field(request, "tx_hash") == Some(expected_tx_hash.as_str()) {
+                return serde_json::from_value(request.clone()).map(Some);
+            }
+
+            Ok(None)
+        })
+        .inspect_err(|error| {
+            error!(
+                body = %body,
+                error = %error,
+                tx_hash = %expected_tx_hash,
+                "Failed to scan list requests response for redemption request"
+            );
+        })
+        .map_err(AlpacaTokenizationError::from)
     }
 
     /// Poll until a tokenization request reaches a terminal state (Completed or Rejected).
@@ -729,6 +708,79 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
             }
         }
     }
+
+    fn list_requests_url(&self, params: &ListRequestsParams) -> String {
+        let mut url = format!(
+            "{}/v1/accounts/{}/tokenization/requests",
+            self.base_url, self.account_id
+        );
+        let mut query_params = Vec::new();
+
+        if let Some(ref request_type) = params.request_type {
+            query_params.push(format!("type={request_type}"));
+        }
+
+        if let Some(ref status) = params.status {
+            query_params.push(format!("status={status}"));
+        }
+
+        if let Some(ref symbol) = params.underlying_symbol {
+            query_params.push(format!("underlying_symbol={symbol}"));
+        }
+
+        if !query_params.is_empty() {
+            url.push('?');
+            url.push_str(&query_params.join("&"));
+        }
+
+        url
+    }
+
+    async fn fetch_requests_body(
+        &self,
+        params: &ListRequestsParams,
+    ) -> Result<String, AlpacaTokenizationError> {
+        let url = self.list_requests_url(params);
+
+        let response = self
+            .http_client
+            .get(&url)
+            .header("APCA-API-KEY-ID", &self.api_key)
+            .header("APCA-API-SECRET-KEY", &self.api_secret)
+            .send()
+            .await?;
+
+        let status = response.status();
+        let body = response.text().await?;
+
+        if status.is_success() {
+            return Ok(body);
+        }
+
+        Err(AlpacaTokenizationError::ApiError {
+            status,
+            message: body,
+        })
+    }
+}
+
+fn string_field<'a>(request: &'a Value, field_name: &str) -> Option<&'a str> {
+    request.get(field_name).and_then(Value::as_str)
+}
+
+fn scan_request_list<T, F>(body: &str, mut matcher: F) -> Result<Option<T>, serde_json::Error>
+where
+    F: FnMut(&Value) -> Result<Option<T>, serde_json::Error>,
+{
+    let requests: Vec<Value> = serde_json::from_str(body)?;
+
+    for request in &requests {
+        if let Some(matched_request) = matcher(request)? {
+            return Ok(Some(matched_request));
+        }
+    }
+
+    Ok(None)
 }
 
 #[async_trait]
@@ -1014,6 +1066,21 @@ pub(crate) mod tests {
         })
     }
 
+    fn malformed_history_request_json(id: &str, request_type: &str) -> serde_json::Value {
+        json!({
+            "tokenization_request_id": id,
+            "type": request_type,
+            "status": "completed",
+            "underlying_symbol": "AAPL",
+            "token_symbol": "tAAPL",
+            "qty": "50.0",
+            "issuer": "st0x",
+            "network": "base",
+            "wallet_address": "not-an-evm-address",
+            "created_at": "2024-01-15T10:30:00Z"
+        })
+    }
+
     #[tokio::test]
     async fn test_list_requests_all() {
         let server = MockServer::start();
@@ -1132,7 +1199,33 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_request_not_found() {
+    async fn test_get_request_ignores_unrelated_malformed_entries() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+
+        let list_mock = server.mock(|when, then| {
+            when.method(GET).path(tokenization_requests_path());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    malformed_history_request_json("req_bad_1", "mint"),
+                    sample_tokenization_request_json("req_target", "redeem", "TSLA")
+                ]));
+        });
+
+        let id = TokenizationRequestId("req_target".to_string());
+        let result = client.get_request(&id).await.unwrap();
+
+        assert_eq!(result.id, id);
+        assert_eq!(result.r#type, Some(TokenizationRequestType::Redeem));
+        assert_eq!(result.underlying_symbol.to_string(), "TSLA");
+
+        list_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_get_request_returns_not_found_when_target_missing() {
         let server = MockServer::start();
         let (_anvil, endpoint, key) = setup_anvil();
         let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
@@ -1302,6 +1395,38 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn test_find_redemption_by_tx_ignores_unrelated_malformed_entries() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+
+        let hash: TxHash =
+            fixed_bytes!("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
+
+        let list_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(tokenization_requests_path())
+                .query_param("type", "redeem");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    malformed_history_request_json("redeem_bad_1", "redeem"),
+                    sample_redemption_request_json_with_tx("redeem_target", "AAPL", hash)
+                ]));
+        });
+
+        let request = client.find_redemption_by_tx(&hash).await.unwrap().unwrap();
+
+        assert_eq!(
+            request.id,
+            TokenizationRequestId("redeem_target".to_string())
+        );
+        assert_eq!(request.tx_hash, Some(hash));
+
+        list_mock.assert();
+    }
+
+    #[tokio::test]
     async fn test_find_redemption_by_tx_not_detected() {
         let server = MockServer::start();
         let (_anvil, endpoint, key) = setup_anvil();
@@ -1366,6 +1491,40 @@ pub(crate) mod tests {
         let id = TokenizationRequestId("req_1".to_string());
         let result = client.poll_until_terminal(&id, &config).await.unwrap();
 
+        assert_eq!(result.status, TokenizationRequestStatus::Completed);
+        list_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_poll_until_terminal_completed_with_large_mixed_history() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+
+        let mut request_history: Vec<_> = (0..128)
+            .map(|index| malformed_history_request_json(&format!("hist_{index}"), "mint"))
+            .collect();
+        request_history.push(sample_request_with_status("req_target", "completed"));
+
+        let list_mock = server.mock(|when, then| {
+            when.method(GET).path(tokenization_requests_path());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(request_history);
+        });
+
+        let config = PollingConfig {
+            interval: Duration::from_millis(10),
+            timeout: Duration::from_secs(5),
+            max_retries: 3,
+            min_retry_delay: Duration::from_millis(10),
+            max_retry_delay: Duration::from_millis(100),
+        };
+
+        let id = TokenizationRequestId("req_target".to_string());
+        let result = client.poll_until_terminal(&id, &config).await.unwrap();
+
+        assert_eq!(result.id, id);
         assert_eq!(result.status, TokenizationRequestStatus::Completed);
         list_mock.assert();
     }
