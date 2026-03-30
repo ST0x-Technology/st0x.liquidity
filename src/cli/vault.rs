@@ -184,6 +184,7 @@ mod tests {
                 equities: EquitiesConfig::default(),
                 cash: None,
             },
+            travel_rule: None,
         }
     }
 
@@ -231,6 +232,7 @@ mod tests {
                 equities: EquitiesConfig::default(),
                 cash,
             },
+            travel_rule: None,
         }
     }
 
