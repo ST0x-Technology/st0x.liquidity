@@ -41,7 +41,10 @@ async fn unwrap_equity_with_wrapper<Writer: Write, W: Wrapper + ?Sized>(
     writeln!(stdout, "   Underlying token: {underlying_token}")?;
 
     let wrapped_amount = quantity.inner().to_u256_18_decimals()?;
-    writeln!(stdout, "   Wrapped amount (smallest unit): {wrapped_amount}")?;
+    writeln!(
+        stdout,
+        "   Wrapped amount (smallest unit): {wrapped_amount}"
+    )?;
     writeln!(stdout, "   Redeeming wrapped shares...")?;
 
     let (unwrap_tx_hash, underlying_amount_u256) = wrapper
@@ -50,10 +53,7 @@ async fn unwrap_equity_with_wrapper<Writer: Write, W: Wrapper + ?Sized>(
     let underlying_amount = FractionalShares::from_u256_18_decimals(underlying_amount_u256)?;
 
     writeln!(stdout, "   Transaction hash: {unwrap_tx_hash}")?;
-    writeln!(
-        stdout,
-        "   Underlying amount received: {underlying_amount}"
-    )?;
+    writeln!(stdout, "   Underlying amount received: {underlying_amount}")?;
     writeln!(
         stdout,
         "   Underlying amount received (smallest unit): {underlying_amount_u256}"
@@ -118,7 +118,9 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            error.to_string().contains("operation requires rebalancing mode"),
+            error
+                .to_string()
+                .contains("operation requires rebalancing mode"),
             "expected rebalancing error, got: {error}"
         );
     }

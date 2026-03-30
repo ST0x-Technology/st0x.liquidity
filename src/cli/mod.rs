@@ -1325,8 +1325,8 @@ mod tests {
 
     #[test]
     fn test_unwrap_equity_command_rejects_zero_quantity() {
-        let error = Cli::try_parse_from(["schwab", "unwrap-equity", "-s", "AAPL", "-q", "0"])
-            .unwrap_err();
+        let error =
+            Cli::try_parse_from(["schwab", "unwrap-equity", "-s", "AAPL", "-q", "0"]).unwrap_err();
         let message = error.to_string();
 
         assert!(message.contains("positive"), "unexpected error: {message}");
@@ -2420,33 +2420,21 @@ mod tests {
             .try_get_matches_from(vec!["cli", "unwrap-equity"]);
         assert!(result.is_err(), "unwrap-equity without args should fail");
 
-        let result = cmd.clone().try_get_matches_from(vec![
-            "cli",
-            "unwrap-equity",
-            "-s",
-            "AAPL",
-        ]);
+        let result = cmd
+            .clone()
+            .try_get_matches_from(vec!["cli", "unwrap-equity", "-s", "AAPL"]);
         assert!(
             result.is_err(),
             "unwrap-equity without quantity should fail"
         );
 
-        let result = cmd.clone().try_get_matches_from(vec![
-            "cli",
-            "unwrap-equity",
-            "-q",
-            "10.5",
-        ]);
+        let result = cmd
+            .clone()
+            .try_get_matches_from(vec!["cli", "unwrap-equity", "-q", "10.5"]);
         assert!(result.is_err(), "unwrap-equity without symbol should fail");
 
-        let result = cmd.try_get_matches_from(vec![
-            "cli",
-            "unwrap-equity",
-            "-s",
-            "AAPL",
-            "-q",
-            "10.5",
-        ]);
+        let result =
+            cmd.try_get_matches_from(vec!["cli", "unwrap-equity", "-s", "AAPL", "-q", "10.5"]);
         assert!(
             result.is_ok(),
             "unwrap-equity with symbol and quantity should succeed: {:?}",
