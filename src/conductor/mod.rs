@@ -53,7 +53,7 @@ use crate::queue::{
 use crate::rebalancing::equity::EquityTransferServices;
 use crate::rebalancing::{
     RebalancerServices, RebalancingCqrsFrameworks, RebalancingCtx, RebalancingTrigger,
-    RebalancingTriggerConfig,
+    RebalancingTriggerConfig, TriggeredOperation,
 };
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
@@ -224,7 +224,7 @@ impl Conductor {
             ) = if let Some(rebalancing_ctx) = rebalancing {
                 let ethereum_wallet = rebalancing_ctx.ethereum_wallet().clone();
                 let base_wallet = rebalancing_ctx.base_wallet().clone();
-                let infra = spawn_rebalancing_infrastructure(
+                let components = build_rebalancing_infrastructure(
                     rebalancing_ctx,
                     ethereum_wallet.clone(),
                     base_wallet.clone(),
@@ -239,17 +239,20 @@ impl Conductor {
                 )
                 .await?;
 
+                let rebalancer = components.spawner.spawn();
+
                 (
-                    infra.position,
-                    infra.position_projection,
-                    infra.snapshot,
-                    Some(infra.rebalancer),
+                    components.position,
+                    components.position_projection,
+                    components.snapshot,
+                    Some(rebalancer),
                     Some(ethereum_wallet),
                     Some(base_wallet),
-                    Some(infra.alpaca_wallet),
+                    Some(components.alpaca_wallet),
                 )
             } else {
                 let (position, position_projection) = build_position_cqrs(&pool).await?;
+
                 let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
                     .build(())
                     .await?;
@@ -372,12 +375,36 @@ impl Conductor {
     }
 }
 
-struct RebalancingInfrastructure {
+/// Built rebalancing components, ready for spawning.
+/// Catch-up has already been performed by `StoreBuilder::build()`.
+/// No background tasks are running yet.
+struct RebalancingComponents<Chain: Wallet> {
     position: Arc<Store<Position>>,
     position_projection: Arc<Projection<Position>>,
     snapshot: Arc<Store<InventorySnapshot>>,
-    rebalancer: JoinHandle<()>,
     alpaca_wallet: Arc<AlpacaWalletService>,
+    spawner: RebalancerSpawner<Chain>,
+}
+
+/// Deferred spawner for the rebalancer task.
+/// Call [`spawn`](Self::spawn) to start the background task.
+struct RebalancerSpawner<Chain: Wallet> {
+    services: RebalancerServices<Chain>,
+    usdc_vault_id: RaindexVaultId,
+    market_maker_wallet: Address,
+    operation_receiver: mpsc::Receiver<TriggeredOperation>,
+    frameworks: RebalancingCqrsFrameworks,
+}
+
+impl<Chain: Wallet + Clone> RebalancerSpawner<Chain> {
+    fn spawn(self) -> JoinHandle<()> {
+        self.services.spawn(
+            self.usdc_vault_id,
+            self.market_maker_wallet,
+            self.operation_receiver,
+            self.frameworks,
+        )
+    }
 }
 
 /// Shared infrastructure dependencies needed to spawn rebalancing.
@@ -455,13 +482,13 @@ async fn seed_vault_registry_from_config(
     Ok(())
 }
 
-fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
+fn build_rebalancing_infrastructure<Chain: Wallet + Clone>(
     rebalancing_ctx: RebalancingCtx,
     ethereum_wallet: Chain,
     base_wallet: Chain,
     deps: RebalancingDeps,
 ) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = anyhow::Result<RebalancingInfrastructure>> + Send>,
+    Box<dyn std::future::Future<Output = anyhow::Result<RebalancingComponents<Chain>>> + Send>,
 > {
     Box::pin(async move {
         info!("Initializing rebalancing infrastructure");
@@ -565,19 +592,18 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             .and_then(|cash| cash.vault_id)
             .ok_or(CtxError::MissingCashVaultId)?;
 
-        let handle = services.spawn(
-            RaindexVaultId(usdc_vault_id),
-            market_maker_wallet,
-            operation_receiver,
-            frameworks,
-        );
-
-        Ok(RebalancingInfrastructure {
+        Ok(RebalancingComponents {
             position: built.position,
             position_projection: built.position_projection,
             snapshot: built.snapshot,
-            rebalancer: handle,
             alpaca_wallet,
+            spawner: RebalancerSpawner {
+                services,
+                usdc_vault_id: RaindexVaultId(usdc_vault_id),
+                market_maker_wallet,
+                operation_receiver,
+                frameworks,
+            },
         })
     })
 }
