@@ -412,26 +412,18 @@ mod tests {
 
     #[ignore = "requires TURNKEY_* env vars -- run with `cargo test -- --ignored`"]
     #[tokio::test]
-    async fn turnkey_wallet_address_matches_configured() {
-        let (api_key, org_id, expected) = turnkey_env()
-            .expect("TURNKEY_API_PRIVATE_KEY, TURNKEY_ORG_ID, and TURNKEY_ADDRESS must be set");
-
-        let (wallet, _anvil) = integration_wallet(api_key, org_id, expected).await;
-
-        assert_eq!(wallet.address(), expected);
-    }
-
-    #[ignore = "requires TURNKEY_* env vars -- run with `cargo test -- --ignored`"]
-    #[tokio::test]
-    async fn turnkey_signs_and_submits_transaction() {
+    async fn turnkey_integration() {
         let (api_key, org_id, address) = turnkey_env()
             .expect("TURNKEY_API_PRIVATE_KEY, TURNKEY_ORG_ID, and TURNKEY_ADDRESS must be set");
 
         let (wallet, _anvil) = integration_wallet(api_key, org_id, address).await;
         let self_address = wallet.address();
 
-        // 0-value self-transfer: minimal gas (21000), exercises the
-        // full Turnkey signing round-trip.
+        // Wallet address matches configured address.
+        assert_eq!(wallet.address(), address);
+
+        // Sequential 0-value self-transfer: exercises the full Turnkey
+        // signing round-trip.
         let receipt = wallet
             .send(self_address, Bytes::new(), "integration test self-transfer")
             .await
@@ -446,16 +438,6 @@ mod tests {
             receipt.from, self_address,
             "transaction should be from the configured wallet"
         );
-    }
-
-    #[ignore = "requires TURNKEY_* env vars -- run with `cargo test -- --ignored`"]
-    #[tokio::test]
-    async fn turnkey_concurrent_signing() {
-        let (api_key, org_id, address) = turnkey_env()
-            .expect("TURNKEY_API_PRIVATE_KEY, TURNKEY_ORG_ID, and TURNKEY_ADDRESS must be set");
-
-        let (wallet, _anvil) = integration_wallet(api_key, org_id, address).await;
-        let self_address = wallet.address();
 
         // Two parallel 0-value self-transfers to verify nonce
         // management doesn't collide under concurrent signing.

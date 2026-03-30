@@ -13,7 +13,7 @@ use st0x_finance::Usdc;
 
 use super::ConvertDirection;
 use crate::alpaca_wallet::{
-    AlpacaWalletService, Network, TokenSymbol, TransferStatus, WhitelistStatus,
+    AlpacaWalletService, Network, TokenSymbol, TransferStatus, TravelRuleInfo, WhitelistStatus,
 };
 use crate::bindings::IERC20;
 use crate::config::{BrokerCtx, Ctx};
@@ -273,12 +273,20 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
         }
     }
 
+    let travel_rule_config = ctx.travel_rule.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing [broker.travel_rule] in config — required for Alpaca whitelist creation"
+        )
+    })?;
+    let travel_rule_info = TravelRuleInfo::from_config(travel_rule_config);
+
     writeln!(stdout, "   Creating whitelist entry...")?;
     let entry = alpaca_wallet
         .create_whitelist_entry(
             &target_address,
             &TokenSymbol::new("USDC"),
             &Network::new("ethereum"),
+            &travel_rule_info,
         )
         .await?;
 
@@ -335,6 +343,55 @@ pub(super) async fn alpaca_whitelist_list_command<W: Write>(
         writeln!(stdout, "   Status: {:?}", entry.status)?;
         writeln!(stdout, "   Created: {}", entry.created_at)?;
         writeln!(stdout)?;
+    }
+
+    Ok(())
+}
+
+pub(super) async fn alpaca_whitelist_patch_travel_rule_command<W: Write>(
+    stdout: &mut W,
+    ctx: &Ctx,
+) -> anyhow::Result<()> {
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
+        anyhow::bail!(
+            "alpaca-whitelist-patch-travel-rule requires Alpaca Broker API configuration"
+        );
+    };
+
+    let travel_rule_config = ctx.travel_rule.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing [broker.travel_rule] in config — required for travel rule patching"
+        )
+    })?;
+    let travel_rule_info = TravelRuleInfo::from_config(travel_rule_config);
+
+    writeln!(
+        stdout,
+        "Patching travel rule info on all whitelisted addresses"
+    )?;
+
+    let alpaca_wallet = AlpacaWalletService::new(
+        alpaca_auth.base_url().to_string(),
+        alpaca_auth.account_id,
+        alpaca_auth.api_key.clone(),
+        alpaca_auth.api_secret.clone(),
+    );
+
+    let patched = alpaca_wallet
+        .patch_all_whitelist_travel_rules(&travel_rule_info)
+        .await?;
+
+    if patched.is_empty() {
+        writeln!(stdout, "No whitelist entries found to patch.")?;
+    } else {
+        writeln!(stdout, "Patched {} whitelist entry/entries:", patched.len())?;
+
+        for entry in &patched {
+            writeln!(stdout, "   ID: {}", entry.id)?;
+            writeln!(stdout, "   Address: {}", entry.address)?;
+            writeln!(stdout, "   Asset: {}", entry.asset.as_ref())?;
+            writeln!(stdout, "   Status: {:?}", entry.status)?;
+        }
     }
 
     Ok(())
@@ -590,6 +647,7 @@ mod tests {
                 equities: EquitiesConfig::default(),
                 cash: None,
             },
+            travel_rule: None,
         }
     }
 
@@ -671,6 +729,7 @@ mod tests {
                     .call(),
             )),
             execution_threshold: ExecutionThreshold::whole_share(),
+            travel_rule: None,
         }
     }
 

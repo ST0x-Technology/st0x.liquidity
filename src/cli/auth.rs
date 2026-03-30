@@ -147,6 +147,7 @@ mod tests {
                 equities: EquitiesConfig::default(),
                 cash: None,
             },
+            travel_rule: None,
         };
 
         (ctx, schwab_auth)

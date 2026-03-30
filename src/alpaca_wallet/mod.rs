@@ -30,6 +30,7 @@ mod whitelist;
 use alloy::primitives::{Address, TxHash};
 use rain_math_float::Float;
 use std::sync::Arc;
+use tracing::error;
 
 use st0x_execution::{AlpacaAccountId, Positive};
 use st0x_finance::{HasZero, Usdc};
@@ -37,7 +38,7 @@ use st0x_finance::{HasZero, Usdc};
 pub(crate) use client::{AlpacaWalletClient, AlpacaWalletError};
 pub(crate) use status::PollingConfig;
 pub(crate) use transfer::{AlpacaTransferId, Network, TokenSymbol, Transfer, TransferStatus};
-pub(crate) use whitelist::WhitelistStatus;
+pub(crate) use whitelist::{TravelRuleInfo, WhitelistStatus};
 
 /// Service facade for Alpaca crypto wallet operations.
 ///
@@ -175,9 +176,10 @@ impl AlpacaWalletService {
         address: &Address,
         asset: &TokenSymbol,
         network: &Network,
+        travel_rule_info: &TravelRuleInfo,
     ) -> Result<whitelist::WhitelistEntry, AlpacaWalletError> {
         self.client
-            .create_whitelist_entry(address, asset, network)
+            .create_whitelist_entry(address, asset, network, travel_rule_info)
             .await
     }
 
@@ -205,6 +207,32 @@ impl AlpacaWalletService {
         }
 
         Ok(matching)
+    }
+
+    /// Patches travel rule info on all existing whitelisted addresses.
+    ///
+    /// Returns all whitelist entries that were patched.
+    pub(crate) async fn patch_all_whitelist_travel_rules(
+        &self,
+        travel_rule_info: &TravelRuleInfo,
+    ) -> Result<Vec<whitelist::WhitelistEntry>, AlpacaWalletError> {
+        let entries = self.client.get_whitelisted_addresses().await?;
+
+        for entry in &entries {
+            self.client
+                .patch_whitelist_travel_rule(&entry.id, travel_rule_info)
+                .await
+                .inspect_err(|err| {
+                    error!(
+                        whitelist_id = %entry.id,
+                        address = %entry.address,
+                        ?err,
+                        "failed to patch travel rule on whitelist entry"
+                    );
+                })?;
+        }
+
+        Ok(entries)
     }
 
     /// Gets all whitelisted addresses for this account.
