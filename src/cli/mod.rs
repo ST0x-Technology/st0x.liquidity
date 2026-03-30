@@ -2415,31 +2415,20 @@ mod tests {
     fn test_unwrap_equity_command_structure() {
         let cmd = Cli::command();
 
-        let result = cmd
-            .clone()
-            .try_get_matches_from(vec!["cli", "unwrap-equity"]);
-        assert!(result.is_err(), "unwrap-equity without args should fail");
+        cmd.clone()
+            .try_get_matches_from(vec!["cli", "unwrap-equity"])
+            .unwrap_err();
 
-        let result = cmd
-            .clone()
-            .try_get_matches_from(vec!["cli", "unwrap-equity", "-s", "AAPL"]);
-        assert!(
-            result.is_err(),
-            "unwrap-equity without quantity should fail"
-        );
+        cmd.clone()
+            .try_get_matches_from(vec!["cli", "unwrap-equity", "-s", "AAPL"])
+            .unwrap_err();
 
-        let result = cmd
-            .clone()
-            .try_get_matches_from(vec!["cli", "unwrap-equity", "-q", "10.5"]);
-        assert!(result.is_err(), "unwrap-equity without symbol should fail");
+        cmd.clone()
+            .try_get_matches_from(vec!["cli", "unwrap-equity", "-q", "10.5"])
+            .unwrap_err();
 
-        let result =
-            cmd.try_get_matches_from(vec!["cli", "unwrap-equity", "-s", "AAPL", "-q", "10.5"]);
-        assert!(
-            result.is_ok(),
-            "unwrap-equity with symbol and quantity should succeed: {:?}",
-            result.err()
-        );
+        cmd.try_get_matches_from(vec!["cli", "unwrap-equity", "-s", "AAPL", "-q", "10.5"])
+            .unwrap();
     }
 
     #[test]
