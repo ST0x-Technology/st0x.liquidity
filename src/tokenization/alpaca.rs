@@ -567,7 +567,11 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
             .await?;
 
         scan_request_list(&body, |request| {
-            if string_field(request, "tokenization_request_id") == Some(id.0.as_str()) {
+            if request
+                .get("tokenization_request_id")
+                .and_then(Value::as_str)
+                == Some(id.0.as_str())
+            {
                 return serde_json::from_value(request.clone()).map(Some);
             }
 
@@ -636,7 +640,15 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         let expected_tx_hash = format!("{tx_hash:#x}");
 
         scan_request_list(&body, |request| {
-            if string_field(request, "tx_hash") == Some(expected_tx_hash.as_str()) {
+            let matches_tx_hash =
+                request
+                    .get("tx_hash")
+                    .and_then(Value::as_str)
+                    .is_some_and(|request_tx_hash| {
+                        request_tx_hash.eq_ignore_ascii_case(expected_tx_hash.as_str())
+                    });
+
+            if matches_tx_hash {
                 return serde_json::from_value(request.clone()).map(Some);
             }
 
@@ -764,16 +776,15 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
     }
 }
 
-fn string_field<'a>(request: &'a Value, field_name: &str) -> Option<&'a str> {
-    request.get(field_name).and_then(Value::as_str)
-}
-
 fn parse_request_list(body: &str) -> Result<Vec<TokenizationRequest>, serde_json::Error> {
     let requests: Vec<Value> = serde_json::from_str(body)?;
     let mut parsed_requests = Vec::with_capacity(requests.len());
 
     for request in requests {
-        let request_id = string_field(&request, "tokenization_request_id").map(str::to_owned);
+        let request_id = request
+            .get("tokenization_request_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
 
         match serde_json::from_value::<TokenizationRequest>(request) {
             Ok(parsed_request) => parsed_requests.push(parsed_request),
@@ -1470,6 +1481,53 @@ pub(crate) mod tests {
         assert_eq!(
             request.id,
             TokenizationRequestId("redeem_target".to_string())
+        );
+        assert_eq!(request.tx_hash, Some(hash));
+
+        list_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_find_redemption_by_tx_matches_uppercase_hash() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+
+        let hash: TxHash =
+            fixed_bytes!("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
+        let uppercase_hash = format!(
+            "0x{}",
+            format!("{hash:#x}")
+                .trim_start_matches("0x")
+                .to_ascii_uppercase()
+        );
+
+        let list_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(tokenization_requests_path())
+                .query_param("type", "redeem");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([{
+                    "tokenization_request_id": "redeem_uppercase",
+                    "type": "redeem",
+                    "status": "pending",
+                    "underlying_symbol": "AAPL",
+                    "token_symbol": "tAAPL",
+                    "qty": "50.0",
+                    "issuer": "st0x",
+                    "network": "base",
+                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "tx_hash": uppercase_hash,
+                    "created_at": "2024-01-15T10:30:00Z"
+                }]));
+        });
+
+        let request = client.find_redemption_by_tx(&hash).await.unwrap().unwrap();
+
+        assert_eq!(
+            request.id,
+            TokenizationRequestId("redeem_uppercase".to_string())
         );
         assert_eq!(request.tx_hash, Some(hash));
 
