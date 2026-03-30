@@ -56,15 +56,6 @@ fn parse_float(input: &str) -> Result<Float, String> {
     Float::parse(input.to_string()).map_err(|err| format!("{err}"))
 }
 
-fn parse_positive_price(input: &str) -> Result<AlpacaLimitPrice, String> {
-    let price = input
-        .parse::<st0x_execution::Usd>()
-        .map_err(|err| format!("{err}"))?;
-    let positive_price =
-        Positive::new(price).map_err(|_| "limit price must be positive".to_string())?;
-    AlpacaLimitPrice::try_new(positive_price).map_err(|err| format!("{err}"))
-}
-
 fn parse_positive_shares(input: &str) -> Result<Positive<FractionalShares>, String> {
     let shares: FractionalShares = input.parse().map_err(|err| format!("{err}"))?;
     Positive::new(shares).map_err(|err| format!("{err}"))
@@ -93,7 +84,7 @@ pub enum Commands {
         #[arg(long = "time-in-force")]
         time_in_force: Option<TimeInForce>,
         /// Limit price for a manual Alpaca Broker API limit order
-        #[arg(long = "limit-price", value_parser = parse_positive_price)]
+        #[arg(long = "limit-price")]
         limit_price: Option<AlpacaLimitPrice>,
         /// Submit the limit order as extended-hours eligible
         #[arg(long = "extended-hours", requires = "limit_price")]
@@ -111,7 +102,7 @@ pub enum Commands {
         #[arg(long = "time-in-force")]
         time_in_force: Option<TimeInForce>,
         /// Limit price for a manual Alpaca Broker API limit order
-        #[arg(long = "limit-price", value_parser = parse_positive_price)]
+        #[arg(long = "limit-price")]
         limit_price: Option<AlpacaLimitPrice>,
         /// Submit the limit order as extended-hours eligible
         #[arg(long = "extended-hours", requires = "limit_price")]
@@ -1371,18 +1362,20 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_positive_price_rejects_zero() {
-        let error = parse_positive_price("0").unwrap_err();
+    fn test_alpaca_limit_price_from_str_rejects_zero() {
+        let error = "0".parse::<AlpacaLimitPrice>().unwrap_err();
 
-        assert_eq!(error, "limit price must be positive");
+        assert_eq!(error.to_string(), "limit price must be positive");
     }
 
     #[test]
-    fn test_parse_positive_price_rejects_invalid_precision() {
-        let error = parse_positive_price("195.255").unwrap_err();
+    fn test_alpaca_limit_price_from_str_rejects_invalid_precision() {
+        let error = "195.255".parse::<AlpacaLimitPrice>().unwrap_err();
 
         assert!(
-            error.contains("exceeds Alpaca's 2-decimal-place precision"),
+            error
+                .to_string()
+                .contains("exceeds Alpaca's 2-decimal-place precision"),
             "unexpected error: {error}"
         );
     }

@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
 use st0x_float_macro::float;
+use std::str::FromStr;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -65,6 +66,18 @@ pub struct AlpacaLimitOrder {
 #[serde(transparent)]
 pub struct AlpacaLimitPrice(Positive<Usd>);
 
+#[derive(Debug, thiserror::Error)]
+pub enum ParseAlpacaLimitPriceError {
+    #[error(transparent)]
+    Float(#[from] rain_math_float::FloatError),
+
+    #[error("limit price must be positive")]
+    NotPositive,
+
+    #[error(transparent)]
+    Validation(#[from] AlpacaBrokerApiError),
+}
+
 impl AlpacaLimitPrice {
     pub fn try_new(limit_price: Positive<Usd>) -> Result<Self, AlpacaBrokerApiError> {
         validate_limit_price_precision(limit_price)?;
@@ -77,6 +90,16 @@ impl AlpacaLimitPrice {
 
     pub fn into_inner(self) -> Positive<Usd> {
         self.0
+    }
+}
+
+impl FromStr for AlpacaLimitPrice {
+    type Err = ParseAlpacaLimitPriceError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let price = value.parse::<Usd>()?;
+        let positive_price = Positive::new(price).map_err(|_| Self::Err::NotPositive)?;
+        Self::try_new(positive_price).map_err(Self::Err::from)
     }
 }
 

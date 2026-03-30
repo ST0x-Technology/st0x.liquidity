@@ -51,7 +51,10 @@ pub enum AssetStatus {
 pub use auth::{AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
 pub use executor::AlpacaBrokerApi;
 pub use journal::{JournalResponse, JournalStatus};
-pub use order::{AlpacaLimitOrder, AlpacaLimitPrice, ConversionDirection, CryptoOrderResponse};
+pub use order::{
+    AlpacaLimitOrder, AlpacaLimitPrice, ConversionDirection, CryptoOrderResponse,
+    ParseAlpacaLimitPriceError,
+};
 
 impl fmt::Display for TimeInForce {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
