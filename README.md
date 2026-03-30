@@ -79,6 +79,12 @@ cargo run --bin server -- --config path/to/config.toml --secrets path/to/secrets
 cargo run --bin reporter -- --config path/to/config.toml
 ```
 
+Manual unwrap of wrapped equity shares:
+
+```bash
+cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml unwrap-equity --symbol AAPL --quantity 10.5
+```
+
 ### Brokerage Setup
 
 **Charles Schwab** (3-5 day approval):
