@@ -71,6 +71,14 @@ pub enum ProjectionError<Entity: EventSourced> {
         table: String,
         row_count: i64,
     },
+    #[error("invalid view ID '{view_id}'")]
+    InvalidViewId { view_id: String },
+    #[error("corrupt view payload for {view_id}")]
+    CorruptPayload {
+        view_id: Entity::Id,
+        #[source]
+        source: serde_json::Error,
+    },
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
     #[error(transparent)]
@@ -236,7 +244,35 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
 
         Ok((pool, table))
     }
+}
 
+fn parse_row<Entity: EventSourced>(
+    view_id: String,
+    payload: &str,
+) -> Result<Option<(Entity::Id, Entity)>, ProjectionError<Entity>>
+where
+    <Entity::Id as FromStr>::Err: Debug,
+{
+    let id: Entity::Id = view_id.parse().map_err(|error| {
+        warn!(view_id, ?error, "Failed to parse view ID");
+        ProjectionError::InvalidViewId { view_id }
+    })?;
+
+    let lifecycle: Lifecycle<Entity> = serde_json::from_str(payload).map_err(|source| {
+        warn!(%id, ?source, "Failed to deserialize view payload");
+        ProjectionError::CorruptPayload {
+            view_id: id.clone(),
+            source,
+        }
+    })?;
+
+    match lifecycle {
+        Lifecycle::Live(entity) => Ok(Some((id, entity))),
+        lifecycle => {
+            debug!(%id, state = lifecycle.label(), "Skipping non-live aggregate in view");
+            Ok(None)
+        }
+    }
 }
 
 fn parse_rows<Entity: EventSourced>(
@@ -245,30 +281,10 @@ fn parse_rows<Entity: EventSourced>(
 where
     <Entity::Id as FromStr>::Err: Debug,
 {
-    let mut result = Vec::with_capacity(rows.len());
-
-    for (view_id, payload) in rows {
-        let id: Entity::Id = view_id.parse().map_err(|error| {
-            warn!(view_id, ?error, "Failed to parse view ID");
-            ProjectionError::Persistence(PersistenceError::UnknownError(
-                format!("invalid view ID '{view_id}': {error:?}").into(),
-            ))
-        })?;
-
-        let lifecycle: Lifecycle<Entity> = serde_json::from_str(&payload).map_err(|error| {
-            warn!(%id, ?error, "Failed to deserialize view payload");
-            ProjectionError::Persistence(PersistenceError::DeserializationError(Box::new(error)))
-        })?;
-
-        match lifecycle {
-            Lifecycle::Live(entity) => result.push((id, entity)),
-            lifecycle => {
-                debug!(%id, state = lifecycle.label(), "Skipping non-live aggregate in view");
-            }
-        }
-    }
-
-    Ok(result)
+    rows.into_iter()
+        .map(|(view_id, payload)| parse_row::<Entity>(view_id, &payload))
+        .filter_map(Result::transpose)
+        .collect()
 }
 
 // TODO: Projection's Repo parameter ideally encodes a
@@ -659,13 +675,15 @@ mod tests {
         }
 
         #[test]
-        fn corrupt_payload_returns_error() {
+        fn corrupt_payload_returns_typed_error_with_parsed_id() {
             let result = parse(vec![("id-1", "not valid json".to_string())]);
 
-            assert!(
-                matches!(result, Err(ProjectionError::Persistence(_))),
-                "expected deserialization error, got {result:?}"
-            );
+            match result {
+                Err(ProjectionError::CorruptPayload { view_id, source: _ }) => {
+                    assert_eq!(view_id, "id-1");
+                }
+                other => panic!("expected CorruptPayload, got {other:?}"),
+            }
         }
 
         #[test]

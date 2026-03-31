@@ -174,7 +174,7 @@ pub use wire::StoreBuilder;
 #[async_trait]
 pub trait EventSourced: Clone + Debug + Send + Sync + Sized + Serialize + DeserializeOwned {
     /// Aggregate identity type, used as the key in the event store.
-    type Id: Display + FromStr + Send + Sync;
+    type Id: Display + FromStr + Clone + Send + Sync;
     /// Domain event type emitted by commands and applied during replay.
     type Event: DomainEvent;
     /// Command type that drives state transitions.

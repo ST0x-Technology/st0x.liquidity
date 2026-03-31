@@ -64,10 +64,7 @@ pub(crate) fn overview_config_from_ctx(ctx: &crate::config::Ctx) -> st0x_dto::Ov
             format!("{formatted} shares")
         }
         ExecutionThreshold::DollarValue(usd) => {
-            let formatted = usd
-                .inner()
-                .format()
-                .unwrap_or_else(|_| "?".to_string());
+            let formatted = usd.inner().format().unwrap_or_else(|_| "?".to_string());
 
             format!("${formatted}")
         }
