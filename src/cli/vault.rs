@@ -9,6 +9,7 @@ use thiserror::Error;
 
 use st0x_event_sorcery::StoreBuilder;
 use st0x_evm::{Evm, OpenChainErrorRegistry};
+use st0x_float_macro::float;
 use st0x_float_serde::format_float_with_fallback;
 
 use crate::bindings::IERC20;
@@ -70,7 +71,7 @@ pub(super) async fn vault_deposit_command<Writer: Write>(
     writeln!(stdout, "   Amount: {}", format_float_with_fallback(&amount))?;
     writeln!(stdout, "   Token: {token}")?;
 
-    if amount.lt(Float::zero()?)? {
+    if amount.lt(float!(0))? {
         return Err(VaultCliError::NegativeAmount(amount).into());
     }
 
@@ -130,7 +131,7 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
     writeln!(stdout, "   Amount: {}", format_float_with_fallback(&amount))?;
     writeln!(stdout, "   Token: {token}")?;
 
-    if amount.lt(Float::zero()?)? {
+    if amount.lt(float!(0))? {
         return Err(VaultCliError::NegativeAmount(amount).into());
     }
 

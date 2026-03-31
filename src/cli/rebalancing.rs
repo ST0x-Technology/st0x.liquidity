@@ -548,6 +548,7 @@ mod tests {
 
     use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
     use st0x_finance::Usdc;
+    use st0x_float_macro::float;
 
     use super::*;
     use crate::config::{
@@ -627,12 +628,12 @@ mod tests {
             trading_mode: TradingMode::Rebalancing(Box::new(
                 RebalancingCtx::stub()
                     .equity(ImbalanceThreshold {
-                        target: Float::parse("0.5".to_string()).unwrap(),
-                        deviation: Float::parse("0.1".to_string()).unwrap(),
+                        target: float!(0.5),
+                        deviation: float!(0.1),
                     })
                     .usdc(ImbalanceThreshold {
-                        target: Float::parse("0.5".to_string()).unwrap(),
-                        deviation: Float::parse("0.1".to_string()).unwrap(),
+                        target: float!(0.5),
+                        deviation: float!(0.1),
                     })
                     .redemption_wallet(Address::ZERO)
                     .alpaca_broker_auth(alpaca_broker_auth)
