@@ -166,6 +166,8 @@ pub(super) async fn vault_withdraw_usdc_command<Writer: Write>(
     ctx: &Ctx,
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
+    ctx.rebalancing_ctx()?;
+
     let vault_id = ctx
         .assets
         .cash
@@ -466,6 +468,27 @@ mod tests {
         assert!(
             err_msg.contains("assets.cash.vault_id is required but not configured"),
             "Expected vault_id missing error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn withdraw_usdc_requires_rebalancing_ctx_before_cash_vault_lookup() {
+        let amount = Usdc::new(float!(100));
+
+        let mut stdout = Vec::new();
+        let err_msg = vault_withdraw_usdc_command(
+            &mut stdout,
+            amount,
+            &create_ctx_without_rebalancing(),
+            &SqlitePool::connect(":memory:").await.unwrap(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err_msg.contains("requires rebalancing mode"),
+            "Expected rebalancing mode error, got: {err_msg}"
         );
     }
 

@@ -160,6 +160,8 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
         anyhow::bail!("transfer-usdc requires Alpaca Broker API configuration");
     };
 
+    let rebalancing_ctx = ctx.rebalancing_ctx()?;
+
     let usdc_vault_id = ctx
         .assets
         .cash
@@ -168,8 +170,6 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
         .ok_or_else(|| anyhow::anyhow!("assets.cash.vault_id is required but not configured"))?;
 
     writeln!(stdout, "   Vault ID: {usdc_vault_id}")?;
-
-    let rebalancing_ctx = ctx.rebalancing_ctx()?;
     let owner = rebalancing_ctx.base_wallet().address();
 
     let broker_mode = if alpaca_auth.is_sandbox() {
@@ -553,7 +553,9 @@ mod tests {
     use crate::config::{
         AssetsConfig, CashAssetConfig, EquitiesConfig, LogLevel, OperationMode, TradingMode,
     };
+    use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmCtx;
+    use crate::rebalancing::RebalancingCtx;
     use crate::test_utils::setup_test_db;
     use crate::threshold::ExecutionThreshold;
 
@@ -595,6 +597,53 @@ mod tests {
             time_in_force: TimeInForce::default(),
         });
         ctx
+    }
+
+    fn create_alpaca_ctx_with_rebalancing(cash: Option<CashAssetConfig>) -> Ctx {
+        let alpaca_broker_auth = AlpacaBrokerApiCtx {
+            api_key: "test-key".to_string(),
+            api_secret: "test-secret".to_string(),
+            account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
+            mode: Some(AlpacaBrokerApiMode::Sandbox),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::default(),
+        };
+
+        Ctx {
+            database_url: ":memory:".to_string(),
+            log_level: LogLevel::Debug,
+            server_port: 8080,
+            evm: EvmCtx {
+                ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+                orderbook: address!("0x1234567890123456789012345678901234567890"),
+                deployment_block: 1,
+            },
+            order_polling_interval: 15,
+            order_polling_max_jitter: 5,
+            position_check_interval: 60,
+            inventory_poll_interval: 60,
+            broker: BrokerCtx::AlpacaBrokerApi(alpaca_broker_auth.clone()),
+            telemetry: None,
+            trading_mode: TradingMode::Rebalancing(Box::new(
+                RebalancingCtx::stub()
+                    .equity(ImbalanceThreshold {
+                        target: Float::parse("0.5".to_string()).unwrap(),
+                        deviation: Float::parse("0.1".to_string()).unwrap(),
+                    })
+                    .usdc(ImbalanceThreshold {
+                        target: Float::parse("0.5".to_string()).unwrap(),
+                        deviation: Float::parse("0.1".to_string()).unwrap(),
+                    })
+                    .redemption_wallet(Address::ZERO)
+                    .alpaca_broker_auth(alpaca_broker_auth)
+                    .call(),
+            )),
+            execution_threshold: ExecutionThreshold::whole_share(),
+            assets: AssetsConfig {
+                equities: EquitiesConfig::default(),
+                cash,
+            },
+        }
     }
 
     #[tokio::test]
@@ -774,7 +823,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_transfer_usdc_requires_vault_id_when_cash_is_none() {
-        let ctx = create_alpaca_ctx_without_rebalancing();
+        let ctx = create_alpaca_ctx_with_rebalancing(None);
         let pool = setup_test_db().await;
         let amount = Usdc::new(Float::parse("100".to_string()).unwrap());
 
@@ -797,12 +846,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_transfer_usdc_requires_vault_id_when_vault_id_is_none() {
-        let mut ctx = create_alpaca_ctx_without_rebalancing();
-        ctx.assets.cash = Some(CashAssetConfig {
+        let ctx = create_alpaca_ctx_with_rebalancing(Some(CashAssetConfig {
             vault_id: None,
             rebalancing: OperationMode::Enabled,
             operational_limit: None,
-        });
+        }));
         let pool = setup_test_db().await;
         let amount = Usdc::new(Float::parse("100".to_string()).unwrap());
 
@@ -825,18 +873,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_transfer_usdc_writes_vault_id_to_stdout() {
-        let mut ctx = create_alpaca_ctx_without_rebalancing();
         let vault_id = b256!("0x00000000000000000000000000000000000000000000000000000000000000ab");
-        ctx.assets.cash = Some(CashAssetConfig {
+        let ctx = create_alpaca_ctx_with_rebalancing(Some(CashAssetConfig {
             vault_id: Some(vault_id),
             rebalancing: OperationMode::Enabled,
             operational_limit: None,
-        });
+        }));
         let pool = setup_test_db().await;
         let amount = Usdc::new(Float::parse("100".to_string()).unwrap());
 
         let mut stdout = Vec::new();
-        // Will fail at rebalancing_ctx, but vault_id check passes first
+        // The vault lookup succeeds, then the command fails later when it reaches
+        // the stubbed service setup.
         transfer_usdc_command(
             &mut stdout,
             TransferDirection::ToRaindex,
