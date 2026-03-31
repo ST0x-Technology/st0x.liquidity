@@ -29,7 +29,10 @@ async fn wrap_equity_with_wrapper<Writer: Write, W: Wrapper + ?Sized>(
     symbol: Symbol,
     quantity: Positive<FractionalShares>,
 ) -> anyhow::Result<()> {
-    writeln!(stdout, "Wrapping tokenized equity into wrapped vault shares")?;
+    writeln!(
+        stdout,
+        "Wrapping tokenized equity into wrapped vault shares"
+    )?;
     writeln!(stdout, "   Symbol: {symbol}")?;
     writeln!(stdout, "   Underlying quantity: {quantity}")?;
     writeln!(stdout, "   Liquidity wallet: {owner}")?;
@@ -45,7 +48,10 @@ async fn wrap_equity_with_wrapper<Writer: Write, W: Wrapper + ?Sized>(
         stdout,
         "   Underlying amount (smallest unit): {underlying_amount}"
     )?;
-    writeln!(stdout, "   Depositing underlying shares into ERC-4626 vault...")?;
+    writeln!(
+        stdout,
+        "   Depositing underlying shares into ERC-4626 vault..."
+    )?;
 
     let (wrap_tx_hash, wrapped_amount_u256) = wrapper
         .to_wrapped(wrapped_token, underlying_amount, owner)
