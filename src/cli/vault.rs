@@ -1,6 +1,7 @@
 //! Raindex vault deposit and withdrawal CLI commands.
 
 use alloy::primitives::{Address, B256, U256};
+use anyhow::Context;
 use rain_math_float::{Float, FloatError};
 use sqlx::SqlitePool;
 use std::io::Write;
@@ -49,9 +50,9 @@ fn float_to_u256(amount: Float, decimals: u8) -> Result<U256, VaultCliError> {
 }
 
 async fn get_token_decimals<E: Evm>(evm: &E, token: Address) -> anyhow::Result<u8> {
-    Ok(evm
-        .call::<OpenChainErrorRegistry, _>(token, IERC20::decimalsCall {})
-        .await?)
+    evm.call::<OpenChainErrorRegistry, _>(token, IERC20::decimalsCall {})
+        .await
+        .with_context(|| format!("failed to read decimals() for token {token}"))
 }
 
 pub(super) async fn vault_deposit_command<Writer: Write>(
@@ -68,6 +69,10 @@ pub(super) async fn vault_deposit_command<Writer: Write>(
     writeln!(stdout, "Depositing tokens to Raindex vault")?;
     writeln!(stdout, "   Amount: {}", format_float_with_fallback(&amount))?;
     writeln!(stdout, "   Token: {token}")?;
+
+    if amount.lt(Float::zero()?)? {
+        return Err(VaultCliError::NegativeAmount(amount).into());
+    }
 
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
     let sender_address = rebalancing_ctx.base_wallet().address();
@@ -124,6 +129,10 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
     writeln!(stdout, "Withdrawing tokens from Raindex vault")?;
     writeln!(stdout, "   Amount: {}", format_float_with_fallback(&amount))?;
     writeln!(stdout, "   Token: {token}")?;
+
+    if amount.lt(Float::zero()?)? {
+        return Err(VaultCliError::NegativeAmount(amount).into());
+    }
 
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
     let sender_address = rebalancing_ctx.base_wallet().address();
@@ -443,6 +452,72 @@ mod tests {
         let decimals = get_token_decimals(&evm, USDC_BASE).await.unwrap();
 
         assert_eq!(decimals, 6);
+    }
+
+    #[tokio::test]
+    async fn get_token_decimals_adds_token_context_on_failure() {
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("boom");
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
+
+        let err = get_token_decimals(&evm, TEST_TOKEN).await.unwrap_err();
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("failed to read decimals() for token"),
+            "Expected token decimals context, got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains(&TEST_TOKEN.to_string()),
+            "Expected token address in error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vault_deposit_negative_amount_fails_before_metadata_lookup() {
+        let ctx = create_ctx_with_rebalancing(None);
+        let deposit = Deposit {
+            amount: float!(-1),
+            token: TEST_TOKEN,
+            vault_id: TEST_VAULT_ID,
+        };
+
+        let mut stdout = Vec::new();
+        let result = vault_deposit_command(
+            &mut stdout,
+            deposit,
+            &ctx,
+            &SqlitePool::connect(":memory:").await.unwrap(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(ref error) if error.to_string().contains("negative amount")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_vault_withdraw_negative_amount_fails_before_metadata_lookup() {
+        let ctx = create_ctx_with_rebalancing(None);
+        let withdraw = Withdraw {
+            amount: float!(-1),
+            token: TEST_TOKEN,
+            vault_id: TEST_VAULT_ID,
+        };
+
+        let mut stdout = Vec::new();
+        let result = vault_withdraw_command(
+            &mut stdout,
+            withdraw,
+            &ctx,
+            &SqlitePool::connect(":memory:").await.unwrap(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(ref error) if error.to_string().contains("negative amount")
+        ));
     }
 
     #[tokio::test]
