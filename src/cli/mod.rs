@@ -148,13 +148,13 @@ pub enum Commands {
     ///
     /// Initiates a withdrawal from Alpaca's crypto wallet to a specified address.
     /// The destination address must be whitelisted and approved in Alpaca.
-    /// Default destination is your configured sender wallet.
+    /// Omit --to to list available whitelisted addresses.
     AlpacaWithdraw {
         /// Amount of USDC to withdraw
         #[arg(short = 'a', long = "amount")]
         amount: Usdc,
 
-        /// Destination address (defaults to SENDER_WALLET from env)
+        /// Destination address (must be whitelisted; omit to list available)
         #[arg(short = 't', long = "to")]
         to_address: Option<Address>,
     },

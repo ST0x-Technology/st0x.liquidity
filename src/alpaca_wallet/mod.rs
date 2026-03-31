@@ -38,7 +38,7 @@ use st0x_finance::{HasZero, Usdc};
 pub(crate) use client::{AlpacaWalletClient, AlpacaWalletError};
 pub(crate) use status::PollingConfig;
 pub(crate) use transfer::{AlpacaTransferId, Network, TokenSymbol, Transfer, TransferStatus};
-pub(crate) use whitelist::{TravelRuleInfo, WhitelistStatus};
+pub(crate) use whitelist::{TravelRuleInfo, WhitelistEntry, WhitelistStatus};
 
 /// Service facade for Alpaca crypto wallet operations.
 ///
