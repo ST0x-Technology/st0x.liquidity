@@ -20,14 +20,12 @@ pub(super) struct Deposit {
     pub(super) amount: Float,
     pub(super) token: Address,
     pub(super) vault_id: B256,
-    pub(super) decimals: u8,
 }
 
 pub(super) struct Withdraw {
     pub(super) amount: Float,
     pub(super) token: Address,
     pub(super) vault_id: B256,
-    pub(super) decimals: u8,
 }
 
 #[derive(Debug, Error)]
@@ -50,23 +48,10 @@ fn float_to_u256(amount: Float, decimals: u8) -> Result<U256, VaultCliError> {
     Ok(amount.to_fixed_decimal(decimals)?)
 }
 
-async fn validate_token_decimals<E: Evm>(
-    evm: &E,
-    token: Address,
-    provided_decimals: u8,
-) -> anyhow::Result<u8> {
-    let onchain_decimals: u8 = evm
+async fn get_token_decimals<E: Evm>(evm: &E, token: Address) -> anyhow::Result<u8> {
+    Ok(evm
         .call::<OpenChainErrorRegistry, _>(token, IERC20::decimalsCall {})
-        .await?;
-
-    if onchain_decimals != provided_decimals {
-        anyhow::bail!(
-            "token {token} decimals mismatch: provided {provided_decimals}, onchain \
-             metadata reports {onchain_decimals}"
-        );
-    }
-
-    Ok(onchain_decimals)
+        .await?)
 }
 
 pub(super) async fn vault_deposit_command<Writer: Write>(
@@ -79,12 +64,10 @@ pub(super) async fn vault_deposit_command<Writer: Write>(
         amount,
         token,
         vault_id,
-        decimals,
     } = deposit;
     writeln!(stdout, "Depositing tokens to Raindex vault")?;
     writeln!(stdout, "   Amount: {}", format_float_with_fallback(&amount))?;
     writeln!(stdout, "   Token: {token}")?;
-    writeln!(stdout, "   Decimals: {decimals}")?;
 
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
     let sender_address = rebalancing_ctx.base_wallet().address();
@@ -105,9 +88,9 @@ pub(super) async fn vault_deposit_command<Writer: Write>(
         sender_address,
     );
 
-    let verified_decimals =
-        validate_token_decimals(rebalancing_ctx.base_wallet(), token, decimals).await?;
-    let amount_u256 = float_to_u256(amount, verified_decimals)?;
+    let token_decimals = get_token_decimals(rebalancing_ctx.base_wallet(), token).await?;
+    writeln!(stdout, "   Decimals: {token_decimals}")?;
+    let amount_u256 = float_to_u256(amount, token_decimals)?;
     writeln!(stdout, "   Amount (smallest unit): {amount_u256}")?;
 
     writeln!(stdout, "   Depositing to vault (approve + deposit)...")?;
@@ -116,7 +99,7 @@ pub(super) async fn vault_deposit_command<Writer: Write>(
             token,
             RaindexVaultId(vault_id),
             amount_u256,
-            verified_decimals,
+            token_decimals,
         )
         .await?;
     writeln!(stdout, "   Deposit tx: {deposit_tx}")?;
@@ -136,13 +119,11 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
         amount,
         token,
         vault_id,
-        decimals,
     } = withdraw;
 
     writeln!(stdout, "Withdrawing tokens from Raindex vault")?;
     writeln!(stdout, "   Amount: {}", format_float_with_fallback(&amount))?;
     writeln!(stdout, "   Token: {token}")?;
-    writeln!(stdout, "   Decimals: {decimals}")?;
 
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
     let sender_address = rebalancing_ctx.base_wallet().address();
@@ -163,19 +144,14 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
         sender_address,
     );
 
-    let verified_decimals =
-        validate_token_decimals(rebalancing_ctx.base_wallet(), token, decimals).await?;
-    let amount_u256 = float_to_u256(amount, verified_decimals)?;
+    let token_decimals = get_token_decimals(rebalancing_ctx.base_wallet(), token).await?;
+    writeln!(stdout, "   Decimals: {token_decimals}")?;
+    let amount_u256 = float_to_u256(amount, token_decimals)?;
     writeln!(stdout, "   Amount (smallest unit): {amount_u256}")?;
 
     writeln!(stdout, "   Withdrawing from vault...")?;
     let withdraw_tx = raindex_service
-        .withdraw(
-            token,
-            RaindexVaultId(vault_id),
-            amount_u256,
-            verified_decimals,
-        )
+        .withdraw(token, RaindexVaultId(vault_id), amount_u256, token_decimals)
         .await?;
     writeln!(stdout, "   Withdraw tx: {withdraw_tx}")?;
 
@@ -201,7 +177,6 @@ pub(super) async fn vault_withdraw_usdc_command<Writer: Write>(
         amount: amount.into(),
         token: USDC_BASE,
         vault_id,
-        decimals: 6,
     };
 
     vault_withdraw_command(stdout, withdraw, ctx, pool).await
@@ -318,7 +293,6 @@ mod tests {
             amount,
             token: TEST_TOKEN,
             vault_id: TEST_VAULT_ID,
-            decimals: 6,
         };
         let result = vault_deposit_command(
             &mut stdout,
@@ -342,7 +316,6 @@ mod tests {
             amount: float!(100),
             token: TEST_TOKEN,
             vault_id: TEST_VAULT_ID,
-            decimals: 18,
         };
 
         let mut stdout = Vec::new();
@@ -370,7 +343,6 @@ mod tests {
             amount: float!(500.5),
             token: TEST_TOKEN,
             vault_id: TEST_VAULT_ID,
-            decimals: 6,
         };
         vault_deposit_command(
             &mut stdout,
@@ -395,7 +367,6 @@ mod tests {
             amount: float!(250.25),
             token: TEST_TOKEN,
             vault_id: TEST_VAULT_ID,
-            decimals: 18,
         };
 
         let mut stdout = Vec::new();
@@ -416,10 +387,6 @@ mod tests {
         assert!(
             output.contains(&TEST_TOKEN.to_string()),
             "Expected token in output, got: {output}"
-        );
-        assert!(
-            output.contains("18"),
-            "Expected decimals in output, got: {output}"
         );
     }
 
@@ -455,39 +422,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_token_decimals_accepts_matching_metadata() {
+    async fn get_token_decimals_reads_metadata() {
         let asserter = Asserter::new();
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
 
-        let decimals = validate_token_decimals(&evm, TEST_TOKEN, 18).await.unwrap();
+        let decimals = get_token_decimals(&evm, TEST_TOKEN).await.unwrap();
 
         assert_eq!(decimals, 18);
     }
 
     #[tokio::test]
-    async fn validate_token_decimals_rejects_metadata_mismatch() {
+    async fn get_token_decimals_reads_usdc_metadata() {
         let asserter = Asserter::new();
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
 
-        let err = validate_token_decimals(&evm, TEST_TOKEN, 6)
-            .await
-            .unwrap_err()
-            .to_string();
+        let decimals = get_token_decimals(&evm, USDC_BASE).await.unwrap();
 
-        assert!(
-            err.contains(&TEST_TOKEN.to_string()),
-            "Expected token address in mismatch error, got: {err}"
-        );
-        assert!(
-            err.contains("provided 6"),
-            "Expected provided decimals in mismatch error, got: {err}"
-        );
-        assert!(
-            err.contains("metadata reports 18"),
-            "Expected onchain decimals in mismatch error, got: {err}"
-        );
+        assert_eq!(decimals, 6);
     }
 
     #[tokio::test]
@@ -568,10 +521,6 @@ mod tests {
         assert!(
             output.contains(&crate::onchain::USDC_BASE.to_string()),
             "Expected USDC token in output, got: {output}"
-        );
-        assert!(
-            output.contains("Decimals: 6"),
-            "Expected USDC decimals in output, got: {output}"
         );
     }
 

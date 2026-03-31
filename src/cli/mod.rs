@@ -198,7 +198,8 @@ pub enum Commands {
     /// Deposit tokens into a Raindex vault
     ///
     /// This command deposits ERC20 tokens from your wallet into a Raindex OrderBook vault.
-    /// It handles ERC20 approval and the vault deposit in sequence.
+    /// It handles ERC20 approval and the vault deposit in sequence, resolving
+    /// token decimals from onchain metadata.
     VaultDeposit {
         /// Amount of tokens to deposit (human-readable, e.g., 100 for 100 tokens)
         #[arg(short = 'a', long = "amount", value_parser = parse_float)]
@@ -211,15 +212,12 @@ pub enum Commands {
         /// Vault ID
         #[arg(short = 'v', long = "vault-id")]
         vault_id: B256,
-
-        /// Token decimals (e.g., 6 for USDC, 18 for most ERC20s)
-        #[arg(short = 'd', long = "decimals")]
-        decimals: u8,
     },
 
     /// Withdraw tokens from a Raindex vault
     ///
-    /// This command withdraws ERC20 tokens from a Raindex OrderBook vault to your wallet.
+    /// This command withdraws ERC20 tokens from a Raindex OrderBook vault to
+    /// your wallet, resolving token decimals from onchain metadata.
     VaultWithdraw {
         /// Amount of tokens to withdraw (human-readable, e.g., 100 for 100 tokens)
         #[arg(short = 'a', long = "amount", value_parser = parse_float)]
@@ -232,10 +230,6 @@ pub enum Commands {
         /// Vault ID
         #[arg(short = 'v', long = "vault-id")]
         vault_id: B256,
-
-        /// Token decimals (e.g., 6 for USDC, 18 for most ERC20s)
-        #[arg(short = 'd', long = "decimals")]
-        decimals: u8,
     },
 
     /// Withdraw USDC from the configured Raindex cash vault
@@ -488,13 +482,11 @@ enum SimpleCommand {
         amount: Float,
         token: Address,
         vault_id: B256,
-        decimals: u8,
     },
     VaultWithdraw {
         amount: Float,
         token: Address,
         vault_id: B256,
-        decimals: u8,
     },
     VaultWithdrawUsdc {
         amount: Usdc,
@@ -616,23 +608,19 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             amount,
             token,
             vault_id,
-            decimals,
         } => Ok(SimpleCommand::VaultDeposit {
             amount,
             token,
             vault_id,
-            decimals,
         }),
         Commands::VaultWithdraw {
             amount,
             token,
             vault_id,
-            decimals,
         } => Ok(SimpleCommand::VaultWithdraw {
             amount,
             token,
             vault_id,
-            decimals,
         }),
         Commands::VaultWithdrawUsdc { amount } => Ok(SimpleCommand::VaultWithdrawUsdc { amount }),
         Commands::CctpBridge { amount, all, from } => {
@@ -754,13 +742,11 @@ async fn run_simple_command<W: Write>(
             amount,
             token,
             vault_id,
-            decimals,
         } => {
             let deposit = vault::Deposit {
                 amount,
                 token,
                 vault_id,
-                decimals,
             };
             vault::vault_deposit_command(stdout, deposit, ctx, pool).await
         }
@@ -768,13 +754,11 @@ async fn run_simple_command<W: Write>(
             amount,
             token,
             vault_id,
-            decimals,
         } => {
             let withdraw = vault::Withdraw {
                 amount,
                 token,
                 vault_id,
-                decimals,
             };
             vault::vault_withdraw_command(stdout, withdraw, ctx, pool).await
         }
@@ -1652,8 +1636,6 @@ mod tests {
             "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
             "-v",
             "0x0000000000000000000000000000000000000000000000000000000000000001",
-            "-d",
-            "18",
         ])
         .unwrap();
 
@@ -1661,7 +1643,6 @@ mod tests {
             amount,
             token,
             vault_id,
-            decimals,
         } = cli.command
         else {
             panic!("expected generic vault withdraw command");
@@ -1679,7 +1660,6 @@ mod tests {
             vault_id,
             b256!("0000000000000000000000000000000000000000000000000000000000000001")
         );
-        assert_eq!(decimals, 18);
     }
 
     #[test]
@@ -1701,7 +1681,6 @@ mod tests {
             amount: float!(10),
             token: address!("0x1234567890123456789012345678901234567890"),
             vault_id,
-            decimals: 18,
         });
         assert!(
             matches!(deposit, Ok(SimpleCommand::VaultDeposit { .. })),
@@ -1712,7 +1691,6 @@ mod tests {
             amount: float!(5),
             token: address!("0x1234567890123456789012345678901234567890"),
             vault_id,
-            decimals: 18,
         });
         assert!(
             matches!(withdraw, Ok(SimpleCommand::VaultWithdraw { .. })),
