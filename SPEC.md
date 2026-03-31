@@ -1258,10 +1258,6 @@ long-running poll begins.
 Alpaca mints unwrapped tokens. Before depositing to Raindex, we wrap them into
 ERC-4626 vault shares using the Wrapper service.
 
-Operators can also invoke direct CLI wrap and unwrap commands for ERC-4626
-conversion when manual recovery or rebalancing workflows need explicit control
-over token wrapping direction.
-
 ##### States
 
 Terminal states store audit-critical fields not available from earlier events:
