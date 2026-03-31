@@ -155,7 +155,7 @@ jobs:
         run: nix develop -c pre-commit run --all-files
 
   deploy:
-    if: github.ref == 'refs/heads/prod'
+    if: github.ref == 'refs/heads/master'
     needs: [backend, dashboard, hooks]
     concurrency:
       group: deploy
