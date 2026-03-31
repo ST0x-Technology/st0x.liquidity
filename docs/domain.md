@@ -101,33 +101,48 @@ and `wtAAPL` both resolve to `AAPL`). Each context uses the specific form it
 knows: Raindex events use `TokenizedSymbol<WrappedTokenizedShares>`, Alpaca
 tokenization uses `TokenizedSymbol<OneToOneTokenizedShares>`.
 
-### Hedge
+### Dislocation
 
-The core mechanism for capturing arbitrage while minimizing directional risk.
-When an onchain trade fills (e.g., buying tokenized AAPL), the bot executes an
-offsetting trade in the opposite direction at the offchain venue (selling AAPL
-shares). This keeps the bot's net position close to zero while capturing the
-spread between onchain and offchain prices.
+Net directional exposure caused by counterparty fills on Raindex. When someone
+takes liquidity from our onchain orders, we gain or lose tokenized equity
+exposure that we didn't intend to hold — this displacement from zero net
+exposure is a dislocation. The system resolves dislocations by placing
+offsetting trades at the offchain venue.
 
-Direction logic: positive net position -> sell offchain; negative net position
--> buy offchain.
+Dislocation is distinct from imbalance: dislocation is about unwanted
+directional exposure (per asset, caused by trading), while imbalance is about
+venue allocation ratios (caused by inventory drift over time).
+
+Direction logic: positive dislocation (long exposure) -> sell offchain; negative
+dislocation (short exposure) -> buy offchain.
+
+### Imbalance
+
+The deviation of the current venue allocation ratio from its target. Each asset
+has a target onchain ratio (e.g., 50% on Raindex, 50% on Alpaca) with an allowed
+deviation band. When the actual ratio drifts outside the band, the system
+triggers a cross-venue transfer (mint, redemption, or USDC bridge) to restore
+the target allocation.
+
+Configured via `ImbalanceThreshold { target, deviation }` per asset category
+(equity and USDC independently).
 
 ### Position
 
 A CQRS aggregate tracking a single symbol's accumulated exposure across both
-venues. It records accumulated long and short volumes, the current net exposure,
-and the last known price. A position determines when it is ready for execution
-based on its configured execution threshold.
+venues. It records accumulated long and short volumes, the current net
+dislocation, and the last known price. A position determines when it is ready
+for execution based on its configured execution threshold.
 
 ### Execution Threshold
 
-The minimum net exposure required before the system triggers an offsetting
+The minimum dislocation required before the system triggers an offsetting
 offchain trade. Two modes:
 
-- **Shares threshold**: Execute when net position reaches N shares (used by
+- **Shares threshold**: Execute when dislocation reaches N shares (used by
   Schwab, which does not support fractional shares, and DryRun).
-- **Dollar value threshold**: Execute when net position value reaches $N (used
-  by Alpaca, which requires a $1 minimum for fractional trading).
+- **Dollar value threshold**: Execute when dislocation value reaches $N (used by
+  Alpaca, which requires a $1 minimum for fractional trading).
 
 ### Rebalancing
 

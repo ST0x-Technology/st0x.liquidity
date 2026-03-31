@@ -3,25 +3,17 @@
   import { onMount } from 'svelte'
   import HeaderBar from '$lib/components/header-bar.svelte'
   import InventoryPanel from '$lib/components/inventory-panel.svelte'
-  import LiveEventsPanel from '$lib/components/live-events-panel.svelte'
-  import { brokerStore } from '$lib/stores/broker.svelte'
-  import { getWebSocketUrl, type Broker } from '$lib/env'
+  import TradeHistoryPanel from '$lib/components/trade-history-panel.svelte'
+  import TransferPanel from '$lib/components/transfer-panel.svelte'
+  import { getWebSocketUrl } from '$lib/env'
   import { reactive } from '$lib/frp.svelte'
   import { createWebSocket, type WebSocketConnection } from '$lib/websocket.svelte'
 
   const queryClient = useQueryClient()
   const ws = reactive<WebSocketConnection | null>(null)
 
-  const handleBrokerChange = (broker: Broker) => {
-    ws.current?.disconnect()
-    queryClient.clear()
-    brokerStore.set(broker)
-    ws.update(() => createWebSocket(getWebSocketUrl(broker), queryClient))
-    ws.current?.connect()
-  }
-
   onMount(() => {
-    ws.update(() => createWebSocket(getWebSocketUrl(brokerStore.value), queryClient))
+    ws.update(() => createWebSocket(getWebSocketUrl(), queryClient))
     ws.current?.connect()
 
     return () => {
@@ -51,8 +43,6 @@
 
 <div class="flex h-screen flex-col bg-background">
   <HeaderBar
-    broker={brokerStore.value}
-    onBrokerChange={handleBrokerChange}
     connectionStatus={connectionState === 'error' ? 'disconnected' : connectionState}
   />
 
@@ -66,10 +56,12 @@
     </div>
   {/if}
 
-  <main class="flex-1 overflow-auto p-2 md:overflow-hidden md:p-4">
-    <div class="grid h-full grid-cols-1 gap-2 md:grid-cols-[3fr_2fr] md:gap-4">
-      <InventoryPanel />
-      <LiveEventsPanel />
+  <main class="flex min-h-0 flex-1 flex-col gap-2 overflow-hidden p-2 md:gap-4 md:p-4">
+    <InventoryPanel />
+
+    <div class="grid min-h-0 flex-1 grid-cols-1 gap-2 md:grid-cols-2 md:gap-4">
+      <TradeHistoryPanel />
+      <TransferPanel />
     </div>
   </main>
 </div>

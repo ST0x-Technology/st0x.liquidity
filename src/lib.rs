@@ -119,6 +119,7 @@ fn spawn_server_task(
         .manage(dashboard::DashboardState {
             inventory,
             pool: pool.clone(),
+            config: dashboard::overview_config_from_ctx(ctx),
         });
 
     tokio::spawn(rocket.launch())

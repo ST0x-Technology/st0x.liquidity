@@ -27,7 +27,7 @@ use st0x_execution::{Executor, FractionalShares, Symbol};
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::bindings::IOrderBookV6::{self, IOrderBookV6Instance};
 use crate::config::{Ctx, CtxError};
-use crate::dashboard::EventBroadcaster;
+use crate::dashboard::Broadcaster;
 use crate::inventory::{BroadcastingInventory, InventoryPollingService, InventorySnapshot};
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::{ExecutorOrderPlacer, OffchainOrder, OrderPlacer};
@@ -148,7 +148,7 @@ impl Conductor {
             .await?;
         }
 
-        let event_broadcaster = Arc::new(EventBroadcaster::new(event_sender.clone(), pool.clone()));
+        let event_broadcaster = Arc::new(Broadcaster::new(event_sender.clone(), pool.clone()));
 
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
             .with(event_broadcaster.clone())
@@ -322,7 +322,7 @@ struct RebalancingDeps {
     pool: SqlitePool,
     ctx: Ctx,
     inventory: Arc<BroadcastingInventory>,
-    event_broadcaster: Arc<EventBroadcaster>,
+    event_broadcaster: Arc<Broadcaster>,
     vault_registry: Arc<Store<VaultRegistry>>,
     vault_registry_projection: Arc<Projection<VaultRegistry>>,
     equity_transfers_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,

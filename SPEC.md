@@ -2491,34 +2491,216 @@ No external dependencies - keeps bundle small and avoids library lock-in.
 - **Server state**: TanStack Query v6 as reactive cache, populated via WebSocket
 - **Local UI state**: Svelte 5 `$state` and `$derived` runes
 
-#### WebSocket-First Data Flow
+#### WebSocket Communication Protocol
 
-All read data flows through a single WebSocket connection:
+The dashboard communicates with the server over a single WebSocket connection
+using a unified message protocol. The server broadcasts **Statements** — public
+announcements about ongoing operations. The client is primarily reactive: it
+receives statements and reflects them in the interface. The client can also send
+**Inquiries** — requests for data or (in the future) adjustments to the system.
 
-1. Client connects to `WS /api/ws`
-2. Server sends full initial state as first message (positions, trades, P&L,
-   auth status, circuit breaker state)
-3. Server streams incremental updates as events occur
+##### Design Goals
 
-##### Benefits
+- **Unified messaging**: All server-to-client communication uses the same
+  `Statement` type, whether it's a full snapshot or a partial update
+- **Incremental updates**: Statements are typically partial — e.g., a status
+  change of a particular rebalance, not all ongoing rebalances. The client
+  merges partial updates into its local state
+- **Sync-friendly**: Supports both fresh page loads (client knows nothing) and
+  reconnections (client describes stale state). The server diffs and sends only
+  what the client is missing
+- **Future-compatible**: The protocol supports client-initiated inquiries for
+  loading more data (e.g., paginating trade history) and eventually for
+  adjusting system parameters (circuit breakers, spreads, capital allocation)
+- **No dedicated request/response**: When a client requests data, the response
+  arrives as a regular statement — the client doesn't block waiting for it. This
+  keeps the client purely reactive
 
-- Single connection to manage
-- No race condition between HTTP fetch and WebSocket updates
-- Server controls exactly what state the client starts with
-- HTTP endpoints only needed for mutations (circuit breaker, auth)
+##### Higher-Kinded Data (HKD) Pattern
 
-##### Message Types
+The core insight: the same data structure should work for both full state and
+partial updates. In Haskell, this is naturally expressed with higher-kinded
+types:
 
-Message types (`ServerMessage`, `InitialState`, etc.) are defined in the
-`st0x-dto` crate (`crates/dto/src/lib.rs`) and auto-generated as TypeScript
-types via `ts-rs`. The DTO crate is the source of truth for all wire formats.
+```haskell
+data Inventory (f :: Type -> Type) = Inventory
+  { cash :: f Usd
+  , equities :: Map Ticker (f FractionalShares)
+  }
+-- Full:    Inventory Identity  -> { cash: Usd, equities: Map Ticker FractionalShares }
+-- Partial: Inventory Maybe     -> { cash: Maybe Usd, equities: Map Ticker (Maybe FractionalShares) }
+```
+
+Rust lacks higher-kinded types, but we achieve the same pattern via a proc macro
+that generates paired Full/Delta types from a single definition.
+
+##### Proc Macro: `#[derive(Statement)]`
+
+A single struct definition generates both the full type and its delta
+counterpart, plus merge logic and TypeScript bindings:
+
+```rust
+#[derive(Statement)]
+struct Inventory {
+    cash: Usd,
+    #[values]
+    equities: BTreeMap<Symbol, FractionalShares>,
+}
+```
+
+This generates:
+
+```rust
+// Full type — all fields required
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+struct Inventory {
+    cash: Usd,
+    equities: BTreeMap<Symbol, FractionalShares>,
+}
+
+// Delta type — all fields optional
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+struct InventoryDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cash: Option<Usd>,
+    // #[values]: map always present, values are Option (Some = upsert, None = remove, absent = unchanged)
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    equities: BTreeMap<Symbol, Option<FractionalShares>>,
+}
+
+impl Stateable for Inventory {
+    type Delta = InventoryDelta;
+    fn merge(&mut self, delta: InventoryDelta) { /* generated */ }
+}
+```
+
+Field attributes control delta behavior:
+
+- **(default)**: Field becomes `Option<T>` in delta. `None` = unchanged.
+- **`#[values]`**: Map field stays present in delta, values become `Option<V>`.
+  Empty map = no changes. `Some(v)` = upsert. `None` = removed.
+- **`#[nested]`**: Field type is itself a `Statement` type. Delta uses
+  `Option<FieldDelta>` instead of `Option<Field>`, enabling partial updates to
+  nested structures.
+- **`#[values(nested)]`**: Combines both — map with nested statement values.
+
+##### Statement Categories
+
+The system's public statements are organized by domain concern:
+
+```rust
+#[derive(Statement)]
+enum PublicStatement {
+    Trading(TradingStatement),
+    Inventory(InventoryStatement),
+    Transfer(TransferStatement),
+}
+```
+
+**Trading** — onchain fills, offchain order placements, order status changes,
+position updates.
+
+**Inventory** — per-venue balances (cash and equities), split by onchain and
+offchain. Values come from polling tasks that check actual balances.
+
+**Transfer** — cross-venue rebalancing operations (tokenization, redemption,
+USDC bridging) with their lifecycle status.
+
+Each category is a nested `Statement` type, so updates can target any level of
+granularity: a single field within a single category, or a full snapshot of
+everything.
+
+##### Wire Format: Envelope
+
+Every message on the wire is wrapped in an envelope that provides ordering and
+timing:
+
+```rust
+#[derive(Serialize, TS)]
+struct Envelope {
+    /// Monotonic sequence number for gap detection and ordering
+    sequence: u64,
+    /// When this statement was produced
+    timestamp: DateTime<Utc>,
+    /// The statement payload
+    #[serde(flatten)]
+    payload: EnvelopePayload,
+}
+
+enum EnvelopePayload {
+    /// Full state — new entity or sync response
+    Full(PublicStatement),
+    /// Partial update — only changed fields
+    Delta(PublicStatementDelta),
+    /// Atomic batch — multiple statements that should be applied together
+    Batch(Vec<Envelope>),
+}
+```
+
+The `Batch` variant handles atomic multi-category updates. For example, a trade
+completion affects both Trading and Inventory — these arrive as a single batch
+with one sequence number so the client applies them together without flashing
+inconsistent intermediate states.
+
+##### Future: Client-to-Server Inquiries
+
+**Sync protocol**: On connect, the client sends a `Sync` inquiry. For a fresh
+page load, `last_sequence: None` — the server responds with full statements for
+all current state. For a reconnect, the client sends the last sequence it
+received — the server replays everything after that point. This handles both
+cache staleness and temporary disconnections.
+
+**Data requests**: When the client needs more data (e.g., scrolling through
+trade history), it sends a `Request`. The server responds asynchronously with
+regular statements — the client doesn't block waiting. Whenever the response
+arrives, the client handles it like any other statement.
+
+Responses to inquiries are delivered as regular `Envelope` messages. The client
+doesn't need separate handling logic — it's always just merging statements into
+local state.
+
+##### Producing Statements
+
+Domain operations produce statements via trait implementation:
+
+```rust
+trait Reportable {
+    fn report(&self, id: &str) -> PublicStatement;
+}
+```
+
+The `Reportable` trait converts domain types and their surrounding context into
+public statements for broadcasting. Each aggregate, reactor, or polling service
+that produces client-visible state changes implements this trait. The conductor
+routes produced statements through the broadcast channel to connected clients.
+
+Statements are partial by default — a status change on a rebalancing operation
+produces a `TransferStatementDelta` containing only the changed status field.
+Full statements are produced for new entities (first time the client learns
+about something) and sync responses.
+
+1. Reactor receives the event for entity X
+2. Rebuilds entity state (standard event sourcing)
+3. Converts to DTO (each tracked aggregate implements a DTO conversion trait)
+4. Compares to the last-broadcast DTO for that entity
+5. If different: broadcasts `{ entity_type, entity_id, sequence, trigger, dto }`
+
+##### DTO Crate
+
+All wire types (`PublicStatement`, `PublicStatementDelta`, `Envelope`,
+`Inquiry`, and their nested types) are defined in the `st0x-dto` crate
+(`crates/dto/src/lib.rs`) and auto-generated as TypeScript types via `ts-rs`.
+The DTO crate is the source of truth for all wire formats. The `Statement`
+derive macro generates both Rust types and their TypeScript counterparts.
 
 ##### TanStack Query Integration
 
-WebSocket messages populate the TanStack Query cache. Each `ServerMessage`
-variant maps to one or more query keys (e.g., `["trades"]`, `["inventory"]`,
-`["transfers", "active"]`). The `initial` message seeds all caches on
-connection; subsequent messages update individual caches incrementally.
+WebSocket messages populate the TanStack Query cache. Each `PublicStatement`
+variant maps to query keys (e.g., `["trades"]`, `["inventory"]`,
+`["transfers"]`). The sync response seeds all caches on connection; subsequent
+deltas update individual caches incrementally. The client merge logic (generated
+by the `Statement` macro on the Rust side, mirrored in TypeScript) handles
+partial updates to nested structures.
 
 ### Core Features
 
@@ -2595,38 +2777,27 @@ POST /api/circuit-breaker/reset
 
 ### Dashboard Layout
 
-Single-page dashboard with live-updating panels, each expandable to full-screen.
-Supports two bot instances (Schwab and Alpaca) via broker selector in header.
-
-#### Broker-specific features
-
-- **Schwab**: OAuth flow management (weekly re-authentication)
-- **Alpaca**: Automated rebalancing panel (minting, redemption, USDC bridging)
+Single-page dashboard with live-updating panels.
 
 #### Header Bar
 
-- Broker selector (Schwab / Alpaca) - switches entire dashboard context
-- Auth status indicator with expiry countdown (Schwab only)
 - Circuit breaker status toggle
 - WebSocket connection status
 
 #### Panels
 
-1. **Performance Metrics**: Key metrics (AUM, P&L, volume, trade count, Sharpe,
-   Sortino, max drawdown, hedge lag, uptime) with timeframe selector (1h, 1d,
-   1w, 1m, all-time).
+Two panels, one per core concern. Both update live via WebSocket statements.
 
-2. **Inventory**: Per-symbol equity holdings and cash balances across venues,
-   with available/inflight breakdowns. Includes an "Inventory Transfers" section
-   showing active and recent transfer operations with status.
+1. **Inventory**: Per-symbol equity holdings and cash balances across onchain
+   vaults and the offchain broker, with available/inflight breakdowns. Below the
+   balances, an "Inventory Transfers" section shows active and recent transfer
+   operations (minting, redemption, USDC bridging) with status.
 
-3. **Spreads**: Last realized spreads per asset (buy/sell prices, Pyth
-   reference, spread bps) and per-symbol price charts over time.
-
-4. **Trade History**: Recent trades filterable by venue (onchain/offchain/both).
-
-5. **Live Events**: Real-time domain event stream (aggregate type, ID, sequence,
-   event type, timestamp). Starts empty, populates via WebSocket.
+2. **Trade History**: Recent fills across both venues. Columns: time of fill,
+   trading venue (Raindex/Alpaca), underlying asset, buy/sell side, exposure
+   change (signed shares), and running dislocation per symbol. This is the core
+   operational view — if the bot detects a trade and places a hedge, the
+   operator sees the dislocation resolve in real time.
 
 ### Architecture
 

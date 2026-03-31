@@ -20,75 +20,146 @@ fn zero_float() -> Float {
     float!(0)
 }
 
+/// Converts a domain entity into a [`Statement`] for broadcasting to
+/// dashboard clients.
+pub trait Reportable {
+    fn report(&self, id: &str) -> Statement;
+}
+
+/// Notification sent from the server to WebSocket clients.
+///
+/// A Statement announces that something changed about a specific entity.
+/// The client uses the concern type to know what to refetch/invalidate.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct Statement {
+    pub id: String,
+    pub statement: Concern,
+}
+
+/// Domain concern category for a [`Statement`].
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum Concern {
+    Inventory,
+    Transfer,
+    Trading,
+}
+
 /// Messages sent from the server to WebSocket clients.
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum ServerMessage {
     Initial(Box<InitialState>),
-    Event(EventStoreEntry),
+    Fill(Trade),
     Snapshot(Box<InventorySnapshot>),
     Transfer(TransferOperation),
+    Statement(Statement),
 }
 
 impl ServerMessage {
+    #[must_use]
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Initial(_) => "Initial",
-            Self::Event(_) => "Event",
+            Self::Fill(_) => "Fill",
             Self::Snapshot(_) => "Snapshot",
             Self::Transfer(_) => "Transfer",
+            Self::Statement(_) => "Statement",
         }
     }
 }
 
-/// Full dashboard snapshot sent to the frontend on connection.
+/// Dashboard snapshot sent to the frontend on connection.
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct InitialState {
-    pub recent_trades: Vec<Trade>,
+    pub trades: Vec<Trade>,
     pub inventory: Inventory,
-    pub metrics: PerformanceMetrics,
-    pub spreads: Vec<SpreadSummary>,
+    pub positions: Vec<Position>,
+    pub config: OverviewConfig,
     pub active_transfers: Vec<TransferOperation>,
     pub recent_transfers: Vec<TransferOperation>,
-    pub auth_status: AuthStatus,
-    pub circuit_breaker: CircuitBreakerStatus,
-    /// Warnings about partial data (e.g. failed to load some transfers).
-    pub warnings: Vec<Warning>,
 }
 
 impl Default for InitialState {
     fn default() -> Self {
         Self {
-            recent_trades: Vec::new(),
+            trades: Vec::new(),
             inventory: Inventory::empty(),
-            metrics: PerformanceMetrics::zero(),
-            spreads: Vec::new(),
+            positions: Vec::new(),
+            config: OverviewConfig::default(),
             active_transfers: Vec::new(),
             recent_transfers: Vec::new(),
-            auth_status: AuthStatus::NotConfigured,
-            circuit_breaker: CircuitBreakerStatus::Active,
-            warnings: Vec::new(),
         }
     }
 }
 
-/// Single event from the event store for live updates.
+/// Operational configuration for the dashboard overview.
 #[derive(Debug, Clone, Serialize, TS)]
-pub struct EventStoreEntry {
-    pub aggregate_type: String,
-    pub aggregate_id: String,
-    #[ts(type = "number")]
-    pub sequence: u64,
-    pub event_type: String,
-    pub timestamp: DateTime<Utc>,
+#[serde(rename_all = "camelCase")]
+pub struct OverviewConfig {
+    pub equity_target: f64,
+    pub equity_deviation: f64,
+    pub usdc_target: Option<f64>,
+    pub usdc_deviation: Option<f64>,
+    pub execution_threshold: String,
+    pub assets: Vec<AssetConfig>,
 }
 
-/// Completed trade record.
+impl Default for OverviewConfig {
+    fn default() -> Self {
+        Self {
+            equity_target: 0.5,
+            equity_deviation: 0.2,
+            usdc_target: None,
+            usdc_deviation: None,
+            execution_threshold: "1 share".to_string(),
+            assets: Vec::new(),
+        }
+    }
+}
+
+/// Per-asset operational config.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetConfig {
+    #[ts(type = "string")]
+    pub symbol: Symbol,
+    pub trading: bool,
+    pub rebalancing: bool,
+    pub operational_limit: Option<String>,
+}
+
+/// Where a trade was executed.
+#[derive(Debug, Clone, Copy, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum TradingVenue {
+    Raindex,
+    Alpaca,
+    Schwab,
+    DryRun,
+}
+
+/// Whether the trade was a buy or sell.
+#[derive(Debug, Clone, Copy, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum TradeDirection {
+    Buy,
+    Sell,
+}
+
+/// A completed trade fill.
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct Trade {
-    pub id: String,
+    pub filled_at: DateTime<Utc>,
+    pub venue: TradingVenue,
+    pub direction: TradeDirection,
+    #[ts(type = "string")]
+    pub symbol: Symbol,
+    #[ts(type = "string")]
+    pub shares: FractionalShares,
 }
 
 /// Per-symbol net position.
@@ -140,6 +211,7 @@ pub struct Inventory {
 }
 
 impl Inventory {
+    #[must_use]
     pub fn empty() -> Self {
         Self {
             per_symbol: Vec::new(),
@@ -169,28 +241,6 @@ pub enum EquityRedemptionTag {}
 
 /// Tag type for USDC bridge operation IDs.
 pub enum UsdcBridgeTag {}
-
-/// Category of transfer aggregate that failed to load.
-#[derive(Debug, Clone, Serialize, TS)]
-#[serde(rename_all = "snake_case")]
-pub enum TransferCategory {
-    EquityMint,
-    EquityRedemption,
-    UsdcBridge,
-}
-
-/// Warning emitted when transfer data is partially loaded.
-#[derive(Debug, Clone, Serialize, TS)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Warning {
-    /// Failed to query aggregate IDs for an entire category.
-    CategoryUnavailable { category: TransferCategory },
-    /// An individual aggregate's events failed to replay.
-    AggregateReplayFailed {
-        category: TransferCategory,
-        aggregate_id: String,
-    },
-}
 
 /// Transfer operation: a tagged union per operation type.
 #[derive(Debug, Clone, Serialize, TS)]
@@ -302,6 +352,7 @@ pub enum UsdcBridgeStatus {
 
 impl TransferOperation {
     /// Whether this transfer is in a terminal state (completed or failed).
+    #[must_use]
     pub fn is_terminal(&self) -> bool {
         match self {
             Self::EquityMint(op) => {
@@ -332,6 +383,7 @@ impl TransferOperation {
     }
 
     /// The last time this transfer was updated.
+    #[must_use]
     pub fn updated_at(&self) -> DateTime<Utc> {
         match self {
             Self::EquityMint(op) => op.updated_at,
@@ -386,6 +438,7 @@ pub struct TimeframeMetrics {
 }
 
 impl TimeframeMetrics {
+    #[must_use]
     pub fn zero() -> Self {
         Self {
             aum: zero_float(),
@@ -419,6 +472,7 @@ pub struct PerformanceMetrics {
 }
 
 impl PerformanceMetrics {
+    #[must_use]
     pub fn zero() -> Self {
         let zero = TimeframeMetrics::zero();
         Self {
@@ -478,20 +532,6 @@ pub struct SpreadUpdate {
     pub pyth_price: Float,
 }
 
-/// Whether the trading circuit breaker is active.
-#[derive(Debug, Clone, Serialize, TS)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum CircuitBreakerStatus {
-    Active,
-}
-
-/// Broker authentication status.
-#[derive(Debug, Clone, Serialize, TS)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum AuthStatus {
-    NotConfigured,
-}
-
 /// Export all TypeScript bindings into `out_dir`.
 ///
 /// Each type is written to `out_dir/TypeName.ts`. The caller controls
@@ -504,7 +544,9 @@ pub enum AuthStatus {
 pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
     ServerMessage::export_all_to(out_dir)?;
     InitialState::export_all_to(out_dir)?;
-    EventStoreEntry::export_all_to(out_dir)?;
+    OverviewConfig::export_all_to(out_dir)?;
+    AssetConfig::export_all_to(out_dir)?;
+    Statement::export_all_to(out_dir)?;
     Trade::export_all_to(out_dir)?;
     Position::export_all_to(out_dir)?;
     SymbolInventory::export_all_to(out_dir)?;
@@ -524,10 +566,6 @@ pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
     PerformanceMetrics::export_all_to(out_dir)?;
     SpreadSummary::export_all_to(out_dir)?;
     SpreadUpdate::export_all_to(out_dir)?;
-    CircuitBreakerStatus::export_all_to(out_dir)?;
-    AuthStatus::export_all_to(out_dir)?;
-    Warning::export_all_to(out_dir)?;
-    TransferCategory::export_all_to(out_dir)?;
 
     Ok(())
 }
@@ -549,21 +587,95 @@ mod tests {
     }
 
     #[test]
+    fn statement_serializes_correctly() {
+        let statement = Statement {
+            id: "test-123".to_string(),
+            statement: Concern::Transfer,
+        };
+        let json = serde_json::to_string(&statement).expect("serialization should succeed");
+        assert!(json.contains(r#""id":"test-123""#));
+        assert!(json.contains(r#""statement""#));
+    }
+
+    #[test]
+    fn server_message_fill_serializes_with_type_tag() {
+        let trade = Trade {
+            filled_at: Utc::now(),
+            venue: TradingVenue::Raindex,
+            direction: TradeDirection::Buy,
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: FractionalShares::new(float!(10)),
+        };
+        let msg = ServerMessage::Fill(trade);
+        let json = serde_json::to_string(&msg).expect("serialization should succeed");
+        assert!(
+            json.contains(r#""type":"fill""#),
+            "expected fill tag, got: {json}"
+        );
+        assert!(json.contains(r#""venue":"raindex""#));
+        assert!(json.contains(r#""direction":"buy""#));
+        assert!(json.contains(r#""symbol":"AAPL""#));
+    }
+
+    #[test]
+    fn server_message_initial_serializes_with_type_tag() {
+        let msg = ServerMessage::Initial(Box::default());
+        let json = serde_json::to_string(&msg).expect("serialization should succeed");
+        assert!(json.contains(r#""type":"initial""#));
+        assert!(json.contains(r#""data":"#));
+    }
+
+    #[test]
+    fn server_message_snapshot_serializes_with_type_tag() {
+        let msg = ServerMessage::Snapshot(Box::new(InventorySnapshot {
+            inventory: Inventory::empty(),
+            fetched_at: Utc::now(),
+        }));
+        let json = serde_json::to_string(&msg).expect("serialization should succeed");
+        assert!(
+            json.contains(r#""type":"snapshot""#),
+            "expected snapshot tag, got: {json}"
+        );
+    }
+
+    #[test]
+    fn server_message_statement_serializes_with_type_tag() {
+        let msg = ServerMessage::Statement(Statement {
+            id: "mint-001".to_string(),
+            statement: Concern::Transfer,
+        });
+        let json = serde_json::to_string(&msg).expect("serialization should succeed");
+        assert!(
+            json.contains(r#""type":"statement""#),
+            "expected statement tag, got: {json}"
+        );
+    }
+
+    #[test]
+    fn trade_serializes_all_fields() {
+        let trade = Trade {
+            filled_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            venue: TradingVenue::Alpaca,
+            direction: TradeDirection::Sell,
+            symbol: Symbol::new("TSLA").unwrap(),
+            shares: FractionalShares::new(float!(5.5)),
+        };
+        let json = serde_json::to_value(&trade).expect("serialization should succeed");
+        assert_eq!(json["venue"], json!("alpaca"));
+        assert_eq!(json["direction"], json!("sell"));
+        assert_eq!(json["symbol"], json!("TSLA"));
+        assert_eq!(json["shares"], json!("5.5"));
+        assert!(json["filledAt"].is_string());
+    }
+
+    #[test]
     fn initial_state_default_serializes_correctly() {
         let initial = InitialState::default();
         let json = serde_json::to_string(&initial).expect("serialization should succeed");
-        assert!(json.contains("recentTrades"));
+        assert!(json.contains("trades"));
         assert!(json.contains("inventory"));
-        assert!(json.contains("metrics"));
-        assert!(json.contains("authStatus"));
-        assert!(json.contains("circuitBreaker"));
         assert!(json.contains("activeTransfers"));
         assert!(json.contains("recentTransfers"));
-        assert!(json.contains("warnings"));
-        assert!(
-            !json.contains("\"0x"),
-            "dashboard DTOs should serialize decimal strings, got: {json}"
-        );
     }
 
     #[test]
@@ -659,6 +771,11 @@ mod tests {
             "InitialState.ts should exist in {}/",
             out_dir.display()
         );
+        assert!(
+            out_dir.join("Statement.ts").exists(),
+            "Statement.ts should exist in {}/",
+            out_dir.display()
+        );
 
         TestOnlyBinding::export_all_to(&out_dir).unwrap();
         let test_file = out_dir.join("TestOnlyBinding.ts");
@@ -677,47 +794,6 @@ mod tests {
             "generated file should contain the field name, got: {contents}"
         );
         std::fs::remove_file(&test_file).unwrap();
-    }
-
-    #[test]
-    fn server_message_initial_serializes_with_type_tag() {
-        let msg = ServerMessage::Initial(Box::default());
-        let json = serde_json::to_string(&msg).expect("serialization should succeed");
-        assert!(json.contains(r#""type":"initial""#));
-        assert!(json.contains(r#""data":"#));
-    }
-
-    #[test]
-    fn server_message_snapshot_serializes_with_type_tag() {
-        let msg = ServerMessage::Snapshot(Box::new(InventorySnapshot {
-            inventory: Inventory::empty(),
-            fetched_at: Utc::now(),
-        }));
-        let json = serde_json::to_string(&msg).expect("serialization should succeed");
-        assert!(
-            json.contains(r#""type":"snapshot""#),
-            "expected snapshot tag, got: {json}"
-        );
-        assert!(json.contains(r#""data":"#));
-    }
-
-    #[test]
-    fn server_message_transfer_serializes_with_type_tag() {
-        let msg = ServerMessage::Transfer(TransferOperation::EquityMint(EquityMintOperation {
-            id: Id::new("mint-001"),
-            symbol: Symbol::new("AAPL").unwrap(),
-            quantity: FractionalShares::new(float!(10)),
-            status: EquityMintStatus::Minting,
-            started_at: Utc::now(),
-            updated_at: Utc::now(),
-        }));
-        let json = serde_json::to_string(&msg).expect("serialization should succeed");
-        assert!(
-            json.contains(r#""type":"transfer""#),
-            "expected transfer tag, got: {json}"
-        );
-        assert!(json.contains(r#""data":"#));
-        assert!(json.contains(r#""kind":"equity_mint""#));
     }
 
     #[test]

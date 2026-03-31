@@ -564,7 +564,7 @@ async fn simulate() -> anyhow::Result<()> {
         (&tsla_buy, "TSLA", "BuyEquity"),
     ];
 
-    let trade_onchain_minutes = 2;
+    let trade_onchain_minutes = 10;
     let trade_duration = Duration::from_secs(trade_onchain_minutes * 60);
     let started = tokio::time::Instant::now();
     let mut round = 0u64;

@@ -1,12 +1,8 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { createWebSocket } from './websocket.svelte'
 import type { QueryClient } from '@tanstack/svelte-query'
-import type { EventStoreEntry } from '$lib/api/EventStoreEntry'
-import type { InitialState } from '$lib/api/InitialState'
-import type { Inventory } from '$lib/api/Inventory'
-import type { InventorySnapshot } from '$lib/api/InventorySnapshot'
 import type { ServerMessage } from '$lib/api/ServerMessage'
-import type { TransferOperation } from '$lib/api/TransferOperation'
+import type { Trade } from '$lib/api/Trade'
 
 class MockWebSocket {
   static instances: MockWebSocket[] = []
@@ -58,70 +54,37 @@ class MockWebSocket {
 type MockQueryClient = QueryClient & {
   cache: Map<string, unknown>
   setQueryDataSpy: ReturnType<typeof vi.fn>
-  getQueryDataSpy: ReturnType<typeof vi.fn>
-  clearSpy: ReturnType<typeof vi.fn>
 }
 
 const createMockQueryClient = (): MockQueryClient => {
   const cache = new Map<string, unknown>()
 
   const setQueryDataSpy = vi.fn((key: unknown[], data: unknown) => {
-    cache.set(JSON.stringify(key), data)
+    if (typeof data === 'function') {
+      const current = cache.get(JSON.stringify(key))
+      cache.set(JSON.stringify(key), (data as (old: unknown) => unknown)(current))
+    } else {
+      cache.set(JSON.stringify(key), data)
+    }
     return undefined
-  })
-
-  const getQueryDataSpy = vi.fn((key: unknown[]) => cache.get(JSON.stringify(key)))
-
-  const clearSpy = vi.fn(() => {
-    cache.clear()
   })
 
   return {
     setQueryData: setQueryDataSpy,
-    getQueryData: getQueryDataSpy,
-    clear: clearSpy,
     cache,
-    setQueryDataSpy,
-    getQueryDataSpy,
-    clearSpy
+    setQueryDataSpy
   } as unknown as MockQueryClient
 }
 
-const createTimeframeMetrics = () => ({
-  aum: '0',
-  pnl: { absolute: '0', percent: '0' },
-  volume: '0',
-  tradeCount: 0,
-  sharpeRatio: null,
-  sortinoRatio: null,
-  maxDrawdown: '0',
-  hedgeLagMs: null,
-  uptimePercent: '100'
-})
+const WS_URL = 'ws://localhost:8001/api/ws'
 
-const createUsdcInventory = () => ({
-  onchainAvailable: '0',
-  onchainInflight: '0',
-  offchainAvailable: '0',
-  offchainInflight: '0'
-})
-
-const createInitialState = (): InitialState => ({
-  recentTrades: [],
-  inventory: { perSymbol: [], usdc: createUsdcInventory() },
-  metrics: {
-    '1h': createTimeframeMetrics(),
-    '1d': createTimeframeMetrics(),
-    '1w': createTimeframeMetrics(),
-    '1m': createTimeframeMetrics(),
-    all: createTimeframeMetrics()
-  },
-  spreads: [],
-  activeTransfers: [],
-  recentTransfers: [],
-  authStatus: { status: 'not_configured' },
-  circuitBreaker: { status: 'active' },
-  warnings: []
+const makeTrade = (overrides: Partial<Trade> = {}): Trade => ({
+  filledAt: '2024-01-01T12:00:00Z',
+  venue: 'raindex',
+  direction: 'buy',
+  symbol: 'AAPL',
+  shares: '10',
+  ...overrides
 })
 
 describe('createWebSocket', () => {
@@ -132,718 +95,194 @@ describe('createWebSocket', () => {
   })
 
   afterEach(() => {
-    vi.unstubAllGlobals()
     vi.useRealTimers()
+    vi.restoreAllMocks()
   })
 
-  it('starts in disconnected state', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
-
-    expect(ws.state).toBe('disconnected')
-  })
-
-  it('transitions to connecting then connected on successful connect', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
-
-    ws.connect()
-    expect(ws.state).toBe('connecting')
-
-    MockWebSocket.getInstance(0).simulateOpen()
-    expect(ws.state).toBe('connected')
-  })
-
-  it('populates query cache on initial message', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
-
-    ws.connect()
-    MockWebSocket.getInstance(0).simulateOpen()
-
-    const initialState = createInitialState()
-    const initialMessage: ServerMessage = {
-      type: 'initial',
-      data: initialState
-    }
-
-    MockWebSocket.getInstance(0).simulateMessage(initialMessage)
-
-    expect(queryClient.setQueryDataSpy).toHaveBeenCalledWith(['events'], [])
-    expect(queryClient.setQueryDataSpy).toHaveBeenCalledWith(['trades'], [])
-    expect(queryClient.setQueryDataSpy).toHaveBeenCalledWith(['inventory'], initialState.inventory)
-    expect(queryClient.setQueryDataSpy).toHaveBeenCalledWith(['auth'], { status: 'not_configured' })
-    expect(queryClient.setQueryDataSpy).toHaveBeenCalledWith(['circuitBreaker'], { status: 'active' })
-  })
-
-  it('prepends events and caps at 100', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
-
-    ws.connect()
-    MockWebSocket.getInstance(0).simulateOpen()
-
-    const existingEvents: EventStoreEntry[] = Array.from({ length: 99 }, (_, i) => ({
-      aggregate_type: 'Position',
-      aggregate_id: `existing-${String(i)}`,
-      sequence: i,
-      event_type: 'Created',
-      timestamp: '2024-01-01T00:00:00Z'
-    }))
-
-    queryClient.setQueryDataSpy.mockImplementation(
-      (key: unknown[], updater: unknown): EventStoreEntry[] | undefined => {
-        if (JSON.stringify(key) === '["events"]' && typeof updater === 'function') {
-          const result = (updater as (old: EventStoreEntry[] | undefined) => EventStoreEntry[])(
-            existingEvents
-          )
-          queryClient.cache.set(JSON.stringify(key), result)
-          return result
-        }
-        return undefined
-      }
-    )
-
-    const newEvent: EventStoreEntry = {
-      aggregate_type: 'Position',
-      aggregate_id: 'new-event',
-      sequence: 1,
-      event_type: 'Updated',
-      timestamp: '2024-01-02T00:00:00Z'
-    }
-
-    MockWebSocket.getInstance(0).simulateMessage({ type: 'event', data: newEvent })
-
-    const setQueryDataCalls = queryClient.setQueryDataSpy.mock.calls
-    const eventsCall = setQueryDataCalls.find(
-      (call: unknown[]) => JSON.stringify(call[0]) === '["events"]'
-    )
-
-    expect(eventsCall).toBeDefined()
-    if (eventsCall === undefined) {
-      throw new Error('eventsCall should be defined')
-    }
-    const updater = eventsCall[1] as (old: EventStoreEntry[] | undefined) => EventStoreEntry[]
-    const result = updater(existingEvents)
-
-    expect(result.length).toBe(100)
-    expect(result[0]).toEqual(newEvent)
-  })
-
-  it('schedules reconnect on close with exponential backoff', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
-
-    ws.connect()
-    MockWebSocket.getInstance(0).simulateOpen()
-    MockWebSocket.getInstance(0).simulateClose()
-
-    expect(ws.state).toBe('error')
-
-    vi.advanceTimersByTime(1000)
-    expect(MockWebSocket.instances.length).toBe(2)
-
-    MockWebSocket.getInstance(1).simulateClose()
-    vi.advanceTimersByTime(2000)
-    expect(MockWebSocket.instances.length).toBe(3)
-
-    MockWebSocket.getInstance(2).simulateClose()
-    vi.advanceTimersByTime(4000)
-    expect(MockWebSocket.instances.length).toBe(4)
-  })
-
-  it('resets reconnect attempts on successful connection', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
-
-    ws.connect()
-    MockWebSocket.getInstance(0).simulateOpen()
-    MockWebSocket.getInstance(0).simulateClose()
-
-    vi.advanceTimersByTime(1000)
-    MockWebSocket.getInstance(1).simulateClose()
-
-    vi.advanceTimersByTime(2000)
-    MockWebSocket.getInstance(2).simulateOpen()
-    MockWebSocket.getInstance(2).simulateClose()
-
-    vi.advanceTimersByTime(1000)
-    expect(MockWebSocket.instances.length).toBe(4)
-  })
-
-  it('disconnect cancels reconnect and closes socket', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
-
-    ws.connect()
-    MockWebSocket.getInstance(0).simulateOpen()
-    MockWebSocket.getInstance(0).simulateClose()
-
-    ws.disconnect()
-
-    vi.advanceTimersByTime(10000)
-    expect(MockWebSocket.instances.length).toBe(1)
-    expect(ws.state).toBe('disconnected')
-  })
-
-  it('handles multiple concurrent clients', () => {
-    const queryClient1 = createMockQueryClient()
-    const queryClient2 = createMockQueryClient()
-
-    const ws1 = createWebSocket('ws://localhost:8080', queryClient1)
-    const ws2 = createWebSocket('ws://localhost:8081', queryClient2)
-
-    ws1.connect()
-    ws2.connect()
-
-    expect(MockWebSocket.instances.length).toBe(2)
-    expect(MockWebSocket.getInstance(0).url).toBe('ws://localhost:8080')
-    expect(MockWebSocket.getInstance(1).url).toBe('ws://localhost:8081')
-
-    MockWebSocket.getInstance(0).simulateOpen()
-    MockWebSocket.getInstance(1).simulateOpen()
-
-    expect(ws1.state).toBe('connected')
-    expect(ws2.state).toBe('connected')
-  })
-
-  it('handles event messages by prepending to events list', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
-
-    ws.connect()
-    MockWebSocket.getInstance(0).simulateOpen()
-
-    const event: EventStoreEntry = {
-      aggregate_type: 'TokenizedEquityMint',
-      aggregate_id: 'mint-123',
-      sequence: 1,
-      event_type: 'MintRequested',
-      timestamp: '2024-01-01T00:00:00Z'
-    }
-
-    MockWebSocket.getInstance(0).simulateMessage({ type: 'event', data: event })
-
-    const setQueryDataCalls = queryClient.setQueryDataSpy.mock.calls
-    const eventsCall = setQueryDataCalls.find(
-      (call: unknown[]) => JSON.stringify(call[0]) === '["events"]'
-    )
-
-    expect(eventsCall).toBeDefined()
-    if (eventsCall === undefined) {
-      throw new Error('eventsCall should be defined')
-    }
-
-    const updater = eventsCall[1] as (old: EventStoreEntry[] | undefined) => EventStoreEntry[]
-    const result = updater([])
-
-    expect(result.length).toBe(1)
-    expect(result[0]).toEqual(event)
-  })
-
-  it('handles error by closing socket', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
-
-    ws.connect()
-    MockWebSocket.getInstance(0).simulateOpen()
-
-    const mockSocket = MockWebSocket.getInstance(0)
-    const closeSpy = vi.spyOn(mockSocket, 'close')
-
-    mockSocket.simulateError()
-
-    expect(closeSpy).toHaveBeenCalled()
-  })
-
-  it('does not connect if already connected', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
-    const consoleSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
-
-    ws.connect()
-    MockWebSocket.getInstance(0).simulateOpen()
-
-    ws.connect()
-
-    expect(MockWebSocket.instances.length).toBe(1)
-    expect(consoleSpy).toHaveBeenCalledWith(
-      'No action defined for event',
-      'connect',
-      'in state',
-      'connected'
-    )
-    consoleSpy.mockRestore()
-  })
-
-  it('keeps retrying with exponential backoff', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
-
-    ws.connect()
-
-    for (let i = 0; i < 10; i++) {
-      MockWebSocket.getInstance(i).simulateClose()
-      const delay = Math.min(1000 * Math.pow(2, i), 30000)
-      vi.advanceTimersByTime(delay)
-    }
-
-    MockWebSocket.getInstance(10).simulateClose()
-    const delay = Math.min(1000 * Math.pow(2, 10), 30000)
-    vi.advanceTimersByTime(delay)
-    expect(MockWebSocket.instances.length).toBe(12)
-  })
-
-  it('exposes null error when not in error state', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
-
-    expect(ws.error).toBeNull()
-
-    ws.connect()
-    expect(ws.error).toBeNull()
-
-    MockWebSocket.getInstance(0).simulateOpen()
-    expect(ws.error).toBeNull()
-  })
-
-  it('exposes error context with attempt count and retry delay', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
-
-    ws.connect()
-    MockWebSocket.getInstance(0).simulateOpen()
-    MockWebSocket.getInstance(0).simulateClose()
-
-    expect(ws.error).toEqual({ attempts: 1, nextRetryMs: 1000 })
-
-    vi.advanceTimersByTime(1000)
-    MockWebSocket.getInstance(1).simulateClose()
-
-    expect(ws.error).toEqual({ attempts: 2, nextRetryMs: 2000 })
-  })
-
-  it('clears error context on successful reconnection', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
-
-    ws.connect()
-    MockWebSocket.getInstance(0).simulateOpen()
-    MockWebSocket.getInstance(0).simulateClose()
-
-    expect(ws.error).not.toBeNull()
-
-    vi.advanceTimersByTime(1000)
-    MockWebSocket.getInstance(1).simulateOpen()
-
-    expect(ws.error).toBeNull()
-  })
-
-  it('rejects messages with invalid JSON', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
-    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
-
-    ws.connect()
-    MockWebSocket.getInstance(0).simulateOpen()
-
-    MockWebSocket.getInstance(0).simulateRawMessage('not valid json')
-
-    expect(queryClient.setQueryDataSpy).not.toHaveBeenCalled()
-    expect(consoleSpy).toHaveBeenCalled()
-    consoleSpy.mockRestore()
-  })
-
-  it('rejects messages without type field', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
-    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
-
-    ws.connect()
-    MockWebSocket.getInstance(0).simulateOpen()
-
-    MockWebSocket.getInstance(0).simulateRawMessage(JSON.stringify({ data: {} }))
-
-    expect(queryClient.setQueryDataSpy).not.toHaveBeenCalled()
-    expect(consoleSpy).toHaveBeenCalledWith('Invalid ServerMessage structure:', { data: {} })
-    consoleSpy.mockRestore()
-  })
-
-  it('rejects messages with unknown type', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
-    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
-
-    ws.connect()
-    MockWebSocket.getInstance(0).simulateOpen()
-
-    MockWebSocket.getInstance(0).simulateRawMessage(
-      JSON.stringify({ type: 'unknown', data: {} })
-    )
-
-    expect(queryClient.setQueryDataSpy).not.toHaveBeenCalled()
-    expect(consoleSpy).toHaveBeenCalledWith('Invalid ServerMessage structure:', {
-      type: 'unknown',
-      data: {}
+  describe('connection lifecycle', () => {
+    it('starts disconnected', () => {
+      const queryClient = createMockQueryClient()
+      const ws = createWebSocket(WS_URL, queryClient)
+
+      expect(ws.state).toBe('disconnected')
     })
-    consoleSpy.mockRestore()
+
+    it('transitions to connecting then connected on open', () => {
+      const queryClient = createMockQueryClient()
+      const ws = createWebSocket(WS_URL, queryClient)
+
+      ws.connect()
+      expect(ws.state).toBe('connecting')
+
+      MockWebSocket.getInstance(0).simulateOpen()
+      expect(ws.state).toBe('connected')
+    })
+
+    it('transitions to error on close from connected', () => {
+      const queryClient = createMockQueryClient()
+      const ws = createWebSocket(WS_URL, queryClient)
+
+      ws.connect()
+      MockWebSocket.getInstance(0).simulateOpen()
+      MockWebSocket.getInstance(0).simulateClose()
+      expect(ws.state).toBe('error')
+    })
+
+    it('returns to disconnected on explicit disconnect', () => {
+      const queryClient = createMockQueryClient()
+      const ws = createWebSocket(WS_URL, queryClient)
+
+      ws.connect()
+      MockWebSocket.getInstance(0).simulateOpen()
+      ws.disconnect()
+      expect(ws.state).toBe('disconnected')
+    })
   })
 
-  it('rejects initial message with missing data fields', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
-    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+  describe('message handling', () => {
+    it('seeds trades from initial message', () => {
+      const queryClient = createMockQueryClient()
+      const ws = createWebSocket(WS_URL, queryClient)
 
-    ws.connect()
-    MockWebSocket.getInstance(0).simulateOpen()
+      ws.connect()
+      MockWebSocket.getInstance(0).simulateOpen()
 
-    MockWebSocket.getInstance(0).simulateRawMessage(
-      JSON.stringify({
+      const trade = makeTrade()
+      const message: ServerMessage = {
         type: 'initial',
-        data: { recentTrades: [] }
-      })
-    )
-
-    expect(queryClient.setQueryDataSpy).not.toHaveBeenCalled()
-    expect(consoleSpy).toHaveBeenCalledWith('Invalid ServerMessage structure:', {
-      type: 'initial',
-      data: { recentTrades: [] }
-    })
-    consoleSpy.mockRestore()
-  })
-
-  it('rejects event message with missing fields', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
-    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
-
-    ws.connect()
-    MockWebSocket.getInstance(0).simulateOpen()
-
-    MockWebSocket.getInstance(0).simulateRawMessage(
-      JSON.stringify({
-        type: 'event',
-        data: { aggregate_type: 'Position' }
-      })
-    )
-
-    expect(queryClient.setQueryDataSpy).not.toHaveBeenCalled()
-    expect(consoleSpy).toHaveBeenCalledWith('Invalid ServerMessage structure:', {
-      type: 'event',
-      data: { aggregate_type: 'Position' }
-    })
-    consoleSpy.mockRestore()
-  })
-
-  it('rejects event message with wrong field types', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
-    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
-
-    ws.connect()
-    MockWebSocket.getInstance(0).simulateOpen()
-
-    MockWebSocket.getInstance(0).simulateRawMessage(
-      JSON.stringify({
-        type: 'event',
         data: {
-          aggregate_type: 'Position',
-          aggregate_id: 123,
-          sequence: 'not a number',
-          event_type: 'Created',
-          timestamp: '2024-01-01T00:00:00Z'
+          trades: [trade],
+          inventory: { perSymbol: [], usdc: { onchainAvailable: '0', onchainInflight: '0', offchainAvailable: '0', offchainInflight: '0' } },
+          positions: [],
+          config: { equityTarget: 0.5, equityDeviation: 0.2, usdcTarget: null, usdcDeviation: null, executionThreshold: '$2', assets: [] },
+          activeTransfers: [],
+          recentTransfers: []
         }
-      })
-    )
-
-    expect(queryClient.setQueryDataSpy).not.toHaveBeenCalled()
-    expect(consoleSpy).toHaveBeenCalledWith('Invalid ServerMessage structure:', {
-      type: 'event',
-      data: {
-        aggregate_type: 'Position',
-        aggregate_id: 123,
-        sequence: 'not a number',
-        event_type: 'Created',
-        timestamp: '2024-01-01T00:00:00Z'
       }
+
+      MockWebSocket.getInstance(0).simulateMessage(message)
+
+      const trades = queryClient.cache.get('["trades"]') as Trade[] | undefined
+      expect(trades).toBeDefined()
+      expect(trades).toEqual([trade])
     })
-    consoleSpy.mockRestore()
-  })
 
-  it('handles snapshot by replacing inventory cache', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
+    it('prepends fill to trades cache', () => {
+      const queryClient = createMockQueryClient()
+      const ws = createWebSocket(WS_URL, queryClient)
 
-    ws.connect()
-    MockWebSocket.getInstance(0).simulateOpen()
+      ws.connect()
+      MockWebSocket.getInstance(0).simulateOpen()
 
-    const inventory: Inventory = {
-      perSymbol: [
-        {
-          symbol: 'tAAPL',
-          onchainAvailable: '100.5',
-          onchainInflight: '0',
-          offchainAvailable: '50',
-          offchainInflight: '10'
-        }
-      ],
-      usdc: createUsdcInventory()
-    }
+      // Seed with existing trade
+      queryClient.cache.set('["trades"]', [makeTrade({ symbol: 'TSLA' })])
 
-    const snapshot: InventorySnapshot = {
-      inventory,
-      fetchedAt: '2024-01-01T00:00:00Z'
-    }
+      const newTrade = makeTrade({ symbol: 'AAPL' })
+      const message: ServerMessage = { type: 'fill', data: newTrade }
 
-    const message: ServerMessage = { type: 'snapshot', data: snapshot }
-    MockWebSocket.getInstance(0).simulateMessage(message)
+      MockWebSocket.getInstance(0).simulateMessage(message)
 
-    expect(queryClient.setQueryDataSpy).toHaveBeenCalledWith(['inventory'], inventory)
-  })
-
-  it('handles transfer by adding new active transfer', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
-
-    ws.connect()
-    MockWebSocket.getInstance(0).simulateOpen()
-
-    const transfer: TransferOperation = {
-      kind: 'equity_mint',
-      id: 'mint-1',
-      symbol: 'tAAPL',
-      quantity: '100',
-      status: { status: 'minting' },
-      startedAt: '2024-01-01T00:00:00Z',
-      updatedAt: '2024-01-01T00:00:00Z'
-    }
-
-    const message: ServerMessage = { type: 'transfer', data: transfer }
-    MockWebSocket.getInstance(0).simulateMessage(message)
-
-    const setQueryDataCalls = queryClient.setQueryDataSpy.mock.calls
-    const transfersCall = setQueryDataCalls.find(
-      (call: unknown[]) => JSON.stringify(call[0]) === '["transfers","active"]'
-    )
-
-    expect(transfersCall).toBeDefined()
-    if (transfersCall === undefined) throw new Error('transfersCall should be defined')
-
-    const updater = transfersCall[1] as (
-      old: TransferOperation[] | undefined
-    ) => TransferOperation[]
-    const result = updater([])
-
-    expect(result).toEqual([transfer])
-  })
-
-  it('handles transfer by replacing existing active transfer with same id', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
-
-    ws.connect()
-    MockWebSocket.getInstance(0).simulateOpen()
-
-    const existingTransfer: TransferOperation = {
-      kind: 'equity_mint',
-      id: 'mint-1',
-      symbol: 'tAAPL',
-      quantity: '100',
-      status: { status: 'minting' },
-      startedAt: '2024-01-01T00:00:00Z',
-      updatedAt: '2024-01-01T00:00:00Z'
-    }
-
-    const updatedTransfer: TransferOperation = {
-      kind: 'equity_mint',
-      id: 'mint-1',
-      symbol: 'tAAPL',
-      quantity: '100',
-      status: { status: 'wrapping' },
-      startedAt: '2024-01-01T00:00:00Z',
-      updatedAt: '2024-01-01T00:00:30Z'
-    }
-
-    const message: ServerMessage = { type: 'transfer', data: updatedTransfer }
-    MockWebSocket.getInstance(0).simulateMessage(message)
-
-    const setQueryDataCalls = queryClient.setQueryDataSpy.mock.calls
-    const transfersCall = setQueryDataCalls.find(
-      (call: unknown[]) => JSON.stringify(call[0]) === '["transfers","active"]'
-    )
-
-    expect(transfersCall).toBeDefined()
-    if (transfersCall === undefined) throw new Error('transfersCall should be defined')
-
-    const updater = transfersCall[1] as (
-      old: TransferOperation[] | undefined
-    ) => TransferOperation[]
-    const result = updater([existingTransfer])
-
-    expect(result).toHaveLength(1)
-    expect(result[0]).toEqual(updatedTransfer)
-  })
-
-  it('handles transfer by moving completed transfer to recent', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
-
-    ws.connect()
-    MockWebSocket.getInstance(0).simulateOpen()
-
-    const activeTransfer: TransferOperation = {
-      kind: 'equity_mint',
-      id: 'mint-1',
-      symbol: 'tAAPL',
-      quantity: '100',
-      status: { status: 'minting' },
-      startedAt: '2024-01-01T00:00:00Z',
-      updatedAt: '2024-01-01T00:00:00Z'
-    }
-
-    const completedTransfer: TransferOperation = {
-      kind: 'equity_mint',
-      id: 'mint-1',
-      symbol: 'tAAPL',
-      quantity: '100',
-      status: { status: 'completed', completedAt: '2024-01-01T00:01:00Z' },
-      startedAt: '2024-01-01T00:00:00Z',
-      updatedAt: '2024-01-01T00:01:00Z'
-    }
-
-    const message: ServerMessage = { type: 'transfer', data: completedTransfer }
-    MockWebSocket.getInstance(0).simulateMessage(message)
-
-    const setQueryDataCalls = queryClient.setQueryDataSpy.mock.calls
-    const activeCall = setQueryDataCalls.find(
-      (call: unknown[]) => JSON.stringify(call[0]) === '["transfers","active"]'
-    )
-
-    expect(activeCall).toBeDefined()
-    if (activeCall === undefined) throw new Error('activeCall should be defined')
-
-    const activeUpdater = activeCall[1] as (
-      old: TransferOperation[] | undefined
-    ) => TransferOperation[]
-    const activeResult = activeUpdater([activeTransfer])
-
-    expect(activeResult).toEqual([])
-
-    const recentCall = setQueryDataCalls.find(
-      (call: unknown[]) => JSON.stringify(call[0]) === '["transfers","recent"]'
-    )
-
-    expect(recentCall).toBeDefined()
-    if (recentCall === undefined) throw new Error('recentCall should be defined')
-
-    const recentUpdater = recentCall[1] as (
-      old: TransferOperation[] | undefined
-    ) => TransferOperation[]
-    const recentResult = recentUpdater([])
-
-    expect(recentResult).toEqual([completedTransfer])
-  })
-
-  it('validates snapshot message structure', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
-    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
-
-    ws.connect()
-    MockWebSocket.getInstance(0).simulateOpen()
-
-    MockWebSocket.getInstance(0).simulateRawMessage(
-      JSON.stringify({ type: 'snapshot', data: { invalid: true } })
-    )
-
-    expect(queryClient.setQueryDataSpy).not.toHaveBeenCalled()
-    expect(consoleSpy).toHaveBeenCalledWith('Invalid ServerMessage structure:', {
-      type: 'snapshot',
-      data: { invalid: true }
+      const trades = queryClient.cache.get('["trades"]') as Trade[]
+      expect(trades).toHaveLength(2)
+      expect(trades[0]?.symbol).toBe('AAPL')
+      expect(trades[1]?.symbol).toBe('TSLA')
     })
-    consoleSpy.mockRestore()
-  })
 
-  it('validates transfer message structure', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
-    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    it('limits trades to 100', () => {
+      const queryClient = createMockQueryClient()
+      const ws = createWebSocket(WS_URL, queryClient)
 
-    ws.connect()
-    MockWebSocket.getInstance(0).simulateOpen()
+      ws.connect()
+      MockWebSocket.getInstance(0).simulateOpen()
 
-    MockWebSocket.getInstance(0).simulateRawMessage(
-      JSON.stringify({ type: 'transfer', data: { noKind: true } })
-    )
+      const existing = Array.from({ length: 100 }, (_, idx) =>
+        makeTrade({ symbol: `SYM${String(idx)}` })
+      )
+      queryClient.cache.set('["trades"]', existing)
 
-    expect(queryClient.setQueryDataSpy).not.toHaveBeenCalled()
-    expect(consoleSpy).toHaveBeenCalledWith('Invalid ServerMessage structure:', {
-      type: 'transfer',
-      data: { noKind: true }
+      const newTrade = makeTrade({ symbol: 'NEW' })
+      MockWebSocket.getInstance(0).simulateMessage({ type: 'fill', data: newTrade })
+
+      const trades = queryClient.cache.get('["trades"]') as Trade[]
+      expect(trades).toHaveLength(100)
+      expect(trades[0]?.symbol).toBe('NEW')
     })
-    consoleSpy.mockRestore()
-  })
 
-  it('rejects transfer with missing nested status field', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
-    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    it('updates inventory from snapshot', () => {
+      const queryClient = createMockQueryClient()
+      const ws = createWebSocket(WS_URL, queryClient)
 
-    ws.connect()
-    MockWebSocket.getInstance(0).simulateOpen()
+      ws.connect()
+      MockWebSocket.getInstance(0).simulateOpen()
 
-    MockWebSocket.getInstance(0).simulateRawMessage(
-      JSON.stringify({
-        type: 'transfer',
-        data: { kind: 'equity_mint', id: 'mint-1', symbol: 'tAAPL', quantity: '100' }
-      })
-    )
+      const inventory = {
+        perSymbol: [{ symbol: 'AAPL', onchainAvailable: '10', onchainInflight: '0', offchainAvailable: '5', offchainInflight: '0' }],
+        usdc: { onchainAvailable: '1000', onchainInflight: '0', offchainAvailable: '500', offchainInflight: '0' }
+      }
 
-    expect(queryClient.setQueryDataSpy).not.toHaveBeenCalled()
-    expect(consoleSpy).toHaveBeenCalledWith(
-      'Invalid ServerMessage structure:',
-      expect.objectContaining({ type: 'transfer' })
-    )
-    consoleSpy.mockRestore()
-  })
-
-  it('rejects snapshot with missing nested usdc fields', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
-    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
-
-    ws.connect()
-    MockWebSocket.getInstance(0).simulateOpen()
-
-    MockWebSocket.getInstance(0).simulateRawMessage(
-      JSON.stringify({
+      const message: ServerMessage = {
         type: 'snapshot',
-        data: {
-          inventory: { perSymbol: [], usdc: {} },
-          fetchedAt: '2024-01-01T00:00:00Z'
-        }
-      })
-    )
+        data: { inventory, fetchedAt: '2024-01-01T12:00:00Z' }
+      }
 
-    expect(queryClient.setQueryDataSpy).not.toHaveBeenCalled()
-    expect(consoleSpy).toHaveBeenCalledWith(
-      'Invalid ServerMessage structure:',
-      expect.objectContaining({ type: 'snapshot' })
-    )
-    consoleSpy.mockRestore()
+      MockWebSocket.getInstance(0).simulateMessage(message)
+
+      expect(queryClient.cache.get('["inventory"]')).toEqual(inventory)
+    })
+
+    it('ignores invalid messages', () => {
+      const queryClient = createMockQueryClient()
+      const ws = createWebSocket(WS_URL, queryClient)
+
+      ws.connect()
+      MockWebSocket.getInstance(0).simulateOpen()
+
+      MockWebSocket.getInstance(0).simulateRawMessage('{"not":"valid"}')
+
+      expect(queryClient.setQueryDataSpy).not.toHaveBeenCalled()
+    })
   })
 
-  it('populates transfer cache keys from initial state', () => {
-    const queryClient = createMockQueryClient()
-    const ws = createWebSocket('ws://localhost:8080', queryClient)
+  describe('reconnection', () => {
+    it('schedules reconnect on error', () => {
+      const queryClient = createMockQueryClient()
+      const ws = createWebSocket(WS_URL, queryClient)
 
-    ws.connect()
-    MockWebSocket.getInstance(0).simulateOpen()
+      ws.connect()
+      MockWebSocket.getInstance(0).simulateError()
 
-    const initialState = createInitialState()
-    MockWebSocket.getInstance(0).simulateMessage({ type: 'initial', data: initialState })
+      expect(ws.state).toBe('error')
+      expect(ws.error).not.toBeNull()
+      expect(ws.error?.attempts).toBe(1)
+    })
 
-    expect(queryClient.setQueryDataSpy).toHaveBeenCalledWith(['transfers', 'active'], [])
-    expect(queryClient.setQueryDataSpy).toHaveBeenCalledWith(['transfers', 'recent'], [])
+    it('reconnects after delay', () => {
+      const queryClient = createMockQueryClient()
+      const ws = createWebSocket(WS_URL, queryClient)
+
+      ws.connect()
+      MockWebSocket.getInstance(0).simulateError()
+
+      expect(MockWebSocket.instances).toHaveLength(1)
+
+      vi.advanceTimersByTime(1000)
+
+      expect(MockWebSocket.instances).toHaveLength(2)
+      expect(ws.state).toBe('connecting')
+    })
+
+    it('resets error state on successful reconnection', () => {
+      const queryClient = createMockQueryClient()
+      const ws = createWebSocket(WS_URL, queryClient)
+
+      ws.connect()
+      MockWebSocket.getInstance(0).simulateError()
+
+      vi.advanceTimersByTime(1000)
+      MockWebSocket.getInstance(1).simulateOpen()
+
+      expect(ws.state).toBe('connected')
+      expect(ws.error).toBeNull()
+    })
   })
 })

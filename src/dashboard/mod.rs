@@ -6,23 +6,126 @@ use rocket_ws::{Channel, Message, WebSocket};
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::{debug, info, warn};
+use tracing::{info, trace, warn};
 
 use st0x_dto::{InitialState, ServerMessage};
 
 use crate::inventory::BroadcastingInventory;
 
 mod event;
+mod trade_loader;
 mod transfer_loader;
-pub(crate) use event::EventBroadcaster;
+pub(crate) use event::Broadcaster;
 
 pub(crate) struct Broadcast {
     pub(crate) sender: broadcast::Sender<ServerMessage>,
 }
 
+fn float_to_f64(value: rain_math_float::Float, fallback: f64) -> f64 {
+    value
+        .format()
+        .ok()
+        .and_then(|formatted| formatted.parse::<f64>().ok())
+        .unwrap_or(fallback)
+}
+
+pub(crate) fn overview_config_from_ctx(ctx: &crate::config::Ctx) -> st0x_dto::OverviewConfig {
+    use crate::config::OperationMode;
+    use crate::threshold::ExecutionThreshold;
+
+    let (equity_target, equity_deviation, usdc_target, usdc_deviation) =
+        ctx.rebalancing_ctx().map_or_else(
+            |_| (0.5, 0.2, None, None),
+            |rebalancing| {
+                let (ut, ud) = rebalancing.usdc.as_ref().map_or((None, None), |threshold| {
+                    (
+                        Some(float_to_f64(threshold.target, 0.5)),
+                        Some(float_to_f64(threshold.deviation, 0.3)),
+                    )
+                });
+
+                (
+                    float_to_f64(rebalancing.equity.target, 0.5),
+                    float_to_f64(rebalancing.equity.deviation, 0.2),
+                    ut,
+                    ud,
+                )
+            },
+        );
+
+    let execution_threshold = match &ctx.execution_threshold {
+        ExecutionThreshold::Shares(shares) => {
+            let formatted = shares
+                .inner()
+                .inner()
+                .format()
+                .unwrap_or_else(|_| "?".to_string());
+
+            format!("{formatted} shares")
+        }
+        ExecutionThreshold::DollarValue(usd) => {
+            let formatted = usd.inner().format().unwrap_or_else(|_| "?".to_string());
+
+            format!("${formatted}")
+        }
+    };
+
+    let assets = ctx
+        .assets
+        .equities
+        .symbols
+        .iter()
+        .map(|(symbol, config)| {
+            let limit = config.operational_limit.map(|limit| {
+                limit
+                    .inner()
+                    .inner()
+                    .format()
+                    .unwrap_or_else(|_| "?".to_string())
+            });
+
+            st0x_dto::AssetConfig {
+                symbol: symbol.clone(),
+                trading: config.trading == OperationMode::Enabled,
+                rebalancing: config.rebalancing == OperationMode::Enabled,
+                operational_limit: limit,
+            }
+        })
+        .collect();
+
+    st0x_dto::OverviewConfig {
+        equity_target,
+        equity_deviation,
+        usdc_target,
+        usdc_deviation,
+        execution_threshold,
+        assets,
+    }
+}
+
 pub(crate) struct DashboardState {
     pub(crate) inventory: Arc<BroadcastingInventory>,
     pub(crate) pool: SqlitePool,
+    pub(crate) config: st0x_dto::OverviewConfig,
+}
+
+async fn load_positions(pool: &SqlitePool) -> Vec<st0x_dto::Position> {
+    let rows: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT symbol, net_position FROM position_view WHERE symbol IS NOT NULL")
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+
+    rows.into_iter()
+        .filter_map(|(symbol, net_str)| {
+            let symbol = st0x_execution::Symbol::new(&symbol).ok()?;
+            let net = net_str
+                .and_then(|value| rain_math_float::Float::parse(value).ok())
+                .unwrap_or_else(|| st0x_float_macro::float!(0));
+
+            Some(st0x_dto::Position { symbol, net })
+        })
+        .collect()
 }
 
 #[get("/ws")]
@@ -34,18 +137,22 @@ fn ws_endpoint<'r>(
     let mut receiver = broadcast.sender.subscribe();
     let inventory = Arc::clone(&dashboard.inventory);
     let pool = dashboard.pool.clone();
+    let config = dashboard.config.clone();
 
     ws.channel(move |mut stream| {
         Box::pin(async move {
             let inventory_dto = inventory.read().await.to_dto();
             let transfers = transfer_loader::load_transfers(&pool).await;
+            let trades = trade_loader::load_trades(&pool).await;
+            let positions = load_positions(&pool).await;
 
             let initial_state = InitialState {
+                trades,
                 inventory: inventory_dto,
+                positions,
+                config,
                 active_transfers: transfers.active,
                 recent_transfers: transfers.recent,
-                warnings: transfers.warnings,
-                ..InitialState::default()
             };
 
             let initial = ServerMessage::Initial(Box::new(initial_state));
@@ -66,7 +173,7 @@ fn ws_endpoint<'r>(
             loop {
                 match receiver.recv().await {
                     Ok(msg) => {
-                        debug!(msg = %msg.kind(), "Broadcasting to dashboard client");
+                        trace!(msg = %msg.kind(), "Broadcasting to dashboard client");
                         let json = match serde_json::to_string(&msg) {
                             Ok(serialized) => serialized,
                             Err(error) => {
@@ -105,7 +212,7 @@ mod tests {
     use rocket::config::Config;
     use rocket::fairing::AdHoc;
     use serde_json::json;
-    use st0x_dto::EventStoreEntry;
+    use st0x_dto::{Concern, Statement};
     use std::sync::Mutex;
     use tokio::sync::oneshot;
     use tokio_tungstenite::connect_async;
@@ -128,6 +235,7 @@ mod tests {
                 event_sender,
             )),
             pool,
+            config: st0x_dto::OverviewConfig::default(),
         }
     }
 
@@ -135,11 +243,10 @@ mod tests {
     async fn initial_state_stub_serializes_correctly() {
         let initial = InitialState::default();
         let json = serde_json::to_string(&initial).expect("serialization should succeed");
-        assert!(json.contains("recentTrades"));
+        assert!(json.contains("trades"));
         assert!(json.contains("inventory"));
-        assert!(json.contains("metrics"));
-        assert!(json.contains("authStatus"));
-        assert!(json.contains("circuitBreaker"));
+        assert!(json.contains("activeTransfers"));
+        assert!(json.contains("recentTransfers"));
     }
 
     #[tokio::test]
@@ -244,7 +351,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("invalid JSON");
 
         assert_eq!(parsed["type"], "initial");
-        assert!(parsed["data"]["recentTrades"].is_array());
+        assert!(parsed["data"]["trades"].is_array());
         assert!(parsed["data"]["inventory"].is_object());
 
         shutdown_handle.notify();
@@ -360,15 +467,11 @@ mod tests {
         client1.next().await.expect("client1 initial").unwrap();
         client2.next().await.expect("client2 initial").unwrap();
 
-        // Broadcast an event message
-        let event = EventStoreEntry {
-            aggregate_type: "TestAggregate".to_string(),
-            aggregate_id: "test-123".to_string(),
-            sequence: 1,
-            event_type: "TestEvent".to_string(),
-            timestamp: chrono::Utc::now(),
-        };
-        let broadcast_msg = ServerMessage::Event(event);
+        // Broadcast a statement message
+        let broadcast_msg = ServerMessage::Statement(Statement {
+            id: "test-123".to_string(),
+            statement: Concern::Trading,
+        });
         server
             .broadcast
             .sender
@@ -388,12 +491,11 @@ mod tests {
 
             assert_eq!(
                 parsed["type"],
-                "event",
-                "client{} should receive event message",
+                "statement",
+                "client{} should receive statement message",
                 i + 1
             );
-            assert_eq!(parsed["data"]["aggregate_type"], "TestAggregate");
-            assert_eq!(parsed["data"]["aggregate_id"], "test-123");
+            assert_eq!(parsed["data"]["id"], "test-123");
         }
 
         server.shutdown.notify();
@@ -421,17 +523,13 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Broadcast a message - should still reach client1
-        let event = EventStoreEntry {
-            aggregate_type: "StillWorking".to_string(),
-            aggregate_id: "after-disconnect".to_string(),
-            sequence: 1,
-            event_type: "TestEvent".to_string(),
-            timestamp: chrono::Utc::now(),
-        };
         server
             .broadcast
             .sender
-            .send(ServerMessage::Event(event))
+            .send(ServerMessage::Statement(Statement {
+                id: "after-disconnect".to_string(),
+                statement: Concern::Trading,
+            }))
             .expect("broadcast send");
 
         // client1 should still receive messages
@@ -444,8 +542,8 @@ mod tests {
         let text = msg.into_text().expect("expected text");
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("invalid JSON");
 
-        assert_eq!(parsed["type"], "event");
-        assert_eq!(parsed["data"]["aggregate_type"], "StillWorking");
+        assert_eq!(parsed["type"], "statement");
+        assert_eq!(parsed["data"]["id"], "after-disconnect");
 
         server.shutdown.notify();
     }
@@ -464,17 +562,13 @@ mod tests {
         client1.next().await.expect("client1 initial").unwrap();
 
         // Broadcast a message (client1 will receive it)
-        let event = EventStoreEntry {
-            aggregate_type: "OldEvent".to_string(),
-            aggregate_id: "before-client2".to_string(),
-            sequence: 1,
-            event_type: "TestEvent".to_string(),
-            timestamp: chrono::Utc::now(),
-        };
         server
             .broadcast
             .sender
-            .send(ServerMessage::Event(event))
+            .send(ServerMessage::Statement(Statement {
+                id: "before-client2".to_string(),
+                statement: Concern::Trading,
+            }))
             .expect("broadcast send");
 
         // Consume the broadcast on client1

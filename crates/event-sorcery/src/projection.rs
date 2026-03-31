@@ -71,6 +71,14 @@ pub enum ProjectionError<Entity: EventSourced> {
         table: String,
         row_count: i64,
     },
+    #[error("invalid view ID '{view_id}'")]
+    InvalidViewId { view_id: String },
+    #[error("corrupt view payload for {view_id}")]
+    CorruptPayload {
+        view_id: Entity::Id,
+        #[source]
+        source: serde_json::Error,
+    },
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
     #[error(transparent)]
@@ -185,7 +193,7 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
 
         let rows: Vec<(String, String)> = sqlx::query_as(&query).fetch_all(pool).await?;
 
-        Ok(Self::parse_rows(rows))
+        parse_rows(rows)
     }
 
     /// Load all live entities where a generated column matches
@@ -223,7 +231,7 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
         let rows: Vec<(String, String)> =
             sqlx::query_as(&query).bind(value).fetch_all(pool).await?;
 
-        Ok(Self::parse_rows(rows))
+        parse_rows(rows)
     }
 
     fn sqlite_backing(&self) -> Result<(&SqlitePool, &str), ProjectionError<Entity>> {
@@ -236,38 +244,47 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
 
         Ok((pool, table))
     }
+}
 
-    fn parse_rows(rows: Vec<(String, String)>) -> Vec<(Entity::Id, Entity)>
-    where
-        <Entity::Id as FromStr>::Err: Debug,
-    {
-        rows.into_iter()
-            .filter_map(|(view_id, payload)| {
-                let id: Entity::Id = match view_id.parse() {
-                    Ok(id) => id,
-                    Err(error) => {
-                        warn!(view_id, ?error, "Failed to parse view ID");
-                        return None;
-                    }
-                };
+fn parse_row<Entity: EventSourced>(
+    view_id: String,
+    payload: &str,
+) -> Result<Option<(Entity::Id, Entity)>, ProjectionError<Entity>>
+where
+    <Entity::Id as FromStr>::Err: Debug,
+{
+    let id: Entity::Id = view_id.parse().map_err(|error| {
+        warn!(view_id, ?error, "Failed to parse view ID");
+        ProjectionError::InvalidViewId { view_id }
+    })?;
 
-                let lifecycle: Lifecycle<Entity> = match serde_json::from_str(&payload) {
-                    Ok(lifecycle) => lifecycle,
-                    Err(error) => {
-                        warn!(%id, ?error, "Failed to deserialize view payload");
-                        return None;
-                    }
-                };
+    let lifecycle: Lifecycle<Entity> = serde_json::from_str(payload).map_err(|source| {
+        warn!(%id, ?source, "Failed to deserialize view payload");
+        ProjectionError::CorruptPayload {
+            view_id: id.clone(),
+            source,
+        }
+    })?;
 
-                if let Lifecycle::Live(entity) = lifecycle {
-                    Some((id, entity))
-                } else {
-                    debug!(%id, "Skipping non-live aggregate in view");
-                    None
-                }
-            })
-            .collect()
+    match lifecycle {
+        Lifecycle::Live(entity) => Ok(Some((id, entity))),
+        lifecycle => {
+            debug!(%id, state = lifecycle.label(), "Skipping non-live aggregate in view");
+            Ok(None)
+        }
     }
+}
+
+fn parse_rows<Entity: EventSourced>(
+    rows: Vec<(String, String)>,
+) -> Result<Vec<(Entity::Id, Entity)>, ProjectionError<Entity>>
+where
+    <Entity::Id as FromStr>::Err: Debug,
+{
+    rows.into_iter()
+        .map(|(view_id, payload)| parse_row::<Entity>(view_id, &payload))
+        .filter_map(Result::transpose)
+        .collect()
 }
 
 // TODO: Projection's Repo parameter ideally encodes a
@@ -577,5 +594,110 @@ mod tests {
             ProjectionError::Lifecycle(boxed)
                 if matches!(*boxed, LifecycleError::EventCantOriginate { .. })
         ));
+    }
+
+    mod parse_rows {
+        use super::*;
+
+        fn live_payload(name: &str) -> String {
+            serde_json::to_string(&Lifecycle::Live(TestEntity {
+                name: name.to_string(),
+            }))
+            .unwrap()
+        }
+
+        fn uninitialized_payload() -> String {
+            serde_json::to_string(&Lifecycle::<TestEntity>::Uninitialized).unwrap()
+        }
+
+        fn failed_payload() -> String {
+            serde_json::to_string(&Lifecycle::Failed {
+                error: LifecycleError::EventCantOriginate { event: TestEvent },
+                last_valid_entity: None::<Box<TestEntity>>,
+            })
+            .unwrap()
+        }
+
+        type ParseResult = Result<Vec<(String, TestEntity)>, ProjectionError<TestEntity>>;
+
+        fn parse(rows: Vec<(&str, String)>) -> ParseResult {
+            let rows = rows
+                .into_iter()
+                .map(|(id, payload)| (id.to_string(), payload))
+                .collect();
+
+            parse_rows::<TestEntity>(rows)
+        }
+
+        #[test]
+        fn empty_input_returns_empty() {
+            let result = parse(vec![]).unwrap();
+            assert!(result.is_empty());
+        }
+
+        #[test]
+        fn live_entities_are_returned() {
+            let result = parse(vec![
+                ("id-1", live_payload("alice")),
+                ("id-2", live_payload("bob")),
+            ])
+            .unwrap();
+
+            assert_eq!(result.len(), 2);
+            assert_eq!(result[0].0, "id-1");
+            assert_eq!(result[0].1.name, "alice");
+            assert_eq!(result[1].0, "id-2");
+            assert_eq!(result[1].1.name, "bob");
+        }
+
+        #[test]
+        fn uninitialized_entities_are_skipped() {
+            let result = parse(vec![
+                ("id-1", live_payload("alice")),
+                ("id-2", uninitialized_payload()),
+            ])
+            .unwrap();
+
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].0, "id-1");
+        }
+
+        #[test]
+        fn failed_entities_are_skipped() {
+            let result = parse(vec![
+                ("id-1", live_payload("alice")),
+                ("id-2", failed_payload()),
+            ])
+            .unwrap();
+
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].0, "id-1");
+        }
+
+        #[test]
+        fn corrupt_payload_returns_typed_error_with_parsed_id() {
+            let result = parse(vec![("id-1", "not valid json".to_string())]);
+
+            match result {
+                Err(ProjectionError::CorruptPayload { view_id, source: _ }) => {
+                    assert_eq!(view_id, "id-1");
+                }
+                other => panic!("expected CorruptPayload, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn corrupt_payload_does_not_silently_drop() {
+            let result = parse(vec![
+                ("id-1", live_payload("alice")),
+                ("id-2", "{broken".to_string()),
+                ("id-3", live_payload("charlie")),
+            ]);
+
+            assert!(
+                result.is_err(),
+                "corrupt row should fail the entire batch, not silently drop"
+            );
+        }
     }
 }
