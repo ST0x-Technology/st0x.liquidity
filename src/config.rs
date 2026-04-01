@@ -552,6 +552,15 @@ impl Ctx {
             });
         }
 
+        let travel_rule = config
+            .broker
+            .as_ref()
+            .map(|broker_config| &broker_config.travel_rule);
+
+        if matches!(broker, BrokerCtx::AlpacaBrokerApi(_)) && travel_rule.is_none() {
+            return Err(CtxError::MissingTravelRule);
+        }
+
         Ok(Self {
             database_url: config.database_url,
             log_level,
@@ -739,6 +748,11 @@ pub enum CtxError {
     MissingEquityVaultId { symbol: Symbol },
     #[error("{field} polling interval must be non-zero")]
     ZeroPollingInterval { field: &'static str },
+    #[error(
+        "[broker.travel_rule] is required when using Alpaca Broker API \
+         -- Alpaca rejects whitelist requests without it since 2026-03-27"
+    )]
+    MissingTravelRule,
     #[error("Float comparison failed during config validation: {0}")]
     FloatComparison(#[from] rain_math_float::FloatError),
 }
@@ -775,6 +789,7 @@ impl CtxError {
             Self::ZeroPollingInterval { .. } => "zero polling interval",
             Self::FloatComparison(_) => "float comparison failed",
             Self::InvalidTravelRule { .. } => "invalid travel rule config",
+            Self::MissingTravelRule => "missing travel rule config",
         }
     }
 }
@@ -870,6 +885,27 @@ pub(crate) mod tests {
         )
         .unwrap();
         file
+    }
+
+    /// Minimal config with `[broker.travel_rule]` included, for tests
+    /// that use Alpaca Broker API secrets (which now require travel rule
+    /// at startup).
+    fn alpaca_config_toml() -> NamedTempFile {
+        toml_file(
+            r#"
+            database_url = ":memory:"
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            deployment_block = 1
+
+            [broker.travel_rule]
+            beneficiary_entity_name = "Test Entity"
+        "#,
+        )
     }
 
     fn dry_run_secrets_toml() -> NamedTempFile {
@@ -1591,7 +1627,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn alpaca_broker_api_executor_uses_dollar_threshold() {
-        let config = minimal_config_toml();
+        let config = alpaca_config_toml();
         let secrets = toml_file(
             r#"
             [evm]
@@ -1610,6 +1646,32 @@ pub(crate) mod tests {
             .unwrap();
         let expected = ExecutionThreshold::dollar_value(Usdc::new(float!(2))).unwrap();
         assert_eq!(ctx.execution_threshold, expected);
+    }
+
+    #[tokio::test]
+    async fn alpaca_broker_without_travel_rule_fails_at_startup() {
+        let config = minimal_config_toml();
+        let secrets = toml_file(
+            r#"
+            [evm]
+            ws_rpc_url = "ws://localhost:8545"
+
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+        "#,
+        );
+
+        let err = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, CtxError::MissingTravelRule),
+            "Expected MissingTravelRule, got: {err:?}"
+        );
     }
 
     #[test]

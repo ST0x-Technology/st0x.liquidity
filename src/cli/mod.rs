@@ -18,6 +18,7 @@ use tracing::{info, warn};
 
 use rain_math_float::Float;
 use st0x_evm::OpenChainErrorRegistry;
+use st0x_execution::alpaca_broker_api::AlpacaLimitPrice;
 use st0x_execution::{AlpacaAccountId, Direction, FractionalShares, Positive, Symbol, TimeInForce};
 use st0x_finance::Usdc;
 
@@ -83,6 +84,12 @@ pub enum Commands {
         /// Time-in-force for the order (day, market-on-close)
         #[arg(long = "time-in-force")]
         time_in_force: Option<TimeInForce>,
+        /// Limit price for a manual Alpaca Broker API limit order
+        #[arg(long = "limit-price")]
+        limit_price: Option<AlpacaLimitPrice>,
+        /// Submit the limit order as extended-hours eligible
+        #[arg(long = "extended-hours", requires = "limit_price")]
+        extended_hours: bool,
     },
     /// Sell shares of a stock
     Sell {
@@ -95,6 +102,12 @@ pub enum Commands {
         /// Time-in-force for the order (day, market-on-close)
         #[arg(long = "time-in-force")]
         time_in_force: Option<TimeInForce>,
+        /// Limit price for a manual Alpaca Broker API limit order
+        #[arg(long = "limit-price")]
+        limit_price: Option<AlpacaLimitPrice>,
+        /// Submit the limit order as extended-hours eligible
+        #[arg(long = "extended-hours", requires = "limit_price")]
+        extended_hours: bool,
     },
     /// Process a transaction hash to execute opposite-side trade
     ProcessTx {
@@ -131,6 +144,16 @@ pub enum Commands {
         quantity: Positive<FractionalShares>,
     },
 
+    /// Unwrap wrapped ERC-4626 equity shares into the underlying tokenized equity
+    UnwrapEquity {
+        /// Stock symbol (e.g., AAPL, TSLA)
+        #[arg(short = 's', long = "symbol")]
+        symbol: Symbol,
+        /// Number of wrapped shares to unwrap (must be positive)
+        #[arg(short = 'q', long = "quantity", value_parser = parse_positive_shares)]
+        quantity: Positive<FractionalShares>,
+    },
+
     /// Transfer USDC between trading venues (Raindex <-> Alpaca)
     ///
     /// Requires Alpaca broker and rebalancing environment variables.
@@ -159,13 +182,13 @@ pub enum Commands {
     ///
     /// Initiates a withdrawal from Alpaca's crypto wallet to a specified address.
     /// The destination address must be whitelisted and approved in Alpaca.
-    /// Default destination is your configured sender wallet.
+    /// Omit --to to list available whitelisted addresses.
     AlpacaWithdraw {
         /// Amount of USDC to withdraw
         #[arg(short = 'a', long = "amount")]
         amount: Usdc,
 
-        /// Destination address (defaults to SENDER_WALLET from env)
+        /// Destination address (must be whitelisted; omit to list available)
         #[arg(short = 't', long = "to")]
         to_address: Option<Address>,
     },
@@ -216,7 +239,8 @@ pub enum Commands {
     /// Deposit tokens into a Raindex vault
     ///
     /// This command deposits ERC20 tokens from your wallet into a Raindex OrderBook vault.
-    /// It handles ERC20 approval and the vault deposit in sequence.
+    /// It handles ERC20 approval and the vault deposit in sequence, resolving
+    /// token decimals from onchain metadata.
     VaultDeposit {
         /// Amount of tokens to deposit (human-readable, e.g., 100 for 100 tokens)
         #[arg(short = 'a', long = "amount", value_parser = parse_float)]
@@ -229,16 +253,32 @@ pub enum Commands {
         /// Vault ID
         #[arg(short = 'v', long = "vault-id")]
         vault_id: B256,
-
-        /// Token decimals (e.g., 6 for USDC, 18 for most ERC20s)
-        #[arg(short = 'd', long = "decimals")]
-        decimals: u8,
     },
 
-    /// Withdraw USDC from a Raindex vault
+    /// Withdraw tokens from a Raindex vault
     ///
-    /// This command withdraws USDC from a Raindex OrderBook vault to your wallet.
+    /// This command withdraws ERC20 tokens from a Raindex OrderBook vault to
+    /// your wallet, resolving token decimals from onchain metadata.
     VaultWithdraw {
+        /// Amount of tokens to withdraw (human-readable, e.g., 100 for 100 tokens)
+        #[arg(short = 'a', long = "amount", value_parser = parse_float)]
+        amount: Float,
+
+        /// Token contract address
+        #[arg(short = 't', long = "token")]
+        token: Address,
+
+        /// Vault ID
+        #[arg(short = 'v', long = "vault-id")]
+        vault_id: B256,
+    },
+
+    /// Withdraw USDC from the configured Raindex cash vault
+    ///
+    /// This preserves the existing USDC-specific operator flow by resolving
+    /// `assets.cash.vault_id` from config and forwarding into the generic
+    /// vault withdrawal implementation.
+    VaultWithdrawUsdc {
         /// Amount of USDC to withdraw
         #[arg(short = 'a', long = "amount")]
         amount: Usdc,
@@ -400,10 +440,7 @@ pub async fn run_command(ctx: Ctx, command: Commands) -> anyhow::Result<()> {
 }
 
 async fn execute_order<W: Write>(
-    symbol: Symbol,
-    quantity: Positive<FractionalShares>,
-    direction: Direction,
-    time_in_force: Option<TimeInForce>,
+    request: trading::CliOrderRequest,
     ctx: &Ctx,
     pool: &SqlitePool,
     stdout: &mut W,
@@ -413,8 +450,11 @@ async fn execute_order<W: Write>(
         BrokerCtx::AlpacaTradingApi(_) | BrokerCtx::AlpacaBrokerApi(_) | BrokerCtx::DryRun => false,
     };
 
-    if broker_rejects_fractional && quantity.to_whole_shares().is_err() {
-        warn!(quantity = %quantity, "Rejecting fractional CLI order for Schwab");
+    if broker_rejects_fractional && request.shares.to_whole_shares().is_err() {
+        warn!(
+            quantity = %request.shares,
+            "Rejecting fractional CLI order for Schwab"
+        );
         writeln!(
             stdout,
             "❌ Schwab does not accept fractional shares for buy/sell orders"
@@ -422,17 +462,11 @@ async fn execute_order<W: Write>(
         anyhow::bail!("Schwab does not accept fractional shares for buy/sell orders");
     }
 
-    info!("Processing {direction:?} order: symbol={symbol}, quantity={quantity}");
-    trading::execute_order_with_writers(
-        symbol,
-        quantity,
-        direction,
-        time_in_force,
-        ctx,
-        pool,
-        stdout,
-    )
-    .await
+    info!(
+        "Processing {:?} order: symbol={}, quantity={}",
+        request.direction, request.symbol, request.shares
+    );
+    trading::execute_order_with_writers(request, ctx, pool, stdout).await
 }
 
 /// Commands that don't require a WebSocket provider.
@@ -441,11 +475,15 @@ enum SimpleCommand {
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
         time_in_force: Option<TimeInForce>,
+        limit_price: Option<AlpacaLimitPrice>,
+        extended_hours: bool,
     },
     Sell {
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
         time_in_force: Option<TimeInForce>,
+        limit_price: Option<AlpacaLimitPrice>,
+        extended_hours: bool,
     },
     Auth,
     TransferEquity {
@@ -454,6 +492,10 @@ enum SimpleCommand {
         quantity: FractionalShares,
     },
     WrapEquity {
+        symbol: Symbol,
+        quantity: Positive<FractionalShares>,
+    },
+    UnwrapEquity {
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
     },
@@ -484,6 +526,19 @@ enum SimpleCommand {
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
     },
+    VaultDeposit {
+        amount: Float,
+        token: Address,
+        vault_id: B256,
+    },
+    VaultWithdraw {
+        amount: Float,
+        token: Address,
+        vault_id: B256,
+    },
+    VaultWithdrawUsdc {
+        amount: Usdc,
+    },
     OrderStatus {
         order_id: String,
     },
@@ -496,15 +551,6 @@ enum ProviderCommand {
     },
     TransferUsdc {
         direction: TransferDirection,
-        amount: Usdc,
-    },
-    VaultDeposit {
-        amount: Float,
-        token: Address,
-        vault_id: B256,
-        decimals: u8,
-    },
-    VaultWithdraw {
         amount: Usdc,
     },
     CctpBridge {
@@ -557,19 +603,27 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             symbol,
             quantity,
             time_in_force,
+            limit_price,
+            extended_hours,
         } => Ok(SimpleCommand::Buy {
             symbol,
             quantity,
             time_in_force,
+            limit_price,
+            extended_hours,
         }),
         Commands::Sell {
             symbol,
             quantity,
             time_in_force,
+            limit_price,
+            extended_hours,
         } => Ok(SimpleCommand::Sell {
             symbol,
             quantity,
             time_in_force,
+            limit_price,
+            extended_hours,
         }),
         Commands::Auth => Ok(SimpleCommand::Auth),
         Commands::TransferEquity {
@@ -583,6 +637,9 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
         }),
         Commands::WrapEquity { symbol, quantity } => {
             Ok(SimpleCommand::WrapEquity { symbol, quantity })
+        }
+        Commands::UnwrapEquity { symbol, quantity } => {
+            Ok(SimpleCommand::UnwrapEquity { symbol, quantity })
         }
         Commands::AlpacaDeposit { amount } => Ok(SimpleCommand::AlpacaDeposit { amount }),
         Commands::AlpacaWithdraw { amount, to_address } => {
@@ -616,14 +673,21 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             amount,
             token,
             vault_id,
-            decimals,
-        } => Err(ProviderCommand::VaultDeposit {
+        } => Ok(SimpleCommand::VaultDeposit {
             amount,
             token,
             vault_id,
-            decimals,
         }),
-        Commands::VaultWithdraw { amount } => Err(ProviderCommand::VaultWithdraw { amount }),
+        Commands::VaultWithdraw {
+            amount,
+            token,
+            vault_id,
+        } => Ok(SimpleCommand::VaultWithdraw {
+            amount,
+            token,
+            vault_id,
+        }),
+        Commands::VaultWithdrawUsdc { amount } => Ok(SimpleCommand::VaultWithdrawUsdc { amount }),
         Commands::CctpBridge { amount, all, from } => {
             Err(ProviderCommand::CctpBridge { amount, all, from })
         }
@@ -670,33 +734,43 @@ async fn run_simple_command<W: Write>(
             symbol,
             quantity,
             time_in_force,
+            limit_price,
+            extended_hours,
         } => {
-            execute_order(
+            let request = trading::CliOrderRequest::from_cli_args(
                 symbol,
                 quantity,
                 Direction::Buy,
                 time_in_force,
-                ctx,
-                pool,
-                stdout,
+                limit_price,
+                extended_hours,
             )
-            .await
+            .map_err(|error| {
+                let _ = writeln!(stdout, "❌ Failed to place order: {error}");
+                error
+            })?;
+            execute_order(request, ctx, pool, stdout).await
         }
         SimpleCommand::Sell {
             symbol,
             quantity,
             time_in_force,
+            limit_price,
+            extended_hours,
         } => {
-            execute_order(
+            let request = trading::CliOrderRequest::from_cli_args(
                 symbol,
                 quantity,
                 Direction::Sell,
                 time_in_force,
-                ctx,
-                pool,
-                stdout,
+                limit_price,
+                extended_hours,
             )
-            .await
+            .map_err(|error| {
+                let _ = writeln!(stdout, "❌ Failed to place order: {error}");
+                error
+            })?;
+            execute_order(request, ctx, pool, stdout).await
         }
         SimpleCommand::Auth => auth::auth_command(stdout, &ctx.broker, pool).await,
         SimpleCommand::TransferEquity {
@@ -709,6 +783,9 @@ async fn run_simple_command<W: Write>(
         }
         SimpleCommand::WrapEquity { symbol, quantity } => {
             wrapper::wrap_equity_command(stdout, symbol, quantity, ctx).await
+        }
+        SimpleCommand::UnwrapEquity { symbol, quantity } => {
+            wrapper::unwrap_equity_command(stdout, symbol, quantity, ctx).await
         }
         SimpleCommand::AlpacaDeposit { amount } => {
             alpaca_wallet::alpaca_deposit_command::<OpenChainErrorRegistry, _>(stdout, amount, ctx)
@@ -745,6 +822,33 @@ async fn run_simple_command<W: Write>(
         } => {
             alpaca_wallet::alpaca_journal_command(stdout, destination, symbol, quantity, ctx).await
         }
+        SimpleCommand::VaultDeposit {
+            amount,
+            token,
+            vault_id,
+        } => {
+            let deposit = vault::Deposit {
+                amount,
+                token,
+                vault_id,
+            };
+            vault::vault_deposit_command(stdout, deposit, ctx, pool).await
+        }
+        SimpleCommand::VaultWithdraw {
+            amount,
+            token,
+            vault_id,
+        } => {
+            let withdraw = vault::Withdraw {
+                amount,
+                token,
+                vault_id,
+            };
+            vault::vault_withdraw_command(stdout, withdraw, ctx, pool).await
+        }
+        SimpleCommand::VaultWithdrawUsdc { amount } => {
+            vault::vault_withdraw_usdc_command(stdout, amount, ctx, pool).await
+        }
         SimpleCommand::OrderStatus { order_id } => {
             trading::order_status_command(stdout, &order_id, ctx, pool).await
         }
@@ -779,23 +883,6 @@ async fn run_provider_command<W: Write>(
         }
         ProviderCommand::TransferUsdc { direction, amount } => {
             rebalancing::transfer_usdc_command(stdout, direction, amount, ctx, pool).await
-        }
-        ProviderCommand::VaultDeposit {
-            amount,
-            token,
-            vault_id,
-            decimals,
-        } => {
-            let deposit = vault::Deposit {
-                amount,
-                token,
-                vault_id,
-                decimals,
-            };
-            vault::vault_deposit_command(stdout, deposit, ctx, pool).await
-        }
-        ProviderCommand::VaultWithdraw { amount } => {
-            vault::vault_withdraw_command(stdout, amount, ctx, pool).await
         }
         ProviderCommand::CctpBridge { amount, all, from } => {
             cctp::cctp_bridge_command::<OpenChainErrorRegistry, _>(stdout, amount, all, from, ctx)
@@ -833,7 +920,7 @@ async fn run_provider_command<W: Write>(
 #[cfg(test)]
 mod tests {
     use alloy::hex;
-    use alloy::primitives::{FixedBytes, IntoLogData, U256, address, fixed_bytes};
+    use alloy::primitives::{FixedBytes, IntoLogData, U256, address, b256, fixed_bytes};
     use alloy::providers::Provider;
     use alloy::providers::mock::Asserter;
     use alloy::sol_types::{SolCall, SolEvent};
@@ -847,8 +934,10 @@ mod tests {
 
     use st0x_event_sorcery::{Column, StoreBuilder};
     use st0x_execution::{
-        Direction, FractionalShares, OrderStatus, Positive, SchwabError, SchwabTokens,
+        Direction, FractionalShares, OrderStatus, Positive, SchwabError, SchwabTokens, Usd,
     };
+    use st0x_finance::Usdc;
+    use st0x_float_macro::float;
 
     use super::*;
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
@@ -871,6 +960,50 @@ mod tests {
             BrokerCtx::Schwab(auth) => auth,
             _ => panic!("Expected Schwab broker ctx in tests"),
         }
+    }
+
+    fn cli_order_request(
+        symbol: Symbol,
+        shares: Positive<FractionalShares>,
+        direction: Direction,
+        time_in_force: Option<TimeInForce>,
+        limit_price: Option<AlpacaLimitPrice>,
+        extended_hours: bool,
+    ) -> anyhow::Result<trading::CliOrderRequest> {
+        trading::CliOrderRequest::from_cli_args(
+            symbol,
+            shares,
+            direction,
+            time_in_force,
+            limit_price,
+            extended_hours,
+        )
+    }
+
+    macro_rules! execute_cli_order_with_writers {
+        (
+            $symbol:expr,
+            $shares:expr,
+            $direction:expr,
+            $time_in_force:expr,
+            $limit_price:expr,
+            $extended_hours:expr,
+            $ctx:expr,
+            $pool:expr,
+            $stdout:expr $(,)?
+        ) => {
+            async {
+                let request = cli_order_request(
+                    $symbol,
+                    $shares,
+                    $direction,
+                    $time_in_force,
+                    $limit_price,
+                    $extended_hours,
+                )?;
+                trading::execute_order_with_writers(request, $ctx, $pool, $stdout).await
+            }
+        };
     }
 
     #[tokio::test]
@@ -901,11 +1034,13 @@ mod tests {
                 .header("location", "/trader/v1/accounts/ABC123DEF456/orders/12345");
         });
 
-        trading::execute_order_with_writers(
+        execute_cli_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -945,11 +1080,13 @@ mod tests {
                 .header("location", "/trader/v1/accounts/ABC123DEF456/orders/12345");
         });
 
-        trading::execute_order_with_writers(
+        execute_cli_order_with_writers!(
             Symbol::new("TSLA").unwrap(),
             positive_shares("50"),
             Direction::Sell,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -990,11 +1127,13 @@ mod tests {
                 }));
         });
 
-        trading::execute_order_with_writers(
+        execute_cli_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -1022,11 +1161,13 @@ mod tests {
             .await
             .unwrap();
 
-        let result = trading::execute_order_with_writers(
+        let result = execute_cli_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -1092,11 +1233,13 @@ mod tests {
                 .header("location", "/trader/v1/accounts/ABC123DEF456/orders/12345");
         });
 
-        let result = trading::execute_order_with_writers(
+        let result = execute_cli_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -1146,11 +1289,13 @@ mod tests {
                 .header("location", "/trader/v1/accounts/ABC123DEF456/orders/12345");
         });
 
-        trading::execute_order_with_writers(
+        execute_cli_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -1187,11 +1332,13 @@ mod tests {
         });
 
         let mut stdout_buffer = Vec::new();
-        trading::execute_order_with_writers(
+        execute_cli_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut stdout_buffer,
@@ -1235,11 +1382,13 @@ mod tests {
         });
 
         let mut stdout_buffer = Vec::new();
-        trading::execute_order_with_writers(
+        execute_cli_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut stdout_buffer,
@@ -1308,6 +1457,38 @@ mod tests {
     }
 
     #[test]
+    fn test_alpaca_limit_price_from_str_rejects_zero() {
+        let error = "0".parse::<AlpacaLimitPrice>().unwrap_err();
+
+        assert_eq!(error.to_string(), "limit price must be positive");
+    }
+
+    #[test]
+    fn test_alpaca_limit_price_from_str_rejects_invalid_precision() {
+        let error = "195.255".parse::<AlpacaLimitPrice>().unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds Alpaca's 2-decimal-place precision"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_buy_command_requires_limit_price_for_extended_hours() {
+        let error =
+            Cli::try_parse_from(["schwab", "buy", "-s", "AAPL", "-q", "1", "--extended-hours"])
+                .unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("--limit-price"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
     fn test_buy_command_rejects_zero_quantity() {
         let error = Cli::try_parse_from(["schwab", "buy", "-s", "AAPL", "-q", "0"]).unwrap_err();
         let message = error.to_string();
@@ -1327,6 +1508,15 @@ mod tests {
     fn test_wrap_equity_command_rejects_zero_quantity() {
         let error =
             Cli::try_parse_from(["schwab", "wrap-equity", "-s", "AAPL", "-q", "0"]).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("positive"), "unexpected error: {message}");
+    }
+
+    #[test]
+    fn test_unwrap_equity_command_rejects_zero_quantity() {
+        let error =
+            Cli::try_parse_from(["schwab", "unwrap-equity", "-s", "AAPL", "-q", "0"]).unwrap_err();
         let message = error.to_string();
 
         assert!(message.contains("positive"), "unexpected error: {message}");
@@ -1641,6 +1831,228 @@ mod tests {
         assert_eq!(quantity, positive_shares("6.15"));
     }
 
+    #[test]
+    fn test_unwrap_equity_command_parses_fractional_quantity() {
+        let cli =
+            Cli::try_parse_from(["schwab", "unwrap-equity", "-s", "SPYM", "-q", "6.15"]).unwrap();
+        let Commands::UnwrapEquity { quantity, .. } = cli.command else {
+            panic!("expected unwrap-equity command");
+        };
+
+        assert_eq!(quantity, positive_shares("6.15"));
+    }
+
+    #[test]
+    fn test_buy_command_parses_limit_price_and_extended_hours() {
+        let cli = Cli::try_parse_from([
+            "schwab",
+            "buy",
+            "-s",
+            "COIN",
+            "-q",
+            "10",
+            "--limit-price",
+            "195.25",
+            "--extended-hours",
+        ])
+        .unwrap();
+        let Commands::Buy {
+            limit_price,
+            extended_hours,
+            ..
+        } = cli.command
+        else {
+            panic!("expected buy command");
+        };
+
+        assert!(extended_hours);
+        assert!(
+            limit_price
+                .unwrap()
+                .as_price()
+                .inner()
+                .eq(&Usd::new(Float::parse("195.25".to_string()).unwrap()))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_vault_withdraw_command_parses_generic_arguments() {
+        let cli = Cli::try_parse_from([
+            "schwab",
+            "vault-withdraw",
+            "-a",
+            "12.5",
+            "-t",
+            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+            "-v",
+            "0x0000000000000000000000000000000000000000000000000000000000000001",
+        ])
+        .unwrap();
+
+        let Commands::VaultWithdraw {
+            amount,
+            token,
+            vault_id,
+        } = cli.command
+        else {
+            panic!("expected generic vault withdraw command");
+        };
+
+        assert!(
+            amount.eq(float!(12.5)).unwrap(),
+            "Expected parsed amount 12.5"
+        );
+        assert_eq!(
+            token,
+            address!("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913")
+        );
+        assert_eq!(
+            vault_id,
+            b256!("0000000000000000000000000000000000000000000000000000000000000001")
+        );
+    }
+
+    #[test]
+    fn test_buy_command_rejects_non_positive_limit_price() {
+        let error = Cli::try_parse_from([
+            "schwab",
+            "buy",
+            "-s",
+            "AAPL",
+            "-q",
+            "1",
+            "--limit-price",
+            "0",
+        ])
+        .unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("limit price must be positive"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn test_sell_command_parses_limit_price_and_extended_hours() {
+        let cli = Cli::try_parse_from([
+            "schwab",
+            "sell",
+            "-s",
+            "COIN",
+            "-q",
+            "10",
+            "--limit-price",
+            "195.25",
+            "--extended-hours",
+        ])
+        .unwrap();
+        let Commands::Sell {
+            limit_price,
+            extended_hours,
+            ..
+        } = cli.command
+        else {
+            panic!("expected sell command");
+        };
+
+        assert!(extended_hours);
+        assert!(
+            limit_price
+                .unwrap()
+                .as_price()
+                .inner()
+                .eq(&Usd::new(Float::parse("195.25".to_string()).unwrap()))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_sell_command_rejects_non_positive_limit_price() {
+        let error = Cli::try_parse_from([
+            "schwab",
+            "sell",
+            "-s",
+            "AAPL",
+            "-q",
+            "1",
+            "--limit-price",
+            "0",
+        ])
+        .unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("limit price must be positive"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn test_sell_command_requires_limit_price_for_extended_hours() {
+        let error = Cli::try_parse_from([
+            "schwab",
+            "sell",
+            "-s",
+            "AAPL",
+            "-q",
+            "1",
+            "--extended-hours",
+        ])
+        .unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("--limit-price"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn test_vault_withdraw_usdc_command_parses_compatibility_arguments() {
+        let cli = Cli::try_parse_from(["schwab", "vault-withdraw-usdc", "-a", "250.25"]).unwrap();
+
+        let Commands::VaultWithdrawUsdc { amount } = cli.command else {
+            panic!("expected USDC compatibility vault withdraw command");
+        };
+
+        assert_eq!(amount, Usdc::new(float!(250.25)));
+    }
+
+    #[test]
+    fn test_vault_commands_use_simple_command_path() {
+        let vault_id = b256!("0000000000000000000000000000000000000000000000000000000000000001");
+
+        let deposit = classify_command(Commands::VaultDeposit {
+            amount: float!(10),
+            token: address!("0x1234567890123456789012345678901234567890"),
+            vault_id,
+        });
+        assert!(
+            matches!(deposit, Ok(SimpleCommand::VaultDeposit { .. })),
+            "vault-deposit should use the simple command path"
+        );
+
+        let withdraw = classify_command(Commands::VaultWithdraw {
+            amount: float!(5),
+            token: address!("0x1234567890123456789012345678901234567890"),
+            vault_id,
+        });
+        assert!(
+            matches!(withdraw, Ok(SimpleCommand::VaultWithdraw { .. })),
+            "vault-withdraw should use the simple command path"
+        );
+
+        let withdraw_usdc = classify_command(Commands::VaultWithdrawUsdc {
+            amount: Usdc::new(float!(25)),
+        });
+        assert!(
+            matches!(withdraw_usdc, Ok(SimpleCommand::VaultWithdrawUsdc { .. })),
+            "vault-withdraw-usdc should use the simple command path"
+        );
+    }
+
     async fn assert_fractional_order_rejected_before_schwab_request(command: Commands) {
         let server = MockServer::start();
         let ctx = create_test_ctx_for_cli(&server, Address::ZERO);
@@ -1672,6 +2084,8 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: positive_shares("6.15"),
             time_in_force: None,
+            limit_price: None,
+            extended_hours: false,
         })
         .await;
     }
@@ -1682,6 +2096,8 @@ mod tests {
             symbol: Symbol::new("TSLA").unwrap(),
             quantity: positive_shares("6.15"),
             time_in_force: None,
+            limit_price: None,
+            extended_hours: false,
         })
         .await;
     }
@@ -1720,6 +2136,8 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: positive_shares("100"),
             time_in_force: None,
+            limit_price: None,
+            extended_hours: false,
         };
 
         let result = run_command_with_writers(ctx, buy_command, &pool, &mut stdout).await;
@@ -1769,6 +2187,8 @@ mod tests {
             symbol: Symbol::new("TSLA").unwrap(),
             quantity: positive_shares("50"),
             time_in_force: None,
+            limit_price: None,
+            extended_hours: false,
         };
 
         let result = run_command_with_writers(ctx, sell_command, &pool, &mut stdout).await;
@@ -1815,11 +2235,13 @@ mod tests {
 
         let mut stdout = Vec::new();
 
-        let result = trading::execute_order_with_writers(
+        let result = execute_cli_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut stdout,
@@ -1890,11 +2312,13 @@ mod tests {
 
         let mut stdout = Vec::new();
 
-        let result = trading::execute_order_with_writers(
+        let result = execute_cli_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut stdout,
@@ -1925,11 +2349,13 @@ mod tests {
 
         let mut stdout = Vec::new();
 
-        let result = trading::execute_order_with_writers(
+        let result = execute_cli_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut stdout,
@@ -1962,11 +2388,13 @@ mod tests {
 
         let mut stdout2 = Vec::new();
 
-        let result2 = trading::execute_order_with_writers(
+        let result2 = execute_cli_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut stdout2,
@@ -1998,11 +2426,13 @@ mod tests {
 
         let mut stdout = Vec::new();
 
-        let result = trading::execute_order_with_writers(
+        let result = execute_cli_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut stdout,
@@ -2089,11 +2519,13 @@ mod tests {
 
         let mut stdout = Vec::new();
 
-        let result = trading::execute_order_with_writers(
+        let result = execute_cli_order_with_writers!(
             Symbol::new("INVALID").unwrap(),
             positive_shares("999999"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut stdout,
@@ -2428,6 +2860,26 @@ mod tests {
             .unwrap_err();
 
         cmd.try_get_matches_from(vec!["cli", "wrap-equity", "-s", "AAPL", "-q", "10.5"])
+            .unwrap();
+    }
+
+    #[test]
+    fn test_unwrap_equity_command_structure() {
+        let cmd = Cli::command();
+
+        cmd.clone()
+            .try_get_matches_from(vec!["cli", "unwrap-equity"])
+            .unwrap_err();
+
+        cmd.clone()
+            .try_get_matches_from(vec!["cli", "unwrap-equity", "-s", "AAPL"])
+            .unwrap_err();
+
+        cmd.clone()
+            .try_get_matches_from(vec!["cli", "unwrap-equity", "-q", "10.5"])
+            .unwrap_err();
+
+        cmd.try_get_matches_from(vec!["cli", "unwrap-equity", "-s", "AAPL", "-q", "10.5"])
             .unwrap();
     }
 

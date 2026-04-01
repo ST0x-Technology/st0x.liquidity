@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
+use st0x_float_macro::float;
+use std::str::FromStr;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -8,7 +10,7 @@ use super::client::AlpacaBrokerApiClient;
 use super::{AlpacaBrokerApiError, TimeInForce};
 use crate::{
     Direction, FractionalShares, MarketOrder, OrderPlacement, OrderStatus, OrderUpdate, Positive,
-    Symbol, deserialize_float_from_number_or_string,
+    Symbol, Usd, deserialize_float_from_number_or_string,
     deserialize_option_float_from_number_or_string, serialize_float_as_string,
 };
 
@@ -51,6 +53,56 @@ pub enum ConversionDirection {
     UsdToUsdc,
 }
 
+#[derive(Debug, Clone)]
+pub struct AlpacaLimitOrder {
+    pub symbol: Symbol,
+    pub shares: Positive<FractionalShares>,
+    pub direction: Direction,
+    pub limit_price: AlpacaLimitPrice,
+    pub extended_hours: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(transparent)]
+pub struct AlpacaLimitPrice(Positive<Usd>);
+
+#[derive(Debug, thiserror::Error)]
+pub enum ParseAlpacaLimitPriceError {
+    #[error(transparent)]
+    Float(#[from] rain_math_float::FloatError),
+
+    #[error("limit price must be positive")]
+    NotPositive,
+
+    #[error(transparent)]
+    Validation(#[from] AlpacaBrokerApiError),
+}
+
+impl AlpacaLimitPrice {
+    pub fn try_new(limit_price: Positive<Usd>) -> Result<Self, AlpacaBrokerApiError> {
+        validate_limit_price_precision(limit_price)?;
+        Ok(Self(limit_price))
+    }
+
+    pub fn as_price(&self) -> &Positive<Usd> {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> Positive<Usd> {
+        self.0
+    }
+}
+
+impl FromStr for AlpacaLimitPrice {
+    type Err = ParseAlpacaLimitPriceError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let price = value.parse::<Usd>()?;
+        let positive_price = Positive::new(price).map_err(|_| Self::Err::NotPositive)?;
+        Self::try_new(positive_price).map_err(Self::Err::from)
+    }
+}
+
 /// Order request for placing market orders.
 ///
 /// The `quantity` field must already be truncated to Alpaca's decimal precision
@@ -64,6 +116,24 @@ pub(super) struct OrderRequest {
     pub side: OrderSide,
     #[serde(rename = "type")]
     pub order_type: &'static str,
+    pub time_in_force: &'static str,
+    pub extended_hours: bool,
+}
+
+/// Order request for placing limit orders.
+///
+/// The `quantity` field must already be truncated to Alpaca's decimal precision
+/// before constructing this struct.
+#[derive(Debug, Serialize)]
+pub(super) struct LimitOrderRequest {
+    #[serde(serialize_with = "serialize_symbol")]
+    pub symbol: Symbol,
+    #[serde(rename = "qty", serialize_with = "serialize_shares_as_string")]
+    pub quantity: Positive<FractionalShares>,
+    pub side: OrderSide,
+    #[serde(rename = "type")]
+    pub order_type: &'static str,
+    pub limit_price: AlpacaLimitPrice,
     pub time_in_force: &'static str,
     pub extended_hours: bool,
 }
@@ -186,6 +256,28 @@ where
     Positive::new(FractionalShares::new(exact)).map_err(serde::de::Error::custom)
 }
 
+fn validate_limit_price_precision(limit_price: Positive<Usd>) -> Result<(), AlpacaBrokerApiError> {
+    let max_decimals = if limit_price.inner().inner().lt(float!(1))? {
+        4
+    } else {
+        2
+    };
+
+    let (_, lossless) = limit_price
+        .inner()
+        .inner()
+        .to_fixed_decimal_lossy(max_decimals)?;
+
+    if !lossless {
+        return Err(AlpacaBrokerApiError::InvalidLimitPricePrecision {
+            limit_price,
+            max_decimals,
+        });
+    }
+
+    Ok(())
+}
+
 pub(super) async fn place_market_order(
     client: &AlpacaBrokerApiClient,
     market_order: MarketOrder,
@@ -196,26 +288,7 @@ pub(super) async fn place_market_order(
         market_order.direction, market_order.shares, market_order.symbol, time_in_force
     );
 
-    // Alpaca supports max 9 decimal places; truncate to avoid rejection.
-    let original = market_order.shares.inner().inner();
-    let truncated_float =
-        crate::truncate_to_decimal_places(original, crate::ALPACA_MAX_DECIMAL_PLACES)?.ok_or(
-            AlpacaBrokerApiError::BelowPrecision {
-                shares: market_order.shares,
-                max_decimals: crate::ALPACA_MAX_DECIMAL_PLACES,
-            },
-        )?;
-
-    if !truncated_float.eq(original)? {
-        warn!(
-            original = %market_order.shares,
-            truncated = %FractionalShares::new(truncated_float),
-            "Truncated order quantity to {} decimal places for Alpaca",
-            crate::ALPACA_MAX_DECIMAL_PLACES,
-        );
-    }
-
-    let placed_shares = Positive::new(FractionalShares::new(truncated_float))?;
+    let placed_shares = truncate_shares_to_alpaca_precision(market_order.shares)?;
 
     let side = match market_order.direction {
         Direction::Buy => OrderSide::Buy,
@@ -239,6 +312,47 @@ pub(super) async fn place_market_order(
         symbol: market_order.symbol,
         shares: placed_shares,
         direction: market_order.direction,
+        placed_at: Utc::now(),
+    })
+}
+
+pub(super) async fn place_limit_order(
+    client: &AlpacaBrokerApiClient,
+    limit_order: AlpacaLimitOrder,
+) -> Result<OrderPlacement<String>, AlpacaBrokerApiError> {
+    debug!(
+        direction = ?limit_order.direction,
+        shares = %limit_order.shares,
+        symbol = %limit_order.symbol,
+        limit_price = ?limit_order.limit_price,
+        extended_hours = limit_order.extended_hours,
+        "Placing Alpaca Broker API limit order"
+    );
+
+    let placed_shares = truncate_shares_to_alpaca_precision(limit_order.shares)?;
+
+    let side = match limit_order.direction {
+        Direction::Buy => OrderSide::Buy,
+        Direction::Sell => OrderSide::Sell,
+    };
+
+    let request = LimitOrderRequest {
+        symbol: limit_order.symbol.clone(),
+        quantity: placed_shares,
+        side,
+        order_type: "limit",
+        limit_price: limit_order.limit_price.clone(),
+        time_in_force: TimeInForce::Day.as_api_str(),
+        extended_hours: limit_order.extended_hours,
+    };
+
+    let response = client.place_limit_order(&request).await?;
+
+    Ok(OrderPlacement {
+        order_id: response.id.to_string(),
+        symbol: limit_order.symbol,
+        shares: placed_shares,
+        direction: limit_order.direction,
         placed_at: Utc::now(),
     })
 }
@@ -308,6 +422,30 @@ fn map_broker_status_to_order_status(status: BrokerOrderStatus) -> OrderStatus {
         | BrokerOrderStatus::Suspended
         | BrokerOrderStatus::Calculated => OrderStatus::Failed,
     }
+}
+
+fn truncate_shares_to_alpaca_precision(
+    shares: Positive<FractionalShares>,
+) -> Result<Positive<FractionalShares>, AlpacaBrokerApiError> {
+    let original = shares.inner().inner();
+    let truncated_float =
+        crate::truncate_to_decimal_places(original, crate::ALPACA_MAX_DECIMAL_PLACES)?.ok_or(
+            AlpacaBrokerApiError::BelowPrecision {
+                shares,
+                max_decimals: crate::ALPACA_MAX_DECIMAL_PLACES,
+            },
+        )?;
+
+    if !truncated_float.eq(original)? {
+        warn!(
+            original = %shares,
+            truncated = %FractionalShares::new(truncated_float),
+            "Truncated order quantity to {} decimal places for Alpaca",
+            crate::ALPACA_MAX_DECIMAL_PLACES,
+        );
+    }
+
+    Ok(Positive::new(FractionalShares::new(truncated_float))?)
 }
 
 /// Convert USDC to/from USD on Alpaca.
@@ -493,6 +631,185 @@ mod tests {
         assert_eq!(placement.symbol.to_string(), "TSLA");
         assert_eq!(placement.shares.inner(), FractionalShares::new(float!(50)));
         assert_eq!(placement.direction, Direction::Sell);
+    }
+
+    #[tokio::test]
+    async fn test_place_limit_order_buy_success() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
+                .json_body(json!({
+                    "symbol": "AAPL",
+                    "qty": "100",
+                    "side": "buy",
+                    "type": "limit",
+                    "limit_price": "195.25",
+                    "time_in_force": "day",
+                    "extended_hours": false
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "symbol": "AAPL",
+                    "qty": "100",
+                    "side": "buy",
+                    "status": "new",
+                    "filled_avg_price": null
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let limit_order = AlpacaLimitOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(100))).unwrap(),
+            direction: Direction::Buy,
+            limit_price: AlpacaLimitPrice::try_new(
+                Positive::new(Usd::new(float!(195.25))).unwrap(),
+            )
+            .unwrap(),
+            extended_hours: false,
+        };
+
+        let placement = place_limit_order(&client, limit_order).await.unwrap();
+
+        mock.assert();
+        assert_eq!(placement.order_id, "904837e3-3b76-47ec-b432-046db621571b");
+        assert_eq!(placement.symbol.to_string(), "AAPL");
+        assert_eq!(placement.shares.inner(), FractionalShares::new(float!(100)));
+        assert_eq!(placement.direction, Direction::Buy);
+    }
+
+    #[tokio::test]
+    async fn test_place_limit_order_sell_success_with_extended_hours() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
+                .json_body(json!({
+                    "symbol": "TSLA",
+                    "qty": "50",
+                    "side": "sell",
+                    "type": "limit",
+                    "limit_price": "210",
+                    "time_in_force": "day",
+                    "extended_hours": true
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "symbol": "TSLA",
+                    "qty": "50",
+                    "side": "sell",
+                    "status": "new",
+                    "filled_avg_price": null
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let limit_order = AlpacaLimitOrder {
+            symbol: Symbol::new("TSLA").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(50))).unwrap(),
+            direction: Direction::Sell,
+            limit_price: AlpacaLimitPrice::try_new(Positive::new(Usd::new(float!(210))).unwrap())
+                .unwrap(),
+            extended_hours: true,
+        };
+
+        let placement = place_limit_order(&client, limit_order).await.unwrap();
+
+        mock.assert();
+        assert_eq!(placement.order_id, "61e7b016-9c91-4a97-b912-615c9d365c9d");
+        assert_eq!(placement.symbol.to_string(), "TSLA");
+        assert_eq!(placement.shares.inner(), FractionalShares::new(float!(50)));
+        assert_eq!(placement.direction, Direction::Sell);
+    }
+
+    #[test]
+    fn test_alpaca_limit_price_rejects_more_than_two_decimals_at_or_above_one() {
+        let error = AlpacaLimitPrice::try_new(Positive::new(Usd::new(float!(195.255))).unwrap())
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AlpacaBrokerApiError::InvalidLimitPricePrecision {
+                    limit_price,
+                    max_decimals: 2,
+                } if limit_price == Positive::new(Usd::new(float!(195.255))).unwrap()
+            ),
+            "Expected InvalidLimitPricePrecision error, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn test_alpaca_limit_price_rejects_more_than_four_decimals_below_one() {
+        let error = AlpacaLimitPrice::try_new(Positive::new(Usd::new(float!(0.12345))).unwrap())
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AlpacaBrokerApiError::InvalidLimitPricePrecision {
+                    limit_price,
+                    max_decimals: 4,
+                } if limit_price == Positive::new(Usd::new(float!(0.12345))).unwrap()
+            ),
+            "Expected InvalidLimitPricePrecision error, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_place_limit_order_accepts_price_with_four_decimals_below_one() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
+                .json_body(json!({
+                    "symbol": "AAPL",
+                    "qty": "1",
+                    "side": "buy",
+                    "type": "limit",
+                    "limit_price": "0.1234",
+                    "time_in_force": "day",
+                    "extended_hours": false
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "symbol": "AAPL",
+                    "qty": "1",
+                    "side": "buy",
+                    "status": "new",
+                    "filled_avg_price": null
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let limit_order = AlpacaLimitOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            direction: Direction::Buy,
+            limit_price: AlpacaLimitPrice::try_new(
+                Positive::new(Usd::new(float!(0.1234))).unwrap(),
+            )
+            .unwrap(),
+            extended_hours: false,
+        };
+
+        let placement = place_limit_order(&client, limit_order).await.unwrap();
+
+        mock.assert();
+        assert_eq!(placement.order_id, "904837e3-3b76-47ec-b432-046db621571b");
     }
 
     #[tokio::test]
@@ -784,6 +1101,95 @@ mod tests {
         let err = place_market_order(&client, market_order, TimeInForce::Day)
             .await
             .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                AlpacaBrokerApiError::BelowPrecision {
+                    max_decimals,
+                    ..
+                } if max_decimals == crate::ALPACA_MAX_DECIMAL_PLACES
+            ),
+            "Expected BelowPrecision error, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncates_limit_order_quantity_to_9() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
+                .json_body(json!({
+                    "symbol": "RKLB",
+                    "qty": "0.996350331",
+                    "side": "sell",
+                    "type": "limit",
+                    "limit_price": "17.45",
+                    "time_in_force": "day",
+                    "extended_hours": false
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "symbol": "RKLB",
+                    "qty": "0.996350331",
+                    "side": "sell",
+                    "status": "new",
+                    "filled_avg_price": null
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let limit_order = AlpacaLimitOrder {
+            symbol: Symbol::new("RKLB").unwrap(),
+            shares: Positive::new(FractionalShares::new(
+                Float::parse("0.996350331351928059".to_string()).unwrap(),
+            ))
+            .unwrap(),
+            direction: Direction::Sell,
+            limit_price: AlpacaLimitPrice::try_new(Positive::new(Usd::new(float!(17.45))).unwrap())
+                .unwrap(),
+            extended_hours: false,
+        };
+
+        let placement = place_limit_order(&client, limit_order).await.unwrap();
+
+        mock.assert();
+        assert!(
+            placement
+                .shares
+                .inner()
+                .inner()
+                .eq(float!(0.996350331))
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn tiny_limit_order_shares_below_precision_returns_error() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        let limit_order = AlpacaLimitOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(
+                Float::parse("0.0000000001".to_string()).unwrap(),
+            ))
+            .unwrap(),
+            direction: Direction::Buy,
+            limit_price: AlpacaLimitPrice::try_new(
+                Positive::new(Usd::new(float!(195.25))).unwrap(),
+            )
+            .unwrap(),
+            extended_hours: false,
+        };
+
+        let err = place_limit_order(&client, limit_order).await.unwrap_err();
 
         assert!(
             matches!(

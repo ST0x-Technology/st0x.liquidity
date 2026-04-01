@@ -132,7 +132,11 @@ edition = "2024"
 rust-version = "1.89"
 
 [features]
-default = []
+default = ["all-wallets"]
+all-wallets = ["wallet-private-key", "wallet-turnkey"]
+wallet-turnkey = ["st0x-evm/turnkey"]
+wallet-private-key = ["st0x-evm/local-signer"]
+
 test-support = ["st0x-bridge/test-support", "wallet-private-key"]
 mock = [
   "st0x-execution/mock",
@@ -140,8 +144,6 @@ mock = [
   "dep:httpmock",
   "wallet-private-key",
 ]
-wallet-turnkey = ["st0x-evm/turnkey"]
-wallet-private-key = ["st0x-evm/local-signer"]
 
 [dependencies]
 aes-gcm.workspace = true

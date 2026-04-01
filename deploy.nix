@@ -6,6 +6,7 @@ let
   profileBase = "/nix/var/nix/profiles/per-service";
 
   st0xPackage = self.packages.${system}.st0x-liquidity;
+  dashboardPackage = self.packages.${system}.st0x-dashboard;
 
   rage = "/run/current-system/sw/bin/rage";
   hostKey = "/etc/ssh/ssh_host_ed25519_key";
@@ -16,15 +17,17 @@ let
     (builtins.filter (n: !services.${n}.enabled)
       (builtins.attrNames services)));
 
-  # Decrypts secrets and restarts service atomically
+  # Links latest config, decrypts secrets, and restarts service atomically
   mkServiceProfile = name:
     let
       cfg = services.${name};
+      configFile = ./config/${name}.toml;
       secretsFile = ./secret/${cfg.encryptedSecret};
     in activate.custom st0xPackage (builtins.concatStringsSep " && " [
       "systemctl stop ${name} || true"
       "rm -f ${cfg.markerFile}"
       "mkdir -p /run/st0x"
+      "ln -sf ${configFile} ${cfg.configPath}"
       "${rage} -d -i ${hostKey} ${secretsFile} > ${cfg.decryptedSecretPath}"
       "chown root:st0x ${cfg.decryptedSecretPath}"
       "chmod 0640 ${cfg.decryptedSecretPath}"
@@ -44,10 +47,15 @@ in {
       sshUser = "root";
       user = "root";
 
-      profilesOrder = [ "system" ] ++ enabledServices;
+      profilesOrder = [ "system" "dashboard" ] ++ enabledServices;
 
       profiles = {
         system.path = activate.nixos self.nixosConfigurations.st0x-liquidity;
+
+        dashboard = {
+          path = activate.custom dashboardPackage "systemctl reload nginx";
+          profilePath = "${profileBase}/dashboard";
+        };
       } // builtins.listToAttrs (map (name: {
         inherit name;
         value = mkProfile name;
@@ -97,44 +105,38 @@ in {
       '';
 
       deployFlags = if localSystem == "x86_64-linux" then
-        ""
+        "--debug-logs --skip-checks"
       else
-        "--skip-checks --remote-build";
+        "--debug-logs --skip-checks --remote-build";
+
+      nixFlags =
+        "--impure --accept-flake-config --extra-experimental-features 'nix-command flakes'";
+
+      mkDeployScript = name:
+        { prelude ? "", target }:
+        pkgs.writeShellApplication {
+          inherit name;
+          runtimeInputs = deployInputs;
+          text = ''
+            ${deployPreamble}
+            ${prelude}
+            deploy ${deployFlags} ''${ssh_flag:+"$ssh_flag"} ${target} \
+              -- ${nixFlags} "$@"
+          '';
+        };
 
     in {
-      deployNixos = pkgs.writeShellApplication {
-        name = "deploy-nixos";
-        runtimeInputs = deployInputs;
-        text = ''
-          ${deployPreamble}
-          deploy ${deployFlags} ''${ssh_flag:+"$ssh_flag"} .#st0x-liquidity.system \
-            -- --impure --accept-flake-config \
-            --extra-experimental-features 'nix-command flakes' "$@"
-        '';
-      };
+      deployNixos =
+        mkDeployScript "deploy-nixos" { target = ".#st0x-liquidity.system"; };
 
-      deployService = pkgs.writeShellApplication {
-        name = "deploy-service";
-        runtimeInputs = deployInputs;
-        text = ''
-          ${deployPreamble}
+      deployService = mkDeployScript "deploy-service" {
+        prelude = ''
           profile="''${1:?usage: deploy-service <profile>}"
           shift
-          deploy ${deployFlags} ''${ssh_flag:+"$ssh_flag"} ".#st0x-liquidity.$profile" \
-            -- --impure --accept-flake-config \
-            --extra-experimental-features 'nix-command flakes' "$@"
         '';
+        target = ''.#st0x-liquidity."$profile"'';
       };
 
-      deployAll = pkgs.writeShellApplication {
-        name = "deploy-all";
-        runtimeInputs = deployInputs;
-        text = ''
-          ${deployPreamble}
-          deploy ${deployFlags} ''${ssh_flag:+"$ssh_flag"} .#st0x-liquidity \
-            -- --impure --accept-flake-config \
-            --extra-experimental-features 'nix-command flakes' "$@"
-        '';
-      };
+      deployAll = mkDeployScript "deploy-all" { target = ".#st0x-liquidity"; };
     };
 }

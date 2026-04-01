@@ -15,6 +15,7 @@
 
 use async_trait::async_trait;
 use cqrs_es::AggregateError;
+use cqrs_es::persist::PersistenceError;
 use serde::{Deserialize, Serialize};
 use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
@@ -206,6 +207,8 @@ pub enum ReconcileError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Aggregate(#[from] AggregateError<LifecycleError<SchemaRegistry>>),
+    #[error(transparent)]
+    Persistence(#[from] PersistenceError),
 }
 
 impl From<Never> for ReconcileError {
