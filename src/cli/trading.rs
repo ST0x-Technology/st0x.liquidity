@@ -12,6 +12,7 @@ use tracing::{error, info};
 
 use st0x_event_sorcery::{Store, StoreBuilder};
 use st0x_evm::ReadOnlyEvm;
+use st0x_execution::alpaca_broker_api::{AlpacaLimitOrder, AlpacaLimitPrice};
 use st0x_execution::{
     Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder, MockExecutor,
     MockExecutorCtx, OrderPlacement, OrderState, Positive, Symbol, TimeInForce, TryIntoExecutor,
@@ -58,6 +59,72 @@ pub(super) fn create_order_placer(ctx: &Ctx, pool: &SqlitePool) -> Arc<dyn Order
         ctx: ctx.clone(),
         pool: pool.clone(),
     })
+}
+
+pub(super) enum CliOrderKind {
+    Market {
+        time_in_force: Option<TimeInForce>,
+    },
+    AlpacaLimit {
+        limit_price: AlpacaLimitPrice,
+        extended_hours: bool,
+    },
+}
+
+pub(super) struct CliOrderRequest {
+    pub(super) symbol: Symbol,
+    pub(super) shares: Positive<FractionalShares>,
+    pub(super) direction: Direction,
+    pub(super) kind: CliOrderKind,
+}
+
+impl CliOrderRequest {
+    pub(super) fn from_cli_args(
+        symbol: Symbol,
+        shares: Positive<FractionalShares>,
+        direction: Direction,
+        time_in_force: Option<TimeInForce>,
+        limit_price: Option<AlpacaLimitPrice>,
+        extended_hours: bool,
+    ) -> anyhow::Result<Self> {
+        let kind = if let Some(limit_price) = limit_price {
+            if time_in_force.is_some() {
+                anyhow::bail!("--time-in-force is not supported with --limit-price");
+            }
+
+            CliOrderKind::AlpacaLimit {
+                limit_price,
+                extended_hours,
+            }
+        } else {
+            if extended_hours {
+                anyhow::bail!("--extended-hours requires --limit-price");
+            }
+
+            CliOrderKind::Market { time_in_force }
+        };
+
+        Ok(Self {
+            symbol,
+            shares,
+            direction,
+            kind,
+        })
+    }
+
+    fn limit_price(&self) -> Option<&AlpacaLimitPrice> {
+        match &self.kind {
+            CliOrderKind::Market { .. } => None,
+            CliOrderKind::AlpacaLimit { limit_price, .. } => Some(limit_price),
+        }
+    }
+
+    fn extended_hours(&self) -> bool {
+        match &self.kind {
+            CliOrderKind::Market { .. } => false,
+            CliOrderKind::AlpacaLimit { extended_hours, .. } => *extended_hours,
+        }
+    }
 }
 
 pub(super) async fn order_status_command<W: Write>(
@@ -144,47 +211,147 @@ async fn get_broker_order_status<W: Write>(
 }
 
 pub(super) async fn execute_order_with_writers<W: Write>(
-    symbol: Symbol,
-    shares: Positive<FractionalShares>,
-    direction: Direction,
-    time_in_force: Option<TimeInForce>,
+    request: CliOrderRequest,
     ctx: &Ctx,
     pool: &SqlitePool,
     stdout: &mut W,
 ) -> anyhow::Result<()> {
-    let market_order = MarketOrder {
-        symbol: symbol.clone(),
-        shares,
-        direction,
+    let symbol_display = request.symbol.to_string();
+    let quantity_display = request.shares.to_string();
+
+    info!(
+        symbol = %symbol_display,
+        direction = ?request.direction,
+        quantity = %quantity_display,
+        limit_price = ?request.limit_price(),
+        extended_hours = request.extended_hours(),
+        "Received order request"
+    );
+
+    let execution = match &request.kind {
+        CliOrderKind::AlpacaLimit { .. } => execute_alpaca_limit_order(&request, ctx, stdout).await,
+        CliOrderKind::Market { .. } => execute_market_order(&request, ctx, pool, stdout).await,
     };
 
-    info!("Created order: symbol={symbol}, direction={direction:?}, quantity={shares}");
-
-    match execute_broker_order(ctx, pool, market_order, time_in_force, stdout).await {
+    match execution {
         Ok(placement) => {
-            info!(
-                symbol = %symbol,
-                direction = ?direction,
-                quantity = %shares,
-                order_id = %placement.order_id,
-                "Order placed successfully"
-            );
-            writeln!(stdout, "✅ Order placed successfully")?;
-            writeln!(stdout, "   Symbol: {symbol}")?;
-            writeln!(stdout, "   Action: {direction:?}")?;
-            writeln!(stdout, "   Quantity: {shares}")?;
+            write_order_success(
+                stdout,
+                &placement,
+                request.limit_price(),
+                request.extended_hours(),
+            )?;
         }
         Err(error) => {
             error!(
-                symbol = %symbol,
-                direction = ?direction,
-                quantity = %shares,
+                symbol = %symbol_display,
+                direction = ?request.direction,
+                quantity = %quantity_display,
                 error = ?error,
                 "Failed to place order"
             );
             writeln!(stdout, "❌ Failed to place order: {error}")?;
             return Err(error);
         }
+    }
+
+    Ok(())
+}
+
+async fn execute_market_order<W: Write>(
+    request: &CliOrderRequest,
+    ctx: &Ctx,
+    pool: &SqlitePool,
+    stdout: &mut W,
+) -> anyhow::Result<OrderPlacement<String>> {
+    let time_in_force = match &request.kind {
+        CliOrderKind::Market { time_in_force } => *time_in_force,
+        CliOrderKind::AlpacaLimit { .. } => {
+            anyhow::bail!("internal error: expected market order request")
+        }
+    };
+
+    let market_order = MarketOrder {
+        symbol: request.symbol.clone(),
+        shares: request.shares,
+        direction: request.direction,
+    };
+
+    execute_broker_order(ctx, pool, market_order, time_in_force, stdout).await
+}
+
+async fn execute_alpaca_limit_order<W: Write>(
+    request: &CliOrderRequest,
+    ctx: &Ctx,
+    stdout: &mut W,
+) -> anyhow::Result<OrderPlacement<String>> {
+    let (limit_price, extended_hours) = match &request.kind {
+        CliOrderKind::AlpacaLimit {
+            limit_price,
+            extended_hours,
+        } => (limit_price.clone(), *extended_hours),
+        CliOrderKind::Market { .. } => {
+            anyhow::bail!("internal error: expected Alpaca limit order request")
+        }
+    };
+
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
+        anyhow::bail!("--limit-price is only supported with alpaca-broker-api");
+    };
+
+    writeln!(stdout, "🔄 Executing Alpaca Broker API limit order...")?;
+
+    let broker = alpaca_auth.clone().try_into_executor().await?;
+    let placement = broker
+        .place_limit_order(AlpacaLimitOrder {
+            symbol: request.symbol.clone(),
+            shares: request.shares,
+            direction: request.direction,
+            limit_price,
+            extended_hours,
+        })
+        .await?;
+
+    writeln!(
+        stdout,
+        "✅ Alpaca Broker API limit order placed with ID: {}",
+        placement.order_id
+    )?;
+
+    Ok(placement)
+}
+
+fn write_order_success<W: Write>(
+    stdout: &mut W,
+    placement: &OrderPlacement<String>,
+    limit_price: Option<&AlpacaLimitPrice>,
+    extended_hours: bool,
+) -> anyhow::Result<()> {
+    info!(
+        symbol = %placement.symbol,
+        direction = ?placement.direction,
+        quantity = %placement.shares,
+        order_id = %placement.order_id,
+        "Order placed successfully"
+    );
+    writeln!(stdout, "✅ Order placed successfully")?;
+    writeln!(stdout, "   Symbol: {}", placement.symbol)?;
+    writeln!(stdout, "   Action: {:?}", placement.direction)?;
+    writeln!(stdout, "   Quantity: {}", placement.shares)?;
+    writeln!(stdout, "   Order ID: {}", placement.order_id)?;
+
+    if let Some(limit_price) = limit_price {
+        writeln!(stdout, "   Order Type: limit")?;
+        writeln!(
+            stdout,
+            "   Limit Price: ${}",
+            format_float_with_fallback(&limit_price.as_price().inner().inner())
+        )?;
+        writeln!(
+            stdout,
+            "   Extended Hours: {}",
+            if extended_hours { "yes" } else { "no" }
+        )?;
     }
 
     Ok(())
@@ -525,14 +692,22 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::config::{AssetsConfig, EquitiesConfig, LogLevel, SchwabAuth, TradingMode};
+    use crate::config::{
+        AssetsConfig, BrokerCtx, EquitiesConfig, LogLevel, SchwabAuth, TradingMode,
+    };
     use crate::onchain::EvmCtx;
     use crate::test_utils::{positive_shares, setup_test_db, setup_test_tokens};
     use crate::threshold::ExecutionThreshold;
+    use st0x_execution::{
+        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaTradingApiCtx,
+        AlpacaTradingApiMode,
+    };
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
+    const TEST_ACCOUNT_ID: AlpacaAccountId =
+        AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
-    fn create_schwab_test_ctx(mock_server: &MockServer) -> Ctx {
+    fn create_base_test_ctx() -> Ctx {
         Ctx {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
@@ -546,14 +721,7 @@ mod tests {
             order_polling_max_jitter: 5,
             position_check_interval: 60,
             inventory_poll_interval: 60,
-            broker: BrokerCtx::Schwab(SchwabAuth {
-                app_key: "test_app_key".to_string(),
-                app_secret: "test_app_secret".to_string(),
-                redirect_uri: Some(Url::parse("https://127.0.0.1").expect("valid test URL")),
-                base_url: Some(Url::parse(&mock_server.base_url()).expect("valid mock URL")),
-                account_index: Some(0),
-                encryption_key: TEST_ENCRYPTION_KEY,
-            }),
+            broker: BrokerCtx::DryRun,
             telemetry: None,
             trading_mode: TradingMode::Standalone {
                 order_owner: Address::ZERO,
@@ -565,6 +733,96 @@ mod tests {
             },
             travel_rule: None,
         }
+    }
+
+    fn create_schwab_test_ctx(mock_server: &MockServer) -> Ctx {
+        let mut ctx = create_base_test_ctx();
+        ctx.broker = BrokerCtx::Schwab(SchwabAuth {
+            app_key: "test_app_key".to_string(),
+            app_secret: "test_app_secret".to_string(),
+            redirect_uri: Some(Url::parse("https://127.0.0.1").expect("valid test URL")),
+            base_url: Some(Url::parse(&mock_server.base_url()).expect("valid mock URL")),
+            account_index: Some(0),
+            encryption_key: TEST_ENCRYPTION_KEY,
+        });
+        ctx
+    }
+
+    fn create_alpaca_broker_api_test_ctx(mock_server: &MockServer) -> Ctx {
+        let mut ctx = create_base_test_ctx();
+        ctx.broker = BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
+            api_key: "test_key".to_string(),
+            api_secret: "test_secret".to_string(),
+            account_id: TEST_ACCOUNT_ID,
+            mode: Some(AlpacaBrokerApiMode::Mock(mock_server.base_url())),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::Day,
+        });
+        ctx
+    }
+
+    fn create_alpaca_trading_api_test_ctx() -> Ctx {
+        let mut ctx = create_base_test_ctx();
+        ctx.broker = BrokerCtx::AlpacaTradingApi(AlpacaTradingApiCtx {
+            api_key: "test_key".to_string(),
+            api_secret: "test_secret".to_string(),
+            trading_mode: Some(AlpacaTradingApiMode::Paper),
+        });
+        ctx
+    }
+
+    fn cli_order_request(
+        symbol: Symbol,
+        shares: Positive<FractionalShares>,
+        direction: Direction,
+        time_in_force: Option<TimeInForce>,
+        limit_price: Option<AlpacaLimitPrice>,
+        extended_hours: bool,
+    ) -> anyhow::Result<CliOrderRequest> {
+        CliOrderRequest::from_cli_args(
+            symbol,
+            shares,
+            direction,
+            time_in_force,
+            limit_price,
+            extended_hours,
+        )
+    }
+
+    fn positive_limit_price(value: &str) -> AlpacaLimitPrice {
+        AlpacaLimitPrice::try_new(
+            Positive::new(st0x_execution::Usd::new(
+                Float::parse(value.to_string()).unwrap(),
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    macro_rules! execute_order_with_writers {
+        (
+            $symbol:expr,
+            $shares:expr,
+            $direction:expr,
+            $time_in_force:expr,
+            $limit_price:expr,
+            $extended_hours:expr,
+            $ctx:expr,
+            $pool:expr,
+            $stdout:expr $(,)?
+        ) => {
+            async {
+                let request = cli_order_request(
+                    $symbol,
+                    $shares,
+                    $direction,
+                    $time_in_force,
+                    $limit_price,
+                    $extended_hours,
+                )?;
+                super::execute_order_with_writers(request, $ctx, $pool, $stdout).await
+            }
+        };
     }
 
     fn get_schwab_auth(ctx: &Ctx) -> &SchwabAuth {
@@ -597,6 +855,60 @@ mod tests {
         (account_mock, order_mock)
     }
 
+    fn setup_alpaca_broker_limit_order_mocks(
+        server: &MockServer,
+    ) -> (httpmock::Mock<'_>, httpmock::Mock<'_>, httpmock::Mock<'_>) {
+        let account_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "status": "ACTIVE"
+                }));
+        });
+
+        let asset_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/v1/assets/AAPL");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "symbol": "AAPL",
+                    "status": "active",
+                    "tradable": true,
+                    "overnight_tradable": true
+                }));
+        });
+
+        let order_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
+                .json_body(json!({
+                    "symbol": "AAPL",
+                    "qty": "10",
+                    "side": "buy",
+                    "type": "limit",
+                    "limit_price": "195.25",
+                    "time_in_force": "day",
+                    "extended_hours": true
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "symbol": "AAPL",
+                    "qty": "10",
+                    "side": "buy",
+                    "status": "new",
+                    "filled_avg_price": null
+                }));
+        });
+
+        (account_mock, asset_mock, order_mock)
+    }
+
     #[tokio::test]
     async fn test_execute_order_buy_success() {
         let server = MockServer::start();
@@ -606,11 +918,13 @@ mod tests {
 
         let (account_mock, order_mock) = setup_schwab_order_mocks(&server);
 
-        execute_order_with_writers(
+        execute_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -631,11 +945,13 @@ mod tests {
 
         let (account_mock, order_mock) = setup_schwab_order_mocks(&server);
 
-        execute_order_with_writers(
+        execute_order_with_writers!(
             Symbol::new("TSLA").unwrap(),
             positive_shares("50"),
             Direction::Sell,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -673,11 +989,13 @@ mod tests {
                 .json_body(json!({"error": "Invalid order"}));
         });
 
-        execute_order_with_writers(
+        execute_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -696,11 +1014,13 @@ mod tests {
         setup_schwab_order_mocks(&server);
 
         let mut stdout_buffer = Vec::new();
-        execute_order_with_writers(
+        execute_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut stdout_buffer,
@@ -711,6 +1031,10 @@ mod tests {
         let output = String::from_utf8(stdout_buffer).unwrap();
         assert!(output.contains("AAPL"), "Output should contain symbol");
         assert!(output.contains("100"), "Output should contain quantity");
+        assert!(
+            output.contains("Order ID: 12345"),
+            "Output should contain order ID"
+        );
     }
 
     #[tokio::test]
@@ -740,11 +1064,13 @@ mod tests {
         });
 
         let mut stdout_buffer = Vec::new();
-        execute_order_with_writers(
+        execute_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
             None,
+            None,
+            false,
             &ctx,
             &pool,
             &mut stdout_buffer,
@@ -768,11 +1094,13 @@ mod tests {
         setup_schwab_order_mocks(&server);
 
         let mut stdout_buffer = Vec::new();
-        execute_order_with_writers(
+        execute_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
             positive_shares("100"),
             Direction::Buy,
             Some(TimeInForce::Day),
+            None,
+            false,
             &ctx,
             &pool,
             &mut stdout_buffer,
@@ -784,6 +1112,178 @@ mod tests {
         assert!(
             output.contains("--time-in-force is ignored"),
             "Expected warning about ignored --time-in-force, got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_limit_order_uses_alpaca_broker_api_path() {
+        let server = MockServer::start();
+        let ctx = create_alpaca_broker_api_test_ctx(&server);
+        let pool = setup_test_db().await;
+        let (account_mock, asset_mock, order_mock) = setup_alpaca_broker_limit_order_mocks(&server);
+
+        let mut stdout_buffer = Vec::new();
+        execute_order_with_writers!(
+            Symbol::new("AAPL").unwrap(),
+            positive_shares("10"),
+            Direction::Buy,
+            None,
+            Some(positive_limit_price("195.25")),
+            true,
+            &ctx,
+            &pool,
+            &mut stdout_buffer,
+        )
+        .await
+        .unwrap();
+
+        account_mock.assert();
+        asset_mock.assert();
+        order_mock.assert();
+
+        let output = String::from_utf8(stdout_buffer).unwrap();
+        assert!(
+            output.contains("Order Type: limit"),
+            "unexpected output: {output}"
+        );
+        assert!(
+            output.contains("Extended Hours: yes"),
+            "unexpected output: {output}"
+        );
+        assert!(
+            output.contains("Order ID: 61e7b016-9c91-4a97-b912-615c9d365c9d"),
+            "unexpected output: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extended_hours_requires_limit_price() {
+        let server = MockServer::start();
+        let ctx = create_schwab_test_ctx(&server);
+        let pool = setup_test_db().await;
+        setup_test_tokens(&pool, get_schwab_auth(&ctx)).await;
+
+        let mut stdout_buffer = Vec::new();
+        let error = execute_order_with_writers!(
+            Symbol::new("AAPL").unwrap(),
+            positive_shares("10"),
+            Direction::Buy,
+            None,
+            None,
+            true,
+            &ctx,
+            &pool,
+            &mut stdout_buffer,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "--extended-hours requires --limit-price");
+    }
+
+    #[tokio::test]
+    async fn test_limit_order_rejected_for_schwab() {
+        let server = MockServer::start();
+        let ctx = create_schwab_test_ctx(&server);
+        let pool = setup_test_db().await;
+
+        let mut stdout_buffer = Vec::new();
+        let error = execute_order_with_writers!(
+            Symbol::new("AAPL").unwrap(),
+            positive_shares("10"),
+            Direction::Buy,
+            None,
+            Some(positive_limit_price("195.25")),
+            false,
+            &ctx,
+            &pool,
+            &mut stdout_buffer,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "--limit-price is only supported with alpaca-broker-api"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_limit_order_rejected_for_dry_run() {
+        let ctx = create_base_test_ctx();
+        let pool = setup_test_db().await;
+
+        let mut stdout_buffer = Vec::new();
+        let error = execute_order_with_writers!(
+            Symbol::new("AAPL").unwrap(),
+            positive_shares("10"),
+            Direction::Buy,
+            None,
+            Some(positive_limit_price("195.25")),
+            false,
+            &ctx,
+            &pool,
+            &mut stdout_buffer,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "--limit-price is only supported with alpaca-broker-api"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_limit_order_rejected_for_alpaca_trading_api() {
+        let ctx = create_alpaca_trading_api_test_ctx();
+        let pool = setup_test_db().await;
+
+        let mut stdout_buffer = Vec::new();
+        let error = execute_order_with_writers!(
+            Symbol::new("AAPL").unwrap(),
+            positive_shares("10"),
+            Direction::Buy,
+            None,
+            Some(positive_limit_price("195.25")),
+            false,
+            &ctx,
+            &pool,
+            &mut stdout_buffer,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "--limit-price is only supported with alpaca-broker-api"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_limit_order_rejects_market_on_close() {
+        let server = MockServer::start();
+        let ctx = create_alpaca_broker_api_test_ctx(&server);
+        let pool = setup_test_db().await;
+
+        let mut stdout_buffer = Vec::new();
+        let error = execute_order_with_writers!(
+            Symbol::new("AAPL").unwrap(),
+            positive_shares("10"),
+            Direction::Buy,
+            Some(TimeInForce::MarketOnClose),
+            Some(positive_limit_price("195.25")),
+            false,
+            &ctx,
+            &pool,
+            &mut stdout_buffer,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "--time-in-force is not supported with --limit-price"
         );
     }
 }

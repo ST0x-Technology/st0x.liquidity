@@ -645,6 +645,7 @@ mod tests {
                 equities: EquitiesConfig::default(),
                 cash,
             },
+            travel_rule: None,
         }
     }
 
