@@ -81,7 +81,15 @@ cargo run --bin server -- --config path/to/config.toml --secrets path/to/secrets
 cargo run --bin reporter -- --config path/to/config.toml
 ```
 
-Manual unwrap of wrapped equity shares:
+Manual wrap of tokenized equity into wrapped vault shares (requires rebalancing
+mode and a configured Base liquidity wallet):
+
+```bash
+cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml wrap-equity --symbol AAPL --quantity 10.5
+```
+
+Manual unwrap of wrapped equity shares (requires rebalancing mode and a
+configured Base liquidity wallet):
 
 ```bash
 cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml unwrap-equity --symbol AAPL --quantity 10.5

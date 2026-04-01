@@ -134,6 +134,16 @@ pub enum Commands {
         quantity: FractionalShares,
     },
 
+    /// Wrap tokenized equity into wrapped ERC-4626 vault shares
+    WrapEquity {
+        /// Stock symbol (e.g., AAPL, TSLA)
+        #[arg(short = 's', long = "symbol")]
+        symbol: Symbol,
+        /// Number of tokenized shares to wrap (must be positive)
+        #[arg(short = 'q', long = "quantity", value_parser = parse_positive_shares)]
+        quantity: Positive<FractionalShares>,
+    },
+
     /// Unwrap wrapped ERC-4626 equity shares into the underlying tokenized equity
     UnwrapEquity {
         /// Stock symbol (e.g., AAPL, TSLA)
@@ -481,6 +491,10 @@ enum SimpleCommand {
         symbol: Symbol,
         quantity: FractionalShares,
     },
+    WrapEquity {
+        symbol: Symbol,
+        quantity: Positive<FractionalShares>,
+    },
     UnwrapEquity {
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
@@ -621,6 +635,9 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             symbol,
             quantity,
         }),
+        Commands::WrapEquity { symbol, quantity } => {
+            Ok(SimpleCommand::WrapEquity { symbol, quantity })
+        }
         Commands::UnwrapEquity { symbol, quantity } => {
             Ok(SimpleCommand::UnwrapEquity { symbol, quantity })
         }
@@ -763,6 +780,9 @@ async fn run_simple_command<W: Write>(
         } => {
             rebalancing::transfer_equity_command(stdout, direction, &symbol, quantity, ctx, pool)
                 .await
+        }
+        SimpleCommand::WrapEquity { symbol, quantity } => {
+            wrapper::wrap_equity_command(stdout, symbol, quantity, ctx).await
         }
         SimpleCommand::UnwrapEquity { symbol, quantity } => {
             wrapper::unwrap_equity_command(stdout, symbol, quantity, ctx).await
@@ -1485,6 +1505,15 @@ mod tests {
     }
 
     #[test]
+    fn test_wrap_equity_command_rejects_zero_quantity() {
+        let error =
+            Cli::try_parse_from(["schwab", "wrap-equity", "-s", "AAPL", "-q", "0"]).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("positive"), "unexpected error: {message}");
+    }
+
+    #[test]
     fn test_unwrap_equity_command_rejects_zero_quantity() {
         let error =
             Cli::try_parse_from(["schwab", "unwrap-equity", "-s", "AAPL", "-q", "0"]).unwrap_err();
@@ -1786,6 +1815,17 @@ mod tests {
         let cli = Cli::try_parse_from(["schwab", "sell", "-s", "SPYM", "-q", "6.15"]).unwrap();
         let Commands::Sell { quantity, .. } = cli.command else {
             panic!("expected sell command");
+        };
+
+        assert_eq!(quantity, positive_shares("6.15"));
+    }
+
+    #[test]
+    fn test_wrap_equity_command_parses_fractional_quantity() {
+        let cli =
+            Cli::try_parse_from(["schwab", "wrap-equity", "-s", "SPYM", "-q", "6.15"]).unwrap();
+        let Commands::WrapEquity { quantity, .. } = cli.command else {
+            panic!("expected wrap-equity command");
         };
 
         assert_eq!(quantity, positive_shares("6.15"));
@@ -2801,6 +2841,26 @@ mod tests {
             "transfer-equity to-alpaca should succeed: {:?}",
             result.err()
         );
+    }
+
+    #[test]
+    fn test_wrap_equity_command_structure() {
+        let cmd = Cli::command();
+
+        cmd.clone()
+            .try_get_matches_from(vec!["cli", "wrap-equity"])
+            .unwrap_err();
+
+        cmd.clone()
+            .try_get_matches_from(vec!["cli", "wrap-equity", "-s", "AAPL"])
+            .unwrap_err();
+
+        cmd.clone()
+            .try_get_matches_from(vec!["cli", "wrap-equity", "-q", "10.5"])
+            .unwrap_err();
+
+        cmd.try_get_matches_from(vec!["cli", "wrap-equity", "-s", "AAPL", "-q", "10.5"])
+            .unwrap();
     }
 
     #[test]
