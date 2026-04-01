@@ -10,7 +10,6 @@
 use alloy::providers::Provider;
 use alloy::rpc::types::Filter;
 use alloy::sol_types::SolEvent;
-use apalis::prelude::TaskSink;
 use backon::{BackoffBuilder, ExponentialBuilder, Retryable};
 use futures_util::future;
 use itertools::Itertools;
@@ -214,7 +213,6 @@ mod tests {
     };
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::rpc::types::Log;
-    use apalis_sqlite::SqliteStorage;
     use rain_math_float::Float;
     use sqlx::SqlitePool;
     use url::Url;
@@ -234,7 +232,7 @@ mod tests {
 
     async fn setup_job_queue(pool: &SqlitePool) -> DexTradeAccountingJobQueue {
         setup_apalis_tables(pool).await.unwrap();
-        SqliteStorage::new(pool)
+        DexTradeAccountingJobQueue::new(pool)
     }
 
     async fn job_count(pool: &SqlitePool) -> i64 {
@@ -1173,9 +1171,10 @@ mod tests {
         .await;
 
         // Should succeed at RPC level but fail at database level
-        // The function handles enqueue failures gracefully by continuing
-        let enqueued = result.unwrap();
-        assert_eq!(enqueued, 0); // No events successfully enqueued
+        assert!(
+            matches!(result, Err(OnChainError::JobQueue(_))),
+            "Expected JobQueue error, got: {result:?}"
+        );
     }
 
     #[tokio::test]

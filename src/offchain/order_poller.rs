@@ -342,6 +342,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::offchain_order::noop_placed_shares;
     use crate::position::TradeId;
     use crate::test_utils::{OnchainTradeBuilder, setup_test_db};
     use crate::threshold::ExecutionThreshold;
@@ -522,7 +523,11 @@ mod tests {
         };
 
         assert_eq!(filled_symbol, symbol, "Filled symbol mismatch");
-        assert_eq!(filled_shares, shares, "Filled shares mismatch");
+        assert_eq!(
+            filled_shares,
+            noop_placed_shares(shares),
+            "Filled shares mismatch"
+        );
         assert_eq!(
             filled_direction,
             Direction::Buy,
@@ -628,7 +633,11 @@ mod tests {
         };
 
         assert_eq!(failed_symbol, symbol, "Failed symbol mismatch");
-        assert_eq!(failed_shares, shares, "Failed shares mismatch");
+        assert_eq!(
+            failed_shares,
+            noop_placed_shares(shares),
+            "Failed shares mismatch"
+        );
         assert_eq!(
             failed_direction,
             Direction::Sell,

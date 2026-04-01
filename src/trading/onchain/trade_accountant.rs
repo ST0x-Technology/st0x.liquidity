@@ -9,9 +9,6 @@
 use alloy::primitives::{Address, IntoLogData};
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
-use apalis_codec::json::JsonCodec;
-use apalis_sqlite::fetcher::SqliteFetcher;
-use apalis_sqlite::{CompactType, SqliteStorage};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -23,7 +20,7 @@ use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
 use st0x_execution::{ExecutionError, Executor};
 
 use super::inclusion::EmittedOnChain;
-use crate::conductor::job::{Job, Label};
+use crate::conductor::job::{Job, JobQueue, Label};
 use crate::conductor::{
     TradeProcessingCqrs, VaultDiscoveryCtx, discover_vaults_for_trade, process_queued_trade,
 };
@@ -36,8 +33,7 @@ use crate::symbol::lock::get_symbol_lock;
 use crate::vault_registry::VaultRegistry;
 
 /// Persistent job queue for DEX trade accounting.
-pub(crate) type DexTradeAccountingJobQueue =
-    SqliteStorage<AccountForDexTrade, JsonCodec<CompactType>, SqliteFetcher>;
+pub(crate) type DexTradeAccountingJobQueue = JobQueue<AccountForDexTrade>;
 
 /// An accounting job for processing a single onchain raindex trade event.
 /// It's the unified mechanism for processing both backfilled events as well as

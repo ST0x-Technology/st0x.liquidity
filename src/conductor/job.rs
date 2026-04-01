@@ -5,13 +5,48 @@
 //! `SqliteStorage`; the generic [`work`] handler deserializes
 //! it and calls [`Job::perform`] with the shared context.
 
-use apalis::prelude::Data;
+use apalis::prelude::{Data, TaskSink};
+use apalis_sqlite::SqliteStorage;
 use backon::{ExponentialBuilder, Retryable};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use std::fmt;
+use sqlx::SqlitePool;
 use std::sync::Arc;
 use tracing::{debug, error, warn};
+
+type Storage<Task> = SqliteStorage<
+    Task,
+    apalis_codec::json::JsonCodec<apalis_sqlite::CompactType>,
+    apalis_sqlite::fetcher::SqliteFetcher,
+>;
+
+/// Persistent job queue backed by apalis `SqliteStorage`.
+pub(crate) struct JobQueue<Task>(Storage<Task>);
+
+impl<Task> Clone for JobQueue<Task> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueue<Task> {
+    pub(crate) fn new(pool: &SqlitePool) -> Self {
+        Self(SqliteStorage::new(pool))
+    }
+
+    pub(crate) async fn push(
+        &mut self,
+        task: Task,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        TaskSink::push(&mut self.0, task)
+            .await
+            .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)
+    }
+
+    pub(crate) fn into_storage(self) -> Storage<Task> {
+        self.0
+    }
+}
 
 /// A persistent, retryable unit of work backed by apalis storage.
 ///
@@ -73,8 +108,10 @@ impl Label {
     }
 }
 
-impl fmt::Display for Label {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Display for Label {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{}", self.0)
     }
 }
+
+// TODO: add missing test coverage

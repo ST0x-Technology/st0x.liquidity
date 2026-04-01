@@ -1,9 +1,8 @@
 //! Constructs a fully-wired [`Conductor`] instance from its dependencies.
 
-use std::sync::Arc;
-
 use alloy::providers::Provider;
 use apalis::prelude::{Monitor, WorkerBuilder};
+use std::sync::Arc;
 use task_supervisor::SupervisorBuilder;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
@@ -147,6 +146,8 @@ where
         dex_streams,
     );
 
+    // NOTE: latest versions of apalias are adding tooling for long-running tasks too,
+    // so we will be able to get rid of this task-supervisor inconsistency
     let supervisor = SupervisorBuilder::default()
         .with_task("order-fill-monitor", order_fill_monitor)
         .build()
@@ -160,7 +161,7 @@ where
             })
             .register(move |index| {
                 WorkerBuilder::new(format!("order-fill-worker-{index}"))
-                    .backend(job_queue.clone())
+                    .backend(job_queue.clone().into_storage())
                     .data(accountant_ctx.clone())
                     .build(work::<AccountantCtx<Prov, Exec>, _>)
             });

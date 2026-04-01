@@ -10,7 +10,6 @@ use alloy::providers::ProviderBuilder;
 use alloy::providers::WsConnect;
 use alloy::rpc::types::Log;
 use alloy::sol_types;
-use apalis::prelude::TaskSink;
 use futures_util::{Stream, StreamExt};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -166,7 +165,6 @@ impl OrderFillMonitor {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, U256, address};
-    use apalis_sqlite::SqliteStorage;
     use futures_util::stream;
     use sqlx::SqlitePool;
 
@@ -185,7 +183,7 @@ mod tests {
     async fn create_test_monitor_with_pool() -> (OrderFillMonitor, SqlitePool) {
         let pool = setup_test_db().await;
         setup_apalis_tables(&pool).await.unwrap();
-        let job_queue: DexTradeAccountingJobQueue = SqliteStorage::new(&pool);
+        let job_queue = DexTradeAccountingJobQueue::new(&pool);
 
         let dex_streams = DexEventStreams {
             clear: Box::pin(stream::empty()),

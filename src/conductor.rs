@@ -8,7 +8,6 @@ mod order_fill_monitor;
 
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
-use apalis_sqlite::SqliteStorage;
 use futures_util::StreamExt;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
@@ -134,7 +133,7 @@ impl Conductor {
         let orderbook = IOrderBookV6Instance::new(ctx.evm.orderbook, &provider);
 
         setup_apalis_tables(&pool).await?;
-        let job_queue: DexTradeAccountingJobQueue = SqliteStorage::new(&pool);
+        let job_queue = DexTradeAccountingJobQueue::new(&pool);
 
         let mut clear_stream = orderbook.ClearV3_filter().watch().await?.into_stream();
         let mut take_stream = orderbook.TakeOrderV3_filter().watch().await?.into_stream();
@@ -1205,6 +1204,7 @@ mod tests {
     use crate::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
     use crate::inventory::view::Operator;
     use crate::inventory::{ImbalanceThreshold, Inventory, InventoryView, Venue};
+    use crate::offchain_order::OrderPlacementResult;
     use crate::onchain::trade::OnchainTrade;
     use crate::rebalancing::{RebalancingTrigger, TriggeredOperation};
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
@@ -1668,9 +1668,13 @@ mod tests {
         impl OrderPlacer for TestOrderPlacer {
             async fn place_market_order(
                 &self,
-                _order: MarketOrder,
-            ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>> {
-                Ok(ExecutorOrderId::new("TEST_BROKER_ORD"))
+                order: MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("TEST_BROKER_ORD"),
+                    placed_shares: order.shares,
+                })
             }
         }
 
@@ -2654,7 +2658,7 @@ mod tests {
                 async fn place_market_order(
                     &self,
                     _order: MarketOrder,
-                ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>>
+                ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
                 {
                     Err("API error (403 Forbidden): trade denied due to pattern day trading protection".into())
                 }
@@ -2738,7 +2742,7 @@ mod tests {
                 async fn place_market_order(
                     &self,
                     _order: MarketOrder,
-                ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>>
+                ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
                 {
                     Err("Broker rejected: insufficient buying power".into())
                 }
