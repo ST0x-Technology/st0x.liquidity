@@ -28,6 +28,8 @@ markets by providing continuous two-sided liquidity.
   offchain hedge executions
 - **Exposure Hedging**: Automatically executes offsetting trades to reduce
   directional exposure from onchain fills
+- **Operator Vault Controls**: CLI supports generic ERC20 deposits to and
+  withdrawals from Raindex vaults, with a USDC-specific withdrawal shortcut
 
 ## Getting Started
 
@@ -309,17 +311,6 @@ cargo nextest run --workspace # run all tests
 cargo clippy --workspace --all-targets --all-features -- -D clippy::all
 cargo fmt                    # format Rust code
 nix fmt                      # format Nix code (when editing .nix files)
-bacon                        # background clippy watcher (press c for clippy, p for pedantic)
-```
-
-#### Bacon (Background Checker)
-
-[Bacon](https://dystroy.org/bacon/) runs cargo check/clippy in the background
-and re-checks on every file save. Errors and warnings are exported to
-`.bacon-locations`.
-
-```bash
-bacon --listen
 ```
 
 ### Flake Commands

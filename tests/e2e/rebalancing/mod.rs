@@ -409,11 +409,6 @@ async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
 /// non-terminating (`1 / 115`) to exercise the precision-dust path without
 /// overriding the generated `ioRatio`. Correct behavior is still that
 /// redemption completes successfully.
-///
-/// Run explicitly when validating the decimal-normalization fix:
-/// `cargo test --test e2e -- --ignored --nocapture \
-///   equity_redemption_buy_inv_repeating_reciprocal_regression`
-#[ignore = "Diagnostic repro: run with --nocapture and inspect PrecisionLoss logs"]
 #[test_log::test(tokio::test)]
 async fn equity_redemption_buy_inv_repeating_reciprocal_regression() -> anyhow::Result<()> {
     let onchain_price = float!(115);
@@ -443,8 +438,12 @@ async fn equity_redemption_buy_inv_repeating_reciprocal_regression() -> anyhow::
             .balanceOf(REDEMPTION_WALLET)
             .call()
             .await?;
+    // Extra equity keeps the onchain/offchain ratio balanced (0.5) before the
+    // take so the trigger doesn't fire at startup. After the BuyEquity fill
+    // adds shares onchain and the hedge sell removes shares offchain, the
+    // ratio exceeds the 0.6 threshold -> Redemption.
     let equity_vault_id = prepared.input_vault_id;
-    let extra_equity: U256 = parse_units("100", 18)?.into();
+    let extra_equity: U256 = parse_units("20", 18)?.into();
     infra
         .base_chain
         .deposit_into_raindex_vault(vault_addr, equity_vault_id, extra_equity, 18)
@@ -526,7 +525,6 @@ async fn equity_redemption_buy_inv_repeating_reciprocal_regression() -> anyhow::
 /// This uses the same rebalancing redemption setup as the `inv(price)` repro
 /// but replaces the generated Rainlang expression with a direct reciprocal
 /// string, matching the old harness path.
-#[ignore = "Diagnostic repro: run with --nocapture and inspect PrecisionLoss logs"]
 #[test_log::test(tokio::test)]
 async fn equity_redemption_buy_literal_reciprocal_regression() -> anyhow::Result<()> {
     let onchain_price = float!(112);
@@ -569,8 +567,10 @@ async fn equity_redemption_buy_literal_reciprocal_regression() -> anyhow::Result
             .balanceOf(REDEMPTION_WALLET)
             .call()
             .await?;
+    // Extra equity keeps the onchain/offchain ratio balanced (0.5) before the
+    // take so the trigger doesn't fire at startup.
     let equity_vault_id = prepared.input_vault_id;
-    let extra_equity: U256 = parse_units("100", 18)?.into();
+    let extra_equity: U256 = parse_units("20", 18)?.into();
     infra
         .base_chain
         .deposit_into_raindex_vault(vault_addr, equity_vault_id, extra_equity, 18)

@@ -1,4 +1,4 @@
-{ pkgs, craneLib, sqlx-cli, sol-build-inputs }:
+{ pkgs, craneLib, sqlx-cli }:
 
 let
   # Requires --impure. Submodules must be checked out and prepSolArtifacts
@@ -106,25 +106,30 @@ in {
     };
   });
 
-  # Main package with all binaries
+  # Server binary for deployment
   package = craneLib.buildPackage (commonArgs // {
     inherit cargoArtifacts;
     preBuild = sqlxSetup;
-    nativeCheckInputs = sol-build-inputs;
-    doCheck = true;
-    cargoTestExtraArgs = "--workspace --all-targets --all-features";
+    cargoExtraArgs = "--bin server --features wallet-private-key";
+    doCheck = false;
 
     meta = {
-      description = "st0x liquidity market making system";
+      description = "st0x liquidity market making server";
       homepage = "https://github.com/ST0x-Technology/st0x.liquidity";
     };
   });
 
-  # Clippy check (reuses cached deps)
-  clippy = craneLib.cargoClippy (commonArgs // {
+  # CLI binary for remote operations
+  cli = craneLib.buildPackage (commonArgs // {
+    pname = "st0x-cli";
     inherit cargoArtifacts;
     preBuild = sqlxSetup;
-    cargoClippyExtraArgs =
-      "--workspace --all-targets --all-features -- -D warnings";
+    cargoExtraArgs = "--bin cli --features wallet-private-key";
+    doCheck = false;
+
+    meta = {
+      description = "st0x liquidity CLI";
+      homepage = "https://github.com/ST0x-Technology/st0x.liquidity";
+    };
   });
 }

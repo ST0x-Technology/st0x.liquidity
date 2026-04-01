@@ -15,7 +15,7 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::EventSourced;
 use crate::dependency::{Cons, Dependent, EntityList, Nil};
@@ -70,6 +70,22 @@ pub enum ProjectionError<Entity: EventSourced> {
         column: Column,
         table: String,
         row_count: i64,
+    },
+    #[error("serde failed for aggregate '{aggregate_id}': {source}")]
+    Serde {
+        aggregate_id: String,
+        source: serde_json::Error,
+    },
+    #[error(
+        "event sequence gap for aggregate '{aggregate_id}': \
+         expected {expected} events after version {view_version}, \
+         found {actual}"
+    )]
+    EventSequenceGap {
+        aggregate_id: String,
+        view_version: i64,
+        expected: i64,
+        actual: usize,
     },
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
@@ -224,6 +240,137 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
             sqlx::query_as(&query).bind(value).fetch_all(pool).await?;
 
         Ok(Self::parse_rows(rows))
+    }
+
+    /// Replays any events the view missed due to a crash between
+    /// event persistence and view update.
+    ///
+    /// For each view row, compares its `version` against the max
+    /// event `sequence` for that aggregate. If behind, fetches the
+    /// missed events and applies them incrementally.
+    ///
+    /// On a normal startup (no crash), this is a cheap version
+    /// comparison query with no replay.
+    pub async fn catch_up(&self) -> Result<(), ProjectionError<Entity>> {
+        let (pool, table) = self.sqlite_backing()?;
+        let aggregate_type = <Lifecycle<Entity> as Aggregate>::aggregate_type();
+
+        // Drive from events table (LEFT JOIN) so we also detect aggregates
+        // with persisted events but no view row (crash before initial view write).
+        // view_version is NULL when the view row is missing.
+        let stale_aggregates: Vec<(String, Option<i64>, i64)> = sqlx::query_as(&format!(
+            "SELECT e.aggregate_id, v.version, e.max_seq \
+             FROM ( \
+                 SELECT aggregate_id, MAX(sequence) as max_seq \
+                 FROM events \
+                 WHERE aggregate_type = ?1 \
+                 GROUP BY aggregate_id \
+             ) e \
+             LEFT JOIN {table} v ON v.view_id = e.aggregate_id \
+             WHERE v.version IS NULL OR e.max_seq > v.version"
+        ))
+        .bind(&aggregate_type)
+        .fetch_all(pool)
+        .await?;
+
+        for (aggregate_id, view_version, max_seq) in &stale_aggregates {
+            let view_version = view_version.unwrap_or(0);
+
+            self.replay_missed_events(
+                pool,
+                table,
+                &aggregate_type,
+                aggregate_id,
+                view_version,
+                *max_seq,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn replay_missed_events(
+        &self,
+        pool: &SqlitePool,
+        table: &str,
+        aggregate_type: &str,
+        view_id: &str,
+        view_version: i64,
+        max_seq: i64,
+    ) -> Result<(), ProjectionError<Entity>> {
+        let behind = max_seq - view_version;
+
+        info!(
+            %view_id, %view_version, %max_seq, %behind, %aggregate_type,
+            "View is behind, replaying missed events"
+        );
+
+        let mut lifecycle = match self.repo.load_with_context(view_id).await? {
+            Some((lifecycle, _context)) => lifecycle,
+            // No view row exists -- start from scratch
+            None => Lifecycle::default(),
+        };
+
+        let missed_payloads: Vec<(String,)> = sqlx::query_as(
+            "SELECT payload FROM events \
+             WHERE aggregate_type = ?1 \
+               AND aggregate_id = ?2 \
+               AND sequence > ?3 \
+             ORDER BY sequence ASC",
+        )
+        .bind(aggregate_type)
+        .bind(view_id)
+        .bind(view_version)
+        .fetch_all(pool)
+        .await?;
+
+        let actual = missed_payloads.len();
+        // behind is always positive (SQL WHERE max_seq > version), safe to compare
+        if !usize::try_from(behind).is_ok_and(|expected| actual == expected) {
+            return Err(ProjectionError::EventSequenceGap {
+                aggregate_id: view_id.to_string(),
+                view_version,
+                expected: behind,
+                actual,
+            });
+        }
+
+        for (payload_json,) in &missed_payloads {
+            let event: Entity::Event = serde_json::from_str(payload_json).map_err(|source| {
+                ProjectionError::<Entity>::Serde {
+                    aggregate_id: view_id.to_string(),
+                    source,
+                }
+            })?;
+
+            lifecycle.apply(event);
+        }
+
+        let payload = serde_json::to_string(&lifecycle).map_err(|source| ProjectionError::<
+            Entity,
+        >::Serde {
+            aggregate_id: view_id.to_string(),
+            source,
+        })?;
+
+        // Write directly with version = max_seq, bypassing the view repo's
+        // optimistic lock (which expects version + 1 increments). This is
+        // safe because catch_up runs once at startup before the main loop.
+        sqlx::query(&format!(
+            "INSERT INTO {table} (view_id, version, payload) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT(view_id) DO UPDATE SET version = ?2, payload = ?3"
+        ))
+        .bind(view_id)
+        .bind(max_seq)
+        .bind(&payload)
+        .execute(pool)
+        .await?;
+
+        info!(%view_id, %behind, "View caught up successfully");
+
+        Ok(())
     }
 
     fn sqlite_backing(&self) -> Result<(&SqlitePool, &str), ProjectionError<Entity>> {
@@ -577,5 +724,309 @@ mod tests {
             ProjectionError::Lifecycle(boxed)
                 if matches!(*boxed, LifecycleError::EventCantOriginate { .. })
         ));
+    }
+
+    // -- catch_up tests --
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct Counter {
+        value: i64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    enum CounterEvent {
+        Created { initial: i64 },
+        Incremented,
+    }
+
+    impl DomainEvent for CounterEvent {
+        fn event_type(&self) -> String {
+            match self {
+                Self::Created { .. } => "CounterEvent::Created".to_string(),
+                Self::Incremented => "CounterEvent::Incremented".to_string(),
+            }
+        }
+
+        fn event_version(&self) -> String {
+            "1.0".to_string()
+        }
+    }
+
+    #[async_trait]
+    impl EventSourced for Counter {
+        type Id = String;
+        type Event = CounterEvent;
+        type Command = ();
+        type Error = Never;
+        type Services = ();
+        type Materialized = Table;
+
+        const AGGREGATE_TYPE: &'static str = "Counter";
+        const PROJECTION: Table = Table("counter_view");
+        const SCHEMA_VERSION: u64 = 1;
+
+        fn originate(event: &CounterEvent) -> Option<Self> {
+            match event {
+                CounterEvent::Created { initial } => Some(Self { value: *initial }),
+                CounterEvent::Incremented => None,
+            }
+        }
+
+        fn evolve(entity: &Self, event: &CounterEvent) -> Result<Option<Self>, Never> {
+            match event {
+                CounterEvent::Created { .. } => Ok(None),
+                CounterEvent::Incremented => Ok(Some(Self {
+                    value: entity.value + 1,
+                })),
+            }
+        }
+
+        async fn initialize(_command: (), _services: &()) -> Result<Vec<CounterEvent>, Never> {
+            Ok(vec![])
+        }
+
+        async fn transition(
+            &self,
+            _command: (),
+            _services: &(),
+        ) -> Result<Vec<CounterEvent>, Never> {
+            Ok(vec![])
+        }
+    }
+
+    async fn setup_catch_up_db() -> SqlitePool {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+
+        sqlx::query(
+            "CREATE TABLE events ( \
+                 aggregate_type TEXT NOT NULL, \
+                 aggregate_id TEXT NOT NULL, \
+                 sequence BIGINT NOT NULL, \
+                 event_type TEXT NOT NULL, \
+                 event_version TEXT NOT NULL, \
+                 payload TEXT NOT NULL, \
+                 metadata TEXT NOT NULL, \
+                 PRIMARY KEY (aggregate_type, aggregate_id, sequence) \
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "CREATE TABLE counter_view ( \
+                 view_id TEXT NOT NULL PRIMARY KEY, \
+                 version BIGINT NOT NULL, \
+                 payload TEXT NOT NULL \
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Also need schema_registry for Projection::sqlite
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS schema_registry ( \
+                 aggregate_type TEXT NOT NULL PRIMARY KEY, \
+                 version BIGINT NOT NULL \
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        pool
+    }
+
+    async fn insert_event(
+        pool: &SqlitePool,
+        aggregate_id: &str,
+        sequence: i64,
+        event: &CounterEvent,
+    ) {
+        let payload = serde_json::to_string(event).unwrap();
+        let event_type = DomainEvent::event_type(event);
+
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+             VALUES (?1, ?2, ?3, ?4, '1.0', ?5, '{}')",
+        )
+        .bind("Counter")
+        .bind(aggregate_id)
+        .bind(sequence)
+        .bind(&event_type)
+        .bind(&payload)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_stale_view(pool: &SqlitePool, view_id: &str, version: i64, counter: &Counter) {
+        let lifecycle = Lifecycle::Live(counter.clone());
+        let payload = serde_json::to_string(&lifecycle).unwrap();
+
+        sqlx::query("INSERT INTO counter_view (view_id, version, payload) VALUES (?1, ?2, ?3)")
+            .bind(view_id)
+            .bind(version)
+            .bind(&payload)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn catch_up_replays_missed_events() {
+        let pool = setup_catch_up_db().await;
+
+        // Insert 3 events: Created(0), Incremented, Incremented
+        insert_event(&pool, "counter-1", 1, &CounterEvent::Created { initial: 0 }).await;
+        insert_event(&pool, "counter-1", 2, &CounterEvent::Incremented).await;
+        insert_event(&pool, "counter-1", 3, &CounterEvent::Incremented).await;
+
+        // View is stale at version 1 (only saw Created)
+        insert_stale_view(&pool, "counter-1", 1, &Counter { value: 0 }).await;
+
+        let projection = Projection::<Counter>::sqlite(pool);
+
+        projection.catch_up().await.unwrap();
+
+        let result = projection.load(&"counter-1".to_string()).await.unwrap();
+        assert_eq!(result, Some(Counter { value: 2 }));
+    }
+
+    #[tokio::test]
+    async fn catch_up_skips_up_to_date_views() {
+        let pool = setup_catch_up_db().await;
+
+        insert_event(&pool, "counter-1", 1, &CounterEvent::Created { initial: 5 }).await;
+
+        // View is up to date at version 1
+        insert_stale_view(&pool, "counter-1", 1, &Counter { value: 5 }).await;
+
+        let projection = Projection::<Counter>::sqlite(pool);
+
+        projection.catch_up().await.unwrap();
+
+        let result = projection.load(&"counter-1".to_string()).await.unwrap();
+        assert_eq!(result, Some(Counter { value: 5 }));
+    }
+
+    #[tokio::test]
+    async fn catch_up_with_no_events_is_noop() {
+        let pool = setup_catch_up_db().await;
+
+        let projection = Projection::<Counter>::sqlite(pool);
+
+        projection.catch_up().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn catch_up_is_idempotent() {
+        let pool = setup_catch_up_db().await;
+
+        insert_event(&pool, "counter-1", 1, &CounterEvent::Created { initial: 0 }).await;
+        insert_event(&pool, "counter-1", 2, &CounterEvent::Incremented).await;
+        insert_event(&pool, "counter-1", 3, &CounterEvent::Incremented).await;
+
+        insert_stale_view(&pool, "counter-1", 1, &Counter { value: 0 }).await;
+
+        let projection = Projection::<Counter>::sqlite(pool.clone());
+
+        projection.catch_up().await.unwrap();
+        projection.catch_up().await.unwrap();
+
+        let result = projection.load(&"counter-1".to_string()).await.unwrap();
+        assert_eq!(result, Some(Counter { value: 2 }));
+
+        // Verify version is correct (should be 3, matching max event sequence)
+        let (version,): (i64,) =
+            sqlx::query_as("SELECT version FROM counter_view WHERE view_id = 'counter-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        assert_eq!(version, 3);
+    }
+
+    #[tokio::test]
+    async fn catch_up_rebuilds_missing_view_row() {
+        let pool = setup_catch_up_db().await;
+
+        // Events exist but no view row (crash before initial view write)
+        insert_event(
+            &pool,
+            "counter-1",
+            1,
+            &CounterEvent::Created { initial: 10 },
+        )
+        .await;
+        insert_event(&pool, "counter-1", 2, &CounterEvent::Incremented).await;
+
+        let projection = Projection::<Counter>::sqlite(pool);
+
+        projection.catch_up().await.unwrap();
+
+        let result = projection.load(&"counter-1".to_string()).await.unwrap();
+        assert_eq!(result, Some(Counter { value: 11 }));
+    }
+
+    #[tokio::test]
+    async fn catch_up_detects_sequence_gap() {
+        let pool = setup_catch_up_db().await;
+
+        // Insert events with a gap: seq 1 and seq 3 (missing seq 2)
+        insert_event(&pool, "counter-1", 1, &CounterEvent::Created { initial: 0 }).await;
+        insert_event(&pool, "counter-1", 3, &CounterEvent::Incremented).await;
+
+        // View at version 1 expects 2 missed events (3 - 1), but only 1 exists
+        insert_stale_view(&pool, "counter-1", 1, &Counter { value: 0 }).await;
+
+        let projection = Projection::<Counter>::sqlite(pool);
+
+        let error = projection.catch_up().await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ProjectionError::EventSequenceGap {
+                    expected: 2,
+                    actual: 1,
+                    ..
+                }
+            ),
+            "expected EventSequenceGap, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn catch_up_fails_on_malformed_payload() {
+        let pool = setup_catch_up_db().await;
+
+        // Insert a valid first event, then a malformed payload at seq 2
+        insert_event(&pool, "counter-1", 1, &CounterEvent::Created { initial: 0 }).await;
+
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+             VALUES (?1, ?2, ?3, ?4, '1.0', ?5, '{}')",
+        )
+        .bind("Counter")
+        .bind("counter-1")
+        .bind(2_i64)
+        .bind("CounterEvent::Incremented")
+        .bind("not valid json {{{")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        insert_stale_view(&pool, "counter-1", 1, &Counter { value: 0 }).await;
+
+        let projection = Projection::<Counter>::sqlite(pool);
+
+        let error = projection.catch_up().await.unwrap_err();
+        assert!(
+            matches!(error, ProjectionError::Serde { .. }),
+            "expected Serde error, got: {error:?}"
+        );
     }
 }

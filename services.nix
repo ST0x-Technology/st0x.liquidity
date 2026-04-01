@@ -1,11 +1,14 @@
 let
-  secrets = name: rec {
+  profileBase = "/nix/var/nix/profiles/per-service";
+
+  paths = name: {
+    profilePath = "${profileBase}/${name}";
     encryptedSecret = "${name}.toml.age";
-    decryptedSecret = "${name}.toml";
-    decryptedSecretPath = "/run/agenix/${decryptedSecret}";
+    configPath = "/run/st0x/${name}.config";
+    decryptedSecretPath = "/run/agenix/${name}.toml";
     markerFile = "/run/st0x/${name}.ready";
   };
-in builtins.mapAttrs (name: attrs: attrs // secrets name) {
+in builtins.mapAttrs (name: attrs: attrs // paths name) {
   st0x-hedge.enabled = false;
   st0x-hedge.bin = "server";
 }

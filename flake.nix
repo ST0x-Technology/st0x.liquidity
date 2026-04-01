@@ -2,23 +2,26 @@
   description = "Flake to rule the world";
 
   inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+
     rainix.url =
       "github:rainprotocol/rainix?rev=6e14de54456eb33821c2f334cf4d250bcc22c121";
+    rainix.inputs.nixpkgs.follows = "nixpkgs";
 
     flake-utils.url = "github:numtide/flake-utils";
     ragenix.url = "github:yaxitech/ragenix";
     deploy-rs.url = "github:serokell/deploy-rs";
 
     bun2nix.url = "github:nix-community/bun2nix?tag=2.0.7";
-    bun2nix.inputs.nixpkgs.follows = "rainix/nixpkgs";
+    bun2nix.inputs.nixpkgs.follows = "nixpkgs";
 
     crane.url = "github:ipetkov/crane";
 
     disko.url = "github:nix-community/disko";
-    disko.inputs.nixpkgs.follows = "rainix/nixpkgs";
+    disko.inputs.nixpkgs.follows = "nixpkgs";
 
     nixos-anywhere.url = "github:nix-community/nixos-anywhere";
-    nixos-anywhere.inputs.nixpkgs.follows = "rainix/nixpkgs";
+    nixos-anywhere.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs = { self, flake-utils, rainix, bun2nix, ragenix, deploy-rs, disko
@@ -27,18 +30,13 @@
       nixosConfigurations.st0x-liquidity =
         rainix.inputs.nixpkgs.lib.nixosSystem {
           system = "x86_64-linux";
-          specialArgs = {
-            dashboard = self.packages.x86_64-linux.st0x-dashboard;
-            inherit (self.packages.x86_64-linux) st0x-liquidity;
-          };
+          specialArgs = { inherit (self.packages.x86_64-linux) st0x-cli; };
 
           modules =
             [ disko.nixosModules.disko ragenix.nixosModules.default ./os.nix ];
         };
 
       deploy = (import ./deploy.nix { inherit deploy-rs self; }).config;
-
-      checks.x86_64-linux = deploy-rs.lib.x86_64-linux.deployChecks self.deploy;
     } // flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import rainix.inputs.nixpkgs {
@@ -65,14 +63,13 @@
           st0xRust = pkgs.callPackage ./rust.nix {
             inherit craneLib;
             inherit (pkgs) sqlx-cli;
-            sol-build-inputs = rainix.sol-build-inputs.${system};
           };
         in rainixPkgs // deployPkgs // {
           inherit (infraPkgs) tfInit tfPlan tfApply tfDestroy tfEditVars;
 
           st0x-dto = st0xRust.dto;
           st0x-liquidity = st0xRust.package;
-          st0x-clippy = st0xRust.clippy;
+          st0x-cli = st0xRust.cli;
 
           st0x-dashboard = pkgs.callPackage ./dashboard {
             bun2nix = bun2nix.packages.${system}.default;
@@ -192,9 +189,9 @@
 
           remote = pkgs.writeShellApplication {
             name = "remote";
-            runtimeInputs = infraPkgs.buildInputs ++ [ pkgs.openssh ];
+            runtimeInputs = infraPkgs.sshBuildInputs ++ [ pkgs.openssh ];
             text = ''
-              ${infraPkgs.resolveIp}
+              ${infraPkgs.resolveHost}
               exec ssh -i "$identity" "root@$host_ip" "$@"
             '';
           };

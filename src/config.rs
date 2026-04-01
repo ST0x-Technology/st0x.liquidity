@@ -150,7 +150,57 @@ struct Config {
     #[serde(rename = "hyperdx")]
     telemetry: Option<TelemetryConfig>,
     rebalancing: Option<RebalancingConfig>,
+    broker: Option<BrokerConfig>,
     assets: AssetsConfig,
+}
+
+/// Non-secret broker settings from the plaintext config TOML.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrokerConfig {
+    travel_rule: TravelRuleConfig,
+}
+
+/// Alpaca Travel Rule beneficiary identity, required for whitelist
+/// creation, effective 2026-03-27.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TravelRuleConfig {
+    pub(crate) beneficiary_entity_name: String,
+}
+
+impl TravelRuleConfig {
+    /// Validates that beneficiary name fields are not blank or placeholder
+    /// values, and returns a normalized copy with trimmed whitespace.
+    fn validated(self) -> Result<Self, CtxError> {
+        let trimmed = self.beneficiary_entity_name.trim();
+
+        if trimmed.is_empty() {
+            return Err(CtxError::InvalidTravelRule {
+                field: "beneficiary_entity_name",
+                reason: "must not be blank",
+            });
+        }
+
+        if trimmed.eq_ignore_ascii_case("PLACEHOLDER") {
+            return Err(CtxError::InvalidTravelRule {
+                field: "beneficiary_entity_name",
+                reason: "must be set to a real value, not a placeholder",
+            });
+        }
+
+        Ok(Self {
+            beneficiary_entity_name: trimmed.to_owned(),
+        })
+    }
+}
+
+impl std::fmt::Debug for TravelRuleConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TravelRuleConfig")
+            .field("beneficiary_entity_name", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Secret credentials deserialized from the encrypted secrets TOML.
@@ -219,6 +269,7 @@ pub struct Ctx {
     pub trading_mode: TradingMode,
     pub execution_threshold: ExecutionThreshold,
     pub(crate) assets: AssetsConfig,
+    pub(crate) travel_rule: Option<TravelRuleConfig>,
 }
 
 /// Runtime broker configuration assembled from `BrokerSecrets`.
@@ -364,6 +415,7 @@ impl std::fmt::Debug for Ctx {
             .field("trading_mode", &self.trading_mode)
             .field("execution_threshold", &self.execution_threshold)
             .field("assets", &self.assets)
+            .field("travel_rule_configured", &self.travel_rule.is_some())
             .finish()
     }
 }
@@ -500,6 +552,15 @@ impl Ctx {
             });
         }
 
+        let travel_rule = config
+            .broker
+            .as_ref()
+            .map(|broker_config| &broker_config.travel_rule);
+
+        if matches!(broker, BrokerCtx::AlpacaBrokerApi(_)) && travel_rule.is_none() {
+            return Err(CtxError::MissingTravelRule);
+        }
+
         Ok(Self {
             database_url: config.database_url,
             log_level,
@@ -514,6 +575,10 @@ impl Ctx {
             trading_mode,
             execution_threshold,
             assets: config.assets,
+            travel_rule: config
+                .broker
+                .map(|broker_config| broker_config.travel_rule.validated())
+                .transpose()?,
         })
     }
 
@@ -590,6 +655,7 @@ impl Ctx {
         assets: AssetsConfig,
         #[builder(default = 2)] inventory_poll_interval: u64,
         execution_threshold_override: Option<ExecutionThreshold>,
+        travel_rule: Option<TravelRuleConfig>,
     ) -> Result<Self, CtxError> {
         let execution_threshold = match execution_threshold_override {
             Some(threshold) => threshold,
@@ -614,6 +680,7 @@ impl Ctx {
             trading_mode,
             execution_threshold,
             assets,
+            travel_rule,
         })
     }
 }
@@ -646,6 +713,11 @@ pub enum CtxError {
     },
     #[error(transparent)]
     InvalidThreshold(#[from] InvalidThresholdError),
+    #[error("invalid travel rule config: {field} {reason}")]
+    InvalidTravelRule {
+        field: &'static str,
+        reason: &'static str,
+    },
     #[error(transparent)]
     Telemetry(#[from] crate::telemetry::TelemetryAssemblyError),
     #[error("operation requires rebalancing mode")]
@@ -676,6 +748,11 @@ pub enum CtxError {
     MissingEquityVaultId { symbol: Symbol },
     #[error("{field} polling interval must be non-zero")]
     ZeroPollingInterval { field: &'static str },
+    #[error(
+        "[broker.travel_rule] is required when using Alpaca Broker API \
+         -- Alpaca rejects whitelist requests without it since 2026-03-27"
+    )]
+    MissingTravelRule,
     #[error("Float comparison failed during config validation: {0}")]
     FloatComparison(#[from] rain_math_float::FloatError),
 }
@@ -711,6 +788,8 @@ impl CtxError {
             Self::MissingEquityVaultId { .. } => "missing equity vault_id",
             Self::ZeroPollingInterval { .. } => "zero polling interval",
             Self::FloatComparison(_) => "float comparison failed",
+            Self::InvalidTravelRule { .. } => "invalid travel rule config",
+            Self::MissingTravelRule => "missing travel rule config",
         }
     }
 }
@@ -786,6 +865,7 @@ pub(crate) mod tests {
                 equities: EquitiesConfig::default(),
                 cash: None,
             },
+            travel_rule: None,
         }
     }
 
@@ -805,6 +885,27 @@ pub(crate) mod tests {
         )
         .unwrap();
         file
+    }
+
+    /// Minimal config with `[broker.travel_rule]` included, for tests
+    /// that use Alpaca Broker API secrets (which now require travel rule
+    /// at startup).
+    fn alpaca_config_toml() -> NamedTempFile {
+        toml_file(
+            r#"
+            database_url = ":memory:"
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            deployment_block = 1
+
+            [broker.travel_rule]
+            beneficiary_entity_name = "Test Entity"
+        "#,
+        )
     }
 
     fn dry_run_secrets_toml() -> NamedTempFile {
@@ -923,6 +1024,111 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(matches!(ctx.broker, BrokerCtx::DryRun));
+    }
+
+    #[tokio::test]
+    async fn travel_rule_parsed_from_broker_section() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            deployment_block = 1
+
+            [broker.travel_rule]
+            beneficiary_entity_name = "T0 TRADE (BVI) LTD"
+        "#,
+        );
+        let secrets = dry_run_secrets_toml();
+        let ctx = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap();
+
+        let travel_rule = ctx.travel_rule.unwrap();
+        assert_eq!(travel_rule.beneficiary_entity_name, "T0 TRADE (BVI) LTD");
+    }
+
+    #[tokio::test]
+    async fn travel_rule_optional_when_broker_section_absent() {
+        let config = minimal_config_toml();
+        let secrets = dry_run_secrets_toml();
+        let ctx = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap();
+
+        assert!(ctx.travel_rule.is_none());
+    }
+
+    #[tokio::test]
+    async fn travel_rule_rejects_placeholder_entity_name() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            deployment_block = 1
+
+            [broker.travel_rule]
+            beneficiary_entity_name = "PLACEHOLDER"
+        "#,
+        );
+        let secrets = dry_run_secrets_toml();
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::InvalidTravelRule {
+                    field: "beneficiary_entity_name",
+                    ..
+                }
+            ),
+            "expected InvalidTravelRule for entity_name, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn travel_rule_rejects_blank_entity_name() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            deployment_block = 1
+
+            [broker.travel_rule]
+            beneficiary_entity_name = "   "
+        "#,
+        );
+        let secrets = dry_run_secrets_toml();
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::InvalidTravelRule {
+                    field: "beneficiary_entity_name",
+                    ..
+                }
+            ),
+            "expected InvalidTravelRule for entity_name, got: {error}"
+        );
     }
 
     #[tokio::test]
@@ -1421,7 +1627,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn alpaca_broker_api_executor_uses_dollar_threshold() {
-        let config = minimal_config_toml();
+        let config = alpaca_config_toml();
         let secrets = toml_file(
             r#"
             [evm]
@@ -1440,6 +1646,32 @@ pub(crate) mod tests {
             .unwrap();
         let expected = ExecutionThreshold::dollar_value(Usdc::new(float!(2))).unwrap();
         assert_eq!(ctx.execution_threshold, expected);
+    }
+
+    #[tokio::test]
+    async fn alpaca_broker_without_travel_rule_fails_at_startup() {
+        let config = minimal_config_toml();
+        let secrets = toml_file(
+            r#"
+            [evm]
+            ws_rpc_url = "ws://localhost:8545"
+
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+        "#,
+        );
+
+        let err = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, CtxError::MissingTravelRule),
+            "Expected MissingTravelRule, got: {err:?}"
+        );
     }
 
     #[test]
@@ -1538,6 +1770,16 @@ pub(crate) mod tests {
             .equities
             .operational_limit
             .map(Positive::inner);
+
+        let broker = config.broker.expect(
+            "prod config must include [broker.travel_rule] — \
+             Alpaca rejects whitelist requests without it, effective 2026-03-27",
+        );
+
+        broker.travel_rule.validated().expect(
+            "prod travel rule config must have real beneficiary names, \
+             not placeholders or blanks",
+        );
 
         for (symbol, equity) in &config.assets.equities.symbols {
             if equity.rebalancing == OperationMode::Enabled
