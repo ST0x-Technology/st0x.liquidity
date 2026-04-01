@@ -4,9 +4,40 @@ let
   buildInputs =
     [ pkgs.terraform pkgs.rage pkgs.jq ragenix.packages.${system}.default ];
 
-  tfState = "infra/terraform.tfstate";
-  tfVars = "infra/terraform.tfvars";
+  sshBuildInputs = [ pkgs.rage ];
+
   tfPlanFile = "infra/tfplan";
+
+  mkEncrypted = { file, role }: {
+    path = file;
+    agePath = "${file}.age";
+    decrypt = ''
+      if [ -f ${file}.age ]; then
+        rage -d -i "$identity" ${file}.age > ${file}
+      fi
+    '';
+    encrypt = ''
+      if [ -f ${file} ]; then
+        nix eval --raw --file ${
+          ../keys.nix
+        } roles.${role} --apply 'builtins.concatStringsSep "\n"' \
+          | rage -e -R /dev/stdin -o ${file}.age ${file}
+      fi
+    '';
+  };
+
+  state = mkEncrypted {
+    file = "infra/terraform.tfstate";
+    role = "infra";
+  };
+  vars = mkEncrypted {
+    file = "infra/terraform.tfvars";
+    role = "infra";
+  };
+  remote = mkEncrypted {
+    file = "infra/.remote";
+    role = "ssh";
+  };
 
   parseIdentity = ''
     set -eo pipefail
@@ -19,77 +50,72 @@ let
       identity="$2"
       shift 2
     else
-      echo "ERROR: -i <identity_file> is required" >&2
-      exit 1
+      identity="$HOME/.ssh/id_ed25519"
+      if [ ! -f "$identity" ]; then
+        echo "ERROR: no -i flag and default key $identity not found" >&2
+        exit 1
+      fi
     fi
   '';
 
-  decryptState = ''
-    if [ -f ${tfState}.age ]; then
-      rage -d -i "$identity" ${tfState}.age > ${tfState}
-    fi
-  '';
-
-  encryptState = ''
-    if [ -f ${tfState} ]; then
-      nix eval --raw --file ${
-        ../keys.nix
-      } roles.infra --apply 'builtins.concatStringsSep "\n"' \
-        | rage -e -R /dev/stdin -o ${tfState}.age ${tfState}
-    fi
-  '';
-
-  cleanup = "rm -f ${tfState} ${tfState}.backup ${tfVars}";
+  cleanup = "rm -f ${state.path} ${state.path}.backup ${vars.path}";
   cleanupWithPlan = "${cleanup} ${tfPlanFile}";
+
+  syncRemote = ''
+    if [ -f ${state.path} ]; then
+      jq -r '.outputs.droplet_ipv4.value' ${state.path} > ${remote.path}
+      ${remote.encrypt}
+      rm -f ${remote.path}
+    fi
+  '';
 
   preamble = ''
     ${parseIdentity}
     on_exit() { ${cleanup}; }
     trap on_exit EXIT
-    ${decryptVars}
+    ${vars.decrypt}
   '';
 
   preambleWithEncrypt = ''
     ${parseIdentity}
     on_exit() {
-      ${encryptState}
+      ${syncRemote}
+      ${state.encrypt}
       ${cleanupWithPlan}
     }
     trap on_exit EXIT
-    ${decryptVars}
+    ${vars.decrypt}
   '';
 
   resolveIp = ''
     ${parseIdentity}
-    trap 'rm -f ${tfState}' EXIT
-    ${decryptState}
-    host_ip=$(jq -r '.outputs.droplet_ipv4.value' ${tfState})
-    rm -f ${tfState}
+    trap 'rm -f ${state.path}' EXIT
+    ${state.decrypt}
+    host_ip=$(jq -r '.outputs.droplet_ipv4.value' ${state.path})
+    rm -f ${state.path}
   '';
 
-  decryptVars = ''
-    rage -d -i "$identity" ${tfVars}.age > ${tfVars}
-  '';
-
-  encryptVars = ''
-    nix eval --raw --file ${
-      ../keys.nix
-    } roles.infra --apply 'builtins.concatStringsSep "\n"' \
-      | rage -e -R /dev/stdin -o ${tfVars}.age ${tfVars}
+  resolveHost = ''
+    ${parseIdentity}
+    ${remote.decrypt}
+    host_ip=$(cat ${remote.path})
+    rm -f ${remote.path}
   '';
 
   tfRekey = ''
     ${parseIdentity}
     on_exit() { ${cleanup}; }
     trap on_exit EXIT
-    ${decryptState}
-    ${encryptState}
-    ${decryptVars}
-    ${encryptVars}
+    ${state.decrypt}
+    ${state.encrypt}
+    ${syncRemote}
+    ${vars.decrypt}
+    ${vars.encrypt}
   '';
 
 in {
-  inherit buildInputs parseIdentity resolveIp tfRekey;
+  inherit buildInputs sshBuildInputs parseIdentity resolveIp resolveHost
+    tfRekey;
 
   tfInit = rainix.mkTask.${system} {
     name = "tf-init";
@@ -105,7 +131,7 @@ in {
     additionalBuildInputs = buildInputs;
     body = ''
       ${preamble}
-      ${decryptState}
+      ${state.decrypt}
       terraform -chdir=infra plan -out=tfplan "$@"
     '';
   };
@@ -115,7 +141,7 @@ in {
     additionalBuildInputs = buildInputs;
     body = ''
       ${preambleWithEncrypt}
-      ${decryptState}
+      ${state.decrypt}
       terraform -chdir=infra apply "$@" tfplan
     '';
   };
@@ -125,7 +151,7 @@ in {
     additionalBuildInputs = buildInputs;
     body = ''
       ${preambleWithEncrypt}
-      ${decryptState}
+      ${state.decrypt}
       terraform -chdir=infra destroy "$@"
     '';
   };
@@ -135,12 +161,12 @@ in {
     additionalBuildInputs = buildInputs;
     body = ''
       ${parseIdentity}
-      on_exit() { rm -f ${tfVars}; }
+      on_exit() { rm -f ${vars.path}; }
       trap on_exit EXIT
 
-      ${decryptVars}
-      ''${EDITOR:-vi} ${tfVars}
-      ${encryptVars}
+      ${vars.decrypt}
+      ''${EDITOR:-vi} ${vars.path}
+      ${vars.encrypt}
     '';
   };
 }

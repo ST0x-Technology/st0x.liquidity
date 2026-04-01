@@ -7,7 +7,7 @@ use std::str::FromStr;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{FractionalShares, Positive, Symbol};
+use crate::{FractionalShares, Positive, Symbol, Usd};
 
 /// Time-in-force specifies how long an order remains active before it expires.
 ///
@@ -51,7 +51,10 @@ pub enum AssetStatus {
 pub use auth::{AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
 pub use executor::AlpacaBrokerApi;
 pub use journal::{JournalResponse, JournalStatus};
-pub use order::{ConversionDirection, CryptoOrderResponse};
+pub use order::{
+    AlpacaLimitOrder, AlpacaLimitPrice, ConversionDirection, CryptoOrderResponse,
+    ParseAlpacaLimitPriceError,
+};
 
 impl fmt::Display for TimeInForce {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -143,6 +146,15 @@ pub enum AlpacaBrokerApiError {
 
     #[error("Asset {symbol} is not tradable on Alpaca")]
     AssetNotTradable { symbol: Symbol },
+
+    #[error(
+        "Limit price {limit_price} exceeds Alpaca's \
+         {max_decimals}-decimal-place precision for this price range"
+    )]
+    InvalidLimitPricePrecision {
+        limit_price: Positive<Usd>,
+        max_decimals: u8,
+    },
 
     #[error("Cash balance {} cannot be converted to cents", format_float_with_fallback(.0))]
     CashBalanceConversion(Float),

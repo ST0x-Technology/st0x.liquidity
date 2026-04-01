@@ -4,4 +4,6 @@ let
 in builtins.listToAttrs (map (name: {
   name = services.${name}.encryptedSecret;
   value.publicKeys = roles.service;
-}) (builtins.attrNames services))
+}) (builtins.attrNames services)) // {
+  "cli.toml.age".publicKeys = roles.service;
+}

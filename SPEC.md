@@ -162,6 +162,9 @@ The bot supports multiple brokers through a unified trait interface:
 
 - API key-based authentication (simpler than OAuth)
 - Market order execution through Alpaca Trading API v2
+- Manual CLI limit orders through Alpaca Broker API for operator intervention
+- Manual Alpaca limit orders use day time-in-force only and can optionally be
+  marked as extended-hours eligible when the asset supports it
 - Order status polling and updates
 - Support for both paper trading and live trading environments
 - Position querying for inventory management

@@ -12,7 +12,7 @@ use rain_math_float::Float;
 use super::auth::{AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx};
 use super::client::AlpacaBrokerApiClient;
 use super::journal::JournalResponse;
-use super::order::{ConversionDirection, CryptoOrderResponse};
+use super::order::{AlpacaLimitOrder, ConversionDirection, CryptoOrderResponse};
 use super::{AlpacaBrokerApiError, AssetStatus, TimeInForce};
 use crate::{
     Executor, FractionalShares, MarketOrder, OrderPlacement, OrderState, OrderStatus, Positive,
@@ -119,19 +119,7 @@ impl Executor for AlpacaBrokerApi {
         order: MarketOrder,
     ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
         let asset = self.get_asset_cached(&order.symbol).await?;
-
-        if asset.status != AssetStatus::Active {
-            return Err(AlpacaBrokerApiError::AssetNotActive {
-                symbol: order.symbol,
-                status: asset.status,
-            });
-        }
-
-        if !asset.tradable {
-            return Err(AlpacaBrokerApiError::AssetNotTradable {
-                symbol: order.symbol,
-            });
-        }
+        Self::validate_asset(&order.symbol, &asset)?;
 
         super::order::place_market_order(&self.client, order, self.time_in_force).await
     }
@@ -233,6 +221,21 @@ impl AlpacaBrokerApi {
             .await
     }
 
+    /// Place a manual Alpaca Broker API limit order for operator intervention.
+    ///
+    /// This stays outside the generic `Executor` trait because automated hedging
+    /// uses market orders only; manual CLI limit orders are an Alpaca-specific
+    /// workflow.
+    pub async fn place_limit_order(
+        &self,
+        order: AlpacaLimitOrder,
+    ) -> Result<OrderPlacement<String>, AlpacaBrokerApiError> {
+        let asset = self.get_asset_cached(&order.symbol).await?;
+        Self::validate_asset(&order.symbol, &asset)?;
+
+        super::order::place_limit_order(&self.client, order).await
+    }
+
     async fn get_asset_cached(&self, symbol: &Symbol) -> Result<CachedAsset, AlpacaBrokerApiError> {
         let symbol_str = symbol.to_string();
 
@@ -255,6 +258,23 @@ impl AlpacaBrokerApi {
 
         Ok(cached)
     }
+
+    fn validate_asset(symbol: &Symbol, asset: &CachedAsset) -> Result<(), AlpacaBrokerApiError> {
+        if asset.status != AssetStatus::Active {
+            return Err(AlpacaBrokerApiError::AssetNotActive {
+                symbol: symbol.clone(),
+                status: asset.status,
+            });
+        }
+
+        if !asset.tradable {
+            return Err(AlpacaBrokerApiError::AssetNotTradable {
+                symbol: symbol.clone(),
+            });
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -267,7 +287,8 @@ mod tests {
     use crate::alpaca_broker_api::auth::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
     };
-    use crate::{Direction, FractionalShares, Positive};
+    use crate::alpaca_broker_api::order::AlpacaLimitPrice;
+    use crate::{Direction, FractionalShares, Positive, Usd};
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b"));
@@ -610,6 +631,32 @@ mod tests {
         })
     }
 
+    fn create_limit_order_mock(server: &MockServer) -> httpmock::Mock<'_> {
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
+                .json_body(json!({
+                    "symbol": "AAPL",
+                    "qty": "100",
+                    "side": "buy",
+                    "type": "limit",
+                    "limit_price": "195.25",
+                    "time_in_force": "day",
+                    "extended_hours": true
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "symbol": "AAPL",
+                    "qty": "100",
+                    "side": "buy",
+                    "status": "new",
+                    "filled_avg_price": null
+                }));
+        })
+    }
+
     #[tokio::test]
     async fn test_place_market_order_fails_for_inactive_asset() {
         let server = MockServer::start();
@@ -849,5 +896,120 @@ mod tests {
         // Asset endpoint should be called twice due to cache expiration
         asset_mock.assert_calls(2);
         order_mock.assert_calls(2);
+    }
+
+    #[tokio::test]
+    async fn test_place_limit_order_succeeds_for_active_tradable_asset() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let account_mock = create_account_mock(&server);
+        let asset_mock = create_asset_mock(&server, "AAPL", "active", true);
+        let order_mock = create_limit_order_mock(&server);
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let order = AlpacaLimitOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(
+                Float::parse("100".to_string()).unwrap(),
+            ))
+            .unwrap(),
+            direction: Direction::Buy,
+            limit_price: AlpacaLimitPrice::try_new(
+                Positive::new(Usd::new(Float::parse("195.25".to_string()).unwrap())).unwrap(),
+            )
+            .unwrap(),
+            extended_hours: true,
+        };
+
+        let result = executor.place_limit_order(order).await.unwrap();
+
+        asset_mock.assert();
+        order_mock.assert();
+        assert_eq!(result.order_id, "61e7b016-9c91-4a97-b912-615c9d365c9d");
+        assert_eq!(result.symbol, Symbol::new("AAPL").unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_place_limit_order_fails_for_inactive_asset() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let account_mock = create_account_mock(&server);
+        let asset_mock = create_asset_mock(&server, "AAPL", "inactive", true);
+        let order_mock = create_order_mock(&server);
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let order = AlpacaLimitOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(
+                Float::parse("100".to_string()).unwrap(),
+            ))
+            .unwrap(),
+            direction: Direction::Buy,
+            limit_price: AlpacaLimitPrice::try_new(
+                Positive::new(Usd::new(Float::parse("195.25".to_string()).unwrap())).unwrap(),
+            )
+            .unwrap(),
+            extended_hours: true,
+        };
+
+        let result = executor.place_limit_order(order).await;
+
+        asset_mock.assert();
+        order_mock.assert_calls(0);
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                AlpacaBrokerApiError::AssetNotActive { symbol, status }
+                    if *symbol == Symbol::new("AAPL").unwrap() && *status == AssetStatus::Inactive
+            ),
+            "Expected AssetNotActive error, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_place_limit_order_fails_for_non_tradable_asset() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let account_mock = create_account_mock(&server);
+        let asset_mock = create_asset_mock(&server, "AAPL", "active", false);
+        let order_mock = create_order_mock(&server);
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let order = AlpacaLimitOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(
+                Float::parse("100".to_string()).unwrap(),
+            ))
+            .unwrap(),
+            direction: Direction::Buy,
+            limit_price: AlpacaLimitPrice::try_new(
+                Positive::new(Usd::new(Float::parse("195.25".to_string()).unwrap())).unwrap(),
+            )
+            .unwrap(),
+            extended_hours: true,
+        };
+
+        let result = executor.place_limit_order(order).await;
+
+        asset_mock.assert();
+        order_mock.assert_calls(0);
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                AlpacaBrokerApiError::AssetNotTradable { symbol } if *symbol == Symbol::new("AAPL").unwrap()
+            ),
+            "Expected AssetNotTradable error, got: {err:?}"
+        );
     }
 }

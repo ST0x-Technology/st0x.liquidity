@@ -36,12 +36,13 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use cqrs_es::Query;
+use cqrs_es::persist::PersistenceError;
 use sqlx::SqlitePool;
 
 use crate::Nil;
 use crate::dependency::HasEntity;
 use crate::lifecycle::{Lifecycle, ReactorBridge};
-use crate::projection::{Projection, Table};
+use crate::projection::{Projection, ProjectionError, Table};
 use crate::reactor::Reactor;
 use crate::schema_registry::{ReconcileError, Reconciler};
 use crate::{EventSourced, Store};
@@ -109,6 +110,19 @@ where
             .await?;
 
         let projection = Arc::new(Projection::sqlite(self.pool.clone()));
+
+        // Replay any events the view missed due to a crash between
+        // event persistence and view update. Runs before registering
+        // the projection as a reactor so no concurrent writes can
+        // interfere.
+        projection.catch_up().await.map_err(|error| match error {
+            ProjectionError::Sqlx(sqlx_error) => ReconcileError::from(sqlx_error),
+            ProjectionError::Persistence(persistence_error) => {
+                ReconcileError::from(persistence_error)
+            }
+            other => ReconcileError::Persistence(PersistenceError::UnknownError(Box::new(other))),
+        })?;
+
         self.queries.push(Box::new(ReactorBridge {
             reactor: projection.clone(),
         }));

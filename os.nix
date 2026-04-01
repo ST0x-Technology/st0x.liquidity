@@ -1,4 +1,4 @@
-{ pkgs, lib, modulesPath, dashboard, st0x-liquidity, ... }:
+{ pkgs, lib, modulesPath, st0x-cli, ... }:
 
 let
   inherit (import ./keys.nix) roles;
@@ -6,56 +6,50 @@ let
   services = import ./services.nix;
   enabledServices = lib.filterAttrs (_: v: v.enabled) services;
 
-  hedgeCfg = services.st0x-hedge;
-
   cli = pkgs.writeShellApplication {
     name = "stox";
-    runtimeInputs = [ st0x-liquidity ];
+    runtimeInputs = [ st0x-cli ];
     text = ''
       exec cli \
-        --config "''${STOX_CONFIG:-${./config/st0x-hedge.toml}}" \
-        --secrets "''${STOX_SECRETS:-${hedgeCfg.decryptedSecretPath}}" \
+        --config "''${STOX_CONFIG:-${./config/cli.toml}}" \
+        --secrets "''${STOX_SECRETS:-/run/agenix/cli.toml}" \
         "$@"
     '';
   };
 
-  mkService = name: cfg:
-    let
-      path = "/nix/var/nix/profiles/per-service/${name}/bin/${cfg.bin}";
-      configFile = ./config/${name}.toml;
-    in {
-      description = "st0x ${cfg.bin} (${name})";
+  mkService = name: cfg: {
+    description = "st0x ${cfg.bin} (${name})";
 
-      # Service is started by deploy.nix profile, not by systemd on boot.
-      # This avoids coordination issues during deployments.
-      wantedBy = [ ];
+    # Service is started by deploy.nix profile, not by systemd on boot.
+    # This avoids coordination issues during deployments.
+    wantedBy = [ ];
 
-      restartIfChanged = false;
-      stopIfChanged = false;
+    restartIfChanged = false;
+    stopIfChanged = false;
 
-      unitConfig = {
-        "X-OnlyManualStart" = true;
+    unitConfig = {
+      "X-OnlyManualStart" = true;
 
-        # Marker file created ONLY by service profile activation.
-        # Guarantees service is SKIPPED (not failed) during system activation.
-        ConditionPathExists = cfg.markerFile;
-      };
-
-      serviceConfig = {
-        DynamicUser = true;
-        SupplementaryGroups = [ "st0x" ];
-        ExecStart = builtins.concatStringsSep " " [
-          path
-          "--config"
-          "${configFile}"
-          "--secrets"
-          cfg.decryptedSecretPath
-        ];
-        Restart = "always";
-        RestartSec = 5;
-        ReadWritePaths = [ "/mnt/data" ];
-      };
+      # Marker file created ONLY by service profile activation.
+      # Guarantees service is SKIPPED (not failed) during system activation.
+      ConditionPathExists = cfg.markerFile;
     };
+
+    serviceConfig = {
+      DynamicUser = true;
+      SupplementaryGroups = [ "st0x" ];
+      ExecStart = builtins.concatStringsSep " " [
+        "${cfg.profilePath}/bin/${cfg.bin}"
+        "--config"
+        cfg.configPath
+        "--secrets"
+        cfg.decryptedSecretPath
+      ];
+      Restart = "always";
+      RestartSec = 5;
+      ReadWritePaths = [ "/mnt/data" ];
+    };
+  };
 
 in {
   imports = [
@@ -123,7 +117,7 @@ in {
       enable = true;
       virtualHosts.default = {
         default = true;
-        root = "${dashboard}";
+        root = "/nix/var/nix/profiles/per-service/dashboard";
 
         locations = let
           wsProxy = port: {
@@ -143,7 +137,7 @@ in {
     };
 
     grafana = {
-      enable = true;
+      enable = false;
       settings.server = {
         http_addr = "0.0.0.0";
         http_port = 3000;
@@ -188,12 +182,13 @@ in {
   users.groups.st0x = { };
   programs.bash.interactiveShellInit = "set -o vi";
 
-  age.secrets = lib.mapAttrs' (_: cfg:
-    lib.nameValuePair cfg.decryptedSecret {
-      file = ./secret/${cfg.encryptedSecret};
+  age.secrets = {
+    "cli.toml" = {
+      file = ./secret/cli.toml.age;
       group = "st0x";
       mode = "0640";
-    }) services;
+    };
+  };
   systemd.tmpfiles.rules = [ "d /mnt/data/grafana 0750 grafana grafana -" ];
   systemd.services = lib.mapAttrs mkService enabledServices;
 
