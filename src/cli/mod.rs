@@ -6,6 +6,7 @@ mod cctp;
 mod rebalancing;
 mod trading;
 mod vault;
+mod wrapper;
 
 use alloy::primitives::{Address, B256, TxHash};
 use alloy::providers::{ProviderBuilder, WsConnect};
@@ -131,6 +132,16 @@ pub enum Commands {
         /// Number of shares to transfer (supports fractional shares)
         #[arg(short = 'q', long = "quantity")]
         quantity: FractionalShares,
+    },
+
+    /// Unwrap wrapped ERC-4626 equity shares into the underlying tokenized equity
+    UnwrapEquity {
+        /// Stock symbol (e.g., AAPL, TSLA)
+        #[arg(short = 's', long = "symbol")]
+        symbol: Symbol,
+        /// Number of wrapped shares to unwrap (must be positive)
+        #[arg(short = 'q', long = "quantity", value_parser = parse_positive_shares)]
+        quantity: Positive<FractionalShares>,
     },
 
     /// Transfer USDC between trading venues (Raindex <-> Alpaca)
@@ -470,6 +481,10 @@ enum SimpleCommand {
         symbol: Symbol,
         quantity: FractionalShares,
     },
+    UnwrapEquity {
+        symbol: Symbol,
+        quantity: Positive<FractionalShares>,
+    },
     AlpacaDeposit {
         amount: Usdc,
     },
@@ -606,6 +621,9 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             symbol,
             quantity,
         }),
+        Commands::UnwrapEquity { symbol, quantity } => {
+            Ok(SimpleCommand::UnwrapEquity { symbol, quantity })
+        }
         Commands::AlpacaDeposit { amount } => Ok(SimpleCommand::AlpacaDeposit { amount }),
         Commands::AlpacaWithdraw { amount, to_address } => {
             Ok(SimpleCommand::AlpacaWithdraw { amount, to_address })
@@ -745,6 +763,9 @@ async fn run_simple_command<W: Write>(
         } => {
             rebalancing::transfer_equity_command(stdout, direction, &symbol, quantity, ctx, pool)
                 .await
+        }
+        SimpleCommand::UnwrapEquity { symbol, quantity } => {
+            wrapper::unwrap_equity_command(stdout, symbol, quantity, ctx).await
         }
         SimpleCommand::AlpacaDeposit { amount } => {
             alpaca_wallet::alpaca_deposit_command::<OpenChainErrorRegistry, _>(stdout, amount, ctx)
@@ -1463,6 +1484,15 @@ mod tests {
         assert!(message.contains("positive"), "unexpected error: {message}");
     }
 
+    #[test]
+    fn test_unwrap_equity_command_rejects_zero_quantity() {
+        let error =
+            Cli::try_parse_from(["schwab", "unwrap-equity", "-s", "AAPL", "-q", "0"]).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("positive"), "unexpected error: {message}");
+    }
+
     const TEST_ORDERBOOK: Address = address!("0x1234567890123456789012345678901234567890");
 
     fn enabled_equity() -> EquityAssetConfig {
@@ -1756,6 +1786,17 @@ mod tests {
         let cli = Cli::try_parse_from(["schwab", "sell", "-s", "SPYM", "-q", "6.15"]).unwrap();
         let Commands::Sell { quantity, .. } = cli.command else {
             panic!("expected sell command");
+        };
+
+        assert_eq!(quantity, positive_shares("6.15"));
+    }
+
+    #[test]
+    fn test_unwrap_equity_command_parses_fractional_quantity() {
+        let cli =
+            Cli::try_parse_from(["schwab", "unwrap-equity", "-s", "SPYM", "-q", "6.15"]).unwrap();
+        let Commands::UnwrapEquity { quantity, .. } = cli.command else {
+            panic!("expected unwrap-equity command");
         };
 
         assert_eq!(quantity, positive_shares("6.15"));
@@ -2760,6 +2801,26 @@ mod tests {
             "transfer-equity to-alpaca should succeed: {:?}",
             result.err()
         );
+    }
+
+    #[test]
+    fn test_unwrap_equity_command_structure() {
+        let cmd = Cli::command();
+
+        cmd.clone()
+            .try_get_matches_from(vec!["cli", "unwrap-equity"])
+            .unwrap_err();
+
+        cmd.clone()
+            .try_get_matches_from(vec!["cli", "unwrap-equity", "-s", "AAPL"])
+            .unwrap_err();
+
+        cmd.clone()
+            .try_get_matches_from(vec!["cli", "unwrap-equity", "-q", "10.5"])
+            .unwrap_err();
+
+        cmd.try_get_matches_from(vec!["cli", "unwrap-equity", "-s", "AAPL", "-q", "10.5"])
+            .unwrap();
     }
 
     #[test]
