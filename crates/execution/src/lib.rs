@@ -38,6 +38,7 @@ pub use schwab::{Schwab, SchwabCtx, SchwabError, SchwabTokens, extract_code_from
 
 pub use st0x_finance::{
     EmptySymbolError, FractionalShares, HasZero, NotPositive, Positive, Symbol, ToWholeSharesError,
+    Usd,
 };
 
 /// Extension trait for U256 conversions on `FractionalShares`.

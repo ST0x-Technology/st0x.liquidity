@@ -28,6 +28,8 @@ markets by providing continuous two-sided liquidity.
   offchain hedge executions
 - **Exposure Hedging**: Automatically executes offsetting trades to reduce
   directional exposure from onchain fills
+- **Operator Vault Controls**: CLI supports generic ERC20 deposits to and
+  withdrawals from Raindex vaults, with a USDC-specific withdrawal shortcut
 
 ## Getting Started
 
@@ -77,6 +79,20 @@ available options.
 ```bash
 cargo run --bin server -- --config path/to/config.toml --secrets path/to/secrets.toml
 cargo run --bin reporter -- --config path/to/config.toml
+```
+
+Manual wrap of tokenized equity into wrapped vault shares (requires rebalancing
+mode and a configured Base liquidity wallet):
+
+```bash
+cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml wrap-equity --symbol AAPL --quantity 10.5
+```
+
+Manual unwrap of wrapped equity shares (requires rebalancing mode and a
+configured Base liquidity wallet):
+
+```bash
+cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml unwrap-equity --symbol AAPL --quantity 10.5
 ```
 
 ### Brokerage Setup
