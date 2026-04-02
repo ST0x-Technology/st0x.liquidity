@@ -48,6 +48,15 @@ stox buy -s COIN -q 10
 The command submits the order but does **not** wait for the fill. Check the
 Alpaca dashboard to confirm the order filled before proceeding.
 
+`buy` and `sell` accept fractional quantities for brokers that support them:
+
+```
+stox buy -s COIN -q 6.15
+stox sell -s COIN -q 2.5
+```
+
+Schwab still rejects fractional `buy` and `sell` orders. Use whole shares there.
+
 **Step 2: Tokenize (mint) onchain**
 
 ```
@@ -77,6 +86,90 @@ stox alpaca-redeem -s COIN -q 10 \
 ```
 stox sell -s COIN -q 10
 ```
+
+### Manual Alpaca Broker API Limit Orders
+
+For manual operator intervention, `buy` and `sell` can place limit orders when
+the configured broker is Alpaca Broker API:
+
+```
+stox buy -s COIN -q 10 --limit-price 195.25
+stox sell -s COIN -q 5.5 --limit-price 201.00
+```
+
+Extended-hours limit orders are supported with `--extended-hours`:
+
+```
+stox buy -s COIN -q 10 --limit-price 195.25 --extended-hours
+```
+
+- `--extended-hours` requires `--limit-price`
+- `--limit-price` is only supported with Alpaca Broker API
+- `--time-in-force` cannot be combined with `--limit-price`
+- limit-order commands submit the order and return the Alpaca order ID; they do
+  not wait for the fill
+
+## Raindex Vault Operations
+
+### Generic ERC20 Vault Withdrawals
+
+`vault-withdraw` can withdraw arbitrary ERC20s from a Raindex vault to the
+configured Base liquidity wallet:
+
+```
+stox vault-withdraw \
+  -a 10.5 \
+  -t 0x626757e6f50675d17fcad312e82f989ae7a23d38 \
+  -v 0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+```
+
+- `-a` is a human-readable token amount
+- `-t` is the ERC20 token address
+- `-v` is the Raindex vault ID
+- token decimals are resolved automatically from onchain metadata
+
+### USDC Cash Vault Shortcut
+
+The old USDC-specific withdrawal flow still exists as a convenience wrapper:
+
+```
+stox vault-withdraw-usdc -a 250
+```
+
+This resolves `assets.cash.vault_id` from config and forwards into the generic
+vault withdrawal logic.
+
+### Wrap Tokenized Equity Into Wrapped Vault Shares
+
+`wrap-equity` deposits tokenized equity into the configured ERC-4626 vault and
+returns wrapped vault shares:
+
+```
+stox wrap-equity -s AAPL -q 10.5
+```
+
+This command:
+
+- requires rebalancing mode
+- uses the configured Base liquidity wallet
+- resolves the wrapped and underlying token addresses from config
+- prints the transaction hash and wrapped amount received
+
+### Unwrap Wrapped Vault Shares Into Tokenized Equity
+
+`unwrap-equity` redeems wrapped ERC-4626 vault shares back into the underlying
+tokenized equity:
+
+```
+stox unwrap-equity -s AAPL -q 10.5
+```
+
+This command:
+
+- requires rebalancing mode
+- uses the configured Base liquidity wallet
+- resolves the wrapped and underlying token addresses from config
+- prints the transaction hash and underlying amount received
 
 ### Checking Order Status
 
