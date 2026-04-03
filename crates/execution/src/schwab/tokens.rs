@@ -176,7 +176,7 @@ impl SchwabTokens {
 
     #[cfg(test)]
     pub(crate) async fn db_count(pool: &SqlitePool) -> Result<i64, SchwabError> {
-        let count = sqlx::query_scalar!("SELECT COUNT(*) FROM schwab_auth")
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schwab_auth")
             .fetch_one(pool)
             .await?;
         Ok(count)
