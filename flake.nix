@@ -196,6 +196,61 @@
             '';
           };
 
+          prodStatus = pkgs.writeShellApplication {
+            name = "prod-status";
+            runtimeInputs = infraPkgs.sshBuildInputs
+              ++ [ pkgs.openssh pkgs.curl pkgs.jq ];
+            text = ''
+              ${infraPkgs.resolveHost}
+              export identity host_ip
+              exec bash scripts/prod-status.sh "$@"
+            '';
+          };
+
+          botStart = pkgs.writeShellApplication {
+            name = "bot-start";
+            runtimeInputs = infraPkgs.sshBuildInputs ++ [ pkgs.openssh ];
+            text = ''
+              ${infraPkgs.resolveHost}
+              echo "Starting st0x-hedge on prod..."
+              ssh -i "$identity" "root@$host_ip" "mkdir -p /run/st0x && touch /run/st0x/st0x-hedge.ready && systemctl start st0x-hedge"
+              ssh -i "$identity" "root@$host_ip" systemctl is-active st0x-hedge
+            '';
+          };
+
+          botStop = pkgs.writeShellApplication {
+            name = "bot-stop";
+            runtimeInputs = infraPkgs.sshBuildInputs ++ [ pkgs.openssh ];
+            text = ''
+              ${infraPkgs.resolveHost}
+              echo "Stopping st0x-hedge on prod..."
+              ssh -i "$identity" "root@$host_ip" "systemctl stop st0x-hedge && rm -f /run/st0x/st0x-hedge.ready"
+              echo "Stopped."
+            '';
+          };
+
+          botRestart = pkgs.writeShellApplication {
+            name = "bot-restart";
+            runtimeInputs = infraPkgs.sshBuildInputs ++ [ pkgs.openssh ];
+            text = ''
+              ${infraPkgs.resolveHost}
+              echo "Restarting st0x-hedge on prod..."
+              ssh -i "$identity" "root@$host_ip" "mkdir -p /run/st0x && touch /run/st0x/st0x-hedge.ready && systemctl restart st0x-hedge"
+              ssh -i "$identity" "root@$host_ip" systemctl is-active st0x-hedge
+            '';
+          };
+
+          prodDashboard = pkgs.writeShellApplication {
+            name = "prod-dashboard";
+            runtimeInputs = infraPkgs.sshBuildInputs
+              ++ [ pkgs.openssh pkgs.bun ];
+            text = ''
+              ${infraPkgs.resolveHost}
+              export identity host_ip
+              exec bash scripts/prod-dashboard.sh "$@"
+            '';
+          };
+
         };
 
         formatter = pkgs.nixfmt-classic;
@@ -221,6 +276,11 @@
               packages.deployNixos
               packages.deployService
               packages.deployAll
+              packages.prodStatus
+              packages.prodDashboard
+              packages.botStart
+              packages.botStop
+              packages.botRestart
             ] ++ rainix.devShells.${system}.default.buildInputs;
         };
       });

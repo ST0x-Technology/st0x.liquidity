@@ -30,7 +30,7 @@ rec {
     # this is for both accessing terraform secrets and encrypted state
     # but the only reason you need one without the other is because ssh
     # requires decoding terraform state just to get the host ip address
-    infra = [ st0x-op ci ];
+    infra = [ st0x-op ci juan ];
 
     # this role was meant to be for the ability to ssh into the machine
     # but in the future we should restrict what that exactly means in
