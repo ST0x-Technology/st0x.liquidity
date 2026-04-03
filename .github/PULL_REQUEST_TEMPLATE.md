@@ -1,27 +1,23 @@
-<!-- Thanks for your Pull Request, please read the contributing guidelines before submitting. -->
+## What
 
-## Motivation
+<!-- Link relevant issues first, then describe what this PR does. -->
 
-<!--
-Explain the context and why you're making that change. What is the problem
-you're trying to solve? In some cases there is not a problem and this can be
-thought of as being the motivation for your change.
--->
+## Why
 
-## Solution
+<!-- Why is this change needed? -->
 
-<!--
-Summarize the solution and provide any necessary context needed to understand
-the code change.
--->
+## How
 
-## Checks
+<!-- How does it work? Summarize the approach and any key design decisions. -->
 
-<!-- It's important you've done these, or your PR will not be considered for review -->
+## Testing
 
-By submitting this for review, I'm confirming I've done the following:
+<!-- How was this tested? What test coverage was added? -->
 
-- [ ] added comprehensive test coverage for any changes in logic
-- [ ] made this PR as small as possible
-- [ ] linked any relevant issues or PRs
-- [ ] included screenshots (if this involves a change to the dashboard)
+## Screenshots
+
+<!-- If applicable, add screenshots or recordings. -->
+
+## Anything else
+
+<!-- Any additional context, trade-offs, or follow-up work. -->

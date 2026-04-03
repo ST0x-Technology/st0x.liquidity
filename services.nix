@@ -9,6 +9,6 @@ let
     markerFile = "/run/st0x/${name}.ready";
   };
 in builtins.mapAttrs (name: attrs: attrs // paths name) {
-  st0x-hedge.enabled = false;
+  st0x-hedge.enabled = true;
   st0x-hedge.bin = "server";
 }

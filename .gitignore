@@ -18,3 +18,4 @@ out/
 cache/
 .tmp/
 .bacon-locations
+claude-local-ctx/
