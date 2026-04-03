@@ -26,10 +26,8 @@ fn main() {
 
         let trimmed = line.trim();
 
-        let decoded = match Float::from_hex(trimmed) {
-            Ok(float) => format_float_with_fallback(&float),
-            Err(_) => line,
-        };
+        let decoded =
+            Float::from_hex(trimmed).map_or(line, |float| format_float_with_fallback(&float));
 
         if writeln!(out, "{decoded}").is_err() {
             break;

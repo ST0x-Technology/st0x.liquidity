@@ -272,6 +272,7 @@
               packages.prepSolArtifacts
               packages.secret
               packages.rekey
+              packages.tfRekey
               packages.remote
               packages.deployNixos
               packages.deployService
