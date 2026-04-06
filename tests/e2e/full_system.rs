@@ -135,6 +135,7 @@ fn build_full_system_ctx<P: Provider + Clone>(
 }
 
 #[tokio::test]
+#[ignore = "long-running system test -- run explicitly with --run-ignored"]
 #[allow(clippy::too_many_lines)]
 async fn full_system() -> anyhow::Result<()> {
     crate::test_infra::init_tracing();
