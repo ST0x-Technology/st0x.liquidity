@@ -1424,4 +1424,36 @@ mod tests {
         assert_eq!(dto.usdc.onchain_available, Usdc::ZERO);
         assert_eq!(dto.usdc.offchain_available, Usdc::ZERO);
     }
+
+    #[test]
+    fn remove_from_nonexistent_venue_creates_negative_balance() {
+        let inventory: Inventory<FractionalShares> = Inventory {
+            onchain: None,
+            offchain: None,
+            last_rebalancing: None,
+        };
+
+        let update = Inventory::available(Venue::Hedging, Operator::Remove, shares(5));
+        let result = update(inventory).unwrap();
+
+        let offchain = result.offchain.unwrap();
+        assert!(offchain.available().inner().eq(float!(-5)).unwrap());
+        assert!(offchain.inflight().inner().eq(float!(0)).unwrap());
+    }
+
+    #[test]
+    fn add_to_nonexistent_venue_creates_positive_balance() {
+        let inventory: Inventory<FractionalShares> = Inventory {
+            onchain: None,
+            offchain: None,
+            last_rebalancing: None,
+        };
+
+        let update = Inventory::available(Venue::Hedging, Operator::Add, shares(5));
+        let result = update(inventory).unwrap();
+
+        let offchain = result.offchain.unwrap();
+        assert!(offchain.available().inner().eq(float!(5)).unwrap());
+        assert!(offchain.inflight().inner().eq(float!(0)).unwrap());
+    }
 }

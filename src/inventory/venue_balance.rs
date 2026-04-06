@@ -144,15 +144,14 @@ where
     }
 
     /// Remove amount from available.
+    ///
+    /// Unlike [`move_to_inflight`](Self::move_to_inflight), this allows the
+    /// balance to go negative. Negative available represents a short position
+    /// at the hedging venue (broker), which is a valid state when the system
+    /// sells shares it doesn't hold. On-chain venues are protected by smart
+    /// contract invariants, so the negativity guard is unnecessary there too.
     pub(super) fn remove_available(self, amount: T) -> Result<Self, InventoryError<T>> {
         let new_available = (self.available - amount)?;
-
-        if new_available.is_negative()? {
-            return Err(InventoryError::InsufficientAvailable {
-                requested: amount,
-                available: self.available,
-            });
-        }
 
         Ok(Self {
             available: new_available,
@@ -346,16 +345,15 @@ mod tests {
     }
 
     #[test]
-    fn remove_available_fails_when_insufficient() {
+    fn remove_available_allows_negative_balance() {
         let balance = equity_balance(10, 50);
         let amount = FractionalShares::new(float!(30));
 
-        let result = balance.remove_available(amount);
+        let result = balance.remove_available(amount).unwrap();
 
-        assert!(matches!(
-            result.unwrap_err(),
-            InventoryError::InsufficientAvailable { .. }
-        ));
+        // Available goes negative (short position at the broker)
+        assert!(result.available().inner().eq(float!(-20)).unwrap());
+        assert!(result.inflight().inner().eq(float!(50)).unwrap());
     }
 
     #[test]
