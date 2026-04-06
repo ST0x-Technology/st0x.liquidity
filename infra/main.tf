@@ -31,3 +31,34 @@ resource "digitalocean_reserved_ip_assignment" "nixos" {
   ip_address = digitalocean_reserved_ip.nixos.ip_address
   droplet_id = digitalocean_droplet.nixos.id
 }
+
+resource "digitalocean_firewall" "st0x" {
+  name        = "st0x-liquidity"
+  droplet_ids = [digitalocean_droplet.nixos.id]
+
+  # Tailscale WireGuard — must be publicly reachable for NAT traversal.
+  # Authentication is handled by WireGuard's Noise protocol, not by IP filtering.
+  inbound_rule {
+    protocol         = "udp"
+    port_range       = "41641"
+    source_addresses = ["0.0.0.0/0", "::/0"]
+  }
+
+  # All outbound
+  outbound_rule {
+    protocol              = "tcp"
+    port_range            = "1-65535"
+    destination_addresses = ["0.0.0.0/0", "::/0"]
+  }
+
+  outbound_rule {
+    protocol              = "udp"
+    port_range            = "1-65535"
+    destination_addresses = ["0.0.0.0/0", "::/0"]
+  }
+
+  outbound_rule {
+    protocol              = "icmp"
+    destination_addresses = ["0.0.0.0/0", "::/0"]
+  }
+}

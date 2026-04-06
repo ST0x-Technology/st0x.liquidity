@@ -177,6 +177,11 @@ jobs:
 
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
@@ -184,12 +189,11 @@ jobs:
           echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
 
-      - name: Resolve and mask host IP
+      - name: Resolve deploy host via Tailscale
         run: |
-          host_ip=$(nix run .#resolveIp)
-          echo "::add-mask::$host_ip"
-          host_key=$(nix eval --raw --file keys.nix keys.host)
-          echo "$host_ip $host_key" > ~/.ssh/known_hosts
+          DEPLOY_HOST=$(nix eval --raw --file keys.nix tailscaleHost)
+          echo "DEPLOY_HOST=$DEPLOY_HOST" >> "$GITHUB_ENV"
+          echo "::add-mask::$DEPLOY_HOST"
 
       - name: Build Solidity artifacts
         run: nix run .#prepSolArtifacts

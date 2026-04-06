@@ -95,11 +95,17 @@ let
     rm -f ${state.path}
   '';
 
+  inherit (import ../keys.nix) tailscaleHost;
+
   resolveHost = ''
     ${parseIdentity}
-    ${remote.decrypt}
-    host_ip=$(cat ${remote.path})
-    rm -f ${remote.path}
+    if tailscale status >/dev/null 2>&1; then
+      host_ip="${tailscaleHost}"
+    else
+      ${remote.decrypt}
+      host_ip=$(cat ${remote.path})
+      rm -f ${remote.path}
+    fi
   '';
 
   tfRekey = ''

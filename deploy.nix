@@ -69,8 +69,13 @@ in {
         ++ [ deploy-rs.packages.${localSystem}.deploy-rs pkgs.openssh ];
 
       deployPreamble = ''
-        ${infraPkgs.resolveIp}
-        export DEPLOY_HOST="$host_ip"
+        if [ -n "''${DEPLOY_HOST:-}" ]; then
+          host_ip="$DEPLOY_HOST"
+          echo "Using pre-set DEPLOY_HOST=$host_ip"
+        else
+          ${infraPkgs.resolveIp}
+          export DEPLOY_HOST="$host_ip"
+        fi
 
         # Verify host key against keys.nix trust anchor
         scanned=$(ssh-keyscan -t ed25519 "$host_ip" 2>/dev/null | grep -v '^#')
