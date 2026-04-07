@@ -1,4 +1,4 @@
-server_port = 8001
+server_port = 8000
 log_level = "debug"
 database_url = "sqlite:///mnt/data/st0x-hedge.db"
 hyperdx.service_name = "st0x-liquidity"
@@ -18,7 +18,7 @@ rebalancing = "disabled"
 # operational_limit = 0.01
 
 [assets.equities.RKLB]
-trading = "enabled"
+trading = "disabled"
 rebalancing = "disabled"
 # operational_limit = 1
 

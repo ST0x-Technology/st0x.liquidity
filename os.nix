@@ -131,7 +131,12 @@ in {
           };
         in {
           "/".tryFiles = "$uri $uri/ /index.html";
-          "/api/alpaca/ws" = wsProxy 8081;
+        } // lib.optionalAttrs services.st0x-hedge.enabled {
+          # Production service (st0x-hedge, port 8000)
+          "/api/alpaca/ws" = wsProxy 8000;
+        } // lib.optionalAttrs services.st0x-experimental.enabled {
+          # Experimental service (st0x-experimental, port 8001)
+          "/experimental/api/alpaca/ws" = wsProxy 8001;
         };
       };
     };
