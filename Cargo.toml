@@ -133,7 +133,8 @@ rust-version = "1.89"
 
 [features]
 default = ["all-wallets"]
-all-wallets = ["wallet-private-key", "wallet-turnkey"]
+all-wallets = ["wallet-fireblocks", "wallet-private-key", "wallet-turnkey"]
+wallet-fireblocks = ["st0x-evm/fireblocks"]
 wallet-turnkey = ["st0x-evm/turnkey"]
 wallet-private-key = ["st0x-evm/local-signer"]
 

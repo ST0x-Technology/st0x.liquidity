@@ -3450,6 +3450,43 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "wallet-fireblocks")]
+    fn valid_fireblocks_rebalancing_config_toml() -> &'static str {
+        r#"
+            redemption_wallet = "0x1234567890123456789012345678901234567890"
+
+            [wallet]
+            kind = "fireblocks"
+            vault_account_id = "0"
+            environment = "sandbox"
+
+            [wallet.chain_asset_ids]
+            1 = "ETH"
+            8453 = "BASECHAIN_ETH"
+
+            [equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [usdc]
+            mode = "enabled"
+            target = "0.5"
+            deviation = "0.3"
+        "#
+    }
+
+    #[cfg(feature = "wallet-fireblocks")]
+    fn valid_fireblocks_rebalancing_secrets_toml() -> &'static str {
+        r#"
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://eth.example.com"
+
+            [wallet]
+            api_key = "fireblocks-api-key"
+            api_private_key_path = "/tmp/fireblocks-api-private-key.pem"
+        "#
+    }
+
     #[test]
     fn deserialize_config_succeeds() {
         let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
@@ -3472,6 +3509,38 @@ mod tests {
     fn deserialize_secrets_succeeds() {
         let _secrets: RebalancingSecrets =
             toml::from_str(&valid_rebalancing_secrets_toml()).unwrap();
+    }
+
+    #[cfg(feature = "wallet-fireblocks")]
+    #[test]
+    fn deserialize_fireblocks_config_and_secrets_succeeds() {
+        let config: RebalancingConfig =
+            toml::from_str(valid_fireblocks_rebalancing_config_toml()).unwrap();
+        let secrets: RebalancingSecrets =
+            toml::from_str(valid_fireblocks_rebalancing_secrets_toml()).unwrap();
+        let WalletKindTag { kind } = WalletKindTag::deserialize(config.wallet.clone()).unwrap();
+
+        assert!(matches!(kind, WalletKind::Fireblocks));
+        assert!(
+            secrets.wallet.is_table(),
+            "wallet secrets should remain a TOML table"
+        );
+        assert!(
+            config
+                .wallet
+                .as_table()
+                .is_some_and(|wallet| wallet.get("api_key").is_none()),
+            "Fireblocks API key must not be stored in config"
+        );
+        assert!(
+            config
+                .wallet
+                .as_table()
+                .and_then(|wallet| wallet.get("chain_asset_ids"))
+                .and_then(|ids| ids.as_table())
+                .is_some_and(|ids| ids.contains_key("1") && ids.contains_key("8453")),
+            "Fireblocks config should include Ethereum and Base asset ids"
+        );
     }
 
     #[test]

@@ -5,8 +5,9 @@ are ordered by priority (highest first).
 
 ## Operational visibility and reliable wallet signing
 
-Stop relying on logs for rebalancing visibility, and replace Fireblocks with
-Turnkey/private-key wallet for onchain signing. All branches stack on #355.
+Stop relying on logs for rebalancing visibility, and keep wallet backend
+selection explicit in config while using the most reliable signer for each
+operation. All branches stack on #355.
 
 ```mermaid
 graph TD
@@ -50,9 +51,9 @@ Turnkey work above, so both proceed in parallel.
 
 ### Wallet provider config (main crate, depends on everything above)
 
-Wires Turnkey and raw-private-key wallets into the main crate config, removes
-Fireblocks entirely. Wallet type is selected via TOML, while cargo features
-control which wallet backends are compiled into the binary.
+Wires wallet backends into the main crate config. Wallet type is selected via
+TOML, while cargo features control which wallet backends are compiled into the
+binary.
 
 - [x] [#380 Configure wallet provider selection (Turnkey vs Fireblocks) in main crate](https://github.com/ST0x-Technology/st0x.liquidity/issues/380)
   - PR:

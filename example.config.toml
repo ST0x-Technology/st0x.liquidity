@@ -18,11 +18,22 @@ equity = { target = 0.5, deviation = 0.2 }
 usdc = { mode = "enabled", target = 0.5, deviation = 0.3 }
 
 # Wallet provider — select via `kind`:
+#   "fireblocks"  — Fireblocks contract-call signing   (requires --features wallet-fireblocks)
 #   "turnkey"     — Turnkey secure enclave signing   (requires --features wallet-turnkey)
 #   "private-key" — local raw private key signing     (requires --features wallet-private-key)
 [rebalancing.wallet]
 kind = "private-key"
 
+# For kind = "fireblocks", use instead:
+# [rebalancing.wallet]
+# kind = "fireblocks"
+# vault_account_id = "0"
+# environment = "sandbox"
+#
+# [rebalancing.wallet.chain_asset_ids]
+# 1 = "ETH"
+# 8453 = "BASECHAIN_ETH"
+#
 # For kind = "turnkey", use instead:
 # [rebalancing.wallet]
 # kind = "turnkey"

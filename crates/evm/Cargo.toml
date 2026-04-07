@@ -8,17 +8,22 @@ default = []
 mock = ["local-signer", "dep:url", "dep:anyhow"]
 local-signer = []
 turnkey = ["dep:alloy-signer-turnkey"]
+fireblocks = ["dep:chrono", "dep:fireblocks-sdk", "dep:tokio", "dep:uuid"]
 
 [dependencies]
 alloy.workspace = true
 alloy-signer-turnkey = { workspace = true, optional = true }
 anyhow = { workspace = true, optional = true }
 async-trait.workspace = true
+chrono = { workspace = true, features = ["serde"], optional = true }
+fireblocks-sdk = { version = "2025.10.17", optional = true }
 rain-error-decoding.workspace = true
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
+tokio = { workspace = true, features = ["time"], optional = true }
 tracing.workspace = true
 url = { workspace = true, optional = true }
+uuid = { workspace = true, features = ["v4"], optional = true }
 
 [dev-dependencies]
 httpmock.workspace = true

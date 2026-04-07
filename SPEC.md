@@ -346,18 +346,26 @@ All SSH keys centralized in `keys.nix` with role-based access:
 ### Wallet Management
 
 All onchain write operations use the `Wallet` trait abstraction from the
-`st0x-evm` crate. Two wallet backends are available, gated by cargo features on
-the `st0x-evm` crate and configured via the `[rebalancing.wallet]` TOML section
-(`type = "turnkey"` or `type = "private-key"`):
+`st0x-evm` crate. Three wallet backends are available, gated by cargo features
+on the `st0x-evm` crate and configured via the `[rebalancing.wallet]` TOML
+section (`kind = "fireblocks"`, `kind = "turnkey"`, or `kind = "private-key"`):
+
+- **Fireblocks** (`fireblocks` feature): Resolves the vault's onchain address
+  from the Fireblocks API and submits contract calls through Fireblocks for
+  liquidity held in Fireblocks-managed wallets. Destination contracts for
+  `kind = "fireblocks"` must already be whitelisted in the Fireblocks account
+  before transactions will be allowed. Non-secret wallet selection stays in
+  config, while Fireblocks credentials (API key and RSA key path) stay in
+  secrets.
 
 - **Turnkey** (`turnkey` feature): Signs via Turnkey's AWS Nitro secure enclaves
   for low-latency production signing (50-100ms).
 - **Raw private key** (`local-signer` feature): Signs locally with a raw private
   key. Also used in development and testing.
 
-The main crate forwards these as `wallet-turnkey` and `wallet-private-key`
-features. Domain logic is decoupled from the signing backend. See
-[crates/evm/](crates/evm/) for implementation details.
+The main crate forwards these as `wallet-fireblocks`, `wallet-turnkey`, and
+`wallet-private-key` features. Domain logic is decoupled from the signing
+backend. See [crates/evm/](crates/evm/) for implementation details.
 
 ## Crate Architecture
 
@@ -448,13 +456,13 @@ The system provides two top-level capabilities:
 
 **Integration Layer** (external API wrappers):
 
-| Crate               | Purpose                                              | Feature Flags                      |
-| ------------------- | ---------------------------------------------------- | ---------------------------------- |
-| `st0x-execution`    | Brokerage API integration for trade execution        | `schwab`, `alpaca-trading`, `mock` |
-| `st0x-tokenization` | Tokenization API for minting/redeeming equity tokens | `alpaca`                           |
-| `st0x-bridge`       | Cross-chain asset transfers                          | `cctp`                             |
-| `st0x-raindex`      | Rain orderbook vault deposit/withdraw operations     | `rain`                             |
-| `st0x-evm`          | EVM chain interaction and wallet abstraction         | `turnkey`, `local-signer`, `mock`  |
+| Crate               | Purpose                                              | Feature Flags                                   |
+| ------------------- | ---------------------------------------------------- | ----------------------------------------------- |
+| `st0x-execution`    | Brokerage API integration for trade execution        | `schwab`, `alpaca-trading`, `mock`              |
+| `st0x-tokenization` | Tokenization API for minting/redeeming equity tokens | `alpaca`                                        |
+| `st0x-bridge`       | Cross-chain asset transfers                          | `cctp`                                          |
+| `st0x-raindex`      | Rain orderbook vault deposit/withdraw operations     | `rain`                                          |
+| `st0x-evm`          | EVM chain interaction and wallet abstraction         | `fireblocks`, `turnkey`, `local-signer`, `mock` |
 
 Each integration crate defines a trait (e.g., `Executor`, `Tokenizer`, `Bridge`,
 `Raindex`, `Wallet`) with one or more implementations selectable via feature

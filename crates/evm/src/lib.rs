@@ -29,6 +29,8 @@ pub mod error_decoding;
 pub use error_decoding::{IntoErrorRegistry, NoOpErrorRegistry, OpenChainErrorRegistry};
 use error_decoding::{decode_reverted_receipt, decode_rpc_revert};
 
+#[cfg(feature = "fireblocks")]
+pub mod fireblocks;
 #[cfg(feature = "local-signer")]
 pub mod local;
 #[cfg(feature = "turnkey")]
@@ -43,6 +45,8 @@ pub mod test_chain;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WalletKind {
+    #[cfg(feature = "fireblocks")]
+    Fireblocks,
     #[cfg(feature = "turnkey")]
     Turnkey,
     #[cfg(feature = "local-signer")]
@@ -78,7 +82,7 @@ impl WalletKind {
     /// When no wallet backend features are enabled, `WalletKind` is
     /// uninhabited and this method can never be called.
     #[cfg_attr(
-        not(any(feature = "turnkey", feature = "local-signer")),
+        not(any(feature = "fireblocks", feature = "turnkey", feature = "local-signer")),
         allow(clippy::unused_async, clippy::uninhabited_references, unused_variables)
     )]
     pub async fn try_into_wallet<Raw, Node>(
@@ -90,6 +94,23 @@ impl WalletKind {
         Node: Provider + Clone + Send + Sync + 'static,
     {
         match *self {
+            #[cfg(feature = "fireblocks")]
+            Self::Fireblocks => {
+                let WalletCtx {
+                    settings,
+                    credentials,
+                    provider,
+                    required_confirmations,
+                } = ctx;
+                let wallet = fireblocks::FireblocksWallet::try_from_ctx(WalletCtx {
+                    settings: settings.parse().map_err(Into::into)?,
+                    credentials: credentials.parse().map_err(Into::into)?,
+                    provider,
+                    required_confirmations,
+                })
+                .await?;
+                Ok(Arc::new(wallet))
+            }
             #[cfg(feature = "turnkey")]
             Self::Turnkey => {
                 let WalletCtx {
@@ -145,6 +166,9 @@ pub enum EvmError {
     Reverted { tx_hash: alloy::primitives::TxHash },
     #[error("wallet config parse error: {0}")]
     WalletConfigParse(Box<dyn std::error::Error + Send + Sync>),
+    #[cfg(feature = "fireblocks")]
+    #[error("Fireblocks error: {0}")]
+    Fireblocks(#[from] fireblocks::FireblocksError),
     #[cfg(feature = "local-signer")]
     #[error("invalid private key: {0}")]
     InvalidPrivateKey(#[from] alloy::signers::k256::ecdsa::Error),
@@ -541,9 +565,11 @@ mod tests {
         assert_eq!(block_number, 0);
     }
 
+    #[cfg(any(feature = "fireblocks", feature = "local-signer", feature = "turnkey"))]
     /// Parser that succeeds with a JSON value (`Some`) or fails (`None`).
     struct MaybeParser(Option<serde_json::Value>);
 
+    #[cfg(any(feature = "fireblocks", feature = "local-signer", feature = "turnkey"))]
     impl Parser for MaybeParser {
         type Error = EvmError;
 
@@ -564,6 +590,37 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "fireblocks")]
+    #[tokio::test]
+    async fn wallet_kind_fireblocks_credentials_parse_error() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
+
+        let ctx = WalletCtx {
+            settings: MaybeParser(Some(serde_json::json!({
+                "vault_account_id": "0",
+                "environment": "sandbox",
+                "chain_asset_ids": {
+                    anvil.chain_id().to_string(): "ETH_TEST5"
+                }
+            }))),
+            credentials: MaybeParser(None),
+            provider,
+            required_confirmations: 1,
+        };
+
+        let result = WalletKind::Fireblocks.try_into_wallet(ctx).await;
+        let Err(error) = result else {
+            panic!("expected WalletConfigParse error from credentials parse, got Ok");
+        };
+
+        assert!(
+            matches!(error, EvmError::WalletConfigParse(_)),
+            "expected WalletConfigParse error from credentials parse, got: {error:?}"
+        );
+    }
     #[cfg(feature = "local-signer")]
     #[tokio::test]
     async fn wallet_kind_private_key_dispatch_succeeds() {
