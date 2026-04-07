@@ -36,7 +36,9 @@ use crate::position::{Position, PositionEvent};
 use crate::tokenized_equity_mint::{
     IssuerRequestId, TokenizedEquityMint, TokenizedEquityMintEvent,
 };
-use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent};
+use crate::usdc_rebalance::{
+    RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent, UsdcRebalanceId,
+};
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 use crate::wrapper::Wrapper;
 
@@ -49,6 +51,13 @@ pub(crate) enum RebalancingTriggerError {
     EquityTrigger(#[from] equity::EquityTriggerError),
     #[error("float arithmetic error: {0}")]
     Float(#[from] rain_math_float::FloatError),
+    #[error("missing USDC tracking context for rebalance {id} at {event}")]
+    MissingUsdcTrackingContext {
+        id: UsdcRebalanceId,
+        event: usdc::UsdcTrackingEvent,
+    },
+    #[error("missing bridged amount for USDC rebalance {id} at deposit confirmation")]
+    MissingUsdcBridgedAmount { id: UsdcRebalanceId },
 }
 
 /// Why loading a token address from the vault registry failed.
@@ -430,6 +439,9 @@ pub(crate) struct RebalancingTrigger {
     /// Tracks symbol/quantity for in-flight redemptions. The initial
     /// `WithdrawnFromRaindex` event carries this data; follow-up events don't.
     redemption_tracking: Arc<RwLock<HashMap<RedemptionAggregateId, (Symbol, FractionalShares)>>>,
+    /// Tracks USDC rebalance lifecycle data needed to settle inventory on
+    /// terminal events with the actual amount received.
+    usdc_tracking: Arc<RwLock<HashMap<UsdcRebalanceId, usdc::UsdcRebalanceTracking>>>,
 }
 
 impl RebalancingTrigger {
@@ -454,6 +466,7 @@ impl RebalancingTrigger {
             wrapper,
             mint_tracking: Arc::new(RwLock::new(HashMap::new())),
             redemption_tracking: Arc::new(RwLock::new(HashMap::new())),
+            usdc_tracking: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -546,7 +559,9 @@ impl RebalancingTrigger {
         let inventory_error = match error {
             RebalancingTriggerError::Inventory(inventory_error) => inventory_error,
             other @ (RebalancingTriggerError::EquityTrigger(_)
-            | RebalancingTriggerError::Float(_)) => return Err(other),
+            | RebalancingTriggerError::Float(_)
+            | RebalancingTriggerError::MissingUsdcTrackingContext { .. }
+            | RebalancingTriggerError::MissingUsdcBridgedAmount { .. }) => return Err(other),
         };
 
         warn!(
@@ -762,30 +777,7 @@ impl Reactor for RebalancingTrigger {
             })
             .on(|id, event| async move { self.on_mint(id, event).await })
             .on(|id, event| async move { self.on_redemption(id, event).await })
-            .on(|_id, event| async move {
-                if let UsdcRebalanceEvent::Initiated {
-                    direction, amount, ..
-                } = &event
-                {
-                    let venue = match direction {
-                        RebalanceDirection::AlpacaToBase => Venue::Hedging,
-                        RebalanceDirection::BaseToAlpaca => Venue::MarketMaking,
-                    };
-                    let update = Inventory::transfer(venue, TransferOp::Start, *amount);
-
-                    let mut inventory = self.inventory.write().await;
-                    *inventory = inventory.clone().update_usdc(update, Utc::now())?;
-                }
-
-                if Self::is_terminal_usdc_rebalance_event(&event) {
-                    self.clear_usdc_in_progress();
-                    debug!("Cleared USDC in-progress flag after rebalance terminal event");
-
-                    self.check_and_trigger_usdc().await;
-                }
-
-                Ok::<(), RebalancingTriggerError>(())
-            })
+            .on(|id, event| async move { self.on_usdc_rebalance(id, event).await })
             .on_with_fallback(
                 |_id, event| async move { self.on_snapshot(event).await },
                 |error, _id, event| async move { self.on_snapshot_recovery(error, event).await },
@@ -1230,6 +1222,7 @@ mod tests {
     use crate::usdc_rebalance::{TransferRef, UsdcRebalanceCommand, UsdcRebalanceId};
     use crate::vault_registry::VaultRegistryCommand;
     use crate::wrapper::mock::MockWrapper;
+    use st0x_execution::HasZero;
     use st0x_float_macro::float;
 
     fn test_config() -> RebalancingTriggerConfig {
@@ -2971,6 +2964,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn base_to_alpaca_terminal_conversion_settles_usdc_inventory() {
+        let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
+
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(500)),
+            )
+            .await
+            .unwrap();
+
+        harness
+            .receive::<UsdcRebalance>(
+                id,
+                make_usdc_conversion_confirmed(RebalanceDirection::BaseToAlpaca, usdc(499)),
+            )
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_available(Venue::MarketMaking),
+            Some(usdc(400)),
+            "terminal conversion should remove the full initiated amount from onchain available"
+        );
+        assert_eq!(
+            inventory.usdc_inflight(Venue::MarketMaking),
+            Some(Usdc::ZERO),
+            "terminal conversion should clear onchain USDC inflight"
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::Hedging),
+            Some(usdc(599)),
+            "terminal conversion should credit offchain cash-equivalent with the filled amount"
+        );
+        assert_eq!(
+            inventory.usdc_inflight(Venue::Hedging),
+            Some(Usdc::ZERO),
+            "terminal conversion should not leave offchain USDC inflight behind"
+        );
+        drop(inventory);
+    }
+
+    #[tokio::test]
+    async fn alpaca_to_base_terminal_deposit_uses_bridged_amount_for_inventory() {
+        let inventory = InventoryView::default().with_usdc(usdc(100), usdc(900));
+
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(500)),
+            )
+            .await
+            .unwrap();
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_bridged_with_amounts(usdc(499), usdc(1)),
+            )
+            .await
+            .unwrap();
+
+        harness
+            .receive::<UsdcRebalance>(
+                id,
+                make_usdc_deposit_confirmed(RebalanceDirection::AlpacaToBase),
+            )
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_available(Venue::Hedging),
+            Some(usdc(400)),
+            "terminal deposit should remove the full initiated amount from offchain available"
+        );
+        assert_eq!(
+            inventory.usdc_inflight(Venue::Hedging),
+            Some(Usdc::ZERO),
+            "terminal deposit should clear offchain USDC inflight"
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::MarketMaking),
+            Some(usdc(599)),
+            "terminal deposit should credit onchain available with the bridged amount after fees"
+        );
+        assert_eq!(
+            inventory.usdc_inflight(Venue::MarketMaking),
+            Some(Usdc::ZERO),
+            "terminal deposit should not leave onchain USDC inflight behind"
+        );
+        drop(inventory);
+    }
+
+    #[tokio::test]
     async fn snapshot_onchain_cash_via_reactor_updates_usdc_balance() {
         // Start with 500 onchain, 500 offchain = balanced
         let inventory = InventoryView::default().with_usdc(usdc(500), usdc(500));
@@ -3240,10 +3337,17 @@ mod tests {
     }
 
     fn make_usdc_bridged() -> UsdcRebalanceEvent {
+        make_usdc_bridged_with_amounts(Usdc::new(float!(99.99)), Usdc::new(float!(0.01)))
+    }
+
+    fn make_usdc_bridged_with_amounts(
+        amount_received: Usdc,
+        fee_collected: Usdc,
+    ) -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::Bridged {
             mint_tx_hash: TxHash::random(),
-            amount_received: Usdc::new(float!(99.99)),
-            fee_collected: Usdc::new(float!(0.01)),
+            amount_received,
+            fee_collected,
             minted_at: Utc::now(),
         }
     }
@@ -3292,20 +3396,130 @@ mod tests {
 
     #[tokio::test]
     async fn usdc_rebalance_completion_clears_in_progress_flag() {
-        let (trigger, _receiver) = make_trigger_with_inventory(InventoryView::default()).await;
+        let inventory = InventoryView::default().with_usdc(usdc(5000), usdc(5000));
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
 
         // Mark USDC as in-progress.
         trigger.usdc_in_progress.store(true, Ordering::SeqCst);
         assert!(trigger.usdc_in_progress.load(Ordering::SeqCst));
 
-        // DepositConfirmed for AlpacaToBase is terminal.
-        assert!(RebalancingTrigger::is_terminal_usdc_rebalance_event(
-            &make_usdc_deposit_confirmed(RebalanceDirection::AlpacaToBase)
-        ));
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(1000)),
+            )
+            .await
+            .unwrap();
 
-        // Simulate what dispatch does - clear in-progress on terminal.
-        trigger.clear_usdc_in_progress();
+        harness
+            .receive::<UsdcRebalance>(
+                id,
+                make_usdc_conversion_confirmed(RebalanceDirection::BaseToAlpaca, usdc(999)),
+            )
+            .await
+            .unwrap();
+
         assert!(!trigger.usdc_in_progress.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn bridged_without_initiated_returns_tracking_error() {
+        let (trigger, _receiver) = make_trigger_with_inventory(InventoryView::default()).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        let error = harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_bridged())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RebalancingTriggerError::MissingUsdcTrackingContext {
+                id: error_id,
+                event: usdc::UsdcTrackingEvent::Bridged,
+            } if error_id == id
+        ));
+    }
+
+    #[tokio::test]
+    async fn deposit_confirmed_without_bridged_amount_returns_error_and_preserves_state() {
+        let inventory = InventoryView::default().with_usdc(usdc(5000), usdc(5000));
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(1000)),
+            )
+            .await
+            .unwrap();
+
+        let error = harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_deposit_confirmed(RebalanceDirection::AlpacaToBase),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RebalancingTriggerError::MissingUsdcBridgedAmount { id: error_id }
+                if error_id == id
+        ));
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "usdc_in_progress should stay set when terminal settlement context is missing"
+        );
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "tracking context should be retained after a terminal settlement failure"
+        );
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_inflight(Venue::Hedging),
+            Some(usdc(1000)),
+            "offchain USDC inflight should remain until settlement succeeds"
+        );
+        drop(inventory);
+    }
+
+    #[tokio::test]
+    async fn conversion_confirmed_without_tracking_returns_error_and_preserves_in_progress() {
+        let inventory = InventoryView::default().with_usdc(usdc(5000), usdc(5000));
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        let error = harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_conversion_confirmed(RebalanceDirection::BaseToAlpaca, usdc(999)),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RebalancingTriggerError::MissingUsdcTrackingContext {
+                id: error_id,
+                event: usdc::UsdcTrackingEvent::ConversionConfirmed,
+            } if error_id == id
+        ));
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "usdc_in_progress should stay set when conversion settlement context is missing"
+        );
     }
 
     #[test]
@@ -3969,6 +4183,19 @@ mod tests {
                     amount: Usdc::new(float!(1000)),
                     withdrawal_ref: TransferRef::OnchainTx(tx_hash),
                     initiated_at: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        trigger_harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                UsdcRebalanceEvent::Bridged {
+                    mint_tx_hash: TxHash::random(),
+                    amount_received: Usdc::new(float!(999)),
+                    fee_collected: Usdc::new(float!(1)),
+                    minted_at: chrono::Utc::now(),
                 },
             )
             .await

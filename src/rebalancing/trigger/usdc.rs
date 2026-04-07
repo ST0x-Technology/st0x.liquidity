@@ -4,13 +4,51 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use chrono::Utc;
+
 use st0x_float_macro::float;
 use tracing::{debug, trace, warn};
 
 use st0x_finance::Usdc;
 
-use super::TriggeredOperation;
-use crate::inventory::{BroadcastingInventory, Imbalance, ImbalanceThreshold};
+use super::{RebalancingTrigger, RebalancingTriggerError, TriggeredOperation};
+use crate::inventory::{
+    BroadcastingInventory, Imbalance, ImbalanceThreshold, Inventory, TransferOp, Venue,
+};
+use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceEvent, UsdcRebalanceId};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UsdcTrackingEvent {
+    Bridged,
+    DepositConfirmed,
+    ConversionConfirmed,
+}
+
+impl std::fmt::Display for UsdcTrackingEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bridged => write!(formatter, "Bridged"),
+            Self::DepositConfirmed => write!(formatter, "DepositConfirmed"),
+            Self::ConversionConfirmed => write!(formatter, "ConversionConfirmed"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct UsdcRebalanceTracking {
+    direction: RebalanceDirection,
+    initiated_amount: Usdc,
+    bridged_amount_received: Option<Usdc>,
+}
+
+impl UsdcRebalanceTracking {
+    fn source_venue(&self) -> Venue {
+        match self.direction {
+            RebalanceDirection::AlpacaToBase => Venue::Hedging,
+            RebalanceDirection::BaseToAlpaca => Venue::MarketMaking,
+        }
+    }
+}
 
 /// Minimum USDC amount for Alpaca withdrawals.
 /// Alpaca requires $50 USD minimum, but due to USDC/USD spread (~17bps observed in live tests),
@@ -133,6 +171,180 @@ fn cap_usdc(amount: Usdc, usdc_limit: Option<Usdc>) -> Usdc {
         cap
     } else {
         amount
+    }
+}
+
+impl RebalancingTrigger {
+    pub(super) async fn on_usdc_rebalance(
+        &self,
+        id: UsdcRebalanceId,
+        event: UsdcRebalanceEvent,
+    ) -> Result<(), RebalancingTriggerError> {
+        use UsdcRebalanceEvent::*;
+
+        match &event {
+            Initiated {
+                direction, amount, ..
+            } => {
+                self.track_initiated_usdc_rebalance(&id, direction, *amount)
+                    .await?;
+            }
+
+            Bridged {
+                amount_received, ..
+            } => {
+                self.track_bridged_amount(&id, *amount_received).await?;
+            }
+
+            ConversionConfirmed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                filled_amount,
+                ..
+            } => {
+                self.complete_usdc_rebalance(
+                    &id,
+                    UsdcTrackingEvent::ConversionConfirmed,
+                    *filled_amount,
+                )
+                .await?;
+            }
+
+            DepositConfirmed {
+                direction: RebalanceDirection::AlpacaToBase,
+                ..
+            } => {
+                self.complete_alpaca_to_base_deposit(&id).await?;
+            }
+
+            WithdrawalConfirmed { .. }
+            | BridgingInitiated { .. }
+            | BridgeAttestationReceived { .. }
+            | DepositInitiated { .. }
+            | ConversionInitiated { .. }
+            | WithdrawalFailed { .. }
+            | BridgingFailed { .. }
+            | DepositFailed { .. }
+            | ConversionFailed { .. }
+            | DepositConfirmed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                ..
+            }
+            | ConversionConfirmed {
+                direction: RebalanceDirection::AlpacaToBase,
+                ..
+            } => {}
+        }
+
+        if Self::is_terminal_usdc_rebalance_event(&event) {
+            self.usdc_tracking.write().await.remove(&id);
+            self.clear_usdc_in_progress();
+            debug!("Cleared USDC in-progress flag after rebalance terminal event");
+
+            self.check_and_trigger_usdc().await;
+        }
+
+        Ok(())
+    }
+
+    async fn track_initiated_usdc_rebalance(
+        &self,
+        id: &UsdcRebalanceId,
+        direction: &RebalanceDirection,
+        amount: Usdc,
+    ) -> Result<(), RebalancingTriggerError> {
+        let tracking = UsdcRebalanceTracking {
+            direction: direction.clone(),
+            initiated_amount: amount,
+            bridged_amount_received: None,
+        };
+        let update = Inventory::transfer(tracking.source_venue(), TransferOp::Start, amount);
+
+        self.usdc_tracking
+            .write()
+            .await
+            .insert(id.clone(), tracking);
+
+        let mut inventory = self.inventory.write().await;
+        *inventory = inventory.clone().update_usdc(update, Utc::now())?;
+        drop(inventory);
+
+        Ok(())
+    }
+
+    async fn track_bridged_amount(
+        &self,
+        id: &UsdcRebalanceId,
+        amount_received: Usdc,
+    ) -> Result<(), RebalancingTriggerError> {
+        let mut tracking = self.usdc_tracking.write().await;
+        let Some(existing) = tracking.get_mut(id) else {
+            warn!(id = %id, "Bridged event missing USDC tracking context");
+            return Err(RebalancingTriggerError::MissingUsdcTrackingContext {
+                id: id.clone(),
+                event: UsdcTrackingEvent::Bridged,
+            });
+        };
+
+        existing.bridged_amount_received = Some(amount_received);
+        drop(tracking);
+
+        Ok(())
+    }
+
+    async fn complete_alpaca_to_base_deposit(
+        &self,
+        id: &UsdcRebalanceId,
+    ) -> Result<(), RebalancingTriggerError> {
+        let Some(tracking) = self.usdc_tracking.read().await.get(id).cloned() else {
+            warn!(id = %id, "DepositConfirmed event missing USDC tracking context");
+            return Err(RebalancingTriggerError::MissingUsdcTrackingContext {
+                id: id.clone(),
+                event: UsdcTrackingEvent::DepositConfirmed,
+            });
+        };
+
+        let Some(amount_received) = tracking.bridged_amount_received else {
+            warn!(
+                id = %id,
+                "DepositConfirmed event missing bridged amount for USDC rebalance"
+            );
+            return Err(RebalancingTriggerError::MissingUsdcBridgedAmount { id: id.clone() });
+        };
+
+        self.complete_usdc_rebalance(id, UsdcTrackingEvent::DepositConfirmed, amount_received)
+            .await
+    }
+
+    async fn complete_usdc_rebalance(
+        &self,
+        id: &UsdcRebalanceId,
+        event: UsdcTrackingEvent,
+        settled_amount: Usdc,
+    ) -> Result<(), RebalancingTriggerError> {
+        let Some(tracking) = self.usdc_tracking.read().await.get(id).cloned() else {
+            warn!(id = %id, "Terminal success event missing USDC tracking context");
+            return Err(RebalancingTriggerError::MissingUsdcTrackingContext {
+                id: id.clone(),
+                event,
+            });
+        };
+
+        let source_venue = tracking.source_venue();
+        let initiated_amount = tracking.initiated_amount;
+        let now = Utc::now();
+        let update = Box::new(move |inventory| {
+            let settled =
+                Inventory::settle_transfer(source_venue, initiated_amount, settled_amount)(
+                    inventory,
+                )?;
+            Inventory::with_last_rebalancing(now)(settled)
+        });
+
+        let mut inventory = self.inventory.write().await;
+        *inventory = inventory.clone().update_usdc(update, now)?;
+        drop(inventory);
+
+        Ok(())
     }
 }
 
