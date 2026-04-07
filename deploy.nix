@@ -113,14 +113,14 @@ in {
         "--impure --accept-flake-config --extra-experimental-features 'nix-command flakes'";
 
       mkDeployScript = name:
-        { prelude ? "", target }:
+        { prelude ? "", target, extraFlags ? "" }:
         pkgs.writeShellApplication {
           inherit name;
           runtimeInputs = deployInputs;
           text = ''
             ${deployPreamble}
             ${prelude}
-            deploy ${deployFlags} ''${ssh_flag:+"$ssh_flag"} ${target} \
+            deploy ${deployFlags} ${extraFlags} ''${ssh_flag:+"$ssh_flag"} ${target} \
               -- ${nixFlags} "$@"
           '';
         };
@@ -138,5 +138,10 @@ in {
       };
 
       deployAll = mkDeployScript "deploy-all" { target = ".#st0x-liquidity"; };
+
+      deployDryRun = mkDeployScript "deploy-dry-run" {
+        target = ".#st0x-liquidity";
+        extraFlags = "--dry-activate";
+      };
     };
 }

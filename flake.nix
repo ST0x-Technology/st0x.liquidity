@@ -240,6 +240,39 @@
             '';
           };
 
+          experimentalStart = pkgs.writeShellApplication {
+            name = "experimental-start";
+            runtimeInputs = infraPkgs.sshBuildInputs ++ [ pkgs.openssh ];
+            text = ''
+              ${infraPkgs.resolveHost}
+              echo "Starting st0x-experimental..."
+              ssh -i "$identity" "root@$host_ip" "mkdir -p /run/st0x && touch /run/st0x/st0x-experimental.ready && systemctl start st0x-experimental"
+              ssh -i "$identity" "root@$host_ip" systemctl is-active st0x-experimental
+            '';
+          };
+
+          experimentalStop = pkgs.writeShellApplication {
+            name = "experimental-stop";
+            runtimeInputs = infraPkgs.sshBuildInputs ++ [ pkgs.openssh ];
+            text = ''
+              ${infraPkgs.resolveHost}
+              echo "Stopping st0x-experimental..."
+              ssh -i "$identity" "root@$host_ip" "systemctl stop st0x-experimental && rm -f /run/st0x/st0x-experimental.ready"
+              echo "Stopped."
+            '';
+          };
+
+          experimentalRestart = pkgs.writeShellApplication {
+            name = "experimental-restart";
+            runtimeInputs = infraPkgs.sshBuildInputs ++ [ pkgs.openssh ];
+            text = ''
+              ${infraPkgs.resolveHost}
+              echo "Restarting st0x-experimental..."
+              ssh -i "$identity" "root@$host_ip" "mkdir -p /run/st0x && touch /run/st0x/st0x-experimental.ready && systemctl restart st0x-experimental"
+              ssh -i "$identity" "root@$host_ip" systemctl is-active st0x-experimental
+            '';
+          };
+
           prodDashboard = pkgs.writeShellApplication {
             name = "prod-dashboard";
             runtimeInputs = infraPkgs.sshBuildInputs
@@ -277,11 +310,15 @@
               packages.deployNixos
               packages.deployService
               packages.deployAll
+              packages.deployDryRun
               packages.prodStatus
               packages.prodDashboard
               packages.botStart
               packages.botStop
               packages.botRestart
+              packages.experimentalStart
+              packages.experimentalStop
+              packages.experimentalRestart
             ] ++ rainix.devShells.${system}.default.buildInputs;
         };
       });
