@@ -328,18 +328,14 @@ impl RebalancingCtx {
 #[cfg(test)]
 #[bon::bon]
 impl RebalancingCtx {
-    /// Test constructor that creates a `RebalancingCtx` with stub wallets.
-    ///
-    /// The wallets panic on `send` -- use only in tests that don't submit
-    /// transactions through the rebalancing wallet.
-    #[builder]
-    pub(crate) fn stub(
+    pub(crate) fn stub_with_wallet_address(
         equity: ImbalanceThreshold,
         usdc: Option<ImbalanceThreshold>,
         redemption_wallet: Address,
         alpaca_broker_auth: AlpacaBrokerApiCtx,
+        wallet_address: Address,
     ) -> Self {
-        let wallet = crate::test_utils::StubWallet::stub(Address::ZERO);
+        let wallet = crate::test_utils::StubWallet::stub(wallet_address);
 
         Self {
             equity,
@@ -355,6 +351,26 @@ impl RebalancingCtx {
             #[cfg(feature = "test-support")]
             message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
         }
+    }
+
+    /// Test constructor that creates a `RebalancingCtx` with stub wallets.
+    ///
+    /// The wallets panic on `send` -- use only in tests that don't submit
+    /// transactions through the rebalancing wallet.
+    #[builder]
+    pub(crate) fn stub(
+        equity: ImbalanceThreshold,
+        usdc: Option<ImbalanceThreshold>,
+        redemption_wallet: Address,
+        alpaca_broker_auth: AlpacaBrokerApiCtx,
+    ) -> Self {
+        Self::stub_with_wallet_address(
+            equity,
+            usdc,
+            redemption_wallet,
+            alpaca_broker_auth,
+            Address::ZERO,
+        )
     }
 }
 
