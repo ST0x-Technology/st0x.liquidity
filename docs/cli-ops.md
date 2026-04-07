@@ -78,6 +78,10 @@ stox alpaca-redeem -s COIN -q 10 \
 stox sell -s COIN -q 10
 ```
 
+`stox vault-withdraw-usdc` must be signed by the same wallet that owns the
+Raindex cash vault. If the configured signer and liquidity wallet differ, the
+CLI now stops before submitting a transaction.
+
 ### Checking Order Status
 
 ```

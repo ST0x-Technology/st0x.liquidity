@@ -40,6 +40,38 @@ pub(crate) enum VaultCliError {
 
     #[error("failed to parse scaled amount as U256")]
     ParseError(#[from] alloy::primitives::ruint::ParseError),
+
+    #[error(
+        "{operation} requires the configured signer {signer} to match the configured \
+         liquidity wallet {liquidity_wallet}"
+    )]
+    LiquidityWalletSignerMismatch {
+        operation: &'static str,
+        signer: Address,
+        liquidity_wallet: Address,
+    },
+
+    #[error(
+        "vault withdrawal delivered {actual_received} units of token {token} to {recipient}, \
+         expected {expected_received}"
+    )]
+    UnexpectedWithdrawalAmount {
+        token: Address,
+        recipient: Address,
+        expected_received: U256,
+        actual_received: U256,
+    },
+
+    #[error(
+        "token balance for {recipient} decreased while verifying withdrawal of token {token}: \
+         before {initial_balance}, after {final_balance}"
+    )]
+    WithdrawalBalanceDecreased {
+        token: Address,
+        recipient: Address,
+        initial_balance: U256,
+        final_balance: U256,
+    },
 }
 
 fn float_to_u256(amount: Float, decimals: u8) -> Result<U256, VaultCliError> {
@@ -54,6 +86,60 @@ async fn get_token_decimals<E: Evm>(evm: &E, token: Address) -> anyhow::Result<u
     evm.call::<OpenChainErrorRegistry, _>(token, IERC20::decimalsCall {})
         .await
         .with_context(|| format!("failed to read decimals() for token {token}"))
+}
+
+async fn get_token_balance<E: Evm>(
+    evm: &E,
+    token: Address,
+    account: Address,
+) -> anyhow::Result<U256> {
+    evm.call::<OpenChainErrorRegistry, _>(token, IERC20::balanceOfCall { account })
+        .await
+        .with_context(|| format!("failed to read balanceOf({account}) for token {token}"))
+}
+
+fn ensure_liquidity_wallet_signer(
+    operation: &'static str,
+    signer: Address,
+    liquidity_wallet: Address,
+) -> Result<(), VaultCliError> {
+    if signer == liquidity_wallet {
+        return Ok(());
+    }
+
+    Err(VaultCliError::LiquidityWalletSignerMismatch {
+        operation,
+        signer,
+        liquidity_wallet,
+    })
+}
+
+fn verify_withdrawal_amount(
+    token: Address,
+    recipient: Address,
+    initial_balance: U256,
+    final_balance: U256,
+    expected_received: U256,
+) -> Result<U256, VaultCliError> {
+    let actual_received = final_balance.checked_sub(initial_balance).ok_or(
+        VaultCliError::WithdrawalBalanceDecreased {
+            token,
+            recipient,
+            initial_balance,
+            final_balance,
+        },
+    )?;
+
+    if actual_received != expected_received {
+        return Err(VaultCliError::UnexpectedWithdrawalAmount {
+            token,
+            recipient,
+            expected_received,
+            actual_received,
+        });
+    }
+
+    Ok(actual_received)
 }
 
 pub(super) async fn vault_deposit_command<Writer: Write>(
@@ -136,9 +222,9 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
     }
 
     let rebalancing_ctx = ctx.rebalancing_ctx()?;
-    let sender_address = rebalancing_ctx.base_wallet().address();
+    let signer_address = rebalancing_ctx.base_wallet().address();
 
-    writeln!(stdout, "   Recipient wallet: {sender_address}")?;
+    writeln!(stdout, "   Recipient wallet: {signer_address}")?;
     writeln!(stdout, "   Orderbook: {}", ctx.evm.orderbook)?;
     writeln!(stdout, "   Vault ID: {vault_id}")?;
 
@@ -151,7 +237,7 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
         rebalancing_ctx.base_wallet().clone(),
         ctx.evm.orderbook,
         vault_registry_projection,
-        sender_address,
+        signer_address,
     );
 
     let token_decimals = get_token_decimals(rebalancing_ctx.base_wallet(), token).await?;
@@ -159,11 +245,27 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
     let amount_u256 = float_to_u256(amount, token_decimals)?;
     writeln!(stdout, "   Amount (smallest unit): {amount_u256}")?;
 
+    let initial_balance =
+        get_token_balance(rebalancing_ctx.base_wallet(), token, signer_address).await?;
+    writeln!(stdout, "   Initial recipient balance: {initial_balance}")?;
+
     writeln!(stdout, "   Withdrawing from vault...")?;
     let withdraw_tx = raindex_service
         .withdraw(token, RaindexVaultId(vault_id), amount_u256, token_decimals)
         .await?;
     writeln!(stdout, "   Withdraw tx: {withdraw_tx}")?;
+
+    let final_balance =
+        get_token_balance(rebalancing_ctx.base_wallet(), token, signer_address).await?;
+    let actual_received = verify_withdrawal_amount(
+        token,
+        signer_address,
+        initial_balance,
+        final_balance,
+        amount_u256,
+    )?;
+    writeln!(stdout, "   Final recipient balance: {final_balance}")?;
+    writeln!(stdout, "   Amount received: {actual_received}")?;
 
     writeln!(stdout, "Vault withdrawal completed successfully!")?;
 
@@ -176,7 +278,13 @@ pub(super) async fn vault_withdraw_usdc_command<Writer: Write>(
     ctx: &Ctx,
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
-    ctx.rebalancing_ctx()?;
+    let rebalancing_ctx = ctx.rebalancing_ctx()?;
+    let signer = rebalancing_ctx.base_wallet().address();
+    ensure_liquidity_wallet_signer(
+        "vault-withdraw-usdc",
+        signer,
+        rebalancing_ctx.redemption_wallet,
+    )?;
 
     let vault_id = ctx
         .assets
@@ -435,6 +543,91 @@ mod tests {
         assert_eq!(result, U256::ZERO);
     }
 
+    #[test]
+    fn ensure_liquidity_wallet_signer_accepts_matching_wallets() {
+        let wallet = Address::repeat_byte(0x11);
+
+        ensure_liquidity_wallet_signer("vault-withdraw-usdc", wallet, wallet).unwrap();
+    }
+
+    #[test]
+    fn ensure_liquidity_wallet_signer_rejects_mismatched_wallets() {
+        let error = ensure_liquidity_wallet_signer(
+            "vault-withdraw-usdc",
+            Address::ZERO,
+            Address::repeat_byte(0xaa),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("configured signer 0x0000000000000000000000000000000000000000"),
+            "expected signer mismatch error, got: {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("configured liquidity wallet 0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa"),
+            "expected liquidity wallet in error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn verify_withdrawal_amount_accepts_exact_balance_delta() {
+        let token = TEST_TOKEN;
+        let recipient = Address::repeat_byte(0x22);
+
+        let actual_received = verify_withdrawal_amount(
+            token,
+            recipient,
+            U256::from(100u64),
+            U256::from(125u64),
+            U256::from(25u64),
+        )
+        .unwrap();
+
+        assert_eq!(actual_received, U256::from(25u64));
+    }
+
+    #[test]
+    fn verify_withdrawal_amount_rejects_zero_delta() {
+        let error = verify_withdrawal_amount(
+            TEST_TOKEN,
+            Address::repeat_byte(0x22),
+            U256::from(100u64),
+            U256::from(100u64),
+            U256::from(25u64),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("expected 25"),
+            "expected withdrawal mismatch error, got: {error}"
+        );
+        assert!(
+            error.to_string().contains("delivered 0 units"),
+            "expected zero-delta error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn verify_withdrawal_amount_rejects_balance_decrease() {
+        let error = verify_withdrawal_amount(
+            TEST_TOKEN,
+            Address::repeat_byte(0x22),
+            U256::from(125u64),
+            U256::from(100u64),
+            U256::from(25u64),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("balance for"),
+            "expected balance decrease error, got: {error}"
+        );
+    }
+
     #[tokio::test]
     async fn get_token_decimals_reads_metadata() {
         let asserter = Asserter::new();
@@ -567,6 +760,61 @@ mod tests {
         assert!(
             err_msg.contains("requires rebalancing mode"),
             "Expected rebalancing mode error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn withdraw_usdc_requires_signer_to_match_liquidity_wallet() {
+        let ctx = create_ctx_with_rebalancing(Some(CashAssetConfig {
+            vault_id: Some(TEST_VAULT_ID),
+            rebalancing: OperationMode::Enabled,
+            operational_limit: None,
+        }));
+        let alpaca_broker_auth = AlpacaBrokerApiCtx {
+            api_key: "test-key".to_string(),
+            api_secret: "test-secret".to_string(),
+            account_id: AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b")),
+            mode: Some(AlpacaBrokerApiMode::Sandbox),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::default(),
+        };
+        let amount = Usdc::new(float!(100));
+
+        let mut stdout = Vec::new();
+        let err_msg = vault_withdraw_usdc_command(
+            &mut stdout,
+            amount,
+            &Ctx {
+                trading_mode: TradingMode::Rebalancing(Box::new(
+                    RebalancingCtx::stub()
+                        .equity(ImbalanceThreshold {
+                            target: float!(0.5),
+                            deviation: float!(0.1),
+                        })
+                        .usdc(ImbalanceThreshold {
+                            target: float!(0.5),
+                            deviation: float!(0.1),
+                        })
+                        .redemption_wallet(Address::repeat_byte(0xaa))
+                        .alpaca_broker_auth(alpaca_broker_auth)
+                        .call(),
+                )),
+                ..ctx
+            },
+            &SqlitePool::connect(":memory:").await.unwrap(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err_msg.contains("configured signer 0x0000000000000000000000000000000000000000"),
+            "Expected signer mismatch error, got: {err_msg}"
+        );
+        assert!(
+            err_msg
+                .contains("configured liquidity wallet 0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa"),
+            "Expected liquidity wallet in error, got: {err_msg}"
         );
     }
 
