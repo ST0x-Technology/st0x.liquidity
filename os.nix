@@ -131,7 +131,12 @@ in {
           };
         in {
           "/".tryFiles = "$uri $uri/ /index.html";
-          "/api/alpaca/ws" = wsProxy 8081;
+
+          # Production service (st0x-hedge, port 8001)
+          "/api/alpaca/ws" = wsProxy 8001;
+
+          # Experimental service (st0x-experimental, port 8002)
+          "/experimental/api/alpaca/ws" = wsProxy 8002;
         };
       };
     };
