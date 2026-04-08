@@ -25,4 +25,6 @@ echo ""
 
 cd dashboard
 bun install --frozen-lockfile
-PUBLIC_ALPACA_WS_URL="ws://localhost:$local_port/api/ws" bun run dev
+PUBLIC_DEFAULT_BROKER=alpaca \
+PUBLIC_ALPACA_WS_URL="ws://localhost:$local_port/api/ws" \
+bun run dev

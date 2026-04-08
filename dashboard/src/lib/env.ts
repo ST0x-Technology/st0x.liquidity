@@ -7,6 +7,11 @@ export type Broker = (typeof VALID_BROKERS)[number]
 export const isBroker = (value: unknown): value is Broker =>
   typeof value === 'string' && VALID_BROKERS.includes(value as Broker)
 
+export const defaultBroker = (): Broker => {
+  const val = env.PUBLIC_DEFAULT_BROKER?.trim()
+  return val !== undefined && isBroker(val) ? val : 'schwab'
+}
+
 const LOCAL_DEV_PORTS: Record<Broker, number> = {
   schwab: 8000,
   alpaca: 8001

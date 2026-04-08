@@ -1,4 +1,8 @@
 rec {
+  # Tailscale MagicDNS hostname for the production server.
+  # Referenced by infra/default.nix and .github/workflows/ci.yaml.
+  tailscaleHost = "st0x-liquidity-nixos";
+
   keys = {
     # purpose: dev/ops
     gleb =

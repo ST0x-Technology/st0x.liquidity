@@ -110,7 +110,22 @@ in {
       settings = {
         PasswordAuthentication = false;
         PermitRootLogin = "prohibit-password";
+        MaxStartups = "50:30:100";
       };
+    };
+
+    # One-off (non-reusable) auth key. After initial enrollment, Tailscale
+    # re-authenticates via the stored node key in /var/lib/tailscale, so the
+    # auth key is only needed once.
+    tailscale = {
+      enable = true;
+      authKeyFile = "/run/agenix/tailscale-authkey";
+    };
+
+    fail2ban = {
+      enable = true;
+      bantime = "1h";
+      maxretry = 3;
     };
 
     nginx = {
@@ -156,8 +171,11 @@ in {
     allowedTCPPorts = [
       22 # SSH
       80 # Dashboard
-      3000 # Grafana
     ];
+    allowedUDPPorts = [
+      41641 # Tailscale WireGuard
+    ];
+    trustedInterfaces = [ "tailscale0" ];
   };
 
   fileSystems."/mnt/data" = {
@@ -187,6 +205,10 @@ in {
       file = ./secret/cli.toml.age;
       group = "st0x";
       mode = "0640";
+    };
+    "tailscale-authkey" = {
+      file = ./secret/tailscale-authkey.age;
+      mode = "0400";
     };
   };
   systemd.tmpfiles.rules = [ "d /mnt/data/grafana 0750 grafana grafana -" ];

@@ -5,6 +5,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   tf-rekey:
@@ -12,6 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: master
           submodules: recursive
 
       - uses: DeterminateSystems/nix-installer-action@main
@@ -32,7 +34,7 @@ jobs:
       - name: Rekey terraform secrets
         run: nix develop -c tf-rekey
 
-      - name: Commit and push rekeyed secrets
+      - name: Create PR with rekeyed secrets
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -40,9 +42,18 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else
+            branch="chore/rekey-terraform-secrets-$(date +%Y%m%d-%H%M%S)"
+            git checkout -b "$branch"
             git commit -m "chore: rekey terraform secrets"
-            git push
+            git push origin "$branch"
+            gh pr create \
+              --title "chore: rekey terraform secrets" \
+              --body "Automated rekeying of terraform secrets." \
+              --base master \
+              --head "$branch"
           fi
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Cleanup SSH
         if: always()

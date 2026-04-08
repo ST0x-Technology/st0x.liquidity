@@ -6,4 +6,5 @@ in builtins.listToAttrs (map (name: {
   value.publicKeys = roles.service;
 }) (builtins.attrNames services)) // {
   "cli.toml.age".publicKeys = roles.service;
+  "tailscale-authkey.age".publicKeys = roles.service;
 }
