@@ -22,29 +22,29 @@ rec {
     st0x-op =
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPZ56nOYbGDd0ZfbqxeY7AbvaQGQrHnlC80ccpRGpCoj";
 
-    # purpoose: used by the remote host to decrypt ragenix secrets we need for the
-    # system to work at all. it gets auto-generated during the bootstrap phase of
-    # our infra provisioning process when nixos-anywhere turns the initially ubuntu
-    # instance into a nixos one. runs once after server provisioning
-    host =
+    # purpose: used by the remote host to decrypt ragenix secrets we need for
+    # the system to work at all. auto-generated during bootstrap when
+    # nixos-anywhere turns the initially ubuntu instance into nixos
+    host-prod =
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDXNYu7AGEwlInGoiqcPIF7e46rcbipk+as9UWCYctxh";
+    # auto-generated during bootstrap
+    host-staging =
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDHGyaEKFAUbg2Lo2w3sjFAh19DQpGJCalp538SgXeu3";
   };
 
   roles = with keys; {
-    # this is for both accessing terraform secrets and encrypted state
-    # but the only reason you need one without the other is because ssh
-    # requires decoding terraform state just to get the host ip address
+    # access to terraform state and encrypted vars (shared across environments)
     infra = [ st0x-op ci juan ];
 
-    # this role was meant to be for the ability to ssh into the machine
-    # but in the future we should restrict what that exactly means in
-    # terms of who should have access to what remote users
-    ssh = [ juan gleb alastair ci ];
+    prod = {
+      ssh = [ juan gleb alastair ci ];
+      service = [ st0x-op host-prod ];
+    };
 
-    # the host needs to actually decrypt the secrets it receives on
-    # deployment. gleb is there cause someone needs to set secrets
-    # to begin with. will be more granular in the future
-    service = [ st0x-op host ];
+    staging = {
+      ssh = [ gleb juan st0x-op ci ];
+      service = [ st0x-op host-staging ];
+    };
   };
 
 }

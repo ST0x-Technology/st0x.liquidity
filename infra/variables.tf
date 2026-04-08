@@ -4,26 +4,26 @@ variable "do_token" {
   sensitive   = true
 }
 
-variable "ssh_key_name" {
-  description = "Name of the SSH key in DigitalOcean to add to the droplet"
-  type        = string
-  default     = "st0x-op"
-}
-
-variable "region" {
-  description = "DigitalOcean region"
-  type        = string
-  default     = "nyc3"
-}
-
-variable "droplet_size" {
-  description = "Droplet size slug"
+variable "prod_droplet_size" {
+  description = "Droplet size slug for prod"
   type        = string
   default     = "s-4vcpu-8gb"
+
+  validation {
+    condition     = length(trimspace(var.prod_droplet_size)) > 0
+    error_message = "prod_droplet_size must not be empty"
+  }
 }
 
-variable "volume_size_gb" {
-  description = "Block storage volume size in GB"
-  type        = number
-  default     = 5
+# s-2vcpu-4gb should be sufficient for staging workloads.
+# bump to s-4vcpu-8gb if nixos rebuilds or the service struggle with memory.
+variable "staging_droplet_size" {
+  description = "Droplet size slug for staging"
+  type        = string
+  default     = "s-2vcpu-4gb"
+
+  validation {
+    condition     = length(trimspace(var.staging_droplet_size)) > 0
+    error_message = "staging_droplet_size must not be empty"
+  }
 }

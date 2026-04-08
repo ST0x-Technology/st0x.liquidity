@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Opens an SSH tunnel to prod and starts the dashboard dev server.
-# Called by the nix `prod-dashboard` wrapper which sets $identity and $host_ip.
-# shellcheck disable=SC2154  # identity and host_ip are exported by the nix wrapper
+# Opens an SSH tunnel and starts the dashboard dev server.
+# Called by the nix `<env>-dashboard` wrapper which sets $identity, $host_ip, and $ENV.
+# shellcheck disable=SC2154  # identity, host_ip, ENV are exported by the nix wrapper
 
 set -euo pipefail
 
 local_port="${1:-8001}"
-ctl_socket="/tmp/prod-dashboard-ssh-$$"
+ctl_socket="/tmp/${ENV}-dashboard-ssh-$$"
 
 cleanup() {
   echo ""
@@ -15,7 +15,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "Opening SSH tunnel: localhost:$local_port -> prod:8001"
+echo "Opening SSH tunnel: localhost:$local_port -> ${ENV}:8001"
 ssh -i "$identity" -f -N -M -S "$ctl_socket" \
   -L "$local_port:localhost:8001" "root@$host_ip"
 

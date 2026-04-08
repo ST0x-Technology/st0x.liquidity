@@ -1,19 +1,41 @@
-output "droplet_id" {
-  description = "ID of the NixOS droplet"
-  value       = digitalocean_droplet.nixos.id
+# Prod
+output "prod_droplet_id" {
+  description = "ID of the prod NixOS droplet"
+  value       = module.prod.droplet_id
 }
 
-output "droplet_ipv4" {
-  description = "Public IPv4 address of the droplet"
-  value       = digitalocean_droplet.nixos.ipv4_address
+output "prod_droplet_ipv4" {
+  description = "Public IPv4 address of the prod droplet"
+  value       = module.prod.droplet_ipv4
 }
 
-output "reserved_ip" {
-  description = "Reserved IP address assigned to the droplet"
-  value       = digitalocean_reserved_ip.nixos.ip_address
+output "prod_reserved_ip" {
+  description = "Reserved IP address assigned to the prod droplet"
+  value       = module.prod.reserved_ip
 }
 
-output "volume_id" {
-  description = "ID of the data volume"
-  value       = digitalocean_volume.data.id
+output "prod_volume_id" {
+  description = "ID of the prod data volume"
+  value       = module.prod.volume_id
+}
+
+# Staging
+output "staging_droplet_id" {
+  description = "ID of the staging NixOS droplet"
+  value       = module.staging.droplet_id
+}
+
+output "staging_droplet_ipv4" {
+  description = "Public IPv4 address of the staging droplet"
+  value       = module.staging.droplet_ipv4
+}
+
+output "staging_reserved_ip" {
+  description = "Reserved IP address assigned to the staging droplet"
+  value       = module.staging.reserved_ip
+}
+
+output "staging_volume_id" {
+  description = "ID of the staging data volume"
+  value       = module.staging.volume_id
 }
