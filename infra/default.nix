@@ -170,8 +170,8 @@ let
         runtimeInputs = sshBuildInputs ++ [ pkgs.openssh pkgs.curl pkgs.jq ];
         text = ''
           ${resolveHost}
-          export identity host_ip ENV="${env}"
-          exec bash scripts/status.sh "$@"
+          export identity host_ip
+          exec bash scripts/status.sh "${env}" "$@"
         '';
       };
 
@@ -213,8 +213,8 @@ let
         runtimeInputs = sshBuildInputs ++ [ pkgs.openssh pkgs.bun ];
         text = ''
           ${resolveHost}
-          export identity host_ip ENV="${env}"
-          exec bash scripts/dashboard.sh "$@"
+          export identity host_ip
+          exec bash scripts/dashboard.sh "${env}" "$@"
         '';
       };
     };

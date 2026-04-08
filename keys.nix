@@ -34,7 +34,7 @@ rec {
 
   roles = with keys; {
     # access to terraform state and encrypted vars (shared across environments)
-    infra = [ st0x-op ci juan ];
+    infra = [ st0x-op ci ];
 
     prod = {
       ssh = [ juan gleb alastair ci ];

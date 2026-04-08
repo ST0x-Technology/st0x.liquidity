@@ -1,0 +1,67 @@
+name: Deploy to Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Git tag to deploy (must be on master)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    environment: production
+    concurrency:
+      group: deploy-prod
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Verify tag is on master
+        run: |
+          git fetch --tags origin master
+          if ! git rev-parse -q --verify "refs/tags/${{ inputs.tag }}" >/dev/null; then
+            echo "ERROR: '${{ inputs.tag }}' is not an existing tag" >&2
+            exit 1
+          fi
+          tag_commit="$(git rev-list -n 1 "refs/tags/${{ inputs.tag }}")"
+          if ! git merge-base --is-ancestor "$tag_commit" origin/master; then
+            echo "ERROR: tag ${{ inputs.tag }} is not on master" >&2
+            exit 1
+          fi
+
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            accept-flake-config = true
+            fallback = true
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+      - name: Build Solidity artifacts
+        run: nix run .#prepSolArtifacts
+
+      - name: Deploy
+        run: nix run .#prodDeployAll
+
+      - name: Cleanup SSH
+        if: always()
+        run: rm -rf ~/.ssh/id_ed25519

@@ -1,4 +1,4 @@
-name: CI/CD
+name: CI
 
 on:
   workflow_dispatch:
@@ -153,54 +153,3 @@ jobs:
 
       - name: pre-commit hooks
         run: nix develop -c pre-commit run --all-files
-
-  deploy:
-    if: github.ref == 'refs/heads/master'
-    needs: [backend, dashboard, hooks]
-    concurrency:
-      group: deploy
-      cancel-in-progress: false
-    runs-on: ubuntu-latest
-    steps:
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@v1.3.1
-
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - uses: DeterminateSystems/nix-installer-action@main
-        with:
-          extra-conf: |
-            accept-flake-config = true
-            fallback = true
-
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-
-      - name: Connect to Tailscale
-        uses: tailscale/github-action@v4
-        with:
-          authkey: ${{ secrets.TS_AUTHKEY }}
-
-      - name: Setup SSH
-        run: |
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-
-      - name: Resolve deploy host via Tailscale
-        run: |
-          DEPLOY_HOST=$(nix eval --raw --file keys.nix tailscaleHost)
-          echo "DEPLOY_HOST=$DEPLOY_HOST" >> "$GITHUB_ENV"
-          echo "::add-mask::$DEPLOY_HOST"
-
-      - name: Build Solidity artifacts
-        run: nix run .#prepSolArtifacts
-
-      - name: Deploy prod
-        run: nix run .#prodDeployAll
-
-      - name: Cleanup SSH
-        if: always()
-        run: rm -rf ~/.ssh/id_ed25519
