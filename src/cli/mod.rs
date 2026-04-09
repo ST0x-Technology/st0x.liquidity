@@ -23,9 +23,13 @@ use st0x_execution::alpaca_broker_api::AlpacaLimitPrice;
 use st0x_execution::{AlpacaAccountId, Direction, FractionalShares, Positive, Symbol, TimeInForce};
 use st0x_finance::Usdc;
 
+use st0x_event_sorcery::Projection;
+
 use crate::config::{BrokerCtx, Ctx, Env};
-use crate::offchain_order::OrderPlacer;
+use crate::offchain_order::{OffchainOrder, OffchainOrderId, OrderPlacer};
+use crate::position::Position;
 use crate::symbol::cache::SymbolCache;
+use crate::vault_registry::VaultRegistry;
 
 /// Direction for transferring assets between trading venues.
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -43,6 +47,17 @@ pub enum ConvertDirection {
     ToUsd,
     /// Convert USD buying power to USDC (buy USDC/USD)
     ToUsdc,
+}
+
+/// Aggregate types that have materialized views.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum AggregateView {
+    /// Position aggregate (position_view)
+    Position,
+    /// Offchain order aggregate (offchain_order_view)
+    OffchainOrder,
+    /// Vault registry aggregate (vault_registry_view)
+    VaultRegistry,
 }
 
 /// CCTP chain identifier for specifying source chain.
@@ -422,6 +437,25 @@ pub enum Commands {
         #[arg(long = "yes")]
         yes: bool,
     },
+
+    /// Rebuild a materialized view by replaying all events from scratch
+    ///
+    /// Use as an escape hatch when a view becomes corrupted (e.g., due to
+    /// lost updates from optimistic lock conflicts). Deletes the view row(s)
+    /// and replays all events to reconstruct correct state.
+    RebuildView {
+        /// Aggregate type to rebuild (position, offchain-order, vault-registry)
+        #[arg(short = 'a', long = "aggregate")]
+        aggregate: AggregateView,
+        /// Specific aggregate ID to rebuild (e.g., AAPL for position).
+        /// Mutually exclusive with --all.
+        #[arg(long = "id", conflicts_with = "all", required_unless_present = "all")]
+        id: Option<String>,
+        /// Rebuild all views for the aggregate type.
+        /// Mutually exclusive with --id.
+        #[arg(long = "all", conflicts_with = "id", required_unless_present = "id")]
+        all: bool,
+    },
 }
 
 #[derive(Debug, Parser)]
@@ -566,6 +600,11 @@ enum SimpleCommand {
         to: Option<Address>,
         data: Option<String>,
         yes: bool,
+    },
+    RebuildView {
+        aggregate: AggregateView,
+        id: Option<String>,
+        all: bool,
     },
 }
 
@@ -746,6 +785,9 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
         }),
         Commands::OrderStatus { order_id } => Ok(SimpleCommand::OrderStatus { order_id }),
         Commands::Submit { to, data, yes } => Ok(SimpleCommand::Submit { to, data, yes }),
+        Commands::RebuildView { aggregate, id, all } => {
+            Ok(SimpleCommand::RebuildView { aggregate, id, all })
+        }
     }
 }
 
@@ -887,7 +929,59 @@ async fn run_simple_command<W: Write>(
             };
             submit::submit_command(stdout, transactions, yes, ctx).await
         }
+        SimpleCommand::RebuildView { aggregate, id, all } => {
+            rebuild_view(stdout, pool, aggregate, id, all).await
+        }
     }
+}
+
+async fn rebuild_view<W: Write>(
+    stdout: &mut W,
+    pool: &SqlitePool,
+    aggregate: AggregateView,
+    id: Option<String>,
+    all: bool,
+) -> anyhow::Result<()> {
+    match aggregate {
+        AggregateView::Position => {
+            let projection = Projection::<Position>::sqlite(pool.clone());
+
+            if let Some(raw_id) = id {
+                let symbol: Symbol = raw_id.parse()?;
+                projection.rebuild(&symbol).await?;
+                writeln!(stdout, "Rebuilt position view for {symbol}")?;
+            } else if all {
+                projection.rebuild_all().await?;
+                writeln!(stdout, "Rebuilt all position views")?;
+            }
+        }
+        AggregateView::OffchainOrder => {
+            let projection = Projection::<OffchainOrder>::sqlite(pool.clone());
+
+            if let Some(raw_id) = id {
+                let order_id: OffchainOrderId = raw_id.parse()?;
+                projection.rebuild(&order_id).await?;
+                writeln!(stdout, "Rebuilt offchain order view for {order_id}")?;
+            } else if all {
+                projection.rebuild_all().await?;
+                writeln!(stdout, "Rebuilt all offchain order views")?;
+            }
+        }
+        AggregateView::VaultRegistry => {
+            let projection = Projection::<VaultRegistry>::sqlite(pool.clone());
+
+            if let Some(raw_id) = id {
+                let registry_id = raw_id.parse()?;
+                projection.rebuild(&registry_id).await?;
+                writeln!(stdout, "Rebuilt vault registry view for {raw_id}")?;
+            } else if all {
+                projection.rebuild_all().await?;
+                writeln!(stdout, "Rebuilt all vault registry views")?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 async fn run_provider_command<W: Write>(

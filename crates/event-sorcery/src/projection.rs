@@ -15,7 +15,7 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::EventSourced;
 use crate::dependency::{Cons, Dependent, EntityList, Nil};
@@ -290,6 +290,45 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
         Ok(())
     }
 
+    /// Rebuild a single view by deleting its row and replaying
+    /// all events from scratch via `catch_up`.
+    ///
+    /// Use as an escape hatch when a view becomes corrupted due
+    /// to lost updates.
+    pub async fn rebuild(&self, id: &Entity::Id) -> Result<(), ProjectionError<Entity>>
+    where
+        <Entity::Id as FromStr>::Err: Debug,
+    {
+        let (pool, table) = self.sqlite_backing()?;
+        let view_id = id.to_string();
+
+        info!(%view_id, %table, "Rebuilding view from event history");
+
+        sqlx::query(&format!("DELETE FROM {table} WHERE view_id = ?1"))
+            .bind(&view_id)
+            .execute(pool)
+            .await?;
+
+        self.catch_up().await
+    }
+
+    /// Rebuild all views by deleting every row and replaying
+    /// all events from scratch via `catch_up`.
+    pub async fn rebuild_all(&self) -> Result<(), ProjectionError<Entity>>
+    where
+        <Entity::Id as FromStr>::Err: Debug,
+    {
+        let (pool, table) = self.sqlite_backing()?;
+
+        info!(%table, "Rebuilding all views from event history");
+
+        sqlx::query(&format!("DELETE FROM {table}"))
+            .execute(pool)
+            .await?;
+
+        self.catch_up().await
+    }
+
     async fn replay_missed_events(
         &self,
         pool: &SqlitePool,
@@ -494,19 +533,40 @@ where
         let (id, event) = event.into_inner();
         let view_id = id.to_string();
 
-        let (mut lifecycle, context) = match self.repo.load_with_context(&view_id).await {
-            Ok(Some(pair)) => pair,
-            Ok(None) => (Lifecycle::default(), ViewContext::new(view_id.clone(), 0)),
-            Err(error) => {
-                warn!(%view_id, ?error, "Failed to load view for update");
-                return Ok(());
+        let max_retries = 3;
+
+        for attempt in 0..=max_retries {
+            let (mut lifecycle, context) = match self.repo.load_with_context(&view_id).await {
+                Ok(Some(pair)) => pair,
+                Ok(None) => (Lifecycle::default(), ViewContext::new(view_id.clone(), 0)),
+                Err(error) => {
+                    warn!(%view_id, ?error, "Failed to load view for update");
+                    return Ok(());
+                }
+            };
+
+            lifecycle.apply(event.clone());
+
+            match self.repo.update_view(lifecycle, context).await {
+                Ok(()) => return Ok(()),
+                Err(PersistenceError::OptimisticLockError) if attempt < max_retries => {
+                    warn!(
+                        %view_id, attempt = attempt + 1, max_retries,
+                        "Optimistic lock conflict, retrying view update"
+                    );
+                }
+                Err(PersistenceError::OptimisticLockError) => {
+                    error!(
+                        %view_id, max_retries,
+                        "View update lost: optimistic lock conflict persisted after all retries"
+                    );
+                    return Ok(());
+                }
+                Err(error) => {
+                    warn!(%view_id, ?error, "Failed to save view update");
+                    return Ok(());
+                }
             }
-        };
-
-        lifecycle.apply(event.clone());
-
-        if let Err(error) = self.repo.update_view(lifecycle, context).await {
-            warn!(%view_id, ?error, "Failed to save view update");
         }
 
         Ok(())
@@ -670,6 +730,149 @@ mod tests {
                 .insert(context.view_instance_id, view);
             Ok(())
         }
+    }
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use crate::dependency::OneOf;
+    use crate::reactor::Reactor;
+
+    /// In-memory view repository that returns `OptimisticLockError`
+    /// a configurable number of times before succeeding.
+    struct ConflictingRepo {
+        views: RwLock<HashMap<String, (Lifecycle<TestEntity>, i64)>>,
+        remaining_conflicts: AtomicU32,
+    }
+
+    impl ConflictingRepo {
+        fn new(conflicts: u32) -> Self {
+            Self {
+                views: RwLock::new(HashMap::new()),
+                remaining_conflicts: AtomicU32::new(conflicts),
+            }
+        }
+
+        fn with_entity(self, aggregate_id: &str, entity: TestEntity) -> Self {
+            let mut views = self.views.into_inner();
+            views.insert(aggregate_id.to_string(), (Lifecycle::Live(entity), 1));
+            Self {
+                views: RwLock::new(views),
+                ..self
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ViewRepository<Lifecycle<TestEntity>, Lifecycle<TestEntity>> for ConflictingRepo {
+        async fn load(
+            &self,
+            aggregate_id: &str,
+        ) -> Result<Option<Lifecycle<TestEntity>>, PersistenceError> {
+            Ok(self
+                .views
+                .read()
+                .await
+                .get(aggregate_id)
+                .map(|(lifecycle, _version)| lifecycle.clone()))
+        }
+
+        async fn load_with_context(
+            &self,
+            aggregate_id: &str,
+        ) -> Result<Option<(Lifecycle<TestEntity>, ViewContext)>, PersistenceError> {
+            let guard = self.views.read().await;
+            Ok(guard.get(aggregate_id).map(|(lifecycle, version)| {
+                let context = ViewContext::new(aggregate_id.to_string(), *version);
+                (lifecycle.clone(), context)
+            }))
+        }
+
+        async fn update_view(
+            &self,
+            view: Lifecycle<TestEntity>,
+            context: ViewContext,
+        ) -> Result<(), PersistenceError> {
+            let remaining = self.remaining_conflicts.load(Ordering::SeqCst);
+
+            if remaining > 0 {
+                self.remaining_conflicts
+                    .store(remaining - 1, Ordering::SeqCst);
+                return Err(PersistenceError::OptimisticLockError);
+            }
+
+            let new_version = context.version + 1;
+            self.views
+                .write()
+                .await
+                .insert(context.view_instance_id, (view, new_version));
+
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn react_retries_on_optimistic_lock_conflict() {
+        let entity = TestEntity {
+            name: "original".to_string(),
+        };
+        let repo = ConflictingRepo::new(2).with_entity("id-1", entity);
+        let projection = Projection::new(Arc::new(repo));
+
+        let event: OneOf<(String, TestEvent), Never> = OneOf::Here(("id-1".to_string(), TestEvent));
+
+        projection.react(event).await.unwrap();
+
+        // evolve clones the entity unchanged, but the update was persisted
+        let result = projection.load(&"id-1".to_string()).await.unwrap();
+        assert_eq!(
+            result,
+            Some(TestEntity {
+                name: "original".to_string(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn react_gives_up_after_max_retries() {
+        // 4 conflicts exceeds the max of 3 retries (attempts 0..=3)
+        let entity = TestEntity {
+            name: "original".to_string(),
+        };
+        let repo = Arc::new(ConflictingRepo::new(4).with_entity("id-1", entity.clone()));
+        let projection = Projection::new(Arc::clone(&repo));
+
+        let event: OneOf<(String, TestEvent), Never> = OneOf::Here(("id-1".to_string(), TestEvent));
+
+        // Should not panic -- react swallows the error
+        projection.react(event).await.unwrap();
+
+        // All 4 attempts were made (counter decremented from 4 to 0)
+        assert_eq!(repo.remaining_conflicts.load(Ordering::SeqCst), 0);
+
+        // View should still have the original entity (update never succeeded)
+        let result = projection.load(&"id-1".to_string()).await.unwrap();
+        assert_eq!(result, Some(entity));
+    }
+
+    #[tokio::test]
+    async fn react_succeeds_without_conflict() {
+        let entity = TestEntity {
+            name: "original".to_string(),
+        };
+        let repo = ConflictingRepo::new(0).with_entity("id-1", entity);
+        let projection = Projection::new(Arc::new(repo));
+
+        let event: OneOf<(String, TestEvent), Never> = OneOf::Here(("id-1".to_string(), TestEvent));
+
+        projection.react(event).await.unwrap();
+
+        let result = projection.load(&"id-1".to_string()).await.unwrap();
+        assert_eq!(
+            result,
+            Some(TestEntity {
+                name: "original".to_string(),
+            })
+        );
     }
 
     #[tokio::test]
@@ -1028,5 +1231,54 @@ mod tests {
             matches!(error, ProjectionError::Serde { .. }),
             "expected Serde error, got: {error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn rebuild_replays_all_events_from_scratch() {
+        let pool = setup_catch_up_db().await;
+
+        // Insert events and a corrupted view (value should be 2, not 99)
+        insert_event(&pool, "counter-1", 1, &CounterEvent::Created { initial: 0 }).await;
+        insert_event(&pool, "counter-1", 2, &CounterEvent::Incremented).await;
+        insert_event(&pool, "counter-1", 3, &CounterEvent::Incremented).await;
+
+        insert_stale_view(&pool, "counter-1", 3, &Counter { value: 99 }).await;
+
+        let projection = Projection::<Counter>::sqlite(pool);
+
+        // catch_up would not fix this because version matches max_seq
+        projection.rebuild(&"counter-1".to_string()).await.unwrap();
+
+        let result = projection.load(&"counter-1".to_string()).await.unwrap();
+        assert_eq!(result, Some(Counter { value: 2 }));
+    }
+
+    #[tokio::test]
+    async fn rebuild_all_replays_all_aggregates() {
+        let pool = setup_catch_up_db().await;
+
+        // Two aggregates with corrupted views
+        insert_event(&pool, "counter-1", 1, &CounterEvent::Created { initial: 0 }).await;
+        insert_event(&pool, "counter-1", 2, &CounterEvent::Incremented).await;
+        insert_event(
+            &pool,
+            "counter-2",
+            1,
+            &CounterEvent::Created { initial: 10 },
+        )
+        .await;
+
+        insert_stale_view(&pool, "counter-1", 2, &Counter { value: 99 }).await;
+        insert_stale_view(&pool, "counter-2", 1, &Counter { value: 99 }).await;
+
+        let projection = Projection::<Counter>::sqlite(pool);
+
+        projection.rebuild_all().await.unwrap();
+
+        let result1 = projection.load(&"counter-1".to_string()).await.unwrap();
+        assert_eq!(result1, Some(Counter { value: 1 }));
+
+        let result2 = projection.load(&"counter-2".to_string()).await.unwrap();
+        assert_eq!(result2, Some(Counter { value: 10 }));
     }
 }
