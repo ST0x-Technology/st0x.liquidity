@@ -51,8 +51,8 @@ case "$env" in
     order_owner="0x386c24644e532387b03c1992ca83542492a3ac32"
     ;;
   staging)
-    subgraph="${STAGING_SUBGRAPH:?Set STAGING_SUBGRAPH env var for staging status}"
-    order_owner="${STAGING_ORDER_OWNER:?Set STAGING_ORDER_OWNER env var for staging status}"
+    subgraph="https://api.goldsky.com/api/public/project_clv14x04y9kzi01saerx7bxpg/subgraphs/ob4-base/2026-02-05-c4ef/gn"
+    order_owner="0x386c24644e532387b03c1992ca83542492a3ac32"
     ;;
   *)
     echo "ERROR: unknown environment '$env'" >&2
