@@ -1,7 +1,8 @@
-{ pkgs, lib, modulesPath, st0x-cli, ... }:
+{ pkgs, lib, modulesPath, st0x-cli, environment, volumeName, ... }:
 
 let
   inherit (import ./keys.nix) roles;
+  envRoles = roles.${environment};
 
   services = import ./services.nix;
   enabledServices = lib.filterAttrs (_: v: v.enabled) services;
@@ -164,7 +165,7 @@ in {
     };
   };
 
-  users.users.root.openssh.authorizedKeys.keys = roles.ssh;
+  users.users.root.openssh.authorizedKeys.keys = envRoles.ssh;
 
   networking.firewall = {
     enable = true;
@@ -179,7 +180,7 @@ in {
   };
 
   fileSystems."/mnt/data" = {
-    device = "/dev/disk/by-id/scsi-0DO_Volume_st0x-liquidity-data";
+    device = "/dev/disk/by-id/scsi-0DO_Volume_${volumeName}";
     fsType = "ext4";
   };
 

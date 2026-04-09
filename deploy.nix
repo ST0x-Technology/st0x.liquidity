@@ -1,4 +1,4 @@
-{ deploy-rs, self }:
+{ deploy-rs, self, environments }:
 
 let
   system = "x86_64-linux";
@@ -10,7 +10,6 @@ let
 
   rage = "/run/current-system/sw/bin/rage";
   hostKey = "/etc/ssh/ssh_host_ed25519_key";
-  expectedHostPubKey = (import ./keys.nix).keys.host;
 
   services = import ./services.nix;
   enabledServices = builtins.attrNames (builtins.removeAttrs services
@@ -40,74 +39,41 @@ let
     profilePath = "${profileBase}/${name}";
   };
 
-in {
-  config = {
-    nodes.st0x-liquidity = {
-      hostname = builtins.getEnv "DEPLOY_HOST";
-      sshUser = "root";
-      user = "root";
+  mkNode = { nixosConfig }: {
+    hostname = builtins.getEnv "DEPLOY_HOST";
+    sshUser = "root";
+    user = "root";
 
-      profilesOrder = [ "system" "dashboard" ] ++ enabledServices;
+    profilesOrder = [ "system" "dashboard" ] ++ enabledServices;
 
-      profiles = {
-        system.path = activate.nixos self.nixosConfigurations.st0x-liquidity;
+    profiles = {
+      system.path = activate.nixos nixosConfig;
 
-        dashboard = {
-          path = activate.custom dashboardPackage "systemctl reload nginx";
-          profilePath = "${profileBase}/dashboard";
-        };
-      } // builtins.listToAttrs (map (name: {
-        inherit name;
-        value = mkProfile name;
-      }) enabledServices);
-    };
+      dashboard = {
+        path = activate.custom dashboardPackage "systemctl reload nginx";
+        profilePath = "${profileBase}/dashboard";
+      };
+    } // builtins.listToAttrs (map (name: {
+      inherit name;
+      value = mkProfile name;
+    }) enabledServices);
   };
 
-  wrappers = { pkgs, infraPkgs, localSystem }:
+in {
+  config = {
+    nodes = builtins.listToAttrs (map (env:
+      let cfg = environments.${env};
+      in {
+        name = cfg.nodeName;
+        value =
+          mkNode { nixosConfig = self.nixosConfigurations.${cfg.nodeName}; };
+      }) (builtins.attrNames environments));
+  };
+
+  mkDeployScripts = { pkgs, infraPkgs, localSystem }:
     let
       deployInputs = infraPkgs.buildInputs
         ++ [ deploy-rs.packages.${localSystem}.deploy-rs pkgs.openssh ];
-
-      deployPreamble = ''
-        if [ -n "''${DEPLOY_HOST:-}" ]; then
-          host_ip="$DEPLOY_HOST"
-          echo "Using pre-set DEPLOY_HOST=$host_ip"
-        else
-          ${infraPkgs.resolveIp}
-          export DEPLOY_HOST="$host_ip"
-        fi
-
-        # Verify host key against keys.nix trust anchor
-        scanned=$(ssh-keyscan -t ed25519 "$host_ip" 2>/dev/null | grep -v '^#')
-        expected="$host_ip ${expectedHostPubKey}"
-
-        if [ -z "$scanned" ]; then
-          echo "ERROR: ssh-keyscan returned no key for $host_ip" >&2
-          exit 1
-        fi
-
-        if [ "$(echo "$scanned" | wc -l)" -ne 1 ]; then
-          echo "ERROR: expected 1 key from $host_ip, got multiple:" >&2
-          echo "$scanned" >&2
-          exit 1
-        fi
-
-        if [ "$scanned" != "$expected" ]; then
-          echo "ERROR: host key mismatch for $host_ip" >&2
-          echo "  expected: $expected" >&2
-          echo "  got:      $scanned" >&2
-          exit 1
-        fi
-
-        ssh-keygen -R "$host_ip" >/dev/null 2>&1 || true
-        echo "$expected" >> "$HOME/.ssh/known_hosts"
-
-        ssh_flag=""
-        if [ "$identity" != "$HOME/.ssh/id_ed25519" ]; then
-          export NIX_SSHOPTS="-i $identity"
-          ssh_flag="--ssh-opts=-i $identity"
-        fi
-      '';
 
       deployFlags = if localSystem == "x86_64-linux" then
         "--debug-logs --skip-checks"
@@ -117,31 +83,82 @@ in {
       nixFlags =
         "--impure --accept-flake-config --extra-experimental-features 'nix-command flakes'";
 
-      mkDeployScript = name:
-        { prelude ? "", target }:
-        pkgs.writeShellApplication {
-          inherit name;
-          runtimeInputs = deployInputs;
-          text = ''
-            ${deployPreamble}
-            ${prelude}
-            deploy ${deployFlags} ''${ssh_flag:+"$ssh_flag"} ${target} \
-              -- ${nixFlags} "$@"
+      mkEnvDeployScripts = env:
+        let
+          cfg = environments.${env};
+          inherit (cfg) hostKey nodeName;
+          envInfraPkgs = infraPkgs.perEnv.${env};
+
+          deployPreamble = ''
+            if [ -n "''${DEPLOY_HOST:-}" ]; then
+              host_ip="$DEPLOY_HOST"
+              echo "Using pre-set DEPLOY_HOST=$host_ip"
+            else
+              ${envInfraPkgs.resolveIp}
+              export DEPLOY_HOST="$host_ip"
+            fi
+
+            # Verify host key against keys.nix trust anchor
+            scanned=$(ssh-keyscan -t ed25519 "$host_ip" 2>/dev/null | grep -v '^#')
+            expected="$host_ip ${hostKey}"
+
+            if [ -z "$scanned" ]; then
+              echo "ERROR: ssh-keyscan returned no key for $host_ip" >&2
+              exit 1
+            fi
+
+            if [ "$(echo "$scanned" | wc -l)" -ne 1 ]; then
+              echo "ERROR: expected 1 key from $host_ip, got multiple:" >&2
+              echo "$scanned" >&2
+              exit 1
+            fi
+
+            if [ "$scanned" != "$expected" ]; then
+              echo "ERROR: host key mismatch for $host_ip" >&2
+              echo "  expected: $expected" >&2
+              echo "  got:      $scanned" >&2
+              exit 1
+            fi
+
+            ssh-keygen -R "$host_ip" >/dev/null 2>&1 || true
+            echo "$expected" >> "$HOME/.ssh/known_hosts"
+
+            ssh_flag=""
+            if [ "$identity" != "$HOME/.ssh/id_ed25519" ]; then
+              export NIX_SSHOPTS="-i $identity"
+              ssh_flag="--ssh-opts=-i $identity"
+            fi
           '';
+
+          mkDeployScript = name:
+            { prelude ? "", target }:
+            pkgs.writeShellApplication {
+              inherit name;
+              runtimeInputs = deployInputs;
+              text = ''
+                ${deployPreamble}
+                ${prelude}
+                deploy ${deployFlags} ''${ssh_flag:+"$ssh_flag"} ${target} \
+                  -- ${nixFlags} "$@"
+              '';
+            };
+
+        in {
+          "${env}DeployNixos" =
+            mkDeployScript "deploy-nixos" { target = ".#${nodeName}.system"; };
+
+          "${env}DeployService" = mkDeployScript "deploy-service" {
+            prelude = ''
+              profile="''${1:?usage: deploy-service <profile>}"
+              shift
+            '';
+            target = ''.#${nodeName}."$profile"'';
+          };
+
+          "${env}DeployAll" =
+            mkDeployScript "deploy-all" { target = ".#${nodeName}"; };
         };
 
-    in {
-      deployNixos =
-        mkDeployScript "deploy-nixos" { target = ".#st0x-liquidity.system"; };
-
-      deployService = mkDeployScript "deploy-service" {
-        prelude = ''
-          profile="''${1:?usage: deploy-service <profile>}"
-          shift
-        '';
-        target = ''.#st0x-liquidity."$profile"'';
-      };
-
-      deployAll = mkDeployScript "deploy-all" { target = ".#st0x-liquidity"; };
-    };
+    in builtins.foldl' (acc: env: acc // mkEnvDeployScripts env) { }
+    (builtins.attrNames environments);
 }

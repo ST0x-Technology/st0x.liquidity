@@ -198,8 +198,8 @@ jobs:
       - name: Build Solidity artifacts
         run: nix run .#prepSolArtifacts
 
-      - name: Deploy
-        run: nix run .#deployAll
+      - name: Deploy prod
+        run: nix run .#prodDeployAll
 
       - name: Cleanup SSH
         if: always()

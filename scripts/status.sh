@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Prod status dump: fetches bot status, Raindex orders, DB, and logs.
-# Called by the nix `prod-status` wrapper which sets $identity and $host_ip.
-# shellcheck disable=SC2154  # identity and host_ip are exported by the nix wrapper
+# Status dump: fetches bot status, Raindex orders, DB, and logs.
+# Called by the nix `<env>-status` wrapper which sets $identity, $host_ip, and $ENV.
+# shellcheck disable=SC2154  # identity, host_ip, ENV are exported by the nix wrapper
 
 set -euo pipefail
 

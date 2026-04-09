@@ -26,17 +26,59 @@
 
   outputs = { self, flake-utils, rainix, bun2nix, ragenix, deploy-rs, disko
     , nixos-anywhere, crane, ... }:
-    {
-      nixosConfigurations.st0x-liquidity =
-        rainix.inputs.nixpkgs.lib.nixosSystem {
-          system = "x86_64-linux";
-          specialArgs = { inherit (self.packages.x86_64-linux) st0x-cli; };
-
-          modules =
-            [ disko.nixosModules.disko ragenix.nixosModules.default ./os.nix ];
+    let
+      inherit (import ./keys.nix) keys;
+      environments = {
+        prod = {
+          nodeName = "st0x-liquidity";
+          volumeName = "st0x-liquidity-data";
+          hostKey = keys.host-prod;
         };
+        staging = {
+          nodeName = "st0x-liquidity-staging";
+          volumeName = "st0x-liquidity-staging-data";
+          hostKey = keys.host-staging;
+        };
+      };
+      envNames = builtins.attrNames environments;
+    in {
+      nixosConfigurations = let
+        mkNixos = { environment, modules }:
+          rainix.inputs.nixpkgs.lib.nixosSystem {
+            system = "x86_64-linux";
+            specialArgs = {
+              inherit environment;
+              inherit (environments.${environment}) volumeName;
+              inherit (self.packages.x86_64-linux) st0x-cli;
+            };
+            modules = [ disko.nixosModules.disko ] ++ modules;
+          };
 
-      deploy = (import ./deploy.nix { inherit deploy-rs self; }).config;
+        full = env:
+          mkNixos {
+            environment = env;
+            modules = [ ragenix.nixosModules.default ./os.nix ];
+          };
+
+        bootstrap = env:
+          mkNixos {
+            environment = env;
+            modules = [ ./bootstrap.nix ];
+          };
+
+      in builtins.listToAttrs (builtins.concatMap (env: [
+        {
+          name = environments.${env}.nodeName;
+          value = full env;
+        }
+        {
+          name = "${environments.${env}.nodeName}-bootstrap";
+          value = bootstrap env;
+        }
+      ]) envNames);
+
+      deploy =
+        (import ./deploy.nix { inherit deploy-rs self environments; }).config;
     } // flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import rainix.inputs.nixpkgs {
@@ -47,25 +89,29 @@
 
         craneLib =
           (crane.mkLib pkgs).overrideToolchain rainix.rust-toolchain.${system};
+
+        rainixPkgs = rainix.packages.${system};
+        infraPkgs = import ./infra {
+          inherit pkgs ragenix rainix system;
+          environments = envNames;
+        };
+        rekeySecrets =
+          ''ragenix --rules ./secret/secrets.nix -i "$identity" -r'';
+
+        deployScripts = (import ./deploy.nix {
+          inherit deploy-rs self environments;
+        }).mkDeployScripts {
+          inherit pkgs infraPkgs;
+          localSystem = system;
+        };
+
+        st0xRust = pkgs.callPackage ./rust.nix {
+          inherit craneLib;
+          inherit (pkgs) sqlx-cli;
+        };
+
       in rec {
-        packages = let
-          rainixPkgs = rainix.packages.${system};
-          infraPkgs = import ./infra { inherit pkgs ragenix rainix system; };
-          rekeySecrets =
-            ''ragenix --rules ./secret/secrets.nix -i "$identity" -r'';
-
-          deployPkgs =
-            (import ./deploy.nix { inherit deploy-rs self; }).wrappers {
-              inherit pkgs infraPkgs;
-              localSystem = system;
-            };
-
-          st0xRust = pkgs.callPackage ./rust.nix {
-            inherit craneLib;
-            inherit (pkgs) sqlx-cli;
-          };
-        in rainixPkgs // deployPkgs // {
-          inherit (infraPkgs) tfInit tfPlan tfApply tfDestroy tfEditVars;
+        packages = rainixPkgs // infraPkgs.packages // deployScripts // {
 
           st0x-dto = st0xRust.dto;
           st0x-liquidity = st0xRust.package;
@@ -114,10 +160,38 @@
             additionalBuildInputs = infraPkgs.buildInputs
               ++ [ nixos-anywhere.packages.${system}.default ];
             body = ''
-              ${infraPkgs.resolveIp}
+              env="''${1:?usage: bootstrap <prod|staging>}"
+              shift
+
+              case "$env" in
+                ${
+                  builtins.concatStringsSep "\n" (map (env: ''
+                    ${env})
+                      flake_config="${environments.${env}.nodeName}-bootstrap"
+                      host_key_field="host-${env}" ;;'') envNames)
+                }
+                *)
+                  echo "ERROR: unknown environment '$env'" >&2
+                  exit 1 ;;
+              esac
+
+              ${infraPkgs.parseIdentity}
+
+              # Resolve IP from terraform state
+              trap "rm -f infra/terraform.tfstate" EXIT
+              if [ -f "infra/terraform.tfstate.age" ]; then
+                rage -d -i "$identity" infra/terraform.tfstate.age > infra/terraform.tfstate
+              fi
+              host_ip=$(jq -r ".outputs.''${env}_droplet_ipv4.value" infra/terraform.tfstate)
+              rm -f infra/terraform.tfstate
+              if [ -z "$host_ip" ] || [ "$host_ip" = "null" ]; then
+                echo "ERROR: could not resolve IP from terraform output '''''${env}_droplet_ipv4'" >&2
+                exit 1
+              fi
+
               ssh_opts="-o StrictHostKeyChecking=no -o ConnectTimeout=5 -i $identity"
 
-              nixos-anywhere --flake ".#st0x-liquidity" \
+              nixos-anywhere --flake ".#$flake_config" \
                 --option pure-eval false \
                 --ssh-option "IdentityFile=$identity" \
                 --target-host "root@$host_ip" "$@"
@@ -146,10 +220,10 @@
               fi
 
               ${pkgs.gnused}/bin/sed -i \
-                '/host =/{n;s|"ssh-ed25519 [A-Za-z0-9+/=]*"|"'"$new_key"'"|;}' \
+                "/$host_key_field =/{n;s|\"ssh-ed25519 [A-Za-z0-9+/=_]*\"|\"$new_key\"|;}" \
                 keys.nix
 
-              echo "Updated host key in keys.nix, rekeying secrets..."
+              echo "Updated $host_key_field in keys.nix, rekeying secrets..."
               ${rekeySecrets}
             '';
           };
@@ -178,79 +252,6 @@
             body = infraPkgs.tfRekey;
           };
 
-          resolveIp = pkgs.writeShellApplication {
-            name = "resolve-ip";
-            runtimeInputs = infraPkgs.buildInputs;
-            text = ''
-              ${infraPkgs.resolveIp}
-              echo "$host_ip"
-            '';
-          };
-
-          remote = pkgs.writeShellApplication {
-            name = "remote";
-            runtimeInputs = infraPkgs.sshBuildInputs ++ [ pkgs.openssh ];
-            text = ''
-              ${infraPkgs.resolveHost}
-              exec ssh -i "$identity" "root@$host_ip" "$@"
-            '';
-          };
-
-          prodStatus = pkgs.writeShellApplication {
-            name = "prod-status";
-            runtimeInputs = infraPkgs.sshBuildInputs
-              ++ [ pkgs.openssh pkgs.curl pkgs.jq ];
-            text = ''
-              ${infraPkgs.resolveHost}
-              export identity host_ip
-              exec bash scripts/prod-status.sh "$@"
-            '';
-          };
-
-          botStart = pkgs.writeShellApplication {
-            name = "bot-start";
-            runtimeInputs = infraPkgs.sshBuildInputs ++ [ pkgs.openssh ];
-            text = ''
-              ${infraPkgs.resolveHost}
-              echo "Starting st0x-hedge on prod..."
-              ssh -i "$identity" "root@$host_ip" "mkdir -p /run/st0x && touch /run/st0x/st0x-hedge.ready && systemctl start st0x-hedge"
-              ssh -i "$identity" "root@$host_ip" systemctl is-active st0x-hedge
-            '';
-          };
-
-          botStop = pkgs.writeShellApplication {
-            name = "bot-stop";
-            runtimeInputs = infraPkgs.sshBuildInputs ++ [ pkgs.openssh ];
-            text = ''
-              ${infraPkgs.resolveHost}
-              echo "Stopping st0x-hedge on prod..."
-              ssh -i "$identity" "root@$host_ip" "systemctl stop st0x-hedge && rm -f /run/st0x/st0x-hedge.ready"
-              echo "Stopped."
-            '';
-          };
-
-          botRestart = pkgs.writeShellApplication {
-            name = "bot-restart";
-            runtimeInputs = infraPkgs.sshBuildInputs ++ [ pkgs.openssh ];
-            text = ''
-              ${infraPkgs.resolveHost}
-              echo "Restarting st0x-hedge on prod..."
-              ssh -i "$identity" "root@$host_ip" "mkdir -p /run/st0x && touch /run/st0x/st0x-hedge.ready && systemctl restart st0x-hedge"
-              ssh -i "$identity" "root@$host_ip" systemctl is-active st0x-hedge
-            '';
-          };
-
-          prodDashboard = pkgs.writeShellApplication {
-            name = "prod-dashboard";
-            runtimeInputs = infraPkgs.sshBuildInputs
-              ++ [ pkgs.openssh pkgs.bun ];
-            text = ''
-              ${infraPkgs.resolveHost}
-              export identity host_ip
-              exec bash scripts/prod-dashboard.sh "$@"
-            '';
-          };
-
         };
 
         formatter = pkgs.nixfmt-classic;
@@ -273,16 +274,10 @@
               packages.secret
               packages.rekey
               packages.tfRekey
-              packages.remote
-              packages.deployNixos
-              packages.deployService
-              packages.deployAll
-              packages.prodStatus
-              packages.prodDashboard
-              packages.botStart
-              packages.botStop
-              packages.botRestart
-            ] ++ rainix.devShells.${system}.default.buildInputs;
+              packages.bootstrap
+            ] ++ builtins.attrValues infraPkgs.packages
+            ++ builtins.attrValues deployScripts
+            ++ rainix.devShells.${system}.default.buildInputs;
         };
       });
 
