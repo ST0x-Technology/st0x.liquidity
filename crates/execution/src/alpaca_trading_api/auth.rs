@@ -1,5 +1,6 @@
 use apca::api::v2::account::{self, GetError};
 use apca::{Client, RequestError};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 
 /// Trading mode for Alpaca Trading API
@@ -19,6 +20,14 @@ impl AlpacaTradingApiMode {
         match self {
             Self::Paper => "https://paper-api.alpaca.markets".to_string(),
             Self::Live => "https://api.alpaca.markets".to_string(),
+            #[cfg(test)]
+            Self::Mock(url) => url.clone(),
+        }
+    }
+
+    fn market_data_base_url(&self) -> String {
+        match self {
+            Self::Paper | Self::Live => "https://data.alpaca.markets".to_string(),
             #[cfg(test)]
             Self::Mock(url) => url.clone(),
         }
@@ -61,6 +70,9 @@ impl std::fmt::Debug for AlpacaTradingApiCtx {
 /// Alpaca Trading API client wrapper with authentication and context
 pub struct AlpacaTradingApiClient {
     client: Client,
+    http_client: reqwest::Client,
+    base_url: String,
+    market_data_base_url: String,
     trading_mode: AlpacaTradingApiMode,
 }
 
@@ -77,11 +89,23 @@ impl AlpacaTradingApiClient {
     pub(crate) fn new(ctx: &AlpacaTradingApiCtx) -> Result<Self, super::AlpacaTradingApiError> {
         let base_url = ctx.base_url();
         let api_info = apca::ApiInfo::from_parts(&base_url, &ctx.api_key, &ctx.api_secret)?;
+        let market_data_base_url = ctx.trading_mode().market_data_base_url();
+        let api_key_header = HeaderName::from_static("apca-api-key-id");
+        let api_secret_header = HeaderName::from_static("apca-api-secret-key");
 
         let client = Client::new(api_info);
+        let headers = HeaderMap::from_iter([
+            (api_key_header, HeaderValue::from_str(&ctx.api_key)?),
+            (api_secret_header, HeaderValue::from_str(&ctx.api_secret)?),
+            (CONTENT_TYPE, HeaderValue::from_static("application/json")),
+        ]);
+        let http_client = reqwest::Client::builder().default_headers(headers).build()?;
 
         Ok(Self {
             client,
+            http_client,
+            base_url,
+            market_data_base_url,
             trading_mode: ctx.trading_mode(),
         })
     }
@@ -97,6 +121,18 @@ impl AlpacaTradingApiClient {
 
     pub(crate) fn client(&self) -> &Client {
         &self.client
+    }
+
+    pub(crate) fn http_client(&self) -> &reqwest::Client {
+        &self.http_client
+    }
+
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    pub(crate) fn market_data_base_url(&self) -> &str {
+        &self.market_data_base_url
     }
 }
 

@@ -14,8 +14,9 @@ use tracing::warn;
 static MOCK_FILL_PRICE: LazyLock<Float> = LazyLock::new(|| float!(100));
 
 use crate::{
-    ExecutionError, Executor, Inventory, InventoryResult, MarketOrder, OrderPlacement, OrderState,
-    SupportedExecutor, TryIntoExecutor,
+    ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, CounterTradePreflight, CounterTradeSkipReason,
+    Direction, ExecutionError, Executor, Inventory, InventoryResult, MarketOrder, OrderPlacement,
+    OrderState, SupportedExecutor, TryIntoExecutor, estimate_buffered_cost_cents,
 };
 
 /// Context for MockExecutor (unit struct - no context needed)
@@ -31,6 +32,7 @@ pub struct MockExecutor {
     inventory_result: InventoryResult,
     order_status_override: Option<OrderState>,
     market_open: bool,
+    preflight_price: Float,
 }
 
 impl MockExecutor {
@@ -42,6 +44,7 @@ impl MockExecutor {
             inventory_result: InventoryResult::Unimplemented,
             order_status_override: None,
             market_open: true,
+            preflight_price: *MOCK_FILL_PRICE,
         }
     }
 
@@ -53,6 +56,7 @@ impl MockExecutor {
             inventory_result: InventoryResult::Unimplemented,
             order_status_override: None,
             market_open: true,
+            preflight_price: *MOCK_FILL_PRICE,
         }
     }
 
@@ -74,6 +78,12 @@ impl MockExecutor {
     #[must_use]
     pub fn with_market_open(mut self, open: bool) -> Self {
         self.market_open = open;
+        self
+    }
+
+    #[must_use]
+    pub fn with_preflight_price(mut self, price: Float) -> Self {
+        self.preflight_price = price;
         self
     }
 
@@ -178,6 +188,58 @@ impl Executor for MockExecutor {
         }
 
         Ok(self.inventory_result.clone())
+    }
+
+    async fn preflight_counter_trade(
+        &self,
+        order: MarketOrder,
+    ) -> Result<CounterTradePreflight, Self::Error> {
+        let InventoryResult::Fetched(inventory) = &self.inventory_result else {
+            return Ok(CounterTradePreflight::Allowed);
+        };
+
+        match order.direction {
+            Direction::Sell => {
+                let available = inventory
+                    .positions
+                    .iter()
+                    .find(|position| position.symbol == order.symbol)
+                    .map(|position| position.quantity)
+                    .unwrap_or(crate::FractionalShares::ZERO);
+
+                if available.inner().gte(order.shares.inner().inner())? {
+                    Ok(CounterTradePreflight::Allowed)
+                } else {
+                    Ok(CounterTradePreflight::Skipped(
+                        CounterTradeSkipReason::InsufficientEquity {
+                            required: order.shares,
+                            available,
+                        },
+                    ))
+                }
+            }
+            Direction::Buy => {
+                let estimated_cost_cents = estimate_buffered_cost_cents(
+                    order.shares,
+                    self.preflight_price,
+                    ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+                )
+                .map_err(|error| ExecutionError::MockFailure {
+                    message: error.to_string(),
+                })?;
+
+                if inventory.cash_balance_cents >= estimated_cost_cents {
+                    Ok(CounterTradePreflight::Allowed)
+                } else {
+                    Ok(CounterTradePreflight::Skipped(
+                        CounterTradeSkipReason::InsufficientCash {
+                            estimated_cost_cents,
+                            available_cash_cents: inventory.cash_balance_cents,
+                        },
+                    ))
+                }
+            }
+        }
     }
 }
 
@@ -340,5 +402,57 @@ mod tests {
 
         assert!(!executor.should_fail);
         assert_eq!(executor.to_supported_executor(), SupportedExecutor::DryRun);
+    }
+
+    #[tokio::test]
+    async fn preflight_counter_trade_skips_sell_without_inventory() {
+        let executor = MockExecutor::new().with_inventory(crate::Inventory {
+            positions: vec![],
+            cash_balance_cents: 50_000,
+        });
+
+        let preflight = executor
+            .preflight_counter_trade(MarketOrder {
+                symbol: Symbol::new("AAPL").unwrap(),
+                shares: positive_shares("2"),
+                direction: Direction::Sell,
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            preflight,
+            CounterTradePreflight::Skipped(CounterTradeSkipReason::InsufficientEquity {
+                required,
+                available,
+            }) if required == positive_shares("2") && available == shares("0")
+        ));
+    }
+
+    #[tokio::test]
+    async fn preflight_counter_trade_skips_buy_without_cash() {
+        let executor = MockExecutor::new()
+            .with_inventory(crate::Inventory {
+                positions: vec![],
+                cash_balance_cents: 10_000,
+            })
+            .with_preflight_price(float!(100));
+
+        let preflight = executor
+            .preflight_counter_trade(MarketOrder {
+                symbol: Symbol::new("AAPL").unwrap(),
+                shares: positive_shares("2"),
+                direction: Direction::Buy,
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            preflight,
+            CounterTradePreflight::Skipped(CounterTradeSkipReason::InsufficientCash {
+                estimated_cost_cents,
+                available_cash_cents,
+            }) if estimated_cost_cents == 20_200 && available_cash_cents == 10_000
+        ));
     }
 }

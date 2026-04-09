@@ -52,6 +52,14 @@ impl AlpacaBrokerApiMode {
             Self::Mock(url) => url,
         }
     }
+
+    pub(super) fn market_data_base_url(&self) -> &str {
+        match self {
+            Self::Sandbox | Self::Production => "https://data.alpaca.markets",
+            #[cfg(any(test, feature = "mock"))]
+            Self::Mock(url) => url,
+        }
+    }
 }
 
 #[derive(Clone, Deserialize)]

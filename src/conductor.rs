@@ -20,9 +20,11 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use st0x_dto::ServerMessage;
-use st0x_event_sorcery::{Projection, Store, StoreBuilder};
-use st0x_evm::Wallet;
-use st0x_execution::{Executor, FractionalShares, Symbol};
+use st0x_event_sorcery::{Projection, SendError, Store, StoreBuilder};
+use st0x_evm::{Evm, ReadOnlyEvm, Wallet};
+use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
+use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
+use st0x_execution::{ExecutionError, Executor, FractionalShares, MarketOrder, Symbol};
 
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::bindings::IOrderBookV6::{self, IOrderBookV6Instance};
@@ -761,6 +763,285 @@ where
     })
 }
 
+<<<<<<< HEAD:src/conductor.rs
+=======
+async fn receive_blockchain_events<S1, S2>(
+    mut clear_stream: S1,
+    mut take_stream: S2,
+    event_sender: UnboundedSender<(TradeEvent, Log)>,
+) where
+    S1: Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin,
+    S2: Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>> + Unpin,
+{
+    loop {
+        let event_result = tokio::select! {
+            Some(result) = clear_stream.next() => {
+                result.map(|(event, log)| (TradeEvent::ClearV3(Box::new(event)), log))
+            }
+            Some(result) = take_stream.next() => {
+                result.map(|(event, log)| (TradeEvent::TakeOrderV3(Box::new(event)), log))
+            }
+            else => {
+                error!("All event streams ended, shutting down event receiver");
+                break;
+            }
+        };
+
+        if !dispatch_blockchain_event(event_result, &event_sender) {
+            break;
+        }
+    }
+}
+
+/// Returns `false` if the event loop should stop.
+fn dispatch_blockchain_event(
+    event_result: Result<(TradeEvent, Log), sol_types::Error>,
+    event_sender: &UnboundedSender<(TradeEvent, Log)>,
+) -> bool {
+    match event_result {
+        Ok((event, log)) => {
+            trace!(
+                "Received blockchain event: tx_hash={:?}, \
+                 log_index={:?}, block_number={:?}",
+                log.transaction_hash, log.log_index, log.block_number
+            );
+            if event_sender.send((event, log)).is_err() {
+                error!("Event receiver dropped, shutting down");
+                return false;
+            }
+            true
+        }
+        Err(error) => {
+            error!("Error in event stream: {error}");
+            true
+        }
+    }
+}
+
+pub(crate) async fn get_cutoff_block<S1, S2, P>(
+    clear_stream: &mut S1,
+    take_stream: &mut S2,
+    provider: &P,
+    pool: &SqlitePool,
+) -> anyhow::Result<u64>
+where
+    S1: Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin,
+    S2: Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>> + Unpin,
+    P: Provider + Clone,
+{
+    info!("Starting WebSocket subscriptions and waiting for first event...");
+
+    let first_event_result = wait_for_first_event_with_timeout(
+        clear_stream,
+        take_stream,
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+
+    let Some((mut event_buffer, block_number)) = first_event_result else {
+        let current_block = provider.get_block_number().await?;
+        info!(
+            "No subscription events within timeout, \
+             using current block {current_block} as cutoff"
+        );
+        return Ok(current_block);
+    };
+
+    buffer_live_events(clear_stream, take_stream, &mut event_buffer, block_number).await;
+
+    crate::queue::enqueue_buffer(pool, event_buffer).await;
+
+    Ok(block_number)
+}
+
+async fn process_live_event(
+    pool: &SqlitePool,
+    event: TradeEvent,
+    log: Log,
+) -> Result<(), EventProcessingError> {
+    match &event {
+        TradeEvent::ClearV3(clear_event) => {
+            info!(
+                "Enqueuing ClearV3 event: tx_hash={:?}, log_index={:?}",
+                log.transaction_hash, log.log_index
+            );
+
+            enqueue(pool, clear_event.as_ref(), &log)
+                .await
+                .map_err(EventProcessingError::EnqueueClearV3)?;
+        }
+        TradeEvent::TakeOrderV3(take_event) => {
+            info!(
+                "Enqueuing TakeOrderV3 event: tx_hash={:?}, log_index={:?}",
+                log.transaction_hash, log.log_index
+            );
+
+            enqueue(pool, take_event.as_ref(), &log)
+                .await
+                .map_err(EventProcessingError::EnqueueTakeOrderV3)?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_queue_processor<E>(
+    executor: &E,
+    ctx: &Ctx,
+    pool: &SqlitePool,
+    cache: &SymbolCache,
+    evm: &impl Evm,
+    cqrs: &TradeProcessingCqrs,
+    vault_registry: &Store<VaultRegistry>,
+) where
+    E: Executor + Clone,
+    EventProcessingError: From<E::Error>,
+{
+    info!("Starting queue processor service");
+
+    let feed_id_cache = FeedIdCache::default();
+
+    log_unprocessed_count(pool).await;
+
+    let queue_context = QueueProcessingCtx {
+        cache,
+        feed_id_cache: &feed_id_cache,
+        vault_registry,
+        executor,
+        order_owner: ctx.order_owner(),
+    };
+
+    loop {
+        let delay = process_queue_step(ctx, pool, evm, cqrs, &queue_context).await;
+        sleep(delay).await;
+    }
+}
+
+async fn log_unprocessed_count(pool: &SqlitePool) {
+    match crate::queue::count_unprocessed(pool).await {
+        Ok(count) if count > 0 => {
+            info!("Found {count} unprocessed events from previous sessions to process");
+        }
+        Ok(_) => info!("No unprocessed events found, starting fresh"),
+        Err(error) => error!("Failed to count unprocessed events: {error}"),
+    }
+}
+
+async fn process_queue_step<E: Executor>(
+    ctx: &Ctx,
+    pool: &SqlitePool,
+    evm: &impl Evm,
+    cqrs: &TradeProcessingCqrs,
+    queue_context: &QueueProcessingCtx<'_, E>,
+) -> Duration
+where
+    EventProcessingError: From<E::Error>,
+{
+    match process_next_queued_event(ctx, pool, evm, cqrs, queue_context).await {
+        Ok(Some(offchain_order_id)) => {
+            info!(%offchain_order_id, "Offchain order placed successfully");
+            std::time::Duration::ZERO
+        }
+        Ok(None) => std::time::Duration::from_millis(100),
+        Err(error) => {
+            error!("Error processing queued event: {error}");
+            std::time::Duration::from_millis(500)
+        }
+    }
+}
+
+/// Context for queue event processing containing caches and CQRS components.
+struct QueueProcessingCtx<'a, E> {
+    cache: &'a SymbolCache,
+    feed_id_cache: &'a FeedIdCache,
+    vault_registry: &'a Store<VaultRegistry>,
+    executor: &'a E,
+    order_owner: Address,
+}
+
+#[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
+async fn process_next_queued_event<E: Executor>(
+    ctx: &Ctx,
+    pool: &SqlitePool,
+    evm: &impl Evm,
+    cqrs: &TradeProcessingCqrs,
+    queue_context: &QueueProcessingCtx<'_, E>,
+) -> Result<Option<OffchainOrderId>, EventProcessingError>
+where
+    EventProcessingError: From<E::Error>,
+{
+    let queued_event = get_next_unprocessed_event(pool).await?;
+    let Some(queued_event) = queued_event else {
+        return Ok(None);
+    };
+
+    let event_id = queued_event.id.ok_or(EventProcessingError::Queue(
+        EventQueueError::MissingQueuedEventId,
+    ))?;
+
+    let onchain_trade = convert_event_to_trade(
+        ctx,
+        queue_context.cache,
+        evm,
+        &queued_event,
+        queue_context.feed_id_cache,
+        queue_context.order_owner,
+    )
+    .await?;
+
+    let Some(trade) = onchain_trade else {
+        info!(
+            "Event filtered out (no matching owner): event_type={:?}, tx_hash={:?}, log_index={}",
+            match &queued_event.event {
+                TradeEvent::ClearV3(_) => "ClearV3",
+                TradeEvent::TakeOrderV3(_) => "TakeOrderV3",
+            },
+            queued_event.tx_hash,
+            queued_event.log_index
+        );
+        mark_event_processed(pool, event_id).await?;
+        return Ok(None);
+    };
+
+    let vault_discovery_ctx = VaultDiscoveryCtx {
+        vault_registry: queue_context.vault_registry,
+        orderbook: ctx.evm.orderbook,
+        order_owner: queue_context.order_owner,
+    };
+
+    info!(
+        "Event successfully converted to trade: event_type={:?}, \
+         tx_hash={:?}, log_index={}, symbol={}, amount={}",
+        match &queued_event.event {
+            TradeEvent::ClearV3(_) => "ClearV3",
+            TradeEvent::TakeOrderV3(_) => "TakeOrderV3",
+        },
+        trade.tx_hash,
+        trade.log_index,
+        trade.symbol,
+        trade.amount
+    );
+
+    discover_vaults_for_trade(&queued_event, &trade, &vault_discovery_ctx).await?;
+
+    let symbol_lock = get_symbol_lock(trade.symbol.base()).await;
+    let _guard = symbol_lock.lock().await;
+
+    let trading_enabled = ctx.is_trading_enabled(trade.symbol.base());
+
+    process_queued_trade(
+        queue_context.executor,
+        pool,
+        &queued_event,
+        event_id,
+        trade,
+        cqrs,
+        trading_enabled,
+    )
+    .await
+}
+
+>>>>>>> 64ed0a32 (Add Alpaca hedge inventory preflight):src/conductor/mod.rs
 /// Discovers vaults from a trade and emits VaultRegistryCommands.
 ///
 /// This function is called AFTER trade conversion succeeds, using the trade's
@@ -970,11 +1251,20 @@ pub(crate) async fn process_queued_trade<E: Executor>(
     trade: OnchainTrade,
     cqrs: &TradeProcessingCqrs,
     asset_enabled: bool,
+<<<<<<< HEAD:src/conductor.rs
 ) -> Result<Option<OffchainOrderId>, TradeAccountingError> {
     let trade_id = OnChainTradeId {
         tx_hash: trade.tx_hash,
         log_index: trade.log_index,
     };
+=======
+) -> Result<Option<OffchainOrderId>, EventProcessingError>
+where
+    EventProcessingError: From<E::Error>,
+{
+    // Update Position aggregate FIRST so threshold check sees current state
+    execute_acknowledge_fill(&cqrs.position, &trade, cqrs.execution_threshold).await;
+>>>>>>> 64ed0a32 (Add Alpaca hedge inventory preflight):src/conductor/mod.rs
 
     if let Ok(Some(_)) = cqrs.onchain_trade.load(&trade_id).await {
         info!(
@@ -1011,6 +1301,10 @@ pub(crate) async fn process_queued_trade<E: Executor>(
     else {
         return Ok(None);
     };
+
+    if !preflight_counter_trade_submission(executor, &execution).await? {
+        return Ok(None);
+    }
 
     place_offchain_order(&execution, cqrs).await
 }
@@ -1129,6 +1423,65 @@ async fn execute_create_offchain_order(
     }
 }
 
+<<<<<<< HEAD:src/conductor.rs
+=======
+async fn preflight_counter_trade_submission<E: Executor>(
+    executor: &E,
+    execution: &ExecutionCtx,
+) -> Result<bool, EventProcessingError>
+where
+    EventProcessingError: From<E::Error>,
+{
+    let order = MarketOrder {
+        symbol: execution.symbol.clone(),
+        shares: execution.shares,
+        direction: execution.direction,
+    };
+
+    match executor.preflight_counter_trade(order).await? {
+        st0x_execution::CounterTradePreflight::Allowed => Ok(true),
+        st0x_execution::CounterTradePreflight::Skipped(reason) => {
+            warn!(
+                symbol = %execution.symbol,
+                shares = %execution.shares,
+                direction = ?execution.direction,
+                reason = %reason,
+                "Skipping counter trade before broker submission"
+            );
+            Ok(false)
+        }
+    }
+}
+
+fn reconstruct_log_from_queued_event(
+    ctx: &EvmCtx,
+    queued_event: &crate::queue::QueuedEvent,
+) -> Log {
+    let log_data = match &queued_event.event {
+        TradeEvent::ClearV3(clear_event) => clear_event.as_ref().clone().into_log_data(),
+        TradeEvent::TakeOrderV3(take_event) => take_event.as_ref().clone().into_log_data(),
+    };
+
+    let block_timestamp = queued_event
+        .block_timestamp
+        .and_then(|dt| u64::try_from(dt.timestamp()).ok());
+
+    Log {
+        inner: alloy::primitives::Log {
+            address: ctx.orderbook,
+            data: log_data,
+        },
+        block_hash: None,
+        block_number: Some(queued_event.block_number),
+        block_timestamp,
+        transaction_hash: Some(queued_event.tx_hash),
+        transaction_index: None,
+        log_index: Some(queued_event.log_index),
+        removed: false,
+    }
+}
+
+>>>>>>> 64ed0a32 (Add Alpaca hedge inventory preflight):src/conductor/mod.rs
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 pub(crate) async fn check_and_execute_accumulated_positions<E>(
     executor: &E,
@@ -1164,6 +1517,10 @@ where
     );
 
     for execution in ready_positions {
+        if !preflight_counter_trade_submission(executor, &execution).await? {
+            continue;
+        }
+
         let offchain_order_id = OffchainOrderId::new();
 
         info!(
@@ -1247,7 +1604,15 @@ mod tests {
 
     use st0x_dto::ServerMessage;
     use st0x_event_sorcery::{StoreBuilder, test_store};
+<<<<<<< HEAD:src/conductor.rs
     use st0x_execution::{Direction, ExecutorOrderId, MarketOrder, MockExecutor, Positive, Symbol};
+=======
+    use st0x_execution::{
+        Direction, EquityPosition, ExecutorOrderId, Inventory as ExecutionInventory, MarketOrder,
+        MockExecutor,
+        MockExecutorCtx, Positive, Symbol, TryIntoExecutor,
+    };
+>>>>>>> 64ed0a32 (Add Alpaca hedge inventory preflight):src/conductor/mod.rs
     use st0x_finance::{Usd, Usdc};
 
     use super::*;
@@ -1905,6 +2270,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trade_above_threshold_skips_order_when_sell_inventory_is_insufficient() {
+        let pool = setup_test_db().await;
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs =
+            trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+
+        let executor = MockExecutor::new().with_inventory(ExecutionInventory {
+            positions: vec![],
+            cash_balance_cents: 5_000_000,
+        });
+        let (queued_event, event_id) = enqueue_and_fetch(&pool, 21).await;
+        let trade = test_trade_with_amount(float!(1.5), 21);
+
+        let result = process_queued_trade(&executor, &pool, &queued_event, event_id, trade, &cqrs, true)
+            .await
+            .unwrap();
+
+        assert_eq!(result, None, "insufficient offchain shares should skip the counter trade");
+
+        let position = cqrs
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .expect("position should exist");
+
+        assert!(
+            position.net.inner().eq(float!(1.5)).unwrap(),
+            "Position net should stay accumulated after the skipped submission"
+        );
+        assert!(
+            position.pending_offchain_order_id.is_none(),
+            "Skipped submissions must not leave a pending offchain order"
+        );
+
+        let offchain_order_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE aggregate_type = 'OffchainOrder'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            offchain_order_events, 0,
+            "Skipped submissions must not create OffchainOrder events"
+        );
+    }
+
+    #[tokio::test]
     async fn multiple_trades_accumulate_then_trigger() {
         let pool = setup_test_db().await;
         let (frameworks, _offchain_order_projection) =
@@ -2083,6 +2497,219 @@ mod tests {
         );
     }
 
+<<<<<<< HEAD:src/conductor.rs
+=======
+    #[tokio::test]
+    async fn periodic_checker_skips_buy_without_cash_then_retries_after_cash_recovers() {
+        let pool = setup_test_db().await;
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs =
+            trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        cqrs.position
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        tx_hash: B256::ZERO,
+                        log_index: 77,
+                    },
+                    amount: FractionalShares::new(float!(2)),
+                    direction: Direction::Sell,
+                    price_usdc: float!(150),
+                    block_timestamp: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let insufficient_cash_executor = MockExecutor::new()
+            .with_inventory(ExecutionInventory {
+                positions: vec![EquityPosition {
+                    symbol: symbol.clone(),
+                    quantity: FractionalShares::new(float!(10)),
+                    market_value: None,
+                }],
+                cash_balance_cents: 10_000,
+            })
+            .with_preflight_price(float!(100));
+
+        check_and_execute_accumulated_positions(
+            &insufficient_cash_executor,
+            &cqrs.position,
+            &cqrs.position_projection,
+            &cqrs.offchain_order,
+            &cqrs.execution_threshold,
+            &cqrs.assets,
+            |_| true,
+        )
+        .await
+        .unwrap();
+
+        let position = cqrs
+            .position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert!(
+            position.pending_offchain_order_id.is_none(),
+            "Insufficient cash should skip without marking the position pending"
+        );
+
+        let offchain_order_events_after_skip: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE aggregate_type = 'OffchainOrder'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            offchain_order_events_after_skip, 0,
+            "Skipped periodic checks must not create OffchainOrder events"
+        );
+
+        let recovered_cash_executor = MockExecutor::new()
+            .with_inventory(ExecutionInventory {
+                positions: vec![EquityPosition {
+                    symbol: symbol.clone(),
+                    quantity: FractionalShares::new(float!(10)),
+                    market_value: None,
+                }],
+                cash_balance_cents: 50_000,
+            })
+            .with_preflight_price(float!(100));
+
+        check_and_execute_accumulated_positions(
+            &recovered_cash_executor,
+            &cqrs.position,
+            &cqrs.position_projection,
+            &cqrs.offchain_order,
+            &cqrs.execution_threshold,
+            &cqrs.assets,
+            |_| true,
+        )
+        .await
+        .unwrap();
+
+        let position = cqrs
+            .position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert!(
+            position.pending_offchain_order_id.is_some(),
+            "Once cash recovers, the periodic checker should retry the counter trade"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_recovery_processes_unprocessed_queue_items() {
+        let pool = setup_test_db().await;
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs =
+            trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+
+        // Enqueue an event (simulating events persisted before a crash)
+        let (queued_event, event_id) = enqueue_and_fetch(&pool, 60).await;
+        let trade = test_trade_with_amount(float!(2.0), 60);
+
+        // Simulate restart: process the unprocessed event
+        let result = process_queued_trade(
+            &MockExecutor::new(),
+            &pool,
+            &queued_event,
+            event_id,
+            trade,
+            &cqrs,
+            true,
+        )
+        .await;
+
+        assert!(
+            result.unwrap().is_some(),
+            "Recovered event should trigger execution"
+        );
+
+        let position = cqrs
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .expect("position should exist");
+
+        assert!(position.net.inner().eq(float!(2.0)).unwrap());
+        assert!(position.pending_offchain_order_id.is_some());
+
+        assert_eq!(
+            crate::queue::count_unprocessed(&pool).await.unwrap(),
+            0,
+            "All events should be marked as processed after recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotent_event_queue_prevents_double_processing() {
+        let pool = setup_test_db().await;
+
+        let event = ClearV3 {
+            sender: address!("0x1111111111111111111111111111111111111111"),
+            alice: get_test_order(),
+            bob: get_test_order(),
+            clearConfig: ClearConfigV2 {
+                aliceInputIOIndex: U256::from(0),
+                aliceOutputIOIndex: U256::from(1),
+                bobInputIOIndex: U256::from(1),
+                bobOutputIOIndex: U256::from(0),
+                aliceBountyVaultId: B256::ZERO,
+                bobBountyVaultId: B256::ZERO,
+            },
+        };
+
+        let log = get_test_log();
+
+        // Enqueue same event twice (same tx_hash + log_index -> INSERT OR IGNORE)
+        crate::queue::enqueue(&pool, &event, &log).await.unwrap();
+        crate::queue::enqueue(&pool, &event, &log).await.unwrap();
+
+        assert_eq!(
+            crate::queue::count_unprocessed(&pool).await.unwrap(),
+            1,
+            "Duplicate enqueue should result in only 1 row"
+        );
+
+        // Process and mark as processed
+        let queued = crate::queue::get_next_unprocessed_event(&pool)
+            .await
+            .unwrap()
+            .expect("should have one event");
+
+        crate::queue::mark_event_processed(&pool, queued.id.unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            crate::queue::count_unprocessed(&pool).await.unwrap(),
+            0,
+            "No unprocessed events should remain"
+        );
+
+        // Re-enqueue same event after processing
+        crate::queue::enqueue(&pool, &event, &log).await.unwrap();
+
+        assert_eq!(
+            crate::queue::count_unprocessed(&pool).await.unwrap(),
+            0,
+            "Re-enqueue of already processed event should be ignored"
+        );
+    }
+
+>>>>>>> 64ed0a32 (Add Alpaca hedge inventory preflight):src/conductor/mod.rs
     /// Builds an `InventoryView` with an equity imbalance: 20% onchain, 80% offchain.
     /// With a 50% target +/- 20% deviation, 20% < 30% lower bound -> TooMuchOffchain.
     fn imbalanced_inventory(symbol: &Symbol) -> InventoryView {

@@ -7,7 +7,8 @@ use std::str::FromStr;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{FractionalShares, Positive, Symbol, Usd};
+use crate::alpaca_market_data::AlpacaMarketDataError;
+use crate::{CounterTradeCostError, FractionalShares, Positive, Symbol, Usd};
 
 /// Time-in-force specifies how long an order remains active before it expires.
 ///
@@ -179,6 +180,10 @@ pub enum AlpacaBrokerApiError {
 
     #[error("Float conversion error: {0}")]
     FloatConversion(#[from] FloatError),
+    #[error("latest trade lookup failed: {0}")]
+    LatestTrade(#[from] AlpacaMarketDataError),
+    #[error("counter-trade cost estimation failed: {0}")]
+    CounterTradeCost(#[from] CounterTradeCostError),
 }
 
 fn format_api_error(
