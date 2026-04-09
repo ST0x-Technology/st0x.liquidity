@@ -24,6 +24,8 @@ markets by providing continuous two-sided liquidity.
   when onchain liquidity is taken
 - **Fractional Share Support**: Executes fractional shares on Alpaca; batches
   until whole shares for Schwab
+- **Alpaca Hedge Preflight**: Checks available offchain shares for sells and
+  available cash for buys before submitting Alpaca hedge orders
 - **Complete Audit Trail**: Database tracking linking every onchain trade to
   offchain hedge executions
 - **Exposure Hedging**: Automatically executes offsetting trades to reduce

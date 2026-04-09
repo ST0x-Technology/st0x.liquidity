@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 use uuid::Uuid;
@@ -19,7 +19,9 @@ use crate::{FractionalShares, Positive, Symbol};
 /// Alpaca Broker API HTTP client with Basic authentication
 pub(crate) struct AlpacaBrokerApiClient {
     http_client: reqwest::Client,
+    market_data_http_client: reqwest::Client,
     base_url: String,
+    market_data_base_url: String,
     account_id: AlpacaAccountId,
     mode: AlpacaBrokerApiMode,
 }
@@ -50,10 +52,24 @@ impl AlpacaBrokerApiClient {
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
             .build()?;
+        let api_key_header = HeaderName::from_static("apca-api-key-id");
+        let api_secret_header = HeaderName::from_static("apca-api-secret-key");
+        let market_data_headers = HeaderMap::from_iter([
+            (api_key_header, HeaderValue::from_str(&ctx.api_key)?),
+            (api_secret_header, HeaderValue::from_str(&ctx.api_secret)?),
+            (CONTENT_TYPE, HeaderValue::from_static("application/json")),
+        ]);
+        let market_data_http_client = reqwest::Client::builder()
+            .default_headers(market_data_headers)
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .build()?;
 
         Ok(Self {
             http_client,
+            market_data_http_client,
             base_url: ctx.base_url().to_string(),
+            market_data_base_url: ctx.mode().market_data_base_url().to_string(),
             account_id: ctx.account_id,
             mode: ctx.mode(),
         })
@@ -69,6 +85,14 @@ impl AlpacaBrokerApiClient {
 
     pub(crate) fn is_sandbox(&self) -> bool {
         !matches!(self.mode, AlpacaBrokerApiMode::Production)
+    }
+
+    pub(crate) fn market_data_base_url(&self) -> &str {
+        &self.market_data_base_url
+    }
+
+    pub(crate) fn market_data_http_client(&self) -> &reqwest::Client {
+        &self.market_data_http_client
     }
 
     /// Verify the account by fetching account details

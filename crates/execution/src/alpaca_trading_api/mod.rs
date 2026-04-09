@@ -1,10 +1,12 @@
 use rain_math_float::FloatError;
 use thiserror::Error;
 
-use crate::{FractionalShares, Positive};
+use crate::alpaca_market_data::AlpacaMarketDataError;
+use crate::{CounterTradeCostError, FractionalShares, Positive};
 
 mod auth;
 mod executor;
+mod inventory;
 mod market_hours;
 mod order;
 
@@ -19,6 +21,10 @@ pub enum AlpacaTradingApiError {
     Api(Box<apca::Error>),
     #[error("Account verification failed: {0}")]
     AccountVerification(#[from] apca::RequestError<apca::api::v2::account::GetError>),
+    #[error("HTTP client setup failed: {0}")]
+    HttpClient(#[from] reqwest::Error),
+    #[error("Invalid header value: {0}")]
+    InvalidHeader(#[from] reqwest::header::InvalidHeaderValue),
     #[error("Order creation failed: {0}")]
     OrderCreate(#[from] apca::RequestError<apca::api::v2::order::CreateError>),
     #[error("Order query failed: {0}")]
@@ -59,6 +65,14 @@ pub enum AlpacaTradingApiError {
     NotionalOrdersNotSupported,
     #[error("Filled order {order_id} is missing required field: {field}")]
     IncompleteFilledOrder { order_id: String, field: String },
+    #[error("latest trade lookup failed: {0}")]
+    LatestTrade(#[from] AlpacaMarketDataError),
+    #[error("counter-trade cost estimation failed: {0}")]
+    CounterTradeCost(#[from] CounterTradeCostError),
+    #[error("cash balance {} cannot be converted to cents", st0x_float_serde::format_float_with_fallback(.0))]
+    CashBalanceConversion(rain_math_float::Float),
+    #[error("cash balance {} has fractional cents after conversion", st0x_float_serde::format_float_with_fallback(.0))]
+    FractionalCents(rain_math_float::Float),
 }
 
 impl From<apca::Error> for AlpacaTradingApiError {

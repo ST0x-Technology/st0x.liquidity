@@ -15,8 +15,9 @@ use super::journal::JournalResponse;
 use super::order::{AlpacaLimitOrder, ConversionDirection, CryptoOrderResponse};
 use super::{AlpacaBrokerApiError, AssetStatus, TimeInForce};
 use crate::{
-    Executor, FractionalShares, MarketOrder, OrderPlacement, OrderState, OrderStatus, Positive,
-    SupportedExecutor, Symbol, TryIntoExecutor,
+    ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, CounterTradePreflight, CounterTradeSkipReason, Direction,
+    Executor, FractionalShares, InventoryResult, MarketOrder, OrderPlacement, OrderState,
+    OrderStatus, Positive, SupportedExecutor, Symbol, TryIntoExecutor, estimate_buffered_cost_cents,
 };
 
 /// Response from the asset endpoint
@@ -168,7 +169,60 @@ impl Executor for AlpacaBrokerApi {
 
     async fn get_inventory(&self) -> Result<crate::InventoryResult, Self::Error> {
         let inventory = super::positions::fetch_inventory(&self.client).await?;
-        Ok(crate::InventoryResult::Fetched(inventory))
+        Ok(InventoryResult::Fetched(inventory))
+    }
+
+    async fn preflight_counter_trade(
+        &self,
+        order: MarketOrder,
+    ) -> Result<CounterTradePreflight, Self::Error> {
+        let inventory = super::positions::fetch_inventory(&self.client).await?;
+
+        match order.direction {
+            Direction::Sell => {
+                let available = inventory
+                    .positions
+                    .into_iter()
+                    .find(|position| position.symbol == order.symbol)
+                    .map(|position| position.quantity)
+                    .unwrap_or(FractionalShares::ZERO);
+
+                if available.inner().gte(order.shares.inner().inner())? {
+                    Ok(CounterTradePreflight::Allowed)
+                } else {
+                    Ok(CounterTradePreflight::Skipped(
+                        CounterTradeSkipReason::InsufficientEquity {
+                            required: order.shares,
+                            available,
+                        },
+                    ))
+                }
+            }
+            Direction::Buy => {
+                let latest_trade_price = crate::alpaca_market_data::fetch_latest_trade_price(
+                    self.client.market_data_http_client(),
+                    self.client.market_data_base_url(),
+                    &order.symbol,
+                )
+                .await?;
+                let estimated_cost_cents = estimate_buffered_cost_cents(
+                    order.shares,
+                    latest_trade_price,
+                    ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+                )?;
+
+                if inventory.cash_balance_cents >= estimated_cost_cents {
+                    Ok(CounterTradePreflight::Allowed)
+                } else {
+                    Ok(CounterTradePreflight::Skipped(
+                        CounterTradeSkipReason::InsufficientCash {
+                            estimated_cost_cents,
+                            available_cash_cents: inventory.cash_balance_cents,
+                        },
+                    ))
+                }
+            }
+        }
     }
 }
 
@@ -281,6 +335,7 @@ impl AlpacaBrokerApi {
 mod tests {
     use httpmock::prelude::*;
     use serde_json::json;
+    use st0x_float_macro::float;
     use std::thread;
 
     use super::*;
@@ -288,7 +343,9 @@ mod tests {
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
     };
     use crate::alpaca_broker_api::order::AlpacaLimitPrice;
-    use crate::{Direction, FractionalShares, Positive, Usd};
+    use crate::{
+        CounterTradePreflight, CounterTradeSkipReason, Direction, FractionalShares, Positive, Usd,
+    };
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b"));
@@ -593,6 +650,79 @@ mod tests {
         account_mock.assert_calls(2);
         positions_mock.assert();
         assert!(matches!(result, crate::InventoryResult::Fetched(_)));
+    }
+
+    fn create_positions_mock(server: &MockServer) -> httpmock::Mock<'_> {
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "symbol": "AAPL",
+                        "qty": "10.5",
+                        "market_value": "1575.00"
+                    }
+                ]));
+        })
+    }
+
+    fn create_latest_trade_mock<'a>(
+        server: &'a MockServer,
+        price: &'static str,
+    ) -> httpmock::Mock<'a> {
+        server.mock(|when, then| {
+            when.method(GET).path("/v2/stocks/AAPL/trades/latest");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "trade": {
+                        "p": price
+                    }
+                }));
+        })
+    }
+
+    #[tokio::test]
+    async fn test_preflight_counter_trade_skips_buy_without_cash() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let account_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "status": "ACTIVE",
+                    "cash": "100.00"
+                }));
+        });
+        let positions_mock = create_positions_mock(&server);
+        let latest_trade_mock = create_latest_trade_mock(&server, "100.00");
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        let preflight = executor
+            .preflight_counter_trade(MarketOrder {
+                symbol: Symbol::new("AAPL").unwrap(),
+                shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
+                direction: Direction::Buy,
+            })
+            .await
+            .unwrap();
+
+        account_mock.assert_calls(2);
+        positions_mock.assert();
+        latest_trade_mock.assert();
+        assert!(matches!(
+            preflight,
+            CounterTradePreflight::Skipped(CounterTradeSkipReason::InsufficientCash {
+                estimated_cost_cents,
+                available_cash_cents,
+            }) if estimated_cost_cents == 20_200 && available_cash_cents == 10_000
+        ));
     }
 
     fn create_asset_mock<'a>(
