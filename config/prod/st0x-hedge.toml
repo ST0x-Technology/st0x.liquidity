@@ -10,7 +10,7 @@ beneficiary_entity_name = "T0 TRADE (BVI) LTD"
 orderbook = "0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D"
 # what block to backfill from
 deployment_block = 43259507
-order_owner = "0x386C24644E532387b03C1992cA83542492A3ac32"
+order_owner = "0xA9C16673F65AE808688cB18952AFE3d9658C808f"
 
 [assets.cash]
 vault_id = "0xfab"
@@ -18,7 +18,7 @@ rebalancing = "disabled"
 # operational_limit = 0.01
 
 [assets.equities.RKLB]
-trading = "enabled"
+trading = "disabled"
 rebalancing = "disabled"
 # operational_limit = 1
 
