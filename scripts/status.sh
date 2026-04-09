@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Status dump: fetches bot status, Raindex orders, DB, and logs.
-# Called by the nix `<env>-status` wrapper which sets $identity, $host_ip, and $ENV.
-# shellcheck disable=SC2154  # identity, host_ip, ENV are exported by the nix wrapper
+# Called by the nix `${env}Status` wrapper which sets $identity and $host_ip.
+# shellcheck disable=SC2154  # identity and host_ip are exported by the nix wrapper
 
 set -euo pipefail
+
+env="${1:?usage: status.sh <prod|staging>}"
+shift
 
 # --- Colors ---
 BOLD='\033[1m'
@@ -41,8 +44,21 @@ trunc2() {
 
 ssh_cmd="ssh -i $identity root@$host_ip"
 db="/mnt/data/st0x-hedge.db"
-subgraph="https://api.goldsky.com/api/public/project_clv14x04y9kzi01saerx7bxpg/subgraphs/ob4-base/2026-02-05-c4ef/gn"
-order_owner="0x386c24644e532387b03c1992ca83542492a3ac32"
+
+case "$env" in
+  prod)
+    subgraph="https://api.goldsky.com/api/public/project_clv14x04y9kzi01saerx7bxpg/subgraphs/ob4-base/2026-02-05-c4ef/gn"
+    order_owner="0x386c24644e532387b03c1992ca83542492a3ac32"
+    ;;
+  staging)
+    subgraph="${STAGING_SUBGRAPH:?Set STAGING_SUBGRAPH env var for staging status}"
+    order_owner="${STAGING_ORDER_OWNER:?Set STAGING_ORDER_OWNER env var for staging status}"
+    ;;
+  *)
+    echo "ERROR: unknown environment '$env'" >&2
+    exit 1
+    ;;
+esac
 
 # Check service status
 if $ssh_cmd systemctl is-active --quiet st0x-hedge; then
