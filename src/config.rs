@@ -1761,10 +1761,9 @@ pub(crate) mod tests {
         assert!(matches!(error, CtxError::NotRebalancing));
     }
 
-    #[test]
-    fn server_config_toml_is_valid() {
-        let config_str = include_str!("../config/st0x-hedge.toml");
-        let config: Config = toml::from_str(config_str).unwrap();
+    fn validate_server_config(env: &str, config_str: &str) {
+        let config: Config = toml::from_str(config_str)
+            .unwrap_or_else(|err| panic!("{env} config parse failed: {err}"));
 
         let global_limit = config
             .assets
@@ -1772,10 +1771,12 @@ pub(crate) mod tests {
             .operational_limit
             .map(Positive::inner);
 
-        let broker = config.broker.expect(
-            "prod config must include [broker.travel_rule] — \
-             Alpaca rejects whitelist requests without it, effective 2026-03-27",
-        );
+        let broker = config.broker.unwrap_or_else(|| {
+            panic!(
+                "{env} config must include [broker.travel_rule] — \
+                 Alpaca rejects whitelist requests without it, effective 2026-03-27"
+            )
+        });
 
         broker.travel_rule.validated().unwrap();
 
@@ -1786,13 +1787,23 @@ pub(crate) mod tests {
             {
                 assert!(
                     limit.inner() < global,
-                    "{symbol}: per-asset operational_limit ({}) must be \
+                    "{env}/{symbol}: per-asset operational_limit ({}) must be \
                      stricter than global equities operational_limit ({global}) \
                      to provide meaningful per-asset safety",
                     limit.inner()
                 );
             }
         }
+    }
+
+    #[test]
+    fn prod_config_toml_is_valid() {
+        validate_server_config("prod", include_str!("../config/prod/st0x-hedge.toml"));
+    }
+
+    #[test]
+    fn staging_config_toml_is_valid() {
+        validate_server_config("staging", include_str!("../config/staging/st0x-hedge.toml"));
     }
 
     #[test]
