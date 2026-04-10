@@ -12,6 +12,12 @@ use crate::{
     deserialize_option_float_from_number_or_string,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AccountFunds {
+    pub(super) cash_balance_cents: i64,
+    pub(super) margin_safe_buying_power_cents: i64,
+}
+
 /// Position response from Alpaca Broker API.
 #[derive(Debug, Deserialize)]
 struct PositionResponse {
@@ -33,13 +39,18 @@ struct PositionResponse {
 struct AccountDetailsResponse {
     #[serde(deserialize_with = "deserialize_float_from_number_or_string")]
     cash: Float,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_option_float_from_number_or_string"
+    )]
+    non_marginable_buying_power: Option<Float>,
 }
 
 pub(super) async fn fetch_inventory(
     client: &AlpacaBrokerApiClient,
 ) -> Result<Inventory, AlpacaBrokerApiError> {
     let positions = list_positions(client).await?;
-    let account = get_account_details(client).await?;
+    let account_funds = get_account_funds(client).await?;
 
     let broker_positions = positions
         .into_iter()
@@ -62,32 +73,28 @@ pub(super) async fn fetch_inventory(
         })
         .collect::<Result<Vec<_>, AlpacaBrokerApiError>>()?;
 
-    let hundred = float!(100);
-    let cents = (account.cash * hundred).map_err(AlpacaBrokerApiError::FloatConversion)?;
-    let frac = cents
-        .frac()
-        .map_err(AlpacaBrokerApiError::FloatConversion)?;
-
-    if !frac
-        .is_zero()
-        .map_err(AlpacaBrokerApiError::FloatConversion)?
-    {
-        return Err(AlpacaBrokerApiError::FractionalCents(account.cash));
-    }
-
-    let integer_cents = cents
-        .integer()
-        .map_err(AlpacaBrokerApiError::FloatConversion)?;
-    let formatted = integer_cents
-        .format_with_scientific(false)
-        .map_err(AlpacaBrokerApiError::FloatConversion)?;
-    let cash_balance_cents: i64 = formatted
-        .parse()
-        .map_err(|_| AlpacaBrokerApiError::CashBalanceConversion(account.cash))?;
-
     Ok(Inventory {
         positions: broker_positions,
+        cash_balance_cents: account_funds.cash_balance_cents,
+    })
+}
+
+pub(super) async fn get_account_funds(
+    client: &AlpacaBrokerApiClient,
+) -> Result<AccountFunds, AlpacaBrokerApiError> {
+    let account = get_account_details(client).await?;
+    let cash_balance_cents = to_cash_value_cents(account.cash)?;
+    let margin_safe_buying_power_cents = account
+        .non_marginable_buying_power
+        .map(to_cash_value_cents)
+        .transpose()?
+        .map_or(cash_balance_cents, |available| {
+            available.min(cash_balance_cents)
+        });
+
+    Ok(AccountFunds {
         cash_balance_cents,
+        margin_safe_buying_power_cents,
     })
 }
 
@@ -117,6 +124,32 @@ async fn get_account_details(
     debug!("Fetching account details from {}", url);
 
     client.get(&url).await
+}
+
+fn to_cash_value_cents(cash: Float) -> Result<i64, AlpacaBrokerApiError> {
+    let hundred = float!(100);
+    let cents = (cash * hundred).map_err(AlpacaBrokerApiError::FloatConversion)?;
+    let frac = cents
+        .frac()
+        .map_err(AlpacaBrokerApiError::FloatConversion)?;
+
+    if !frac
+        .is_zero()
+        .map_err(AlpacaBrokerApiError::FloatConversion)?
+    {
+        return Err(AlpacaBrokerApiError::FractionalCents(cash));
+    }
+
+    let integer_cents = cents
+        .integer()
+        .map_err(AlpacaBrokerApiError::FloatConversion)?;
+    let formatted = integer_cents
+        .format_with_scientific(false)
+        .map_err(AlpacaBrokerApiError::FloatConversion)?;
+
+    formatted
+        .parse()
+        .map_err(|_| AlpacaBrokerApiError::CashBalanceConversion(cash))
 }
 
 #[cfg(test)]
@@ -154,6 +187,7 @@ mod tests {
             mode: Some(mode),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::Day,
+            counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
         }
     }
 

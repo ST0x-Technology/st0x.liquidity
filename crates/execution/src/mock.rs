@@ -14,9 +14,10 @@ use tracing::warn;
 static MOCK_FILL_PRICE: LazyLock<Float> = LazyLock::new(|| float!(100));
 
 use crate::{
-    ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, CounterTradePreflight, CounterTradeSkipReason,
-    Direction, ExecutionError, Executor, Inventory, InventoryResult, MarketOrder, OrderPlacement,
-    OrderState, SupportedExecutor, TryIntoExecutor, estimate_buffered_cost_cents,
+    CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason,
+    DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, Direction, ExecutionError, Executor, Inventory,
+    InventoryResult, MarketOrder, OrderPlacement, OrderState, SupportedExecutor, TryIntoExecutor,
+    estimate_buffered_cost_cents,
 };
 
 /// Context for MockExecutor (unit struct - no context needed)
@@ -195,7 +196,7 @@ impl Executor for MockExecutor {
         order: MarketOrder,
     ) -> Result<CounterTradePreflight, Self::Error> {
         let InventoryResult::Fetched(inventory) = &self.inventory_result else {
-            return Ok(CounterTradePreflight::Allowed);
+            return Ok(CounterTradePreflight::Allowed { reservation: None });
         };
 
         match order.direction {
@@ -204,11 +205,16 @@ impl Executor for MockExecutor {
                     .positions
                     .iter()
                     .find(|position| position.symbol == order.symbol)
-                    .map(|position| position.quantity)
-                    .unwrap_or(crate::FractionalShares::ZERO);
+                    .map_or(crate::FractionalShares::ZERO, |position| position.quantity);
 
                 if available.inner().gte(order.shares.inner().inner())? {
-                    Ok(CounterTradePreflight::Allowed)
+                    Ok(CounterTradePreflight::Allowed {
+                        reservation: Some(CounterTradeReservation::Equity {
+                            symbol: order.symbol,
+                            required: order.shares,
+                            available,
+                        }),
+                    })
                 } else {
                     Ok(CounterTradePreflight::Skipped(
                         CounterTradeSkipReason::InsufficientEquity {
@@ -222,19 +228,24 @@ impl Executor for MockExecutor {
                 let estimated_cost_cents = estimate_buffered_cost_cents(
                     order.shares,
                     self.preflight_price,
-                    ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+                    DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
                 )
                 .map_err(|error| ExecutionError::MockFailure {
                     message: error.to_string(),
                 })?;
 
                 if inventory.cash_balance_cents >= estimated_cost_cents {
-                    Ok(CounterTradePreflight::Allowed)
+                    Ok(CounterTradePreflight::Allowed {
+                        reservation: Some(CounterTradeReservation::BuyingPower {
+                            estimated_cost_cents,
+                            available_buying_power_cents: inventory.cash_balance_cents,
+                        }),
+                    })
                 } else {
                     Ok(CounterTradePreflight::Skipped(
-                        CounterTradeSkipReason::InsufficientCash {
+                        CounterTradeSkipReason::InsufficientBuyingPower {
                             estimated_cost_cents,
-                            available_cash_cents: inventory.cash_balance_cents,
+                            available_buying_power_cents: inventory.cash_balance_cents,
                         },
                     ))
                 }
@@ -449,10 +460,10 @@ mod tests {
 
         assert!(matches!(
             preflight,
-            CounterTradePreflight::Skipped(CounterTradeSkipReason::InsufficientCash {
+            CounterTradePreflight::Skipped(CounterTradeSkipReason::InsufficientBuyingPower {
                 estimated_cost_cents,
-                available_cash_cents,
-            }) if estimated_cost_cents == 20_200 && available_cash_cents == 10_000
+                available_buying_power_cents,
+            }) if estimated_cost_cents == 20_200 && available_buying_power_cents == 10_000
         ));
     }
 }

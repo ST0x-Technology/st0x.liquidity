@@ -1012,6 +1012,7 @@ mod tests {
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::default(),
+            counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
         };
 
         AlpacaBrokerApi::try_from_ctx(auth)

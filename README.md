@@ -25,7 +25,10 @@ markets by providing continuous two-sided liquidity.
 - **Fractional Share Support**: Executes fractional shares on Alpaca; batches
   until whole shares for Schwab
 - **Alpaca Hedge Preflight**: Checks available offchain shares for sells and
-  available cash for buys before submitting Alpaca hedge orders
+  margin-safe buying power for buys before submitting Alpaca hedge orders
+- **Serialized Counter-Trade Submission**: Within one bot process, queued and
+  periodic hedge submissions share a lock and reserve budget against active
+  offchain orders before placing new Alpaca counter-trades
 - **Complete Audit Trail**: Database tracking linking every onchain trade to
   offchain hedge executions
 - **Exposure Hedging**: Automatically executes offsetting trades to reduce
@@ -119,7 +122,9 @@ For individual accounts. Create an account at
 dashboard.
 
 Add credentials to your TOML config file under the `[broker]` section (see
-`example.config.toml` and `example.secrets.toml`).
+`example.config.toml` and `example.secrets.toml`). Alpaca configs must also set
+`broker.counter_trade_slippage_bps`, which controls the buy-side preflight
+buffer in basis points.
 
 ### Token Encryption (Schwab only)
 

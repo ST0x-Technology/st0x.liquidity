@@ -149,7 +149,11 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
     let broker_fill_price = float!(148.00);
     let amount_per_trade = float!(7.5);
 
-    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
+    let infra = TestInfra::start(
+        vec![("AAPL", broker_fill_price)],
+        vec![("AAPL", float!(30))],
+    )
+    .await?;
     let wrapped_token = infra.equity_addresses[0].1;
     let unwrapped_token = infra.equity_addresses[0].2;
 
@@ -669,7 +673,11 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
     let amount_per_trade = float!(7.5);
     let expected_alpaca_wallet_balance = float!(1250.75);
 
-    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
+    let infra = TestInfra::start(
+        vec![("AAPL", broker_fill_price)],
+        vec![("AAPL", float!(30))],
+    )
+    .await?;
     let cctp = CctpInfra::start(&infra).await?;
     let eth_balance_provider = alloy::providers::ProviderBuilder::new()
         .connect(&cctp.ethereum_endpoint)

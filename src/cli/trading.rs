@@ -757,6 +757,7 @@ mod tests {
             mode: Some(AlpacaBrokerApiMode::Mock(mock_server.base_url())),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::Day,
+            counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
         });
         ctx
     }
@@ -767,6 +768,7 @@ mod tests {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
             trading_mode: Some(AlpacaTradingApiMode::Paper),
+            counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
         });
         ctx
     }

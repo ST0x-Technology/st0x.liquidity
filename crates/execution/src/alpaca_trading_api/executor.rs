@@ -7,15 +7,16 @@ use uuid::Uuid;
 use super::AlpacaTradingApiError;
 use super::auth::{AlpacaTradingApiClient, AlpacaTradingApiCtx};
 use crate::{
-    ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, CounterTradePreflight, CounterTradeSkipReason, Direction,
-    Executor, InventoryResult, MarketOrder, OrderPlacement, OrderState, OrderStatus,
-    SupportedExecutor, TryIntoExecutor, estimate_buffered_cost_cents,
+    CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason, Direction, Executor,
+    InventoryResult, MarketOrder, OrderPlacement, OrderState, OrderStatus, SupportedExecutor,
+    TryIntoExecutor, buying_power_counter_trade_preflight, estimate_buffered_cost_cents,
 };
 
 /// Alpaca Trading API executor implementation
 #[derive(Debug, Clone)]
 pub struct AlpacaTradingApi {
     client: Arc<AlpacaTradingApiClient>,
+    counter_trade_slippage_bps: u16,
 }
 
 #[async_trait]
@@ -40,6 +41,7 @@ impl Executor for AlpacaTradingApi {
 
         Ok(Self {
             client: Arc::new(client),
+            counter_trade_slippage_bps: ctx.counter_trade_slippage_bps,
         })
     }
 
@@ -106,19 +108,23 @@ impl Executor for AlpacaTradingApi {
         &self,
         order: MarketOrder,
     ) -> Result<CounterTradePreflight, Self::Error> {
-        let inventory = super::inventory::fetch_inventory(&self.client).await?;
-
         match order.direction {
             Direction::Sell => {
+                let inventory = super::inventory::fetch_inventory(&self.client).await?;
                 let available = inventory
                     .positions
                     .into_iter()
                     .find(|position| position.symbol == order.symbol)
-                    .map(|position| position.quantity)
-                    .unwrap_or(crate::FractionalShares::ZERO);
+                    .map_or(crate::FractionalShares::ZERO, |position| position.quantity);
 
                 if available.inner().gte(order.shares.inner().inner())? {
-                    Ok(CounterTradePreflight::Allowed)
+                    Ok(CounterTradePreflight::Allowed {
+                        reservation: Some(CounterTradeReservation::Equity {
+                            symbol: order.symbol,
+                            required: order.shares,
+                            available,
+                        }),
+                    })
                 } else {
                     Ok(CounterTradePreflight::Skipped(
                         CounterTradeSkipReason::InsufficientEquity {
@@ -135,22 +141,17 @@ impl Executor for AlpacaTradingApi {
                     &order.symbol,
                 )
                 .await?;
+                let account_funds = super::inventory::get_account_funds(&self.client).await?;
                 let estimated_cost_cents = estimate_buffered_cost_cents(
                     order.shares,
                     latest_trade_price,
-                    ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+                    self.counter_trade_slippage_bps,
                 )?;
 
-                if inventory.cash_balance_cents >= estimated_cost_cents {
-                    Ok(CounterTradePreflight::Allowed)
-                } else {
-                    Ok(CounterTradePreflight::Skipped(
-                        CounterTradeSkipReason::InsufficientCash {
-                            estimated_cost_cents,
-                            available_cash_cents: inventory.cash_balance_cents,
-                        },
-                    ))
-                }
+                Ok(buying_power_counter_trade_preflight(
+                    estimated_cost_cents,
+                    account_funds.margin_safe_buying_power_cents,
+                ))
             }
         }
     }
@@ -175,13 +176,16 @@ mod tests {
 
     use super::*;
     use crate::alpaca_trading_api::AlpacaTradingApiMode;
-    use crate::{CounterTradePreflight, CounterTradeSkipReason, FractionalShares, Positive, Symbol};
+    use crate::{
+        CounterTradePreflight, CounterTradeSkipReason, FractionalShares, Positive, Symbol,
+    };
 
     fn create_test_auth_env(base_url: &str) -> AlpacaTradingApiCtx {
         AlpacaTradingApiCtx {
             api_key: "test_key_id".to_string(),
             api_secret: "test_secret_key".to_string(),
             trading_mode: Some(AlpacaTradingApiMode::Mock(base_url.to_string())),
+            counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
         }
     }
 
@@ -378,7 +382,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_preflight_counter_trade_skips_buy_without_cash() {
+    async fn test_preflight_counter_trade_skips_buy_without_margin_safe_buying_power() {
         let server = MockServer::start();
         let auth = create_test_auth_env(&server.base_url());
 
@@ -394,8 +398,8 @@ mod tests {
                     "buying_power": "100000.00",
                     "regt_buying_power": "100000.00",
                     "daytrading_buying_power": "400000.00",
-                    "non_marginable_buying_power": "100000.00",
-                    "cash": "100.00",
+                    "non_marginable_buying_power": "100.00",
+                    "cash": "1000.00",
                     "accrued_fees": "0",
                     "pending_transfer_out": "0",
                     "pending_transfer_in": "0",
@@ -419,7 +423,6 @@ mod tests {
                     "daytrade_count": 0
                 }));
         });
-        let positions_mock = create_positions_mock(&server);
         let latest_trade_mock = create_latest_trade_mock(&server, "100.00");
 
         let executor = AlpacaTradingApi::try_from_ctx(auth).await.unwrap();
@@ -433,14 +436,13 @@ mod tests {
             .unwrap();
 
         account_mock.assert_calls(2);
-        positions_mock.assert();
         latest_trade_mock.assert();
         assert!(matches!(
             preflight,
-            CounterTradePreflight::Skipped(CounterTradeSkipReason::InsufficientCash {
+            CounterTradePreflight::Skipped(CounterTradeSkipReason::InsufficientBuyingPower {
                 estimated_cost_cents,
-                available_cash_cents,
-            }) if estimated_cost_cents == 20_200 && available_cash_cents == 10_000
+                available_buying_power_cents,
+            }) if estimated_cost_cents == 20_200 && available_buying_power_cents == 10_000
         ));
     }
 }

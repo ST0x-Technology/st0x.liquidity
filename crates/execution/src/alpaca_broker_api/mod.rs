@@ -175,6 +175,20 @@ pub enum AlpacaBrokerApiError {
         max_decimals: u8,
     },
 
+    #[error(
+        "USDC conversion amount {} is below Alpaca's \
+         {max_decimals}-decimal-place precision",
+        format_float_with_fallback(.amount)
+    )]
+    UsdcBelowPrecision { amount: Float, max_decimals: u8 },
+
+    #[error(
+        "USDC conversion amount {} exceeds Alpaca's \
+         {max_decimals}-decimal-place precision",
+        format_float_with_fallback(.amount)
+    )]
+    UsdcPrecisionExceeded { amount: Float, max_decimals: u8 },
+
     #[error(transparent)]
     NotPositive(#[from] st0x_finance::NotPositive<FractionalShares>),
 
