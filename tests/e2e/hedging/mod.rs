@@ -1380,7 +1380,10 @@ async fn duplicate_event_delivery() -> anyhow::Result<()> {
 
     poll_for_events(&mut bot, &infra.db_path, "OffchainOrderEvent::Filled", 1).await;
 
-    // Snapshot counts before restart
+    bot.abort();
+    let _ = bot.await;
+
+    // Snapshot after shutdown so all in-flight view updates have settled
     let pool = connect_db(&infra.db_path).await?;
     let pre_onchain_events = count_events(&pool, "OnChainTrade").await?;
 
@@ -1389,9 +1392,6 @@ async fn duplicate_event_delivery() -> anyhow::Result<()> {
         .await?
         .expect("Position should exist after first run");
     pool.close().await;
-
-    bot.abort();
-    let _ = bot.await;
 
     // Phase 2: restart bot with SAME deployment_block (re-backfills same events)
     let ctx2 = build_ctx()
