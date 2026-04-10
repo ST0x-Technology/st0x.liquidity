@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT event_type FROM events WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ? ORDER BY sequence",
+  "describe": {
+    "columns": [
+      {
+        "name": "event_type",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "defd203a4e2eed5bc266e9583e4e58e58e2c6eb53da658c9b0843d41eb2a2771"
+}

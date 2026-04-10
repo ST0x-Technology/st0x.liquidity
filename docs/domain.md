@@ -32,6 +32,31 @@ Types follow a strict naming convention based on their role:
   construction interface without splitting Config from Secrets - that split
   belongs in the caller.
 
+### Abstraction Coupling
+
+Module-level documentation describes the module's **domain purpose**, not the
+framework powering it. A trade accounting module is about accounting for trades
+-- the fact that apalis happens to be the job framework is an implementation
+detail that belongs in the implementation, not the module framing.
+
+Struct-level documentation may mention the framework when relevant to
+construction or wiring (e.g., "injected via `Data`"), but the module `//!`
+docstring must remain implementation-agnostic.
+
+### Job Queues
+
+A `SqliteStorage<Job, ...>` type alias is a **job queue**, not "storage".
+Variables and parameters of this type must be named `job_queue`, never
+`storage`. The primary purpose is queueing jobs for processing; the fact that
+SQLite backs it is an implementation detail.
+
+### Refactoring Completeness
+
+When renaming a type, **all** related names must change: variable names,
+function names, parameters, test helpers. Zero mentions of the old name may
+remain. A type rename without updating the surrounding vocabulary is incomplete
+and confusing.
+
 ## Domain Glossary
 
 ### Trading Venue

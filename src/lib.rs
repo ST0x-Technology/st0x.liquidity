@@ -9,7 +9,7 @@ use sqlx::SqlitePool;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::task::{AbortHandle, JoinError, JoinHandle};
-use tracing::{Instrument, error, info, info_span, warn};
+use tracing::{error, info, warn};
 
 use st0x_dto::ServerMessage;
 use st0x_execution::{ExecutionError, Executor, MockExecutorCtx, SchwabError, TryIntoExecutor};
@@ -33,13 +33,13 @@ mod offchain_order;
 mod onchain;
 mod onchain_trade;
 mod position;
-mod queue;
 mod rebalancing;
 mod shares;
 mod symbol;
-mod telemetry;
+pub mod telemetry;
 mod threshold;
 mod tokenization;
+mod trading;
 #[cfg(feature = "mock")]
 pub use tokenization::mock_api;
 mod tokenized_equity_mint;
@@ -47,7 +47,7 @@ mod usdc_rebalance;
 mod vault_registry;
 mod wrapper;
 
-pub use telemetry::{TelemetryError, TelemetryGuard, setup_tracing};
+pub use telemetry::{TelemetryError, TelemetryGuard, mk_env_filter, setup_tracing};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use config::TradingMode;
@@ -69,32 +69,34 @@ mod integration_tests;
 #[cfg(test)]
 pub mod test_utils;
 
-pub async fn launch(ctx: Ctx) -> anyhow::Result<()> {
-    async {
-        if let config::TradingMode::Rebalancing(ref rebalancing) = ctx.trading_mode {
-            rebalancing.validate_rpc_connectivity().await?;
-        }
+#[tracing::instrument(skip_all, level = tracing::Level::INFO)]
+pub async fn run_bot_session(ctx: Ctx) -> anyhow::Result<()> {
+    let (event_sender, _) = broadcast::channel::<ServerMessage>(256);
+    run_bot_session_with_event_channel(ctx, event_sender).await
+}
 
-        let pool = ctx.get_sqlite_pool().await?;
-        sqlx::migrate!().run(&pool).await?;
+#[tracing::instrument(skip_all, level = tracing::Level::INFO)]
+pub async fn run_bot_session_with_event_channel(
+    ctx: Ctx,
+    event_sender: broadcast::Sender<ServerMessage>,
+) -> anyhow::Result<()> {
+    let pool = ctx.get_sqlite_pool().await?;
+    sqlx::migrate!().set_ignore_missing(true).run(&pool).await?;
 
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(256);
-        let inventory = Arc::new(inventory::BroadcastingInventory::new(
-            inventory::InventoryView::default(),
-            event_sender.clone(),
-        ));
+    let inventory = Arc::new(inventory::BroadcastingInventory::new(
+        inventory::InventoryView::default(),
+        event_sender.clone(),
+    ));
 
-        let server_task = spawn_server_task(&ctx, &pool, event_sender.clone(), inventory.clone());
-        let bot_task = spawn_bot_task(ctx, pool, event_sender, inventory);
+    let server_task = spawn_server_task(&ctx, &pool, event_sender.clone(), inventory.clone());
+    let bot_task = tokio::spawn(async move {
+        Box::pin(run_conductor_loop(ctx, pool, event_sender, inventory)).await
+    });
 
-        await_shutdown(server_task, bot_task).await;
+    await_shutdown(server_task, bot_task).await?;
 
-        info!("Shutdown complete");
-
-        Ok(())
-    }
-    .instrument(info_span!("launch"))
-    .await
+    info!("Shutdown complete");
+    Ok(())
 }
 
 fn spawn_server_task(
@@ -123,37 +125,25 @@ fn spawn_server_task(
     tokio::spawn(rocket.launch())
 }
 
-fn spawn_bot_task(
-    ctx: Ctx,
-    pool: SqlitePool,
-    event_sender: broadcast::Sender<ServerMessage>,
-    inventory: Arc<inventory::BroadcastingInventory>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        if let Err(error) = run(ctx, pool, event_sender, inventory).await {
-            error!("Bot failed: {error}");
-        }
-    })
-}
-
 async fn await_shutdown(
     server_task: JoinHandle<Result<Rocket<Ignite>, rocket::Error>>,
-    bot_task: JoinHandle<()>,
-) {
+    bot_task: JoinHandle<anyhow::Result<()>>,
+) -> anyhow::Result<()> {
     let server_abort = server_task.abort_handle();
     let bot_abort = bot_task.abort_handle();
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             handle_ctrl_c(&server_abort, &bot_abort);
+            Ok(())
         }
         result = server_task => {
-            log_server_result(result);
             abort_task("bot", &bot_abort);
+            check_server_result(result)
         }
         result = bot_task => {
-            log_bot_result(result);
             abort_task("server", &server_abort);
+            check_bot_result(result)
         }
     }
 }
@@ -169,23 +159,46 @@ fn abort_task(name: &str, handle: &AbortHandle) {
     handle.abort();
 }
 
-fn log_server_result(result: Result<Result<Rocket<Ignite>, rocket::Error>, JoinError>) {
+fn check_server_result(
+    result: Result<Result<Rocket<Ignite>, rocket::Error>, JoinError>,
+) -> anyhow::Result<()> {
     match result {
-        Ok(Ok(_)) => info!("Server completed successfully"),
-        Ok(Err(error)) => error!("Server failed: {error}"),
-        Err(error) => error!("Server task panicked: {error}"),
+        Ok(Ok(_)) => {
+            info!("Server completed successfully");
+            Ok(())
+        }
+        Ok(Err(error)) => {
+            error!("Server failed: {error}");
+            Err(anyhow::anyhow!("Server failed: {error}"))
+        }
+        Err(error) => {
+            error!("Server task panicked: {error}");
+            Err(anyhow::anyhow!("Server task panicked: {error}"))
+        }
     }
 }
 
-fn log_bot_result(result: Result<(), JoinError>) {
+fn check_bot_result(result: Result<anyhow::Result<()>, JoinError>) -> anyhow::Result<()> {
     match result {
-        Ok(()) => info!("Bot task completed"),
-        Err(error) => error!("Bot task panicked: {error}"),
+        Ok(Ok(())) => {
+            info!("Bot task completed");
+            Ok(())
+        }
+        Ok(Err(error)) => {
+            error!("Bot failed: {error}");
+            Err(error)
+        }
+        Err(error) => {
+            error!("Bot task panicked: {error}");
+            Err(anyhow::anyhow!("Bot task panicked: {error}"))
+        }
     }
 }
 
+/// Retry loop that initializes the broker executor and runs the conductor.
+/// Retries on Schwab token expiration; all other errors are fatal.
 #[tracing::instrument(skip_all, level = tracing::Level::INFO)]
-async fn run(
+async fn run_conductor_loop(
     ctx: Ctx,
     pool: SqlitePool,
     event_sender: broadcast::Sender<ServerMessage>,
@@ -194,12 +207,12 @@ async fn run(
     const RERUN_DELAY_SECS: u64 = 10;
 
     loop {
-        let result = run_bot_session(
+        let result = Box::pin(dispatch_to_executor(
             ctx.clone(),
             pool.clone(),
             event_sender.clone(),
             inventory.clone(),
-        )
+        ))
         .await;
 
         match result {
@@ -226,8 +239,10 @@ async fn run(
     }
 }
 
-#[tracing::instrument(skip_all, level = tracing::Level::INFO)]
-async fn run_bot_session(
+// NOTE: this can be refactored much cleaner via macro/DI BUT
+// TODO: nuke schwab. nuke alpaca trading api. live happily ever after
+#[allow(clippy::cognitive_complexity)]
+async fn dispatch_to_executor(
     ctx: Ctx,
     pool: SqlitePool,
     event_sender: broadcast::Sender<ServerMessage>,
@@ -239,15 +254,8 @@ async fn run_bot_session(
             let executor = MockExecutorCtx.try_into_executor().await?;
             let maintenance = executor.run_executor_maintenance().await;
 
-            conductor::run_market_hours_loop(
-                executor,
-                ctx,
-                pool,
-                maintenance,
-                event_sender,
-                inventory,
-            )
-            .await
+            conductor::Conductor::run(executor, ctx, pool, maintenance, event_sender, inventory)
+                .await
         }
         BrokerCtx::Schwab(schwab_auth) => {
             info!("Initializing Schwab executor");
@@ -255,45 +263,24 @@ async fn run_bot_session(
             let executor = schwab_ctx.try_into_executor().await?;
             let maintenance = executor.run_executor_maintenance().await;
 
-            conductor::run_market_hours_loop(
-                executor,
-                ctx,
-                pool,
-                maintenance,
-                event_sender,
-                inventory,
-            )
-            .await
+            conductor::Conductor::run(executor, ctx, pool, maintenance, event_sender, inventory)
+                .await
         }
         BrokerCtx::AlpacaTradingApi(alpaca_auth) => {
             info!("Initializing Alpaca Trading API executor");
             let executor = alpaca_auth.try_into_executor().await?;
             let maintenance = executor.run_executor_maintenance().await;
 
-            conductor::run_market_hours_loop(
-                executor,
-                ctx,
-                pool,
-                maintenance,
-                event_sender,
-                inventory,
-            )
-            .await
+            conductor::Conductor::run(executor, ctx, pool, maintenance, event_sender, inventory)
+                .await
         }
         BrokerCtx::AlpacaBrokerApi(alpaca_auth) => {
             info!("Initializing Alpaca Broker API executor");
             let executor = alpaca_auth.try_into_executor().await?;
             let maintenance = executor.run_executor_maintenance().await;
 
-            conductor::run_market_hours_loop(
-                executor,
-                ctx,
-                pool,
-                maintenance,
-                event_sender,
-                inventory,
-            )
-            .await
+            conductor::Conductor::run(executor, ctx, pool, maintenance, event_sender, inventory)
+                .await
         }
     }
 }
@@ -317,7 +304,7 @@ mod tests {
     }
 
     fn create_test_inventory() -> Arc<inventory::BroadcastingInventory> {
-        let (sender, _) = broadcast::channel(16);
+        let sender = create_test_event_sender();
         Arc::new(inventory::BroadcastingInventory::new(
             inventory::InventoryView::default(),
             sender,
@@ -331,7 +318,7 @@ mod tests {
         ));
         let pool = create_test_pool().await;
         ctx.evm.ws_rpc_url = "ws://invalid.nonexistent.url:8545".parse().unwrap();
-        let error = Box::pin(run(
+        let error = Box::pin(run_conductor_loop(
             ctx,
             pool,
             create_test_event_sender(),
@@ -354,7 +341,7 @@ mod tests {
         let pool = create_test_pool().await;
         ctx.evm.orderbook = Address::ZERO;
         ctx.evm.ws_rpc_url = "ws://localhost:8545".parse().unwrap();
-        let error = Box::pin(run(
+        let error = Box::pin(run_conductor_loop(
             ctx,
             pool,
             create_test_event_sender(),
@@ -376,7 +363,7 @@ mod tests {
         ));
         ctx.evm.ws_rpc_url = "ws://invalid.nonexistent.localhost:9999".parse().unwrap();
         let pool = create_test_pool().await;
-        let error = Box::pin(run(
+        let error = Box::pin(run_conductor_loop(
             ctx,
             pool,
             create_test_event_sender(),

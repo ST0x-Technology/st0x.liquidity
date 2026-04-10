@@ -1,7 +1,7 @@
 //! Onchain trade conversion and persistence. Converts raw blockchain events
-//! ([`TradeEvent`]) into structured [`OnchainTrade`]s with symbol resolution,
-//! price calculation, and Pyth oracle pricing. Also provides vault extraction
-//! utilities for the vault registry.
+//! ([`RaindexTradeEvent`]) into structured [`OnchainTrade`]s with symbol
+//! resolution, price calculation, and Pyth oracle pricing. Also provides
+//! vault extraction utilities for the vault registry.
 
 use alloy::primitives::ruint::FromUintError;
 use alloy::primitives::{Address, B256, TxHash, U256};
@@ -26,10 +26,21 @@ use crate::onchain::pyth::FeedIdCache;
 use crate::onchain_trade::PythPrice;
 use crate::symbol::cache::SymbolCache;
 
+/// Onchain trade event emitted by the Raindex orderbook, wrapping either
+/// a `ClearV3` or `TakeOrderV3` payload for downstream processing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum TradeEvent {
+pub enum RaindexTradeEvent {
     ClearV3(Box<ClearV3>),
     TakeOrderV3(Box<TakeOrderV3>),
+}
+
+impl RaindexTradeEvent {
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::ClearV3(_) => "ClearV3",
+            Self::TakeOrderV3(_) => "TakeOrderV3",
+        }
+    }
 }
 
 /// Information about a vault extracted from an order's IO specification.
@@ -223,7 +234,7 @@ impl OnchainTrade {
         {
             Ok(pyth_price) => Some(pyth_price),
             Err(error) => {
-                error!("Failed to get Pyth pricing for tx_hash={tx_hash:?}: {error}");
+                warn!(%tx_hash, %error, "Pyth price extraction failed");
                 None
             }
         };

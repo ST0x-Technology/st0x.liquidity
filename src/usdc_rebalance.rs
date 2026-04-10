@@ -3578,6 +3578,7 @@ mod tests {
             ])
             .when(UsdcRebalanceCommand::InitiatePostDepositConversion {
                 order_id,
+                // Must match deposit amount (amount_received from bridging, not original)
                 amount: Usdc::new(float!(99.99)),
             })
             .await
@@ -3720,6 +3721,7 @@ mod tests {
             .await
             .then_expect_error();
 
+        // Deposit amount is amount_received (99.99), not original (1000)
         assert!(
             matches!(
                 &error,
@@ -3774,13 +3776,13 @@ mod tests {
                 },
                 UsdcRebalanceEvent::ConversionInitiated {
                     direction: RebalanceDirection::BaseToAlpaca,
-                    amount: Usdc::new(float!(99.99)),
+                    amount: Usdc::new(float!(1000.00)),
                     order_id,
                     initiated_at: Utc::now(),
                 },
             ])
             .when(UsdcRebalanceCommand::ConfirmConversion {
-                filled_amount: Usdc::new(float!(99)),
+                filled_amount: Usdc::new(float!(998)),
             })
             .await
             .events();
