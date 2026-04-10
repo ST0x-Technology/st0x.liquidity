@@ -80,6 +80,62 @@ echo -e "${BOLD}${WHITE}══════════════════�
 echo -e "  ${status_color}${status_icon} Bot is ${BOLD}${status}${RESET}"
 echo -e "${BOLD}${WHITE}══════════════════════════════════════${RESET}"
 
+# Deployed version
+echo ""
+echo -e "${BOLD}${CYAN}▸ Deployed Version${RESET}"
+git_rev=$($ssh_cmd "cat /run/st0x/st0x-hedge.git-rev 2>/dev/null" || echo "")
+if [ -n "$git_rev" ] && [ "$git_rev" != "unknown" ]; then
+  short_rev="${git_rev:0:8}"
+  echo -e "  ${DIM}Commit:${RESET}   ${WHITE}${short_rev}${RESET}  ${DIM}(${git_rev})${RESET}"
+  echo -e "  ${DIM}GitHub:${RESET}   https://github.com/ST0x-Technology/st0x.liquidity/commit/${git_rev}"
+else
+  echo -e "  ${DIM}Commit:${RESET}   ${YELLOW}unknown${RESET} ${DIM}(pre-tracking deployment)${RESET}"
+fi
+deploy_ts=$($ssh_cmd "stat -c '%y' /nix/var/nix/profiles/per-service/st0x-hedge 2>/dev/null" | cut -d. -f1 || echo "")
+if [ -n "$deploy_ts" ]; then
+  echo -e "  ${DIM}Deployed:${RESET} ${deploy_ts} UTC"
+fi
+
+# Active config summary
+echo ""
+echo -e "${BOLD}${CYAN}▸ Active Config${RESET}"
+config=$($ssh_cmd "cat /run/st0x/st0x-hedge.config 2>/dev/null" || echo "")
+if [ -n "$config" ]; then
+  # Operational settings
+  log_level=$(echo "$config" | grep -E '^log_level' | head -1 | sed 's/.*= *"*\([^"]*\)"*/\1/')
+  deployment_block=$(echo "$config" | grep -E '^deployment_block' | head -1 | sed 's/.*= *//')
+  order_owner=$(echo "$config" | grep -E '^order_owner' | head -1 | sed 's/.*= *"*\([^"]*\)"*/\1/')
+  orderbook=$(echo "$config" | grep -E '^orderbook' | head -1 | sed 's/.*= *"*\([^"]*\)"*/\1/')
+
+  [ -n "$log_level" ] && echo -e "  ${DIM}Log level:${RESET}        ${WHITE}${log_level}${RESET}"
+  [ -n "$deployment_block" ] && echo -e "  ${DIM}Deployment block:${RESET} ${WHITE}${deployment_block}${RESET}"
+  [ -n "$orderbook" ] && echo -e "  ${DIM}Orderbook:${RESET}        ${WHITE}${orderbook}${RESET}"
+  [ -n "$order_owner" ] && echo -e "  ${DIM}Order owner:${RESET}      ${WHITE}${order_owner}${RESET}"
+
+  # Asset trading status
+  echo ""
+  echo -e "  ${DIM}Assets:${RESET}"
+  # Parse each equity section: extract symbol, trading, and rebalancing status
+  echo "$config" | awk '
+    /^\[assets\.equities\.[A-Z]/ {
+      gsub(/\[assets\.equities\./, ""); gsub(/\]/, "");
+      symbol = $0; trading = ""; rebalancing = ""
+      in_equity = 1; next
+    }
+    /^\[/ { in_equity = 0; next }
+    !in_equity { next }
+    /^trading/ { gsub(/.*= *"?/, ""); gsub(/"/, ""); trading = $0 }
+    /^rebalancing/ {
+      gsub(/.*= *"?/, ""); gsub(/"/, ""); rebalancing = $0
+      color_t = (trading == "enabled") ? "\033[32m" : "\033[2m"
+      color_r = (rebalancing == "enabled") ? "\033[32m" : "\033[2m"
+      printf "    %-6s  trade: %s%-8s\033[0m  rebalance: %s%-8s\033[0m\n", symbol, color_t, trading, color_r, rebalancing
+    }
+  '
+else
+  echo -e "  ${DIM}(no config found)${RESET}"
+fi
+
 # Last boot time
 echo ""
 echo -e "${BOLD}${CYAN}▸ Last Started${RESET}"

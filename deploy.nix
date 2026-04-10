@@ -8,6 +8,8 @@ let
   st0xPackage = self.packages.${system}.st0x-liquidity;
   dashboardPackage = self.packages.${system}.st0x-dashboard;
 
+  gitRev = self.rev or self.dirtyRev or "unknown";
+
   rage = "/run/current-system/sw/bin/rage";
   hostKey = "/etc/ssh/ssh_host_ed25519_key";
 
@@ -30,6 +32,7 @@ let
       "${rage} -d -i ${hostKey} ${secretsFile} > ${cfg.decryptedSecretPath}"
       "chown root:st0x ${cfg.decryptedSecretPath}"
       "chmod 0640 ${cfg.decryptedSecretPath}"
+      "echo '${gitRev}' > /run/st0x/${name}.git-rev"
       "touch ${cfg.markerFile}"
       "systemctl restart ${name}"
     ]);
