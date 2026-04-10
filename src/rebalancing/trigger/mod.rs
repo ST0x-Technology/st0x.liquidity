@@ -58,6 +58,16 @@ pub(crate) enum RebalancingTriggerError {
     },
     #[error("missing bridged amount for USDC rebalance {id} at deposit confirmation")]
     MissingUsdcBridgedAmount { id: UsdcRebalanceId },
+    #[error(
+        "settled USDC amount {settled_amount} exceeds initiated amount {initiated_amount} \
+         for rebalance {id} at {event}"
+    )]
+    SettledUsdcExceedsInitiatedAmount {
+        id: UsdcRebalanceId,
+        event: usdc::UsdcTrackingEvent,
+        initiated_amount: Usdc,
+        settled_amount: Usdc,
+    },
 }
 
 /// Why loading a token address from the vault registry failed.
@@ -561,7 +571,10 @@ impl RebalancingTrigger {
             other @ (RebalancingTriggerError::EquityTrigger(_)
             | RebalancingTriggerError::Float(_)
             | RebalancingTriggerError::MissingUsdcTrackingContext { .. }
-            | RebalancingTriggerError::MissingUsdcBridgedAmount { .. }) => return Err(other),
+            | RebalancingTriggerError::MissingUsdcBridgedAmount { .. }
+            | RebalancingTriggerError::SettledUsdcExceedsInitiatedAmount { .. }) => {
+                return Err(other);
+            }
         };
 
         warn!(
@@ -3445,6 +3458,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initiated_with_insufficient_balance_does_not_insert_tracking_context() {
+        let inventory = InventoryView::default().with_usdc(usdc(100), usdc(100));
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        let error = harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(1000)),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, RebalancingTriggerError::Inventory(_)),
+            "initiated event should fail through inventory validation, got {error:?}"
+        );
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "tracking context should not be inserted when the initiation inventory update fails"
+        );
+    }
+
+    #[tokio::test]
     async fn deposit_confirmed_without_bridged_amount_returns_error_and_preserves_state() {
         let inventory = InventoryView::default().with_usdc(usdc(5000), usdc(5000));
         let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
@@ -3493,6 +3531,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_failure_cancels_inflight_usdc_and_clears_tracking() {
+        let inventory = InventoryView::default().with_usdc(usdc(5000), usdc(5000));
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(1000)),
+            )
+            .await
+            .unwrap();
+
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_withdrawal_failed())
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "usdc_in_progress should clear after a terminal failure cancels inflight inventory"
+        );
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "tracking context should be removed after terminal failure cleanup succeeds"
+        );
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_available(Venue::Hedging),
+            Some(usdc(5000)),
+            "terminal failure should restore the full offchain USDC balance"
+        );
+        assert_eq!(
+            inventory.usdc_inflight(Venue::Hedging),
+            Some(Usdc::ZERO),
+            "terminal failure should clear offchain USDC inflight"
+        );
+        drop(inventory);
+    }
+
+    #[tokio::test]
+    async fn conversion_failed_without_started_transfer_still_clears_in_progress() {
+        let inventory = InventoryView::default().with_usdc(usdc(5000), usdc(5000));
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_conversion_failed())
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "pre-withdrawal conversion failure should still clear usdc_in_progress"
+        );
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "pre-withdrawal conversion failure should not leave tracking context behind"
+        );
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_available(Venue::MarketMaking),
+            Some(usdc(5000)),
+            "conversion failure before withdrawal should not change onchain USDC inventory"
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::Hedging),
+            Some(usdc(5000)),
+            "conversion failure before withdrawal should not change offchain USDC inventory"
+        );
+        drop(inventory);
+    }
+
+    #[tokio::test]
     async fn conversion_confirmed_without_tracking_returns_error_and_preserves_in_progress() {
         let inventory = InventoryView::default().with_usdc(usdc(5000), usdc(5000));
         let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
@@ -3520,6 +3640,70 @@ mod tests {
             trigger.usdc_in_progress.load(Ordering::SeqCst),
             "usdc_in_progress should stay set when conversion settlement context is missing"
         );
+    }
+
+    #[tokio::test]
+    async fn conversion_confirmed_above_initiated_returns_error_and_preserves_state() {
+        let inventory = InventoryView::default().with_usdc(usdc(5000), usdc(5000));
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(1000)),
+            )
+            .await
+            .unwrap();
+
+        let error = harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_conversion_confirmed(RebalanceDirection::BaseToAlpaca, usdc(1001)),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RebalancingTriggerError::SettledUsdcExceedsInitiatedAmount {
+                id: error_id,
+                event: usdc::UsdcTrackingEvent::ConversionConfirmed,
+                initiated_amount,
+                settled_amount,
+            } if error_id == id
+                && initiated_amount == usdc(1000)
+                && settled_amount == usdc(1001)
+        ));
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "usdc_in_progress should stay set when settled amount validation fails"
+        );
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "tracking context should be retained after settled amount validation fails"
+        );
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_available(Venue::MarketMaking),
+            Some(usdc(4000)),
+            "initiated amount should remain deducted until a valid terminal event settles it"
+        );
+        assert_eq!(
+            inventory.usdc_inflight(Venue::MarketMaking),
+            Some(usdc(1000)),
+            "initiated amount should remain inflight when settled amount validation fails"
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::Hedging),
+            Some(usdc(5000)),
+            "invalid settlement must not credit the destination venue"
+        );
+        drop(inventory);
     }
 
     #[test]

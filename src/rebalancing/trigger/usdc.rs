@@ -216,15 +216,18 @@ impl RebalancingTrigger {
                 self.complete_alpaca_to_base_deposit(&id).await?;
             }
 
+            WithdrawalFailed { .. }
+            | BridgingFailed { .. }
+            | DepositFailed { .. }
+            | ConversionFailed { .. } => {
+                self.cancel_tracked_usdc_rebalance(&id).await?;
+            }
+
             WithdrawalConfirmed { .. }
             | BridgingInitiated { .. }
             | BridgeAttestationReceived { .. }
             | DepositInitiated { .. }
             | ConversionInitiated { .. }
-            | WithdrawalFailed { .. }
-            | BridgingFailed { .. }
-            | DepositFailed { .. }
-            | ConversionFailed { .. }
             | DepositConfirmed {
                 direction: RebalanceDirection::BaseToAlpaca,
                 ..
@@ -259,14 +262,14 @@ impl RebalancingTrigger {
         };
         let update = Inventory::transfer(tracking.source_venue(), TransferOp::Start, amount);
 
+        let mut inventory = self.inventory.write().await;
+        *inventory = inventory.clone().update_usdc(update, Utc::now())?;
+        drop(inventory);
+
         self.usdc_tracking
             .write()
             .await
             .insert(id.clone(), tracking);
-
-        let mut inventory = self.inventory.write().await;
-        *inventory = inventory.clone().update_usdc(update, Utc::now())?;
-        drop(inventory);
 
         Ok(())
     }
@@ -315,6 +318,34 @@ impl RebalancingTrigger {
             .await
     }
 
+    async fn cancel_tracked_usdc_rebalance(
+        &self,
+        id: &UsdcRebalanceId,
+    ) -> Result<(), RebalancingTriggerError> {
+        let Some(tracking) = self.usdc_tracking.read().await.get(id).cloned() else {
+            debug!(
+                id = %id,
+                "Terminal failure event had no USDC tracking context to cancel"
+            );
+            return Ok(());
+        };
+
+        let source_venue = tracking.source_venue();
+        let initiated_amount = tracking.initiated_amount;
+        let now = Utc::now();
+        let update = Box::new(move |inventory| {
+            let cancelled =
+                Inventory::transfer(source_venue, TransferOp::Cancel, initiated_amount)(inventory)?;
+            Inventory::with_last_rebalancing(now)(cancelled)
+        });
+
+        let mut inventory = self.inventory.write().await;
+        *inventory = inventory.clone().update_usdc(update, now)?;
+        drop(inventory);
+
+        Ok(())
+    }
+
     async fn complete_usdc_rebalance(
         &self,
         id: &UsdcRebalanceId,
@@ -331,6 +362,23 @@ impl RebalancingTrigger {
 
         let source_venue = tracking.source_venue();
         let initiated_amount = tracking.initiated_amount;
+
+        if settled_amount.gt(&initiated_amount)? {
+            warn!(
+                id = %id,
+                ?event,
+                ?initiated_amount,
+                ?settled_amount,
+                "Settled USDC amount exceeds initiated amount"
+            );
+            return Err(RebalancingTriggerError::SettledUsdcExceedsInitiatedAmount {
+                id: id.clone(),
+                event,
+                initiated_amount,
+                settled_amount,
+            });
+        }
+
         let now = Utc::now();
         let update = Box::new(move |inventory| {
             let settled =
