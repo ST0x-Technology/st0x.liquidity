@@ -3,6 +3,9 @@ log_level = "debug"
 database_url = "sqlite:///mnt/data/cli.db"
 hyperdx.service_name = "manual-cli"
 
+[broker]
+counter_trade_slippage_bps = 100
+
 [broker.travel_rule]
 beneficiary_entity_name = "T0 TRADE (BVI) LTD"
 

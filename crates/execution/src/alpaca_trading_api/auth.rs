@@ -39,6 +39,7 @@ pub struct AlpacaTradingApiCtx {
     pub api_key: String,
     pub api_secret: String,
     pub trading_mode: Option<AlpacaTradingApiMode>,
+    pub counter_trade_slippage_bps: u16,
 }
 
 impl AlpacaTradingApiCtx {
@@ -63,6 +64,10 @@ impl std::fmt::Debug for AlpacaTradingApiCtx {
             .field("api_key", &"[REDACTED]")
             .field("api_secret", &"[REDACTED]")
             .field("trading_mode", &self.trading_mode())
+            .field(
+                "counter_trade_slippage_bps",
+                &self.counter_trade_slippage_bps,
+            )
             .finish()
     }
 }
@@ -99,7 +104,9 @@ impl AlpacaTradingApiClient {
             (api_secret_header, HeaderValue::from_str(&ctx.api_secret)?),
             (CONTENT_TYPE, HeaderValue::from_static("application/json")),
         ]);
-        let http_client = reqwest::Client::builder().default_headers(headers).build()?;
+        let http_client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()?;
 
         Ok(Self {
             client,
@@ -145,6 +152,7 @@ mod tests {
             api_key: "test_key_id".to_string(),
             api_secret: "test_secret_key".to_string(),
             trading_mode: Some(AlpacaTradingApiMode::Paper),
+            counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
         }
     }
 
@@ -153,6 +161,7 @@ mod tests {
             api_key: "test_key_id".to_string(),
             api_secret: "test_secret_key".to_string(),
             trading_mode: Some(AlpacaTradingApiMode::Live),
+            counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
         }
     }
 
@@ -192,6 +201,7 @@ mod tests {
             api_key: String::new(),
             api_secret: String::new(),
             trading_mode: None,
+            counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
         };
 
         let result = AlpacaTradingApiClient::new(&empty_ctx);
@@ -218,6 +228,7 @@ mod tests {
             api_key: "secret_key_id_123".to_string(),
             api_secret: "super_secret_key_456".to_string(),
             trading_mode: Some(AlpacaTradingApiMode::Paper),
+            counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
         };
 
         let debug_output = format!("{ctx:?}");

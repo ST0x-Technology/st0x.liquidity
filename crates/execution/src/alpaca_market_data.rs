@@ -21,7 +21,10 @@ struct LatestTradeEnvelope {
 
 #[derive(Debug, Deserialize)]
 struct LatestTrade {
-    #[serde(rename = "p", deserialize_with = "deserialize_float_from_number_or_string")]
+    #[serde(
+        rename = "p",
+        deserialize_with = "deserialize_float_from_number_or_string"
+    )]
     price: Float,
 }
 
@@ -31,7 +34,9 @@ pub(crate) async fn fetch_latest_trade_price(
     symbol: &Symbol,
 ) -> Result<Float, AlpacaMarketDataError> {
     let response: LatestTradeEnvelope = client
-        .get(format!("{market_data_base_url}/v2/stocks/{symbol}/trades/latest"))
+        .get(format!(
+            "{market_data_base_url}/v2/stocks/{symbol}/trades/latest"
+        ))
         .send()
         .await?
         .error_for_status()?

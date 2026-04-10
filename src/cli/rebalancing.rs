@@ -185,6 +185,7 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
         mode: Some(broker_mode),
         asset_cache_ttl: std::time::Duration::from_secs(3600),
         time_in_force: TimeInForce::default(),
+        counter_trade_slippage_bps: alpaca_auth.counter_trade_slippage_bps,
     };
 
     let alpaca_broker = Arc::new(AlpacaBrokerApi::try_from_ctx(broker_auth.clone()).await?);
@@ -597,6 +598,7 @@ mod tests {
             mode: Some(AlpacaBrokerApiMode::Sandbox),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::default(),
+            counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
         });
         ctx
     }
@@ -609,6 +611,7 @@ mod tests {
             mode: Some(AlpacaBrokerApiMode::Sandbox),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::default(),
+            counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
         };
 
         Ctx {
@@ -785,6 +788,7 @@ mod tests {
             mode: Some(AlpacaBrokerApiMode::Sandbox),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::default(),
+            counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
         };
 
         let broker_mode = if alpaca_auth.is_sandbox() {
@@ -809,6 +813,7 @@ mod tests {
             mode: Some(AlpacaBrokerApiMode::Production),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::default(),
+            counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
         };
 
         let broker_mode = if alpaca_auth.is_sandbox() {
