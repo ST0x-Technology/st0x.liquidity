@@ -34,7 +34,7 @@ use crate::bindings::{
     TOFUTokenDecimals,
 };
 use crate::conductor::{
-    EventProcessingError, TradeProcessingCqrs, VaultDiscoveryCtx,
+    EventProcessingError, OffchainOrderViews, TradeProcessingCqrs, VaultDiscoveryCtx,
     check_and_execute_accumulated_positions, discover_vaults_for_trade, process_queued_trade,
 };
 use crate::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
@@ -651,6 +651,7 @@ async fn create_test_cqrs_with_assets(
         position: position.clone(),
         position_projection: position_projection.clone(),
         offchain_order: offchain_order.clone(),
+        counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
         execution_threshold: ExecutionThreshold::whole_share(),
         assets,
     };
@@ -900,7 +901,11 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
         &MockExecutor::new(),
         &position,
         &position_query,
-        &offchain_order,
+        OffchainOrderViews::new(
+            offchain_order.as_ref(),
+            offchain_order_projection.as_ref(),
+            cqrs.counter_trade_submission_lock.as_ref(),
+        ),
         &ExecutionThreshold::whole_share(),
         &AssetsConfig {
             equities: EquitiesConfig::default(),
@@ -1428,7 +1433,11 @@ async fn position_checker_noop_when_hedged() -> Result<(), Box<dyn std::error::E
         &MockExecutor::new(),
         &position,
         &position_query,
-        &offchain_order,
+        OffchainOrderViews::new(
+            offchain_order.as_ref(),
+            offchain_order_projection.as_ref(),
+            cqrs.counter_trade_submission_lock.as_ref(),
+        ),
         &ExecutionThreshold::whole_share(),
         &AssetsConfig {
             equities: EquitiesConfig::default(),
@@ -2177,7 +2186,11 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
         &MockExecutor::new(),
         &position,
         &position_query,
-        &offchain_order,
+        OffchainOrderViews::new(
+            offchain_order.as_ref(),
+            offchain_order_projection.as_ref(),
+            cqrs.counter_trade_submission_lock.as_ref(),
+        ),
         &ExecutionThreshold::whole_share(),
         &assets,
         |_| true,
@@ -2206,7 +2219,11 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
         &MockExecutor::new(),
         &position,
         &position_query,
-        &offchain_order,
+        OffchainOrderViews::new(
+            offchain_order.as_ref(),
+            offchain_order_projection.as_ref(),
+            cqrs.counter_trade_submission_lock.as_ref(),
+        ),
         &ExecutionThreshold::whole_share(),
         &assets,
         |_| true,
@@ -2247,7 +2264,11 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
         &MockExecutor::new(),
         &position,
         &position_query,
-        &offchain_order,
+        OffchainOrderViews::new(
+            offchain_order.as_ref(),
+            offchain_order_projection.as_ref(),
+            cqrs.counter_trade_submission_lock.as_ref(),
+        ),
         &ExecutionThreshold::whole_share(),
         &assets,
         |_| true,
@@ -2369,7 +2390,11 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
         &MockExecutor::new(),
         &position,
         &position_query,
-        &offchain_order,
+        OffchainOrderViews::new(
+            offchain_order.as_ref(),
+            offchain_order_projection.as_ref(),
+            cqrs.counter_trade_submission_lock.as_ref(),
+        ),
         &ExecutionThreshold::whole_share(),
         &assets,
         |_| true,
@@ -2402,7 +2427,11 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
         &MockExecutor::new(),
         &position,
         &position_query,
-        &offchain_order,
+        OffchainOrderViews::new(
+            offchain_order.as_ref(),
+            offchain_order_projection.as_ref(),
+            cqrs.counter_trade_submission_lock.as_ref(),
+        ),
         &ExecutionThreshold::whole_share(),
         &assets,
         |_| true,

@@ -4,6 +4,7 @@
 //! the task handles; [`run_market_hours_loop`] drives the lifecycle.
 
 mod builder;
+mod counter_trade;
 mod manifest;
 
 use alloy::primitives::{Address, IntoLogData};
@@ -24,7 +25,7 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 
 use st0x_dto::ServerMessage;
-use st0x_event_sorcery::{Projection, SendError, Store, StoreBuilder};
+use st0x_event_sorcery::{Projection, ProjectionError, SendError, Store, StoreBuilder};
 use st0x_evm::{Evm, ReadOnlyEvm, Wallet};
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
 use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
@@ -43,7 +44,7 @@ use crate::offchain_order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer,
 };
 use crate::onchain::USDC_BASE;
-use crate::onchain::accumulator::{ExecutionCtx, check_all_positions, check_execution_readiness};
+use crate::onchain::accumulator::{ExecutionCtx, check_execution_readiness};
 use crate::onchain::backfill::backfill_events;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
@@ -69,6 +70,8 @@ use crate::wrapper::WrapperService;
 
 use self::manifest::QueryManifest;
 pub(crate) use builder::{ConductorBuilder, CqrsFrameworks};
+use counter_trade::submit_ready_counter_trade;
+pub(crate) use counter_trade::{OffchainOrderViews, check_and_execute_accumulated_positions};
 
 /// Bundles CQRS frameworks used throughout the trade processing pipeline.
 pub(crate) struct TradeProcessingCqrs {
@@ -76,6 +79,7 @@ pub(crate) struct TradeProcessingCqrs {
     pub(crate) position: Arc<Store<Position>>,
     pub(crate) position_projection: Arc<Projection<Position>>,
     pub(crate) offchain_order: Arc<Store<OffchainOrder>>,
+    pub(crate) counter_trade_submission_lock: Arc<tokio::sync::Mutex<()>>,
     pub(crate) execution_threshold: ExecutionThreshold,
     pub(crate) assets: AssetsConfig,
 }
@@ -134,6 +138,8 @@ pub(crate) enum EventProcessingError {
     AlpacaTradingApi(#[from] AlpacaTradingApiError),
     #[error("Alpaca broker API error: {0}")]
     AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
+    #[error("Offchain order projection error: {0}")]
+    OffchainOrderProjection(#[from] ProjectionError<OffchainOrder>),
 }
 
 pub(crate) async fn run_market_hours_loop<E>(
@@ -817,6 +823,8 @@ fn spawn_periodic_accumulated_position_check<E>(
     position: Arc<Store<Position>>,
     position_projection: Arc<Projection<Position>>,
     offchain_order: Arc<Store<OffchainOrder>>,
+    offchain_order_projection: Arc<Projection<OffchainOrder>>,
+    counter_trade_submission_lock: Arc<tokio::sync::Mutex<()>>,
     execution_threshold: ExecutionThreshold,
     check_interval: Duration,
     ctx: Ctx,
@@ -838,7 +846,11 @@ where
                 &executor,
                 &position,
                 &position_projection,
-                &offchain_order,
+                OffchainOrderViews::new(
+                    offchain_order.as_ref(),
+                    offchain_order_projection.as_ref(),
+                    counter_trade_submission_lock.as_ref(),
+                ),
                 &execution_threshold,
                 &ctx.assets,
                 |symbol| ctx.is_trading_enabled(symbol),
@@ -1043,7 +1055,10 @@ async fn process_queue_step<E: Executor>(
     evm: &impl Evm,
     cqrs: &TradeProcessingCqrs,
     queue_context: &QueueProcessingCtx<'_, E>,
-) -> Duration {
+) -> Duration
+where
+    EventProcessingError: From<E::Error>,
+{
     match process_next_queued_event(ctx, pool, evm, cqrs, queue_context).await {
         Ok(Some(offchain_order_id)) => {
             info!(%offchain_order_id, "Offchain order placed successfully");
@@ -1073,7 +1088,10 @@ async fn process_next_queued_event<E: Executor>(
     evm: &impl Evm,
     cqrs: &TradeProcessingCqrs,
     queue_context: &QueueProcessingCtx<'_, E>,
-) -> Result<Option<OffchainOrderId>, EventProcessingError> {
+) -> Result<Option<OffchainOrderId>, EventProcessingError>
+where
+    EventProcessingError: From<E::Error>,
+{
     let queued_event = get_next_unprocessed_event(pool).await?;
     let Some(queued_event) = queued_event else {
         return Ok(None);
@@ -1389,7 +1407,10 @@ pub(crate) async fn process_queued_trade<E: Executor>(
     trade: OnchainTrade,
     cqrs: &TradeProcessingCqrs,
     asset_enabled: bool,
-) -> Result<Option<OffchainOrderId>, EventProcessingError> {
+) -> Result<Option<OffchainOrderId>, EventProcessingError>
+where
+    EventProcessingError: From<E::Error>,
+{
     // Update Position aggregate FIRST so threshold check sees current state
     execute_acknowledge_fill(&cqrs.position, &trade, cqrs.execution_threshold).await;
 
@@ -1420,7 +1441,7 @@ pub(crate) async fn process_queued_trade<E: Executor>(
         return Ok(None);
     };
 
-    place_offchain_order(&execution, cqrs).await
+    submit_ready_counter_trade(executor, &execution, cqrs).await
 }
 
 #[allow(clippy::cognitive_complexity)] // conductor is getting refactored in pr #483
@@ -1627,173 +1648,6 @@ fn reconstruct_log_from_queued_event(
     }
 }
 
-#[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-pub(crate) async fn check_and_execute_accumulated_positions<E>(
-    executor: &E,
-    position: &Store<Position>,
-    position_projection: &Projection<Position>,
-    offchain_order: &Arc<Store<OffchainOrder>>,
-    threshold: &ExecutionThreshold,
-    assets: &AssetsConfig,
-    is_trading_enabled: impl Fn(&Symbol) -> bool,
-) -> Result<(), EventProcessingError>
-where
-    E: Executor + Clone + Send + 'static,
-    EventProcessingError: From<E::Error>,
-{
-    let executor_type = executor.to_supported_executor();
-    let ready_positions = check_all_positions(
-        executor,
-        position_projection,
-        executor_type,
-        assets,
-        is_trading_enabled,
-    )
-    .await?;
-
-    if ready_positions.is_empty() {
-        debug!("No accumulated positions ready for execution");
-        return Ok(());
-    }
-
-    info!(
-        "Found {} accumulated positions ready for execution",
-        ready_positions.len()
-    );
-
-    for execution in ready_positions {
-        let offchain_order_id = OffchainOrderId::new();
-
-        info!(
-            symbol = %execution.symbol,
-            shares = %execution.shares,
-            direction = ?execution.direction,
-            %offchain_order_id,
-            "Executing accumulated position"
-        );
-
-        let command = PositionCommand::PlaceOffChainOrder {
-            offchain_order_id,
-            shares: execution.shares,
-            direction: execution.direction,
-            executor: execution.executor,
-            threshold: *threshold,
-        };
-
-        if let Err(error) = position.send(&execution.symbol, command).await {
-            warn!(
-                %offchain_order_id,
-                symbol = %execution.symbol,
-                "Position::PlaceOffChainOrder rejected (likely pending execution), \
-                 skipping OffchainOrder creation: {error}"
-            );
-            continue;
-        }
-
-        info!(
-            %offchain_order_id,
-            symbol = %execution.symbol,
-            "Position marked as pending execution"
-        );
-
-        let command = OffchainOrderCommand::Place {
-            symbol: execution.symbol.clone(),
-            shares: execution.shares,
-            direction: execution.direction,
-            executor: execution.executor,
-        };
-
-        match offchain_order.send(&offchain_order_id, command).await {
-            Ok(()) => debug!(
-                %offchain_order_id,
-                symbol = %execution.symbol,
-                "Offchain order command processed, checking broker result"
-            ),
-            Err(error) => error!(
-                %offchain_order_id,
-                symbol = %execution.symbol,
-                "Offchain order command failed: {error}"
-            ),
-        }
-
-        match offchain_order.load(&offchain_order_id).await {
-            Ok(Some(OffchainOrder::Failed { error, .. })) => {
-                warn!(
-                    %offchain_order_id,
-                    symbol = %execution.symbol,
-                    %error,
-                    "Broker rejected order, clearing position pending state"
-                );
-                execute_fail_offchain_order_position(
-                    position,
-                    offchain_order_id,
-                    &execution,
-                    error,
-                )
-                .await;
-            }
-
-            Ok(Some(OffchainOrder::Submitted { .. })) => {
-                info!(
-                    %offchain_order_id,
-                    symbol = %execution.symbol,
-                    "Order submitted to broker"
-                );
-            }
-
-            Ok(Some(OffchainOrder::PartiallyFilled { .. })) => {
-                info!(
-                    %offchain_order_id,
-                    symbol = %execution.symbol,
-                    "Order partially filled by broker"
-                );
-            }
-
-            Ok(Some(OffchainOrder::Filled { .. })) => {
-                info!(
-                    %offchain_order_id,
-                    symbol = %execution.symbol,
-                    "Order filled by broker"
-                );
-            }
-
-            Ok(other) => {
-                error!(
-                    %offchain_order_id,
-                    symbol = %execution.symbol,
-                    state = ?other,
-                    "Unexpected offchain order state after placement"
-                );
-                execute_fail_offchain_order_position(
-                    position,
-                    offchain_order_id,
-                    &execution,
-                    format!("Unexpected offchain order state: {other:?}"),
-                )
-                .await;
-            }
-
-            Err(error) => {
-                error!(
-                    %offchain_order_id,
-                    symbol = %execution.symbol,
-                    ?error,
-                    "Failed to load offchain order after placement"
-                );
-                execute_fail_offchain_order_position(
-                    position,
-                    offchain_order_id,
-                    &execution,
-                    format!("Failed to load offchain order: {error}"),
-                )
-                .await;
-            }
-        }
-    }
-
-    Ok(())
-}
-
 /// Maps database symbols to current executor-recognized tickers.
 async fn wait_for_first_event_with_timeout<S1, S2>(
     clear_stream: &mut S1,
@@ -1883,8 +1737,11 @@ mod tests {
     use st0x_dto::ServerMessage;
     use st0x_event_sorcery::{StoreBuilder, test_store};
     use st0x_execution::{
-        Direction, ExecutorOrderId, MarketOrder, MockExecutor, MockExecutorCtx, Positive, Symbol,
-        TryIntoExecutor,
+        CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason,
+        DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, Direction, EquityPosition, ExecutionError,
+        Executor, ExecutorOrderId, Inventory as ExecutionInventory, InventoryResult, MarketOrder,
+        MockExecutor, MockExecutorCtx, OrderPlacement, OrderState, Positive, SupportedExecutor,
+        Symbol, TryIntoExecutor,
     };
     use st0x_finance::{Usd, Usdc};
 
@@ -1917,6 +1774,7 @@ mod tests {
             position: frameworks.position.clone(),
             position_projection: frameworks.position_projection.clone(),
             offchain_order: frameworks.offchain_order.clone(),
+            counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
@@ -3086,6 +2944,185 @@ mod tests {
             .build()
     }
 
+    fn test_sell_trade(symbol: &str, amount: Float, log_index: u64) -> OnchainTrade {
+        let tokenized_symbol = format!("wt{symbol}");
+        let mut trade = OnchainTradeBuilder::default()
+            .with_symbol(&tokenized_symbol)
+            .with_equity_token(TEST_EQUITY_TOKEN)
+            .with_amount(amount)
+            .with_log_index(log_index)
+            .build();
+        trade.direction = Direction::Sell;
+        trade
+    }
+
+    #[derive(Clone)]
+    struct SharedBuyingPower {
+        available_cents: Arc<tokio::sync::Mutex<i64>>,
+        preflight_price: Float,
+    }
+
+    impl SharedBuyingPower {
+        fn new(available_cents: i64, preflight_price: Float) -> Self {
+            Self {
+                available_cents: Arc::new(tokio::sync::Mutex::new(available_cents)),
+                preflight_price,
+            }
+        }
+
+        fn estimated_cost_cents(
+            &self,
+            shares: Positive<FractionalShares>,
+        ) -> Result<i64, ExecutionError> {
+            let basis_points = Float::parse("10000".to_string()).map_err(ExecutionError::from)?;
+            let slippage = Float::parse(DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS.to_string())
+                .map_err(ExecutionError::from)?;
+            let multiplier = ((basis_points + slippage)? / basis_points)?;
+            let raw_cost = (shares.inner().inner() * self.preflight_price)?;
+            let buffered_cost = (raw_cost * multiplier)?;
+            let (fixed_cents, lossless) = buffered_cost.to_fixed_decimal_lossy(2)?;
+            let rounded_cents = if lossless {
+                fixed_cents
+            } else {
+                fixed_cents + U256::from(1)
+            };
+
+            rounded_cents
+                .to_string()
+                .parse()
+                .map_err(|_| ExecutionError::MockFailure {
+                    message: "estimated cost overflow".to_string(),
+                })
+        }
+    }
+
+    #[derive(Clone)]
+    struct LiveBuyingPowerExecutor {
+        state: SharedBuyingPower,
+    }
+
+    #[async_trait::async_trait]
+    impl Executor for LiveBuyingPowerExecutor {
+        type Error = ExecutionError;
+        type OrderId = String;
+        type Ctx = MockExecutorCtx;
+
+        async fn try_from_ctx(_ctx: Self::Ctx) -> Result<Self, Self::Error> {
+            Ok(Self {
+                state: SharedBuyingPower::new(0, float!(100)),
+            })
+        }
+
+        async fn is_market_open(&self) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        async fn place_market_order(
+            &self,
+            order: MarketOrder,
+        ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
+            Ok(OrderPlacement {
+                order_id: "unused".to_string(),
+                symbol: order.symbol,
+                shares: order.shares,
+                direction: order.direction,
+                placed_at: chrono::Utc::now(),
+            })
+        }
+
+        async fn get_order_status(
+            &self,
+            order_id: &Self::OrderId,
+        ) -> Result<OrderState, Self::Error> {
+            Ok(OrderState::Filled {
+                executed_at: chrono::Utc::now(),
+                order_id: order_id.clone(),
+                price: self.state.preflight_price,
+            })
+        }
+
+        fn to_supported_executor(&self) -> SupportedExecutor {
+            SupportedExecutor::DryRun
+        }
+
+        fn parse_order_id(&self, order_id_str: &str) -> Result<Self::OrderId, Self::Error> {
+            Ok(order_id_str.to_string())
+        }
+
+        async fn run_executor_maintenance(&self) -> Option<tokio::task::JoinHandle<()>> {
+            None
+        }
+
+        async fn get_inventory(&self) -> Result<InventoryResult, Self::Error> {
+            Ok(InventoryResult::Fetched(ExecutionInventory {
+                positions: vec![],
+                cash_balance_cents: *self.state.available_cents.lock().await,
+            }))
+        }
+
+        async fn preflight_counter_trade(
+            &self,
+            order: MarketOrder,
+        ) -> Result<CounterTradePreflight, Self::Error> {
+            match order.direction {
+                Direction::Sell => Ok(CounterTradePreflight::Allowed { reservation: None }),
+                Direction::Buy => {
+                    let estimated_cost_cents = self.state.estimated_cost_cents(order.shares)?;
+                    let available_buying_power_cents = *self.state.available_cents.lock().await;
+
+                    if available_buying_power_cents >= estimated_cost_cents {
+                        Ok(CounterTradePreflight::Allowed {
+                            reservation: Some(CounterTradeReservation::BuyingPower {
+                                estimated_cost_cents,
+                                available_buying_power_cents,
+                            }),
+                        })
+                    } else {
+                        Ok(CounterTradePreflight::Skipped(
+                            CounterTradeSkipReason::InsufficientBuyingPower {
+                                estimated_cost_cents,
+                                available_buying_power_cents,
+                            },
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
+    struct BuyingPowerOrderPlacer {
+        state: SharedBuyingPower,
+        entered: Option<Arc<tokio::sync::Notify>>,
+        release: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    #[async_trait::async_trait]
+    impl OrderPlacer for BuyingPowerOrderPlacer {
+        async fn place_market_order(
+            &self,
+            order: MarketOrder,
+        ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+            if let Some(entered) = &self.entered {
+                entered.notify_one();
+            }
+
+            if let Some(release) = &self.release {
+                release.notified().await;
+            }
+
+            if order.direction == Direction::Buy {
+                let estimated_cost_cents = self.state.estimated_cost_cents(order.shares)?;
+                let mut available_cents = self.state.available_cents.lock().await;
+                *available_cents -= estimated_cost_cents;
+            }
+
+            Ok(OrderPlacementResult {
+                executor_order_id: ExecutorOrderId::new("live-buying-power-order"),
+                placed_shares: order.shares,
+            })
+        }
+    }
+
     fn create_vault_discovery_context(
         vault_registry: &Store<VaultRegistry>,
     ) -> VaultDiscoveryCtx<'_> {
@@ -3343,6 +3380,7 @@ mod tests {
             position: frameworks.position.clone(),
             position_projection: frameworks.position_projection.clone(),
             offchain_order: frameworks.offchain_order.clone(),
+            counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
             execution_threshold: threshold,
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
@@ -3485,6 +3523,66 @@ mod tests {
         assert!(
             matches!(offchain_order, OffchainOrder::Submitted { .. }),
             "Offchain order should be Submitted after successful placement, got: {offchain_order:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn trade_above_threshold_skips_order_when_sell_inventory_is_insufficient() {
+        let pool = setup_test_db().await;
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs =
+            trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+
+        let executor = MockExecutor::new().with_inventory(ExecutionInventory {
+            positions: vec![],
+            cash_balance_cents: 5_000_000,
+        });
+        let (queued_event, event_id) = enqueue_and_fetch(&pool, 21).await;
+        let trade = test_trade_with_amount(float!(1.5), 21);
+
+        let result = process_queued_trade(
+            &executor,
+            &pool,
+            &queued_event,
+            event_id,
+            trade,
+            &cqrs,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result, None,
+            "insufficient offchain shares should skip the counter trade"
+        );
+
+        let position = cqrs
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .expect("position should exist");
+
+        assert!(
+            position.net.inner().eq(float!(1.5)).unwrap(),
+            "Position net should stay accumulated after the skipped submission"
+        );
+        assert!(
+            position.pending_offchain_order_id.is_none(),
+            "Skipped submissions must not leave a pending offchain order"
+        );
+
+        let offchain_order_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE aggregate_type = 'OffchainOrder'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            offchain_order_events, 0,
+            "Skipped submissions must not create OffchainOrder events"
         );
     }
 
@@ -3687,7 +3785,11 @@ mod tests {
             &executor,
             &cqrs.position,
             &cqrs.position_projection,
-            &cqrs.offchain_order,
+            OffchainOrderViews::new(
+                cqrs.offchain_order.as_ref(),
+                frameworks.offchain_order_projection.as_ref(),
+                cqrs.counter_trade_submission_lock.as_ref(),
+            ),
             &cqrs.execution_threshold,
             &cqrs.assets,
             |_| true,
@@ -3710,6 +3812,402 @@ mod tests {
             position.pending_offchain_order_id.unwrap(),
             first_order_id,
             "New order should have a different ID than the completed one"
+        );
+    }
+
+    #[tokio::test]
+    async fn periodic_checker_skips_buy_without_cash_then_retries_after_cash_recovers() {
+        let pool = setup_test_db().await;
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs =
+            trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        cqrs.position
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        tx_hash: B256::ZERO,
+                        log_index: 77,
+                    },
+                    amount: FractionalShares::new(float!(2)),
+                    direction: Direction::Sell,
+                    price_usdc: float!(150),
+                    block_timestamp: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let insufficient_cash_executor = MockExecutor::new()
+            .with_inventory(ExecutionInventory {
+                positions: vec![EquityPosition {
+                    symbol: symbol.clone(),
+                    quantity: FractionalShares::new(float!(10)),
+                    market_value: None,
+                }],
+                cash_balance_cents: 10_000,
+            })
+            .with_preflight_price(float!(100));
+
+        check_and_execute_accumulated_positions(
+            &insufficient_cash_executor,
+            &cqrs.position,
+            &cqrs.position_projection,
+            OffchainOrderViews::new(
+                cqrs.offchain_order.as_ref(),
+                frameworks.offchain_order_projection.as_ref(),
+                cqrs.counter_trade_submission_lock.as_ref(),
+            ),
+            &cqrs.execution_threshold,
+            &cqrs.assets,
+            |_| true,
+        )
+        .await
+        .unwrap();
+
+        let position = cqrs
+            .position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert!(
+            position.pending_offchain_order_id.is_none(),
+            "Insufficient cash should skip without marking the position pending"
+        );
+
+        let offchain_order_events_after_skip: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE aggregate_type = 'OffchainOrder'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            offchain_order_events_after_skip, 0,
+            "Skipped periodic checks must not create OffchainOrder events"
+        );
+
+        let recovered_cash_executor = MockExecutor::new()
+            .with_inventory(ExecutionInventory {
+                positions: vec![EquityPosition {
+                    symbol: symbol.clone(),
+                    quantity: FractionalShares::new(float!(10)),
+                    market_value: None,
+                }],
+                cash_balance_cents: 50_000,
+            })
+            .with_preflight_price(float!(100));
+
+        check_and_execute_accumulated_positions(
+            &recovered_cash_executor,
+            &cqrs.position,
+            &cqrs.position_projection,
+            OffchainOrderViews::new(
+                cqrs.offchain_order.as_ref(),
+                frameworks.offchain_order_projection.as_ref(),
+                cqrs.counter_trade_submission_lock.as_ref(),
+            ),
+            &cqrs.execution_threshold,
+            &cqrs.assets,
+            |_| true,
+        )
+        .await
+        .unwrap();
+
+        let position = cqrs
+            .position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert!(
+            position.pending_offchain_order_id.is_some(),
+            "Once cash recovers, the periodic checker should retry the counter trade"
+        );
+    }
+
+    #[tokio::test]
+    async fn periodic_checker_reserves_buying_power_across_ready_positions() {
+        let pool = setup_test_db().await;
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs =
+            trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+
+        for (symbol, log_index) in [("AAPL", 90_u64), ("MSFT", 91_u64)] {
+            let symbol = Symbol::new(symbol).unwrap();
+
+            cqrs.position
+                .send(
+                    &symbol,
+                    PositionCommand::AcknowledgeOnChainFill {
+                        symbol: symbol.clone(),
+                        threshold: ExecutionThreshold::whole_share(),
+                        trade_id: TradeId {
+                            tx_hash: B256::ZERO,
+                            log_index,
+                        },
+                        amount: FractionalShares::new(float!(1)),
+                        direction: Direction::Sell,
+                        price_usdc: float!(150),
+                        block_timestamp: chrono::Utc::now(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let executor = MockExecutor::new()
+            .with_inventory(ExecutionInventory {
+                positions: vec![],
+                cash_balance_cents: 15_000,
+            })
+            .with_preflight_price(float!(100));
+
+        check_and_execute_accumulated_positions(
+            &executor,
+            &cqrs.position,
+            &cqrs.position_projection,
+            OffchainOrderViews::new(
+                cqrs.offchain_order.as_ref(),
+                frameworks.offchain_order_projection.as_ref(),
+                cqrs.counter_trade_submission_lock.as_ref(),
+            ),
+            &cqrs.execution_threshold,
+            &cqrs.assets,
+            |_| true,
+        )
+        .await
+        .unwrap();
+
+        let offchain_order_aggregates: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT aggregate_id) FROM events WHERE aggregate_type = 'OffchainOrder'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            offchain_order_aggregates, 1,
+            "The periodic checker must not oversubscribe the same buy-side cash budget"
+        );
+
+        let mut pending_count = 0;
+        for symbol in ["AAPL", "MSFT"] {
+            let pending = cqrs
+                .position_projection
+                .load(&Symbol::new(symbol).unwrap())
+                .await
+                .unwrap()
+                .expect("position should exist")
+                .pending_offchain_order_id
+                .is_some();
+
+            if pending {
+                pending_count += 1;
+            }
+        }
+
+        assert_eq!(
+            pending_count, 1,
+            "Exactly one position should reserve the available buy-side budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_trade_uses_live_buying_power_after_prior_submission() {
+        let pool = setup_test_db().await;
+        let shared_buying_power = SharedBuyingPower::new(15_000, float!(100));
+        let order_placer: Arc<dyn OrderPlacer> = Arc::new(BuyingPowerOrderPlacer {
+            state: shared_buying_power.clone(),
+            entered: None,
+            release: None,
+        });
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, order_placer).await;
+        let cqrs =
+            trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+        let executor = LiveBuyingPowerExecutor {
+            state: shared_buying_power,
+        };
+
+        let (queued_event_1, event_id_1) = enqueue_and_fetch(&pool, 92).await;
+        let first_trade = test_sell_trade("AAPL", float!(1), 92);
+        let first_order = process_queued_trade(
+            &executor,
+            &pool,
+            &queued_event_1,
+            event_id_1,
+            first_trade,
+            &cqrs,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            first_order.is_some(),
+            "first queued trade should place a buy hedge"
+        );
+
+        let (queued_event_2, event_id_2) = enqueue_and_fetch(&pool, 93).await;
+        let second_trade = test_sell_trade("MSFT", float!(1), 93);
+        let second_order = process_queued_trade(
+            &executor,
+            &pool,
+            &queued_event_2,
+            event_id_2,
+            second_trade,
+            &cqrs,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            second_order, None,
+            "queue processing must respect the reduced live buying power after the first buy hedge"
+        );
+
+        let offchain_order_aggregates: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT aggregate_id) FROM events WHERE aggregate_type = 'OffchainOrder'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            offchain_order_aggregates, 1,
+            "the second queued trade must not create a second offchain order"
+        );
+
+        let msft_position = cqrs
+            .position_projection
+            .load(&Symbol::new("MSFT").unwrap())
+            .await
+            .unwrap()
+            .expect("MSFT position should exist");
+        assert!(
+            msft_position.pending_offchain_order_id.is_none(),
+            "skipped queued trade must not leave MSFT pending"
+        );
+        assert!(
+            msft_position.net.inner().eq(float!(-1)).unwrap(),
+            "MSFT net exposure should remain accumulated for retry after skip"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_trade_serializes_submission_until_live_buying_power_updates() {
+        let pool = setup_test_db().await;
+        let shared_buying_power = SharedBuyingPower::new(15_000, float!(100));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let order_placer: Arc<dyn OrderPlacer> = Arc::new(BuyingPowerOrderPlacer {
+            state: shared_buying_power.clone(),
+            entered: Some(entered.clone()),
+            release: Some(release.clone()),
+        });
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, order_placer).await;
+        let cqrs = Arc::new(trade_processing_cqrs_with_threshold(
+            &frameworks,
+            ExecutionThreshold::whole_share(),
+        ));
+        let executor = LiveBuyingPowerExecutor {
+            state: shared_buying_power,
+        };
+
+        let (queued_event_1, event_id_1) = enqueue_and_fetch(&pool, 94).await;
+        let first_trade = test_sell_trade("AAPL", float!(1), 94);
+        let first_task = {
+            let cqrs = Arc::clone(&cqrs);
+            let executor = executor.clone();
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                process_queued_trade(
+                    &executor,
+                    &pool,
+                    &queued_event_1,
+                    event_id_1,
+                    first_trade,
+                    cqrs.as_ref(),
+                    true,
+                )
+                .await
+            })
+        };
+
+        entered.notified().await;
+
+        let (queued_event_2, event_id_2) = enqueue_and_fetch(&pool, 95).await;
+        let second_trade = test_sell_trade("MSFT", float!(1), 95);
+        let second_task = {
+            let cqrs = Arc::clone(&cqrs);
+            let executor = executor.clone();
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                process_queued_trade(
+                    &executor,
+                    &pool,
+                    &queued_event_2,
+                    event_id_2,
+                    second_trade,
+                    cqrs.as_ref(),
+                    true,
+                )
+                .await
+            })
+        };
+
+        tokio::task::yield_now().await;
+        release.notify_waiters();
+
+        let first_order = first_task
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("first queued trade should place a buy hedge");
+        let second_order = second_task.await.unwrap().unwrap();
+
+        assert_eq!(
+            second_order, None,
+            "the second queued trade must wait for the first submission to update live buying power"
+        );
+
+        let offchain_order_aggregates: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT aggregate_id) FROM events WHERE aggregate_type = 'OffchainOrder'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            offchain_order_aggregates, 1,
+            "concurrent queue submissions must not oversubscribe buy-side cash before persistence"
+        );
+
+        let first_position = cqrs
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .expect("AAPL position should exist");
+        assert_eq!(
+            first_position.pending_offchain_order_id,
+            Some(first_order),
+            "the first position should keep its pending offchain order"
+        );
+
+        let second_position = cqrs
+            .position_projection
+            .load(&Symbol::new("MSFT").unwrap())
+            .await
+            .unwrap()
+            .expect("MSFT position should exist");
+        assert!(
+            second_position.pending_offchain_order_id.is_none(),
+            "the skipped second position must remain available for a future retry"
         );
     }
 
@@ -4506,7 +5004,11 @@ mod tests {
             &executor,
             &cqrs.position,
             &cqrs.position_projection,
-            &cqrs.offchain_order,
+            OffchainOrderViews::new(
+                cqrs.offchain_order.as_ref(),
+                frameworks.offchain_order_projection.as_ref(),
+                cqrs.counter_trade_submission_lock.as_ref(),
+            ),
             &cqrs.execution_threshold,
             &cqrs.assets,
             |_| true,
@@ -4590,7 +5092,11 @@ mod tests {
             &executor,
             &cqrs.position,
             &cqrs.position_projection,
-            &cqrs.offchain_order,
+            OffchainOrderViews::new(
+                cqrs.offchain_order.as_ref(),
+                frameworks.offchain_order_projection.as_ref(),
+                cqrs.counter_trade_submission_lock.as_ref(),
+            ),
             &cqrs.execution_threshold,
             &cqrs.assets,
             |_| true,

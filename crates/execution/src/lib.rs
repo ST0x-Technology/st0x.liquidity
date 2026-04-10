@@ -15,6 +15,7 @@ pub(crate) use st0x_float_serde::{
 pub use st0x_float_macro::float;
 
 pub mod alpaca_broker_api;
+mod alpaca_market_data;
 pub mod alpaca_trading_api;
 pub mod error;
 pub mod mock;
@@ -180,6 +181,19 @@ pub trait Executor: Send + Sync + 'static {
     // for auto-rebalancing but not all executors support auto-rebalancing, so
     // implementing the method for non-auto-rebalancing executors is lower priority
     async fn get_inventory(&self) -> Result<InventoryResult, Self::Error>;
+
+    /// Checks whether a counter-trade can be submitted without relying on
+    /// margin or short inventory.
+    ///
+    /// Executors that do not implement preflight checks return
+    /// [`CounterTradePreflight::Allowed`] by default so existing non-Alpaca
+    /// flows remain unchanged.
+    async fn preflight_counter_trade(
+        &self,
+        _order: MarketOrder,
+    ) -> Result<CounterTradePreflight, Self::Error> {
+        Ok(CounterTradePreflight::Allowed { reservation: None })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -366,6 +380,46 @@ pub enum InventoryResult {
     Fetched(Inventory),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CounterTradeSkipReason {
+    #[error(
+        "insufficient offchain equity inventory: need {required}, but only {available} shares are available"
+    )]
+    InsufficientEquity {
+        required: Positive<FractionalShares>,
+        available: FractionalShares,
+    },
+    #[error(
+        "insufficient margin-safe buying power: estimated cost {estimated_cost_cents} cents \
+         exceeds available {available_buying_power_cents} cents"
+    )]
+    InsufficientBuyingPower {
+        estimated_cost_cents: i64,
+        available_buying_power_cents: i64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CounterTradeReservation {
+    Equity {
+        symbol: Symbol,
+        required: Positive<FractionalShares>,
+        available: FractionalShares,
+    },
+    BuyingPower {
+        estimated_cost_cents: i64,
+        available_buying_power_cents: i64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CounterTradePreflight {
+    Allowed {
+        reservation: Option<CounterTradeReservation>,
+    },
+    Skipped(CounterTradeSkipReason),
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutionError {
     #[error("Database error: {0}")]
@@ -396,6 +450,67 @@ pub enum ExecutionError {
     DateTimeParse(#[from] chrono::ParseError),
     #[error("Float operation failed: {0}")]
     Float(#[from] FloatError),
+    #[error(
+        "buying power reservation overflow: current reserved {current_reserved_cents} cents, \
+         additional {additional_cents} cents"
+    )]
+    BuyingPowerReservationOverflow {
+        current_reserved_cents: i64,
+        additional_cents: i64,
+    },
+}
+
+pub const DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS: u16 = 100;
+
+#[derive(Debug, thiserror::Error)]
+pub enum CounterTradeCostError {
+    #[error("Float conversion failed: {0}")]
+    Float(#[from] FloatError),
+    #[error("estimated cost in cents does not fit in i64: {formatted_cents}")]
+    EstimatedCostOverflow { formatted_cents: String },
+}
+
+pub(crate) fn estimate_buffered_cost_cents(
+    shares: Positive<FractionalShares>,
+    reference_price: Float,
+    slippage_bps: u16,
+) -> Result<i64, CounterTradeCostError> {
+    let basis_points = Float::parse("10000".to_string())?;
+    let slippage = Float::parse(u64::from(slippage_bps).to_string())?;
+    let multiplier = ((basis_points + slippage)? / basis_points)?;
+    let raw_cost = (shares.inner().inner() * reference_price)?;
+    let buffered_cost = (raw_cost * multiplier)?;
+    let (fixed_cents, lossless) = buffered_cost.to_fixed_decimal_lossy(2)?;
+
+    let rounded_cents = if lossless {
+        fixed_cents
+    } else {
+        fixed_cents + U256::from(1)
+    };
+
+    let formatted_cents = rounded_cents.to_string();
+    formatted_cents
+        .parse()
+        .map_err(|_| CounterTradeCostError::EstimatedCostOverflow { formatted_cents })
+}
+
+pub(crate) fn buying_power_counter_trade_preflight(
+    estimated_cost_cents: i64,
+    available_buying_power_cents: i64,
+) -> CounterTradePreflight {
+    if available_buying_power_cents >= estimated_cost_cents {
+        CounterTradePreflight::Allowed {
+            reservation: Some(CounterTradeReservation::BuyingPower {
+                estimated_cost_cents,
+                available_buying_power_cents,
+            }),
+        }
+    } else {
+        CounterTradePreflight::Skipped(CounterTradeSkipReason::InsufficientBuyingPower {
+            estimated_cost_cents,
+            available_buying_power_cents,
+        })
+    }
 }
 
 /// Trait for converting executor contexts into their corresponding executor implementations
@@ -443,6 +558,18 @@ mod tests {
 
         let shares = Positive::new(FractionalShares::new(float!(100))).unwrap();
         assert_eq!(shares.to_whole_shares().unwrap(), 100);
+    }
+
+    #[test]
+    fn estimate_buffered_cost_cents_applies_slippage_and_rounds_up() {
+        let estimated_cost_cents = estimate_buffered_cost_cents(
+            Positive::new(FractionalShares::new(float!(2))).unwrap(),
+            float!(100),
+            DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+        )
+        .unwrap();
+
+        assert_eq!(estimated_cost_cents, 20_200);
     }
 
     #[test]

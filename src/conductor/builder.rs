@@ -246,11 +246,15 @@ where
         );
         let event_processor =
             spawn_event_processor(self.common.pool.clone(), self.state.event_receiver);
+        let counter_trade_submission_lock = Arc::new(tokio::sync::Mutex::new(()));
+
         let position_checker = spawn_periodic_accumulated_position_check()
             .executor(self.common.executor.clone())
             .position(self.common.frameworks.position.clone())
             .position_projection(self.common.frameworks.position_projection.clone())
             .offchain_order(self.common.frameworks.offchain_order.clone())
+            .offchain_order_projection(self.common.frameworks.offchain_order_projection.clone())
+            .counter_trade_submission_lock(counter_trade_submission_lock.clone())
             .execution_threshold(self.common.execution_threshold)
             .check_interval(std::time::Duration::from_secs(
                 self.common.ctx.position_check_interval,
@@ -262,6 +266,7 @@ where
             position: self.common.frameworks.position,
             position_projection: self.common.frameworks.position_projection,
             offchain_order: self.common.frameworks.offchain_order,
+            counter_trade_submission_lock,
             execution_threshold: self.common.execution_threshold,
             assets: self.common.ctx.assets.clone(),
         };

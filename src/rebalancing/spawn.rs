@@ -210,6 +210,8 @@ mod tests {
                 mode: Some(AlpacaBrokerApiMode::Sandbox),
                 asset_cache_ttl: std::time::Duration::from_secs(3600),
                 time_in_force: TimeInForce::default(),
+                counter_trade_slippage_bps:
+                    st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
             })
             .call()
     }
@@ -299,6 +301,7 @@ mod tests {
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::default(),
+            counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
         };
         let broker = Arc::new(
             AlpacaBrokerApi::try_from_ctx(broker_auth)
@@ -375,6 +378,7 @@ mod tests {
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::default(),
+            counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
         };
 
         let spawn_error: SpawnRebalancerError = AlpacaBrokerApi::try_from_ctx(broker_auth)
