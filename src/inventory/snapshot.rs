@@ -68,17 +68,17 @@ pub(crate) struct InventorySnapshot {
     /// Latest onchain equity balances by symbol
     pub(crate) onchain_equity: BTreeMap<Symbol, FractionalShares>,
     /// Latest onchain USDC balance
-    pub(crate) onchain_cash: Option<Usdc>,
+    pub(crate) onchain_usdc: Option<Usdc>,
     /// Latest offchain equity positions by symbol
     pub(crate) offchain_equity: BTreeMap<Symbol, FractionalShares>,
-    /// Latest offchain cash balance in cents
-    pub(crate) offchain_cash_cents: Option<i64>,
+    /// Latest offchain USD balance in cents
+    pub(crate) offchain_usd_cents: Option<i64>,
     /// Latest Ethereum wallet USDC balance
-    pub(crate) ethereum_cash: Option<Usdc>,
+    pub(crate) ethereum_usdc: Option<Usdc>,
     /// Latest Base wallet USDC balance (outside Raindex vaults)
     pub(crate) base_wallet_usdc: Option<Usdc>,
     /// Latest USDC balance in Alpaca's crypto wallet
-    pub(crate) alpaca_wallet_cash: Option<Usdc>,
+    pub(crate) alpaca_wallet_usdc: Option<Usdc>,
     /// Latest Base wallet unwrapped equity token balances
     pub(crate) base_wallet_unwrapped_equity: BTreeMap<Symbol, FractionalShares>,
     /// Latest Base wallet wrapped equity token balances
@@ -102,19 +102,19 @@ impl EventSourced for InventorySnapshot {
 
     const AGGREGATE_TYPE: &'static str = "InventorySnapshot";
     const PROJECTION: Nil = Nil;
-    const SCHEMA_VERSION: u64 = 2;
+    const SCHEMA_VERSION: u64 = 3;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         let mut snapshot = Self {
             onchain_equity: BTreeMap::new(),
-            onchain_cash: None,
+            onchain_usdc: None,
             offchain_equity: BTreeMap::new(),
-            offchain_cash_cents: None,
-            ethereum_cash: None,
+            offchain_usd_cents: None,
+            ethereum_usdc: None,
             base_wallet_usdc: None,
             inflight_mints: BTreeMap::new(),
             inflight_redemptions: BTreeMap::new(),
-            alpaca_wallet_cash: None,
+            alpaca_wallet_usdc: None,
             base_wallet_unwrapped_equity: BTreeMap::new(),
             base_wallet_wrapped_equity: BTreeMap::new(),
             last_updated: event.timestamp(),
@@ -140,7 +140,7 @@ impl EventSourced for InventorySnapshot {
                 balances,
                 fetched_at: now,
             },
-            OnchainCash { usdc_balance } => InventorySnapshotEvent::OnchainCash {
+            OnchainUsdc { usdc_balance } => InventorySnapshotEvent::OnchainUsdc {
                 usdc_balance,
                 fetched_at: now,
             },
@@ -148,15 +148,15 @@ impl EventSourced for InventorySnapshot {
                 positions,
                 fetched_at: now,
             },
-            OffchainCash { cash_balance_cents } => InventorySnapshotEvent::OffchainCash {
-                cash_balance_cents,
+            OffchainUsd { usd_balance_cents } => InventorySnapshotEvent::OffchainUsd {
+                usd_balance_cents,
                 fetched_at: now,
             },
-            EthereumCash { usdc_balance } => InventorySnapshotEvent::EthereumCash {
+            EthereumUsdc { usdc_balance } => InventorySnapshotEvent::EthereumUsdc {
                 usdc_balance,
                 fetched_at: now,
             },
-            BaseWalletCash { usdc_balance } => InventorySnapshotEvent::BaseWalletCash {
+            BaseWalletUsdc { usdc_balance } => InventorySnapshotEvent::BaseWalletUsdc {
                 usdc_balance,
                 fetched_at: now,
             },
@@ -165,7 +165,7 @@ impl EventSourced for InventorySnapshot {
                 redemptions,
                 fetched_at: now,
             },
-            AlpacaWalletCash { usdc_balance } => InventorySnapshotEvent::AlpacaWalletCash {
+            AlpacaWalletUsdc { usdc_balance } => InventorySnapshotEvent::AlpacaWalletUsdc {
                 usdc_balance,
                 fetched_at: now,
             },
@@ -197,7 +197,7 @@ impl EventSourced for InventorySnapshot {
                 balances,
                 fetched_at: now,
             }]),
-            OnchainCash { usdc_balance } => Ok(vec![InventorySnapshotEvent::OnchainCash {
+            OnchainUsdc { usdc_balance } => Ok(vec![InventorySnapshotEvent::OnchainUsdc {
                 usdc_balance,
                 fetched_at: now,
             }]),
@@ -205,24 +205,24 @@ impl EventSourced for InventorySnapshot {
                 positions,
                 fetched_at: now,
             }]),
-            OffchainCash { cash_balance_cents } => Ok(vec![InventorySnapshotEvent::OffchainCash {
-                cash_balance_cents,
+            OffchainUsd { usd_balance_cents } => Ok(vec![InventorySnapshotEvent::OffchainUsd {
+                usd_balance_cents,
                 fetched_at: now,
             }]),
-            EthereumCash { usdc_balance } => {
-                if self.ethereum_cash == Some(usdc_balance) {
+            EthereumUsdc { usdc_balance } => {
+                if self.ethereum_usdc == Some(usdc_balance) {
                     return Ok(vec![]);
                 }
-                Ok(vec![InventorySnapshotEvent::EthereumCash {
+                Ok(vec![InventorySnapshotEvent::EthereumUsdc {
                     usdc_balance,
                     fetched_at: now,
                 }])
             }
-            BaseWalletCash { usdc_balance } => {
+            BaseWalletUsdc { usdc_balance } => {
                 if self.base_wallet_usdc == Some(usdc_balance) {
                     return Ok(vec![]);
                 }
-                Ok(vec![InventorySnapshotEvent::BaseWalletCash {
+                Ok(vec![InventorySnapshotEvent::BaseWalletUsdc {
                     usdc_balance,
                     fetched_at: now,
                 }])
@@ -237,11 +237,11 @@ impl EventSourced for InventorySnapshot {
                     fetched_at: now,
                 }])
             }
-            AlpacaWalletCash { usdc_balance } => {
-                if self.alpaca_wallet_cash == Some(usdc_balance) {
+            AlpacaWalletUsdc { usdc_balance } => {
+                if self.alpaca_wallet_usdc == Some(usdc_balance) {
                     return Ok(vec![]);
                 }
-                Ok(vec![InventorySnapshotEvent::AlpacaWalletCash {
+                Ok(vec![InventorySnapshotEvent::AlpacaWalletUsdc {
                     usdc_balance,
                     fetched_at: now,
                 }])
@@ -276,21 +276,21 @@ impl InventorySnapshot {
             InventorySnapshotEvent::OnchainEquity { balances, .. } => {
                 self.onchain_equity = balances.clone();
             }
-            InventorySnapshotEvent::OnchainCash { usdc_balance, .. } => {
-                self.onchain_cash = Some(*usdc_balance);
+            InventorySnapshotEvent::OnchainUsdc { usdc_balance, .. } => {
+                self.onchain_usdc = Some(*usdc_balance);
             }
             InventorySnapshotEvent::OffchainEquity { positions, .. } => {
                 self.offchain_equity = positions.clone();
             }
-            InventorySnapshotEvent::OffchainCash {
-                cash_balance_cents, ..
+            InventorySnapshotEvent::OffchainUsd {
+                usd_balance_cents, ..
             } => {
-                self.offchain_cash_cents = Some(*cash_balance_cents);
+                self.offchain_usd_cents = Some(*usd_balance_cents);
             }
-            InventorySnapshotEvent::EthereumCash { usdc_balance, .. } => {
-                self.ethereum_cash = Some(*usdc_balance);
+            InventorySnapshotEvent::EthereumUsdc { usdc_balance, .. } => {
+                self.ethereum_usdc = Some(*usdc_balance);
             }
-            InventorySnapshotEvent::BaseWalletCash { usdc_balance, .. } => {
+            InventorySnapshotEvent::BaseWalletUsdc { usdc_balance, .. } => {
                 self.base_wallet_usdc = Some(*usdc_balance);
             }
             InventorySnapshotEvent::InflightEquity {
@@ -299,8 +299,8 @@ impl InventorySnapshot {
                 self.inflight_mints = mints.clone();
                 self.inflight_redemptions = redemptions.clone();
             }
-            InventorySnapshotEvent::AlpacaWalletCash { usdc_balance, .. } => {
-                self.alpaca_wallet_cash = Some(*usdc_balance);
+            InventorySnapshotEvent::AlpacaWalletUsdc { usdc_balance, .. } => {
+                self.alpaca_wallet_usdc = Some(*usdc_balance);
             }
             InventorySnapshotEvent::BaseWalletUnwrappedEquity { balances, .. } => {
                 self.base_wallet_unwrapped_equity = balances.clone();
@@ -317,22 +317,22 @@ pub(crate) enum InventorySnapshotCommand {
     OnchainEquity {
         balances: BTreeMap<Symbol, FractionalShares>,
     },
-    OnchainCash {
+    OnchainUsdc {
         usdc_balance: Usdc,
     },
     OffchainEquity {
         positions: BTreeMap<Symbol, FractionalShares>,
     },
-    OffchainCash {
-        cash_balance_cents: i64,
+    OffchainUsd {
+        usd_balance_cents: i64,
     },
-    EthereumCash {
+    EthereumUsdc {
         usdc_balance: Usdc,
     },
-    BaseWalletCash {
+    BaseWalletUsdc {
         usdc_balance: Usdc,
     },
-    AlpacaWalletCash {
+    AlpacaWalletUsdc {
         usdc_balance: Usdc,
     },
     BaseWalletUnwrappedEquity {
@@ -357,7 +357,8 @@ pub(crate) enum InventorySnapshotEvent {
         balances: BTreeMap<Symbol, FractionalShares>,
         fetched_at: DateTime<Utc>,
     },
-    OnchainCash {
+    #[serde(alias = "OnchainCash")]
+    OnchainUsdc {
         usdc_balance: Usdc,
         fetched_at: DateTime<Utc>,
     },
@@ -365,15 +366,19 @@ pub(crate) enum InventorySnapshotEvent {
         positions: BTreeMap<Symbol, FractionalShares>,
         fetched_at: DateTime<Utc>,
     },
-    OffchainCash {
-        cash_balance_cents: i64,
+    #[serde(alias = "OffchainCash")]
+    OffchainUsd {
+        #[serde(alias = "cash_balance_cents")]
+        usd_balance_cents: i64,
         fetched_at: DateTime<Utc>,
     },
-    EthereumCash {
+    #[serde(alias = "EthereumCash")]
+    EthereumUsdc {
         usdc_balance: Usdc,
         fetched_at: DateTime<Utc>,
     },
-    BaseWalletCash {
+    #[serde(alias = "BaseWalletCash")]
+    BaseWalletUsdc {
         usdc_balance: Usdc,
         fetched_at: DateTime<Utc>,
     },
@@ -384,7 +389,8 @@ pub(crate) enum InventorySnapshotEvent {
         redemptions: BTreeMap<Symbol, FractionalShares>,
         fetched_at: DateTime<Utc>,
     },
-    AlpacaWalletCash {
+    #[serde(alias = "AlpacaWalletCash")]
+    AlpacaWalletUsdc {
         usdc_balance: Usdc,
         fetched_at: DateTime<Utc>,
     },
@@ -402,12 +408,12 @@ impl InventorySnapshotEvent {
     pub(crate) fn timestamp(&self) -> DateTime<Utc> {
         match self {
             Self::OnchainEquity { fetched_at, .. }
-            | Self::OnchainCash { fetched_at, .. }
+            | Self::OnchainUsdc { fetched_at, .. }
             | Self::OffchainEquity { fetched_at, .. }
-            | Self::OffchainCash { fetched_at, .. }
-            | Self::EthereumCash { fetched_at, .. }
-            | Self::BaseWalletCash { fetched_at, .. }
-            | Self::AlpacaWalletCash { fetched_at, .. }
+            | Self::OffchainUsd { fetched_at, .. }
+            | Self::EthereumUsdc { fetched_at, .. }
+            | Self::BaseWalletUsdc { fetched_at, .. }
+            | Self::AlpacaWalletUsdc { fetched_at, .. }
             | Self::BaseWalletUnwrappedEquity { fetched_at, .. }
             | Self::BaseWalletWrappedEquity { fetched_at, .. }
             | Self::InflightEquity { fetched_at, .. } => *fetched_at,
@@ -419,12 +425,12 @@ impl DomainEvent for InventorySnapshotEvent {
     fn event_type(&self) -> String {
         match self {
             Self::OnchainEquity { .. } => "InventorySnapshotEvent::OnchainEquity".to_string(),
-            Self::OnchainCash { .. } => "InventorySnapshotEvent::OnchainCash".to_string(),
+            Self::OnchainUsdc { .. } => "InventorySnapshotEvent::OnchainUsdc".to_string(),
             Self::OffchainEquity { .. } => "InventorySnapshotEvent::OffchainEquity".to_string(),
-            Self::OffchainCash { .. } => "InventorySnapshotEvent::OffchainCash".to_string(),
-            Self::EthereumCash { .. } => "InventorySnapshotEvent::EthereumCash".to_string(),
-            Self::BaseWalletCash { .. } => "InventorySnapshotEvent::BaseWalletCash".to_string(),
-            Self::AlpacaWalletCash { .. } => "InventorySnapshotEvent::AlpacaWalletCash".to_string(),
+            Self::OffchainUsd { .. } => "InventorySnapshotEvent::OffchainUsd".to_string(),
+            Self::EthereumUsdc { .. } => "InventorySnapshotEvent::EthereumUsdc".to_string(),
+            Self::BaseWalletUsdc { .. } => "InventorySnapshotEvent::BaseWalletUsdc".to_string(),
+            Self::AlpacaWalletUsdc { .. } => "InventorySnapshotEvent::AlpacaWalletUsdc".to_string(),
             Self::BaseWalletUnwrappedEquity { .. } => {
                 "InventorySnapshotEvent::BaseWalletUnwrappedEquity".to_string()
             }
@@ -527,7 +533,7 @@ mod tests {
         balances.insert(test_symbol("AAPL"), test_shares(100));
 
         let events = TestHarness::<InventorySnapshot>::with(())
-            .given(vec![InventorySnapshotEvent::OnchainCash {
+            .given(vec![InventorySnapshotEvent::OnchainUsdc {
                 usdc_balance: Usdc::from_str("1000").unwrap(),
                 fetched_at: Utc::now(),
             }])
@@ -550,24 +556,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_onchain_cash_emits_event() {
+    async fn record_onchain_usdc_emits_event() {
         let usdc_balance = Usdc::from_str("10000.50").unwrap();
 
         let events = TestHarness::<InventorySnapshot>::with(())
             .given_no_previous_events()
-            .when(InventorySnapshotCommand::OnchainCash { usdc_balance })
+            .when(InventorySnapshotCommand::OnchainUsdc { usdc_balance })
             .await
             .events();
 
         assert_eq!(events.len(), 1);
         match &events[0] {
-            InventorySnapshotEvent::OnchainCash {
+            InventorySnapshotEvent::OnchainUsdc {
                 usdc_balance: event_balance,
                 ..
             } => {
                 assert_eq!(*event_balance, usdc_balance);
             }
-            _ => panic!("Expected OnchainCash event"),
+            _ => panic!("Expected OnchainUsdc event"),
         }
     }
 
@@ -597,24 +603,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_offchain_cash_emits_event() {
-        let cash_balance_cents = 50_000_000; // $500,000.00
+    async fn record_offchain_usd_emits_event() {
+        let usd_balance_cents = 50_000_000; // $500,000.00
 
         let events = TestHarness::<InventorySnapshot>::with(())
             .given_no_previous_events()
-            .when(InventorySnapshotCommand::OffchainCash { cash_balance_cents })
+            .when(InventorySnapshotCommand::OffchainUsd { usd_balance_cents })
             .await
             .events();
 
         assert_eq!(events.len(), 1);
         match &events[0] {
-            InventorySnapshotEvent::OffchainCash {
-                cash_balance_cents: event_cents,
+            InventorySnapshotEvent::OffchainUsd {
+                usd_balance_cents: event_cents,
                 ..
             } => {
-                assert_eq!(*event_cents, cash_balance_cents);
+                assert_eq!(*event_cents, usd_balance_cents);
             }
-            _ => panic!("Expected OffchainCash event"),
+            _ => panic!("Expected OffchainUsd event"),
         }
     }
 
@@ -630,7 +636,7 @@ mod tests {
                 balances: balances.clone(),
                 fetched_at: Utc::now(),
             },
-            InventorySnapshotEvent::OnchainCash {
+            InventorySnapshotEvent::OnchainUsdc {
                 usdc_balance: usdc,
                 fetched_at: Utc::now(),
             },
@@ -639,7 +645,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(snapshot.onchain_equity, balances);
-        assert_eq!(snapshot.onchain_cash, Some(usdc));
+        assert_eq!(snapshot.onchain_usdc, Some(usdc));
     }
 
     #[test]
@@ -668,62 +674,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ethereum_cash_command_initializes_aggregate() {
+    async fn ethereum_usdc_command_initializes_aggregate() {
         let usdc_balance = Usdc::from_str("5000.50").unwrap();
 
         let events = TestHarness::<InventorySnapshot>::with(())
             .given_no_previous_events()
-            .when(InventorySnapshotCommand::EthereumCash { usdc_balance })
+            .when(InventorySnapshotCommand::EthereumUsdc { usdc_balance })
             .await
             .events();
 
         assert_eq!(events.len(), 1);
         match &events[0] {
-            InventorySnapshotEvent::EthereumCash {
+            InventorySnapshotEvent::EthereumUsdc {
                 usdc_balance: event_balance,
                 ..
             } => {
                 assert_eq!(*event_balance, usdc_balance);
             }
-            _ => panic!("Expected EthereumCash event"),
+            _ => panic!("Expected EthereumUsdc event"),
         }
     }
 
     #[tokio::test]
-    async fn ethereum_cash_command_emits_event_on_existing_aggregate() {
+    async fn ethereum_usdc_command_emits_event_on_existing_aggregate() {
         let usdc_balance = Usdc::from_str("2500").unwrap();
 
         let events = TestHarness::<InventorySnapshot>::with(())
-            .given(vec![InventorySnapshotEvent::OnchainCash {
+            .given(vec![InventorySnapshotEvent::OnchainUsdc {
                 usdc_balance: Usdc::from_str("1000").unwrap(),
                 fetched_at: Utc::now(),
             }])
-            .when(InventorySnapshotCommand::EthereumCash { usdc_balance })
+            .when(InventorySnapshotCommand::EthereumUsdc { usdc_balance })
             .await
             .events();
 
         assert_eq!(events.len(), 1);
         match &events[0] {
-            InventorySnapshotEvent::EthereumCash {
+            InventorySnapshotEvent::EthereumUsdc {
                 usdc_balance: event_balance,
                 ..
             } => {
                 assert_eq!(*event_balance, usdc_balance);
             }
-            _ => panic!("Expected EthereumCash event"),
+            _ => panic!("Expected EthereumUsdc event"),
         }
     }
 
     #[tokio::test]
-    async fn ethereum_cash_command_skips_event_when_unchanged() {
+    async fn ethereum_usdc_command_skips_event_when_unchanged() {
         let usdc_balance = Usdc::from_str("5000").unwrap();
 
         let events = TestHarness::<InventorySnapshot>::with(())
-            .given(vec![InventorySnapshotEvent::EthereumCash {
+            .given(vec![InventorySnapshotEvent::EthereumUsdc {
                 usdc_balance,
                 fetched_at: Utc::now(),
             }])
-            .when(InventorySnapshotCommand::EthereumCash { usdc_balance })
+            .when(InventorySnapshotCommand::EthereumUsdc { usdc_balance })
             .await
             .events();
 
@@ -734,77 +740,77 @@ mod tests {
     }
 
     #[test]
-    fn apply_event_updates_ethereum_cash() {
+    fn apply_event_updates_ethereum_usdc() {
         let usdc = Usdc::from_str("7500").unwrap();
 
-        let snapshot = replay::<InventorySnapshot>(vec![InventorySnapshotEvent::EthereumCash {
+        let snapshot = replay::<InventorySnapshot>(vec![InventorySnapshotEvent::EthereumUsdc {
             usdc_balance: usdc,
             fetched_at: Utc::now(),
         }])
         .unwrap()
         .unwrap();
 
-        assert_eq!(snapshot.ethereum_cash, Some(usdc));
+        assert_eq!(snapshot.ethereum_usdc, Some(usdc));
     }
 
     #[tokio::test]
-    async fn base_wallet_cash_initializes_on_first_command() {
+    async fn base_wallet_usdc_initializes_on_first_command() {
         let usdc_balance = Usdc::from_str("500").unwrap();
 
         let events = TestHarness::<InventorySnapshot>::with(())
             .given_no_previous_events()
-            .when(InventorySnapshotCommand::BaseWalletCash { usdc_balance })
+            .when(InventorySnapshotCommand::BaseWalletUsdc { usdc_balance })
             .await
             .events();
 
         assert_eq!(events.len(), 1);
-        let InventorySnapshotEvent::BaseWalletCash {
+        let InventorySnapshotEvent::BaseWalletUsdc {
             usdc_balance: event_balance,
             ..
         } = &events[0]
         else {
-            panic!("Expected BaseWalletCash event, got {:?}", events[0]);
+            panic!("Expected BaseWalletUsdc event, got {:?}", events[0]);
         };
         assert_eq!(*event_balance, usdc_balance);
     }
 
     #[tokio::test]
-    async fn base_wallet_cash_emits_on_change() {
+    async fn base_wallet_usdc_emits_on_change() {
         let old_balance = Usdc::from_str("500").unwrap();
         let new_balance = Usdc::from_str("750").unwrap();
 
         let events = TestHarness::<InventorySnapshot>::with(())
-            .given(vec![InventorySnapshotEvent::BaseWalletCash {
+            .given(vec![InventorySnapshotEvent::BaseWalletUsdc {
                 usdc_balance: old_balance,
                 fetched_at: Utc::now(),
             }])
-            .when(InventorySnapshotCommand::BaseWalletCash {
+            .when(InventorySnapshotCommand::BaseWalletUsdc {
                 usdc_balance: new_balance,
             })
             .await
             .events();
 
         assert_eq!(events.len(), 1);
-        let InventorySnapshotEvent::BaseWalletCash {
+        let InventorySnapshotEvent::BaseWalletUsdc {
             usdc_balance: event_balance,
             ..
         } = &events[0]
         else {
-            panic!("Expected BaseWalletCash event, got {:?}", events[0]);
+            panic!("Expected BaseWalletUsdc event, got {:?}", events[0]);
         };
         assert_eq!(*event_balance, new_balance);
     }
 
     #[tokio::test]
-    async fn base_wallet_cash_skips_when_unchanged() {
+    async fn base_wallet_usdc_skips_when_unchanged() {
         let balance = Usdc::from_str("500").unwrap();
 
         let events = TestHarness::<InventorySnapshot>::with(())
-            .given(vec![InventorySnapshotEvent::BaseWalletCash {
+            .given(vec![InventorySnapshotEvent::BaseWalletUsdc {
                 usdc_balance: balance,
                 fetched_at: Utc::now(),
             }])
-            .when(InventorySnapshotCommand::BaseWalletCash {
+            .when(InventorySnapshotCommand::BaseWalletUsdc {
                 usdc_balance: balance,
             })
             .await
@@ -817,7 +823,7 @@ mod tests {
     fn apply_event_updates_base_wallet_usdc() {
         let usdc = Usdc::from_str("1234.56").unwrap();
 
-        let snapshot = replay::<InventorySnapshot>(vec![InventorySnapshotEvent::BaseWalletCash {
+        let snapshot = replay::<InventorySnapshot>(vec![InventorySnapshotEvent::BaseWalletUsdc {
             usdc_balance: usdc,
             fetched_at: Utc::now(),
         }])
@@ -828,63 +834,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn alpaca_wallet_cash_initializes_on_first_command() {
+    async fn alpaca_wallet_usdc_initializes_on_first_command() {
         let usdc_balance = Usdc::from_str("750").unwrap();
 
         let events = TestHarness::<InventorySnapshot>::with(())
             .given_no_previous_events()
-            .when(InventorySnapshotCommand::AlpacaWalletCash { usdc_balance })
+            .when(InventorySnapshotCommand::AlpacaWalletUsdc { usdc_balance })
             .await
             .events();
 
         assert_eq!(events.len(), 1);
-        let InventorySnapshotEvent::AlpacaWalletCash {
+        let InventorySnapshotEvent::AlpacaWalletUsdc {
             usdc_balance: event_balance,
             ..
         } = &events[0]
         else {
-            panic!("Expected AlpacaWalletCash event, got {:?}", events[0]);
+            panic!("Expected AlpacaWalletUsdc event, got {:?}", events[0]);
         };
         assert_eq!(*event_balance, usdc_balance);
     }
 
     #[tokio::test]
-    async fn alpaca_wallet_cash_emits_on_change() {
+    async fn alpaca_wallet_usdc_emits_on_change() {
         let old_balance = Usdc::from_str("750").unwrap();
         let new_balance = Usdc::from_str("0").unwrap();
 
         let events = TestHarness::<InventorySnapshot>::with(())
-            .given(vec![InventorySnapshotEvent::AlpacaWalletCash {
+            .given(vec![InventorySnapshotEvent::AlpacaWalletUsdc {
                 usdc_balance: old_balance,
                 fetched_at: Utc::now(),
             }])
-            .when(InventorySnapshotCommand::AlpacaWalletCash {
+            .when(InventorySnapshotCommand::AlpacaWalletUsdc {
                 usdc_balance: new_balance,
             })
             .await
             .events();
 
         assert_eq!(events.len(), 1);
-        let InventorySnapshotEvent::AlpacaWalletCash {
+        let InventorySnapshotEvent::AlpacaWalletUsdc {
             usdc_balance: event_balance,
             ..
         } = &events[0]
         else {
-            panic!("Expected AlpacaWalletCash event, got {:?}", events[0]);
+            panic!("Expected AlpacaWalletUsdc event, got {:?}", events[0]);
         };
         assert_eq!(*event_balance, new_balance);
     }
 
     #[tokio::test]
-    async fn alpaca_wallet_cash_skips_when_unchanged() {
+    async fn alpaca_wallet_usdc_skips_when_unchanged() {
         let balance = Usdc::from_str("750").unwrap();
 
         let events = TestHarness::<InventorySnapshot>::with(())
-            .given(vec![InventorySnapshotEvent::AlpacaWalletCash {
+            .given(vec![InventorySnapshotEvent::AlpacaWalletUsdc {
                 usdc_balance: balance,
                 fetched_at: Utc::now(),
             }])
-            .when(InventorySnapshotCommand::AlpacaWalletCash {
+            .when(InventorySnapshotCommand::AlpacaWalletUsdc {
                 usdc_balance: balance,
             })
             .await
@@ -894,18 +900,18 @@ mod tests {
     }
 
     #[test]
-    fn apply_event_updates_alpaca_wallet_cash() {
+    fn apply_event_updates_alpaca_wallet_usdc() {
         let usdc = Usdc::from_str("987.65").unwrap();
 
         let snapshot =
-            replay::<InventorySnapshot>(vec![InventorySnapshotEvent::AlpacaWalletCash {
+            replay::<InventorySnapshot>(vec![InventorySnapshotEvent::AlpacaWalletUsdc {
                 usdc_balance: usdc,
                 fetched_at: Utc::now(),
             }])
             .unwrap()
             .unwrap();
 
-        assert_eq!(snapshot.alpaca_wallet_cash, Some(usdc));
+        assert_eq!(snapshot.alpaca_wallet_usdc, Some(usdc));
     }
 
     #[tokio::test]
@@ -1308,7 +1314,7 @@ mod tests {
         let before = Utc::now();
 
         let events = TestHarness::<InventorySnapshot>::with(())
-            .given(vec![InventorySnapshotEvent::OnchainCash {
+            .given(vec![InventorySnapshotEvent::OnchainUsdc {
                 usdc_balance: Usdc::from_str("1000").unwrap(),
                 fetched_at: Utc::now(),
             }])

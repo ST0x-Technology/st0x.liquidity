@@ -156,7 +156,7 @@ where
         };
 
         self.poll_onchain_equity(snapshot_id, &registry).await?;
-        self.poll_onchain_cash(snapshot_id, &registry).await?;
+        self.poll_onchain_usdc(snapshot_id, &registry).await?;
 
         Ok(())
     }
@@ -221,7 +221,7 @@ where
         Ok(())
     }
 
-    async fn poll_onchain_cash(
+    async fn poll_onchain_usdc(
         &self,
         snapshot_id: &InventorySnapshotId,
         registry: &VaultRegistry,
@@ -242,7 +242,7 @@ where
         self.snapshot
             .send(
                 snapshot_id,
-                InventorySnapshotCommand::OnchainCash { usdc_balance },
+                InventorySnapshotCommand::OnchainUsdc { usdc_balance },
             )
             .await?;
 
@@ -258,10 +258,10 @@ where
             return Ok(());
         };
 
-        self.poll_ethereum_cash(snapshot_id, &wallets.ethereum)
+        self.poll_ethereum_usdc(snapshot_id, &wallets.ethereum)
             .await?;
 
-        self.poll_base_wallet_cash(snapshot_id, &wallets.base)
+        self.poll_base_wallet_usdc(snapshot_id, &wallets.base)
             .await?;
 
         let balances = self
@@ -298,14 +298,14 @@ where
         self.snapshot
             .send(
                 snapshot_id,
-                InventorySnapshotCommand::AlpacaWalletCash { usdc_balance },
+                InventorySnapshotCommand::AlpacaWalletUsdc { usdc_balance },
             )
             .await?;
 
         Ok(())
     }
 
-    async fn poll_ethereum_cash(
+    async fn poll_ethereum_usdc(
         &self,
         snapshot_id: &InventorySnapshotId,
         wallet: &Arc<dyn Wallet<Provider = RootProvider>>,
@@ -324,14 +324,14 @@ where
         self.snapshot
             .send(
                 snapshot_id,
-                InventorySnapshotCommand::EthereumCash { usdc_balance },
+                InventorySnapshotCommand::EthereumUsdc { usdc_balance },
             )
             .await?;
 
         Ok(())
     }
 
-    async fn poll_base_wallet_cash(
+    async fn poll_base_wallet_usdc(
         &self,
         snapshot_id: &InventorySnapshotId,
         wallet: &Arc<dyn Wallet<Provider = RootProvider>>,
@@ -350,7 +350,7 @@ where
         self.snapshot
             .send(
                 snapshot_id,
-                InventorySnapshotCommand::BaseWalletCash { usdc_balance },
+                InventorySnapshotCommand::BaseWalletUsdc { usdc_balance },
             )
             .await?;
 
@@ -412,8 +412,8 @@ where
         self.snapshot
             .send(
                 snapshot_id,
-                InventorySnapshotCommand::OffchainCash {
-                    cash_balance_cents: inventory.cash_balance_cents,
+                InventorySnapshotCommand::OffchainUsd {
+                    usd_balance_cents: inventory.usd_balance_cents,
                 },
             )
             .await?;
@@ -717,7 +717,7 @@ mod tests {
                     market_value: Some(float!(20000)),
                 },
             ],
-            cash_balance_cents: 10_000_000,
+            usd_balance_cents: 10_000_000,
         };
         let executor = MockExecutor::new().with_inventory(inventory.clone());
 
@@ -757,7 +757,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_and_record_emits_offchain_cash_command_with_executor_cash_balance() {
+    async fn poll_and_record_emits_offchain_usd_command_with_executor_usd_balance() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
         let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
@@ -765,7 +765,7 @@ mod tests {
 
         let inventory = Inventory {
             positions: vec![],
-            cash_balance_cents: 25_000_000, // $250,000.00
+            usd_balance_cents: 25_000_000, // $250,000.00
         };
         let executor = MockExecutor::new().with_inventory(inventory);
 
@@ -783,19 +783,19 @@ mod tests {
         service.poll_and_record().await.unwrap();
 
         let events = load_snapshot_events(&pool, orderbook, order_owner).await;
-        let offchain_cash_event = events
+        let offchain_usd_event = events
             .iter()
-            .find(|event| matches!(event, InventorySnapshotEvent::OffchainCash { .. }))
-            .expect("Expected OffchainCash event to be emitted");
+            .find(|event| matches!(event, InventorySnapshotEvent::OffchainUsd { .. }))
+            .expect("Expected OffchainUsd event to be emitted");
 
-        let InventorySnapshotEvent::OffchainCash {
-            cash_balance_cents, ..
-        } = offchain_cash_event
+        let InventorySnapshotEvent::OffchainUsd {
+            usd_balance_cents, ..
+        } = offchain_usd_event
         else {
-            panic!("Expected OffchainCash event, got {offchain_cash_event:?}");
+            panic!("Expected OffchainUsd event, got {offchain_usd_event:?}");
         };
         assert_eq!(
-            *cash_balance_cents, 25_000_000,
+            *usd_balance_cents, 25_000_000,
             "Cash balance mismatch: expected $250,000.00"
         );
     }
@@ -809,7 +809,7 @@ mod tests {
 
         let inventory = Inventory {
             positions: vec![],
-            cash_balance_cents: 5_000_000,
+            usd_balance_cents: 5_000_000,
         };
         let executor = MockExecutor::new().with_inventory(inventory);
 
@@ -867,17 +867,17 @@ mod tests {
         let has_offchain_equity = events
             .iter()
             .any(|event| matches!(event, InventorySnapshotEvent::OffchainEquity { .. }));
-        let has_offchain_cash = events
+        let has_offchain_usd = events
             .iter()
-            .any(|event| matches!(event, InventorySnapshotEvent::OffchainCash { .. }));
+            .any(|event| matches!(event, InventorySnapshotEvent::OffchainUsd { .. }));
 
         assert!(
             !has_offchain_equity,
             "Should NOT emit OffchainEquity when executor returns Unimplemented"
         );
         assert!(
-            !has_offchain_cash,
-            "Should NOT emit OffchainCash when executor returns Unimplemented"
+            !has_offchain_usd,
+            "Should NOT emit OffchainUsd when executor returns Unimplemented"
         );
         assert!(
             logs_contain(
@@ -888,7 +888,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_and_record_handles_negative_cash_balance() {
+    async fn poll_and_record_handles_negative_usd_balance() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
         let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
@@ -901,7 +901,7 @@ mod tests {
                 quantity: test_shares(1000),
                 market_value: Some(float!(150000)),
             }],
-            cash_balance_cents: -5_000_000, // -$50,000 (margin debt)
+            usd_balance_cents: -5_000_000, // -$50,000 (margin debt)
         };
         let executor = MockExecutor::new().with_inventory(inventory);
 
@@ -919,19 +919,19 @@ mod tests {
         service.poll_and_record().await.unwrap();
 
         let events = load_snapshot_events(&pool, orderbook, order_owner).await;
-        let offchain_cash_event = events
+        let offchain_usd_event = events
             .iter()
-            .find(|event| matches!(event, InventorySnapshotEvent::OffchainCash { .. }))
-            .expect("Expected OffchainCash event");
+            .find(|event| matches!(event, InventorySnapshotEvent::OffchainUsd { .. }))
+            .expect("Expected OffchainUsd event");
 
-        let InventorySnapshotEvent::OffchainCash {
-            cash_balance_cents, ..
-        } = offchain_cash_event
+        let InventorySnapshotEvent::OffchainUsd {
+            usd_balance_cents, ..
+        } = offchain_usd_event
         else {
-            panic!("Expected OffchainCash event, got {offchain_cash_event:?}");
+            panic!("Expected OffchainUsd event, got {offchain_usd_event:?}");
         };
         assert_eq!(
-            *cash_balance_cents, -5_000_000,
+            *usd_balance_cents, -5_000_000,
             "Should preserve negative cash balance"
         );
     }
@@ -950,7 +950,7 @@ mod tests {
                 quantity: fractional_qty,
                 market_value: Some(float!(1851.75)),
             }],
-            cash_balance_cents: 1_000_000,
+            usd_balance_cents: 1_000_000,
         };
         let executor = MockExecutor::new().with_inventory(inventory);
 
@@ -993,7 +993,7 @@ mod tests {
 
         let inventory = Inventory {
             positions: vec![],
-            cash_balance_cents: 10_000,
+            usd_balance_cents: 10_000,
         };
         let executor = MockExecutor::new().with_inventory(inventory);
 
@@ -1108,17 +1108,17 @@ mod tests {
         let has_onchain_equity = events
             .iter()
             .any(|event| matches!(event, InventorySnapshotEvent::OnchainEquity { .. }));
-        let has_onchain_cash = events
+        let has_onchain_usdc = events
             .iter()
-            .any(|event| matches!(event, InventorySnapshotEvent::OnchainCash { .. }));
+            .any(|event| matches!(event, InventorySnapshotEvent::OnchainUsdc { .. }));
 
         assert!(
             !has_onchain_equity,
             "Should NOT emit OnchainEquity when VaultRegistry not initialized"
         );
         assert!(
-            !has_onchain_cash,
-            "Should NOT emit OnchainCash when VaultRegistry not initialized"
+            !has_onchain_usdc,
+            "Should NOT emit OnchainUsdc when VaultRegistry not initialized"
         );
         assert!(
             logs_contain("Vault registry not initialized, skipping onchain polling"),
@@ -1171,7 +1171,7 @@ mod tests {
 
     #[tracing_test::traced_test]
     #[tokio::test]
-    async fn poll_and_record_skips_onchain_cash_when_no_usdc_vault_discovered() {
+    async fn poll_and_record_skips_onchain_usdc_when_no_usdc_vault_discovered() {
         let pool = setup_test_db().await;
         let (orderbook, order_owner) = test_addresses();
 
@@ -1206,13 +1206,13 @@ mod tests {
         service.poll_and_record().await.unwrap();
 
         let events = load_snapshot_events(&pool, orderbook, order_owner).await;
-        let has_onchain_cash = events
+        let has_onchain_usdc = events
             .iter()
-            .any(|event| matches!(event, InventorySnapshotEvent::OnchainCash { .. }));
+            .any(|event| matches!(event, InventorySnapshotEvent::OnchainUsdc { .. }));
 
         assert!(
-            !has_onchain_cash,
-            "Should NOT emit OnchainCash when no USDC vault discovered"
+            !has_onchain_usdc,
+            "Should NOT emit OnchainUsdc when no USDC vault discovered"
         );
         assert!(
             logs_contain("No USDC vault discovered, skipping onchain cash polling"),
@@ -1335,7 +1335,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_and_record_emits_ethereum_cash_when_wallet_provided() {
+    async fn poll_and_record_emits_ethereum_usdc_when_wallet_provided() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
         let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
@@ -1367,20 +1367,20 @@ mod tests {
         service.poll_and_record().await.unwrap();
 
         let events = load_snapshot_events(&pool, orderbook, order_owner).await;
-        let ethereum_cash_event = events
+        let ethereum_usdc_event = events
             .iter()
-            .find(|event| matches!(event, InventorySnapshotEvent::EthereumCash { .. }))
-            .expect("Expected EthereumCash event to be emitted");
+            .find(|event| matches!(event, InventorySnapshotEvent::EthereumUsdc { .. }))
+            .expect("Expected EthereumUsdc event to be emitted");
 
-        let InventorySnapshotEvent::EthereumCash { usdc_balance, .. } = ethereum_cash_event else {
-            panic!("Expected EthereumCash event, got {ethereum_cash_event:?}");
+        let InventorySnapshotEvent::EthereumUsdc { usdc_balance, .. } = ethereum_usdc_event else {
+            panic!("Expected EthereumUsdc event, got {ethereum_usdc_event:?}");
         };
         let expected = u256_to_usdc(raw_usdc).unwrap();
         assert_eq!(*usdc_balance, expected, "USDC balance mismatch");
     }
 
     #[tokio::test]
-    async fn poll_and_record_emits_base_wallet_cash_when_wallet_provided() {
+    async fn poll_and_record_emits_base_wallet_usdc_when_wallet_provided() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
         let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
@@ -1412,21 +1412,21 @@ mod tests {
         service.poll_and_record().await.unwrap();
 
         let events = load_snapshot_events(&pool, orderbook, order_owner).await;
-        let base_wallet_cash_event = events
+        let base_wallet_usdc_event = events
             .iter()
-            .find(|event| matches!(event, InventorySnapshotEvent::BaseWalletCash { .. }))
-            .expect("Expected BaseWalletCash event to be emitted");
+            .find(|event| matches!(event, InventorySnapshotEvent::BaseWalletUsdc { .. }))
+            .expect("Expected BaseWalletUsdc event to be emitted");
 
-        let InventorySnapshotEvent::BaseWalletCash { usdc_balance, .. } = base_wallet_cash_event
+        let InventorySnapshotEvent::BaseWalletUsdc { usdc_balance, .. } = base_wallet_usdc_event
         else {
-            panic!("Expected BaseWalletCash event, got {base_wallet_cash_event:?}");
+            panic!("Expected BaseWalletUsdc event, got {base_wallet_usdc_event:?}");
         };
         let expected = u256_to_usdc(raw_usdc).unwrap();
         assert_eq!(*usdc_balance, expected, "USDC balance mismatch");
     }
 
     #[tokio::test]
-    async fn poll_and_record_emits_alpaca_wallet_cash_when_wallet_provided() {
+    async fn poll_and_record_emits_alpaca_wallet_usdc_when_wallet_provided() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
         let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
@@ -1465,15 +1465,15 @@ mod tests {
         service.poll_and_record().await.unwrap();
 
         let events = load_snapshot_events(&pool, orderbook, order_owner).await;
-        let alpaca_wallet_cash_event = events
+        let alpaca_wallet_usdc_event = events
             .iter()
-            .find(|event| matches!(event, InventorySnapshotEvent::AlpacaWalletCash { .. }))
-            .expect("Expected AlpacaWalletCash event to be emitted");
+            .find(|event| matches!(event, InventorySnapshotEvent::AlpacaWalletUsdc { .. }))
+            .expect("Expected AlpacaWalletUsdc event to be emitted");
 
-        let InventorySnapshotEvent::AlpacaWalletCash { usdc_balance, .. } =
-            alpaca_wallet_cash_event
+        let InventorySnapshotEvent::AlpacaWalletUsdc { usdc_balance, .. } =
+            alpaca_wallet_usdc_event
         else {
-            panic!("Expected AlpacaWalletCash event, got {alpaca_wallet_cash_event:?}");
+            panic!("Expected AlpacaWalletUsdc event, got {alpaca_wallet_usdc_event:?}");
         };
         assert!(usdc_balance.inner().eq(float!(1250.75)).unwrap());
         wallets_mock.assert();
@@ -1481,7 +1481,7 @@ mod tests {
 
     #[tracing_test::traced_test]
     #[tokio::test]
-    async fn poll_and_record_skips_alpaca_wallet_cash_when_no_wallet() {
+    async fn poll_and_record_skips_alpaca_wallet_usdc_when_no_wallet() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
         let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
@@ -1501,13 +1501,13 @@ mod tests {
         service.poll_and_record().await.unwrap();
 
         let events = load_snapshot_events(&pool, orderbook, order_owner).await;
-        let has_alpaca_wallet_cash = events
+        let has_alpaca_wallet_usdc = events
             .iter()
-            .any(|event| matches!(event, InventorySnapshotEvent::AlpacaWalletCash { .. }));
+            .any(|event| matches!(event, InventorySnapshotEvent::AlpacaWalletUsdc { .. }));
 
         assert!(
-            !has_alpaca_wallet_cash,
-            "Should NOT emit AlpacaWalletCash when no Alpaca wallet configured"
+            !has_alpaca_wallet_usdc,
+            "Should NOT emit AlpacaWalletUsdc when no Alpaca wallet configured"
         );
         assert!(logs_contain(
             "No wallet polling configured, skipping wallet balance polling"
@@ -1555,7 +1555,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_and_record_skips_unchanged_alpaca_wallet_cash_snapshot() {
+    async fn poll_and_record_skips_unchanged_alpaca_wallet_usdc_snapshot() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
         let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
@@ -1595,21 +1595,21 @@ mod tests {
         service.poll_and_record().await.unwrap();
 
         let events = load_snapshot_events(&pool, orderbook, order_owner).await;
-        let alpaca_wallet_cash_event_count = events
+        let alpaca_wallet_usdc_event_count = events
             .iter()
-            .filter(|event| matches!(event, InventorySnapshotEvent::AlpacaWalletCash { .. }))
+            .filter(|event| matches!(event, InventorySnapshotEvent::AlpacaWalletUsdc { .. }))
             .count();
 
         assert_eq!(
-            alpaca_wallet_cash_event_count, 1,
-            "Should not emit a second AlpacaWalletCash event when the balance is unchanged"
+            alpaca_wallet_usdc_event_count, 1,
+            "Should not emit a second AlpacaWalletUsdc event when the balance is unchanged"
         );
         wallets_mock.assert_calls(2);
     }
 
     #[tracing_test::traced_test]
     #[tokio::test]
-    async fn poll_and_record_skips_ethereum_cash_when_no_wallet() {
+    async fn poll_and_record_skips_ethereum_usdc_when_no_wallet() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
         let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
@@ -1631,13 +1631,13 @@ mod tests {
         service.poll_and_record().await.unwrap();
 
         let events = load_snapshot_events(&pool, orderbook, order_owner).await;
-        let has_ethereum_cash = events
+        let has_ethereum_usdc = events
             .iter()
-            .any(|event| matches!(event, InventorySnapshotEvent::EthereumCash { .. }));
+            .any(|event| matches!(event, InventorySnapshotEvent::EthereumUsdc { .. }));
 
         assert!(
-            !has_ethereum_cash,
-            "Should NOT emit EthereumCash when no Ethereum wallet configured"
+            !has_ethereum_usdc,
+            "Should NOT emit EthereumUsdc when no Ethereum wallet configured"
         );
         assert!(
             logs_contain("No wallet polling configured, skipping wallet balance polling"),
@@ -1647,7 +1647,7 @@ mod tests {
 
     #[tracing_test::traced_test]
     #[tokio::test]
-    async fn poll_and_record_skips_base_wallet_cash_when_no_wallet() {
+    async fn poll_and_record_skips_base_wallet_usdc_when_no_wallet() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
         let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
@@ -1669,13 +1669,13 @@ mod tests {
         service.poll_and_record().await.unwrap();
 
         let events = load_snapshot_events(&pool, orderbook, order_owner).await;
-        let has_base_wallet_cash = events
+        let has_base_wallet_usdc = events
             .iter()
-            .any(|event| matches!(event, InventorySnapshotEvent::BaseWalletCash { .. }));
+            .any(|event| matches!(event, InventorySnapshotEvent::BaseWalletUsdc { .. }));
 
         assert!(
-            !has_base_wallet_cash,
-            "Should NOT emit BaseWalletCash when no Base wallet configured"
+            !has_base_wallet_usdc,
+            "Should NOT emit BaseWalletUsdc when no Base wallet configured"
         );
         assert!(
             logs_contain("No wallet polling configured, skipping wallet balance polling"),

@@ -347,7 +347,7 @@ pub struct EquityPosition {
 #[derive(Debug, Clone)]
 pub struct Inventory {
     pub positions: Vec<EquityPosition>,
-    pub cash_balance_cents: i64,
+    pub usd_balance_cents: i64,
 }
 
 /// Result of fetching inventory from an executor.

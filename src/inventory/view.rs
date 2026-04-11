@@ -27,8 +27,8 @@ pub(crate) enum InventoryViewError {
     Equity(#[from] InventoryError<FractionalShares>),
     #[error(transparent)]
     Usdc(#[from] InventoryError<Usdc>),
-    #[error("failed to convert cash balance cents {0} to USDC")]
-    CashBalanceConversion(i64),
+    #[error("failed to convert USD balance cents {0} to USDC")]
+    UsdBalanceConversion(i64),
 }
 
 /// Why an equity imbalance check failed.
