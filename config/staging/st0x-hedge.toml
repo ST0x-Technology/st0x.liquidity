@@ -21,7 +21,6 @@ rebalancing = "disabled"
 trading = "enabled"
 rebalancing = "disabled"
 # operational_limit = 1
-
 vault_id = "0xfab"
 tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
 tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"

@@ -167,11 +167,11 @@ let
 
       "${env}Status" = pkgs.writeShellApplication {
         name = "${env}-status";
-        runtimeInputs = sshBuildInputs ++ [ pkgs.openssh pkgs.curl pkgs.jq ];
+        runtimeInputs = sshBuildInputs ++ [ pkgs.openssh pkgs.nushell ];
         text = ''
           ${resolveHost}
           export identity host_ip
-          exec bash scripts/status.sh "${env}" "$@"
+          exec nu scripts/status.nu "${env}" "$@"
         '';
       };
 
@@ -210,11 +210,12 @@ let
 
       "${env}Dashboard" = pkgs.writeShellApplication {
         name = "${env}-dashboard";
-        runtimeInputs = sshBuildInputs ++ [ pkgs.openssh pkgs.bun ];
+        runtimeInputs = sshBuildInputs
+          ++ [ pkgs.openssh pkgs.nushell pkgs.bun ];
         text = ''
           ${resolveHost}
           export identity host_ip
-          exec bash scripts/dashboard.sh "${env}" "$@"
+          exec nu scripts/dashboard.nu "${env}" "$@"
         '';
       };
     };
