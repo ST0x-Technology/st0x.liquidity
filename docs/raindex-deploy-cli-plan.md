@@ -14,7 +14,7 @@ raindex strategy-builder \
   --select-token input=0x... --select-token output=0x... \
   --set-field max-spread=0.002 --set-deposit output=0.5 \
   --owner 0xA9C16673... \
-| cli submit --to 0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D
+| cli submit
 ```
 
 No on-disk state between runs. The chain is the record of truth.
@@ -81,25 +81,23 @@ transaction unless `--yes`.
 Before submitting, `cli submit` prints a summary:
 
 ```
-Chain:    base (8453)
-Signer:   0xA9C16673F65AE808688cB18952AFE3d9658C808f  (turnkey)
+Signer: 0xA9C16673F65AE808688cB18952AFE3d9658C808f
 
 Tx 1/3
-  to:     0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
-  data:   0x095ea7b3... (68 bytes)
-  gas:    ~46,300
+  to:   0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
+  data: 68 bytes
 
 Tx 2/3
-  to:     0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D
-  data:   0x... (1,240 bytes)
-  gas:    ~380,000
+  to:   0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D
+  data: 1240 bytes
 
-Submit all 3 transactions? [y/N]
+Submit 3 transactions? [y/N]
 ```
 
-The review is intentionally minimal — `cli submit` is a generic submitter and
-does not decode Rain-specific calldata. Decoding (approve, addOrder2, etc.)
-belongs in `raindex-calldata --verbose` if we want it later.
+The review is intentionally minimal — signer address, target, and data size per
+transaction. `cli submit` is a generic submitter and does not decode calldata or
+estimate gas. A single batch confirmation covers all transactions (not per-tx
+prompts).
 
 ## Why two binaries
 
@@ -154,7 +152,7 @@ The pipe architecture cleanly separates the two dependency graphs.
 
 ```
 src/cli/submit.rs     # clap subcommand: parse --to/--data or stdin,
-                      #   review block, per-tx prompt, base_wallet().send loop
+                      #   review block, batch prompt, base_wallet().send loop
 ```
 
 `src/cli/mod.rs` grows a `Submit(SubmitCommand)` arm dispatching to
@@ -240,7 +238,7 @@ Manual verification on Base with a known-good strategy.
    `Vec<(Address, Bytes)>`)
 2. `submit.rs` — flag mode parser (`--to` + `--data`)
 3. `submit.rs` — review block rendering
-4. `submit.rs` — per-tx prompt + `base_wallet().send(...)` loop
+4. `submit.rs` — batch prompt + `base_wallet().send(...)` loop
 5. `mod.rs` — clap wiring for `Submit`
 6. Unit tests for parser + review
 7. Anvil integration test
