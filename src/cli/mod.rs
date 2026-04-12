@@ -4,7 +4,7 @@ mod alpaca_wallet;
 mod auth;
 mod cctp;
 mod rebalancing;
-pub(crate) mod submit;
+mod submit;
 mod trading;
 mod vault;
 mod wrapper;

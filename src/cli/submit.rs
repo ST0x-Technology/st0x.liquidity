@@ -30,6 +30,12 @@ pub(crate) enum SubmitError {
 
     #[error("no transactions to submit (empty input)")]
     EmptyInput,
+
+    #[error("line {line_number}: failed to read input: {source}")]
+    ReadInput {
+        line_number: usize,
+        source: std::io::Error,
+    },
 }
 
 pub(crate) struct Transaction {
@@ -41,9 +47,9 @@ pub(crate) fn parse_stdin_lines(reader: impl BufRead) -> Result<Vec<Transaction>
     let mut transactions = Vec::new();
 
     for (index, line) in reader.lines().enumerate() {
-        let line = line.map_err(|err| SubmitError::MissingSeparator {
+        let line = line.map_err(|source| SubmitError::ReadInput {
             line_number: index + 1,
-            raw: err.to_string(),
+            source,
         })?;
 
         let line = line.trim().to_string();
@@ -146,7 +152,7 @@ pub(super) async fn submit_command<Writer: Write>(
             "Submit {count} transaction{}? [y/N] ",
             if count == 1 { "" } else { "s" }
         )?;
-        std::io::stdout().flush()?;
+        stdout.flush()?;
 
         let mut answer = String::new();
         std::io::stdin().read_line(&mut answer)?;
