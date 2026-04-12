@@ -28,6 +28,12 @@ pub(crate) enum SubmitError {
         source: alloy::hex::FromHexError,
     },
 
+    #[error("invalid hex calldata \"{raw}\": {source}")]
+    InvalidFlagCalldata {
+        raw: String,
+        source: alloy::hex::FromHexError,
+    },
+
     #[error("no transactions to submit (empty input)")]
     EmptyInput,
 
@@ -70,8 +76,7 @@ pub(crate) fn parse_stdin_lines(reader: impl BufRead) -> Result<Vec<Transaction>
 
 pub(crate) fn parse_flag_transaction(to: Address, data: &str) -> Result<Transaction, SubmitError> {
     let data = data.strip_prefix("0x").unwrap_or(data);
-    let bytes = hex::decode(data).map_err(|source| SubmitError::InvalidCalldata {
-        line_number: 0,
+    let bytes = hex::decode(data).map_err(|source| SubmitError::InvalidFlagCalldata {
         raw: data.to_string(),
         source,
     })?;
