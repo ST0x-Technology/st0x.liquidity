@@ -10,7 +10,7 @@ use tracing::{error, info};
 use st0x_event_sorcery::{Projection, Store};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::Executor;
-use st0x_finance::{HasZero, Positive, Usd};
+use st0x_finance::{HasZero, Usdc};
 
 use super::job::work;
 use super::order_fill_monitor::{DexEventStreams, OrderFillMonitor};
@@ -93,7 +93,7 @@ where
         .cash
         .as_ref()
         .and_then(|cash| cash.reserved)
-        .map_or(Usd::ZERO, Positive::inner);
+        .map_or(Usdc::ZERO, |positive| Usdc::new(positive.inner().inner()));
 
     let snapshot_id = InventorySnapshotId {
         orderbook: context.ctx.evm.orderbook,

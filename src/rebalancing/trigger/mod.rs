@@ -506,8 +506,8 @@ impl RebalancingTrigger {
         event: &InventorySnapshotEvent,
     ) -> Result<(), RebalancingTriggerError> {
         use InventorySnapshotEvent::{
-            AlpacaWalletCash, BaseWalletCash, BaseWalletUnwrappedEquity, BaseWalletWrappedEquity,
-            EthereumCash, OffchainCash, OffchainEquity, OnchainCash, OnchainEquity,
+            AlpacaWalletUsdc, BaseWalletUnwrappedEquity, BaseWalletUsdc, BaseWalletWrappedEquity,
+            EthereumUsdc, InflightEquity, OffchainEquity, OffchainUsd, OnchainEquity, OnchainUsdc,
         };
 
         match event {
