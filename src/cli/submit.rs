@@ -75,8 +75,9 @@ pub(crate) fn parse_stdin_lines(reader: impl BufRead) -> Result<Vec<Transaction>
 }
 
 pub(crate) fn parse_flag_transaction(to: Address, data: &str) -> Result<Transaction, SubmitError> {
-    let bytes = hex::decode(data).map_err(|source| SubmitError::InvalidFlagCalldata {
-        raw: data.to_string(),
+    let trimmed = data.trim();
+    let bytes = hex::decode(trimmed).map_err(|source| SubmitError::InvalidFlagCalldata {
+        raw: trimmed.to_string(),
         source,
     })?;
 
@@ -136,6 +137,46 @@ fn render_review<Writer: Write>(
     Ok(())
 }
 
+fn confirm<Reader: BufRead, Writer: Write>(
+    stdout: &mut Writer,
+    stdin: &mut Reader,
+    count: usize,
+) -> std::io::Result<bool> {
+    write!(
+        stdout,
+        "Submit {count} transaction{}? [y/N] ",
+        if count == 1 { "" } else { "s" }
+    )?;
+    stdout.flush()?;
+
+    let mut answer = String::new();
+    stdin.read_line(&mut answer)?;
+
+    Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
+}
+
+async fn submit_batch<Wal: Wallet, Writer: Write>(
+    wallet: &Wal,
+    transactions: Vec<Transaction>,
+    stdout: &mut Writer,
+) -> anyhow::Result<()> {
+    let total = transactions.len();
+
+    for (index, transaction) in transactions.into_iter().enumerate() {
+        let note = format!("submit tx {}/{total}", index + 1);
+        writeln!(stdout, "Submitting tx {}/{}...", index + 1, total)?;
+
+        let receipt = wallet
+            .submit_raw(transaction.to, transaction.data, &note)
+            .await?;
+
+        writeln!(stdout, "  tx: {}", receipt.transaction_hash)?;
+    }
+
+    writeln!(stdout, "All {total} transactions submitted.")?;
+    Ok(())
+}
+
 pub(super) async fn submit_command<Writer: Write>(
     stdout: &mut Writer,
     transactions: Vec<Transaction>,
@@ -149,40 +190,28 @@ pub(super) async fn submit_command<Writer: Write>(
     render_review(stdout, signer, &transactions)?;
 
     if !skip_confirmation {
-        let count = transactions.len();
-        write!(
-            stdout,
-            "Submit {count} transaction{}? [y/N] ",
-            if count == 1 { "" } else { "s" }
-        )?;
-        stdout.flush()?;
-
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-
-        if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+        let mut stdin = std::io::stdin().lock();
+        if !confirm(stdout, &mut stdin, transactions.len())? {
             writeln!(stdout, "Aborted.")?;
             return Ok(());
         }
     }
 
-    let total = transactions.len();
-    for (index, transaction) in transactions.into_iter().enumerate() {
-        let note = format!("submit tx {}/{total}", index + 1);
-        writeln!(stdout, "Submitting tx {}/{}...", index + 1, total)?;
-
-        let receipt = wallet.send(transaction.to, transaction.data, &note).await?;
-
-        writeln!(stdout, "  tx: {}", receipt.transaction_hash)?;
-    }
-
-    writeln!(stdout, "All {total} transactions submitted.")?;
-    Ok(())
+    submit_batch(wallet, transactions, stdout).await
 }
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::address;
+    use alloy::consensus::{Receipt, ReceiptEnvelope, ReceiptWithBloom};
+    use alloy::primitives::{Bloom, TxHash, address};
+    use alloy::providers::RootProvider;
+    use alloy::rpc::client::RpcClient;
+    use alloy::rpc::types::TransactionReceipt;
+    use async_trait::async_trait;
+    use std::io::Cursor;
+    use std::sync::Mutex;
+
+    use st0x_evm::{Evm, EvmError};
 
     use super::*;
 
@@ -308,5 +337,206 @@ mod tests {
         assert!(text.contains("68 bytes"), "missing data size 1: {text}");
         assert!(text.contains("1240 bytes"), "missing data size 2: {text}");
         assert!(text.contains(&signer.to_string()), "missing signer: {text}");
+    }
+
+    #[test]
+    fn parse_flag_transaction_trims_whitespace() {
+        let to = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+        let tx = parse_flag_transaction(to, "  0xabcdef  ").unwrap();
+        assert_eq!(tx.data, Bytes::from(vec![0xab, 0xcd, 0xef]));
+    }
+
+    #[test]
+    fn confirm_accepts_y() {
+        let mut stdout = Vec::new();
+        let mut stdin = Cursor::new(b"y\n");
+        assert!(confirm(&mut stdout, &mut stdin, 1).unwrap());
+    }
+
+    #[test]
+    fn confirm_accepts_yes() {
+        let mut stdout = Vec::new();
+        let mut stdin = Cursor::new(b"yes\n");
+        assert!(confirm(&mut stdout, &mut stdin, 2).unwrap());
+    }
+
+    #[test]
+    fn confirm_rejects_no() {
+        let mut stdout = Vec::new();
+        let mut stdin = Cursor::new(b"no\n");
+        assert!(!confirm(&mut stdout, &mut stdin, 1).unwrap());
+    }
+
+    #[test]
+    fn confirm_rejects_empty() {
+        let mut stdout = Vec::new();
+        let mut stdin = Cursor::new(b"\n");
+        assert!(!confirm(&mut stdout, &mut stdin, 1).unwrap());
+    }
+
+    fn successful_receipt(tx_hash: TxHash) -> TransactionReceipt {
+        TransactionReceipt {
+            inner: ReceiptEnvelope::Eip1559(ReceiptWithBloom {
+                receipt: Receipt {
+                    status: true.into(),
+                    cumulative_gas_used: 0,
+                    logs: vec![],
+                },
+                logs_bloom: Bloom::default(),
+            }),
+            transaction_hash: tx_hash,
+            transaction_index: Some(0),
+            block_hash: None,
+            block_number: Some(42),
+            gas_used: 21000,
+            effective_gas_price: 1,
+            blob_gas_used: None,
+            blob_gas_price: None,
+            from: Address::ZERO,
+            to: Some(Address::ZERO),
+            contract_address: None,
+        }
+    }
+
+    fn reverted_receipt() -> TransactionReceipt {
+        TransactionReceipt {
+            inner: ReceiptEnvelope::Eip1559(ReceiptWithBloom {
+                receipt: Receipt {
+                    status: false.into(),
+                    cumulative_gas_used: 0,
+                    logs: vec![],
+                },
+                logs_bloom: Bloom::default(),
+            }),
+            transaction_hash: TxHash::random(),
+            transaction_index: Some(0),
+            block_hash: None,
+            block_number: None,
+            gas_used: 21000,
+            effective_gas_price: 1,
+            blob_gas_used: None,
+            blob_gas_price: None,
+            from: Address::ZERO,
+            to: Some(Address::ZERO),
+            contract_address: None,
+        }
+    }
+
+    struct MockWallet {
+        address: Address,
+        provider: RootProvider,
+        receipts: Mutex<Vec<Result<TransactionReceipt, EvmError>>>,
+        calls: Mutex<Vec<(Address, Bytes)>>,
+    }
+
+    impl MockWallet {
+        fn with_receipts(receipts: Vec<Result<TransactionReceipt, EvmError>>) -> Self {
+            Self {
+                address: address!("A9C16673F65AE808688cB18952AFE3d9658C808f"),
+                provider: RootProvider::new(
+                    RpcClient::builder().http("http://mock.invalid".parse().unwrap()),
+                ),
+                receipts: Mutex::new(receipts),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn recorded_calls(&self) -> Vec<(Address, Bytes)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl Evm for MockWallet {
+        type Provider = RootProvider;
+
+        fn provider(&self) -> &RootProvider {
+            &self.provider
+        }
+    }
+
+    #[async_trait]
+    impl Wallet for MockWallet {
+        fn address(&self) -> Address {
+            self.address
+        }
+
+        async fn send(
+            &self,
+            contract: Address,
+            calldata: Bytes,
+            _note: &str,
+        ) -> Result<TransactionReceipt, EvmError> {
+            self.calls.lock().unwrap().push((contract, calldata));
+            self.receipts.lock().unwrap().remove(0)
+        }
+    }
+
+    fn test_transactions() -> Vec<Transaction> {
+        vec![
+            Transaction {
+                to: address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
+                data: Bytes::from(vec![0xaa, 0xbb]),
+            },
+            Transaction {
+                to: address!("4200000000000000000000000000000000000006"),
+                data: Bytes::from(vec![0xcc, 0xdd]),
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn submit_batch_submits_all_in_order() {
+        let hash_1 = TxHash::random();
+        let hash_2 = TxHash::random();
+        let wallet = MockWallet::with_receipts(vec![
+            Ok(successful_receipt(hash_1)),
+            Ok(successful_receipt(hash_2)),
+        ]);
+
+        let transactions = test_transactions();
+        let expected_to_0 = transactions[0].to;
+        let expected_data_0 = transactions[0].data.clone();
+        let expected_to_1 = transactions[1].to;
+        let expected_data_1 = transactions[1].data.clone();
+
+        let mut output = Vec::new();
+        submit_batch(&wallet, transactions, &mut output)
+            .await
+            .unwrap();
+
+        let calls = wallet.recorded_calls();
+        assert_eq!(calls.len(), 2, "expected 2 calls, got {}", calls.len());
+        assert_eq!(calls[0].0, expected_to_0);
+        assert_eq!(calls[0].1, expected_data_0);
+        assert_eq!(calls[1].0, expected_to_1);
+        assert_eq!(calls[1].1, expected_data_1);
+
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains(&hash_1.to_string()), "missing hash 1: {text}");
+        assert!(text.contains(&hash_2.to_string()), "missing hash 2: {text}");
+        assert!(
+            text.contains("All 2 transactions submitted."),
+            "missing completion message: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_batch_bails_on_revert() {
+        let wallet = MockWallet::with_receipts(vec![
+            Ok(successful_receipt(TxHash::random())),
+            Ok(reverted_receipt()),
+        ]);
+
+        let mut output = Vec::new();
+        let result = submit_batch(&wallet, test_transactions(), &mut output).await;
+
+        assert!(result.is_err(), "expected error on revert");
+        let calls = wallet.recorded_calls();
+        assert_eq!(
+            calls.len(),
+            2,
+            "expected 2 send calls (revert detected after send)"
+        );
     }
 }
