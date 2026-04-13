@@ -489,6 +489,36 @@ where
         })
     }
 
+    /// Confirm an inflight transfer at the source venue and add the
+    /// actual settled amount at the destination venue.
+    ///
+    /// Unlike [`Self::transfer`] with [`TransferOp::Complete`], this allows
+    /// the amount leaving the source venue to differ from the amount credited
+    /// at the destination venue. USDC rebalancing needs this because bridge
+    /// fees and conversion slippage mean the settled amount can be smaller
+    /// than the amount that originally left the source venue.
+    pub(crate) fn settle_transfer(
+        from: Venue,
+        sent_amount: T,
+        received_amount: T,
+    ) -> Box<dyn FnOnce(Self) -> Result<Self, InventoryError<T>> + Send> {
+        Box::new(move |inventory| {
+            let source = inventory
+                .get_venue(from)
+                .unwrap_or_default()
+                .confirm_inflight(sent_amount)?;
+
+            let dest = match inventory.get_venue(from.other()) {
+                Some(balance) => balance.add_available(received_amount)?,
+                None => VenueBalance::new(received_amount, T::ZERO),
+            };
+
+            Ok(inventory
+                .set_venue(from, Some(source))
+                .set_venue(from.other(), Some(dest)))
+        })
+    }
+
     pub(crate) fn last_rebalancing(&self) -> Option<DateTime<Utc>> {
         self.last_rebalancing
     }
@@ -748,6 +778,15 @@ impl InventoryView {
         match venue {
             Venue::MarketMaking => self.usdc.onchain.map(VenueBalance::available),
             Venue::Hedging => self.usdc.offchain.map(VenueBalance::available),
+        }
+    }
+
+    /// Returns the USDC inflight balance at the given venue.
+    #[cfg(test)]
+    pub(crate) fn usdc_inflight(&self, venue: Venue) -> Option<Usdc> {
+        match venue {
+            Venue::MarketMaking => self.usdc.onchain.map(VenueBalance::inflight),
+            Venue::Hedging => self.usdc.offchain.map(VenueBalance::inflight),
         }
     }
 

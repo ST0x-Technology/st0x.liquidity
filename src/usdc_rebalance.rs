@@ -73,7 +73,7 @@ use st0x_finance::{Id, Usdc};
 use crate::alpaca_wallet::AlpacaTransferId;
 
 /// Unique identifier for a USDC rebalance operation.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub(crate) struct UsdcRebalanceId(pub(crate) Uuid);
 
 impl Display for UsdcRebalanceId {
