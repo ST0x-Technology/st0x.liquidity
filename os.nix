@@ -37,8 +37,8 @@ let
     };
 
     serviceConfig = {
-      DynamicUser = true;
-      SupplementaryGroups = [ "st0x" ];
+      User = "st0x";
+      Group = "st0x";
       ExecStart = builtins.concatStringsSep " " [
         "${cfg.profilePath}/bin/${cfg.bin}"
         "--config"
@@ -48,7 +48,6 @@ let
       ];
       Restart = "always";
       RestartSec = 5;
-      ReadWritePaths = [ "/mnt/data" ];
     };
   };
 
@@ -165,7 +164,14 @@ in {
     };
   };
 
-  users.users.root.openssh.authorizedKeys.keys = envRoles.ssh;
+  users = {
+    users.root.openssh.authorizedKeys.keys = envRoles.ssh;
+    users.st0x = {
+      isSystemUser = true;
+      group = "st0x";
+    };
+    groups.st0x = { };
+  };
 
   networking.firewall = {
     enable = true;
@@ -198,7 +204,6 @@ in {
     };
   };
 
-  users.groups.st0x = { };
   programs.bash.interactiveShellInit = "set -o vi";
 
   age.secrets = {
@@ -212,7 +217,10 @@ in {
       mode = "0400";
     };
   };
-  systemd.tmpfiles.rules = [ "d /mnt/data/grafana 0750 grafana grafana -" ];
+  systemd.tmpfiles.rules = [
+    "d /mnt/data 0755 st0x st0x -"
+    "d /mnt/data/grafana 0750 grafana grafana -"
+  ];
   systemd.services = lib.mapAttrs mkService enabledServices;
 
   environment.systemPackages = with pkgs; [
