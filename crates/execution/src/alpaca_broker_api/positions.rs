@@ -81,13 +81,13 @@ pub(super) async fn fetch_inventory(
     let formatted = integer_cents
         .format_with_scientific(false)
         .map_err(AlpacaBrokerApiError::FloatConversion)?;
-    let cash_balance_cents: i64 = formatted
+    let usd_balance_cents: i64 = formatted
         .parse()
-        .map_err(|_| AlpacaBrokerApiError::CashBalanceConversion(account.cash))?;
+        .map_err(|_| AlpacaBrokerApiError::UsdBalanceConversion(account.cash))?;
 
     Ok(Inventory {
         positions: broker_positions,
-        cash_balance_cents,
+        usd_balance_cents,
     })
 }
 
@@ -198,7 +198,7 @@ mod tests {
         account_mock.assert();
 
         assert_eq!(state.positions.len(), 2);
-        assert_eq!(state.cash_balance_cents, 5_000_000);
+        assert_eq!(state.usd_balance_cents, 5_000_000);
 
         let aapl = state
             .positions
@@ -242,7 +242,7 @@ mod tests {
         account_mock.assert();
 
         assert!(state.positions.is_empty());
-        assert_eq!(state.cash_balance_cents, 10_000_000);
+        assert_eq!(state.usd_balance_cents, 10_000_000);
     }
 
     #[tokio::test]

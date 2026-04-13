@@ -357,12 +357,12 @@ async fn assert_inventory_snapshots(
 
     if assert_cash {
         assert!(
-            event_types.contains(&"InventorySnapshotEvent::OnchainCash"),
-            "Missing OnchainCash event, got types: {event_types:?}"
+            event_types.contains(&"InventorySnapshotEvent::OnchainUsdc"),
+            "Missing OnchainUsdc event, got types: {event_types:?}"
         );
         assert!(
-            event_types.contains(&"InventorySnapshotEvent::OffchainCash"),
-            "Missing OffchainCash event, got types: {event_types:?}"
+            event_types.contains(&"InventorySnapshotEvent::OffchainUsd"),
+            "Missing OffchainUsd event, got types: {event_types:?}"
         );
     }
 
@@ -412,17 +412,17 @@ async fn assert_inventory_snapshots(
     }
 
     if assert_cash {
-        let last_onchain_cash = events
+        let last_onchain_usdc = events
             .iter()
             .rev()
-            .find(|ev| ev.event_type == "InventorySnapshotEvent::OnchainCash")
-            .ok_or_else(|| anyhow::anyhow!("Missing OnchainCash event"))?;
-        let usdc_balance_str = last_onchain_cash
+            .find(|ev| ev.event_type == "InventorySnapshotEvent::OnchainUsdc")
+            .ok_or_else(|| anyhow::anyhow!("Missing OnchainUsdc event"))?;
+        let usdc_balance_str = last_onchain_usdc
             .payload
-            .get("OnchainCash")
+            .get("OnchainUsdc")
             .and_then(|val| val.get("usdc_balance"))
             .and_then(|val| val.as_str())
-            .ok_or_else(|| anyhow::anyhow!("OnchainCash payload missing usdc_balance"))?;
+            .ok_or_else(|| anyhow::anyhow!("OnchainUsdc payload missing usdc_balance"))?;
         let _usdc_balance = Float::parse(usdc_balance_str.to_string())
             .unwrap_or_else(|err| panic!("Failed to parse onchain USDC balance: {err:?}"));
     }
@@ -1276,62 +1276,62 @@ async fn assert_usdc_rebalancing_onchain_state<P: Provider>(
     Ok(())
 }
 
-/// Asserts that at least one `EthereumCash` inventory snapshot was emitted.
-pub(crate) async fn assert_ethereum_cash_event_exists(
+/// Asserts that at least one `EthereumUsdc` inventory snapshot was emitted.
+pub(crate) async fn assert_ethereum_usdc_event_exists(
     db_path: &std::path::Path,
 ) -> anyhow::Result<()> {
     let pool = connect_db(db_path).await?;
     let events = fetch_events_by_type(&pool, "InventorySnapshot").await?;
 
-    let has_ethereum_cash = events
+    let has_ethereum_usdc = events
         .iter()
-        .any(|event| event.event_type == "InventorySnapshotEvent::EthereumCash");
+        .any(|event| event.event_type == "InventorySnapshotEvent::EthereumUsdc");
     assert!(
-        has_ethereum_cash,
-        "Expected EthereumCash snapshot from Ethereum wallet polling"
+        has_ethereum_usdc,
+        "Expected EthereumUsdc snapshot from Ethereum wallet polling"
     );
 
     pool.close().await;
     Ok(())
 }
 
-pub(crate) async fn assert_base_wallet_cash_event_exists(
+pub(crate) async fn assert_base_wallet_usdc_event_exists(
     db_path: &std::path::Path,
 ) -> anyhow::Result<()> {
     let pool = connect_db(db_path).await?;
     let events = fetch_events_by_type(&pool, "InventorySnapshot").await?;
 
-    let has_base_wallet_cash = events
+    let has_base_wallet_usdc = events
         .iter()
-        .any(|event| event.event_type == "InventorySnapshotEvent::BaseWalletCash");
+        .any(|event| event.event_type == "InventorySnapshotEvent::BaseWalletUsdc");
     assert!(
-        has_base_wallet_cash,
-        "Expected BaseWalletCash snapshot from Base wallet polling"
+        has_base_wallet_usdc,
+        "Expected BaseWalletUsdc snapshot from Base wallet polling"
     );
 
     pool.close().await;
     Ok(())
 }
 
-pub(crate) async fn assert_alpaca_wallet_cash_event(
+pub(crate) async fn assert_alpaca_wallet_usdc_event(
     db_path: &std::path::Path,
     expected_balance: Float,
 ) -> anyhow::Result<()> {
     let pool = connect_db(db_path).await?;
     let events = fetch_events_by_type(&pool, "InventorySnapshot").await?;
 
-    let alpaca_wallet_cash = events
+    let alpaca_wallet_usdc = events
         .iter()
         .rev()
-        .find(|event| event.event_type == "InventorySnapshotEvent::AlpacaWalletCash")
-        .ok_or_else(|| anyhow::anyhow!("Missing AlpacaWalletCash event"))?;
+        .find(|event| event.event_type == "InventorySnapshotEvent::AlpacaWalletUsdc")
+        .ok_or_else(|| anyhow::anyhow!("Missing AlpacaWalletUsdc event"))?;
 
-    let balance_str = alpaca_wallet_cash
+    let balance_str = alpaca_wallet_usdc
         .payload
-        .get("AlpacaWalletCash")
+        .get("AlpacaWalletUsdc")
         .and_then(|value| value.get("usdc_balance"))
         .and_then(|value| value.as_str())
-        .ok_or_else(|| anyhow::anyhow!("AlpacaWalletCash payload missing usdc_balance"))?;
+        .ok_or_else(|| anyhow::anyhow!("AlpacaWalletUsdc payload missing usdc_balance"))?;
     let balance = Float::parse(balance_str.to_string())
         .unwrap_or_else(|error| panic!("Failed to parse Alpaca wallet USDC balance: {error}"));
 

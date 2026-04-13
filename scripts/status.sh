@@ -311,10 +311,10 @@ if [ -n "$onchain_equity_val" ]; then
   echo -e "    Equity: ${WHITE}$(trunc2 "$onchain_equity_val") RKLB${RESET}  ${DIM}($(fmt_ts "$onchain_equity_ts"))${RESET}"
 fi
 
-onchain_cash_ts=$($ssh_cmd "sqlite3 $db \"SELECT json_extract(payload, '\\\$.OnchainCash.fetched_at') FROM events WHERE event_type = 'InventorySnapshotEvent::OnchainCash' ORDER BY rowid DESC LIMIT 1;\"" 2>/dev/null || echo "")
-onchain_cash_val=$($ssh_cmd "sqlite3 $db \"SELECT json_extract(payload, '\\\$.OnchainCash.usdc_balance') FROM events WHERE event_type = 'InventorySnapshotEvent::OnchainCash' ORDER BY rowid DESC LIMIT 1;\"" 2>/dev/null || echo "")
-if [ -n "$onchain_cash_val" ]; then
-  echo -e "    Cash:   ${WHITE}$(trunc2 "$onchain_cash_val") USDC${RESET}  ${DIM}($(fmt_ts "$onchain_cash_ts"))${RESET}"
+onchain_usdc_ts=$($ssh_cmd "sqlite3 $db \"SELECT json_extract(payload, '\\\$.OnchainUsdc.fetched_at') FROM events WHERE event_type = 'InventorySnapshotEvent::OnchainUsdc' ORDER BY rowid DESC LIMIT 1;\"" 2>/dev/null || echo "")
+onchain_usdc_val=$($ssh_cmd "sqlite3 $db \"SELECT json_extract(payload, '\\\$.OnchainUsdc.usdc_balance') FROM events WHERE event_type = 'InventorySnapshotEvent::OnchainUsdc' ORDER BY rowid DESC LIMIT 1;\"" 2>/dev/null || echo "")
+if [ -n "$onchain_usdc_val" ]; then
+  echo -e "    USDC:   ${WHITE}$(trunc2 "$onchain_usdc_val") USDC${RESET}  ${DIM}($(fmt_ts "$onchain_usdc_ts"))${RESET}"
 fi
 
 echo -e "  ${YELLOW}Offchain:${RESET}"
@@ -325,10 +325,10 @@ if [ -n "$offchain_equity_val" ]; then
   echo -e "    Equity: ${WHITE}$(trunc2 "$offchain_equity_val") RKLB${RESET}  ${DIM}($(fmt_ts "$offchain_equity_ts"))${RESET}"
 fi
 
-offchain_cash_ts=$($ssh_cmd "sqlite3 $db \"SELECT json_extract(payload, '\\\$.OffchainCash.fetched_at') FROM events WHERE event_type = 'InventorySnapshotEvent::OffchainCash' ORDER BY rowid DESC LIMIT 1;\"" 2>/dev/null || echo "")
-offchain_cash_val=$($ssh_cmd "sqlite3 $db \"SELECT printf('%.2f', json_extract(payload, '\\\$.OffchainCash.cash_balance_cents') / 100.0) FROM events WHERE event_type = 'InventorySnapshotEvent::OffchainCash' ORDER BY rowid DESC LIMIT 1;\"" 2>/dev/null || echo "")
-if [ -n "$offchain_cash_val" ]; then
-  echo -e "    Cash:   ${WHITE}\$${offchain_cash_val}${RESET}  ${DIM}($(fmt_ts "$offchain_cash_ts"))${RESET}"
+offchain_usd_ts=$($ssh_cmd "sqlite3 $db \"SELECT json_extract(payload, '\\\$.OffchainUsd.fetched_at') FROM events WHERE event_type = 'InventorySnapshotEvent::OffchainUsd' ORDER BY rowid DESC LIMIT 1;\"" 2>/dev/null || echo "")
+offchain_usd_val=$($ssh_cmd "sqlite3 $db \"SELECT printf('%.2f', json_extract(payload, '\\\$.OffchainUsd.usd_balance_cents') / 100.0) FROM events WHERE event_type = 'InventorySnapshotEvent::OffchainUsd' ORDER BY rowid DESC LIMIT 1;\"" 2>/dev/null || echo "")
+if [ -n "$offchain_usd_val" ]; then
+  echo -e "    USD:    ${WHITE}\$${offchain_usd_val}${RESET}  ${DIM}($(fmt_ts "$offchain_usd_ts"))${RESET}"
 fi
 
 # Recent onchain trades (from events table -- views are rebuilt only at startup)
