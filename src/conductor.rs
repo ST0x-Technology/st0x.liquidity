@@ -156,17 +156,19 @@ impl Conductor {
         // Phase 2: determine cutoff block from WS subscription
         let cutoff_block = get_cutoff_block(&mut clear_stream, &mut take_stream, &provider).await?;
 
-        // Phase 3: backfill historical events to the job queue
-        if let Some(end_block) = cutoff_block.checked_sub(1) {
-            backfill_events(
-                &provider,
-                &ctx.evm,
-                end_block,
-                get_backfill_retry_strat(),
-                job_queue.clone(),
-            )
-            .await?;
-        }
+        // Phase 3: backfill historical events to the job queue.
+        // Backfill includes the cutoff block because `get_cutoff_block`
+        // consumed one stream item to learn the block number — that event
+        // would otherwise be lost. Duplicate events from the overlap are
+        // harmless: OnChainTrade aggregates deduplicate by (tx_hash, log_index).
+        backfill_events(
+            &provider,
+            &ctx.evm,
+            cutoff_block,
+            get_backfill_retry_strat(),
+            job_queue.clone(),
+        )
+        .await?;
 
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
             .build(())
