@@ -14,7 +14,7 @@ raindex strategy-builder \
   --select-token input=0x... --select-token output=0x... \
   --set-field max-spread=0.002 --set-deposit output=0.5 \
   --owner 0xA9C16673... \
-| cli submit
+| stox submit
 ```
 
 No on-disk state between runs. The chain is the record of truth.
@@ -56,15 +56,15 @@ registry fetch, GUI construction, or validation fails.
 This subcommand is **not** part of `st0x.liquidity`. It lives in
 `rain.orderbook` where all rain crate dependencies resolve cleanly.
 
-### 2. `cli submit` — lives in `st0x.liquidity`
+### 2. `stox submit` — lives in `st0x.liquidity`
 
 New subcommand added to the existing CLI. Generic calldata submitter, follows
 `cast send` conventions:
 
 ```
-cli submit --to <address> --data 0x<hex>        # single tx from flags
-cli submit                                       # multi-tx from stdin pipe
-cli submit --to <address> --data 0x<hex> --yes   # skip confirmation prompt
+stox submit --to <address> --data 0x<hex>        # single tx from flags
+stox submit                                       # multi-tx from stdin pipe
+stox submit --to <address> --data 0x<hex> --yes   # skip confirmation prompt
 ```
 
 **Stdin mode** (for pipe composition): reads `<to>:<calldata>` lines from stdin,
@@ -78,7 +78,7 @@ transaction unless `--yes`.
 
 ### Review block
 
-Before submitting, `cli submit` prints a summary:
+Before submitting, `stox submit` prints a summary:
 
 ```
 Signer: 0xA9C16673F65AE808688cB18952AFE3d9658C808f
@@ -95,8 +95,8 @@ Submit 3 transactions? [y/N]
 ```
 
 The review is intentionally minimal — signer address, target, and data size per
-transaction. `cli submit` is a generic submitter and does not decode calldata or
-estimate gas. A single batch confirmation covers all transactions (not per-tx
+transaction. `stox submit` is a generic submitter and does not decode calldata
+or estimate gas. A single batch confirmation covers all transactions (not per-tx
 prompts).
 
 ## Why two binaries
@@ -143,8 +143,8 @@ The pipe architecture cleanly separates the two dependency graphs.
 - Porting `DotrainOrderGui` logic into st0x.liquidity — that's why we pipe.
 - Adding a `deployment.toml` config schema to st0x.liquidity — config parsing
   belongs on the `raindex strategy-builder` side (or in a bash wrapper).
-- Interactive mode in `cli submit` — it's a dumb submitter. Interactive strategy
-  selection belongs in `raindex strategy-builder` if we want it.
+- Interactive mode in `stox submit` — it's a dumb submitter. Interactive
+  strategy selection belongs in `raindex strategy-builder` if we want it.
 - Changes to Turnkey wiring, ragenix secrets, or the existing `wallet-turnkey` /
   `wallet-private-key` feature flags.
 
@@ -160,8 +160,8 @@ src/cli/submit.rs     # clap subcommand: parse --to/--data or stdin,
 
 ### Dependency additions
 
-None. `cli submit` uses only `alloy` types (`Address`, `Bytes`) and the existing
-`Wallet` trait already in the workspace.
+None. `stox submit` uses only `alloy` types (`Address`, `Bytes`) and the
+existing `Wallet` trait already in the workspace.
 
 ## Secrets
 
@@ -181,9 +181,9 @@ translation.
   assert correct `(Address, Bytes)` pairs are extracted. Test malformed input
   rejection.
 - **Unit**: review block rendering — fixture input, snapshot the output.
-- **Integration (Anvil)**: pipe fixture calldata lines into `cli submit`, signer
-  = local raw key (not Turnkey). Assert transactions land onchain with expected
-  `to` and `input` fields.
+- **Integration (Anvil)**: pipe fixture calldata lines into `stox submit`,
+  signer = local raw key (not Turnkey). Assert transactions land onchain with
+  expected `to` and `input` fields.
 - **Integration (gated on `TURNKEY_*` env)**: same pipeline with
   `TurnkeyWallet`, still against local Anvil. Mirrors the existing
   `turnkey_integration` test.
@@ -227,7 +227,7 @@ raindex strategy-builder \
   --set-field max-spread=0.002 --set-field oracle-key=ETH/USD \
   --set-deposit output=0.5 \
   --owner 0xA9C16673F65AE808688cB18952AFE3d9658C808f \
-| cli submit
+| stox submit
 ```
 
 Manual verification on Base with a known-good strategy.
@@ -266,7 +266,7 @@ rationale (pinned toolchain, feature coverage, clippy/fmt drift).
   `raindex strategy-builder` ever needs to convey more per-tx metadata (value,
   gas limit), we'd need to evolve the format. JSON-lines is the natural upgrade
   path, but start simple.
-- **Gas estimation**: `cli submit` does RPC gas estimation at submit time. If
+- **Gas estimation**: `stox submit` does RPC gas estimation at submit time. If
   the RPC underprovisions (dRPC load balancing, cold provider), the review
   block's gas estimate may differ from what lands. Flag as approximate.
 - **Multi-tx atomicity**: transactions are submitted sequentially. If tx 2/3
