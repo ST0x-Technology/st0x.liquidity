@@ -487,7 +487,7 @@ impl RebalancingTrigger {
     ) -> Result<(), RebalancingTriggerError> {
         use InventorySnapshotEvent::{
             AlpacaWalletCash, BaseWalletCash, BaseWalletUnwrappedEquity, BaseWalletWrappedEquity,
-            EthereumCash, OffchainCash, OffchainEquity, OnchainCash, OnchainEquity,
+            EthereumCash, InflightEquity, OffchainCash, OffchainEquity, OnchainCash, OnchainEquity,
         };
 
         let now = Utc::now();
@@ -572,7 +572,7 @@ impl RebalancingTrigger {
     ) -> Result<(), RebalancingTriggerError> {
         use InventorySnapshotEvent::{
             AlpacaWalletCash, BaseWalletCash, BaseWalletUnwrappedEquity, BaseWalletWrappedEquity,
-            EthereumCash, OffchainCash, OffchainEquity, OnchainCash, OnchainEquity,
+            EthereumCash, InflightEquity, OffchainCash, OffchainEquity, OnchainCash, OnchainEquity,
         };
 
         let inventory_error = match error {
@@ -598,7 +598,6 @@ impl RebalancingTrigger {
         let mut inventory = self.inventory.write().await;
         *inventory = InventoryView::default();
 
-        use InventorySnapshotEvent::*;
         let updated = match &event {
             OnchainEquity { balances, .. } => {
                 balances
@@ -685,7 +684,7 @@ impl RebalancingTrigger {
     ) -> Result<(), RebalancingTriggerError> {
         use InventorySnapshotEvent::{
             AlpacaWalletCash, BaseWalletCash, BaseWalletUnwrappedEquity, BaseWalletWrappedEquity,
-            EthereumCash, OffchainCash, OffchainEquity, OnchainCash, OnchainEquity,
+            EthereumCash, InflightEquity, OffchainCash, OffchainEquity, OnchainCash, OnchainEquity,
         };
 
         match event {
