@@ -167,13 +167,11 @@ pub(super) async fn submit_command<Writer: Write>(
     }
 
     let total = transactions.len();
-    for (index, transaction) in transactions.iter().enumerate() {
+    for (index, transaction) in transactions.into_iter().enumerate() {
         let note = format!("submit tx {}/{total}", index + 1);
         writeln!(stdout, "Submitting tx {}/{}...", index + 1, total)?;
 
-        let receipt = wallet
-            .send(transaction.to, transaction.data.clone(), &note)
-            .await?;
+        let receipt = wallet.send(transaction.to, transaction.data, &note).await?;
 
         writeln!(stdout, "  tx: {}", receipt.transaction_hash)?;
     }

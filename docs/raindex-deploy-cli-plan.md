@@ -73,8 +73,8 @@ passed.
 
 **Flag mode** (standalone): `--to` and `--data` are required, submits one tx.
 
-Signs via the existing `base_wallet()` -> `TurnkeyWallet`. Prompts before each
-transaction unless `--yes`.
+Signs via the existing `base_wallet()` -> `TurnkeyWallet`. Prompts once for the
+full batch unless `--yes`.
 
 ### Review block
 
