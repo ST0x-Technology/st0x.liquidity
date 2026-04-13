@@ -51,8 +51,8 @@ case "$env" in
     order_owner="0x386c24644e532387b03c1992ca83542492a3ac32"
     ;;
   staging)
-    subgraph="${STAGING_SUBGRAPH:?Set STAGING_SUBGRAPH env var for staging status}"
-    order_owner="${STAGING_ORDER_OWNER:?Set STAGING_ORDER_OWNER env var for staging status}"
+    subgraph="https://api.goldsky.com/api/public/project_clv14x04y9kzi01saerx7bxpg/subgraphs/ob4-base/2026-02-05-c4ef/gn"
+    order_owner="0x386c24644e532387b03c1992ca83542492a3ac32"
     ;;
   *)
     echo "ERROR: unknown environment '$env'" >&2
@@ -79,6 +79,70 @@ echo ""
 echo -e "${BOLD}${WHITE}══════════════════════════════════════${RESET}"
 echo -e "  ${status_color}${status_icon} Bot is ${BOLD}${status}${RESET}"
 echo -e "${BOLD}${WHITE}══════════════════════════════════════${RESET}"
+
+# Deployed version
+echo ""
+echo -e "${BOLD}${CYAN}▸ Deployed Version${RESET}"
+git_rev=$($ssh_cmd "cat /run/st0x/st0x-hedge.git-rev 2>/dev/null" || echo "")
+if [ -n "$git_rev" ] && [ "$git_rev" != "unknown" ]; then
+  short_rev="${git_rev:0:8}"
+  if [[ "$git_rev" =~ ^[0-9a-f]{7,40}$ ]]; then
+    echo -e "  ${DIM}Commit:${RESET}   ${WHITE}${short_rev}${RESET}  ${DIM}(${git_rev})${RESET}"
+    echo -e "  ${DIM}GitHub:${RESET}   https://github.com/ST0x-Technology/st0x.liquidity/commit/${git_rev}"
+  else
+    echo -e "  ${DIM}Commit:${RESET}   ${WHITE}${short_rev}${RESET}  ${YELLOW}[dirty]${RESET} ${DIM}(${git_rev})${RESET}"
+  fi
+else
+  echo -e "  ${DIM}Commit:${RESET}   ${YELLOW}unknown${RESET} ${DIM}(pre-tracking deployment)${RESET}"
+fi
+deploy_epoch=$($ssh_cmd "stat -c '%Y' /nix/var/nix/profiles/per-service/st0x-hedge 2>/dev/null" || echo "")
+if [ -n "$deploy_epoch" ]; then
+  deploy_ts=$(date -u -d "@$deploy_epoch" '+%b %d, %Y %H:%M UTC' 2>/dev/null \
+    || date -u -r "$deploy_epoch" '+%b %d, %Y %H:%M UTC' 2>/dev/null \
+    || echo "$deploy_epoch")
+  echo -e "  ${DIM}Deployed:${RESET} ${deploy_ts}"
+fi
+
+# Active config summary
+echo ""
+echo -e "${BOLD}${CYAN}▸ Active Config${RESET}"
+config=$($ssh_cmd "cat /run/st0x/st0x-hedge.config 2>/dev/null" || echo "")
+if [ -n "$config" ]; then
+  # Operational settings
+  log_level=$(echo "$config" | { grep -E '^log_level' || true; } | head -1 | sed 's/.*= *"*\([^"]*\)"*/\1/')
+  deployment_block=$(echo "$config" | { grep -E '^deployment_block' || true; } | head -1 | sed 's/.*= *//')
+  config_order_owner=$(echo "$config" | { grep -E '^order_owner' || true; } | head -1 | sed 's/.*= *"*\([^"]*\)"*/\1/')
+  orderbook=$(echo "$config" | { grep -E '^orderbook' || true; } | head -1 | sed 's/.*= *"*\([^"]*\)"*/\1/')
+  [ -n "$config_order_owner" ] && order_owner="$config_order_owner"
+
+  [ -n "$log_level" ] && echo -e "  ${DIM}Log level:${RESET}        ${WHITE}${log_level}${RESET}"
+  [ -n "$deployment_block" ] && echo -e "  ${DIM}Deployment block:${RESET} ${WHITE}${deployment_block}${RESET}"
+  [ -n "$orderbook" ] && echo -e "  ${DIM}Orderbook:${RESET}        ${WHITE}${orderbook}${RESET}"
+  [ -n "$order_owner" ] && echo -e "  ${DIM}Order owner:${RESET}      ${WHITE}${order_owner}${RESET}"
+
+  # Asset trading status
+  echo ""
+  echo -e "  ${DIM}Assets:${RESET}"
+  # Parse each equity section: extract symbol, trading, and rebalancing status
+  echo "$config" | awk '
+    /^\[assets\.equities\.[A-Z]/ {
+      gsub(/\[assets\.equities\./, ""); gsub(/\]/, "");
+      symbol = $0; trading = ""; rebalancing = ""
+      in_equity = 1; next
+    }
+    /^\[/ { in_equity = 0; next }
+    !in_equity { next }
+    /^trading/ { gsub(/.*= *"?/, ""); gsub(/"/, ""); trading = $0 }
+    /^rebalancing/ {
+      gsub(/.*= *"?/, ""); gsub(/"/, ""); rebalancing = $0
+      color_t = (trading == "enabled") ? "\033[32m" : "\033[2m"
+      color_r = (rebalancing == "enabled") ? "\033[32m" : "\033[2m"
+      printf "    %-6s  trade: %s%-8s\033[0m  rebalance: %s%-8s\033[0m\n", symbol, color_t, trading, color_r, rebalancing
+    }
+  '
+else
+  echo -e "  ${DIM}(no config found)${RESET}"
+fi
 
 # Last boot time
 echo ""
