@@ -1,0 +1,68 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT\n            id,\n            tx_hash,\n            log_index,\n            block_number,\n            event_data,\n            processed,\n            created_at,\n            processed_at,\n            block_timestamp\n        FROM event_queue\n        WHERE processed = 0\n        ORDER BY block_number ASC, log_index ASC\n        LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "tx_hash",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "log_index",
+        "ordinal": 2,
+        "type_info": "Integer"
+      },
+      {
+        "name": "block_number",
+        "ordinal": 3,
+        "type_info": "Integer"
+      },
+      {
+        "name": "event_data",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "processed",
+        "ordinal": 5,
+        "type_info": "Bool"
+      },
+      {
+        "name": "created_at",
+        "ordinal": 6,
+        "type_info": "Datetime"
+      },
+      {
+        "name": "processed_at",
+        "ordinal": 7,
+        "type_info": "Datetime"
+      },
+      {
+        "name": "block_timestamp",
+        "ordinal": 8,
+        "type_info": "Datetime"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "0900431855311db452d541e415308e32392c370340e90798831868a521aba626"
+}

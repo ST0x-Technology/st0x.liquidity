@@ -105,7 +105,7 @@ in {
   package = craneLib.buildPackage (commonArgs // {
     inherit cargoArtifacts;
 
-    cargoExtraArgs = "--bin server --features wallet-private-key";
+    cargoExtraArgs = "--bin server --features wallet-turnkey";
     doCheck = false;
 
     meta = {
@@ -119,7 +119,7 @@ in {
     pname = "st0x-cli";
     inherit cargoArtifacts;
 
-    cargoExtraArgs = "--bin cli --features wallet-private-key";
+    cargoExtraArgs = "--bin cli --features wallet-turnkey";
     doCheck = false;
 
     meta = {
