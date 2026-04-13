@@ -230,6 +230,32 @@ pub trait Wallet: Evm {
         note: &str,
     ) -> Result<TransactionReceipt, EvmError>;
 
+    /// Submit raw calldata with automatic revert detection.
+    ///
+    /// Like [`send`](Wallet::send), but checks the receipt status and
+    /// returns [`EvmError::Reverted`] if the transaction reverted.
+    /// Uses [`NoOpErrorRegistry`] since the caller doesn't know the
+    /// contract's error types.
+    async fn submit_raw(
+        &self,
+        contract: Address,
+        calldata: Bytes,
+        note: &str,
+    ) -> Result<TransactionReceipt, EvmError>
+    where
+        Self: Sized,
+    {
+        let receipt = self.send(contract, calldata.clone(), note).await?;
+        decode_reverted_receipt::<NoOpErrorRegistry>(
+            self.provider(),
+            self.address(),
+            contract,
+            calldata,
+            receipt,
+        )
+        .await
+    }
+
     /// Submit a typed contract call with automatic revert decoding.
     ///
     /// Encodes the call via `SolCall::abi_encode()`, delegates to
@@ -350,6 +376,26 @@ impl<Inner: Wallet + ?Sized> Wallet for Arc<Inner> {
         note: &str,
     ) -> Result<TransactionReceipt, EvmError> {
         (**self).send(contract, calldata, note).await
+    }
+
+    async fn submit_raw(
+        &self,
+        contract: Address,
+        calldata: Bytes,
+        note: &str,
+    ) -> Result<TransactionReceipt, EvmError>
+    where
+        Self: Sized,
+    {
+        let receipt = self.send(contract, calldata.clone(), note).await?;
+        decode_reverted_receipt::<NoOpErrorRegistry>(
+            self.provider(),
+            self.address(),
+            contract,
+            calldata,
+            receipt,
+        )
+        .await
     }
 
     async fn submit<Registry: IntoErrorRegistry, Call: SolCall + Send>(
