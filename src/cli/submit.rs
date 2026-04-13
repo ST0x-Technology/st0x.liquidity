@@ -75,7 +75,6 @@ pub(crate) fn parse_stdin_lines(reader: impl BufRead) -> Result<Vec<Transaction>
 }
 
 pub(crate) fn parse_flag_transaction(to: Address, data: &str) -> Result<Transaction, SubmitError> {
-    let data = data.strip_prefix("0x").unwrap_or(data);
     let bytes = hex::decode(data).map_err(|source| SubmitError::InvalidFlagCalldata {
         raw: data.to_string(),
         source,
@@ -105,7 +104,6 @@ fn parse_transaction_line(line_number: usize, line: &str) -> Result<Transaction,
         })?;
 
     let data_str = data_str.trim();
-    let data_str = data_str.strip_prefix("0x").unwrap_or(data_str);
     let bytes = hex::decode(data_str).map_err(|source| SubmitError::InvalidCalldata {
         line_number,
         raw: data_str.to_string(),
