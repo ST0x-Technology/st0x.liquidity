@@ -56,6 +56,12 @@ pub fn encrypt_token(
     Ok(EncryptedToken::new(combined))
 }
 
+/// Decrypts an [`EncryptedToken`] using AES-256-GCM.
+///
+/// # Errors
+///
+/// Returns [`EncryptionError`] if the ciphertext is too short,
+/// decryption fails, or the result is not valid UTF-8.
 pub fn decrypt_token(
     key: &EncryptionKey,
     token: &EncryptedToken,
