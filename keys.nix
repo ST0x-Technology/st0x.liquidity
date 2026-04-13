@@ -1,7 +1,10 @@
 rec {
-  # Tailscale MagicDNS hostname for the production server.
-  # Referenced by infra/default.nix and .github/workflows/ci.yaml.
-  tailscaleHost = "st0x-liquidity-nixos";
+  # Tailscale MagicDNS hostnames per environment. Referenced by
+  # infra/default.nix (local tooling) and the deploy workflows.
+  tailscaleHost = {
+    prod = "st0x-liquidity-nixos";
+    staging = "st0x-liquidity-staging";
+  };
 
   keys = {
     # purpose: dev/ops

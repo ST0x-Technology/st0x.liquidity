@@ -114,12 +114,14 @@ in {
       };
     };
 
-    # One-off (non-reusable) auth key. After initial enrollment, Tailscale
-    # re-authenticates via the stored node key in /var/lib/tailscale, so the
-    # auth key is only needed once.
+    # Per-environment reusable, tagged auth key. Used only on first
+    # enrollment — after that Tailscale re-authenticates via the stored
+    # node key in /var/lib/tailscale. To rotate the node identity
+    # (e.g. re-tag), run `tailscale up --force-reauth --auth-key ...`
+    # manually on the droplet.
     tailscale = {
       enable = true;
-      authKeyFile = "/run/agenix/tailscale-authkey";
+      authKeyFile = "/run/agenix/tailscale-authkey-${environment}";
     };
 
     fail2ban = {
@@ -180,10 +182,11 @@ in {
 
   networking.firewall = {
     enable = true;
-    allowedTCPPorts = [
-      22 # SSH
-      80 # Dashboard
-    ];
+    # All inbound access is gated by the DO Cloud Firewall (infra/modules/stack)
+    # which only permits Tailscale WireGuard. SSH and the dashboard are reached
+    # exclusively over tailscale0, which is trusted below and bypasses the
+    # NixOS firewall entirely.
+    allowedTCPPorts = [ ];
     allowedUDPPorts = [
       41641 # Tailscale WireGuard
     ];
@@ -217,8 +220,8 @@ in {
       group = "st0x";
       mode = "0640";
     };
-    "tailscale-authkey" = {
-      file = ./secret/tailscale-authkey.age;
+    "tailscale-authkey-${environment}" = {
+      file = ./secret/tailscale-authkey-${environment}.age;
       mode = "0400";
     };
   };
