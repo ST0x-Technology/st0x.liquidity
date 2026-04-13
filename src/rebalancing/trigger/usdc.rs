@@ -123,15 +123,29 @@ pub(super) async fn check_imbalance_and_build_operation(
                 Ok(TriggeredOperation::UsdcAlpacaToBase { amount: capped })
             }
         }
-        Imbalance::TooMuchOnchain { excess } => Ok(TriggeredOperation::UsdcBaseToAlpaca {
-            amount: truncate_for_transfer(cap_usdc(excess, usdc_limit)).map_err(|error| {
+        Imbalance::TooMuchOnchain { excess } => {
+            let amount = truncate_for_transfer(cap_usdc(excess, usdc_limit)).map_err(|error| {
                 warn!(
                     ?error,
                     "Failed to truncate onchain USDC imbalance for transfer"
                 );
                 UsdcTriggerSkip::ArithmeticError
-            })?,
-        }),
+            })?;
+
+            if amount
+                .inner()
+                .is_zero()
+                .map_err(|_| UsdcTriggerSkip::NoImbalance)?
+            {
+                debug!(
+                    excess = ?excess,
+                    "Skipping onchain USDC rebalance because truncation collapsed the transfer to zero"
+                );
+                return Err(UsdcTriggerSkip::NoImbalance);
+            }
+
+            Ok(TriggeredOperation::UsdcBaseToAlpaca { amount })
+        }
     }
 }
 
@@ -448,5 +462,22 @@ mod tests {
         let truncated = truncate_for_transfer(original).unwrap();
 
         assert_eq!(truncated, original);
+    }
+
+    #[tokio::test]
+    async fn too_much_onchain_skips_when_truncation_would_send_zero() {
+        let inventory =
+            InventoryView::default().with_usdc(Usdc::new(float!(0.0000009)), Usdc::new(float!(0)));
+
+        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
+        let threshold = ImbalanceThreshold {
+            target: float!(0.5),
+            deviation: float!(0.2),
+        };
+
+        let result = check_imbalance_and_build_operation(&threshold, &inventory, None).await;
+
+        assert_eq!(result, Err(UsdcTriggerSkip::NoImbalance));
     }
 }

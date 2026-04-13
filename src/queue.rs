@@ -9,7 +9,7 @@ use std::str::FromStr;
 use tracing::{error, info, warn};
 
 use crate::bindings::IOrderBookV6::{ClearV3, TakeOrderV3};
-use crate::onchain::trade::TradeEvent;
+use crate::onchain::trade::RaindexTradeEvent as TradeEvent;
 
 /// Trait for events that can be enqueued
 pub(crate) trait Enqueueable {

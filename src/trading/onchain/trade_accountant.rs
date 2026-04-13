@@ -287,6 +287,7 @@ mod tests {
             offchain_order,
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: ctx.assets.clone(),
+            counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
 
         let accountant_ctx = AccountantCtx {

@@ -22,7 +22,7 @@ pub(super) struct AccountFunds {
 struct PositionResponse {
     symbol: String,
     #[serde(
-        rename = "qty",
+        rename = "qty_available",
         deserialize_with = "deserialize_float_from_number_or_string"
     )]
     quantity: Float,
@@ -37,11 +37,8 @@ struct PositionResponse {
 pub(super) struct AccountResponse {
     #[serde(deserialize_with = "deserialize_float_from_number_or_string")]
     pub(super) cash: Float,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_option_float_from_number_or_string"
-    )]
-    pub(super) non_marginable_buying_power: Option<Float>,
+    #[serde(deserialize_with = "deserialize_float_from_number_or_string")]
+    pub(super) non_marginable_buying_power: Float,
 }
 
 pub(super) async fn fetch_inventory(
@@ -78,13 +75,8 @@ pub(super) async fn get_account_funds(
 ) -> Result<AccountFunds, AlpacaTradingApiError> {
     let account = get_account_details(client).await?;
     let cash_balance_cents = to_cash_value_cents(account.cash)?;
-    let margin_safe_buying_power_cents = account
-        .non_marginable_buying_power
-        .map(to_cash_value_cents)
-        .transpose()?
-        .map_or(cash_balance_cents, |available| {
-            available.min(cash_balance_cents)
-        });
+    let margin_safe_buying_power_cents =
+        to_cash_value_cents(account.non_marginable_buying_power)?.min(cash_balance_cents);
 
     Ok(AccountFunds {
         cash_balance_cents,

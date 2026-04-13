@@ -195,6 +195,12 @@ impl Executor for MockExecutor {
         &self,
         order: MarketOrder,
     ) -> Result<CounterTradePreflight, Self::Error> {
+        if self.should_fail {
+            return Err(ExecutionError::MockFailure {
+                message: self.failure_message.clone(),
+            });
+        }
+
         let InventoryResult::Fetched(inventory) = &self.inventory_result else {
             return Ok(CounterTradePreflight::Allowed { reservation: None });
         };
@@ -464,6 +470,23 @@ mod tests {
                 estimated_cost_cents,
                 available_buying_power_cents,
             }) if estimated_cost_cents == 20_200 && available_buying_power_cents == 10_000
+        ));
+    }
+
+    #[tokio::test]
+    async fn preflight_counter_trade_returns_error_when_should_fail() {
+        let executor = MockExecutor::with_failure("preflight failed");
+
+        assert!(matches!(
+            executor
+                .preflight_counter_trade(MarketOrder {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    shares: positive_shares("2"),
+                    direction: Direction::Buy,
+                })
+                .await
+                .unwrap_err(),
+            ExecutionError::MockFailure { message } if message == "preflight failed"
         ));
     }
 }

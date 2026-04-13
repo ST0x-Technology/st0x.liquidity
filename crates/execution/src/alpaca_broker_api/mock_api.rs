@@ -647,7 +647,7 @@ fn register_positions_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>
                         let abs_qty = pos.quantity.abs()?;
                         Ok(json!({
                             "symbol": pos.symbol,
-                            "qty": format_float_with_fallback(&abs_qty),
+                            "qty_available": format_float_with_fallback(&abs_qty),
                             "market_value": format_float_with_fallback(&pos.market_value),
                             "side": side,
                             "avg_entry_price": "0",

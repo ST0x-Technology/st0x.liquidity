@@ -570,6 +570,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(estimated_cost_cents, 20_200);
+
+        let rounded_up_cost_cents = estimate_buffered_cost_cents(
+            Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            float!(100.005),
+            DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+        )
+        .unwrap();
+
+        assert_eq!(rounded_up_cost_cents, 10_101);
     }
 
     #[test]

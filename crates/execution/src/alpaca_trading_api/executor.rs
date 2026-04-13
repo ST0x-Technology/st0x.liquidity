@@ -144,7 +144,7 @@ impl Executor for AlpacaTradingApi {
                 let account_funds = super::inventory::get_account_funds(&self.client).await?;
                 let estimated_cost_cents = estimate_buffered_cost_cents(
                     order.shares,
-                    latest_trade_price,
+                    latest_trade_price.inner(),
                     self.counter_trade_slippage_bps,
                 )?;
 
@@ -237,7 +237,7 @@ mod tests {
                 .json_body(json!([
                     {
                         "symbol": "AAPL",
-                        "qty": "10.5",
+                        "qty_available": "10.5",
                         "market_value": "1575.00"
                     }
                 ]));

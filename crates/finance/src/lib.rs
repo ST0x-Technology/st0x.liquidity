@@ -31,6 +31,18 @@ pub trait HasZero: Sized + Copy {
     fn is_negative(&self) -> Result<bool, FloatError>;
 }
 
+impl HasZero for Float {
+    const ZERO: Self = Self::from_raw(alloy_primitives::B256::ZERO);
+
+    fn is_zero(&self) -> Result<bool, FloatError> {
+        Self::is_zero(*self)
+    }
+
+    fn is_negative(&self) -> Result<bool, FloatError> {
+        self.lt(Self::ZERO)
+    }
+}
+
 /// Value must be positive (greater than zero).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("value must be positive, got {value:?}")]
