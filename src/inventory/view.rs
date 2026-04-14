@@ -995,7 +995,8 @@ impl InventoryView {
             | BaseWalletUsdc { .. }
             | AlpacaWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
-            | BaseWalletWrappedEquity { .. } => Ok(self),
+            | BaseWalletWrappedEquity { .. }
+            | OffchainMarginSafeBuyingPower { .. } => Ok(self),
 
             InflightEquity {
                 mints, redemptions, ..
@@ -1074,7 +1075,8 @@ impl InventoryView {
             | BaseWalletUsdc { .. }
             | AlpacaWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
-            | BaseWalletWrappedEquity { .. } => Ok(self),
+            | BaseWalletWrappedEquity { .. }
+            | OffchainMarginSafeBuyingPower { .. } => Ok(self),
 
             InflightEquity {
                 mints,

@@ -149,19 +149,20 @@ in {
             };
 
         in {
-          "${env}DeployNixos" =
-            mkDeployScript "deploy-nixos" { target = ".#${nodeName}.system"; };
+          "${env}DeployNixos" = mkDeployScript "${env}-deploy-nixos" {
+            target = ".#${nodeName}.system";
+          };
 
-          "${env}DeployService" = mkDeployScript "deploy-service" {
+          "${env}DeployService" = mkDeployScript "${env}-deploy-service" {
             prelude = ''
-              profile="''${1:?usage: deploy-service <profile>}"
+              profile="''${1:?usage: ${env}-deploy-service <profile>}"
               shift
             '';
             target = ''.#${nodeName}."$profile"'';
           };
 
           "${env}DeployAll" =
-            mkDeployScript "deploy-all" { target = ".#${nodeName}"; };
+            mkDeployScript "${env}-deploy-all" { target = ".#${nodeName}"; };
         };
 
     in builtins.foldl' (acc: env: acc // mkEnvDeployScripts env) { }

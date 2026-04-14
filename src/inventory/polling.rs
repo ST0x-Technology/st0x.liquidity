@@ -418,6 +418,15 @@ where
             )
             .await?;
 
+        self.snapshot
+            .send(
+                snapshot_id,
+                InventorySnapshotCommand::OffchainMarginSafeBuyingPower {
+                    margin_safe_buying_power_cents: inventory.margin_safe_buying_power_cents,
+                },
+            )
+            .await?;
+
         Ok(())
     }
 
@@ -718,6 +727,7 @@ mod tests {
                 },
             ],
             usd_balance_cents: 10_000_000,
+            margin_safe_buying_power_cents: Some(10_000_000),
         };
         let executor = MockExecutor::new().with_inventory(inventory.clone());
 
@@ -766,6 +776,7 @@ mod tests {
         let inventory = Inventory {
             positions: vec![],
             usd_balance_cents: 25_000_000, // $250,000.00
+            margin_safe_buying_power_cents: Some(25_000_000),
         };
         let executor = MockExecutor::new().with_inventory(inventory);
 
@@ -810,6 +821,7 @@ mod tests {
         let inventory = Inventory {
             positions: vec![],
             usd_balance_cents: 5_000_000,
+            margin_safe_buying_power_cents: Some(5_000_000),
         };
         let executor = MockExecutor::new().with_inventory(inventory);
 
@@ -902,6 +914,7 @@ mod tests {
                 market_value: Some(float!(150000)),
             }],
             usd_balance_cents: -5_000_000, // -$50,000 (margin debt)
+            margin_safe_buying_power_cents: Some(0),
         };
         let executor = MockExecutor::new().with_inventory(inventory);
 
@@ -951,6 +964,7 @@ mod tests {
                 market_value: Some(float!(1851.75)),
             }],
             usd_balance_cents: 1_000_000,
+            margin_safe_buying_power_cents: Some(1_000_000),
         };
         let executor = MockExecutor::new().with_inventory(inventory);
 
@@ -994,6 +1008,7 @@ mod tests {
         let inventory = Inventory {
             positions: vec![],
             usd_balance_cents: 10_000,
+            margin_safe_buying_power_cents: Some(10_000),
         };
         let executor = MockExecutor::new().with_inventory(inventory);
 

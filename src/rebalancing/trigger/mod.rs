@@ -526,6 +526,9 @@ impl RebalancingTrigger {
             | AlpacaWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
             | BaseWalletWrappedEquity { .. }
+            // Buying power is display-only and doesn't feed venue balances,
+            // so it never drives a rebalance.
+            | OffchainMarginSafeBuyingPower { .. }
             // Inflight snapshots don't trigger rebalancing -- they indicate
             // transfers already in progress, not new balances to rebalance.
             | InflightEquity { .. } => {}

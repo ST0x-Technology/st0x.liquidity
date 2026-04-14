@@ -13,6 +13,10 @@ let
     agePath = "${file}.age";
     decrypt = ''
       if [ -f ${file}.age ]; then
+        if [ -z "''${identity:-}" ]; then
+          echo "ERROR: decrypting ${file}.age requires an identity -- pass -i <path> or set SSH_IDENTITY" >&2
+          exit 1
+        fi
         rage -d -i "$identity" ${file}.age > ${file}
       fi
     '';
@@ -87,12 +91,18 @@ let
       fi
       identity="$2"
       shift 2
-    else
+    elif [ -n "''${SSH_IDENTITY:-}" ]; then
+      identity="$SSH_IDENTITY"
+    elif [ -f "$HOME/.ssh/id_ed25519" ]; then
       identity="$HOME/.ssh/id_ed25519"
-      if [ ! -f "$identity" ]; then
-        echo "ERROR: no -i flag and default key $identity not found" >&2
-        exit 1
-      fi
+    else
+      echo "ERROR: no SSH identity found. Options:" >&2
+      echo "  1. Start Tailscale:  tailscale up  (bypasses key requirement)" >&2
+      echo "  2. 1Password:        $0 --op op://vault/item" >&2
+      echo "  3. Env var:          SSH_IDENTITY=/path/to/key $0" >&2
+      echo "  4. Key file:         $0 -i /path/to/key" >&2
+      echo "  5. Default key:      place key at $HOME/.ssh/id_ed25519" >&2
+      exit 1
     fi
   '';
 
@@ -172,6 +182,7 @@ let
         if tailscale status >/dev/null 2>&1; then
           host_ip="${tailscaleHost.${env}}"
         else
+          echo "Tailscale not connected, resolving ${env} host via encrypted IP cache..." >&2
           ${remoteFile.decrypt}
           host_ip=$(cat ${remoteFile.path})
           rm -f ${remoteFile.path}
@@ -187,7 +198,7 @@ let
         text = ''
           ${resolveHost}
           trap _cleanup_identity EXIT
-          ssh -i "$identity" "root@$host_ip" "$@"
+          exec ssh ''${identity:+-i "$identity"} "root@$host_ip" "$@"
         '';
       };
 
@@ -209,8 +220,8 @@ let
           ${resolveHost}
           trap _cleanup_identity EXIT
           echo "Starting st0x-hedge on ${env}..."
-          ssh -i "$identity" "root@$host_ip" "mkdir -p /run/st0x && touch /run/st0x/st0x-hedge.ready && systemctl start st0x-hedge"
-          ssh -i "$identity" "root@$host_ip" systemctl is-active st0x-hedge
+          ssh ''${identity:+-i "$identity"} "root@$host_ip" "mkdir -p /run/st0x && touch /run/st0x/st0x-hedge.ready && systemctl start st0x-hedge"
+          ssh ''${identity:+-i "$identity"} "root@$host_ip" systemctl is-active st0x-hedge
         '';
       };
 
@@ -221,7 +232,7 @@ let
           ${resolveHost}
           trap _cleanup_identity EXIT
           echo "Stopping st0x-hedge on ${env}..."
-          ssh -i "$identity" "root@$host_ip" "systemctl stop st0x-hedge && rm -f /run/st0x/st0x-hedge.ready"
+          ssh ''${identity:+-i "$identity"} "root@$host_ip" "systemctl stop st0x-hedge && rm -f /run/st0x/st0x-hedge.ready"
           echo "Stopped."
         '';
       };
@@ -233,8 +244,8 @@ let
           ${resolveHost}
           trap _cleanup_identity EXIT
           echo "Restarting st0x-hedge on ${env}..."
-          ssh -i "$identity" "root@$host_ip" "mkdir -p /run/st0x && touch /run/st0x/st0x-hedge.ready && systemctl restart st0x-hedge"
-          ssh -i "$identity" "root@$host_ip" systemctl is-active st0x-hedge
+          ssh ''${identity:+-i "$identity"} "root@$host_ip" "mkdir -p /run/st0x && touch /run/st0x/st0x-hedge.ready && systemctl restart st0x-hedge"
+          ssh ''${identity:+-i "$identity"} "root@$host_ip" systemctl is-active st0x-hedge
         '';
       };
 

@@ -12,8 +12,8 @@ let
     runtimeInputs = [ st0x-cli ];
     text = ''
       exec cli \
-        --config "''${STOX_CONFIG:-${./config/cli.toml}}" \
-        --secrets "''${STOX_SECRETS:-/run/agenix/cli.toml}" \
+        --config "''${STOX_CONFIG:-/run/st0x/st0x-hedge.config}" \
+        --secrets "''${STOX_SECRETS:-/run/agenix/st0x-hedge.toml}" \
         "$@"
     '';
   };
@@ -210,21 +210,25 @@ in {
   programs.bash.interactiveShellInit = "set -o vi";
 
   age.secrets = {
-    "cli.toml" = {
-      file = ./secret/cli.toml.age;
-      group = "st0x";
-      mode = "0640";
-    };
     "tailscale-authkey-${environment}" = {
       file = ./secret/tailscale-authkey-${environment}.age;
       mode = "0400";
     };
   };
-  systemd.tmpfiles.rules = [
-    "d /mnt/data 0755 st0x st0x -"
-    "d /mnt/data/grafana 0750 grafana grafana -"
-  ];
-  systemd.services = lib.mapAttrs mkService enabledServices;
+  systemd = {
+    tmpfiles.rules = [
+      "d /mnt/data 0755 st0x st0x -"
+      "d /mnt/data/grafana 0750 grafana grafana -"
+    ];
+
+    services = lib.mapAttrs mkService enabledServices // {
+      # Clean up stale TUN device before tailscaled starts. During NixOS
+      # activation the old tailscaled may still hold /dev/net/tun when the
+      # new unit starts, causing a crash-loop.
+      tailscaled.serviceConfig.ExecStartPre =
+        [ "-${pkgs.iproute2}/bin/ip link delete tailscale0" ];
+    };
+  };
 
   environment.systemPackages = with pkgs; [
     bat

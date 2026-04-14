@@ -15,6 +15,7 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::str::FromStr;
 use std::sync::Arc;
+use tokio::time::{Duration, sleep};
 use tracing::{error, info, warn};
 
 use crate::EventSourced;
@@ -533,7 +534,10 @@ where
         let (id, event) = event.into_inner();
         let view_id = id.to_string();
 
-        let max_retries = 3;
+        // Retry with exponential backoff: 10ms, 20ms, 40ms, ... capped at 1s.
+        // 10 retries gives ~4s of total retry budget, enough for any realistic
+        // burst of concurrent writers on the same aggregate.
+        let max_retries = 10u32;
 
         for attempt in 0..=max_retries {
             let (mut lifecycle, context) = match self.repo.load_with_context(&view_id).await {
@@ -550,10 +554,12 @@ where
             match self.repo.update_view(lifecycle, context).await {
                 Ok(()) => return Ok(()),
                 Err(PersistenceError::OptimisticLockError) if attempt < max_retries => {
+                    let delay_ms = 10u64 * (1u64 << attempt.min(6));
                     warn!(
-                        %view_id, attempt = attempt + 1, max_retries,
+                        %view_id, attempt = attempt + 1, max_retries, delay_ms,
                         "Optimistic lock conflict, retrying view update"
                     );
+                    sleep(Duration::from_millis(delay_ms)).await;
                 }
                 Err(PersistenceError::OptimisticLockError) => {
                     error!(
