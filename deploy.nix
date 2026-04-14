@@ -125,6 +125,7 @@ in {
             ssh-keygen -R "$host_ip" >/dev/null 2>&1 || true
             echo "$expected" >> "$HOME/.ssh/known_hosts"
 
+            identity="''${SSH_IDENTITY:-$HOME/.ssh/id_ed25519}"
             ssh_flag=""
             if [ "$identity" != "$HOME/.ssh/id_ed25519" ]; then
               export NIX_SSHOPTS="-i $identity"
