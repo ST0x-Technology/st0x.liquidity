@@ -17,10 +17,10 @@ let
       (builtins.attrNames services)));
 
   # Links latest config, decrypts secrets, and restarts service atomically
-  mkServiceProfile = name:
+  mkServiceProfile = env: name:
     let
       cfg = services.${name};
-      configFile = ./config/${name}.toml;
+      configFile = ./config/${env}/${name}.toml;
       secretsFile = ./secret/${cfg.encryptedSecret};
     in activate.custom st0xPackage (builtins.concatStringsSep " && " [
       "systemctl stop ${name} || true"
@@ -34,12 +34,12 @@ let
       "systemctl restart ${name}"
     ]);
 
-  mkProfile = name: {
-    path = mkServiceProfile name;
+  mkProfile = env: name: {
+    path = mkServiceProfile env name;
     profilePath = "${profileBase}/${name}";
   };
 
-  mkNode = { nixosConfig }: {
+  mkNode = { env, nixosConfig }: {
     hostname = builtins.getEnv "DEPLOY_HOST";
     sshUser = "root";
     user = "root";
@@ -55,7 +55,7 @@ let
       };
     } // builtins.listToAttrs (map (name: {
       inherit name;
-      value = mkProfile name;
+      value = mkProfile env name;
     }) enabledServices);
   };
 
@@ -65,8 +65,10 @@ in {
       let cfg = environments.${env};
       in {
         name = cfg.nodeName;
-        value =
-          mkNode { nixosConfig = self.nixosConfigurations.${cfg.nodeName}; };
+        value = mkNode {
+          inherit env;
+          nixosConfig = self.nixosConfigurations.${cfg.nodeName};
+        };
       }) (builtins.attrNames environments));
   };
 
