@@ -27,10 +27,11 @@ use st0x_finance::Usdc;
 
 use crate::config::AssetsConfig;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent, RedemptionAggregateId};
+use crate::inventory::projection::{InventoryProjection, InventoryProjectionError};
 use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::{
-    BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, InventoryViewError,
-    Operator, TransferOp, Venue,
+    BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryViewError, Operator, TransferOp,
+    Venue,
 };
 use crate::position::{Position, PositionEvent};
 use crate::tokenized_equity_mint::{
@@ -47,6 +48,8 @@ use crate::wrapper::Wrapper;
 pub(crate) enum RebalancingTriggerError {
     #[error(transparent)]
     Inventory(#[from] InventoryViewError),
+    #[error(transparent)]
+    Projection(#[from] InventoryProjectionError),
     #[error(transparent)]
     EquityTrigger(#[from] equity::EquityTriggerError),
     #[error("float arithmetic error: {0}")]
@@ -439,6 +442,10 @@ pub(crate) struct RebalancingTrigger {
     orderbook: Address,
     order_owner: Address,
     inventory: Arc<BroadcastingInventory>,
+    /// Folds snapshot events into the view before threshold checks run.
+    /// Gating the checks on a successful apply keeps stale-view
+    /// rebalancing decisions from slipping past a projection failure.
+    projection: Arc<InventoryProjection>,
     pub(crate) equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
     pub(crate) usdc_in_progress: Arc<AtomicBool>,
     sender: mpsc::Sender<TriggeredOperation>,
@@ -464,12 +471,14 @@ impl RebalancingTrigger {
         sender: mpsc::Sender<TriggeredOperation>,
         wrapper: Arc<dyn Wrapper>,
     ) -> Self {
+        let projection = Arc::new(InventoryProjection::new(inventory.clone()));
         Self {
             config,
             vault_registry,
             orderbook,
             order_owner,
             inventory,
+            projection,
             equity_in_progress: Arc::new(std::sync::RwLock::new(HashSet::new())),
             usdc_in_progress: Arc::new(AtomicBool::new(false)),
             sender,
@@ -480,190 +489,14 @@ impl RebalancingTrigger {
         }
     }
 
-    /// Process a snapshot event under normal operation.
+    /// Fold the snapshot event into the view, then run threshold
+    /// checks. A failed apply (including recovery) short-circuits the
+    /// checks so rebalancing never runs against a stale view.
     async fn on_snapshot(
         &self,
         event: InventorySnapshotEvent,
     ) -> Result<(), RebalancingTriggerError> {
-        let now = Utc::now();
-        let fetched_at = event.timestamp();
-        let mut inventory = self.inventory.write().await;
-
-        use InventorySnapshotEvent::*;
-        let updated =
-            match &event {
-                OnchainEquity { balances, .. } => balances.iter().try_fold(
-                    inventory.clone(),
-                    |view, (symbol, snapshot_balance)| {
-                        view.update_equity(
-                            symbol,
-                            Inventory::on_snapshot(
-                                Venue::MarketMaking,
-                                *snapshot_balance,
-                                fetched_at,
-                            ),
-                            now,
-                        )
-                    },
-                ),
-
-                OnchainUsdc { usdc_balance, .. } => inventory.clone().update_usdc(
-                    Inventory::on_snapshot(Venue::MarketMaking, *usdc_balance, fetched_at),
-                    now,
-                ),
-
-                OffchainEquity { positions, .. } => positions.iter().try_fold(
-                    inventory.clone(),
-                    |view, (symbol, snapshot_balance)| {
-                        view.update_equity(
-                            symbol,
-                            Inventory::on_snapshot(Venue::Hedging, *snapshot_balance, fetched_at),
-                            now,
-                        )
-                    },
-                ),
-
-                OffchainUsd {
-                    usd_balance_cents, ..
-                } => {
-                    let usdc = Usdc::from_cents(*usd_balance_cents)
-                        .ok_or(InventoryViewError::UsdBalanceConversion(*usd_balance_cents))?;
-                    inventory.clone().update_usdc(
-                        Inventory::on_snapshot(Venue::Hedging, usdc, fetched_at),
-                        now,
-                    )
-                }
-
-                EthereumUsdc { .. }
-                | BaseWalletUsdc { .. }
-                | AlpacaWalletUsdc { .. }
-                | BaseWalletUnwrappedEquity { .. }
-                | BaseWalletWrappedEquity { .. } => Ok(inventory.clone()),
-
-                InflightEquity {
-                    mints, redemptions, ..
-                } => inventory
-                    .clone()
-                    .apply_inflight_snapshot(mints, redemptions, fetched_at, now),
-            }?;
-
-        *inventory = updated;
-        drop(inventory);
-
-        debug!("Applied inventory snapshot event");
-
-        self.check_and_trigger_after_snapshot(&event).await
-    }
-
-    /// Reprocess a snapshot event after the normal handler failed.
-    ///
-    /// Resets the inventory, then force-applies the snapshot --
-    /// bypassing inflight guards that may have caused the
-    /// original failure.
-    async fn on_snapshot_recovery(
-        &self,
-        error: RebalancingTriggerError,
-        event: InventorySnapshotEvent,
-    ) -> Result<(), RebalancingTriggerError> {
-        let inventory_error = match error {
-            RebalancingTriggerError::Inventory(inventory_error) => inventory_error,
-            other @ (RebalancingTriggerError::EquityTrigger(_)
-            | RebalancingTriggerError::Float(_)
-            | RebalancingTriggerError::MissingUsdcTrackingContext { .. }
-            | RebalancingTriggerError::MissingUsdcBridgedAmount { .. }
-            | RebalancingTriggerError::SettledUsdcExceedsInitiatedAmount { .. }) => {
-                return Err(other);
-            }
-        };
-
-        warn!(
-            ?inventory_error,
-            "Resetting inventory and force-applying snapshot to recover"
-        );
-
-        // Wrap in Arc so it can be cloned across multiple force_on_snapshot calls
-        let recovery_reason = Arc::new(inventory_error);
-
-        let now = Utc::now();
-        let mut inventory = self.inventory.write().await;
-        *inventory = InventoryView::default();
-
-        use InventorySnapshotEvent::*;
-        let updated = match &event {
-            OnchainEquity { balances, .. } => {
-                balances
-                    .iter()
-                    .try_fold(inventory.clone(), |view, (symbol, snapshot_balance)| {
-                        view.update_equity(
-                            symbol,
-                            Inventory::force_on_snapshot(
-                                Venue::MarketMaking,
-                                *snapshot_balance,
-                                recovery_reason.clone(),
-                            ),
-                            now,
-                        )
-                    })
-            }
-
-            OnchainUsdc { usdc_balance, .. } => inventory.clone().update_usdc(
-                Inventory::force_on_snapshot(
-                    Venue::MarketMaking,
-                    *usdc_balance,
-                    recovery_reason.clone(),
-                ),
-                now,
-            ),
-
-            OffchainEquity { positions, .. } => {
-                positions
-                    .iter()
-                    .try_fold(inventory.clone(), |view, (symbol, snapshot_balance)| {
-                        view.update_equity(
-                            symbol,
-                            Inventory::force_on_snapshot(
-                                Venue::Hedging,
-                                *snapshot_balance,
-                                recovery_reason.clone(),
-                            ),
-                            now,
-                        )
-                    })
-            }
-
-            OffchainUsd {
-                usd_balance_cents, ..
-            } => {
-                let usdc = Usdc::from_cents(*usd_balance_cents)
-                    .ok_or(InventoryViewError::UsdBalanceConversion(*usd_balance_cents))?;
-                inventory.clone().update_usdc(
-                    Inventory::force_on_snapshot(Venue::Hedging, usdc, recovery_reason),
-                    now,
-                )
-            }
-
-            EthereumUsdc { .. }
-            | BaseWalletUsdc { .. }
-            | AlpacaWalletUsdc { .. }
-            | BaseWalletUnwrappedEquity { .. }
-            | BaseWalletWrappedEquity { .. } => Ok(inventory.clone()),
-
-            // Recovery for inflight snapshots: forward the original fetched_at
-            // so is_stale_for_symbol still rejects pre-rebalancing polls.
-            InflightEquity {
-                mints,
-                redemptions,
-                fetched_at,
-            } => inventory
-                .clone()
-                .apply_inflight_snapshot(mints, redemptions, *fetched_at, now),
-        }?;
-
-        *inventory = updated;
-        drop(inventory);
-
-        debug!("Force-applied inventory snapshot after recovery");
-
+        self.projection.apply(&event).await?;
         self.check_and_trigger_after_snapshot(&event).await
     }
 
@@ -789,10 +622,7 @@ impl Reactor for RebalancingTrigger {
             .on(|id, event| async move { self.on_mint(id, event).await })
             .on(|id, event| async move { self.on_redemption(id, event).await })
             .on(|id, event| async move { self.on_usdc_rebalance(id, event).await })
-            .on_with_fallback(
-                |_id, event| async move { self.on_snapshot(event).await },
-                |error, _id, event| async move { self.on_snapshot_recovery(error, event).await },
-            )
+            .on(|_id, event| async move { self.on_snapshot(event).await })
             .exhaustive()
             .await
     }
@@ -1225,7 +1055,7 @@ mod tests {
     use crate::equity_redemption::DetectionFailure;
     use crate::inventory::snapshot::{InventorySnapshotEvent, InventorySnapshotId};
     use crate::inventory::view::Operator;
-    use crate::inventory::{TransferOp, Venue};
+    use crate::inventory::{InventoryView, TransferOp, Venue};
     use crate::offchain_order::OffchainOrderId;
     use crate::position::{PositionEvent, TradeId};
     use crate::threshold::ExecutionThreshold;
@@ -1280,6 +1110,17 @@ mod tests {
             )),
             receiver,
         )
+    }
+
+    /// Mirrors the production wiring where [`InventoryProjection`] writes
+    /// Drives the trigger's production snapshot path: apply then
+    /// threshold checks, short-circuiting if apply fails.
+    async fn apply_and_dispatch_snapshot(
+        trigger: Arc<RebalancingTrigger>,
+        _id: InventorySnapshotId,
+        event: InventorySnapshotEvent,
+    ) -> Result<(), RebalancingTriggerError> {
+        trigger.on_snapshot(event).await
     }
 
     #[tokio::test]
@@ -2716,7 +2557,6 @@ mod tests {
 
         let (trigger, mut receiver) =
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
-        let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = InventorySnapshotId {
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
@@ -2727,16 +2567,16 @@ mod tests {
         let mut balances = BTreeMap::new();
         balances.insert(symbol.clone(), shares(40));
 
-        harness
-            .receive::<InventorySnapshot>(
-                id.clone(),
-                InventorySnapshotEvent::OnchainEquity {
-                    balances,
-                    fetched_at: Utc::now(),
-                },
-            )
-            .await
-            .unwrap();
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            id.clone(),
+            InventorySnapshotEvent::OnchainEquity {
+                balances,
+                fetched_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
 
         // After snapshot: 40 onchain (reconciled), 20 offchain
         // 40/60 = 66.7% -> within threshold (30%-70%), no trigger
@@ -2768,7 +2608,6 @@ mod tests {
 
         let (trigger, mut receiver) =
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
-        let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = InventorySnapshotId {
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
@@ -2786,16 +2625,16 @@ mod tests {
         let mut positions = BTreeMap::new();
         positions.insert(symbol.clone(), shares(20));
 
-        harness
-            .receive::<InventorySnapshot>(
-                id.clone(),
-                InventorySnapshotEvent::OffchainEquity {
-                    positions,
-                    fetched_at: Utc::now(),
-                },
-            )
-            .await
-            .unwrap();
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            id.clone(),
+            InventorySnapshotEvent::OffchainEquity {
+                positions,
+                fetched_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
 
         // After snapshot: 20 onchain, 20 offchain = balanced
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
@@ -3086,7 +2925,6 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let (trigger, mut receiver) =
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
-        let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = InventorySnapshotId {
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
@@ -3100,16 +2938,16 @@ mod tests {
         );
 
         // Snapshot says onchain is actually 900 -> creates imbalance
-        harness
-            .receive::<InventorySnapshot>(
-                id.clone(),
-                InventorySnapshotEvent::OnchainUsdc {
-                    usdc_balance: usdc(900),
-                    fetched_at: Utc::now(),
-                },
-            )
-            .await
-            .unwrap();
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            id.clone(),
+            InventorySnapshotEvent::OnchainUsdc {
+                usdc_balance: usdc(900),
+                fetched_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
 
         // Now 900 onchain, 500 offchain = 64% ratio -> with target 50% deviation 30%,
         // upper bound = 80%, so 64% is within threshold -> no trigger
@@ -3133,7 +2971,6 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let (trigger, mut receiver) =
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
-        let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = InventorySnapshotId {
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
@@ -3149,16 +2986,16 @@ mod tests {
 
         // Snapshot says offchain is actually 900 (not 100)
         // 95000 cents = $950.00
-        harness
-            .receive::<InventorySnapshot>(
-                id.clone(),
-                InventorySnapshotEvent::OffchainUsd {
-                    usd_balance_cents: 90000,
-                    fetched_at: Utc::now(),
-                },
-            )
-            .await
-            .unwrap();
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            id.clone(),
+            InventorySnapshotEvent::OffchainUsd {
+                usd_balance_cents: 90000,
+                fetched_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
 
         // Now 900 onchain, 900 offchain = balanced -> no trigger
         trigger.check_and_trigger_usdc().await;
@@ -4562,7 +4399,6 @@ mod tests {
             Arc::new(MockWrapper::new()),
         ));
 
-        let harness = ReactorHarness::new(trigger.clone());
         let id = InventorySnapshotId {
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
@@ -4580,8 +4416,7 @@ mod tests {
 
         // React to the onchain event - this should NOT trigger rebalancing
         // because we don't have offchain data yet
-        harness
-            .receive::<InventorySnapshot>(id.clone(), onchain_event.clone())
+        apply_and_dispatch_snapshot(trigger.clone(), id.clone(), onchain_event.clone())
             .await
             .unwrap();
 
@@ -4627,7 +4462,6 @@ mod tests {
             Arc::new(MockWrapper::new()),
         ));
 
-        let harness = ReactorHarness::new(trigger.clone());
         let id = InventorySnapshotId {
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
@@ -4642,8 +4476,7 @@ mod tests {
             fetched_at: Utc::now(),
         };
 
-        harness
-            .receive::<InventorySnapshot>(id.clone(), onchain_event)
+        apply_and_dispatch_snapshot(trigger.clone(), id.clone(), onchain_event)
             .await
             .unwrap();
 
@@ -4662,8 +4495,7 @@ mod tests {
             fetched_at: Utc::now(),
         };
 
-        harness
-            .receive::<InventorySnapshot>(id.clone(), offchain_event)
+        apply_and_dispatch_snapshot(trigger.clone(), id.clone(), offchain_event)
             .await
             .unwrap();
 
@@ -4708,7 +4540,6 @@ mod tests {
             Arc::new(MockWrapper::new()),
         ));
 
-        let harness = ReactorHarness::new(trigger.clone());
         let id = InventorySnapshotId {
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
@@ -4723,8 +4554,7 @@ mod tests {
             fetched_at: Utc::now(),
         };
 
-        harness
-            .receive::<InventorySnapshot>(id.clone(), onchain_event)
+        apply_and_dispatch_snapshot(trigger.clone(), id.clone(), onchain_event)
             .await
             .unwrap();
 
@@ -4770,7 +4600,6 @@ mod tests {
             Arc::new(MockWrapper::new()),
         ));
 
-        let harness = ReactorHarness::new(trigger.clone());
         let id = InventorySnapshotId {
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
@@ -4780,31 +4609,31 @@ mod tests {
         let mut balances = BTreeMap::new();
         balances.insert(symbol.clone(), shares(100));
 
-        harness
-            .receive::<InventorySnapshot>(
-                id.clone(),
-                InventorySnapshotEvent::OnchainEquity {
-                    balances,
-                    fetched_at: Utc::now(),
-                },
-            )
-            .await
-            .unwrap();
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            id.clone(),
+            InventorySnapshotEvent::OnchainEquity {
+                balances,
+                fetched_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
 
         // Now apply offchain data - both venues now have data
         let mut positions = BTreeMap::new();
         positions.insert(symbol.clone(), shares(0));
 
-        harness
-            .receive::<InventorySnapshot>(
-                id.clone(),
-                InventorySnapshotEvent::OffchainEquity {
-                    positions,
-                    fetched_at: Utc::now(),
-                },
-            )
-            .await
-            .unwrap();
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            id.clone(),
+            InventorySnapshotEvent::OffchainEquity {
+                positions,
+                fetched_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
 
         // Verify the trigger fired after both venues have data
         assert!(
@@ -4973,7 +4802,6 @@ mod tests {
 
         let (trigger, mut receiver) =
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
-        let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = InventorySnapshotId {
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
@@ -4991,17 +4819,17 @@ mod tests {
         let mut mints = BTreeMap::new();
         mints.insert(symbol.clone(), shares(10));
 
-        harness
-            .receive::<InventorySnapshot>(
-                id.clone(),
-                InventorySnapshotEvent::InflightEquity {
-                    mints,
-                    redemptions: BTreeMap::new(),
-                    fetched_at: Utc::now(),
-                },
-            )
-            .await
-            .unwrap();
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            id.clone(),
+            InventorySnapshotEvent::InflightEquity {
+                mints,
+                redemptions: BTreeMap::new(),
+                fetched_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
 
         // Inflight should block rebalancing even though ratios are balanced
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
@@ -5059,18 +4887,17 @@ mod tests {
         );
 
         // Empty InflightEquity snapshot: symbol absent, so inflight preserved
-        let harness = ReactorHarness::new(Arc::clone(&trigger));
-        harness
-            .receive::<InventorySnapshot>(
-                id.clone(),
-                InventorySnapshotEvent::InflightEquity {
-                    mints: BTreeMap::new(),
-                    redemptions: BTreeMap::new(),
-                    fetched_at: Utc::now(),
-                },
-            )
-            .await
-            .unwrap();
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            id.clone(),
+            InventorySnapshotEvent::InflightEquity {
+                mints: BTreeMap::new(),
+                redemptions: BTreeMap::new(),
+                fetched_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
 
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
         assert!(
@@ -5147,17 +4974,17 @@ mod tests {
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
         };
-        harness
-            .receive::<InventorySnapshot>(
-                snapshot_id,
-                InventorySnapshotEvent::InflightEquity {
-                    mints: BTreeMap::new(),
-                    redemptions: BTreeMap::new(),
-                    fetched_at: Utc::now(),
-                },
-            )
-            .await
-            .unwrap();
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            snapshot_id,
+            InventorySnapshotEvent::InflightEquity {
+                mints: BTreeMap::new(),
+                redemptions: BTreeMap::new(),
+                fetched_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
 
         assert!(
             trigger
@@ -5212,17 +5039,17 @@ mod tests {
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
         };
-        harness
-            .receive::<InventorySnapshot>(
-                snapshot_id,
-                InventorySnapshotEvent::InflightEquity {
-                    mints: BTreeMap::new(),
-                    redemptions: BTreeMap::new(),
-                    fetched_at: Utc::now(),
-                },
-            )
-            .await
-            .unwrap();
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            snapshot_id,
+            InventorySnapshotEvent::InflightEquity {
+                mints: BTreeMap::new(),
+                redemptions: BTreeMap::new(),
+                fetched_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
 
         assert!(
             trigger
@@ -5278,17 +5105,17 @@ mod tests {
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
         };
-        harness
-            .receive::<InventorySnapshot>(
-                snapshot_id,
-                InventorySnapshotEvent::InflightEquity {
-                    mints: BTreeMap::new(),
-                    redemptions: BTreeMap::new(),
-                    fetched_at: Utc::now(),
-                },
-            )
-            .await
-            .unwrap();
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            snapshot_id,
+            InventorySnapshotEvent::InflightEquity {
+                mints: BTreeMap::new(),
+                redemptions: BTreeMap::new(),
+                fetched_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
 
         assert!(
             !trigger
@@ -5322,7 +5149,6 @@ mod tests {
 
         let (trigger, mut receiver) =
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
-        let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = InventorySnapshotId {
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
@@ -5372,16 +5198,16 @@ mod tests {
         let mut balances = BTreeMap::new();
         balances.insert(symbol.clone(), shares(80));
 
-        harness
-            .receive::<InventorySnapshot>(
-                id,
-                InventorySnapshotEvent::OnchainEquity {
-                    balances,
-                    fetched_at: Utc::now(),
-                },
-            )
-            .await
-            .unwrap();
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            id,
+            InventorySnapshotEvent::OnchainEquity {
+                balances,
+                fetched_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
 
         assert!(
             matches!(
@@ -5413,7 +5239,6 @@ mod tests {
 
         let (trigger, mut receiver) =
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
-        let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = InventorySnapshotId {
             orderbook: TEST_ORDERBOOK,
             owner: TEST_ORDER_OWNER,
@@ -5423,30 +5248,30 @@ mod tests {
         let mut mints = BTreeMap::new();
         mints.insert(symbol.clone(), shares(10));
 
-        harness
-            .receive::<InventorySnapshot>(
-                id.clone(),
-                InventorySnapshotEvent::InflightEquity {
-                    mints: mints.clone(),
-                    redemptions: BTreeMap::new(),
-                    fetched_at: Utc::now(),
-                },
-            )
-            .await
-            .unwrap();
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            id.clone(),
+            InventorySnapshotEvent::InflightEquity {
+                mints: mints.clone(),
+                redemptions: BTreeMap::new(),
+                fetched_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
 
         // Apply same inflight again -- still present, no recheck
-        harness
-            .receive::<InventorySnapshot>(
-                id.clone(),
-                InventorySnapshotEvent::InflightEquity {
-                    mints,
-                    redemptions: BTreeMap::new(),
-                    fetched_at: Utc::now(),
-                },
-            )
-            .await
-            .unwrap();
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            id.clone(),
+            InventorySnapshotEvent::InflightEquity {
+                mints,
+                redemptions: BTreeMap::new(),
+                fetched_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
 
         assert!(
             matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
@@ -5523,17 +5348,17 @@ mod tests {
         let mut stale_mints = BTreeMap::new();
         stale_mints.insert(symbol.clone(), shares(10));
 
-        harness
-            .receive::<InventorySnapshot>(
-                snapshot_id,
-                InventorySnapshotEvent::InflightEquity {
-                    mints: stale_mints,
-                    redemptions: BTreeMap::new(),
-                    fetched_at: Utc::now(),
-                },
-            )
-            .await
-            .unwrap();
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            snapshot_id,
+            InventorySnapshotEvent::InflightEquity {
+                mints: stale_mints,
+                redemptions: BTreeMap::new(),
+                fetched_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
 
         // Inflight is present from the mint snapshot (Hedging venue).
         // No extra rebalance should be triggered by InflightEquity events.
@@ -5614,17 +5439,17 @@ mod tests {
         let mut stale_redemptions = BTreeMap::new();
         stale_redemptions.insert(symbol.clone(), shares(5));
 
-        harness
-            .receive::<InventorySnapshot>(
-                snapshot_id,
-                InventorySnapshotEvent::InflightEquity {
-                    mints: BTreeMap::new(),
-                    redemptions: stale_redemptions,
-                    fetched_at: Utc::now(),
-                },
-            )
-            .await
-            .unwrap();
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            snapshot_id,
+            InventorySnapshotEvent::InflightEquity {
+                mints: BTreeMap::new(),
+                redemptions: stale_redemptions,
+                fetched_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
 
         // No spurious rebalancing from the snapshot
         assert!(
