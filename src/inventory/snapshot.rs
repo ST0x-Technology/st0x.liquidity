@@ -73,6 +73,9 @@ pub(crate) struct InventorySnapshot {
     pub(crate) offchain_equity: BTreeMap<Symbol, FractionalShares>,
     /// Latest offchain USD balance in cents
     pub(crate) offchain_usd_cents: Option<i64>,
+    /// Latest offchain margin-safe buying power in cents (`non_marginable_buying_power`
+    /// capped at cash balance -- the same value used for counter-trade preflight checks)
+    pub(crate) offchain_margin_safe_buying_power_cents: Option<i64>,
     /// Latest Ethereum wallet USDC balance
     pub(crate) ethereum_usdc: Option<Usdc>,
     /// Latest Base wallet USDC balance (outside Raindex vaults)
@@ -102,7 +105,7 @@ impl EventSourced for InventorySnapshot {
 
     const AGGREGATE_TYPE: &'static str = "InventorySnapshot";
     const PROJECTION: Nil = Nil;
-    const SCHEMA_VERSION: u64 = 3;
+    const SCHEMA_VERSION: u64 = 4;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         let mut snapshot = Self {
@@ -110,6 +113,7 @@ impl EventSourced for InventorySnapshot {
             onchain_usdc: None,
             offchain_equity: BTreeMap::new(),
             offchain_usd_cents: None,
+            offchain_margin_safe_buying_power_cents: None,
             ethereum_usdc: None,
             base_wallet_usdc: None,
             inflight_mints: BTreeMap::new(),
@@ -150,6 +154,12 @@ impl EventSourced for InventorySnapshot {
             },
             OffchainUsd { usd_balance_cents } => InventorySnapshotEvent::OffchainUsd {
                 usd_balance_cents,
+                fetched_at: now,
+            },
+            OffchainMarginSafeBuyingPower {
+                margin_safe_buying_power_cents,
+            } => InventorySnapshotEvent::OffchainMarginSafeBuyingPower {
+                margin_safe_buying_power_cents,
                 fetched_at: now,
             },
             EthereumUsdc { usdc_balance } => InventorySnapshotEvent::EthereumUsdc {
@@ -209,6 +219,18 @@ impl EventSourced for InventorySnapshot {
                 usd_balance_cents,
                 fetched_at: now,
             }]),
+            OffchainMarginSafeBuyingPower {
+                margin_safe_buying_power_cents,
+            } => {
+                // Always emit so the status readout reflects poll freshness,
+                // mirroring OffchainUsd.
+                Ok(vec![
+                    InventorySnapshotEvent::OffchainMarginSafeBuyingPower {
+                        margin_safe_buying_power_cents,
+                        fetched_at: now,
+                    },
+                ])
+            }
             EthereumUsdc { usdc_balance } => {
                 if self.ethereum_usdc == Some(usdc_balance) {
                     return Ok(vec![]);
@@ -287,6 +309,12 @@ impl InventorySnapshot {
             } => {
                 self.offchain_usd_cents = Some(*usd_balance_cents);
             }
+            InventorySnapshotEvent::OffchainMarginSafeBuyingPower {
+                margin_safe_buying_power_cents,
+                ..
+            } => {
+                self.offchain_margin_safe_buying_power_cents = *margin_safe_buying_power_cents;
+            }
             InventorySnapshotEvent::EthereumUsdc { usdc_balance, .. } => {
                 self.ethereum_usdc = Some(*usdc_balance);
             }
@@ -325,6 +353,9 @@ pub(crate) enum InventorySnapshotCommand {
     },
     OffchainUsd {
         usd_balance_cents: i64,
+    },
+    OffchainMarginSafeBuyingPower {
+        margin_safe_buying_power_cents: Option<i64>,
     },
     EthereumUsdc {
         usdc_balance: Usdc,
@@ -372,6 +403,10 @@ pub(crate) enum InventorySnapshotEvent {
         usd_balance_cents: i64,
         fetched_at: DateTime<Utc>,
     },
+    OffchainMarginSafeBuyingPower {
+        margin_safe_buying_power_cents: Option<i64>,
+        fetched_at: DateTime<Utc>,
+    },
     #[serde(alias = "EthereumCash")]
     EthereumUsdc {
         usdc_balance: Usdc,
@@ -411,6 +446,7 @@ impl InventorySnapshotEvent {
             | Self::OnchainUsdc { fetched_at, .. }
             | Self::OffchainEquity { fetched_at, .. }
             | Self::OffchainUsd { fetched_at, .. }
+            | Self::OffchainMarginSafeBuyingPower { fetched_at, .. }
             | Self::EthereumUsdc { fetched_at, .. }
             | Self::BaseWalletUsdc { fetched_at, .. }
             | Self::AlpacaWalletUsdc { fetched_at, .. }
@@ -428,6 +464,9 @@ impl DomainEvent for InventorySnapshotEvent {
             Self::OnchainUsdc { .. } => "InventorySnapshotEvent::OnchainUsdc".to_string(),
             Self::OffchainEquity { .. } => "InventorySnapshotEvent::OffchainEquity".to_string(),
             Self::OffchainUsd { .. } => "InventorySnapshotEvent::OffchainUsd".to_string(),
+            Self::OffchainMarginSafeBuyingPower { .. } => {
+                "InventorySnapshotEvent::OffchainMarginSafeBuyingPower".to_string()
+            }
             Self::EthereumUsdc { .. } => "InventorySnapshotEvent::EthereumUsdc".to_string(),
             Self::BaseWalletUsdc { .. } => "InventorySnapshotEvent::BaseWalletUsdc".to_string(),
             Self::AlpacaWalletUsdc { .. } => "InventorySnapshotEvent::AlpacaWalletUsdc".to_string(),
@@ -621,6 +660,43 @@ mod tests {
                 assert_eq!(*event_cents, usd_balance_cents);
             }
             _ => panic!("Expected OffchainUsd event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn offchain_margin_safe_buying_power_emits_even_when_unchanged() {
+        // Unchanged buying power must still emit so the status readout
+        // reflects poll freshness (mirroring OffchainUsd). Without this,
+        // the BuyPwr timestamp would freeze between value changes while
+        // the USD timestamp kept ticking.
+        let margin_safe_buying_power_cents = Some(3_000_000);
+
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![
+                InventorySnapshotEvent::OffchainMarginSafeBuyingPower {
+                    margin_safe_buying_power_cents,
+                    fetched_at: Utc::now(),
+                },
+            ])
+            .when(InventorySnapshotCommand::OffchainMarginSafeBuyingPower {
+                margin_safe_buying_power_cents,
+            })
+            .await
+            .events();
+
+        assert_eq!(
+            events.len(),
+            1,
+            "unchanged OffchainMarginSafeBuyingPower must still emit a fresh event"
+        );
+        match &events[0] {
+            InventorySnapshotEvent::OffchainMarginSafeBuyingPower {
+                margin_safe_buying_power_cents: event_cents,
+                ..
+            } => {
+                assert_eq!(*event_cents, margin_safe_buying_power_cents);
+            }
+            _ => panic!("Expected OffchainMarginSafeBuyingPower event"),
         }
     }
 

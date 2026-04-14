@@ -16,7 +16,6 @@ let
   }) (builtins.attrNames services));
 
 in serviceSecrets // {
-  "cli.toml.age".publicKeys = allServiceKeys;
   "tailscale-authkey-prod.age".publicKeys = roles.prod.service;
   "tailscale-authkey-staging.age".publicKeys = roles.staging.service;
 }

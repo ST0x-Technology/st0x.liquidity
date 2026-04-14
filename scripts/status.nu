@@ -5,14 +5,37 @@
 
 # --- Helpers ---
 
+# Locate the decode-floats binary without invoking cargo if possible.
+# Prefers a pre-built binary in target/ to avoid cargo's startup overhead.
+def find-decode-floats []: nothing -> string {
+  if (which decode-floats | is-not-empty) {
+    "decode-floats"
+  } else if ("target/release/decode-floats" | path exists) {
+    "target/release/decode-floats"
+  } else if ("target/debug/decode-floats" | path exists) {
+    "target/debug/decode-floats"
+  } else {
+    ""
+  }
+}
+
+# Build ssh flags: only pass -i when an identity file is set.
+def ssh-flags []: nothing -> list<string> {
+  if ($env.identity? | is-not-empty) and ($env.identity | str trim | is-not-empty) {
+    ["-i" $env.identity]
+  } else {
+    []
+  }
+}
+
 def ssh-run [cmd: string]: nothing -> string {
-  let result = (^ssh -i $env.identity $"root@($env.host_ip)" $cmd | complete)
+  let result = (^ssh ...(ssh-flags) $"root@($env.host_ip)" $cmd | complete)
   if $result.exit_code == 0 { $result.stdout | str trim } else { "" }
 }
 
 # Pipe SQL via stdin to avoid quoting issues with json_extract('$.field')
 def ssh-sqlite-json [db: string, query: string]: nothing -> list<any> {
-  let result = ($query | ^ssh -i $env.identity $"root@($env.host_ip)" $"sqlite3 -json ($db)" | complete)
+  let result = ($query | ^ssh ...(ssh-flags) $"root@($env.host_ip)" $"sqlite3 -json ($db)" | complete)
   if $result.exit_code == 0 and ($result.stdout | str trim | is-not-empty) {
     try { $result.stdout | from json } catch { [] }
   } else {
@@ -21,7 +44,7 @@ def ssh-sqlite-json [db: string, query: string]: nothing -> list<any> {
 }
 
 def ssh-sqlite-scalar [db: string, query: string]: nothing -> string {
-  let result = ($query | ^ssh -i $env.identity $"root@($env.host_ip)" $"sqlite3 ($db)" | complete)
+  let result = ($query | ^ssh ...(ssh-flags) $"root@($env.host_ip)" $"sqlite3 ($db)" | complete)
   if $result.exit_code == 0 { $result.stdout | str trim } else { "" }
 }
 
@@ -58,12 +81,32 @@ def main [env_name: string] {
 
   let db = "/mnt/data/st0x-hedge.db"
 
-  # Both envs currently share the same subgraph and order_owner
   let subgraph = "https://api.goldsky.com/api/public/project_clv14x04y9kzi01saerx7bxpg/subgraphs/ob4-base/2026-02-05-c4ef/gn"
-  let order_owner = "0x386c24644e532387b03c1992ca83542492a3ac32"
+
+  # Fetch running config upfront so order_owner and other fields are available throughout.
+  # In Standalone mode, order_owner is set explicitly under [raindex].
+  # In Rebalancing mode, order_owner equals the wallet address under [rebalancing.wallet].
+  # For private-key wallets (no explicit address), fall back to the secrets file.
+  let config_str = (ssh-run "cat /run/st0x/st0x-hedge.config 2>/dev/null")
+  let config = if ($config_str | is-not-empty) { try { $config_str | from toml } catch { null } } else { null }
+  let order_owner = if $config != null {
+    let explicit = (try { $config.raindex.order_owner } catch { "" })
+    if ($explicit | is-not-empty) {
+      $explicit
+    } else {
+      # Private-key wallets derive the address at runtime; try both
+      # config locations that could hold it.
+      let wallet_addr = (try { $config.rebalancing.wallet.address } catch { "" })
+      if ($wallet_addr | is-not-empty) {
+        $wallet_addr
+      } else {
+        try { $config.rebalancing.address } catch { "" }
+      }
+    }
+  } else { "" }
 
   # Check service status
-  let is_active = (^ssh -i $env.identity $"root@($env.host_ip)" "systemctl is-active --quiet st0x-hedge" | complete).exit_code == 0
+  let is_active = (^ssh ...(ssh-flags) $"root@($env.host_ip)" "systemctl is-active --quiet st0x-hedge" | complete).exit_code == 0
   let status = if $is_active { "running" } else { "stopped" }
   let status_color = if $is_active { (ansi green) } else { (ansi red) }
   let status_icon = if $is_active { "●" } else { "○" }
@@ -111,33 +154,32 @@ def main [env_name: string] {
   try {
     print ""
     print $"(ansi attr_bold)(ansi cyan)▸ Active Config(ansi reset)"
-    let config_str = (ssh-run "cat /run/st0x/st0x-hedge.config 2>/dev/null")
-    if ($config_str | is-not-empty) {
-      let config = try { $config_str | from toml } catch { null }
-      if $config != null {
-        let log_level = (try { $config.log_level } catch { "" })
-        let deployment_block = (try { $config.deployment_block | into string } catch { "" })
-        let orderbook = (try { $config.orderbook } catch { "" })
-        let cfg_order_owner = (try { $config.order_owner } catch { "" })
+    if $config != null {
+      let log_level = (try { $config.log_level } catch { "" })
+      let deployment_block = (try { $config.deployment_block | into string } catch { "" })
+      let orderbook = (try { $config.orderbook } catch { "" })
 
-        if ($log_level | is-not-empty) { print $"  (ansi attr_dimmed)Log level:(ansi reset)        (ansi attr_bold)(ansi white)($log_level)(ansi reset)" }
-        if ($deployment_block | is-not-empty) { print $"  (ansi attr_dimmed)Deployment block:(ansi reset) (ansi attr_bold)(ansi white)($deployment_block)(ansi reset)" }
-        if ($orderbook | is-not-empty) { print $"  (ansi attr_dimmed)Orderbook:(ansi reset)        (ansi attr_bold)(ansi white)($orderbook)(ansi reset)" }
-        if ($cfg_order_owner | is-not-empty) { print $"  (ansi attr_dimmed)Order owner:(ansi reset)      (ansi attr_bold)(ansi white)($cfg_order_owner)(ansi reset)" }
+      let rebalancing_enabled = (try { $config.rebalancing | is-not-empty } catch { false })
+      let rebalancing_label = if $rebalancing_enabled { $"(ansi green)enabled(ansi reset)" } else { $"(ansi attr_dimmed)disabled(ansi reset)" }
 
-        # Assets (nushell parses TOML natively -- no awk needed)
-        let equities = try { $config.assets.equities } catch { null }
-        if $equities != null {
-          print ""
-          print $"  (ansi attr_dimmed)Assets:(ansi reset)"
-          for symbol in ($equities | columns | sort) {
-            let eq = ($equities | get $symbol)
-            let trading = (try { $eq.trading } catch { "disabled" })
-            let rebalancing = (try { $eq.rebalancing } catch { "disabled" })
-            let tc = if $trading == "enabled" { (ansi green) } else { (ansi attr_dimmed) }
-            let rc = if $rebalancing == "enabled" { (ansi green) } else { (ansi attr_dimmed) }
-            print $"    ($symbol | fill -w 6 -a left)  trade: ($tc)($trading | fill -w 8 -a left)(ansi reset)  rebalance: ($rc)($rebalancing | fill -w 8 -a left)(ansi reset)"
-          }
+      if ($log_level | is-not-empty) { print $"  (ansi attr_dimmed)Log level:(ansi reset)        (ansi attr_bold)(ansi white)($log_level)(ansi reset)" }
+      if ($deployment_block | is-not-empty) { print $"  (ansi attr_dimmed)Deployment block:(ansi reset) (ansi attr_bold)(ansi white)($deployment_block)(ansi reset)" }
+      if ($orderbook | is-not-empty) { print $"  (ansi attr_dimmed)Orderbook:(ansi reset)        (ansi attr_bold)(ansi white)($orderbook)(ansi reset)" }
+      if ($order_owner | is-not-empty) { print $"  (ansi attr_dimmed)Order owner:(ansi reset)      (ansi attr_bold)(ansi white)($order_owner)(ansi reset)" }
+      print $"  (ansi attr_dimmed)Rebalancing:(ansi reset)      ($rebalancing_label)"
+
+      # Assets (nushell parses TOML natively -- no awk needed)
+      let equities = try { $config.assets.equities } catch { null }
+      if $equities != null {
+        print ""
+        print $"  (ansi attr_dimmed)Assets:(ansi reset)"
+        for symbol in ($equities | columns | sort) {
+          let eq = ($equities | get $symbol)
+          let trading = (try { $eq.trading } catch { "disabled" })
+          let rebalancing = (try { $eq.rebalancing } catch { "disabled" })
+          let tc = if $trading == "enabled" { (ansi green) } else { (ansi attr_dimmed) }
+          let rc = if $rebalancing == "enabled" { (ansi green) } else { (ansi attr_dimmed) }
+          print $"    ($symbol | fill -w 6 -a left)  trade: ($tc)($trading | fill -w 8 -a left)(ansi reset)  rebalance: ($rc)($rebalancing | fill -w 8 -a left)(ansi reset)"
         }
       }
     } else {
@@ -173,10 +215,16 @@ def main [env_name: string] {
     print ""
     print $"(ansi attr_bold)(ansi cyan)▸ Raindex Open Orders(ansi reset)"
 
+    if ($order_owner | is-empty) {
+      print $"  (ansi yellow)order_owner not found in config -- skipping subgraph query(ansi reset)"
+      print $"  (ansi attr_dimmed)Checked: raindex.order_owner, rebalancing.wallet.address, rebalancing.address(ansi reset)"
+      print $"  (ansi attr_dimmed)Private-key wallets derive the address at runtime; add 'address' to config to enable this section.(ansi reset)"
+    } else {
+
     let gql = ('{ orders(where: { owner: "' + $order_owner + '", active: true }, orderBy: timestampAdded, orderDirection: desc) { orderHash active timestampAdded inputs { token { symbol decimals } balance vaultId } outputs { token { symbol decimals } balance vaultId } trades(first: 5, orderBy: timestamp, orderDirection: desc) { timestamp inputVaultBalanceChange { amount vault { token { symbol decimals } } } outputVaultBalanceChange { amount vault { token { symbol decimals } } } } } }')
 
     let orders_response = try {
-      http post --content-type "application/json" $subgraph { query: $gql }
+      http post --content-type "application/json" --max-time 15sec $subgraph { query: $gql }
     } catch {
       { data: { orders: [] } }
     }
@@ -200,8 +248,13 @@ def main [env_name: string] {
     let dec_values = if ($hex_values | is-empty) {
       []
     } else {
+      let bin = (find-decode-floats)
       try {
-        $hex_values | str join "\n" | ^cargo run --quiet --bin decode-floats | complete | get stdout | lines
+        if ($bin | is-not-empty) {
+          $hex_values | str join "\n" | run-external $bin | complete | get stdout | lines
+        } else {
+          $hex_values | str join "\n" | ^cargo run --quiet --bin decode-floats | complete | get stdout | lines
+        }
       } catch { [] }
     }
 
@@ -261,7 +314,7 @@ def main [env_name: string] {
         let trade_gql = ('{ trades(first: ' + ($page_size | into string) + ', skip: ' + ($skip | into string) + ', orderBy: timestamp, orderDirection: desc, where: { order_: { orderHash: "' + $order_hash + '" } }) { timestamp inputVaultBalanceChange { amount vault { token { symbol } } } outputVaultBalanceChange { amount vault { token { symbol } } } tradeEvent { transaction { id blockNumber } } } }')
 
         let page_data = try {
-          http post --content-type "application/json" $subgraph { query: $trade_gql }
+          http post --content-type "application/json" --max-time 15sec $subgraph { query: $trade_gql }
         } catch {
           { data: { trades: [] } }
         }
@@ -287,8 +340,13 @@ def main [env_name: string] {
     # Batch decode trade hex values and build CSVs
     let unique_trade_hexes = ($all_trade_hexes | uniq | sort)
     if ($unique_trade_hexes | is-not-empty) {
+      let bin = (find-decode-floats)
       let decoded_trade_hexes = try {
-        $unique_trade_hexes | str join "\n" | ^cargo run --quiet --bin decode-floats | complete | get stdout | lines
+        if ($bin | is-not-empty) {
+          $unique_trade_hexes | str join "\n" | run-external $bin | complete | get stdout | lines
+        } else {
+          $unique_trade_hexes | str join "\n" | ^cargo run --quiet --bin decode-floats | complete | get stdout | lines
+        }
       } catch { [] }
 
       if ($unique_trade_hexes | length) == ($decoded_trade_hexes | length) {
@@ -332,6 +390,7 @@ def main [env_name: string] {
       }
     }
     print ""
+    } # end else (order_owner is set)
   } catch {
     print $"  (ansi red)Failed to fetch Raindex orders/trades(ansi reset)"
   }
@@ -383,6 +442,13 @@ def main [env_name: string] {
       let usd_display = "$" + $offchain_usd_val
       print $"    USD:    (ansi attr_bold)(ansi white)($usd_display)(ansi reset)  (ansi attr_dimmed)\((fmt-ts $offchain_usd_ts)\)(ansi reset)"
     }
+
+    let bp_ts = (ssh-sqlite-scalar $db "SELECT json_extract(payload, '$.OffchainMarginSafeBuyingPower.fetched_at') FROM events WHERE event_type = 'InventorySnapshotEvent::OffchainMarginSafeBuyingPower' ORDER BY rowid DESC LIMIT 1;")
+    let bp_val = (ssh-sqlite-scalar $db "SELECT printf('%.2f', json_extract(payload, '$.OffchainMarginSafeBuyingPower.margin_safe_buying_power_cents') / 100.0) FROM events WHERE event_type = 'InventorySnapshotEvent::OffchainMarginSafeBuyingPower' ORDER BY rowid DESC LIMIT 1;")
+    if ($bp_val | is-not-empty) {
+      let bp_display = "$" + $bp_val
+      print $"    BuyPwr: (ansi attr_bold)(ansi white)($bp_display)(ansi reset)  (ansi attr_dimmed)\((fmt-ts $bp_ts)\)(ansi reset)"
+    }
   } catch {
     print $"  (ansi attr_dimmed)\(no inventory data -- DB may not be initialized\)(ansi reset)"
   }
@@ -419,7 +485,7 @@ def main [env_name: string] {
     print ""
     print $"(ansi attr_bold)(ansi cyan)▸ Recent Offchain Orders(ansi reset)"
 
-    let offchain_orders = (ssh-sqlite-json $db "SELECT view_id, status, payload FROM offchain_order_view ORDER BY view_id DESC LIMIT 20;")
+    let offchain_orders = (ssh-sqlite-json $db "SELECT view_id, status, payload FROM offchain_order_view ORDER BY COALESCE(json_extract(payload, '$.Live.Filled.filled_at'), json_extract(payload, '$.Live.Failed.failed_at'), json_extract(payload, '$.Live.PartiallyFilled.partially_filled_at'), json_extract(payload, '$.Live.Submitted.submitted_at'), json_extract(payload, '$.Live.Filled.placed_at'), json_extract(payload, '$.Live.Failed.placed_at'), json_extract(payload, '$.Live.PartiallyFilled.placed_at'), json_extract(payload, '$.Live.Submitted.placed_at'), json_extract(payload, '$.Live.Pending.placed_at')) DESC, view_id DESC LIMIT 20;")
 
     for order in $offchain_orders {
       let sc = if $order.status == "Filled" { (ansi green) } else if $order.status == "Failed" { (ansi red) } else if $order.status == "Submitted" { (ansi yellow) } else if $order.status == "Pending" { (ansi blue) } else { (ansi attr_dimmed) }
@@ -457,7 +523,7 @@ def main [env_name: string] {
   print $"(ansi attr_dimmed)Saving full data to ($out_dir) ...(ansi reset)"
 
   mut saved_logs = false
-  let logs_result = (^ssh -i $env.identity $"root@($env.host_ip)" "journalctl -u st0x-hedge --no-pager" | complete)
+  let logs_result = (^ssh ...(ssh-flags) $"root@($env.host_ip)" "journalctl -u st0x-hedge --no-pager" | complete)
   if $logs_result.exit_code == 0 {
     $logs_result.stdout | save -f $"($out_dir)/logs.txt"
     $saved_logs = true
@@ -465,7 +531,7 @@ def main [env_name: string] {
 
   mut saved_db = false
   try {
-    ^scp -i $env.identity $"root@($env.host_ip):($db)" $"($out_dir)/st0x-hedge.db"
+    ^scp ...(ssh-flags) $"root@($env.host_ip):($db)" $"($out_dir)/st0x-hedge.db"
     $saved_db = true
   } catch { }
 

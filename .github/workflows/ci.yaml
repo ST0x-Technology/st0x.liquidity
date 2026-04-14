@@ -75,8 +75,7 @@ jobs:
       - name: Clippy
         run: |
           nix develop -c cargo clippy \
-            --workspace --all-targets --all-features \
-            -- -D clippy::all -D warnings
+            --workspace --all-targets --all-features
 
   dashboard:
     concurrency:

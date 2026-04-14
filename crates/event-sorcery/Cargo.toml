@@ -13,14 +13,11 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, optional = true }
+tokio.workspace = true
 tracing.workspace = true
 
 [features]
-test-support = ["dep:tokio"]
-
-[dev-dependencies]
-tokio.workspace = true
+test-support = []
 
 [lints]
 workspace = true
