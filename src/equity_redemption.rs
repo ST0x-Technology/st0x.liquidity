@@ -1116,6 +1116,38 @@ pub(crate) async fn symbols_with_stuck_redemptions(
     Ok(result)
 }
 
+/// Returns redemption aggregate IDs whose latest event is non-terminal and
+/// should be resumed after restart.
+pub(crate) async fn interrupted_redemption_ids(
+    pool: &SqlitePool,
+) -> Result<Vec<RedemptionAggregateId>, sqlx::Error> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "WITH latest AS ( \
+             SELECT aggregate_id, MAX(sequence) AS max_seq \
+             FROM events \
+             WHERE aggregate_type = 'EquityRedemption' \
+             GROUP BY aggregate_id \
+         ) \
+         SELECT latest.aggregate_id \
+         FROM events last_ev \
+         INNER JOIN latest \
+             ON last_ev.aggregate_id = latest.aggregate_id \
+            AND last_ev.sequence = latest.max_seq \
+         WHERE last_ev.aggregate_type = 'EquityRedemption' \
+           AND last_ev.event_type IN ( \
+               'EquityRedemptionEvent::WithdrawnFromRaindex', \
+               'EquityRedemptionEvent::TokensUnwrapped', \
+               'EquityRedemptionEvent::TokensSent', \
+               'EquityRedemptionEvent::Detected' \
+           ) \
+         ORDER BY latest.aggregate_id",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(RedemptionAggregateId::new).collect())
+}
+
 fn parse_stuck_symbol(aggregate_id: &str, raw: Option<String>) -> Option<Symbol> {
     let value = raw.or_else(|| {
         warn!(
@@ -1984,6 +2016,48 @@ mod tests {
             "Recovered quantity should be 10, got {:?}",
             result[&aapl]
         );
+    }
+
+    #[tokio::test]
+    async fn interrupted_redemption_ids_returns_only_non_terminal_redemptions() {
+        let pool = crate::test_utils::setup_test_db().await;
+
+        insert_event(
+            &pool,
+            "resume-me",
+            0,
+            "EquityRedemptionEvent::WithdrawnFromRaindex",
+            &withdrawn_payload("AAPL"),
+        )
+        .await;
+        insert_event(
+            &pool,
+            "resume-me",
+            1,
+            "EquityRedemptionEvent::TokensSent",
+            r#"{"TokensSent":{"redemption_wallet":"0x0000000000000000000000000000000000000001","redemption_tx":"0x0000000000000000000000000000000000000000000000000000000000000002","sent_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .await;
+
+        insert_event(
+            &pool,
+            "completed",
+            0,
+            "EquityRedemptionEvent::WithdrawnFromRaindex",
+            &withdrawn_payload("TSLA"),
+        )
+        .await;
+        insert_event(
+            &pool,
+            "completed",
+            1,
+            "EquityRedemptionEvent::Completed",
+            r#"{"Completed":{"completed_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .await;
+
+        let result = interrupted_redemption_ids(&pool).await.unwrap();
+        assert_eq!(result, vec![RedemptionAggregateId::new("resume-me")]);
     }
 
     #[tokio::test]

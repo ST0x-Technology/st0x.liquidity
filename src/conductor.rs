@@ -28,7 +28,9 @@ use crate::alpaca_wallet::AlpacaWalletService;
 use crate::bindings::IOrderBookV6::{self, IOrderBookV6Instance};
 use crate::config::{AssetsConfig, Ctx, CtxError};
 use crate::dashboard::EventBroadcaster;
-use crate::equity_redemption::symbols_with_stuck_redemptions;
+use crate::equity_redemption::{
+    EquityRedemption, interrupted_redemption_ids, symbols_with_stuck_redemptions,
+};
 use crate::inventory::{
     BroadcastingInventory, Inventory, InventoryPollingService, InventoryProjection,
     InventorySnapshot, Venue,
@@ -45,7 +47,7 @@ use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::onchain::trade::{RaindexTradeEvent, extract_owned_vaults, extract_vaults_from_clear};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
 use crate::position::{Position, PositionCommand, TradeId};
-use crate::rebalancing::equity::EquityTransferServices;
+use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
 use crate::rebalancing::{
     RebalancerServices, RebalancingCqrsFrameworks, RebalancingCtx, RebalancingTrigger,
     RebalancingTriggerConfig,
@@ -54,6 +56,7 @@ use crate::symbol::cache::SymbolCache;
 use crate::threshold::ExecutionThreshold;
 use crate::tokenization::Tokenizer;
 use crate::tokenization::alpaca::AlpacaTokenizationService;
+use crate::tokenized_equity_mint::{TokenizedEquityMint, interrupted_mint_ids};
 use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::trade_accountant::{DexTradeAccountingJobQueue, TradeAccountingError};
 use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryId};
@@ -174,8 +177,6 @@ impl Conductor {
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
             .build(())
             .await?;
-
-        recover_stuck_redemptions(&pool, &inventory).await?;
 
         let (vault_registry, vault_registry_projection) =
             StoreBuilder::<VaultRegistry>::new(pool.clone())
@@ -481,16 +482,35 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             market_maker_wallet,
             deps.inventory.clone(),
             operation_sender,
-            wrapper,
+            wrapper.clone(),
         ));
 
         let event_broadcaster =
             Arc::new(EventBroadcaster::new(deps.event_sender, deps.pool.clone()));
-        let manifest = QueryManifest::new(rebalancing_trigger, event_broadcaster);
+        let manifest = QueryManifest::new(rebalancing_trigger.clone(), event_broadcaster);
 
         let built = manifest
             .build(deps.pool.clone(), equity_transfer_services)
             .await?;
+
+        let recovery_transfer = CrossVenueEquityTransfer::new(
+            raindex_service.clone(),
+            tokenizer.clone(),
+            wrapper.clone(),
+            market_maker_wallet,
+            built.mint.clone(),
+            built.redemption.clone(),
+        );
+
+        recover_interrupted_tokenization_aggregates(
+            &deps.pool,
+            &rebalancing_trigger,
+            deps.inventory.as_ref(),
+            &recovery_transfer,
+            built.mint.clone(),
+            built.redemption.clone(),
+        )
+        .await?;
 
         let frameworks = RebalancingCqrsFrameworks {
             mint: built.mint,
@@ -572,6 +592,62 @@ async fn recover_stuck_redemptions(
         stuck = ?stuck_redemptions,
         "Recovered inflight from event history"
     );
+
+    Ok(())
+}
+
+async fn recover_interrupted_tokenization_aggregates(
+    pool: &SqlitePool,
+    rebalancing_trigger: &RebalancingTrigger,
+    inventory: &BroadcastingInventory,
+    transfer: &CrossVenueEquityTransfer,
+    mint_store: Arc<Store<TokenizedEquityMint>>,
+    redemption_store: Arc<Store<EquityRedemption>>,
+) -> anyhow::Result<()> {
+    let interrupted_mints = interrupted_mint_ids(pool).await?;
+    let interrupted_redemptions = interrupted_redemption_ids(pool).await?;
+
+    for mint_id in &interrupted_mints {
+        let Some(mint) = mint_store.load(mint_id).await? else {
+            return Err(anyhow::anyhow!(
+                "Interrupted mint aggregate {mint_id} missing from store"
+            ));
+        };
+
+        rebalancing_trigger
+            .recover_mint_state(mint_id, &mint)
+            .await?;
+    }
+
+    for redemption_id in &interrupted_redemptions {
+        let Some(redemption) = redemption_store.load(redemption_id).await? else {
+            return Err(anyhow::anyhow!(
+                "Interrupted redemption aggregate {redemption_id} missing from store"
+            ));
+        };
+
+        rebalancing_trigger
+            .recover_redemption_state(redemption_id, &redemption)
+            .await?;
+    }
+
+    recover_stuck_redemptions(pool, inventory).await?;
+
+    for mint_id in &interrupted_mints {
+        transfer.resume_mint(mint_id).await?;
+    }
+
+    for redemption_id in &interrupted_redemptions {
+        transfer.resume_redemption(redemption_id).await?;
+    }
+
+    if !interrupted_mints.is_empty() || !interrupted_redemptions.is_empty() {
+        info!(
+            mint_count = interrupted_mints.len(),
+            redemption_count = interrupted_redemptions.len(),
+            "Recovered interrupted tokenization aggregates"
+        );
+    }
 
     Ok(())
 }
