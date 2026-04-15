@@ -192,6 +192,171 @@ impl CrossVenueEquityTransfer {
         }
     }
 
+    async fn load_mint_entity(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+    ) -> Result<TokenizedEquityMint, MintError> {
+        self.mint_store
+            .load(issuer_request_id)
+            .await?
+            .ok_or_else(|| MintError::EntityNotFound {
+                issuer_request_id: issuer_request_id.clone(),
+                expected_state: "active mint state",
+            })
+    }
+
+    async fn finalize_received_mint(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+        tokens_received: TokensReceivedData,
+    ) -> Result<(), MintError> {
+        self.verify_received_mint(&tokens_received).await?;
+
+        let (wrapped_token, wrapped_shares) = self
+            .wrap_received_mint(issuer_request_id, &tokens_received)
+            .await?;
+
+        self.deposit_wrapped_mint(
+            issuer_request_id,
+            &tokens_received.symbol,
+            wrapped_token,
+            wrapped_shares,
+        )
+        .await
+    }
+
+    async fn deposit_wrapped_mint(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+        symbol: &Symbol,
+        wrapped_token: Address,
+        wrapped_shares: U256,
+    ) -> Result<(), MintError> {
+        let vault_id = self.raindex.lookup_vault_id(wrapped_token).await?;
+        let vault_deposit_tx_hash = self
+            .raindex
+            .deposit(
+                wrapped_token,
+                vault_id,
+                wrapped_shares,
+                TOKENIZED_EQUITY_DECIMALS,
+            )
+            .await?;
+
+        self.mint_store
+            .send(
+                issuer_request_id,
+                TokenizedEquityMintCommand::DepositToVault {
+                    vault_deposit_tx_hash,
+                },
+            )
+            .await?;
+
+        info!(%symbol, %vault_deposit_tx_hash, "Mint workflow completed");
+        Ok(())
+    }
+
+    async fn verify_received_mint(
+        &self,
+        tokens_received: &TokensReceivedData,
+    ) -> Result<(), MintError> {
+        info!(
+            shares_minted = %tokens_received.shares_minted,
+            tx_hash = %tokens_received.tx_hash,
+            "Tokens received, verifying onchain"
+        );
+
+        let unwrapped_token = self.wrapper.lookup_underlying(&tokens_received.symbol)?;
+        self.tokenizer
+            .verify_mint_tx(
+                tokens_received.tx_hash,
+                unwrapped_token,
+                tokens_received.wallet,
+                tokens_received.shares_minted,
+            )
+            .await
+            .inspect_err(|error| {
+                warn!(%error, "Onchain mint verification failed");
+            })?;
+
+        Ok(())
+    }
+
+    async fn wrap_received_mint(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+        tokens_received: &TokensReceivedData,
+    ) -> Result<(Address, U256), MintError> {
+        info!("Onchain verification passed, wrapping into ERC-4626 shares");
+
+        let wrapped_token = self.wrapper.lookup_derivative(&tokens_received.symbol)?;
+        let (wrap_tx_hash, wrapped_shares) = self
+            .wrapper
+            .to_wrapped(wrapped_token, tokens_received.shares_minted, self.wallet)
+            .await?;
+
+        self.mint_store
+            .send(
+                issuer_request_id,
+                TokenizedEquityMintCommand::WrapTokens {
+                    wrap_tx_hash,
+                    wrapped_shares,
+                },
+            )
+            .await?;
+
+        info!(%wrap_tx_hash, %wrapped_shares, "Tokens wrapped, depositing to Raindex vault");
+        Ok((wrapped_token, wrapped_shares))
+    }
+
+    pub(crate) async fn resume_mint(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+    ) -> Result<(), MintError> {
+        loop {
+            match self.load_mint_entity(issuer_request_id).await? {
+                TokenizedEquityMint::MintAccepted { .. } => {
+                    info!(%issuer_request_id, "Resuming accepted mint");
+                    self.mint_store
+                        .send(issuer_request_id, TokenizedEquityMintCommand::Poll)
+                        .await?;
+                }
+                TokenizedEquityMint::TokensReceived { .. } => {
+                    info!(%issuer_request_id, "Resuming received mint");
+                    let tokens_received = self.load_tokens_received(issuer_request_id).await?;
+                    return self
+                        .finalize_received_mint(issuer_request_id, tokens_received)
+                        .await;
+                }
+                TokenizedEquityMint::TokensWrapped {
+                    symbol,
+                    wrapped_shares,
+                    ..
+                } => {
+                    info!(%issuer_request_id, "Resuming wrapped mint");
+                    let wrapped_token = self.wrapper.lookup_derivative(&symbol)?;
+                    return self
+                        .deposit_wrapped_mint(
+                            issuer_request_id,
+                            &symbol,
+                            wrapped_token,
+                            wrapped_shares,
+                        )
+                        .await;
+                }
+                TokenizedEquityMint::DepositedIntoRaindex { .. }
+                | TokenizedEquityMint::Failed { .. } => return Ok(()),
+                entity @ TokenizedEquityMint::MintRequested { .. } => {
+                    return Err(MintError::UnexpectedState {
+                        issuer_request_id: issuer_request_id.clone(),
+                        expected_state: "MintAccepted, TokensReceived, or TokensWrapped",
+                        entity: Box::new(entity),
+                    });
+                }
+            }
+        }
+    }
+
     /// Sends the Redeem command to withdraw from Raindex vault.
     async fn withdraw_from_raindex(
         &self,
@@ -344,6 +509,126 @@ impl CrossVenueEquityTransfer {
             }
         }
     }
+
+    async fn load_redemption_entity(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+    ) -> Result<EquityRedemption, RedemptionError> {
+        self.redemption_store
+            .load(aggregate_id)
+            .await?
+            .ok_or_else(|| RedemptionError::EntityNotFound {
+                aggregate_id: aggregate_id.clone(),
+            })
+    }
+
+    pub(crate) async fn resume_redemption(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+    ) -> Result<(), RedemptionError> {
+        loop {
+            match self.load_redemption_entity(aggregate_id).await? {
+                EquityRedemption::WithdrawnFromRaindex { .. } => {
+                    self.resume_withdrawn_redemption(aggregate_id).await?;
+                }
+                EquityRedemption::TokensUnwrapped { .. } => {
+                    self.resume_unwrapped_redemption(aggregate_id).await?;
+                }
+                EquityRedemption::TokensSent { redemption_tx, .. } => {
+                    self.resume_sent_redemption(aggregate_id, &redemption_tx)
+                        .await?;
+                }
+                EquityRedemption::Pending {
+                    tokenization_request_id,
+                    ..
+                } => {
+                    return self
+                        .resume_pending_redemption(aggregate_id, &tokenization_request_id)
+                        .await;
+                }
+                EquityRedemption::Completed { .. } | EquityRedemption::Failed { .. } => {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    async fn resume_withdrawn_redemption(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+    ) -> Result<(), RedemptionError> {
+        info!(%aggregate_id, "Resuming withdrawn redemption");
+        self.redemption_store
+            .send(aggregate_id, EquityRedemptionCommand::UnwrapTokens)
+            .await?;
+        Ok(())
+    }
+
+    async fn resume_unwrapped_redemption(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+    ) -> Result<(), RedemptionError> {
+        info!(%aggregate_id, "Resuming unwrapped redemption");
+        self.redemption_store
+            .send(aggregate_id, EquityRedemptionCommand::SendTokens)
+            .await?;
+        Ok(())
+    }
+
+    async fn resume_sent_redemption(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+        redemption_tx: &TxHash,
+    ) -> Result<(), RedemptionError> {
+        info!(%aggregate_id, "Resuming sent redemption");
+        match self.poll_detection(aggregate_id, redemption_tx).await {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                self.ignore_redemption_error_if_terminal(aggregate_id, error)
+                    .await
+            }
+        }
+    }
+
+    async fn resume_pending_redemption(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+        tokenization_request_id: &TokenizationRequestId,
+    ) -> Result<(), RedemptionError> {
+        info!(%aggregate_id, "Resuming detected redemption");
+        match self
+            .poll_completion(aggregate_id, tokenization_request_id)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.ignore_redemption_error_if_terminal(aggregate_id, error)
+                    .await
+            }
+        }
+    }
+
+    async fn ignore_redemption_error_if_terminal(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+        error: RedemptionError,
+    ) -> Result<(), RedemptionError> {
+        if self.redemption_is_terminal(aggregate_id).await? {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+
+    async fn redemption_is_terminal(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+    ) -> Result<bool, RedemptionError> {
+        Ok(matches!(
+            self.load_redemption_entity(aggregate_id).await?,
+            EquityRedemption::Completed { .. } | EquityRedemption::Failed { .. }
+        ))
+    }
 }
 
 /// Hedging -> Market-Making: tokenize equity on Alpaca and deposit into
@@ -379,68 +664,8 @@ impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTra
             .await?;
 
         let tokens_received = self.load_tokens_received(&issuer_request_id).await?;
-
-        info!(
-            shares_minted = %tokens_received.shares_minted,
-            tx_hash = %tokens_received.tx_hash,
-            "Tokens received, verifying onchain"
-        );
-
-        let unwrapped_token = self.wrapper.lookup_underlying(&tokens_received.symbol)?;
-        self.tokenizer
-            .verify_mint_tx(
-                tokens_received.tx_hash,
-                unwrapped_token,
-                tokens_received.wallet,
-                tokens_received.shares_minted,
-            )
+        self.finalize_received_mint(&issuer_request_id, tokens_received)
             .await
-            .inspect_err(|error| {
-                warn!(%error, "Onchain mint verification failed");
-            })?;
-
-        info!("Onchain verification passed, wrapping into ERC-4626 shares");
-
-        let wrapped_token = self.wrapper.lookup_derivative(&symbol)?;
-        let (wrap_tx_hash, wrapped_shares) = self
-            .wrapper
-            .to_wrapped(wrapped_token, tokens_received.shares_minted, self.wallet)
-            .await?;
-
-        self.mint_store
-            .send(
-                &issuer_request_id,
-                TokenizedEquityMintCommand::WrapTokens {
-                    wrap_tx_hash,
-                    wrapped_shares,
-                },
-            )
-            .await?;
-
-        info!(%wrap_tx_hash, %wrapped_shares, "Tokens wrapped, depositing to Raindex vault");
-
-        let vault_id = self.raindex.lookup_vault_id(wrapped_token).await?;
-        let vault_deposit_tx_hash = self
-            .raindex
-            .deposit(
-                wrapped_token,
-                vault_id,
-                wrapped_shares,
-                TOKENIZED_EQUITY_DECIMALS,
-            )
-            .await?;
-
-        self.mint_store
-            .send(
-                &issuer_request_id,
-                TokenizedEquityMintCommand::DepositToVault {
-                    vault_deposit_tx_hash,
-                },
-            )
-            .await?;
-
-        info!(%vault_deposit_tx_hash, "Mint workflow completed");
-        Ok(())
     }
 }
 
@@ -544,6 +769,81 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_mint_from_accepted_completes_workflow() {
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let id = IssuerRequestId::new("ISS-RESUME");
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(10),
+                    wallet: transfer.wallet,
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer.resume_mint(&id).await.unwrap();
+
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::DepositedIntoRaindex { .. }),
+            "Expected deposited mint after resume, got: {entity:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_redemption_from_tokens_sent_completes_workflow() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+            MockTokenizer::new()
+                .with_detection_outcome(MockDetectionOutcome::Detected)
+                .with_completion_outcome(MockCompletionOutcome::Completed),
+        );
+        let transfer = create_equity_transfer(
+            tokenizer,
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let id = RedemptionAggregateId::new("redemption-resume");
+        let symbol = Symbol::new("TEST").unwrap();
+        let (token, _vault_id) = transfer.raindex.lookup_vault_info(&symbol).await.unwrap();
+        let amount = FractionalShares::new(float!(50))
+            .to_u256_18_decimals()
+            .unwrap();
+
+        transfer
+            .withdraw_from_raindex(
+                &id,
+                &symbol,
+                FractionalShares::new(float!(50)),
+                token,
+                amount,
+            )
+            .await
+            .unwrap();
+        transfer.unwrap_and_send(&id).await.unwrap();
+
+        transfer.resume_redemption(&id).await.unwrap();
+
+        let entity = transfer.redemption_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::Completed { .. }),
+            "Expected completed redemption after resume, got: {entity:?}"
+        );
     }
 
     #[tokio::test]
