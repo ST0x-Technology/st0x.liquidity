@@ -247,6 +247,12 @@ impl AlpacaTokenizationMock {
         lock(&self.state).redemption_outcome = outcome;
     }
 
+    /// Configures how many poll cycles a request stays pending before it can
+    /// complete or reject.
+    pub fn set_polls_until_complete(&self, polls_until_complete: usize) {
+        lock(&self.state).polls_until_complete = polls_until_complete;
+    }
+
     /// Injects a pending tokenization request with an arbitrary wallet
     /// address. Used to simulate requests from other conductors sharing
     /// the same Alpaca account.
