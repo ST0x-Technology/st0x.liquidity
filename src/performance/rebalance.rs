@@ -1015,7 +1015,10 @@ mod tests {
             },
             UsdcRebalanceEvent::ConversionConfirmed {
                 direction: RebalanceDirection::AlpacaToBase,
-                conversion: ConversionAmounts::new(Usdc::new(float!(1000)), Usdc::new(float!(1000))),
+                conversion: ConversionAmounts::new(
+                    Usdc::new(float!(1000)),
+                    Usdc::new(float!(1000)),
+                ),
                 converted_at: timestamp(10),
             },
             UsdcRebalanceEvent::WithdrawalSubmitting {
