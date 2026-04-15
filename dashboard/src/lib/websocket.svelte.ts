@@ -39,7 +39,6 @@ const isInitialState = (value: unknown): boolean => {
     Array.isArray(value['spreads']) &&
     Array.isArray(value['activeTransfers']) &&
     Array.isArray(value['recentTransfers']) &&
-    isObject(value['authStatus']) &&
     isObject(value['circuitBreaker']) &&
     Array.isArray(value['warnings'])
   )
@@ -110,7 +109,6 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
         queryClient.setQueryData(['spreads'], data.spreads)
         queryClient.setQueryData(['transfers', 'active'], data.activeTransfers)
         queryClient.setQueryData(['transfers', 'recent'], data.recentTransfers)
-        queryClient.setQueryData(['auth'], data.authStatus)
         queryClient.setQueryData(['circuitBreaker'], data.circuitBreaker)
         queryClient.setQueryData(['warnings'], data.warnings)
       },

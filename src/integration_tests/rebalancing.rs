@@ -344,7 +344,7 @@ async fn build_imbalanced_inventory(imbalance: Imbalance<'_>) {
                         offchain_order_id,
                         shares: Positive::new(FractionalShares::new(offchain)).unwrap(),
                         direction: Direction::Buy,
-                        executor: SupportedExecutor::AlpacaTradingApi,
+                        executor: SupportedExecutor::AlpacaBrokerApi,
                         threshold: ExecutionThreshold::whole_share(),
                     },
                 )

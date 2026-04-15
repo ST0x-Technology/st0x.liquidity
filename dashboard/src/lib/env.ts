@@ -1,21 +1,7 @@
 import { browser } from '$app/environment'
 import { env } from '$env/dynamic/public'
 
-export const VALID_BROKERS = ['schwab', 'alpaca'] as const
-export type Broker = (typeof VALID_BROKERS)[number]
-
-export const isBroker = (value: unknown): value is Broker =>
-  typeof value === 'string' && VALID_BROKERS.includes(value as Broker)
-
-export const defaultBroker = (): Broker => {
-  const val = env.PUBLIC_DEFAULT_BROKER?.trim()
-  return val !== undefined && isBroker(val) ? val : 'schwab'
-}
-
-const LOCAL_DEV_PORTS: Record<Broker, number> = {
-  schwab: 8000,
-  alpaca: 8001
-}
+const LOCAL_DEV_PORT = 8001
 
 const isLocalDev = (): boolean => {
   if (!browser) return true
@@ -23,17 +9,17 @@ const isLocalDev = (): boolean => {
   return hostname === 'localhost' && port !== '80' && port !== ''
 }
 
-const getDefaultWsUrl = (broker: Broker): string => {
+const getDefaultWsUrl = (): string => {
   if (isLocalDev()) {
-    return `ws://localhost:${String(LOCAL_DEV_PORTS[broker])}/api/ws`
+    return `ws://localhost:${String(LOCAL_DEV_PORT)}/api/ws`
   }
 
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${protocol}//${window.location.host}/api/${broker}/ws`
+  return `${protocol}//${window.location.host}/api/ws`
 }
 
-export const getWebSocketUrl = (broker: Broker): string => {
-  const envKey = broker === 'schwab' ? 'PUBLIC_SCHWAB_WS_URL' : 'PUBLIC_ALPACA_WS_URL'
+export const getWebSocketUrl = (): string => {
+  const envKey = 'PUBLIC_ALPACA_WS_URL'
   const val = env[envKey]?.trim()
-  return val !== undefined && val !== '' ? val : getDefaultWsUrl(broker)
+  return val !== undefined && val !== '' ? val : getDefaultWsUrl()
 }

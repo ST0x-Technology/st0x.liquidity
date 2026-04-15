@@ -119,7 +119,6 @@ const createInitialState = (): InitialState => ({
   spreads: [],
   activeTransfers: [],
   recentTransfers: [],
-  authStatus: { status: 'not_configured' },
   circuitBreaker: { status: 'active' },
   warnings: []
 })
@@ -172,7 +171,6 @@ describe('createWebSocket', () => {
     expect(queryClient.setQueryDataSpy).toHaveBeenCalledWith(['events'], [])
     expect(queryClient.setQueryDataSpy).toHaveBeenCalledWith(['trades'], [])
     expect(queryClient.setQueryDataSpy).toHaveBeenCalledWith(['inventory'], initialState.inventory)
-    expect(queryClient.setQueryDataSpy).toHaveBeenCalledWith(['auth'], { status: 'not_configured' })
     expect(queryClient.setQueryDataSpy).toHaveBeenCalledWith(['circuitBreaker'], { status: 'active' })
   })
 

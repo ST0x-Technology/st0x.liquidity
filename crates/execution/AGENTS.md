@@ -34,9 +34,9 @@ remain hidden.
 **What to expose (and ONLY what to expose):**
 
 1. **The `Executor` trait** - The core abstraction
-2. **Implementation types** - `SchwabExecutor`, `AlpacaTradingApi`, etc.
+2. **Implementation types** - `AlpacaBrokerApi`, `MockExecutor`, etc.
 3. **Configuration/initialization types** - What's needed to construct an
-   executor (e.g., `SchwabAuthEnv`, `AlpacaTradingApiEnv`)
+   executor (e.g., `AlpacaBrokerApiCtx`)
 4. **Error types** - Implementation-specific errors and shared error types
 5. **Domain types** - Shared types like `Symbol`, `Shares`, `Direction`,
    `MarketOrder`, `OrderPlacement`
@@ -53,33 +53,22 @@ remain hidden.
 
 ### Module Organization Pattern
 
-Look at `src/schwab/mod.rs` and `src/alpaca_trading_api/mod.rs` as reference
-examples:
+Look at `src/alpaca_broker_api/mod.rs` as the reference example:
 
 ```rust
-// src/schwab/mod.rs - GOOD EXAMPLE
+// src/alpaca_broker_api/mod.rs - GOOD EXAMPLE
 
 // Private implementation modules
 mod auth;
 mod executor;
-mod encryption;
 mod market_hours;
 mod order;
-mod order_status;
-mod tokens;
 
 // Re-export ONLY what's needed for construction
-pub use auth::SchwabAuthEnv;
-pub use executor::{SchwabExecutor, SchwabConfig};
+pub use auth::AlpacaBrokerApiCtx;
+pub use executor::AlpacaBrokerApi;
 
-// Re-export for auth CLI command (Schwab-specific, not part of generic API)
-pub use tokens::SchwabTokens;
-
-// Public error type (needed for error handling)
-pub enum SchwabError { ... }
-
-// Utility function needed for initialization
-pub fn extract_code_from_url(url: &str) -> Result<String, SchwabError> { ... }
+pub enum AlpacaBrokerApiError { ... }
 ```
 
 **Key principles demonstrated:**
@@ -121,8 +110,7 @@ Before exposing anything:
 
 ## Adding New Implementations
 
-When adding support for a new brokerage (e.g., Interactive Brokers, TD
-Ameritrade):
+When adding support for a new brokerage:
 
 1. **Create module** in `src/your_executor/` with private submodules
 2. **Implement `Executor` trait** with all required methods

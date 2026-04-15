@@ -651,7 +651,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(100))).unwrap(),
             direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
+            executor: SupportedExecutor::DryRun,
         }
     }
 

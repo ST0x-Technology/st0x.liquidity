@@ -40,7 +40,6 @@ pub struct InitialState {
     pub spreads: Vec<SpreadSummary>,
     pub active_transfers: Vec<TransferOperation>,
     pub recent_transfers: Vec<TransferOperation>,
-    pub auth_status: AuthStatus,
     pub circuit_breaker: CircuitBreakerStatus,
     /// Warnings about partial data (e.g. failed to load some transfers).
     pub warnings: Vec<Warning>,
@@ -55,7 +54,6 @@ impl Default for InitialState {
             spreads: Vec::new(),
             active_transfers: Vec::new(),
             recent_transfers: Vec::new(),
-            auth_status: AuthStatus::NotConfigured,
             circuit_breaker: CircuitBreakerStatus::Active,
             warnings: Vec::new(),
         }
@@ -474,13 +472,6 @@ pub enum CircuitBreakerStatus {
     Active,
 }
 
-/// Broker authentication status.
-#[derive(Debug, Clone, Serialize, TS)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum AuthStatus {
-    NotConfigured,
-}
-
 /// Export all TypeScript bindings into `out_dir`.
 ///
 /// Each type is written to `out_dir/TypeName.ts`. The caller controls
@@ -514,7 +505,6 @@ pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
     SpreadSummary::export_all_to(out_dir)?;
     SpreadUpdate::export_all_to(out_dir)?;
     CircuitBreakerStatus::export_all_to(out_dir)?;
-    AuthStatus::export_all_to(out_dir)?;
     Warning::export_all_to(out_dir)?;
     TransferCategory::export_all_to(out_dir)?;
 
@@ -544,7 +534,6 @@ mod tests {
         assert!(json.contains("recentTrades"));
         assert!(json.contains("inventory"));
         assert!(json.contains("metrics"));
-        assert!(json.contains("authStatus"));
         assert!(json.contains("circuitBreaker"));
         assert!(json.contains("activeTransfers"));
         assert!(json.contains("recentTransfers"));

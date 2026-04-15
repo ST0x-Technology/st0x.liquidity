@@ -4,24 +4,15 @@
   import HeaderBar from '$lib/components/header-bar.svelte'
   import InventoryPanel from '$lib/components/inventory-panel.svelte'
   import LiveEventsPanel from '$lib/components/live-events-panel.svelte'
-  import { brokerStore } from '$lib/stores/broker.svelte'
-  import { getWebSocketUrl, type Broker } from '$lib/env'
+  import { getWebSocketUrl } from '$lib/env'
   import { reactive } from '$lib/frp.svelte'
   import { createWebSocket, type WebSocketConnection } from '$lib/websocket.svelte'
 
   const queryClient = useQueryClient()
   const ws = reactive<WebSocketConnection | null>(null)
 
-  const handleBrokerChange = (broker: Broker) => {
-    ws.current?.disconnect()
-    queryClient.clear()
-    brokerStore.set(broker)
-    ws.update(() => createWebSocket(getWebSocketUrl(broker), queryClient))
-    ws.current?.connect()
-  }
-
   onMount(() => {
-    ws.update(() => createWebSocket(getWebSocketUrl(brokerStore.value), queryClient))
+    ws.update(() => createWebSocket(getWebSocketUrl(), queryClient))
     ws.current?.connect()
 
     return () => {
@@ -34,11 +25,7 @@
 </script>
 
 <div class="flex h-screen flex-col bg-background">
-  <HeaderBar
-    broker={brokerStore.value}
-    onBrokerChange={handleBrokerChange}
-    connectionStatus={connectionState === 'error' ? 'disconnected' : connectionState}
-  />
+  <HeaderBar connectionStatus={connectionState === 'error' ? 'disconnected' : connectionState} />
 
   {#if errorContext}
     <div

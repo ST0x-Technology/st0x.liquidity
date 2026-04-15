@@ -18,7 +18,6 @@ use st0x_execution::{
     MockExecutorCtx, OrderPlacement, OrderState, Positive, Symbol, TimeInForce, TryIntoExecutor,
 };
 
-use super::auth::ensure_schwab_authentication;
 use crate::config::{BrokerCtx, Ctx};
 use crate::offchain_order::{
     OffchainOrderCommand, OffchainOrderId, OrderPlacementResult, OrderPlacer,
@@ -33,7 +32,7 @@ use crate::threshold::ExecutionThreshold;
 use st0x_float_serde::format_float_with_fallback;
 
 /// OrderPlacer for the CLI that delegates to the broker-specific executor
-/// constructed from config. Handles Schwab auth, symbol mapping, etc.
+/// constructed from config.
 struct CliOrderPlacer {
     ctx: Ctx,
     pool: SqlitePool,
@@ -184,21 +183,11 @@ pub(super) async fn order_status_command<W: Write>(
 
 async fn get_broker_order_status<W: Write>(
     ctx: &Ctx,
-    pool: &SqlitePool,
+    _pool: &SqlitePool,
     order_id: &str,
-    stdout: &mut W,
+    _stdout: &mut W,
 ) -> anyhow::Result<OrderState> {
     match &ctx.broker {
-        BrokerCtx::Schwab(schwab_auth) => {
-            ensure_schwab_authentication(pool, &ctx.broker, stdout).await?;
-            let schwab_ctx = schwab_auth.to_schwab_ctx(pool.clone());
-            let broker = schwab_ctx.try_into_executor().await?;
-            Ok(broker.get_order_status(&order_id.to_string()).await?)
-        }
-        BrokerCtx::AlpacaTradingApi(alpaca_auth) => {
-            let broker = alpaca_auth.clone().try_into_executor().await?;
-            Ok(broker.get_order_status(&order_id.to_string()).await?)
-        }
         BrokerCtx::AlpacaBrokerApi(alpaca_auth) => {
             let broker = alpaca_auth.clone().try_into_executor().await?;
             Ok(broker.get_order_status(&order_id.to_string()).await?)
@@ -412,49 +401,12 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
 
 pub(super) async fn execute_broker_order<W: Write>(
     ctx: &Ctx,
-    pool: &SqlitePool,
+    _pool: &SqlitePool,
     market_order: MarketOrder,
     time_in_force: Option<TimeInForce>,
     stdout: &mut W,
 ) -> anyhow::Result<OrderPlacement<String>> {
     match &ctx.broker {
-        BrokerCtx::Schwab(schwab_auth) => {
-            ensure_schwab_authentication(pool, &ctx.broker, stdout).await?;
-            writeln!(stdout, "🔄 Executing Schwab order...")?;
-            if time_in_force.is_some() {
-                writeln!(
-                    stdout,
-                    "⚠️  --time-in-force is ignored for Schwab (only supported by Alpaca Broker API)"
-                )?;
-            }
-            let schwab_ctx = schwab_auth.to_schwab_ctx(pool.clone());
-            let broker = schwab_ctx.try_into_executor().await?;
-            let placement = broker.place_market_order(market_order).await?;
-            writeln!(
-                stdout,
-                "✅ Schwab order placed with ID: {}",
-                placement.order_id
-            )?;
-            Ok(placement)
-        }
-        BrokerCtx::AlpacaTradingApi(alpaca_auth) => {
-            writeln!(stdout, "🔄 Executing Alpaca Trading API order...")?;
-            if time_in_force.is_some() {
-                writeln!(
-                    stdout,
-                    "⚠️  --time-in-force is ignored for Alpaca Trading API \
-                     (only supported by Alpaca Broker API)"
-                )?;
-            }
-            let broker = alpaca_auth.clone().try_into_executor().await?;
-            let placement = broker.place_market_order(market_order).await?;
-            writeln!(
-                stdout,
-                "✅ Alpaca Trading API order placed with ID: {}",
-                placement.order_id
-            )?;
-            Ok(placement)
-        }
         BrokerCtx::AlpacaBrokerApi(alpaca_auth) => {
             writeln!(stdout, "🔄 Executing Alpaca Broker API order...")?;
             let mut auth = alpaca_auth.clone();
@@ -686,24 +638,18 @@ fn display_trade_details<W: Write>(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, FixedBytes, address};
+    use alloy::primitives::{Address, address};
     use httpmock::MockServer;
     use serde_json::json;
     use url::Url;
 
     use super::*;
-    use crate::config::{
-        AssetsConfig, BrokerCtx, EquitiesConfig, LogLevel, SchwabAuth, TradingMode,
-    };
+    use crate::config::{AssetsConfig, BrokerCtx, EquitiesConfig, LogLevel, TradingMode};
     use crate::onchain::EvmCtx;
-    use crate::test_utils::{positive_shares, setup_test_db, setup_test_tokens};
+    use crate::test_utils::{positive_shares, setup_test_db};
     use crate::threshold::ExecutionThreshold;
-    use st0x_execution::{
-        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaTradingApiCtx,
-        AlpacaTradingApiMode,
-    };
+    use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
 
-    const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
@@ -735,19 +681,6 @@ mod tests {
         }
     }
 
-    fn create_schwab_test_ctx(mock_server: &MockServer) -> Ctx {
-        let mut ctx = create_base_test_ctx();
-        ctx.broker = BrokerCtx::Schwab(SchwabAuth {
-            app_key: "test_app_key".to_string(),
-            app_secret: "test_app_secret".to_string(),
-            redirect_uri: Some(Url::parse("https://127.0.0.1").expect("valid test URL")),
-            base_url: Some(Url::parse(&mock_server.base_url()).expect("valid mock URL")),
-            account_index: Some(0),
-            encryption_key: TEST_ENCRYPTION_KEY,
-        });
-        ctx
-    }
-
     fn create_alpaca_broker_api_test_ctx(mock_server: &MockServer) -> Ctx {
         let mut ctx = create_base_test_ctx();
         ctx.broker = BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
@@ -757,16 +690,6 @@ mod tests {
             mode: Some(AlpacaBrokerApiMode::Mock(mock_server.base_url())),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::Day,
-        });
-        ctx
-    }
-
-    fn create_alpaca_trading_api_test_ctx() -> Ctx {
-        let mut ctx = create_base_test_ctx();
-        ctx.broker = BrokerCtx::AlpacaTradingApi(AlpacaTradingApiCtx {
-            api_key: "test_key".to_string(),
-            api_secret: "test_secret".to_string(),
-            trading_mode: Some(AlpacaTradingApiMode::Paper),
         });
         ctx
     }
@@ -825,34 +748,61 @@ mod tests {
         };
     }
 
-    fn get_schwab_auth(ctx: &Ctx) -> &SchwabAuth {
-        match &ctx.broker {
-            BrokerCtx::Schwab(auth) => auth,
-            _ => panic!("Expected Schwab broker ctx"),
-        }
-    }
-
-    fn setup_schwab_order_mocks(server: &MockServer) -> (httpmock::Mock<'_>, httpmock::Mock<'_>) {
+    fn setup_alpaca_broker_market_order_mocks<'a>(
+        server: &'a MockServer,
+        symbol: &'a str,
+        quantity: &'a str,
+        side: &'a str,
+    ) -> (httpmock::Mock<'a>, httpmock::Mock<'a>, httpmock::Mock<'a>) {
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
-                .path("/trader/v1/accounts/accountNumbers");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body(json!([{
-                    "accountNumber": "123456789",
-                    "hashValue": "ABC123DEF456"
-                }]));
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "status": "ACTIVE"
+                }));
+        });
+
+        let asset_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!("/v1/assets/{symbol}"));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "symbol": symbol,
+                    "status": "active",
+                    "tradable": true,
+                    "overnight_tradable": true
+                }));
         });
 
         let order_mock = server.mock(|when, then| {
             when.method(httpmock::Method::POST)
-                .path("/trader/v1/accounts/ABC123DEF456/orders")
-                .header("authorization", "Bearer test_access_token");
-            then.status(201)
-                .header("location", "/trader/v1/accounts/ABC123DEF456/orders/12345");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
+                .json_body(json!({
+                    "symbol": symbol,
+                    "qty": quantity,
+                    "side": side,
+                    "type": "market",
+                    "time_in_force": "day",
+                    "extended_hours": false
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "symbol": symbol,
+                    "qty": quantity,
+                    "side": side,
+                    "status": "new",
+                    "filled_avg_price": null
+                }));
         });
 
-        (account_mock, order_mock)
+        (account_mock, asset_mock, order_mock)
     }
 
     fn setup_alpaca_broker_limit_order_mocks(
@@ -912,11 +862,10 @@ mod tests {
     #[tokio::test]
     async fn test_execute_order_buy_success() {
         let server = MockServer::start();
-        let ctx = create_schwab_test_ctx(&server);
+        let ctx = create_alpaca_broker_api_test_ctx(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth(&ctx)).await;
-
-        let (account_mock, order_mock) = setup_schwab_order_mocks(&server);
+        let (account_mock, asset_mock, order_mock) =
+            setup_alpaca_broker_market_order_mocks(&server, "AAPL", "100", "buy");
 
         execute_order_with_writers!(
             Symbol::new("AAPL").unwrap(),
@@ -933,17 +882,17 @@ mod tests {
         .unwrap();
 
         account_mock.assert();
+        asset_mock.assert();
         order_mock.assert();
     }
 
     #[tokio::test]
     async fn test_execute_order_sell_success() {
         let server = MockServer::start();
-        let ctx = create_schwab_test_ctx(&server);
+        let ctx = create_alpaca_broker_api_test_ctx(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth(&ctx)).await;
-
-        let (account_mock, order_mock) = setup_schwab_order_mocks(&server);
+        let (account_mock, asset_mock, order_mock) =
+            setup_alpaca_broker_market_order_mocks(&server, "TSLA", "50", "sell");
 
         execute_order_with_writers!(
             Symbol::new("TSLA").unwrap(),
@@ -960,104 +909,43 @@ mod tests {
         .unwrap();
 
         account_mock.assert();
+        asset_mock.assert();
         order_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_execute_order_api_failure() {
-        let server = MockServer::start();
-        let ctx = create_schwab_test_ctx(&server);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth(&ctx)).await;
-
-        server.mock(|when, then| {
-            when.method(httpmock::Method::GET)
-                .path("/trader/v1/accounts/accountNumbers");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([{
-                    "accountNumber": "123456789",
-                    "hashValue": "ABC123DEF456"
-                }]));
-        });
-
-        server.mock(|when, then| {
-            when.method(httpmock::Method::POST)
-                .path("/trader/v1/accounts/ABC123DEF456/orders");
-            then.status(400)
-                .header("content-type", "application/json")
-                .json_body(json!({"error": "Invalid order"}));
-        });
-
-        execute_order_with_writers!(
-            Symbol::new("AAPL").unwrap(),
-            positive_shares("100"),
-            Direction::Buy,
-            None,
-            None,
-            false,
-            &ctx,
-            &pool,
-            &mut std::io::sink(),
-        )
-        .await
-        .unwrap_err();
-    }
-
-    #[tokio::test]
-    async fn test_execute_order_stdout_contains_details() {
-        let server = MockServer::start();
-        let ctx = create_schwab_test_ctx(&server);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth(&ctx)).await;
-
-        setup_schwab_order_mocks(&server);
-
-        let mut stdout_buffer = Vec::new();
-        execute_order_with_writers!(
-            Symbol::new("AAPL").unwrap(),
-            positive_shares("100"),
-            Direction::Buy,
-            None,
-            None,
-            false,
-            &ctx,
-            &pool,
-            &mut stdout_buffer,
-        )
-        .await
-        .unwrap();
-
-        let output = String::from_utf8(stdout_buffer).unwrap();
-        assert!(output.contains("AAPL"), "Output should contain symbol");
-        assert!(output.contains("100"), "Output should contain quantity");
-        assert!(
-            output.contains("Order ID: 12345"),
-            "Output should contain order ID"
-        );
     }
 
     #[tokio::test]
     async fn test_execute_order_failure_stdout_contains_error() {
         let server = MockServer::start();
-        let ctx = create_schwab_test_ctx(&server);
+        let ctx = create_alpaca_broker_api_test_ctx(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth(&ctx)).await;
 
         server.mock(|when, then| {
             when.method(httpmock::Method::GET)
-                .path("/trader/v1/accounts/accountNumbers");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body(json!([{
-                    "accountNumber": "123456789",
-                    "hashValue": "ABC123DEF456"
-                }]));
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "status": "ACTIVE"
+                }));
+        });
+
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/v1/assets/AAPL");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "symbol": "AAPL",
+                    "status": "active",
+                    "tradable": true,
+                    "overnight_tradable": true
+                }));
         });
 
         server.mock(|when, then| {
             when.method(httpmock::Method::POST)
-                .path("/trader/v1/accounts/ABC123DEF456/orders");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
             then.status(400)
                 .header("content-type", "application/json")
                 .json_body(json!({"error": "Insufficient funds"}));
@@ -1077,6 +965,7 @@ mod tests {
         )
         .await
         .unwrap_err();
+
         let output = String::from_utf8(stdout_buffer).unwrap();
         assert!(
             output.contains("❌ Failed to place order"),
@@ -1085,13 +974,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_time_in_force_warning_for_schwab() {
-        let server = MockServer::start();
-        let ctx = create_schwab_test_ctx(&server);
+    async fn test_time_in_force_warning_for_dry_run() {
+        let ctx = create_base_test_ctx();
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth(&ctx)).await;
-
-        setup_schwab_order_mocks(&server);
 
         let mut stdout_buffer = Vec::new();
         execute_order_with_writers!(
@@ -1158,10 +1043,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_extended_hours_requires_limit_price() {
-        let server = MockServer::start();
-        let ctx = create_schwab_test_ctx(&server);
+        let ctx = create_base_test_ctx();
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth(&ctx)).await;
 
         let mut stdout_buffer = Vec::new();
         let error = execute_order_with_writers!(
@@ -1182,61 +1065,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_limit_order_rejected_for_schwab() {
-        let server = MockServer::start();
-        let ctx = create_schwab_test_ctx(&server);
-        let pool = setup_test_db().await;
-
-        let mut stdout_buffer = Vec::new();
-        let error = execute_order_with_writers!(
-            Symbol::new("AAPL").unwrap(),
-            positive_shares("10"),
-            Direction::Buy,
-            None,
-            Some(positive_limit_price("195.25")),
-            false,
-            &ctx,
-            &pool,
-            &mut stdout_buffer,
-        )
-        .await
-        .unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "--limit-price is only supported with alpaca-broker-api"
-        );
-    }
-
-    #[tokio::test]
     async fn test_limit_order_rejected_for_dry_run() {
         let ctx = create_base_test_ctx();
-        let pool = setup_test_db().await;
-
-        let mut stdout_buffer = Vec::new();
-        let error = execute_order_with_writers!(
-            Symbol::new("AAPL").unwrap(),
-            positive_shares("10"),
-            Direction::Buy,
-            None,
-            Some(positive_limit_price("195.25")),
-            false,
-            &ctx,
-            &pool,
-            &mut stdout_buffer,
-        )
-        .await
-        .unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "--limit-price is only supported with alpaca-broker-api"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_limit_order_rejected_for_alpaca_trading_api() {
-        let ctx = create_alpaca_trading_api_test_ctx();
         let pool = setup_test_db().await;
 
         let mut stdout_buffer = Vec::new();

@@ -4,23 +4,23 @@
 //! validates compatibility, and assembles the runtime [`Ctx`] that the rest
 //! of the application consumes.
 
-use alloy::primitives::{Address, B256, FixedBytes};
+use alloy::primitives::{Address, B256};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
+use st0x_execution::{
+    AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Positive,
+    SupportedExecutor, Symbol, TimeInForce,
+};
+use st0x_finance::Usdc;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use tracing::Level;
-use url::Url;
 
-use st0x_execution::{
-    AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaTradingApiCtx,
-    AlpacaTradingApiMode, FractionalShares, Positive, SchwabCtx, SupportedExecutor, Symbol,
-    TimeInForce,
-};
-use st0x_finance::Usdc;
+#[cfg(any(test, feature = "test-support"))]
+use url::Url;
 
 use crate::offchain::order_poller::OrderPollerCtx;
 use crate::onchain::{EvmConfig, EvmCtx, EvmSecrets};
@@ -31,16 +31,12 @@ use crate::telemetry::{TelemetryConfig, TelemetryCtx, TelemetrySecrets};
 use crate::threshold::{ExecutionThreshold, InvalidThresholdError};
 use st0x_float_macro::float;
 
-/// Schwab minimum execution threshold: 1 share.
-static SCHWAB_MIN_SHARES: LazyLock<Positive<FractionalShares>> = LazyLock::new(|| {
-    Positive::new(FractionalShares::new(float!(1))).unwrap_or_else(|_| {
-        // Positive::new only fails for zero/negative — 1 is always positive.
-        unreachable!()
-    })
-});
-
 /// Alpaca minimum execution threshold: $2.
 static ALPACA_MIN_DOLLARS: LazyLock<Usdc> = LazyLock::new(|| Usdc::new(float!(2)));
+
+/// Dry-run minimum execution threshold: 1 share.
+static DRY_RUN_MIN_SHARES: LazyLock<FractionalShares> =
+    LazyLock::new(|| FractionalShares::new(float!(1)));
 
 #[derive(Parser, Debug)]
 pub struct Env {
@@ -220,19 +216,6 @@ struct Secrets {
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)] // isn't relevant for a brief startup step
 enum BrokerSecrets {
-    Schwab {
-        app_key: String,
-        app_secret: String,
-        redirect_uri: Option<Url>,
-        base_url: Option<Url>,
-        account_index: Option<usize>,
-        encryption_key: FixedBytes<32>,
-    },
-    AlpacaTradingApi {
-        api_key: String,
-        api_secret: String,
-        trading_mode: Option<AlpacaTradingApiMode>,
-    },
     AlpacaBrokerApi {
         api_key: String,
         api_secret: String,
@@ -275,8 +258,6 @@ pub struct Ctx {
 /// Runtime broker configuration assembled from `BrokerSecrets`.
 #[derive(Clone)]
 pub enum BrokerCtx {
-    Schwab(SchwabAuth),
-    AlpacaTradingApi(AlpacaTradingApiCtx),
     AlpacaBrokerApi(AlpacaBrokerApiCtx),
     DryRun,
 }
@@ -284,8 +265,6 @@ pub enum BrokerCtx {
 impl BrokerCtx {
     pub(crate) fn to_supported_executor(&self) -> SupportedExecutor {
         match self {
-            Self::Schwab(_) => SupportedExecutor::Schwab,
-            Self::AlpacaTradingApi(_) => SupportedExecutor::AlpacaTradingApi,
             Self::AlpacaBrokerApi(_) => SupportedExecutor::AlpacaBrokerApi,
             Self::DryRun => SupportedExecutor::DryRun,
         }
@@ -293,9 +272,14 @@ impl BrokerCtx {
 
     fn execution_threshold(&self) -> Result<ExecutionThreshold, CtxError> {
         match self {
-            Self::Schwab(_) | Self::DryRun => Ok(ExecutionThreshold::shares(*SCHWAB_MIN_SHARES)),
-            Self::AlpacaTradingApi(_) | Self::AlpacaBrokerApi(_) => {
-                Ok(ExecutionThreshold::dollar_value(*ALPACA_MIN_DOLLARS)?)
+            Self::AlpacaBrokerApi(_) => Ok(ExecutionThreshold::dollar_value(*ALPACA_MIN_DOLLARS)?),
+            Self::DryRun => {
+                let shares = Positive::new(*DRY_RUN_MIN_SHARES).map_err(|error| {
+                    CtxError::InvalidDryRunMinimumShares {
+                        configured: error.value,
+                    }
+                })?;
+                Ok(ExecutionThreshold::shares(shares))
             }
         }
     }
@@ -304,32 +288,6 @@ impl BrokerCtx {
 impl From<BrokerSecrets> for BrokerCtx {
     fn from(secrets: BrokerSecrets) -> Self {
         match secrets {
-            BrokerSecrets::Schwab {
-                app_key,
-                app_secret,
-                redirect_uri,
-                base_url,
-                account_index,
-                encryption_key,
-            } => Self::Schwab(SchwabAuth {
-                app_key,
-                app_secret,
-                redirect_uri,
-                base_url,
-                account_index,
-                encryption_key,
-            }),
-
-            BrokerSecrets::AlpacaTradingApi {
-                api_key,
-                api_secret,
-                trading_mode,
-            } => Self::AlpacaTradingApi(AlpacaTradingApiCtx {
-                api_key,
-                api_secret,
-                trading_mode,
-            }),
-
             BrokerSecrets::AlpacaBrokerApi {
                 api_key,
                 api_secret,
@@ -349,50 +307,9 @@ impl From<BrokerSecrets> for BrokerCtx {
     }
 }
 
-/// Schwab auth credentials used by the main crate for token management
-/// and executor construction.
-#[derive(Clone)]
-pub struct SchwabAuth {
-    pub(crate) app_key: String,
-    pub(crate) app_secret: String,
-    pub(crate) redirect_uri: Option<Url>,
-    pub(crate) base_url: Option<Url>,
-    pub(crate) account_index: Option<usize>,
-    pub(crate) encryption_key: FixedBytes<32>,
-}
-
-impl SchwabAuth {
-    pub(crate) fn to_schwab_ctx(&self, pool: SqlitePool) -> SchwabCtx {
-        SchwabCtx {
-            app_key: self.app_key.clone(),
-            app_secret: self.app_secret.clone(),
-            redirect_uri: self.redirect_uri.clone(),
-            base_url: self.base_url.clone(),
-            account_index: self.account_index,
-            encryption_key: self.encryption_key,
-            pool,
-        }
-    }
-}
-
-impl std::fmt::Debug for SchwabAuth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SchwabAuth")
-            .field("app_key", &"[REDACTED]")
-            .field("app_secret", &"[REDACTED]")
-            .field("redirect_uri", &self.redirect_uri)
-            .field("base_url", &self.base_url)
-            .field("account_index", &self.account_index)
-            .field("encryption_key", &"[REDACTED]")
-            .finish()
-    }
-}
-
 impl std::fmt::Debug for BrokerCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Schwab(auth) => f.debug_tuple("Schwab").field(auth).finish(),
-            Self::AlpacaTradingApi(ctx) => f.debug_tuple("AlpacaTradingApi").field(ctx).finish(),
             Self::AlpacaBrokerApi(ctx) => f.debug_tuple("AlpacaBrokerApi").field(ctx).finish(),
             Self::DryRun => write!(f, "DryRun"),
         }
@@ -484,7 +401,6 @@ impl Ctx {
         let telemetry = TelemetryCtx::new(config.telemetry, secrets.telemetry)?;
 
         // Execution threshold is determined by broker capabilities:
-        // - Schwab API doesn't support fractional shares, so use 1 whole share threshold
         // - Alpaca requires $1 minimum for fractional trading. We use $2 to provide buffer
         //   for slippage, fees, and price discrepancies that could push fills below $1.
         // - DryRun uses shares threshold for testing
@@ -754,6 +670,8 @@ pub enum CtxError {
          -- Alpaca rejects whitelist requests without it since 2026-03-27"
     )]
     MissingTravelRule,
+    #[error("dry-run minimum shares must be positive, got {configured}")]
+    InvalidDryRunMinimumShares { configured: FractionalShares },
     #[error("Float comparison failed during config validation: {0}")]
     FloatComparison(#[from] rain_math_float::FloatError),
 }
@@ -791,6 +709,7 @@ impl CtxError {
             Self::FloatComparison(_) => "float comparison failed",
             Self::InvalidTravelRule { .. } => "invalid travel rule config",
             Self::MissingTravelRule => "missing travel rule config",
+            Self::InvalidDryRunMinimumShares { .. } => "invalid dry-run minimum shares",
         }
     }
 }
@@ -818,7 +737,7 @@ pub(crate) async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePo
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use alloy::primitives::{Address, FixedBytes, address};
+    use alloy::primitives::{Address, address};
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -828,8 +747,6 @@ pub(crate) mod tests {
     use crate::onchain::EvmCtx;
     use crate::threshold::ExecutionThreshold;
     use st0x_float_macro::float;
-
-    const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
     fn toml_file(content: &str) -> NamedTempFile {
         let mut file = NamedTempFile::new().unwrap();
@@ -851,14 +768,7 @@ pub(crate) mod tests {
             order_polling_max_jitter: 5,
             position_check_interval: 60,
             inventory_poll_interval: 60,
-            broker: BrokerCtx::Schwab(SchwabAuth {
-                app_key: "test_key".to_owned(),
-                app_secret: "test_secret".to_owned(),
-                redirect_uri: None,
-                base_url: Some(url::Url::parse("https://test.com").unwrap()),
-                account_index: None,
-                encryption_key: TEST_ENCRYPTION_KEY,
-            }),
+            broker: BrokerCtx::DryRun,
             telemetry: None,
             trading_mode: TradingMode::Standalone { order_owner },
             execution_threshold: ExecutionThreshold::whole_share(),
@@ -924,41 +834,6 @@ pub(crate) mod tests {
         file
     }
 
-    fn schwab_secrets_toml() -> NamedTempFile {
-        let mut file = NamedTempFile::new().unwrap();
-        file.write_all(
-            br#"
-            [evm]
-            ws_rpc_url = "ws://localhost:8545"
-
-            [broker]
-            type = "schwab"
-            app_key = "test_key"
-            app_secret = "test_secret"
-            encryption_key = "0x0000000000000000000000000000000000000000000000000000000000000000"
-        "#,
-        )
-        .unwrap();
-        file
-    }
-
-    fn minimal_config_toml_without_order_owner() -> NamedTempFile {
-        let mut file = NamedTempFile::new().unwrap();
-        file.write_all(
-            br#"
-            database_url = ":memory:"
-
-            [assets.equities]
-
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-            deployment_block = 1
-        "#,
-        )
-        .unwrap();
-        file
-    }
-
     fn example_config_toml() -> &'static Path {
         Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/example.config.toml"))
     }
@@ -1002,13 +877,7 @@ pub(crate) mod tests {
         let ctx = create_test_ctx_with_order_owner(address!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
-        let pool = crate::test_utils::setup_test_db().await;
-
-        let BrokerCtx::Schwab(schwab_auth) = &ctx.broker else {
-            panic!("Expected Schwab broker ctx");
-        };
-        let schwab_ctx = schwab_auth.to_schwab_ctx(pool.clone());
-        schwab_ctx.try_into_executor().await.unwrap_err();
+        assert!(matches!(ctx.broker, BrokerCtx::DryRun));
 
         // MockExecutorCtx implements TryIntoExecutor, which produces a
         // MockExecutor via the Executor trait's associated Ctx type.
@@ -1025,6 +894,42 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(matches!(ctx.broker, BrokerCtx::DryRun));
+    }
+
+    #[tokio::test]
+    async fn load_files_rejects_invalid_orderbook_address() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "not-an-address"
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            deployment_block = 1
+        "#,
+        );
+        let secrets = dry_run_secrets_toml();
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::ConfigToml { .. }),
+            "expected config parse failure for invalid orderbook, got: {error:#}"
+        );
+
+        let source = std::error::Error::source(&error).unwrap();
+        let source_display = source.to_string();
+        assert!(
+            source_display.contains("orderbook"),
+            "expected parse error to mention orderbook field, got: {source_display}"
+        );
+        assert!(
+            source_display.contains("not-an-address"),
+            "expected parse error to mention invalid orderbook value, got: {source_display}"
+        );
     }
 
     #[tokio::test]
@@ -1256,92 +1161,6 @@ pub(crate) mod tests {
         assert_eq!(ctx.order_polling_max_jitter, 10);
         assert_eq!(ctx.position_check_interval, 120);
         assert_eq!(ctx.inventory_poll_interval, 90);
-    }
-
-    #[tokio::test]
-    async fn rebalancing_with_schwab_fails() {
-        let secrets = toml_file(
-            r#"
-            [evm]
-            ws_rpc_url = "ws://localhost:8545"
-
-            [broker]
-            type = "schwab"
-            app_key = "test_key"
-            app_secret = "test_secret"
-            encryption_key = "0x0000000000000000000000000000000000000000000000000000000000000000"
-
-            [rebalancing]
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.infura.io"
-
-            [rebalancing.wallet]
-            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-        "#,
-        );
-
-        let config = toml_file(
-            r#"
-            database_url = ":memory:"
-
-            [assets.equities]
-
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-            deployment_block = 1
-
-            [rebalancing]
-            redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-
-            [rebalancing.wallet]
-            kind = "private-key"
-            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-
-            [rebalancing.equity]
-            target = "0.5"
-            deviation = "0.2"
-
-            [rebalancing.usdc]
-            mode = "enabled"
-            target = "0.5"
-            deviation = "0.3"
-        "#,
-        );
-
-        let error = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                CtxError::Rebalancing(ref inner) if matches!(**inner, RebalancingCtxError::NotAlpacaBroker)
-            ),
-            "Expected NotAlpacaBroker error for rebalancing with Schwab broker, got {error:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn schwab_without_order_owner_fails() {
-        let config = minimal_config_toml_without_order_owner();
-        let secrets = schwab_secrets_toml();
-        let result = Ctx::load_files(config.path(), secrets.path()).await;
-        assert!(
-            matches!(result, Err(CtxError::MissingOrderOwner)),
-            "Expected MissingOrderOwner error, got {result:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn schwab_with_order_owner_succeeds() {
-        let config = minimal_config_toml();
-        let secrets = schwab_secrets_toml();
-        let ctx = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap();
-        assert_eq!(
-            ctx.order_owner(),
-            address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-        );
     }
 
     #[tokio::test]
@@ -1592,41 +1411,6 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn schwab_executor_uses_shares_threshold() {
-        let config = minimal_config_toml();
-        let secrets = schwab_secrets_toml();
-        let ctx = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap();
-        assert_eq!(
-            ctx.execution_threshold,
-            ExecutionThreshold::shares(Positive::new(FractionalShares::new(float!(1))).unwrap())
-        );
-    }
-
-    #[tokio::test]
-    async fn alpaca_trading_api_executor_uses_dollar_threshold() {
-        let config = minimal_config_toml();
-        let secrets = toml_file(
-            r#"
-            [evm]
-            ws_rpc_url = "ws://localhost:8545"
-
-            [broker]
-            type = "alpaca-trading-api"
-            api_key = "test-key"
-            api_secret = "test-secret"
-        "#,
-        );
-
-        let ctx = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap();
-        let expected = ExecutionThreshold::dollar_value(Usdc::new(float!(2))).unwrap();
-        assert_eq!(ctx.execution_threshold, expected);
-    }
-
-    #[tokio::test]
     async fn alpaca_broker_api_executor_uses_dollar_threshold() {
         let config = alpaca_config_toml();
         let secrets = toml_file(
@@ -1685,69 +1469,6 @@ pub(crate) mod tests {
     fn config_error_kind_invalid_threshold() {
         let err = CtxError::InvalidThreshold(InvalidThresholdError::ZeroDollarValue);
         assert_eq!(err.kind(), "invalid execution threshold");
-    }
-
-    #[tokio::test]
-    async fn rebalancing_with_schwab_logs_error_kind() {
-        let secrets = toml_file(
-            r#"
-            [evm]
-            ws_rpc_url = "ws://localhost:8545"
-
-            [broker]
-            type = "schwab"
-            app_key = "test_key"
-            app_secret = "test_secret"
-            encryption_key = "0x0000000000000000000000000000000000000000000000000000000000000000"
-
-            [rebalancing]
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.infura.io"
-
-            [rebalancing.wallet]
-            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-        "#,
-        );
-
-        let config = toml_file(
-            r#"
-            database_url = ":memory:"
-
-            [assets.equities]
-
-            [raindex]
-            orderbook = "0x1111111111111111111111111111111111111111"
-            deployment_block = 1
-
-            [rebalancing]
-            redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-
-            [rebalancing.wallet]
-            kind = "private-key"
-            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-
-            [rebalancing.equity]
-            target = "0.5"
-            deviation = "0.2"
-
-            [rebalancing.usdc]
-            mode = "enabled"
-            target = "0.5"
-            deviation = "0.3"
-        "#,
-        );
-
-        let error = Ctx::load_files(config.path(), secrets.path())
-            .await
-            .unwrap_err();
-
-        assert!(
-            matches!(
-                error,
-                CtxError::Rebalancing(ref inner) if matches!(**inner, RebalancingCtxError::NotAlpacaBroker)
-            ),
-            "expected NotAlpacaBroker, got: {error:?}"
-        );
     }
 
     #[tokio::test]
@@ -2639,8 +2360,6 @@ pub(crate) mod tests {
     fn broker_type_tag_uses_kebab_case() {
         let variants = [
             ("dry-run", "DryRun"),
-            ("schwab", "Schwab"),
-            ("alpaca-trading-api", "AlpacaTradingApi"),
             ("alpaca-broker-api", "AlpacaBrokerApi"),
         ];
 
@@ -2655,8 +2374,8 @@ pub(crate) mod tests {
                 "#,
             );
 
-            // Only dry-run and schwab parse without extra fields;
-            // alpaca variants need credentials but the tag itself
+            // Only dry-run parses without extra fields;
+            // alpaca broker needs credentials but the tag itself
             // must be accepted before field validation runs.
             let result = toml::from_str::<Secrets>(&toml_str);
             match result {
@@ -2714,7 +2433,7 @@ pub(crate) mod tests {
 
     #[test]
     fn broker_type_tag_rejects_snake_case() {
-        let snake_values = ["dry_run", "alpaca_trading_api", "alpaca_broker_api"];
+        let snake_values = ["dry_run", "alpaca_broker_api"];
 
         for snake_value in snake_values {
             let toml_str = format!(

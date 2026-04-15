@@ -356,8 +356,8 @@ impl Position {
     ///
     /// Returns `Ok(Some((direction, shares)))` if met:
     /// - `direction`: Sell for long, Buy for short
-    /// - `shares`: Full fractional amount if executor
-    ///   supports it, otherwise floored to whole shares
+    /// - `shares`: Full fractional amount, optionally
+    ///   capped by `shares_limit`
     ///
     /// Returns `Ok(None)` if threshold is not met or no
     /// price available for dollar-value threshold.
@@ -365,7 +365,6 @@ impl Position {
     /// Returns `Err` on arithmetic overflow.
     pub(crate) fn is_ready_for_execution(
         &self,
-        executor: SupportedExecutor,
         shares_limit: Option<Positive<FractionalShares>>,
     ) -> Result<Option<(Direction, FractionalShares)>, PositionError> {
         if self.pending_offchain_order_id.is_some() {
@@ -393,13 +392,7 @@ impl Position {
                     }
                 });
 
-                let executable_shares = if executor.supports_fractional_shares() {
-                    capped_shares
-                } else {
-                    FractionalShares::new(capped_shares.inner().integer()?)
-                };
-
-                if executable_shares.is_zero()? {
+                if capped_shares.is_zero()? {
                     return Ok(None);
                 }
 
@@ -409,7 +402,7 @@ impl Position {
                     Direction::Sell
                 };
 
-                Ok(Some((direction, executable_shares)))
+                Ok(Some((direction, capped_shares)))
             }
             None => Ok(None),
         }
@@ -877,7 +870,7 @@ mod tests {
                 offchain_order_id: OffchainOrderId::new(),
                 shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
                 direction: Direction::Sell,
-                executor: SupportedExecutor::Schwab,
+                executor: SupportedExecutor::DryRun,
                 threshold,
             })
             .await
@@ -913,7 +906,7 @@ mod tests {
                 offchain_order_id: OffchainOrderId::new(),
                 shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
                 direction: Direction::Sell,
-                executor: SupportedExecutor::Schwab,
+                executor: SupportedExecutor::DryRun,
                 threshold,
             })
             .await
@@ -952,7 +945,7 @@ mod tests {
                     offchain_order_id,
                     shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
                     direction: Direction::Sell,
-                    executor: SupportedExecutor::Schwab,
+                    executor: SupportedExecutor::DryRun,
                     trigger_reason: TriggerReason::SharesThreshold {
                         net_position_shares: float!(1.5),
                         threshold_shares: float!(1),
@@ -964,7 +957,7 @@ mod tests {
                 offchain_order_id: OffchainOrderId::new(),
                 shares: Positive::new(FractionalShares::new(float!(0.5))).unwrap(),
                 direction: Direction::Sell,
-                executor: SupportedExecutor::Schwab,
+                executor: SupportedExecutor::DryRun,
                 threshold,
             })
             .await
@@ -1003,7 +996,7 @@ mod tests {
                     offchain_order_id,
                     shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
                     direction: Direction::Sell,
-                    executor: SupportedExecutor::Schwab,
+                    executor: SupportedExecutor::DryRun,
                     trigger_reason: TriggerReason::SharesThreshold {
                         net_position_shares: float!(1.5),
                         threshold_shares: float!(1),
@@ -1052,7 +1045,7 @@ mod tests {
                     offchain_order_id,
                     shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
                     direction: Direction::Sell,
-                    executor: SupportedExecutor::Schwab,
+                    executor: SupportedExecutor::DryRun,
                     trigger_reason: TriggerReason::SharesThreshold {
                         net_position_shares: float!(1.5),
                         threshold_shares: float!(1),
@@ -1114,7 +1107,7 @@ mod tests {
                 offchain_order_id,
                 shares: Positive::new(FractionalShares::new(float!(1.5))).unwrap(),
                 direction: Direction::Sell,
-                executor: SupportedExecutor::Schwab,
+                executor: SupportedExecutor::DryRun,
                 trigger_reason: TriggerReason::SharesThreshold {
                     net_position_shares: float!(2),
                     threshold_shares: float!(1),
@@ -1166,7 +1159,7 @@ mod tests {
                 offchain_order_id,
                 shares: Positive::new(FractionalShares::new(float!(1.5))).unwrap(),
                 direction: Direction::Buy,
-                executor: SupportedExecutor::Schwab,
+                executor: SupportedExecutor::DryRun,
                 trigger_reason: TriggerReason::SharesThreshold {
                     net_position_shares: float!(2),
                     threshold_shares: float!(1),
@@ -1218,7 +1211,7 @@ mod tests {
                 offchain_order_id,
                 shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
                 direction: Direction::Sell,
-                executor: SupportedExecutor::Schwab,
+                executor: SupportedExecutor::DryRun,
                 trigger_reason: TriggerReason::SharesThreshold {
                     net_position_shares: float!(1.5),
                     threshold_shares: float!(1),
@@ -1320,7 +1313,7 @@ mod tests {
             offchain_order_id: OffchainOrderId::new(),
             shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
             direction: Direction::Sell,
-            executor: SupportedExecutor::Schwab,
+            executor: SupportedExecutor::DryRun,
             trigger_reason: TriggerReason::SharesThreshold {
                 net_position_shares: float!(1),
                 threshold_shares: float!(1),
@@ -1373,7 +1366,7 @@ mod tests {
     }
 
     #[test]
-    fn is_ready_for_execution_floors_shares_for_non_fractional_executor() {
+    fn is_ready_for_execution_returns_fractional_shares() {
         let position = Position {
             symbol: Symbol::new("AAPL").unwrap(),
             net: FractionalShares::new(float!(1.212)),
@@ -1386,61 +1379,7 @@ mod tests {
         };
 
         let (direction, shares) = position
-            .is_ready_for_execution(SupportedExecutor::Schwab, None)
-            .unwrap()
-            .expect("should be ready for execution");
-
-        assert_eq!(direction, Direction::Sell);
-        assert_eq!(
-            shares,
-            FractionalShares::new(float!(1)),
-            "Schwab executor should floor to whole \
-             shares: expected 1, got {shares}",
-        );
-    }
-
-    #[test]
-    fn is_ready_for_execution_floors_shares_for_negative_position_with_non_fractional_executor() {
-        let position = Position {
-            symbol: Symbol::new("AAPL").unwrap(),
-            net: FractionalShares::new(float!(-2.567)),
-            accumulated_long: FractionalShares::ZERO,
-            accumulated_short: FractionalShares::new(float!(2.567)),
-            pending_offchain_order_id: None,
-            threshold: ExecutionThreshold::whole_share(),
-            last_price_usdc: Some(float!(150)),
-            last_updated: Some(Utc::now()),
-        };
-
-        let (direction, shares) = position
-            .is_ready_for_execution(SupportedExecutor::Schwab, None)
-            .unwrap()
-            .expect("should be ready for execution");
-
-        assert_eq!(direction, Direction::Buy);
-        assert_eq!(
-            shares,
-            FractionalShares::new(float!(2)),
-            "Schwab executor should floor to whole \
-             shares: expected 2, got {shares}",
-        );
-    }
-
-    #[test]
-    fn is_ready_for_execution_returns_fractional_shares_for_fractional_executor() {
-        let position = Position {
-            symbol: Symbol::new("AAPL").unwrap(),
-            net: FractionalShares::new(float!(1.212)),
-            accumulated_long: FractionalShares::new(float!(1.212)),
-            accumulated_short: FractionalShares::ZERO,
-            pending_offchain_order_id: None,
-            threshold: ExecutionThreshold::dollar_value(Usdc::new(float!(1))).unwrap(),
-            last_price_usdc: Some(float!(150)),
-            last_updated: Some(Utc::now()),
-        };
-
-        let (direction, shares) = position
-            .is_ready_for_execution(SupportedExecutor::AlpacaTradingApi, None)
+            .is_ready_for_execution(None)
             .unwrap()
             .expect("should be ready for execution");
 
@@ -1448,26 +1387,25 @@ mod tests {
         assert_eq!(
             shares,
             FractionalShares::new(float!(1.212)),
-            "Alpaca executor should return full \
-             fractional shares: expected 1.212, got {shares}",
+            "Expected 1.212 shares, got {shares}",
         );
     }
 
     #[test]
-    fn is_ready_for_execution_returns_fractional_for_negative_position_with_fractional_executor() {
+    fn is_ready_for_execution_returns_fractional_buy_for_negative_position() {
         let position = Position {
             symbol: Symbol::new("AAPL").unwrap(),
             net: FractionalShares::new(float!(-2.567)),
             accumulated_long: FractionalShares::ZERO,
             accumulated_short: FractionalShares::new(float!(2.567)),
             pending_offchain_order_id: None,
-            threshold: ExecutionThreshold::dollar_value(Usdc::new(float!(1))).unwrap(),
+            threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
         };
 
         let (direction, shares) = position
-            .is_ready_for_execution(SupportedExecutor::AlpacaTradingApi, None)
+            .is_ready_for_execution(None)
             .unwrap()
             .expect("should be ready for execution");
 
@@ -1475,8 +1413,7 @@ mod tests {
         assert_eq!(
             shares,
             FractionalShares::new(float!(2.567)),
-            "Alpaca executor should return full \
-             fractional shares: expected 2.567, got {shares}",
+            "Expected 2.567 shares, got {shares}",
         );
     }
 
@@ -1496,7 +1433,7 @@ mod tests {
         let shares_limit = Positive::new(FractionalShares::new(float!(50))).unwrap();
 
         let (direction, shares) = position
-            .is_ready_for_execution(SupportedExecutor::DryRun, Some(shares_limit))
+            .is_ready_for_execution(Some(shares_limit))
             .unwrap()
             .expect("should be ready for execution");
 
@@ -1525,7 +1462,7 @@ mod tests {
         let shares_limit = Positive::new(FractionalShares::new(float!(50))).unwrap();
 
         let (direction, shares) = position
-            .is_ready_for_execution(SupportedExecutor::DryRun, Some(shares_limit))
+            .is_ready_for_execution(Some(shares_limit))
             .unwrap()
             .expect("should be ready for execution");
 
@@ -1539,7 +1476,7 @@ mod tests {
     }
 
     #[test]
-    fn operational_limits_cap_floors_for_non_fractional_executor() {
+    fn operational_limits_preserve_fractional_cap() {
         let position = Position {
             symbol: Symbol::new("AAPL").unwrap(),
             net: FractionalShares::new(float!(100)),
@@ -1554,15 +1491,14 @@ mod tests {
         let shares_limit = Positive::new(FractionalShares::new(float!(50.7))).unwrap();
 
         let (_, shares) = position
-            .is_ready_for_execution(SupportedExecutor::Schwab, Some(shares_limit))
+            .is_ready_for_execution(Some(shares_limit))
             .unwrap()
             .expect("should be ready for execution");
 
         assert_eq!(
             shares,
-            FractionalShares::new(float!(50)),
-            "Non-fractional executor should floor capped shares: \
-             cap is 50.7, floored to 50, got {shares}",
+            FractionalShares::new(float!(50.7)),
+            "Fractional executor should preserve the exact cap: expected 50.7, got {shares}",
         );
     }
 
@@ -1583,7 +1519,7 @@ mod tests {
         let shares_limit = Positive::new(FractionalShares::new(float!(7.5))).unwrap();
 
         let (direction, shares) = position
-            .is_ready_for_execution(SupportedExecutor::AlpacaTradingApi, Some(shares_limit))
+            .is_ready_for_execution(Some(shares_limit))
             .unwrap()
             .expect("should be ready for execution");
 
@@ -1612,7 +1548,7 @@ mod tests {
         let shares_limit = Positive::new(FractionalShares::new(float!(5))).unwrap();
 
         let (direction, shares) = position
-            .is_ready_for_execution(SupportedExecutor::AlpacaTradingApi, Some(shares_limit))
+            .is_ready_for_execution(Some(shares_limit))
             .unwrap()
             .expect("should be ready for execution");
 
@@ -1641,7 +1577,7 @@ mod tests {
         let shares_limit = Positive::new(FractionalShares::new(float!(50))).unwrap();
 
         let (direction, shares) = position
-            .is_ready_for_execution(SupportedExecutor::DryRun, Some(shares_limit))
+            .is_ready_for_execution(Some(shares_limit))
             .unwrap()
             .expect("should be ready for execution");
 
@@ -1718,7 +1654,7 @@ mod tests {
         };
 
         let (_, first_shares) = position
-            .is_ready_for_execution(SupportedExecutor::DryRun, Some(shares_limit))
+            .is_ready_for_execution(Some(shares_limit))
             .unwrap()
             .expect("first check should trigger");
         assert_eq!(
@@ -1735,7 +1671,7 @@ mod tests {
         };
 
         let (_, second_shares) = after_first
-            .is_ready_for_execution(SupportedExecutor::DryRun, Some(shares_limit))
+            .is_ready_for_execution(Some(shares_limit))
             .unwrap()
             .expect("remaining 70 shares still exceeds threshold");
         assert_eq!(
@@ -1752,7 +1688,7 @@ mod tests {
         };
 
         let (_, third_shares) = after_second
-            .is_ready_for_execution(SupportedExecutor::DryRun, Some(shares_limit))
+            .is_ready_for_execution(Some(shares_limit))
             .unwrap()
             .expect("remaining 20 shares still exceeds threshold");
         assert_eq!(

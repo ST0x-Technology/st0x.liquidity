@@ -138,7 +138,6 @@ mod tests {
         assert!(json.contains("recentTrades"));
         assert!(json.contains("inventory"));
         assert!(json.contains("metrics"));
-        assert!(json.contains("authStatus"));
         assert!(json.contains("circuitBreaker"));
     }
 

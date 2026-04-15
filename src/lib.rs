@@ -9,10 +9,10 @@ use sqlx::SqlitePool;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::task::{AbortHandle, JoinError, JoinHandle};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use st0x_dto::ServerMessage;
-use st0x_execution::{ExecutionError, Executor, MockExecutorCtx, SchwabError, TryIntoExecutor};
+use st0x_execution::{Executor, MockExecutorCtx, TryIntoExecutor};
 
 use crate::config::{BrokerCtx, Ctx};
 
@@ -89,9 +89,12 @@ pub async fn run_bot_session_with_event_channel(
     ));
 
     let server_task = spawn_server_task(&ctx, &pool, event_sender.clone(), inventory.clone());
-    let bot_task = tokio::spawn(async move {
-        Box::pin(run_conductor_loop(ctx, pool, event_sender, inventory)).await
-    });
+    let bot_task = tokio::spawn(Box::pin(run_conductor_session(
+        ctx,
+        pool,
+        event_sender,
+        inventory,
+    )));
 
     await_shutdown(server_task, bot_task).await?;
 
@@ -195,53 +198,28 @@ fn check_bot_result(result: Result<anyhow::Result<()>, JoinError>) -> anyhow::Re
     }
 }
 
-/// Retry loop that initializes the broker executor and runs the conductor.
-/// Retries on Schwab token expiration; all other errors are fatal.
+/// Runs a single conductor session with the configured broker executor.
 #[tracing::instrument(skip_all, level = tracing::Level::INFO)]
-async fn run_conductor_loop(
+async fn run_conductor_session(
     ctx: Ctx,
     pool: SqlitePool,
     event_sender: broadcast::Sender<ServerMessage>,
     inventory: Arc<inventory::BroadcastingInventory>,
 ) -> anyhow::Result<()> {
-    const RERUN_DELAY_SECS: u64 = 10;
+    let result = dispatch_to_executor(ctx, pool, event_sender, inventory).await;
 
-    loop {
-        let result = Box::pin(dispatch_to_executor(
-            ctx.clone(),
-            pool.clone(),
-            event_sender.clone(),
-            inventory.clone(),
-        ))
-        .await;
-
-        match result {
-            Ok(()) => {
-                info!("Bot session completed successfully");
-                break Ok(());
-            }
-            Err(error) => {
-                if let Some(execution_error) = error.downcast_ref::<ExecutionError>()
-                    && matches!(
-                        execution_error,
-                        ExecutionError::Schwab(SchwabError::RefreshTokenExpired)
-                    )
-                {
-                    warn!("Refresh token expired, retrying in {RERUN_DELAY_SECS} seconds");
-                    tokio::time::sleep(std::time::Duration::from_secs(RERUN_DELAY_SECS)).await;
-                    continue;
-                }
-
-                error!("Bot session failed: {error}");
-                return Err(error);
-            }
+    match result {
+        Ok(()) => {
+            info!("Bot session completed successfully");
+            Ok(())
+        }
+        Err(error) => {
+            error!("Bot session failed: {error}");
+            Err(error)
         }
     }
 }
 
-// NOTE: this can be refactored much cleaner via macro/DI BUT
-// TODO: nuke schwab. nuke alpaca trading api. live happily ever after
-#[allow(clippy::cognitive_complexity)]
 async fn dispatch_to_executor(
     ctx: Ctx,
     pool: SqlitePool,
@@ -252,23 +230,6 @@ async fn dispatch_to_executor(
         BrokerCtx::DryRun => {
             info!("Initializing test executor for dry-run mode");
             let executor = MockExecutorCtx.try_into_executor().await?;
-            let maintenance = executor.run_executor_maintenance().await;
-
-            conductor::Conductor::run(executor, ctx, pool, maintenance, event_sender, inventory)
-                .await
-        }
-        BrokerCtx::Schwab(schwab_auth) => {
-            info!("Initializing Schwab executor");
-            let schwab_ctx = schwab_auth.to_schwab_ctx(pool.clone());
-            let executor = schwab_ctx.try_into_executor().await?;
-            let maintenance = executor.run_executor_maintenance().await;
-
-            conductor::Conductor::run(executor, ctx, pool, maintenance, event_sender, inventory)
-                .await
-        }
-        BrokerCtx::AlpacaTradingApi(alpaca_auth) => {
-            info!("Initializing Alpaca Trading API executor");
-            let executor = alpaca_auth.try_into_executor().await?;
             let maintenance = executor.run_executor_maintenance().await;
 
             conductor::Conductor::run(executor, ctx, pool, maintenance, event_sender, inventory)
@@ -287,10 +248,14 @@ async fn dispatch_to_executor(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, address};
+    use alloy::primitives::address;
 
     use super::*;
     use crate::config::tests::create_test_ctx_with_order_owner;
+
+    // `Ctx::load_files` parses `orderbook` into `Address`, so runtime tests
+    // only exercise already-validated addresses. Invalid orderbook input is
+    // covered in `config::tests::load_files_rejects_invalid_orderbook_address`.
 
     async fn create_test_pool() -> SqlitePool {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
@@ -318,7 +283,7 @@ mod tests {
         ));
         let pool = create_test_pool().await;
         ctx.evm.ws_rpc_url = "ws://invalid.nonexistent.url:8545".parse().unwrap();
-        let error = Box::pin(run_conductor_loop(
+        let error = Box::pin(run_conductor_session(
             ctx,
             pool,
             create_test_event_sender(),
@@ -328,31 +293,10 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            error.downcast_ref::<ExecutionError>().is_some(),
-            "expected ExecutionError from Schwab executor init, got: {error:#}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_run_function_invalid_orderbook_address() {
-        let mut ctx = create_test_ctx_with_order_owner(address!(
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        ));
-        let pool = create_test_pool().await;
-        ctx.evm.orderbook = Address::ZERO;
-        ctx.evm.ws_rpc_url = "ws://localhost:8545".parse().unwrap();
-        let error = Box::pin(run_conductor_loop(
-            ctx,
-            pool,
-            create_test_event_sender(),
-            create_test_inventory(),
-        ))
-        .await
-        .unwrap_err();
-
-        assert!(
-            error.downcast_ref::<ExecutionError>().is_some(),
-            "expected ExecutionError from Schwab executor init, got: {error:#}"
+            error
+                .to_string()
+                .contains("failed to connect websocket provider"),
+            "expected websocket provider connection failure, got: {error:#}"
         );
     }
 
@@ -363,7 +307,7 @@ mod tests {
         ));
         ctx.evm.ws_rpc_url = "ws://invalid.nonexistent.localhost:9999".parse().unwrap();
         let pool = create_test_pool().await;
-        let error = Box::pin(run_conductor_loop(
+        let error = Box::pin(run_conductor_session(
             ctx,
             pool,
             create_test_event_sender(),
@@ -373,8 +317,10 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            error.downcast_ref::<ExecutionError>().is_some(),
-            "expected ExecutionError from Schwab executor init, got: {error:#}"
+            error
+                .to_string()
+                .contains("failed to connect websocket provider"),
+            "expected websocket provider connection failure, got: {error:#}"
         );
     }
 }

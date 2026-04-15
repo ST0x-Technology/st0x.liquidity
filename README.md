@@ -17,13 +17,12 @@ markets by providing continuous two-sided liquidity.
 
 ## Features
 
-- **Multiple Brokerages**: Execute hedges through Alpaca Broker API (managed
-  accounts, auto-rebalancing), Alpaca Trading API (individual accounts), Charles
-  Schwab, or dry-run mode for testing
+- **Supported Executors**: Execute hedges through Alpaca Broker API (managed
+  accounts, auto-rebalancing) or dry-run mode for testing
 - **Real-Time Hedging**: WebSocket-based monitoring for near instant execution
   when onchain liquidity is taken
-- **Fractional Share Support**: Executes fractional shares on Alpaca; batches
-  until whole shares for Schwab
+- **Fractional Share Support**: Executes fractional shares on Alpaca; dry-run
+  mirrors the same execution model for testing
 - **Complete Audit Trail**: Database tracking linking every onchain trade to
   offchain hedge executions
 - **Exposure Hedging**: Automatically executes offsetting trades to reduce
@@ -76,6 +75,8 @@ The application uses TOML configuration files split into plaintext config and
 encrypted secrets. See `example.config.toml` and `example.secrets.toml` for all
 available options.
 
+Current broker support is limited to `alpaca-broker-api` and `dry-run`.
+
 ```bash
 cargo run --bin server -- --config path/to/config.toml --secrets path/to/secrets.toml
 cargo run --bin reporter -- --config path/to/config.toml
@@ -97,36 +98,14 @@ cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.to
 
 ### Brokerage Setup
 
-**Charles Schwab** (3-5 day approval):
-
-1. Create account at [schwab.com](https://www.schwab.com/)
-2. Register at [Schwab Developer Portal](https://developer.schwab.com/)
-3. Request "Trader API" access under API Products -> Individual Developers
-4. After approval, run `cargo run --bin cli -- auth` for one-time OAuth setup
-
 **Alpaca Broker API** (managed accounts, supports auto-rebalancing):
 
 For managed/omnibus accounts. Requires Broker API access from Alpaca. This is
 the only integration that supports automatic portfolio rebalancing (USDC/equity
 threshold-based).
 
-**Alpaca Trading API** (instant, paper trading available):
-
-For individual accounts. Create an account at
-[alpaca.markets](https://alpaca.markets/) and generate API keys from the
-dashboard.
-
 Add credentials to your TOML config file under the `[broker]` section (see
 `example.config.toml` and `example.secrets.toml`).
-
-### Token Encryption (Schwab only)
-
-Schwab OAuth tokens are encrypted at rest using AES-256-GCM. Generate a key and
-add it to your config:
-
-```bash
-openssl rand -hex 32
-```
 
 ## Deployment
 
@@ -141,10 +120,8 @@ GitHub Actions (CI/CD)
   | deploy-rs over SSH
   v
 NixOS host (DigitalOcean droplet)
-  ├── server-schwab    (systemd, hedging bot)
-  ├── server-alpaca    (systemd, hedging bot)
-  ├── reporter-schwab  (systemd, P&L reporter)
-  ├── reporter-alpaca  (systemd, P&L reporter)
+  ├── server           (systemd, hedging bot)
+  ├── reporter         (systemd, P&L reporter)
   ├── nginx            (dashboard + WebSocket proxy)
   └── grafana          (metrics visualization)
 ```
@@ -201,11 +178,11 @@ SSH into the host and run:
 ```bash
 # Roll back the server profile to previous deployment
 nix-env --profile /nix/var/nix/profiles/per-service/server --rollback
-systemctl restart server-schwab server-alpaca
+systemctl restart server
 
 # Roll back the reporter profile
 nix-env --profile /nix/var/nix/profiles/per-service/reporter --rollback
-systemctl restart reporter-schwab reporter-alpaca
+systemctl restart reporter
 ```
 
 ### Secrets Management
@@ -216,7 +193,7 @@ using its SSH key, mounting cleartext to `/run/agenix/` (tmpfs).
 
 ```bash
 # Edit an encrypted config
-nix run .#secret config/server-schwab.toml.age
+nix run .#secret config/st0x-hedge.toml.age
 
 # Re-encrypt all secrets after key changes
 ragenix --rules ./config/secrets.nix -r
@@ -285,8 +262,7 @@ Workspace crates:
 - **`st0x-event-sorcery`** (`crates/event-sorcery/`) - CQRS/event-sourcing
   helpers and testing utilities
 - **`st0x-execution`** (`crates/execution/`) - Standalone `Executor` trait
-  abstraction with Schwab, Alpaca Trading API, Alpaca Broker API, and mock
-  implementations
+  abstraction with Alpaca Broker API and mock implementations
 - **`st0x-bridge`** (`crates/bridge/`) - Cross-chain bridge abstractions and
   CCTP implementation
 - **`st0x-evm`** (`crates/evm/`) - EVM wallet, provider, and test-chain support
@@ -304,10 +280,8 @@ disko.nix                  # Disk partitioning for bootstrap
 keys.nix                   # SSH keys and role-based access
 config/
 ├── secrets.nix            # ragenix secret declarations
-├── server-schwab.toml.age # encrypted service configs
-├── server-alpaca.toml.age
-├── reporter-schwab.toml.age
-└── reporter-alpaca.toml.age
+├── st0x-hedge.toml        # plaintext service config
+└── st0x-hedge.toml.age    # encrypted service secrets
 infra/                     # Terraform (DigitalOcean)
 dashboard/                 # SvelteKit operations dashboard
 .github/workflows/
@@ -405,8 +379,9 @@ CI will fail if `bun.nix` is out of sync with `bun.lock`.
    liquidity onchain
 3. **Parse Trade**: Extract details (symbol, amount, direction, price) from
    blockchain events
-4. **Accumulate**: Batch fractional positions until the executor's minimum
-   threshold (immediate for Alpaca fractional shares, ≥1.0 for Schwab)
+4. **Accumulate**: Batch positions until the configured execution threshold is
+   reached (typically dollar-based for Alpaca Broker API, whole-share for
+   `dry-run`)
 5. **Hedge**: Execute offsetting market order on traditional brokerage to reduce
    exposure
 6. **Track**: Maintain complete audit trail linking onchain fills to offchain
@@ -416,6 +391,6 @@ CI will fail if `bun.nix` is out of sync with `bun.lock`.
 onchain order price and offchain hedge execution price) while hedging
 directional exposure.
 
-**Note**: Alpaca supports fractional share execution (minimum $1 worth). Schwab
-requires whole shares, so fractional onchain trades are batched until they
-accumulate to at least 1.0 shares before hedging.
+**Note**: Alpaca Broker API supports fractional share execution and the bot can
+hedge using dollar-value thresholds. `dry-run` remains available for local
+testing with whole-share thresholds when that is operationally useful.

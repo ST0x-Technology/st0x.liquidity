@@ -8,6 +8,7 @@ mod order_fill_monitor;
 
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
+use anyhow::Context;
 use chrono::Utc;
 use futures_util::StreamExt;
 use sqlx::SqlitePool;
@@ -92,8 +93,8 @@ pub(crate) struct Conductor {
     supervisor: SupervisorHandle,
     /// Runs the apalis job queue workers that process trade accounting jobs.
     monitor: JoinHandle<()>,
-    /// Periodic executor upkeep (e.g. Schwab token refresh). Absent when
-    /// the executor requires no background maintenance.
+    /// Periodic executor upkeep. Absent when the executor requires no
+    /// background maintenance.
     executor_maintenance: Option<JoinHandle<()>>,
     /// Periodic rebalancing loop. Absent when rebalancing is not configured.
     rebalancer: Option<JoinHandle<()>>,
@@ -144,7 +145,10 @@ impl Conductor {
     {
         // Phase 1: connect WS and set up apalis tables (parallel)
         let ws = WsConnect::new(ctx.evm.ws_rpc_url.as_str());
-        let provider = ProviderBuilder::new().connect_ws(ws).await?;
+        let provider = ProviderBuilder::new()
+            .connect_ws(ws)
+            .await
+            .context("failed to connect websocket provider")?;
         let cache = SymbolCache::default();
         let orderbook = IOrderBookV6Instance::new(ctx.evm.orderbook, &provider);
 

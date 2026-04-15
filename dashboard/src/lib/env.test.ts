@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { getWebSocketUrl } from './env'
 
-const mockEnv = vi.hoisted(() => ({ current: {} as Record<string, string | undefined> }))
+const mockEnv = { current: {} as Record<string, string | undefined> }
 
 vi.mock('$app/environment', () => ({ browser: true }))
 vi.mock('$env/dynamic/public', () => ({
@@ -11,7 +12,7 @@ vi.mock('$env/dynamic/public', () => ({
 
 describe('getWebSocketUrl', () => {
   beforeEach(() => {
-    vi.resetModules()
+    mockEnv.current = {}
     Object.defineProperty(globalThis, 'window', {
       value: {
         location: {
@@ -26,38 +27,31 @@ describe('getWebSocketUrl', () => {
     })
   })
 
-  it('returns env value when set', async () => {
-    mockEnv.current = { PUBLIC_SCHWAB_WS_URL: 'wss://custom.example.com/ws' }
-    const { getWebSocketUrl } = await import('./env')
+  it('returns env value when set', () => {
+    mockEnv.current = { PUBLIC_ALPACA_WS_URL: 'wss://custom.example.com/ws' }
 
-    expect(getWebSocketUrl('schwab')).toBe('wss://custom.example.com/ws')
+    expect(getWebSocketUrl()).toBe('wss://custom.example.com/ws')
   })
 
-  it('returns default URL when env is undefined', async () => {
-    mockEnv.current = {}
-    const { getWebSocketUrl } = await import('./env')
-
-    expect(getWebSocketUrl('schwab')).toBe('wss://example.com/api/schwab/ws')
+  it('returns default URL when env is undefined', () => {
+    expect(getWebSocketUrl()).toBe('wss://example.com/api/ws')
   })
 
-  it('returns default URL when env is empty string', async () => {
-    mockEnv.current = { PUBLIC_SCHWAB_WS_URL: '' }
-    const { getWebSocketUrl } = await import('./env')
+  it('returns default URL when env is empty string', () => {
+    mockEnv.current = { PUBLIC_ALPACA_WS_URL: '' }
 
-    expect(getWebSocketUrl('schwab')).toBe('wss://example.com/api/schwab/ws')
+    expect(getWebSocketUrl()).toBe('wss://example.com/api/ws')
   })
 
-  it('returns default URL when env is whitespace only', async () => {
-    mockEnv.current = { PUBLIC_SCHWAB_WS_URL: '   ' }
-    const { getWebSocketUrl } = await import('./env')
+  it('returns default URL when env is whitespace only', () => {
+    mockEnv.current = { PUBLIC_ALPACA_WS_URL: '   ' }
 
-    expect(getWebSocketUrl('schwab')).toBe('wss://example.com/api/schwab/ws')
+    expect(getWebSocketUrl()).toBe('wss://example.com/api/ws')
   })
 
-  it('trims whitespace from valid env values', async () => {
+  it('trims whitespace from valid env values', () => {
     mockEnv.current = { PUBLIC_ALPACA_WS_URL: '  wss://trimmed.example.com/ws  ' }
-    const { getWebSocketUrl } = await import('./env')
 
-    expect(getWebSocketUrl('alpaca')).toBe('wss://trimmed.example.com/ws')
+    expect(getWebSocketUrl()).toBe('wss://trimmed.example.com/ws')
   })
 })

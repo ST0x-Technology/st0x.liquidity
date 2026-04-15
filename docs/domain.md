@@ -12,9 +12,9 @@ Types follow a strict naming convention based on their role:
 | Suffix     | Meaning                  | Source                               | Example                       |
 | ---------- | ------------------------ | ------------------------------------ | ----------------------------- |
 | `*Env`     | CLI args / env vars      | clap-powered struct                  | `ServerEnv`, `ReporterEnv`    |
-| `*Config`  | Non-secret settings      | Plaintext TOML (`config/*.toml`)     | `SchwabConfig`, `EvmConfig`   |
-| `*Secrets` | Secret credentials       | Encrypted TOML (`secret/*.toml.age`) | `SchwabSecrets`, `EvmSecrets` |
-| `*Ctx`     | Combined runtime context | Assembled from runtime state         | `SchwabCtx`, `EvmCtx`         |
+| `*Config`  | Non-secret settings      | Plaintext TOML (`config/*.toml`)     | `BrokerConfig`, `EvmConfig`   |
+| `*Secrets` | Secret credentials       | Encrypted TOML (`secret/*.toml.age`) | `BrokerSecrets`, `EvmSecrets` |
+| `*Ctx`     | Combined runtime context | Assembled from runtime state         | `BrokerCtx`, `EvmCtx`         |
 
 **Rules:**
 
@@ -67,16 +67,16 @@ venue:
 - **Onchain venue (Raindex)**: A decentralized exchange on Base where tokenized
   equities and USDC are traded via limit orders. The bot places and maintains
   orders on Raindex.
-- **Offchain venue (brokerage)**: A traditional equity market accessed through a
-  broker API (Alpaca Markets or Charles Schwab). The bot executes offsetting
-  trades here to hedge onchain exposure.
+- **Offchain venue (brokerage)**: A traditional equity market accessed through
+  the Alpaca Broker API. The bot executes offsetting trades here to hedge
+  onchain exposure.
 
 ### Executor
 
 An abstraction over an offchain trading venue. The `Executor` trait provides a
 uniform interface for placing market orders, polling order status, and querying
-inventory regardless of which brokerage is used. Implementations: `Schwab`,
-`AlpacaTradingApi`, `AlpacaBrokerApi`, `MockExecutor`.
+inventory regardless of which brokerage is used. Implementations:
+`AlpacaBrokerApi`, `MockExecutor`.
 
 ### Conductor
 
@@ -125,7 +125,7 @@ The minimum net exposure required before the system triggers an offsetting
 offchain trade. Two modes:
 
 - **Shares threshold**: Execute when net position reaches N shares (used by
-  Schwab, which does not support fractional shares, and DryRun).
+  DryRun).
 - **Dollar value threshold**: Execute when net position value reaches $N (used
   by Alpaca, which requires a $1 minimum for fractional trading).
 

@@ -16,7 +16,6 @@ use tracing::{debug, info};
 use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
-use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
 use st0x_execution::{ExecutionError, Executor};
 
 use super::inclusion::EmittedOnChain;
@@ -191,9 +190,7 @@ pub(crate) enum TradeAccountingError {
     VaultRegistry(#[from] SendError<VaultRegistry>),
     #[error("Execution error: {0}")]
     Execution(#[from] ExecutionError),
-    // TODO: shouldn't be coupled to a concrete executor
-    #[error("Alpaca trading API error: {0}")]
-    AlpacaTradingApi(#[from] AlpacaTradingApiError),
+    // TODO: TradeAccountingError should not be coupled to a concrete executor error type.
     #[error("Alpaca broker API error: {0}")]
     AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
 }

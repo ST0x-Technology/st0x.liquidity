@@ -1,8 +1,8 @@
 # st0x-execution
 
-Trade execution abstraction for placing orders across different brokerage
-platforms. Part of the st0x workspace, sharing the same database schema for
-token storage and order tracking.
+Trade execution abstraction for placing orders across supported offchain
+execution backends. Part of the st0x workspace, sharing the same database schema
+for order tracking.
 
 ## Naming
 
@@ -17,10 +17,6 @@ against specific brokerage APIs.
 
 ## Implementations
 
-- **SchwabExecutor** - Charles Schwab API with OAuth 2.0 and automatic token
-  refresh
-- **AlpacaTradingApi** - Alpaca Trading API for individual accounts with
-  paper/live trading support
 - **AlpacaBrokerApi** - Alpaca Broker API for managing customer accounts
 - **MockExecutor** - Testing implementation with configurable behavior
 
@@ -50,7 +46,6 @@ async fn execute_trade<E: Executor>(
     ticker: &str,
     qty: u32,
 ) -> Result<(), E::Error> {
-    executor.wait_until_market_open().await?;
     let order = MarketOrder {
         symbol: Symbol::new(ticker)?,
         shares: Shares::new(qty)?,
@@ -61,8 +56,8 @@ async fn execute_trade<E: Executor>(
 }
 
 // Use with any implementation
-let schwab = SchwabExecutor::try_from_ctx(config).await?;
-execute_trade(&schwab, "AAPL", 10).await?;
+let executor = MockExecutor::new();
+execute_trade(&executor, "AAPL", 10).await?;
 ```
 
 ## Crate Structure
@@ -72,11 +67,8 @@ src/
 ├── lib.rs                 # Public API: Executor trait, domain types, exports
 ├── error.rs               # Shared error types
 ├── order/                 # Shared order types (MarketOrder, OrderPlacement)
-├── schwab/                # Charles Schwab implementation
-├── alpaca_trading_api/    # Alpaca Trading API implementation
 ├── alpaca_broker_api/     # Alpaca Broker API implementation
-├── mock.rs                # Mock implementation for testing
-└── test_utils.rs          # Shared test utilities
+└── mock.rs                # Mock implementation for testing
 ```
 
 ## Design Principles

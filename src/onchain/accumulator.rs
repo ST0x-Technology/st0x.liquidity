@@ -46,8 +46,7 @@ pub(crate) async fn check_execution_readiness<E: Executor>(
         .and_then(|config| config.operational_limit)
         .or(assets.equities.operational_limit);
 
-    let Some((direction, shares)) = position.is_ready_for_execution(executor_type, shares_limit)?
-    else {
+    let Some((direction, shares)) = position.is_ready_for_execution(shares_limit)? else {
         debug!(%symbol, net = %position.net, "Position not ready for execution");
         return Ok(None);
     };
@@ -121,9 +120,7 @@ pub(crate) async fn check_all_positions<E: Executor>(
             .and_then(|config| config.operational_limit)
             .or(assets.equities.operational_limit);
 
-        if let Some((direction, shares)) =
-            position.is_ready_for_execution(executor_type, shares_limit)?
-        {
+        if let Some((direction, shares)) = position.is_ready_for_execution(shares_limit)? {
             if !check_market_open(executor, symbol).await? {
                 continue;
             }
@@ -219,7 +216,7 @@ mod tests {
             &executor,
             &query,
             &Symbol::new("AAPL").unwrap(),
-            SupportedExecutor::Schwab,
+            SupportedExecutor::DryRun,
             &AssetsConfig {
                 equities: EquitiesConfig::default(),
                 cash: None,
@@ -251,7 +248,7 @@ mod tests {
             &executor,
             &query,
             &symbol,
-            SupportedExecutor::Schwab,
+            SupportedExecutor::DryRun,
             &AssetsConfig {
                 equities: EquitiesConfig::default(),
                 cash: None,
@@ -337,7 +334,7 @@ mod tests {
         let ready = check_all_positions(
             &executor,
             &query,
-            SupportedExecutor::Schwab,
+            SupportedExecutor::DryRun,
             &AssetsConfig {
                 equities: EquitiesConfig::default(),
                 cash: None,

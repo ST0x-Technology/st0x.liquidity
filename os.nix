@@ -148,12 +148,7 @@ in {
           };
         in {
           "/".tryFiles = "$uri $uri/ /index.html";
-          # The dashboard frontend opens ws://host/api/<broker>/ws — the
-          # `broker` segment is a frontend-side discriminator, not a
-          # backend route. Nginx rewrites both onto the single
-          # `/api/ws` endpoint served by the hedge server on 8001.
-          "/api/alpaca/ws" = wsProxy 8001;
-          "/api/schwab/ws" = wsProxy 8001;
+          "/api/ws" = wsProxy 8001;
         };
       };
     };

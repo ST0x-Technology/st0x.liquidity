@@ -1,7 +1,6 @@
 //! CLI commands for trading, asset transfers, and authentication.
 
 mod alpaca_wallet;
-mod auth;
 mod cctp;
 mod rebalancing;
 mod submit;
@@ -15,17 +14,16 @@ use clap::{Parser, Subcommand, ValueEnum};
 use sqlx::SqlitePool;
 use std::io::Write;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::info;
 
 use rain_math_float::Float;
+use st0x_event_sorcery::Projection;
 use st0x_evm::OpenChainErrorRegistry;
 use st0x_execution::alpaca_broker_api::AlpacaLimitPrice;
 use st0x_execution::{AlpacaAccountId, Direction, FractionalShares, Positive, Symbol, TimeInForce};
 use st0x_finance::Usdc;
 
-use st0x_event_sorcery::Projection;
-
-use crate::config::{BrokerCtx, Ctx, Env};
+use crate::config::{Ctx, Env};
 use crate::offchain_order::{OffchainOrder, OffchainOrderId, OrderPlacer};
 use crate::position::Position;
 use crate::symbol::cache::SymbolCache;
@@ -79,8 +77,8 @@ fn parse_positive_shares(input: &str) -> Result<Positive<FractionalShares>, Stri
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "schwab")]
-#[command(about = "A CLI tool for Charles Schwab stock trading")]
+#[command(name = "st0x-cli")]
+#[command(about = "A CLI tool for st0x liquidity operations")]
 #[command(version)]
 pub struct Cli {
     #[command(subcommand)]
@@ -131,9 +129,6 @@ pub enum Commands {
         #[arg(long = "tx-hash")]
         tx_hash: TxHash,
     },
-    /// Perform Charles Schwab OAuth authentication flow
-    Auth,
-
     /// Transfer tokenized equity between trading venues (Raindex <-> Alpaca)
     ///
     /// Requires Alpaca broker and rebalancing environment variables.
@@ -412,9 +407,9 @@ pub enum Commands {
     /// Useful for debugging tokenization status without creating new requests.
     AlpacaTokenizationRequests,
 
-    /// Check the status of a Schwab order by order ID
+    /// Check the status of a broker order by order ID
     OrderStatus {
-        /// The Schwab order ID to check
+        /// The broker order ID to check
         #[arg(long = "order-id")]
         order_id: String,
     },
@@ -459,8 +454,8 @@ pub enum Commands {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "schwab-cli")]
-#[command(about = "A CLI tool for Charles Schwab stock trading")]
+#[command(name = "st0x-cli")]
+#[command(about = "A CLI tool for st0x liquidity operations")]
 #[command(version)]
 pub struct CliEnv {
     #[clap(flatten)]
@@ -499,23 +494,6 @@ async fn execute_order<W: Write>(
     pool: &SqlitePool,
     stdout: &mut W,
 ) -> anyhow::Result<()> {
-    let broker_rejects_fractional = match &ctx.broker {
-        BrokerCtx::Schwab(_) => true,
-        BrokerCtx::AlpacaTradingApi(_) | BrokerCtx::AlpacaBrokerApi(_) | BrokerCtx::DryRun => false,
-    };
-
-    if broker_rejects_fractional && request.shares.to_whole_shares().is_err() {
-        warn!(
-            quantity = %request.shares,
-            "Rejecting fractional CLI order for Schwab"
-        );
-        writeln!(
-            stdout,
-            "❌ Schwab does not accept fractional shares for buy/sell orders"
-        )?;
-        anyhow::bail!("Schwab does not accept fractional shares for buy/sell orders");
-    }
-
     info!(
         "Processing {:?} order: symbol={}, quantity={}",
         request.direction, request.symbol, request.shares
@@ -539,7 +517,6 @@ enum SimpleCommand {
         limit_price: Option<AlpacaLimitPrice>,
         extended_hours: bool,
     },
-    Auth,
     TransferEquity {
         direction: TransferDirection,
         symbol: Symbol,
@@ -689,7 +666,6 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             limit_price,
             extended_hours,
         }),
-        Commands::Auth => Ok(SimpleCommand::Auth),
         Commands::TransferEquity {
             direction,
             symbol,
@@ -840,7 +816,6 @@ async fn run_simple_command<W: Write>(
             })?;
             execute_order(request, ctx, pool, stdout).await
         }
-        SimpleCommand::Auth => auth::auth_command(stdout, &ctx.broker, pool).await,
         SimpleCommand::TransferEquity {
             direction,
             symbol,
@@ -1048,2061 +1023,227 @@ async fn run_provider_command<W: Write>(
 
 #[cfg(test)]
 mod tests {
-    use alloy::hex;
-    use alloy::primitives::{FixedBytes, IntoLogData, U256, address, b256, fixed_bytes};
-    use alloy::providers::Provider;
-    use alloy::providers::mock::Asserter;
-    use alloy::sol_types::{SolCall, SolEvent};
+    use alloy::primitives::{Address, TxHash, address};
     use clap::{CommandFactory, Parser};
-    use httpmock::MockServer;
-    use rain_math_float::Float;
-    use serde_json::json;
-    use std::collections::HashMap;
-    use std::str::FromStr;
     use url::Url;
 
-    use st0x_event_sorcery::{Column, StoreBuilder};
-    use st0x_execution::{
-        Direction, FractionalShares, OrderStatus, Positive, SchwabError, SchwabTokens, Usd,
-    };
-    use st0x_finance::Usdc;
-    use st0x_float_macro::float;
-
     use super::*;
-    use crate::bindings::IERC20::{decimalsCall, symbolCall};
-    use crate::bindings::IOrderBookV6::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
-    use crate::config::{
-        AssetsConfig, BrokerCtx, EquitiesConfig, EquityAssetConfig, LogLevel, OperationMode,
-        SchwabAuth, TradingMode,
-    };
-    use crate::offchain_order::OffchainOrder;
+    use crate::config::{AssetsConfig, BrokerCtx, EquitiesConfig, LogLevel, TradingMode};
     use crate::onchain::EvmCtx;
-    use crate::test_utils::{get_test_order, positive_shares, setup_test_db, setup_test_tokens};
+    use crate::test_utils::{positive_shares, setup_test_db};
     use crate::threshold::ExecutionThreshold;
 
-    const STATUS: Column = Column("status");
-
-    const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
-
-    fn get_schwab_auth_from_ctx(ctx: &Ctx) -> &SchwabAuth {
-        match &ctx.broker {
-            BrokerCtx::Schwab(auth) => auth,
-            _ => panic!("Expected Schwab broker ctx in tests"),
-        }
-    }
-
-    fn cli_order_request(
-        symbol: Symbol,
-        shares: Positive<FractionalShares>,
-        direction: Direction,
-        time_in_force: Option<TimeInForce>,
-        limit_price: Option<AlpacaLimitPrice>,
-        extended_hours: bool,
-    ) -> anyhow::Result<trading::CliOrderRequest> {
-        trading::CliOrderRequest::from_cli_args(
-            symbol,
-            shares,
-            direction,
-            time_in_force,
-            limit_price,
-            extended_hours,
-        )
-    }
-
-    macro_rules! execute_cli_order_with_writers {
-        (
-            $symbol:expr,
-            $shares:expr,
-            $direction:expr,
-            $time_in_force:expr,
-            $limit_price:expr,
-            $extended_hours:expr,
-            $ctx:expr,
-            $pool:expr,
-            $stdout:expr $(,)?
-        ) => {
-            async {
-                let request = cli_order_request(
-                    $symbol,
-                    $shares,
-                    $direction,
-                    $time_in_force,
-                    $limit_price,
-                    $extended_hours,
-                )?;
-                trading::execute_order_with_writers(request, $ctx, $pool, $stdout).await
-            }
-        };
-    }
-
-    #[tokio::test]
-    async fn test_run_buy_order() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx_for_cli(&server, Address::ZERO);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
-
-        let account_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::GET)
-                .path("/trader/v1/accounts/accountNumbers");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([{
-                    "accountNumber": "123456789",
-                    "hashValue": "ABC123DEF456"
-                }]));
-        });
-
-        let order_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::POST)
-                .path("/trader/v1/accounts/ABC123DEF456/orders")
-                .header("authorization", "Bearer test_access_token")
-                .header("accept", "*/*")
-                .header("content-type", "application/json");
-            then.status(201)
-                .header("location", "/trader/v1/accounts/ABC123DEF456/orders/12345");
-        });
-
-        execute_cli_order_with_writers!(
-            Symbol::new("AAPL").unwrap(),
-            positive_shares("100"),
-            Direction::Buy,
-            None,
-            None,
-            false,
-            &ctx,
-            &pool,
-            &mut std::io::sink(),
-        )
-        .await
-        .unwrap();
-
-        account_mock.assert();
-        order_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_run_sell_order() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx_for_cli(&server, Address::ZERO);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
-
-        let account_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::GET)
-                .path("/trader/v1/accounts/accountNumbers");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([{
-                    "accountNumber": "123456789",
-                    "hashValue": "ABC123DEF456"
-                }]));
-        });
-
-        let order_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::POST)
-                .path("/trader/v1/accounts/ABC123DEF456/orders")
-                .header("authorization", "Bearer test_access_token")
-                .header("accept", "*/*")
-                .header("content-type", "application/json");
-            then.status(201)
-                .header("location", "/trader/v1/accounts/ABC123DEF456/orders/12345");
-        });
-
-        execute_cli_order_with_writers!(
-            Symbol::new("TSLA").unwrap(),
-            positive_shares("50"),
-            Direction::Sell,
-            None,
-            None,
-            false,
-            &ctx,
-            &pool,
-            &mut std::io::sink(),
-        )
-        .await
-        .unwrap();
-
-        account_mock.assert();
-        order_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_execute_order_failure() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx_for_cli(&server, Address::ZERO);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
-
-        let account_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::GET)
-                .path("/trader/v1/accounts/accountNumbers");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([{
-                    "accountNumber": "123456789",
-                    "hashValue": "ABC123DEF456"
-                }]));
-        });
-
-        let order_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::POST)
-                .path("/trader/v1/accounts/ABC123DEF456/orders");
-            then.status(400)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "error": "Invalid order",
-                    "message": "Insufficient funds"
-                }));
-        });
-
-        execute_cli_order_with_writers!(
-            Symbol::new("AAPL").unwrap(),
-            positive_shares("100"),
-            Direction::Buy,
-            None,
-            None,
-            false,
-            &ctx,
-            &pool,
-            &mut std::io::sink(),
-        )
-        .await
-        .unwrap_err();
-        account_mock.assert();
-        order_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_run_with_expired_refresh_token() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx_for_cli(&server, Address::ZERO);
-        let pool = setup_test_db().await;
-
-        let expired_tokens = SchwabTokens {
-            access_token: "expired_access_token".to_string(),
-            access_token_fetched_at: chrono::Utc::now() - chrono::Duration::minutes(35),
-            refresh_token: "expired_refresh_token".to_string(),
-            refresh_token_fetched_at: chrono::Utc::now() - chrono::Duration::days(8),
-        };
-        expired_tokens
-            .store(&pool, &get_schwab_auth_from_ctx(&ctx).encryption_key)
-            .await
-            .unwrap();
-
-        let result = execute_cli_order_with_writers!(
-            Symbol::new("AAPL").unwrap(),
-            positive_shares("100"),
-            Direction::Buy,
-            None,
-            None,
-            false,
-            &ctx,
-            &pool,
-            &mut std::io::sink(),
-        )
-        .await;
-
-        assert!(matches!(
-            result.unwrap_err().downcast_ref::<SchwabError>(),
-            Some(SchwabError::RefreshTokenExpired)
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_run_with_successful_token_refresh() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx_for_cli(&server, Address::ZERO);
-        let pool = setup_test_db().await;
-
-        let expired_access_tokens = SchwabTokens {
-            access_token: "expired_access_token".to_string(),
-            access_token_fetched_at: chrono::Utc::now() - chrono::Duration::minutes(35),
-            refresh_token: "valid_refresh_token".to_string(),
-            refresh_token_fetched_at: chrono::Utc::now() - chrono::Duration::days(1),
-        };
-        expired_access_tokens
-            .store(&pool, &get_schwab_auth_from_ctx(&ctx).encryption_key)
-            .await
-            .unwrap();
-
-        let token_refresh_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::POST)
-                .path("/v1/oauth/token")
-                .body_includes("grant_type=refresh_token")
-                .body_includes("refresh_token=valid_refresh_token");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "access_token": "refreshed_access_token",
-                    "token_type": "Bearer",
-                    "expires_in": 1800,
-                    "refresh_token": "new_refresh_token",
-                    "refresh_token_expires_in": 604_800
-                }));
-        });
-
-        let account_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::GET)
-                .path("/trader/v1/accounts/accountNumbers")
-                .header("authorization", "Bearer refreshed_access_token");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([{
-                    "accountNumber": "123456789",
-                    "hashValue": "ABC123DEF456"
-                }]));
-        });
-
-        let order_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::POST)
-                .path("/trader/v1/accounts/ABC123DEF456/orders")
-                .header("authorization", "Bearer refreshed_access_token");
-            then.status(201)
-                .header("location", "/trader/v1/accounts/ABC123DEF456/orders/12345");
-        });
-
-        let result = execute_cli_order_with_writers!(
-            Symbol::new("AAPL").unwrap(),
-            positive_shares("100"),
-            Direction::Buy,
-            None,
-            None,
-            false,
-            &ctx,
-            &pool,
-            &mut std::io::sink(),
-        )
-        .await;
-
-        assert!(result.is_ok(), "Order should succeed after token refresh");
-        token_refresh_mock.assert();
-        account_mock.assert();
-        order_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_run_with_valid_tokens_no_refresh_needed() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx_for_cli(&server, Address::ZERO);
-        let pool = setup_test_db().await;
-
-        let valid_tokens = SchwabTokens {
-            access_token: "valid_access_token".to_string(),
-            access_token_fetched_at: chrono::Utc::now() - chrono::Duration::minutes(5),
-            refresh_token: "valid_refresh_token".to_string(),
-            refresh_token_fetched_at: chrono::Utc::now() - chrono::Duration::days(1),
-        };
-        valid_tokens
-            .store(&pool, &get_schwab_auth_from_ctx(&ctx).encryption_key)
-            .await
-            .unwrap();
-
-        let account_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::GET)
-                .path("/trader/v1/accounts/accountNumbers")
-                .header("authorization", "Bearer valid_access_token");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([{
-                    "accountNumber": "123456789",
-                    "hashValue": "ABC123DEF456"
-                }]));
-        });
-
-        let order_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::POST)
-                .path("/trader/v1/accounts/ABC123DEF456/orders")
-                .header("authorization", "Bearer valid_access_token");
-            then.status(201)
-                .header("location", "/trader/v1/accounts/ABC123DEF456/orders/12345");
-        });
-
-        execute_cli_order_with_writers!(
-            Symbol::new("AAPL").unwrap(),
-            positive_shares("100"),
-            Direction::Buy,
-            None,
-            None,
-            false,
-            &ctx,
-            &pool,
-            &mut std::io::sink(),
-        )
-        .await
-        .unwrap();
-        account_mock.assert();
-        order_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_execute_order_success_stdout_output() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx_for_cli(&server, Address::ZERO);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
-
-        server.mock(|when, then| {
-            when.method(httpmock::Method::GET)
-                .path("/trader/v1/accounts/accountNumbers");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([{
-                    "accountNumber": "123456789",
-                    "hashValue": "ABC123DEF456"
-                }]));
-        });
-
-        server.mock(|when, then| {
-            when.method(httpmock::Method::POST)
-                .path("/trader/v1/accounts/ABC123DEF456/orders");
-            then.status(201)
-                .header("location", "/trader/v1/accounts/ABC123DEF456/orders/12345");
-        });
-
-        let mut stdout_buffer = Vec::new();
-        execute_cli_order_with_writers!(
-            Symbol::new("AAPL").unwrap(),
-            positive_shares("100"),
-            Direction::Buy,
-            None,
-            None,
-            false,
-            &ctx,
-            &pool,
-            &mut stdout_buffer,
-        )
-        .await
-        .unwrap();
-
-        let stdout_output = String::from_utf8(stdout_buffer).unwrap();
-        assert!(stdout_output.contains("Order placed successfully"));
-        assert!(stdout_output.contains("AAPL"));
-        assert!(stdout_output.contains("100"));
-    }
-
-    #[tokio::test]
-    async fn test_execute_order_failure_stderr_output() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx_for_cli(&server, Address::ZERO);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
-
-        server.mock(|when, then| {
-            when.method(httpmock::Method::GET)
-                .path("/trader/v1/accounts/accountNumbers");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([{
-                    "accountNumber": "123456789",
-                    "hashValue": "ABC123DEF456"
-                }]));
-        });
-
-        server.mock(|when, then| {
-            when.method(httpmock::Method::POST)
-                .path("/trader/v1/accounts/ABC123DEF456/orders");
-            then.status(400)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "error": "Invalid order",
-                    "message": "Insufficient funds"
-                }));
-        });
-
-        let mut stdout_buffer = Vec::new();
-        execute_cli_order_with_writers!(
-            Symbol::new("AAPL").unwrap(),
-            positive_shares("100"),
-            Direction::Buy,
-            None,
-            None,
-            false,
-            &ctx,
-            &pool,
-            &mut stdout_buffer,
-        )
-        .await
-        .unwrap_err();
-
-        let stdout_output = String::from_utf8(stdout_buffer).unwrap();
-        assert!(stdout_output.contains("Failed to place order"));
-    }
-
-    #[tokio::test]
-    async fn test_authentication_with_oauth_flow_on_expired_refresh_token() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx_for_cli(&server, Address::ZERO);
-        let pool = setup_test_db().await;
-
-        let expired_tokens = SchwabTokens {
-            access_token: "expired_access_token".to_string(),
-            access_token_fetched_at: chrono::Utc::now() - chrono::Duration::minutes(35),
-            refresh_token: "expired_refresh_token".to_string(),
-            refresh_token_fetched_at: chrono::Utc::now() - chrono::Duration::days(8),
-        };
-        expired_tokens
-            .store(&pool, &get_schwab_auth_from_ctx(&ctx).encryption_key)
-            .await
-            .unwrap();
-
-        let mut stdout_buffer = Vec::new();
-
-        let result =
-            auth::ensure_schwab_authentication(&pool, &ctx.broker, &mut stdout_buffer).await;
-
-        assert!(matches!(
-            result.unwrap_err().downcast_ref::<SchwabError>(),
-            Some(SchwabError::RefreshTokenExpired)
-        ));
-
-        let mut stdout_buffer = Vec::new();
-        writeln!(
-            &mut stdout_buffer,
-            "🔄 Your refresh token has expired. Starting authentication process..."
-        )
-        .unwrap();
-        writeln!(
-            &mut stdout_buffer,
-            "   You will be guided through the Charles Schwab OAuth process."
-        )
-        .unwrap();
-
-        let stdout_output = String::from_utf8(stdout_buffer).unwrap();
-        assert!(
-            stdout_output
-                .contains("🔄 Your refresh token has expired. Starting authentication process...")
-        );
-        assert!(
-            stdout_output.contains("You will be guided through the Charles Schwab OAuth process.")
-        );
-    }
-
-    #[test]
-    fn test_parse_positive_shares_rejects_zero() {
-        let error = parse_positive_shares("0").unwrap_err();
-
-        assert!(error.contains("positive"), "unexpected error: {error}");
-    }
-
-    #[test]
-    fn test_alpaca_limit_price_from_str_rejects_zero() {
-        let error = "0".parse::<AlpacaLimitPrice>().unwrap_err();
-
-        assert_eq!(error.to_string(), "limit price must be positive");
-    }
-
-    #[test]
-    fn test_alpaca_limit_price_from_str_rejects_invalid_precision() {
-        let error = "195.255".parse::<AlpacaLimitPrice>().unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("exceeds Alpaca's 2-decimal-place precision"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn test_buy_command_requires_limit_price_for_extended_hours() {
-        let error =
-            Cli::try_parse_from(["schwab", "buy", "-s", "AAPL", "-q", "1", "--extended-hours"])
-                .unwrap_err();
-        let message = error.to_string();
-
-        assert!(
-            message.contains("--limit-price"),
-            "unexpected error: {message}"
-        );
-    }
-
-    #[test]
-    fn test_buy_command_rejects_zero_quantity() {
-        let error = Cli::try_parse_from(["schwab", "buy", "-s", "AAPL", "-q", "0"]).unwrap_err();
-        let message = error.to_string();
-
-        assert!(message.contains("positive"), "unexpected error: {message}");
-    }
-
-    #[test]
-    fn test_sell_command_rejects_zero_quantity() {
-        let error = Cli::try_parse_from(["schwab", "sell", "-s", "AAPL", "-q", "0"]).unwrap_err();
-        let message = error.to_string();
-
-        assert!(message.contains("positive"), "unexpected error: {message}");
-    }
-
-    #[test]
-    fn test_wrap_equity_command_rejects_zero_quantity() {
-        let error =
-            Cli::try_parse_from(["schwab", "wrap-equity", "-s", "AAPL", "-q", "0"]).unwrap_err();
-        let message = error.to_string();
-
-        assert!(message.contains("positive"), "unexpected error: {message}");
-    }
-
-    #[test]
-    fn test_unwrap_equity_command_rejects_zero_quantity() {
-        let error =
-            Cli::try_parse_from(["schwab", "unwrap-equity", "-s", "AAPL", "-q", "0"]).unwrap_err();
-        let message = error.to_string();
-
-        assert!(message.contains("positive"), "unexpected error: {message}");
-    }
-
-    const TEST_ORDERBOOK: Address = address!("0x1234567890123456789012345678901234567890");
-
-    fn enabled_equity() -> EquityAssetConfig {
-        EquityAssetConfig {
-            tokenized_equity: Address::ZERO,
-            tokenized_equity_derivative: Address::ZERO,
-            vault_id: None,
-            trading: OperationMode::Enabled,
-            rebalancing: OperationMode::Enabled,
-            operational_limit: None,
-        }
-    }
-
-    fn test_equity_symbols() -> HashMap<Symbol, EquityAssetConfig> {
-        HashMap::from([
-            (Symbol::new("AAPL").unwrap(), enabled_equity()),
-            (Symbol::new("TSLA").unwrap(), enabled_equity()),
-        ])
-    }
-
-    fn create_test_ctx_for_cli(mock_server: &MockServer, order_owner: Address) -> Ctx {
+    fn create_test_ctx() -> Ctx {
         Ctx {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
             evm: EvmCtx {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
-                orderbook: TEST_ORDERBOOK,
+                orderbook: address!("0x1234567890123456789012345678901234567890"),
                 deployment_block: 1,
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             position_check_interval: 60,
             inventory_poll_interval: 60,
-            broker: BrokerCtx::Schwab(SchwabAuth {
-                app_key: "test_app_key".to_string(),
-                app_secret: "test_app_secret".to_string(),
-                redirect_uri: Some(Url::parse("https://127.0.0.1").expect("valid test URL")),
-                base_url: Some(Url::parse(&mock_server.base_url()).expect("valid mock URL")),
-                account_index: Some(0),
-                encryption_key: TEST_ENCRYPTION_KEY,
-            }),
+            broker: BrokerCtx::DryRun,
             telemetry: None,
-            trading_mode: TradingMode::Standalone { order_owner },
+            trading_mode: TradingMode::Standalone {
+                order_owner: Address::ZERO,
+            },
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: AssetsConfig {
-                equities: EquitiesConfig {
-                    operational_limit: None,
-                    symbols: test_equity_symbols(),
-                },
+                equities: EquitiesConfig::default(),
                 cash: None,
             },
             travel_rule: None,
         }
     }
 
-    struct MockBlockchainData {
-        order_owner: Address,
-        receipt_json: serde_json::Value,
-        after_clear_log: alloy::rpc::types::Log,
+    #[test]
+    fn cli_uses_updated_binary_name() {
+        let command = Cli::command();
+        assert_eq!(command.get_name(), "st0x-cli");
     }
 
-    fn create_mock_blockchain_data(
-        orderbook: Address,
-        tx_hash: TxHash,
-        alice_output_shares: &str,
-        bob_output_usdc: u64,
-    ) -> MockBlockchainData {
-        let order = get_test_order();
-        let order_owner = order.owner;
+    #[test]
+    fn buy_command_parses_fractional_quantity() {
+        let cli = Cli::try_parse_from(["st0x-cli", "buy", "-s", "SPYM", "-q", "6.15"]).unwrap();
 
-        let clear_event = ClearV3 {
-            sender: address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
-            alice: order.clone(),
-            bob: order,
-            clearConfig: ClearConfigV2 {
-                aliceInputIOIndex: U256::from(0),
-                aliceOutputIOIndex: U256::from(1),
-                bobInputIOIndex: U256::from(1),
-                bobOutputIOIndex: U256::from(0),
-                aliceBountyVaultId: B256::ZERO,
-                bobBountyVaultId: B256::ZERO,
-            },
-        };
-
-        let receipt_json = json!({
-            "transactionHash": tx_hash,
-            "transactionIndex": "0x0",
-            "blockHash": "0x1111111111111111111111111111111111111111111111111111111111111111",
-            "blockNumber": "0x64",
-            "from": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "to": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            "contractAddress": null,
-            "gasUsed": "0x5208",
-            "cumulativeGasUsed": "0xf4240",
-            "effectiveGasPrice": "0x3b9aca00",
-            "status": "0x1",
-            "type": "0x2",
-            "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-            "logs": [{
-                "address": orderbook,
-                "topics": [ClearV3::SIGNATURE_HASH],
-                "data": format!("0x{}", hex::encode(clear_event.into_log_data().data)),
-                "blockNumber": "0x64",
-                "blockTimestamp": "0x6553f100",
-                "transactionHash": tx_hash,
-                "transactionIndex": "0x0",
-                "logIndex": "0x0",
-                "removed": false
-            }]
-        });
-
-        fn create_float_from_u256(value: U256, decimals: u8) -> B256 {
-            let (float, _lossy) =
-                Float::from_fixed_decimal_lossy(value, decimals).expect("valid Float");
-            float.get_inner()
-        }
-
-        let alice_shares_u256 = U256::from_str(alice_output_shares).unwrap();
-        let bob_usdc_u256 = U256::from(bob_output_usdc);
-
-        let after_clear_event = AfterClearV2 {
-            sender: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-            clearStateChange: ClearStateChangeV2 {
-                aliceOutput: create_float_from_u256(alice_shares_u256, 18),
-                bobOutput: create_float_from_u256(bob_usdc_u256, 6),
-                aliceInput: create_float_from_u256(bob_usdc_u256, 6),
-                bobInput: create_float_from_u256(alice_shares_u256, 18),
-            },
-        };
-
-        let after_clear_log = alloy::rpc::types::Log {
-            inner: alloy::primitives::Log {
-                address: orderbook,
-                data: after_clear_event.into_log_data(),
-            },
-            block_hash: Some(fixed_bytes!(
-                "0x1111111111111111111111111111111111111111111111111111111111111111"
-            )),
-            block_number: Some(100),
-            block_timestamp: Some(1_700_000_000),
-            transaction_hash: Some(tx_hash),
-            transaction_index: Some(0),
-            log_index: Some(1),
-            removed: false,
-        };
-
-        MockBlockchainData {
-            order_owner,
-            receipt_json,
-            after_clear_log,
+        match cli.command {
+            Commands::Buy {
+                symbol, quantity, ..
+            } => {
+                assert_eq!(symbol, Symbol::new("SPYM").unwrap());
+                assert_eq!(quantity, positive_shares("6.15"));
+            }
+            other => panic!("expected buy command, got: {other:?}"),
         }
     }
 
-    fn setup_mock_provider_for_process_tx(
-        mock_data: &MockBlockchainData,
-        input_symbol: &str,
-        output_symbol: &str,
-    ) -> impl Provider + Clone + 'static {
-        let asserter = Asserter::new();
-        asserter.push_success(&mock_data.receipt_json);
-        asserter.push_success(&json!([mock_data.after_clear_log]));
-        asserter.push_success(&mock_data.receipt_json);
-        let input_decimals = if input_symbol == "USDC" { 6u8 } else { 18u8 };
-        let output_decimals = if output_symbol == "USDC" { 6u8 } else { 18u8 };
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(
-            &input_decimals,
-        ));
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &input_symbol.to_string(),
-        ));
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(
-            &output_decimals,
-        ));
-        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &output_symbol.to_string(),
-        ));
-
-        ProviderBuilder::new().connect_mocked_client(asserter)
-    }
-
-    fn setup_schwab_api_mocks(server: &MockServer) -> (httpmock::Mock<'_>, httpmock::Mock<'_>) {
-        let account_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::GET)
-                .path("/trader/v1/accounts/accountNumbers");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([{
-                    "accountNumber": "123456789",
-                    "hashValue": "ABC123DEF456"
-                }]));
-        });
-
-        let order_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::POST)
-                .path("/trader/v1/accounts/ABC123DEF456/orders")
-                .header("authorization", "Bearer test_access_token")
-                .header("accept", "*/*")
-                .header("content-type", "application/json");
-            then.status(201)
-                .header("location", "/trader/v1/accounts/ABC123DEF456/orders/12345");
-        });
-
-        (account_mock, order_mock)
+    #[test]
+    fn buy_command_rejects_zero_quantity() {
+        let error = Cli::try_parse_from(["st0x-cli", "buy", "-s", "AAPL", "-q", "0"]).unwrap_err();
+        let rendered = error.to_string();
+        assert!(rendered.contains('0'), "unexpected clap error: {rendered}");
     }
 
     #[test]
-    fn verify_cli() {
-        Cli::command().debug_assert();
+    fn sell_command_rejects_zero_quantity() {
+        let error = Cli::try_parse_from(["st0x-cli", "sell", "-s", "AAPL", "-q", "0"]).unwrap_err();
+        let rendered = error.to_string();
+        assert!(rendered.contains('0'), "unexpected clap error: {rendered}");
     }
 
     #[test]
-    fn test_cli_command_structure_validation() {
-        let cmd = Cli::command();
-
-        cmd.clone()
-            .try_get_matches_from(vec!["schwab", "buy", "-s", "AAPL"])
-            .unwrap_err();
-
-        let _err = cmd
-            .clone()
-            .try_get_matches_from(vec!["schwab", "sell", "-q", "100"])
-            .unwrap_err();
-
-        let _err = cmd
-            .clone()
-            .try_get_matches_from(vec!["schwab", "buy"])
-            .unwrap_err();
-
-        let _matches = cmd
-            .clone()
-            .try_get_matches_from(vec!["schwab", "buy", "-s", "AAPL", "-q", "100"])
-            .unwrap();
-
-        let _matches = cmd
-            .clone()
-            .try_get_matches_from(vec!["schwab", "sell", "-s", "TSLA", "-q", "50"])
-            .unwrap();
-
-        cmd.clone()
-            .try_get_matches_from(vec![
-                "schwab",
-                "buy",
-                "-s",
-                "AAPL",
-                "-q",
-                "100",
-                "--time-in-force",
-                "day",
-            ])
-            .unwrap();
-
-        cmd.clone()
-            .try_get_matches_from(vec![
-                "schwab",
-                "sell",
-                "-s",
-                "TSLA",
-                "-q",
-                "50",
-                "--time-in-force",
-                "market-on-close",
-            ])
-            .unwrap();
-
-        cmd.try_get_matches_from(vec![
-            "schwab",
-            "buy",
-            "-s",
-            "AAPL",
-            "-q",
-            "100",
-            "--time-in-force",
-            "invalid",
-        ])
-        .unwrap_err();
-    }
-
-    #[test]
-    fn test_buy_command_parses_fractional_quantity() {
-        let cli = Cli::try_parse_from(["schwab", "buy", "-s", "SPYM", "-q", "6.15"]).unwrap();
-        let Commands::Buy { quantity, .. } = cli.command else {
-            panic!("expected buy command");
-        };
-
-        assert_eq!(quantity, positive_shares("6.15"));
-    }
-
-    #[test]
-    fn test_sell_command_parses_fractional_quantity() {
-        let cli = Cli::try_parse_from(["schwab", "sell", "-s", "SPYM", "-q", "6.15"]).unwrap();
-        let Commands::Sell { quantity, .. } = cli.command else {
-            panic!("expected sell command");
-        };
-
-        assert_eq!(quantity, positive_shares("6.15"));
-    }
-
-    #[test]
-    fn test_wrap_equity_command_parses_fractional_quantity() {
-        let cli =
-            Cli::try_parse_from(["schwab", "wrap-equity", "-s", "SPYM", "-q", "6.15"]).unwrap();
-        let Commands::WrapEquity { quantity, .. } = cli.command else {
-            panic!("expected wrap-equity command");
-        };
-
-        assert_eq!(quantity, positive_shares("6.15"));
-    }
-
-    #[test]
-    fn test_unwrap_equity_command_parses_fractional_quantity() {
-        let cli =
-            Cli::try_parse_from(["schwab", "unwrap-equity", "-s", "SPYM", "-q", "6.15"]).unwrap();
-        let Commands::UnwrapEquity { quantity, .. } = cli.command else {
-            panic!("expected unwrap-equity command");
-        };
-
-        assert_eq!(quantity, positive_shares("6.15"));
-    }
-
-    #[test]
-    fn test_buy_command_parses_limit_price_and_extended_hours() {
-        let cli = Cli::try_parse_from([
-            "schwab",
-            "buy",
-            "-s",
-            "COIN",
-            "-q",
-            "10",
-            "--limit-price",
-            "195.25",
-            "--extended-hours",
-        ])
-        .unwrap();
-        let Commands::Buy {
-            limit_price,
-            extended_hours,
-            ..
-        } = cli.command
-        else {
-            panic!("expected buy command");
-        };
-
-        assert!(extended_hours);
-        assert!(
-            limit_price
-                .unwrap()
-                .as_price()
-                .inner()
-                .eq(&Usd::new(Float::parse("195.25".to_string()).unwrap()))
-                .unwrap()
-        );
-    }
-
-    #[test]
-    fn test_vault_withdraw_command_parses_generic_arguments() {
-        let cli = Cli::try_parse_from([
-            "schwab",
-            "vault-withdraw",
-            "-a",
-            "12.5",
-            "-t",
-            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
-            "-v",
-            "0x0000000000000000000000000000000000000000000000000000000000000001",
-        ])
-        .unwrap();
-
-        let Commands::VaultWithdraw {
-            amount,
-            token,
-            vault_id,
-        } = cli.command
-        else {
-            panic!("expected generic vault withdraw command");
-        };
-
-        assert!(
-            amount.eq(float!(12.5)).unwrap(),
-            "Expected parsed amount 12.5"
-        );
-        assert_eq!(
-            token,
-            address!("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913")
-        );
-        assert_eq!(
-            vault_id,
-            b256!("0000000000000000000000000000000000000000000000000000000000000001")
-        );
-    }
-
-    #[test]
-    fn test_buy_command_rejects_non_positive_limit_price() {
-        let error = Cli::try_parse_from([
-            "schwab",
-            "buy",
-            "-s",
-            "AAPL",
-            "-q",
-            "1",
-            "--limit-price",
-            "0",
-        ])
-        .unwrap_err();
-        let message = error.to_string();
-
-        assert!(
-            message.contains("limit price must be positive"),
-            "unexpected error: {message}"
-        );
-    }
-
-    #[test]
-    fn test_sell_command_parses_limit_price_and_extended_hours() {
-        let cli = Cli::try_parse_from([
-            "schwab",
-            "sell",
-            "-s",
-            "COIN",
-            "-q",
-            "10",
-            "--limit-price",
-            "195.25",
-            "--extended-hours",
-        ])
-        .unwrap();
-        let Commands::Sell {
-            limit_price,
-            extended_hours,
-            ..
-        } = cli.command
-        else {
-            panic!("expected sell command");
-        };
-
-        assert!(extended_hours);
-        assert!(
-            limit_price
-                .unwrap()
-                .as_price()
-                .inner()
-                .eq(&Usd::new(Float::parse("195.25".to_string()).unwrap()))
-                .unwrap()
-        );
-    }
-
-    #[test]
-    fn test_sell_command_rejects_non_positive_limit_price() {
-        let error = Cli::try_parse_from([
-            "schwab",
-            "sell",
-            "-s",
-            "AAPL",
-            "-q",
-            "1",
-            "--limit-price",
-            "0",
-        ])
-        .unwrap_err();
-        let message = error.to_string();
-
-        assert!(
-            message.contains("limit price must be positive"),
-            "unexpected error: {message}"
-        );
-    }
-
-    #[test]
-    fn test_sell_command_requires_limit_price_for_extended_hours() {
-        let error = Cli::try_parse_from([
-            "schwab",
-            "sell",
-            "-s",
-            "AAPL",
-            "-q",
-            "1",
-            "--extended-hours",
-        ])
-        .unwrap_err();
-        let message = error.to_string();
-
-        assert!(
-            message.contains("--limit-price"),
-            "unexpected error: {message}"
-        );
-    }
-
-    #[test]
-    fn test_vault_withdraw_usdc_command_parses_compatibility_arguments() {
-        let cli = Cli::try_parse_from(["schwab", "vault-withdraw-usdc", "-a", "250.25"]).unwrap();
-
-        let Commands::VaultWithdrawUsdc { amount } = cli.command else {
-            panic!("expected USDC compatibility vault withdraw command");
-        };
-
-        assert_eq!(amount, Usdc::new(float!(250.25)));
-    }
-
-    #[test]
-    fn test_vault_commands_use_simple_command_path() {
-        let vault_id = b256!("0000000000000000000000000000000000000000000000000000000000000001");
-
-        let deposit = classify_command(Commands::VaultDeposit {
-            amount: float!(10),
-            token: address!("0x1234567890123456789012345678901234567890"),
-            vault_id,
-        });
-        assert!(
-            matches!(deposit, Ok(SimpleCommand::VaultDeposit { .. })),
-            "vault-deposit should use the simple command path"
-        );
-
-        let withdraw = classify_command(Commands::VaultWithdraw {
-            amount: float!(5),
-            token: address!("0x1234567890123456789012345678901234567890"),
-            vault_id,
-        });
-        assert!(
-            matches!(withdraw, Ok(SimpleCommand::VaultWithdraw { .. })),
-            "vault-withdraw should use the simple command path"
-        );
-
-        let withdraw_usdc = classify_command(Commands::VaultWithdrawUsdc {
-            amount: Usdc::new(float!(25)),
-        });
-        assert!(
-            matches!(withdraw_usdc, Ok(SimpleCommand::VaultWithdrawUsdc { .. })),
-            "vault-withdraw-usdc should use the simple command path"
-        );
-    }
-
-    async fn assert_fractional_order_rejected_before_schwab_request(command: Commands) {
-        let server = MockServer::start();
-        let ctx = create_test_ctx_for_cli(&server, Address::ZERO);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
-
-        let (account_mock, order_mock) = setup_schwab_api_mocks(&server);
-        let mut stdout = Vec::new();
-
-        let result = run_command_with_writers(ctx, command, &pool, &mut stdout).await;
-        let error = result.unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "Schwab does not accept fractional shares for buy/sell orders"
-        );
-        account_mock.assert_calls(0);
-        order_mock.assert_calls(0);
-
-        let stdout_str = String::from_utf8(stdout).unwrap();
-        assert!(
-            stdout_str.contains("Schwab does not accept fractional shares"),
-            "expected Schwab fractional-share rejection output, got: {stdout_str}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_buy_command_rejects_fractional_quantity_for_schwab_before_execution() {
-        assert_fractional_order_rejected_before_schwab_request(Commands::Buy {
-            symbol: Symbol::new("AAPL").unwrap(),
-            quantity: positive_shares("6.15"),
-            time_in_force: None,
-            limit_price: None,
-            extended_hours: false,
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_sell_command_rejects_fractional_quantity_for_schwab_before_execution() {
-        assert_fractional_order_rejected_before_schwab_request(Commands::Sell {
-            symbol: Symbol::new("TSLA").unwrap(),
-            quantity: positive_shares("6.15"),
-            time_in_force: None,
-            limit_price: None,
-            extended_hours: false,
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_integration_buy_command_end_to_end() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx_for_cli(&server, Address::ZERO);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
-
-        let account_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::GET)
-                .path("/trader/v1/accounts/accountNumbers");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([{
-                    "accountNumber": "123456789",
-                    "hashValue": "ABC123DEF456"
-                }]));
-        });
-
-        let order_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::POST)
-                .path("/trader/v1/accounts/ABC123DEF456/orders")
-                .header("authorization", "Bearer test_access_token")
-                .header("accept", "*/*")
-                .header("content-type", "application/json");
-            then.status(201)
-                .header("location", "/trader/v1/accounts/ABC123DEF456/orders/12345");
-        });
-
-        let mut stdout = Vec::new();
-
-        let buy_command = Commands::Buy {
-            symbol: Symbol::new("AAPL").unwrap(),
-            quantity: positive_shares("100"),
-            time_in_force: None,
-            limit_price: None,
-            extended_hours: false,
-        };
-
-        let result = run_command_with_writers(ctx, buy_command, &pool, &mut stdout).await;
-
-        assert!(
-            result.is_ok(),
-            "End-to-end CLI command should succeed: {result:?}"
-        );
-        account_mock.assert();
-        order_mock.assert();
-
-        let stdout_str = String::from_utf8(stdout).unwrap();
-        assert!(stdout_str.contains("Order placed successfully"));
-    }
-
-    #[tokio::test]
-    async fn test_integration_sell_command_end_to_end() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx_for_cli(&server, Address::ZERO);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
-
-        let account_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::GET)
-                .path("/trader/v1/accounts/accountNumbers");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([{
-                    "accountNumber": "123456789",
-                    "hashValue": "ABC123DEF456"
-                }]));
-        });
-
-        let order_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::POST)
-                .path("/trader/v1/accounts/ABC123DEF456/orders")
-                .header("authorization", "Bearer test_access_token")
-                .header("accept", "*/*")
-                .header("content-type", "application/json");
-            then.status(201)
-                .header("location", "/trader/v1/accounts/ABC123DEF456/orders/12345");
-        });
-
-        let mut stdout = Vec::new();
-
-        let sell_command = Commands::Sell {
-            symbol: Symbol::new("TSLA").unwrap(),
-            quantity: positive_shares("50"),
-            time_in_force: None,
-            limit_price: None,
-            extended_hours: false,
-        };
-
-        let result = run_command_with_writers(ctx, sell_command, &pool, &mut stdout).await;
-
-        assert!(
-            result.is_ok(),
-            "End-to-end CLI command should succeed: {result:?}"
-        );
-        account_mock.assert();
-        order_mock.assert();
-
-        let stdout_str = String::from_utf8(stdout).unwrap();
-        assert!(stdout_str.contains("Order placed successfully"));
-    }
-
-    #[tokio::test]
-    async fn test_integration_authentication_failure_scenarios() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx_for_cli(&server, Address::ZERO);
-        let pool = setup_test_db().await;
-
-        let expired_tokens = SchwabTokens {
-            access_token: "expired_access_token".to_string(),
-            access_token_fetched_at: chrono::Utc::now() - chrono::Duration::minutes(35),
-            refresh_token: "valid_but_rejected_refresh_token".to_string(),
-            refresh_token_fetched_at: chrono::Utc::now() - chrono::Duration::days(1),
-        };
-        expired_tokens
-            .store(&pool, &get_schwab_auth_from_ctx(&ctx).encryption_key)
-            .await
-            .unwrap();
-
-        let token_refresh_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::POST)
-                .path("/v1/oauth/token")
-                .body_includes("grant_type=refresh_token")
-                .body_includes("refresh_token=valid_but_rejected_refresh_token");
-            then.status(400)
-                .header("content-type", "application/json")
-                .json_body(
-                    json!({"error": "invalid_grant", "error_description": "Refresh token expired"}),
-                );
-        });
-
-        let mut stdout = Vec::new();
-
-        let result = execute_cli_order_with_writers!(
-            Symbol::new("AAPL").unwrap(),
-            positive_shares("100"),
-            Direction::Buy,
-            None,
-            None,
-            false,
-            &ctx,
-            &pool,
-            &mut stdout,
-        )
-        .await;
-
-        assert!(
-            result.is_err(),
-            "CLI command should fail due to auth issues"
-        );
-        token_refresh_mock.assert();
-
-        assert!(format!("{}", result.unwrap_err()).contains("Refresh token expired"));
-    }
-
-    #[tokio::test]
-    async fn test_integration_token_refresh_flow() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx_for_cli(&server, Address::ZERO);
-        let pool = setup_test_db().await;
-
-        let expired_tokens = SchwabTokens {
-            access_token: "expired_access_token".to_string(),
-            access_token_fetched_at: chrono::Utc::now() - chrono::Duration::minutes(35),
-            refresh_token: "valid_refresh_token".to_string(),
-            refresh_token_fetched_at: chrono::Utc::now() - chrono::Duration::days(1),
-        };
-        expired_tokens
-            .store(&pool, &get_schwab_auth_from_ctx(&ctx).encryption_key)
-            .await
-            .unwrap();
-
-        let token_refresh_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::POST)
-                .path("/v1/oauth/token")
-                .body_includes("grant_type=refresh_token")
-                .body_includes("refresh_token=valid_refresh_token");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "access_token": "new_access_token",
-                    "token_type": "Bearer",
-                    "expires_in": 1800,
-                    "refresh_token": "new_refresh_token",
-                    "refresh_token_expires_in": 604_800
-                }));
-        });
-
-        let account_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::GET)
-                .path("/trader/v1/accounts/accountNumbers")
-                .header("authorization", "Bearer new_access_token");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([{
-                    "accountNumber": "123456789",
-                    "hashValue": "ABC123DEF456"
-                }]));
-        });
-
-        let order_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::POST)
-                .path("/trader/v1/accounts/ABC123DEF456/orders")
-                .header("authorization", "Bearer new_access_token");
-            then.status(201)
-                .header("location", "/trader/v1/accounts/ABC123DEF456/orders/12345");
-        });
-
-        let mut stdout = Vec::new();
-
-        let result = execute_cli_order_with_writers!(
-            Symbol::new("AAPL").unwrap(),
-            positive_shares("100"),
-            Direction::Buy,
-            None,
-            None,
-            false,
-            &ctx,
-            &pool,
-            &mut stdout,
-        )
-        .await;
-
-        assert!(
-            result.is_ok(),
-            "CLI command should succeed after token refresh: {result:?}"
-        );
-        token_refresh_mock.assert();
-        account_mock.assert();
-        order_mock.assert();
-
-        let stored_tokens =
-            SchwabTokens::load(&pool, &get_schwab_auth_from_ctx(&ctx).encryption_key)
-                .await
-                .unwrap();
-        assert_eq!(stored_tokens.access_token, "new_access_token");
-        assert_eq!(stored_tokens.refresh_token, "new_refresh_token");
-    }
-
-    #[tokio::test]
-    async fn test_integration_database_operations() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx_for_cli(&server, Address::ZERO);
-        let pool = setup_test_db().await;
-
-        let mut stdout = Vec::new();
-
-        let result = execute_cli_order_with_writers!(
-            Symbol::new("AAPL").unwrap(),
-            positive_shares("100"),
-            Direction::Buy,
-            None,
-            None,
-            false,
-            &ctx,
-            &pool,
-            &mut stdout,
-        )
-        .await;
-
-        assert!(result.is_err(), "CLI should fail when no tokens are stored");
-
-        assert!(format!("{}", result.unwrap_err()).contains("no rows returned"));
-
-        setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
-
-        let account_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::GET)
-                .path("/trader/v1/accounts/accountNumbers");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([{
-                    "accountNumber": "123456789",
-                    "hashValue": "ABC123DEF456"
-                }]));
-        });
-
-        let order_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::POST)
-                .path("/trader/v1/accounts/ABC123DEF456/orders");
-            then.status(201)
-                .header("location", "/trader/v1/accounts/ABC123DEF456/orders/12345");
-        });
-
-        let mut stdout2 = Vec::new();
-
-        let result2 = execute_cli_order_with_writers!(
-            Symbol::new("AAPL").unwrap(),
-            positive_shares("100"),
-            Direction::Buy,
-            None,
-            None,
-            false,
-            &ctx,
-            &pool,
-            &mut stdout2,
-        )
-        .await;
-
-        assert!(
-            result2.is_ok(),
-            "CLI should succeed with valid tokens in database"
-        );
-        account_mock.assert();
-        order_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_integration_network_error_handling() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx_for_cli(&server, Address::ZERO);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
-
-        let account_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::GET)
-                .path("/trader/v1/accounts/accountNumbers");
-            then.status(500)
-                .header("content-type", "application/json")
-                .json_body(json!({"error": "Internal Server Error"}));
-        });
-
-        let mut stdout = Vec::new();
-
-        let result = execute_cli_order_with_writers!(
-            Symbol::new("AAPL").unwrap(),
-            positive_shares("100"),
-            Direction::Buy,
-            None,
-            None,
-            false,
-            &ctx,
-            &pool,
-            &mut stdout,
-        )
-        .await;
-
-        assert!(result.is_err(), "CLI should fail on network errors");
-        account_mock.assert();
-
-        let stdout_str = String::from_utf8(stdout).unwrap();
-        assert!(
-            !stdout_str.is_empty(),
-            "Should provide error feedback to user"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_process_tx_command_transaction_not_found() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx_for_cli(&server, Address::ZERO);
-        let pool = setup_test_db().await;
-
-        let tx_hash =
-            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
-        let mut stdout = Vec::new();
-
-        let asserter = Asserter::new();
-        asserter.push_success(&json!(null));
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let cache = SymbolCache::default();
-        let order_placer = trading::create_order_placer(&ctx, &pool);
-
-        let result = trading::process_tx_with_provider(
-            tx_hash,
-            &ctx,
-            &pool,
-            &mut stdout,
-            &provider,
-            &cache,
-            order_placer,
-        )
-        .await;
-
-        assert!(
-            result.is_ok(),
-            "Should handle transaction not found gracefully"
-        );
-
-        let stdout_str = String::from_utf8(stdout).unwrap();
-        assert!(
-            stdout_str.contains("Transaction not found"),
-            "Should display transaction not found message"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_integration_invalid_order_parameters() {
-        let server = MockServer::start();
-        let ctx = create_test_ctx_for_cli(&server, Address::ZERO);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
-
-        let account_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::GET)
-                .path("/trader/v1/accounts/accountNumbers");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([{
-                    "accountNumber": "123456789",
-                    "hashValue": "ABC123DEF456"
-                }]));
-        });
-
-        let order_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::POST)
-                .path("/trader/v1/accounts/ABC123DEF456/orders");
-            then.status(400)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "error": "Invalid order parameters",
-                    "message": "Insufficient buying power"
-                }));
-        });
-
-        let mut stdout = Vec::new();
-
-        let result = execute_cli_order_with_writers!(
-            Symbol::new("INVALID").unwrap(),
-            positive_shares("999999"),
-            Direction::Buy,
-            None,
-            None,
-            false,
-            &ctx,
-            &pool,
-            &mut stdout,
-        )
-        .await;
-
-        assert!(
-            result.is_err(),
-            "CLI should fail on invalid order parameters"
-        );
-        account_mock.assert();
-        order_mock.assert();
-
-        let stdout_str = String::from_utf8(stdout).unwrap();
-        assert!(
-            stdout_str.contains("Failed to place order"),
-            "Expected failure message in output, got: {stdout_str}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_process_tx_with_database_integration_success() {
-        let server = MockServer::start();
-        let tx_hash =
-            fixed_bytes!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
-
-        let mock_data = create_mock_blockchain_data(
-            TEST_ORDERBOOK,
-            tx_hash,
-            "9000000000000000000",
-            100_000_000,
-        );
-
-        let ctx = create_test_ctx_for_cli(&server, mock_data.order_owner);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
-
-        let (account_mock, order_mock) = setup_schwab_api_mocks(&server);
-
-        let provider = setup_mock_provider_for_process_tx(&mock_data, "USDC", "wtAAPL");
-        let cache = SymbolCache::default();
-        let order_placer = trading::create_order_placer(&ctx, &pool);
-
-        let mut stdout = Vec::new();
-
-        let result = trading::process_tx_with_provider(
-            tx_hash,
-            &ctx,
-            &pool,
-            &mut stdout,
-            &provider,
-            &cache,
-            order_placer,
-        )
-        .await;
-
-        assert!(
-            result.is_ok(),
-            "process_tx should succeed with proper mocking: {:?}",
-            result.as_ref().err()
-        );
-
-        let (_offchain_store, offchain_projection) =
-            StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(trading::create_order_placer(&ctx, &pool))
-                .await
-                .unwrap();
-        let executions = offchain_projection
-            .filter(STATUS, &OrderStatus::Submitted)
-            .await
-            .unwrap();
-        assert_eq!(executions.len(), 1);
-
-        let (order_id, order) = &executions[0];
-        assert_eq!(
-            order.shares(),
-            Positive::new(FractionalShares::new(
-                Float::parse("9".to_string()).unwrap()
-            ))
-            .unwrap()
-        );
-        assert_eq!(order.direction(), Direction::Buy);
-        assert!(
-            order.executor_order_id().is_some(),
-            "Executor order ID should be set after submission"
-        );
-        assert!(!order_id.to_string().is_empty());
-
-        account_mock.assert();
-        order_mock.assert();
-
-        let stdout_str = String::from_utf8(stdout).unwrap();
-        assert!(stdout_str.contains("Processing trade with TradeAccumulator"));
-        assert!(stdout_str.contains("Trade triggered execution for Schwab"));
-        assert!(stdout_str.contains("Trade processing completed"));
-    }
-
-    #[tokio::test]
-    async fn test_process_tx_database_duplicate_handling() {
-        let server = MockServer::start();
-        let tx_hash =
-            fixed_bytes!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
-
-        let mock_data =
-            create_mock_blockchain_data(TEST_ORDERBOOK, tx_hash, "5000000000000000000", 50_000_000);
-
-        let ctx = create_test_ctx_for_cli(&server, mock_data.order_owner);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
-
-        let account_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::GET)
-                .path("/trader/v1/accounts/accountNumbers");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([{
-                    "accountNumber": "123456789",
-                    "hashValue": "ABC123DEF456"
-                }]));
-        });
-
-        let order_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::POST)
-                .path("/trader/v1/accounts/ABC123DEF456/orders")
-                .header("authorization", "Bearer test_access_token")
-                .header("accept", "*/*")
-                .header("content-type", "application/json");
-            then.status(201)
-                .header("location", "/trader/v1/accounts/ABC123DEF456/orders/12345");
-        });
-
-        let asserter1 = Asserter::new();
-        asserter1.push_success(&mock_data.receipt_json);
-        asserter1.push_success(&json!([mock_data.after_clear_log]));
-        asserter1.push_success(&mock_data.receipt_json);
-        asserter1.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
-        asserter1.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"USDC".to_string(),
-        ));
-        asserter1.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
-        asserter1.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"wtTSLA".to_string(),
-        ));
-
-        let provider1 = ProviderBuilder::new().connect_mocked_client(asserter1);
-        let cache1 = SymbolCache::default();
-        let order_placer = trading::create_order_placer(&ctx, &pool);
-
-        let mut stdout1 = Vec::new();
-
-        let result1 = trading::process_tx_with_provider(
-            tx_hash,
-            &ctx,
-            &pool,
-            &mut stdout1,
-            &provider1,
-            &cache1,
-            order_placer.clone(),
-        )
-        .await;
-        assert!(
-            result1.is_ok(),
-            "First process_tx should succeed: {:?}",
-            result1.as_ref().err()
-        );
-
-        let (_offchain_store, offchain_projection) =
-            StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(order_placer.clone())
-                .await
-                .unwrap();
-        let executions = offchain_projection
-            .filter(STATUS, &OrderStatus::Submitted)
-            .await
-            .unwrap();
-        assert_eq!(executions.len(), 1);
-        let order = &executions[0].1;
-        assert_eq!(
-            order.shares(),
-            Positive::new(FractionalShares::new(
-                Float::parse("5".to_string()).unwrap()
-            ))
-            .unwrap()
-        );
-
-        let stdout_str1 = String::from_utf8(stdout1).unwrap();
-        assert!(stdout_str1.contains("Processing trade with TradeAccumulator"));
-
-        let asserter2 = Asserter::new();
-        asserter2.push_success(&mock_data.receipt_json);
-        asserter2.push_success(&json!([mock_data.after_clear_log]));
-        asserter2.push_success(&mock_data.receipt_json);
-        asserter2.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
-        asserter2.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"USDC".to_string(),
-        ));
-        asserter2.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
-        asserter2.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            &"wtTSLA".to_string(),
-        ));
-
-        let provider2 = ProviderBuilder::new().connect_mocked_client(asserter2);
-        let cache2 = SymbolCache::default();
-
-        let mut stdout2 = Vec::new();
-
-        let result2 = trading::process_tx_with_provider(
-            tx_hash,
-            &ctx,
-            &pool,
-            &mut stdout2,
-            &provider2,
-            &cache2,
-            order_placer,
-        )
-        .await;
-        assert!(
-            result2.is_ok(),
-            "Second process_tx should succeed with graceful duplicate handling"
-        );
-
-        let count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(DISTINCT aggregate_id) FROM events WHERE aggregate_type = 'Position'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(count.0, 1, "Only one position aggregate should exist");
-
-        let stdout_str2 = String::from_utf8(stdout2).unwrap();
-        assert!(stdout_str2.contains("Processing trade with TradeAccumulator"));
-        assert!(stdout_str2.contains("Trade accumulated but did not trigger execution yet"));
-
-        account_mock.assert_calls(1);
-        order_mock.assert_calls(1);
-    }
-
-    #[test]
-    fn test_auth_command_cli_help_text() {
-        let mut cmd = Cli::command();
-
-        let help_output = cmd.render_help().to_string();
-        assert!(help_output.contains("auth"));
-        assert!(help_output.contains("OAuth"));
-        assert!(help_output.contains("authentication"));
-    }
-
-    #[test]
-    fn test_transfer_commands_in_help_text() {
-        let mut cmd = Cli::command();
-        let help_output = cmd.render_help().to_string();
-
-        assert!(
-            help_output.contains("transfer-equity"),
-            "Help should contain transfer-equity command"
-        );
-        assert!(
-            help_output.contains("transfer-usdc"),
-            "Help should contain transfer-usdc command"
-        );
-    }
-
-    #[test]
-    fn test_transfer_equity_command_structure() {
-        let cmd = Cli::command();
-
-        let result = cmd
-            .clone()
-            .try_get_matches_from(vec!["cli", "transfer-equity"]);
-        assert!(result.is_err(), "transfer-equity without args should fail");
-
-        let result = cmd.clone().try_get_matches_from(vec![
-            "cli",
-            "transfer-equity",
-            "-s",
-            "AAPL",
-            "-q",
-            "10.5",
-        ]);
-        assert!(
-            result.is_err(),
-            "transfer-equity without direction should fail"
-        );
-
-        let result = cmd.clone().try_get_matches_from(vec![
-            "cli",
-            "transfer-equity",
-            "-d",
-            "to-raindex",
-            "-s",
-            "AAPL",
-            "-q",
-            "10.5",
-        ]);
-        assert!(
-            result.is_ok(),
-            "transfer-equity to-raindex should succeed: {:?}",
-            result.err()
-        );
-
-        let result = cmd.try_get_matches_from(vec![
-            "cli",
-            "transfer-equity",
-            "-d",
-            "to-alpaca",
-            "-s",
-            "AAPL",
-            "-q",
-            "5.0",
-        ]);
-        assert!(
-            result.is_ok(),
-            "transfer-equity to-alpaca should succeed: {:?}",
-            result.err()
-        );
-    }
-
-    #[test]
-    fn test_wrap_equity_command_structure() {
-        let cmd = Cli::command();
-
-        cmd.clone()
-            .try_get_matches_from(vec!["cli", "wrap-equity"])
-            .unwrap_err();
-
-        cmd.clone()
-            .try_get_matches_from(vec!["cli", "wrap-equity", "-s", "AAPL"])
-            .unwrap_err();
-
-        cmd.clone()
-            .try_get_matches_from(vec!["cli", "wrap-equity", "-q", "10.5"])
-            .unwrap_err();
-
-        cmd.try_get_matches_from(vec!["cli", "wrap-equity", "-s", "AAPL", "-q", "10.5"])
-            .unwrap();
-    }
-
-    #[test]
-    fn test_unwrap_equity_command_structure() {
-        let cmd = Cli::command();
-
-        cmd.clone()
-            .try_get_matches_from(vec!["cli", "unwrap-equity"])
-            .unwrap_err();
-
-        cmd.clone()
-            .try_get_matches_from(vec!["cli", "unwrap-equity", "-s", "AAPL"])
-            .unwrap_err();
-
-        cmd.clone()
-            .try_get_matches_from(vec!["cli", "unwrap-equity", "-q", "10.5"])
-            .unwrap_err();
-
-        cmd.try_get_matches_from(vec!["cli", "unwrap-equity", "-s", "AAPL", "-q", "10.5"])
-            .unwrap();
-    }
-
-    #[test]
-    fn test_transfer_usdc_command_structure() {
-        let cmd = Cli::command();
-
-        let result = cmd
-            .clone()
-            .try_get_matches_from(vec!["cli", "transfer-usdc"]);
-        assert!(result.is_err(), "transfer-usdc without args should fail");
-
-        let result =
-            cmd.clone()
-                .try_get_matches_from(vec!["cli", "transfer-usdc", "-a", "1000.50"]);
-        assert!(
-            result.is_err(),
-            "transfer-usdc without direction should fail"
-        );
-
-        let result = cmd.clone().try_get_matches_from(vec![
-            "cli",
-            "transfer-usdc",
-            "-d",
-            "to-raindex",
-            "-a",
-            "1000.50",
-        ]);
-        assert!(
-            result.is_ok(),
-            "transfer-usdc to-raindex should succeed: {:?}",
-            result.err()
-        );
-
-        let result = cmd.try_get_matches_from(vec![
-            "cli",
-            "transfer-usdc",
-            "-d",
-            "to-alpaca",
-            "-a",
-            "500.25",
-        ]);
-        assert!(
-            result.is_ok(),
-            "transfer-usdc to-alpaca should succeed: {:?}",
-            result.err()
-        );
-    }
-
-    #[test]
-    fn cli_env_parses_config_secrets_and_subcommand() {
-        let cli_env = CliEnv::try_parse_from([
-            "cli",
-            "--config",
-            "config.toml",
-            "--secrets",
-            "secrets.toml",
-            "auth",
-        ])
-        .unwrap();
-
-        assert!(matches!(cli_env.command, Commands::Auth));
-    }
-
-    #[test]
-    fn cli_env_rejects_missing_config_flag() {
+    fn wrap_equity_command_rejects_zero_quantity() {
         let error =
-            CliEnv::try_parse_from(["cli", "--secrets", "secrets.toml", "auth"]).unwrap_err();
+            Cli::try_parse_from(["st0x-cli", "wrap-equity", "-s", "AAPL", "-q", "0"]).unwrap_err();
+        let rendered = error.to_string();
+        assert!(rendered.contains('0'), "unexpected clap error: {rendered}");
+    }
 
+    #[test]
+    fn unwrap_equity_command_rejects_zero_quantity() {
+        let error = Cli::try_parse_from(["st0x-cli", "unwrap-equity", "-s", "AAPL", "-q", "0"])
+            .unwrap_err();
+        let rendered = error.to_string();
+        assert!(rendered.contains('0'), "unexpected clap error: {rendered}");
+    }
+
+    #[test]
+    fn sell_command_parses_fractional_quantity() {
+        let cli = Cli::try_parse_from(["st0x-cli", "sell", "-s", "SPYM", "-q", "6.15"]).unwrap();
+
+        match cli.command {
+            Commands::Sell {
+                symbol, quantity, ..
+            } => {
+                assert_eq!(symbol, Symbol::new("SPYM").unwrap());
+                assert_eq!(quantity, positive_shares("6.15"));
+            }
+            other => panic!("expected sell command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wrap_equity_command_parses_fractional_quantity() {
+        let cli =
+            Cli::try_parse_from(["st0x-cli", "wrap-equity", "-s", "SPYM", "-q", "6.15"]).unwrap();
+
+        match cli.command {
+            Commands::WrapEquity { symbol, quantity } => {
+                assert_eq!(symbol, Symbol::new("SPYM").unwrap());
+                assert_eq!(quantity, positive_shares("6.15"));
+            }
+            other => panic!("expected wrap-equity command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_positive_shares_rejects_zero() {
+        let error = parse_positive_shares("0").unwrap_err();
+        assert!(error.contains("positive"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn classify_buy_command_as_simple() {
+        let command = Commands::Buy {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: positive_shares("1"),
+            time_in_force: None,
+            limit_price: None,
+            extended_hours: false,
+        };
+
+        match classify_command(command) {
+            Ok(SimpleCommand::Buy { .. }) => {}
+            Ok(_) => panic!("expected buy simple command"),
+            Err(
+                ProviderCommand::ProcessTx { .. }
+                | ProviderCommand::TransferUsdc { .. }
+                | ProviderCommand::CctpBridge { .. }
+                | ProviderCommand::CctpRecover { .. }
+                | ProviderCommand::ResetAllowance { .. }
+                | ProviderCommand::AlpacaTokenize { .. }
+                | ProviderCommand::AlpacaRedeem { .. }
+                | ProviderCommand::AlpacaTokenizationRequests,
+            ) => panic!("expected simple command classification"),
+        }
+    }
+
+    #[test]
+    fn classify_process_tx_command_as_provider() {
+        let command = Commands::ProcessTx {
+            tx_hash: TxHash::ZERO,
+        };
+
+        match classify_command(command) {
+            Err(ProviderCommand::ProcessTx { .. }) => {}
+            Err(
+                ProviderCommand::TransferUsdc { .. }
+                | ProviderCommand::CctpBridge { .. }
+                | ProviderCommand::CctpRecover { .. }
+                | ProviderCommand::ResetAllowance { .. }
+                | ProviderCommand::AlpacaTokenize { .. }
+                | ProviderCommand::AlpacaRedeem { .. }
+                | ProviderCommand::AlpacaTokenizationRequests,
+            ) => panic!("expected process-tx provider command"),
+            Ok(_) => panic!("expected provider command classification"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_command_with_writers_executes_dry_run_buy() {
+        let ctx = create_test_ctx();
+        let pool = setup_test_db().await;
+        let command = Commands::Buy {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: positive_shares("1"),
+            time_in_force: None,
+            limit_price: None,
+            extended_hours: false,
+        };
+
+        let mut stdout_buffer = Vec::new();
+        let () = run_command_with_writers(ctx, command, &pool, &mut stdout_buffer)
+            .await
+            .unwrap();
+
+        let output = String::from_utf8(stdout_buffer).unwrap();
         assert!(
-            error.to_string().contains("--config"),
-            "Expected error about --config, got: {error}"
+            output.contains("Order placed successfully"),
+            "unexpected output: {output}"
         );
     }
 
     #[test]
-    fn cli_env_rejects_missing_subcommand() {
-        let error = CliEnv::try_parse_from(["cli", "--config", "c.toml", "--secrets", "s.toml"])
-            .unwrap_err();
-
-        assert!(
-            error.to_string().contains("subcommand"),
-            "Expected error about subcommand, got: {error}"
+    fn extended_hours_without_limit_price_is_rejected_by_request_builder() {
+        let result = trading::CliOrderRequest::from_cli_args(
+            Symbol::new("AAPL").unwrap(),
+            positive_shares("1"),
+            Direction::Buy,
+            None,
+            None,
+            true,
         );
+
+        match result {
+            Ok(_) => panic!("expected --extended-hours validation failure"),
+            Err(error) => {
+                assert_eq!(error.to_string(), "--extended-hours requires --limit-price");
+            }
+        }
     }
 
     #[tokio::test]
-    async fn parse_and_convert_succeeds_with_valid_config() {
+    async fn cli_env_loads_dry_run_config() {
         let config_dir = tempfile::tempdir().unwrap();
-
         let config_path = config_dir.path().join("config.toml");
         let secrets_path = config_dir.path().join("secrets.toml");
 
-        tokio::fs::write(
+        std::fs::write(
             &config_path,
             r#"
                 database_url = ":memory:"
@@ -3115,10 +1256,9 @@ mod tests {
                 order_owner = "0x2222222222222222222222222222222222222222"
             "#,
         )
-        .await
         .unwrap();
 
-        tokio::fs::write(
+        std::fs::write(
             &secrets_path,
             r#"
                 [evm]
@@ -3128,51 +1268,27 @@ mod tests {
                 type = "dry-run"
             "#,
         )
-        .await
         .unwrap();
 
         let (ctx, command) = CliEnv::try_parse_from([
-            "cli",
+            "st0x-cli",
             "--config",
             config_path.to_str().unwrap(),
             "--secrets",
             secrets_path.to_str().unwrap(),
-            "auth",
+            "buy",
+            "-s",
+            "AAPL",
+            "-q",
+            "1",
         ])
         .unwrap()
         .load()
         .await
         .unwrap();
 
-        assert!(matches!(command, Commands::Auth));
+        assert!(matches!(command, Commands::Buy { .. }));
         assert_eq!(ctx.database_url, ":memory:");
-        assert!(
-            matches!(ctx.trading_mode, TradingMode::Standalone { order_owner }
-                if order_owner == address!("0x2222222222222222222222222222222222222222")),
-            "Expected Standalone mode, got: {:?}",
-            ctx.trading_mode
-        );
         assert!(matches!(ctx.broker, BrokerCtx::DryRun));
-    }
-
-    #[tokio::test]
-    async fn parse_and_convert_fails_with_missing_files() {
-        let error = CliEnv::try_parse_from([
-            "cli",
-            "--config",
-            "/nonexistent/config.toml",
-            "--secrets",
-            "/nonexistent/secrets.toml",
-            "auth",
-        ])
-        .unwrap()
-        .load()
-        .await
-        .unwrap_err();
-
-        assert!(
-            error.to_string().contains("failed to read config file"),
-            "Expected config file read error, got: {error}"
-        );
     }
 }

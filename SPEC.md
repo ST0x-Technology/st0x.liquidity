@@ -5,6 +5,9 @@ design decisions at a level sufficient to understand the system without
 prescribing exact commands or code. For terminology and naming conventions, see
 [docs/domain.md](docs/domain.md).
 
+Current supported offchain execution backends are `alpaca-broker-api` and
+`dry-run`.
+
 ## Background
 
 Early-stage onchain tokenized equity markets typically suffer from poor price
@@ -20,9 +23,9 @@ tokenized equities and their traditional market counterparts.
 
 The bot monitors Raindex Orders from a specific owner that continuously offer
 tokenized equities at spreads around Pyth oracle prices. When a solver clears
-any of these orders, the bot immediately executes an offsetting trade on a
-supported brokerage (Charles Schwab or Alpaca Markets), hedging directional
-exposure while capturing the spread differential.
+any of these orders, the bot immediately executes an offsetting trade on the
+supported brokerage backend (Alpaca Broker API), hedging directional exposure
+while capturing the spread differential.
 
 The focus is on getting a functional system live quickly. There are known risks
 that will be addressed in future iterations as total value locked (TVL) grows
@@ -42,7 +45,7 @@ and the system proves market fit.
 
 #### Offchain Infrastructure
 
-- Brokerage account with API access (Charles Schwab or Alpaca Markets)
+- Brokerage account with API access (Alpaca Markets)
 - Arbitrage bot monitoring and execution engine
 - Basic terminal/logging interface for system overview
 
@@ -59,32 +62,21 @@ and the system proves market fit.
 2. Bot monitors Raindex for clears involving any orders from the arbitrageur's
    owner address
 3. Bot records onchain trades and accumulates net position changes per symbol
-4. When accumulated net position reaches an absolute value of >=1.0 share,
-   execute offsetting trade for floor(abs(net_position)) shares on the selected
-   brokerage, using the sign of the net position to determine side (positive =
-   sell to reduce a long, negative = buy to cover a short), and continue
-   tracking the remaining fractional share (net_position minus the executed
-   floor) with its sign for future batching
+4. When accumulated net position reaches the configured execution threshold,
+   execute the offsetting trade on the selected brokerage, using the sign of the
+   net position to determine side (positive = sell to reduce a long, negative =
+   buy to cover a short)
 5. Bot maintains running inventory of positions across both venues
 6. Periodic rebalancing via st0x bridge to normalize inventory levels
 
 #### Note on Fractional Share Handling
 
-- **Charles Schwab**: Does not support fractional shares via their API. Batching
-  to whole shares is required (as described above).
-- **Alpaca Markets**: Supports fractional share trading (minimum $1 worth). The
-  current implementation uses the same batching logic for both brokers, but this
-  may be reconfigured to allow immediate fractional execution when using Alpaca,
-  reducing unhedged exposure.
-
-Example (Offchain Batching):
-
-- Onchain trades: 0.3 AAPL sold, 0.5 AAPL sold, 0.4 AAPL sold -> net 1.2 AAPL
-  sold
-- Bot executes: Buy 1 AAPL share on broker (floor of 1.2), continues tracking
-  0.2 AAPL net exposure
-- Continue accumulating fractional amount until next whole share threshold is
-  reached
+- **Alpaca Broker API**: Supports fractional share trading. Production can use
+  dollar-value execution thresholds to reduce unhedged exposure while still
+  respecting buying-power constraints.
+- **Dry run**: Supports fractional arithmetic for simulation and testing.
+  Operators may still configure whole-share thresholds when that is useful for
+  conservative modeling.
 
 #### Rebalancing Process
 
@@ -107,12 +99,7 @@ Example (Offchain Batching):
 - **Integration**: Uses Alpaca for share/USDC management, Circle CCTP for
   cross-chain USDC transfers
 
-##### Schwab (Manual)
-
-- Rebalancing for Schwab-based operations remains manual
-- Monitor inventory drift over time
-- Execute manual transfers as needed to maintain adequate trading capital
-- No automated rebalancing infrastructure for Schwab
+Automated rebalancing is Alpaca Broker API based.
 
 ## Bot Implementation Specification
 
@@ -219,19 +206,11 @@ graph LR
 
 The bot supports multiple brokers through a unified trait interface:
 
-##### Charles Schwab
+##### Alpaca Broker API
 
-- OAuth 2.0 authentication flow with token refresh
-- Connection pooling and retry logic for API calls with exponential backoff
-- Rate limiting compliance and queue management
-- Market order execution for immediate fills
-- Order status tracking and confirmation with polling
-
-##### Alpaca Markets
-
-- API key-based authentication (simpler than OAuth)
-- Market order execution through Alpaca Trading API v2
-- Manual CLI limit orders through Alpaca Broker API for operator intervention
+- API key-based authentication
+- Market order execution for automated hedging
+- Manual CLI limit orders for operator intervention
 - Manual Alpaca limit orders use day time-in-force only and can optionally be
   marked as extended-hours eligible when the asset supports it
 - Order status polling and updates
@@ -257,16 +236,14 @@ The bot supports multiple brokers through a unified trait interface:
 
 The bot uses a multi-table SQLite database to track trades and manage state. Key
 tables include: onchain trade records, broker execution tracking, position
-accumulators for batching fractional shares, audit trail linking, OAuth token
-storage, and event queue for idempotency. The complete database schema is
-defined in `migrations/20250703115746_trades.sql`.
+accumulators for batching fractional shares, audit trail linking, and event
+queue for idempotency. The complete database schema is defined in
+`migrations/20250703115746_trades.sql`.
 
 - Store each onchain trade with symbol, amount, direction, and price
 - Track broker executions separately with whole share amounts, status, and
-  broker type ('schwab', 'alpaca', 'dry_run')
-- Accumulate fractional positions per symbol until execution thresholds are
-  reached (required for Charles Schwab; used uniformly across all brokers in
-  current implementation)
+  broker type
+- Accumulate positions per symbol until execution thresholds are reached
 - Maintain complete audit trail linking onchain trades to broker executions
 - Handle concurrent database writes safely with per-symbol locking
 
@@ -363,7 +340,7 @@ _System configuration_ (deploy-rs `activate.nixos`):
 
 _Per-service profiles_ (deploy-rs `activate.custom`, deployed independently):
 
-- `server` - hedging bot binary (serves both Schwab and Alpaca instances)
+- `server` - hedging bot binary
 
 Each profile is independently deployable and rollback-able without affecting
 other profiles. The dashboard is served as static files by nginx (part of the
@@ -393,10 +370,10 @@ schedule.
 
 #### CI/CD Credential Management
 
-| Secret Type | Storage               | When Used           | Example                |
-| ----------- | --------------------- | ------------------- | ---------------------- |
-| Runtime     | ragenix (.age in git) | Decrypted at deploy | Schwab/Alpaca API keys |
-| Build-time  | GitHub Secrets        | CI build/deploy     | DO token, SSH key      |
+| Secret Type | Storage               | When Used           | Example           |
+| ----------- | --------------------- | ------------------- | ----------------- |
+| Runtime     | ragenix (.age in git) | Decrypted at deploy | Alpaca API keys   |
+| Build-time  | GitHub Secrets        | CI build/deploy     | DO token, SSH key |
 
 Use GitHub Actions environment protection (require approval for production,
 restrict to master branch).
@@ -462,8 +439,7 @@ The system provides two top-level capabilities:
 │  ├─ Executor trait   ├─ Tokenizer trait ├─ Bridge trait├─ Raindex trait │
 │  │                   │                  │              │                │
 │  │ features:         │ features:        │ features:    │ features:      │
-│  │ ├─ schwab         │ └─ alpaca        │ └─ cctp      │ └─ rain        │
-│  │ ├─ alpaca-trading │                  │              │                │
+│  │ ├─ alpaca-broker  │ └─ alpaca        │ └─ cctp      │ └─ rain        │
 │  │ └─ mock           │                  │              │                │
 │                                                                         │
 └───────┬──────────────────┬──────────────────┬──────────────┬────────────┘
@@ -502,7 +478,6 @@ The system provides two top-level capabilities:
                 · · · · · · · · · · · · · · · · · · · · ·
                 ·                                       ·
                 ·  st0x-cli (temporary utility)         ·
-                ·  ├─ Manual auth flows                 ·
                 ·  ├─ Debug commands                    ·
                 ·  └─ To be deprecated                  ·
                 ·                                       ·
@@ -513,13 +488,13 @@ The system provides two top-level capabilities:
 
 **Integration Layer** (external API wrappers):
 
-| Crate               | Purpose                                              | Feature Flags                      |
-| ------------------- | ---------------------------------------------------- | ---------------------------------- |
-| `st0x-execution`    | Brokerage API integration for trade execution        | `schwab`, `alpaca-trading`, `mock` |
-| `st0x-tokenization` | Tokenization API for minting/redeeming equity tokens | `alpaca`                           |
-| `st0x-bridge`       | Cross-chain asset transfers                          | `cctp`                             |
-| `st0x-raindex`      | Rain orderbook vault deposit/withdraw operations     | `rain`                             |
-| `st0x-evm`          | EVM chain interaction and wallet abstraction         | `turnkey`, `local-signer`, `mock`  |
+| Crate               | Purpose                                              | Feature Flags                     |
+| ------------------- | ---------------------------------------------------- | --------------------------------- |
+| `st0x-execution`    | Brokerage API integration for trade execution        | `mock`                            |
+| `st0x-tokenization` | Tokenization API for minting/redeeming equity tokens | `alpaca`                          |
+| `st0x-bridge`       | Cross-chain asset transfers                          | `cctp`                            |
+| `st0x-raindex`      | Rain orderbook vault deposit/withdraw operations     | `rain`                            |
+| `st0x-evm`          | EVM chain interaction and wallet abstraction         | `turnkey`, `local-signer`, `mock` |
 
 Each integration crate defines a trait (e.g., `Executor`, `Tokenizer`, `Bridge`,
 `Raindex`, `Wallet`) with one or more implementations selectable via feature
@@ -541,19 +516,19 @@ enables testing with mocks and future implementation swaps.
 | ---------------- | ---------------------------------------------------------------------- |
 | `st0x-server`    | Main bot binary, conductor, wires hedging + rebalancing, API endpoints |
 | `st0x-dashboard` | Admin dashboard backend, websocket events, manual operations           |
-| `st0x-cli`       | Temporary utility for manual auth and debug (to be deprecated)         |
+| `st0x-cli`       | Temporary utility for manual trading and debug operations              |
 
 ### Feature Flag Strategy
 
 Feature flags control which implementations are compiled:
 
 ```toml
-# Production equities bot with Schwab
+# Production equities bot
 [dependencies]
-st0x-server = { features = ["schwab", "alpaca-tokenization", "cctp", "rain"] }
+st0x-server = { features = ["all-wallets"] }
 
 # Dry-run testing
-st0x-server = { features = ["mock", "alpaca-tokenization", "cctp", "rain"] }
+st0x-server = { features = ["mock"] }
 
 # Future: crypto + perps fork with different integrations
 st0x-server = { features = ["perp-exchange", "other-bridge", "other-vault"] }
@@ -610,13 +585,10 @@ implementation. Solutions will be developed in later iterations.
 
 ### Offchain Risks
 
-- **Fractional Share Exposure**: Charles Schwab does not support fractional
-  share trading, requiring offchain batching until net positions reach whole
-  share amounts. This creates temporary unhedged exposure for fractional amounts
-  that haven't reached the execution threshold. Note: Alpaca Markets supports
-  fractional share trading (minimum $1 worth of shares), but we currently use
-  the same batching logic for both brokers. This may be reconfigured in the
-  future to allow immediate fractional execution when using Alpaca.
+- **Threshold-Induced Exposure**: Any configured batching threshold can create
+  temporary unhedged exposure while the bot waits to execute the next offchain
+  hedge. Fractional support reduces this risk, but buying-power constraints,
+  market conditions, and operator-selected thresholds can still delay execution.
 - **Missed Trade Execution**: The bot fails to execute offsetting trades on the
   selected brokerage when onchain trades occur, creating unhedged exposure. For
   example:
@@ -688,10 +660,8 @@ The source of truth for all table schemas is the `migrations/` directory.
 
 **CQRS projection views**: `position_view`, `offchain_order_view`,
 `onchain_trade_view`, `usdc_rebalance_view`, `vault_registry_view`,
-`equity_redemption_view`, `schwab_auth_view`. Some views use SQLite generated
-columns to expose JSON fields as queryable columns for Grafana dashboards.
-
-**Legacy tables** (still used directly): `schwab_auth`.
+`equity_redemption_view`. Some views use SQLite generated columns to expose JSON
+fields as queryable columns for Grafana dashboards.
 
 ### Architecture Decision: Position as Aggregate
 
@@ -710,8 +680,7 @@ lifecycles, so we model them as separate aggregates:
   order tracking.
 - **Position**: Lifecycle = accumulates fills -> triggers hedging decisions.
   Uses configurable threshold (shares or dollar value) to determine when to
-  place offsetting broker orders. Schwab uses shares threshold (1.0 minimum),
-  Alpaca can use dollar threshold ($1.00 minimum).
+  place offsetting broker orders.
 
 This means blockchain fills are recorded in both OnChainTradeEvent::Filled
 (audit trail) and PositionEvent::OnChainOrderFilled (position tracking), but
@@ -909,8 +878,8 @@ struct Position {
 }
 
 enum ExecutionThreshold {
-    Shares(FractionalShares),  // Schwab: 1.0 shares minimum
-    DollarValue(Usdc),         // Alpaca: $1.00 minimum trade value
+    Shares(FractionalShares),  // Whole-share style threshold
+    DollarValue(Usdc),         // Dollar-value threshold
 }
 ```
 
@@ -1007,10 +976,10 @@ enum TriggerReason {
 - `AcknowledgeOnChainFill` serves as the genesis event (initializes the
   aggregate on first fill)
 - Can only place offchain order when threshold is met:
-  - **Shares threshold**: `|net_position| >= threshold` (e.g., 1.0 shares for
-    Schwab)
+  - **Shares threshold**: `|net_position| >= threshold` (e.g., whole-share
+    threshold)
   - **Dollar threshold**: `|net_position * price_usdc| >= threshold` (e.g.,
-    $1.00 for Alpaca)
+    $1.00 minimum trade value)
 - Direction of offchain order must be opposite to accumulated position (positive
   net = sell, negative net = buy)
 - Cannot have multiple pending executions for same symbol
@@ -1140,63 +1109,9 @@ enum OffchainOrderEvent {
 struct BrokerErrorCode(String);
 ```
 
-#### SchwabAuth Aggregate
-
-**Purpose**: Manages OAuth tokens for Charles Schwab broker. Alpaca uses simple
-API key/secret (configured via environment variables) and doesn't require
-database storage.
-
-**Aggregate ID**: `"schwab"` (singleton)
-
-##### States
-
-```rust
-enum SchwabAuth {
-    NotAuthenticated,
-    Authenticated {
-        access_token: EncryptedToken,
-        access_token_fetched_at: DateTime<Utc>,
-        refresh_token: EncryptedToken,
-        refresh_token_fetched_at: DateTime<Utc>,
-    },
-}
-```
-
-##### Commands
-
-```rust
-enum SchwabAuthCommand {
-    StoreTokens {
-        access_token: String,
-        refresh_token: String,
-    },
-    RefreshAccessToken {
-        new_access_token: String,
-    },
-}
-```
-
-##### Events
-
-```rust
-enum SchwabAuthEvent {
-    TokensStored {
-        access_token: EncryptedToken,
-        access_token_fetched_at: DateTime<Utc>,
-        refresh_token: EncryptedToken,
-        refresh_token_fetched_at: DateTime<Utc>,
-    },
-    AccessTokenRefreshed {
-        access_token: EncryptedToken,
-        refreshed_at: DateTime<Utc>,
-    },
-}
-```
-
 ### Rebalancing Aggregates
 
-**Note**: Automated rebalancing is **Alpaca-only**. These aggregates are not
-used for Schwab-based operations, which rely on manual rebalancing processes.
+**Note**: Automated rebalancing is Alpaca Broker API based.
 
 #### Cross-Venue Asset Transfer Model
 
@@ -2274,7 +2189,7 @@ All work managed by the Conductor falls into one of these categories:
 | Inventory poll       | ~30s     | Poll vault + broker balances, broadcast to dashboard |
 | Order status poll    | ~10s     | Poll broker for pending order fills                  |
 | Position check       | ~60s     | Reconcile accumulated positions (safety net)         |
-| Executor maintenance | ~15m     | Refresh auth tokens, check asset availability        |
+| Executor maintenance | ~15m     | Refresh broker metadata, check asset availability    |
 
 **Lifecycle workflows** (stepped, durable, future):
 
@@ -2376,9 +2291,9 @@ async fn test_full_flow_blockchain_to_broker() {
 ### Code Organization
 
 Aggregates use flat file structure by default. Submodules are only introduced
-when natural business logic boundaries emerge (e.g., `schwab/auth/` uses CQRS
-submodules because auth is a complex domain with distinct commands, events, and
-views).
+when natural business logic boundaries emerge (e.g., `alpaca_broker_api/` splits
+auth, client, order, and positions because broker integration has distinct
+business concerns).
 
 ```text
 Cargo.toml                        - Workspace definition (st0x-hedge + crates/execution)
@@ -2413,7 +2328,7 @@ crates/
   bridge/                         - Circle CCTP bridge abstraction
   dto/                            - TypeScript binding generation for dashboard
   event-sorcery/                  - CQRS/ES framework (EventSourced, Store, Reactor, Projection)
-  execution/                      - Trade execution library (Executor trait, Schwab, Alpaca)
+  execution/                      - Trade execution library (Executor trait, Alpaca, mock)
 ```
 
 ---
@@ -2507,7 +2422,7 @@ All read data flows through a single WebSocket connection:
 
 1. Client connects to `WS /api/ws`
 2. Server sends full initial state as first message (positions, trades, P&L,
-   auth status, circuit breaker state)
+   circuit breaker state)
 3. Server streams incremental updates as events occur
 
 ##### Benefits
@@ -2515,7 +2430,7 @@ All read data flows through a single WebSocket connection:
 - Single connection to manage
 - No race condition between HTTP fetch and WebSocket updates
 - Server controls exactly what state the client starts with
-- HTTP endpoints only needed for mutations (circuit breaker, auth)
+- HTTP endpoints only needed for mutations (circuit breaker)
 
 ##### Message Types
 
@@ -2561,25 +2476,6 @@ const response = await fetch("https://api.hyperdx.io/api/v1/alerts", {
 });
 ```
 
-#### Schwab OAuth Integration
-
-Streamline the weekly OAuth re-authentication flow:
-
-- Display current authentication status with token expiry countdown
-- Show warning when refresh token is approaching expiry (< 2 days)
-- "Re-authenticate" button that initiates OAuth flow
-- OAuth callback handler in dashboard
-- Eliminates need for manual CLI coordination
-
-##### Flow
-
-1. User clicks "Re-authenticate" in dashboard
-2. Dashboard opens Schwab OAuth URL in new tab
-3. User authenticates with Schwab
-4. Schwab redirects to dashboard callback URL
-5. Dashboard extracts code and calls existing `POST /auth/refresh` endpoint
-6. Dashboard displays success/error and updates status
-
 #### Circuit Breaker
 
 Emergency control to halt all trading activity:
@@ -2606,17 +2502,11 @@ POST /api/circuit-breaker/reset
 ### Dashboard Layout
 
 Single-page dashboard with live-updating panels, each expandable to full-screen.
-Supports two bot instances (Schwab and Alpaca) via broker selector in header.
-
-#### Broker-specific features
-
-- **Schwab**: OAuth flow management (weekly re-authentication)
-- **Alpaca**: Automated rebalancing panel (minting, redemption, USDC bridging)
+It presents the current Alpaca-backed runtime rather than switching between
+multiple broker-specific contexts.
 
 #### Header Bar
 
-- Broker selector (Schwab / Alpaca) - switches entire dashboard context
-- Auth status indicator with expiry countdown (Schwab only)
 - Circuit breaker status toggle
 - WebSocket connection status
 
@@ -2654,9 +2544,7 @@ dashboard/
 │   │   └── websocket.svelte.ts
 │   ├── routes/
 │   │   ├── +layout.svelte  # App shell with header bar
-│   │   ├── +page.svelte    # Main dashboard (all panels)
-│   │   └── auth/
-│   │       └── callback/   # OAuth callback handler
+│   │   └── +page.svelte    # Main dashboard (all panels)
 │   └── app.html
 ├── static/
 ├── package.json
@@ -2678,13 +2566,11 @@ WS /api/ws
 Sends initial state on connect, then streams updates. See WebSocket-First Data
 Flow section above.
 
-##### Mutations (HTTP, require auth)
+##### Mutations (HTTP, require API key)
 
 ```text
 POST /api/circuit-breaker/trigger  { reason: string }
 POST /api/circuit-breaker/reset
-GET  /api/auth/url                 (generates Schwab OAuth URL)
-POST /auth/refresh                 (existing endpoint)
 ```
 
 #### Authentication
@@ -2693,7 +2579,7 @@ Public read access with authenticated actions:
 
 - **Read endpoints** (positions, trades, P&L, status): No authentication
   required
-- **Action endpoints** (circuit breaker trigger/reset, OAuth): Require API key
+- **Action endpoints** (circuit breaker trigger/reset): Require API key
 - API key sent in `Authorization` header, validated against `DASHBOARD_API_KEY`
   environment variable
 - Future: Proper user authentication system with role-based access

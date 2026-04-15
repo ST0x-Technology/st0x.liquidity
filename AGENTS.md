@@ -174,7 +174,7 @@ visible conversation, treat the change as unjustified and revert it.
 
 This is a Rust-based market making system for tokenized equities that provides
 onchain liquidity via Raindex orders and hedges directional exposure by
-executing offsetting trades on traditional brokerages (Charles Schwab or Alpaca
+executing offsetting trades on traditional brokerages (currently Alpaca
 Markets). The system captures arbitrage profits from spreads while attempting to
 minimize delta exposure through automated hedging.
 
@@ -201,10 +201,8 @@ verification before a release, or when the user explicitly asks to run the
 binary).
 
 - `cargo run --bin server` - Run the main arbitrage bot
-- `cargo run --bin cli -- auth` - Run the authentication flow for Charles Schwab
-  OAuth setup
-- `cargo run --bin cli -- test -t AAPL -q 100 -d buy` - Test trading
-  functionality with mocked execution
+- `cargo run --bin cli -- buy -s AAPL -q 1` - Submit a manual buy order via the
+  configured broker
 - `cargo run --bin cli` - Run the command-line interface for manual operations
 
 ### Testing
@@ -356,8 +354,7 @@ abstractions.
 - Main crate stays execution-agnostic via trait; execution-specific logic in
   `st0x-execution` crate
 - Newtypes (`Symbol`, `Shares`, `Direction`) and enums prevent invalid states
-- Supported implementations: SchwabExecutor, AlpacaTradingApi, AlpacaBrokerApi,
-  MockExecutor
+- Supported implementations: AlpacaBrokerApi, MockExecutor
 
 For detailed implementation requirements, see @crates/execution/AGENTS.md
 
@@ -392,14 +389,14 @@ is the source of truth for terminology and naming conventions.
   feature, split into directory only when business logic boundaries emerge
 - **Event-Driven Architecture**: Each trade spawns independent async task for
   maximum throughput
-- **SQLite Persistence**: Embedded database for trade tracking and
-  authentication tokens
+- **SQLite Persistence**: Embedded database for trade tracking, CQRS state, and
+  runtime data
 - **Symbol Prefix Convention**: Tokenized equities use "t" prefix to distinguish
   from base assets (e.g., tAAPL, tTSLA, tSPYM)
 - **Price Direction Logic**: Onchain buy = offchain sell (and vice versa) to
   hedge directional exposure
 - **Comprehensive Error Handling**: Custom error types (`OnChainError`,
-  `SchwabError`) with proper propagation
+  `AlpacaBrokerApiError`) with proper propagation
 - **CRITICAL: Onchain Transaction Confirmations**: All onchain operations must
   explicitly wait for the configured number of confirmations before proceeding.
   Load-balanced RPC providers (like dRPC) may route subsequent requests to
@@ -516,7 +513,7 @@ reviewing code that uses configuration instead of reading secrets directly.
 
 - **Mock Blockchain Interactions**: Uses `alloy::providers::mock::Asserter` for
   deterministic testing
-- **HTTP API Mocking**: `httpmock` crate for Charles Schwab API testing
+- **HTTP API Mocking**: `httpmock` crate for broker and tokenization API tests
 - **Database Isolation**: In-memory SQLite databases for test isolation
 - **Edge Case Coverage**: Comprehensive error scenario testing for trade
   conversion logic

@@ -468,7 +468,7 @@ mod tests {
                 symbol: &symbol,
                 shares,
                 direction: Direction::Buy,
-                executor: SupportedExecutor::Schwab,
+                executor: SupportedExecutor::DryRun,
             },
         )
         .await;
@@ -485,7 +485,7 @@ mod tests {
             symbol: symbol.clone(),
             shares,
             direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
+            executor: SupportedExecutor::DryRun,
             executor_order_id: ExecutorOrderId::new("ORD123"),
             placed_at: Utc::now(),
             submitted_at: Utc::now(),
@@ -535,7 +535,7 @@ mod tests {
         );
         assert_eq!(
             filled_executor,
-            SupportedExecutor::Schwab,
+            SupportedExecutor::DryRun,
             "Filled executor mismatch"
         );
         assert_eq!(
@@ -585,7 +585,7 @@ mod tests {
                 symbol: &symbol,
                 shares,
                 direction: Direction::Sell,
-                executor: SupportedExecutor::Schwab,
+                executor: SupportedExecutor::DryRun,
             },
         )
         .await;
@@ -602,7 +602,7 @@ mod tests {
             symbol: symbol.clone(),
             shares,
             direction: Direction::Sell,
-            executor: SupportedExecutor::Schwab,
+            executor: SupportedExecutor::DryRun,
             executor_order_id: ExecutorOrderId::new("ORD456"),
             placed_at: Utc::now(),
             submitted_at: Utc::now(),
@@ -645,7 +645,7 @@ mod tests {
         );
         assert_eq!(
             failed_executor,
-            SupportedExecutor::Schwab,
+            SupportedExecutor::DryRun,
             "Failed executor mismatch"
         );
         assert_eq!(

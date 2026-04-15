@@ -15,26 +15,17 @@ pub(crate) use st0x_float_serde::{
 pub use st0x_float_macro::float;
 
 pub mod alpaca_broker_api;
-pub mod alpaca_trading_api;
 pub mod error;
 pub mod mock;
 pub mod order;
-pub mod schwab;
-
-#[cfg(test)]
-pub mod test_utils;
 
 pub use alpaca_broker_api::{
     AlpacaAccountId, AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiError,
     AlpacaBrokerApiMode, ConversionDirection, JournalResponse, JournalStatus, TimeInForce,
 };
-pub use alpaca_trading_api::{
-    AlpacaTradingApi, AlpacaTradingApiCtx, AlpacaTradingApiError, AlpacaTradingApiMode,
-};
 pub use error::PersistenceError;
 pub use mock::{MockExecutor, MockExecutorCtx};
 pub use order::{MarketOrder, OrderPlacement, OrderState, OrderStatus, OrderUpdate};
-pub use schwab::{Schwab, SchwabCtx, SchwabError, SchwabTokens, extract_code_from_url};
 
 pub use st0x_finance::{
     EmptySymbolError, FractionalShares, HasZero, NotPositive, Positive, Symbol, ToWholeSharesError,
@@ -251,27 +242,13 @@ pub struct InvalidDirectionError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SupportedExecutor {
-    Schwab,
-    AlpacaTradingApi,
     AlpacaBrokerApi,
     DryRun,
-}
-
-impl SupportedExecutor {
-    /// Returns whether this executor supports fractional share orders.
-    pub const fn supports_fractional_shares(self) -> bool {
-        match self {
-            Self::Schwab => false,
-            Self::AlpacaTradingApi | Self::AlpacaBrokerApi | Self::DryRun => true,
-        }
-    }
 }
 
 impl std::fmt::Display for SupportedExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Schwab => write!(f, "schwab"),
-            Self::AlpacaTradingApi => write!(f, "alpaca-trading-api"),
             Self::AlpacaBrokerApi => write!(f, "alpaca-broker-api"),
             Self::DryRun => write!(f, "dry-run"),
         }
@@ -289,8 +266,6 @@ impl std::str::FromStr for SupportedExecutor {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "schwab" => Ok(Self::Schwab),
-            "alpaca-trading-api" => Ok(Self::AlpacaTradingApi),
             "alpaca-broker-api" => Ok(Self::AlpacaBrokerApi),
             "dry-run" => Ok(Self::DryRun),
             _ => Err(InvalidExecutorError {
@@ -370,8 +345,6 @@ pub enum InventoryResult {
 pub enum ExecutionError {
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
-    #[error("Schwab error: {0}")]
-    Schwab(#[from] schwab::SchwabError),
     #[error("{status:?} order requires order_id")]
     MissingOrderId { status: OrderStatus },
     #[error("{status:?} order requires price")]
@@ -599,23 +572,29 @@ mod tests {
     }
 
     #[test]
-    fn schwab_does_not_support_fractional_shares() {
-        assert!(!SupportedExecutor::Schwab.supports_fractional_shares());
+    fn from_str_rejects_removed_schwab_executor_name() {
+        let error = "schwab".parse::<SupportedExecutor>().unwrap_err();
+        assert_eq!(error.executor_provided, "schwab");
     }
 
     #[test]
-    fn alpaca_trading_api_supports_fractional_shares() {
-        assert!(SupportedExecutor::AlpacaTradingApi.supports_fractional_shares());
+    fn from_str_rejects_removed_alpaca_trading_api_executor_name() {
+        let error = "alpaca-trading-api"
+            .parse::<SupportedExecutor>()
+            .unwrap_err();
+        assert_eq!(error.executor_provided, "alpaca-trading-api");
     }
 
     #[test]
-    fn alpaca_broker_api_supports_fractional_shares() {
-        assert!(SupportedExecutor::AlpacaBrokerApi.supports_fractional_shares());
-    }
-
-    #[test]
-    fn dry_run_supports_fractional_shares() {
-        assert!(SupportedExecutor::DryRun.supports_fractional_shares());
+    fn from_str_accepts_supported_runtime_executor_names() {
+        assert_eq!(
+            "alpaca-broker-api".parse::<SupportedExecutor>().unwrap(),
+            SupportedExecutor::AlpacaBrokerApi
+        );
+        assert_eq!(
+            "dry-run".parse::<SupportedExecutor>().unwrap(),
+            SupportedExecutor::DryRun
+        );
     }
 
     #[test]

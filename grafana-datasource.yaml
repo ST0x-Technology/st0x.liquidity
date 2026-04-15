@@ -1,17 +1,10 @@
 apiVersion: 1
 
 datasources:
-  - name: Schwab SQLite
-    type: frser-sqlite-datasource
-    access: proxy
-    isDefault: true
-    editable: true
-    jsonData:
-      path: /databases/schwab.db
   - name: Alpaca SQLite
     type: frser-sqlite-datasource
     access: proxy
-    isDefault: false
+    isDefault: true
     editable: true
     jsonData:
       path: /databases/alpaca.db
