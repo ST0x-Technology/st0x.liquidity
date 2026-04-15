@@ -828,7 +828,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                     order_id = %order.id,
                     ?direction,
                     %error,
-                    "Conversion response missing fill details"
+                    "Failed to derive settled conversion amounts"
                 );
                 self.cqrs
                     .send(
@@ -1226,6 +1226,30 @@ mod tests {
                     "status": "filled",
                     "filled_avg_price": null,
                     "filled_qty": filled_qty,
+                    "created_at": "2024-01-15T10:30:00Z"
+                }));
+        })
+    }
+
+    fn create_get_order_mock_missing_quantity<'a>(
+        server: &'a MockServer,
+        order_id: &str,
+        requested_qty: &str,
+        filled_avg_price: &str,
+    ) -> httpmock::Mock<'a> {
+        server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
+            ));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": order_id,
+                    "symbol": "USDCUSD",
+                    "qty": requested_qty,
+                    "status": "filled",
+                    "filled_avg_price": filled_avg_price,
+                    "filled_qty": null,
                     "created_at": "2024-01-15T10:30:00Z"
                 }));
         })
@@ -2594,6 +2618,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn usd_to_usdc_conversion_missing_quantity_fails_aggregate() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, private_key) = setup_anvil();
+
+        let _account_mock = create_broker_account_mock(&server);
+        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet).await;
+        let cqrs = create_test_store_instance().await;
+
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
+
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            Arc::clone(&cqrs),
+            market_maker_wallet,
+            TEST_VAULT_ID,
+        );
+
+        let _order_mock = create_conversion_order_pending_mock(&server, "1000");
+        let _get_mock = create_get_order_mock_missing_quantity(
+            &server,
+            "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "1000",
+            "1.0001",
+        );
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1000");
+
+        assert!(
+            matches!(
+                manager.execute_usd_to_usdc_conversion(&id, amount).await,
+                Err(UsdcTransferError::MissingFilledQuantity { .. })
+            ),
+            "Missing fill quantity should fail the conversion"
+        );
+
+        let retry_result = cqrs
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailConversion {
+                    reason: "should already be failed".to_string(),
+                },
+            )
+            .await;
+
+        assert!(
+            matches!(
+                retry_result,
+                Err(AggregateError::UserError(LifecycleError::Apply(
+                    UsdcRebalanceError::ConversionAlreadyCompleted
+                )))
+            ),
+            "Aggregate should already be in ConversionFailed, got: {retry_result:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn usdc_to_usd_conversion_missing_average_price_fails_aggregate() {
         let server = MockServer::start();
         let (_anvil, endpoint, private_key) = setup_anvil();
@@ -2639,6 +2726,74 @@ mod tests {
                 Err(UsdcTransferError::MissingFilledAveragePrice { .. })
             ),
             "Missing fill price should fail the post-deposit conversion"
+        );
+
+        let retry_result = cqrs
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailConversion {
+                    reason: "should already be failed".to_string(),
+                },
+            )
+            .await;
+
+        assert!(
+            matches!(
+                retry_result,
+                Err(AggregateError::UserError(LifecycleError::Apply(
+                    UsdcRebalanceError::ConversionAlreadyCompleted
+                )))
+            ),
+            "Aggregate should already be in ConversionFailed, got: {retry_result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn usdc_to_usd_conversion_missing_quantity_fails_aggregate() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, private_key) = setup_anvil();
+
+        let _account_mock = create_broker_account_mock(&server);
+        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet).await;
+        let cqrs = create_test_store_instance().await;
+
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let rebalance_amount = usdc("1000");
+        let deposited_amount = usdc("1000");
+
+        advance_to_deposit_confirmed_base_to_alpaca(&cqrs, &id, rebalance_amount, deposited_amount)
+            .await;
+
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            Arc::clone(&cqrs),
+            market_maker_wallet,
+            TEST_VAULT_ID,
+        );
+
+        let _order_mock = create_conversion_order_pending_mock(&server, "1000");
+        let _get_mock = create_get_order_mock_missing_quantity(
+            &server,
+            "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "1000",
+            "0.9983",
+        );
+
+        assert!(
+            matches!(
+                manager
+                    .execute_usdc_to_usd_conversion(&id, deposited_amount)
+                    .await,
+                Err(UsdcTransferError::MissingFilledQuantity { .. })
+            ),
+            "Missing fill quantity should fail the post-deposit conversion"
         );
 
         let retry_result = cqrs

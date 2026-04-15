@@ -4371,8 +4371,8 @@ mod tests {
                 &id,
                 UsdcRebalanceCommand::ConfirmConversion {
                     conversion: ConversionAmounts::new(
-                        Usdc::new(float!(500)),
-                        Usdc::new(float!(499)),
+                        Usdc::new(float!(99.99)),
+                        Usdc::new(float!(99.79)),
                     ), // ~0.2% slippage
                 },
             )
