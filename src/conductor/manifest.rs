@@ -96,6 +96,8 @@ impl QueryManifest {
             .build(())
             .await?;
 
+        // The trigger owns the snapshot projection internally, so it's
+        // the sole subscriber here.
         let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
             .with(rebalancing_trigger)
             .build(())
@@ -115,21 +117,22 @@ impl QueryManifest {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::Address;
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashSet};
     use tokio::sync::{broadcast, mpsc};
 
     use st0x_event_sorcery::test_store;
-    use st0x_execution::Symbol;
+    use st0x_execution::{FractionalShares, Symbol};
+    use st0x_float_macro::float;
 
     use super::*;
     use crate::config::{AssetsConfig, EquitiesConfig};
-    use crate::inventory::{BroadcastingInventory, ImbalanceThreshold, InventoryView};
+    use crate::inventory::snapshot::{InventorySnapshotCommand, InventorySnapshotId};
+    use crate::inventory::{BroadcastingInventory, ImbalanceThreshold, InventoryView, Venue};
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::RebalancingTriggerConfig;
     use crate::test_utils::setup_test_db;
     use crate::tokenization::mock::MockTokenizer;
     use crate::wrapper::mock::MockWrapper;
-    use st0x_float_macro::float;
 
     fn test_trigger_config() -> RebalancingTriggerConfig {
         RebalancingTriggerConfig {
@@ -158,15 +161,17 @@ mod tests {
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
 
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default(),
+            event_sender.clone(),
+        ));
+
         let rebalancing_trigger = Arc::new(RebalancingTrigger::new(
             test_trigger_config(),
             vault_registry,
             Address::ZERO,
             Address::ZERO,
-            Arc::new(BroadcastingInventory::new(
-                InventoryView::default(),
-                event_sender.clone(),
-            )),
+            inventory.clone(),
             operation_sender,
             Arc::new(MockWrapper::new()),
         ));
@@ -190,5 +195,73 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_none());
+    }
+
+    /// Live snapshot commands dispatched through the built store must
+    /// reach `BroadcastingInventory` via the trigger's internal
+    /// projection. Historical replay on restart is out of scope —
+    /// `InventorySnapshot` is non-projected, so `StoreBuilder::build`
+    /// does not `catch_up` reactor subscribers.
+    #[tokio::test]
+    async fn build_frameworks_dispatches_live_snapshot_events_to_view() {
+        let pool = setup_test_db().await;
+        let (operation_sender, _operation_receiver) = mpsc::channel(10);
+        let (event_sender, _event_receiver) = broadcast::channel(10);
+
+        let vault_registry = Arc::new(test_store(pool.clone(), ()));
+
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default(),
+            event_sender.clone(),
+        ));
+
+        let rebalancing_trigger = Arc::new(RebalancingTrigger::new(
+            test_trigger_config(),
+            vault_registry,
+            Address::ZERO,
+            Address::ZERO,
+            inventory.clone(),
+            operation_sender,
+            Arc::new(MockWrapper::new()),
+        ));
+        let event_broadcaster = Arc::new(EventBroadcaster::new(event_sender, pool.clone()));
+        let manifest = QueryManifest::new(rebalancing_trigger, event_broadcaster);
+        let services = EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::new()),
+        };
+        let built = manifest.build(pool, services).await.unwrap();
+
+        // Dispatch a live snapshot command through the built store and
+        // verify it lands in the shared BroadcastingInventory via the
+        // trigger's internal projection.
+        let id = InventorySnapshotId {
+            orderbook: Address::repeat_byte(0xAB),
+            owner: Address::repeat_byte(0xCD),
+        };
+        let mut balances = BTreeMap::new();
+        balances.insert(
+            Symbol::new("RKLB").unwrap(),
+            FractionalShares::new(float!(7)),
+        );
+        built
+            .snapshot
+            .send(&id, InventorySnapshotCommand::OnchainEquity { balances })
+            .await
+            .unwrap();
+
+        let symbol = Symbol::new("RKLB").unwrap();
+        let available = inventory
+            .read()
+            .await
+            .equity_available(&symbol, Venue::MarketMaking);
+        assert_eq!(
+            available,
+            Some(FractionalShares::new(float!(7))),
+            "manifest build must wire the InventorySnapshot store so that \
+             live commands dispatch through the trigger's projection into \
+             BroadcastingInventory",
+        );
     }
 }

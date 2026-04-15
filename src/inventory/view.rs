@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::{Add, Sub};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use chrono::{DateTime, Utc};
 use itertools::Itertools;
@@ -15,6 +15,7 @@ use st0x_execution::{Direction, FractionalShares, HasZero, Symbol};
 use st0x_finance::Usdc;
 use st0x_float_macro::float;
 
+use super::snapshot::InventorySnapshotEvent;
 use super::venue_balance::{InventoryError, VenueBalance};
 use crate::wrapper::{RatioError, UnderlyingPerWrapped};
 
@@ -924,6 +925,163 @@ impl InventoryView {
         }
 
         Ok(view)
+    }
+
+    /// Fold an [`InventorySnapshotEvent`] into this view under normal
+    /// operation. Uses [`Inventory::on_snapshot`], which silently
+    /// ignores stale snapshots (fetched before the last rebalancing)
+    /// and snapshots that arrive while inflight balances are tracked --
+    /// both return the unmodified view wrapped in `Ok`, not an error.
+    /// A genuine [`InventoryViewError`] (arithmetic failure, cents
+    /// conversion, etc.) is the only signal that callers should fall
+    /// back to [`Self::force_apply_snapshot_event`] for recovery.
+    ///
+    /// Events that do not correspond to a tracked inventory slot
+    /// (raw wallet reads used elsewhere for accounting) are no-ops.
+    pub(crate) fn apply_snapshot_event(
+        self,
+        event: &InventorySnapshotEvent,
+        now: DateTime<Utc>,
+    ) -> Result<Self, InventoryViewError> {
+        use InventorySnapshotEvent::*;
+
+        let fetched_at = event.timestamp();
+        match event {
+            OnchainEquity { balances, .. } => {
+                balances
+                    .iter()
+                    .try_fold(self, |view, (symbol, snapshot_balance)| {
+                        view.update_equity(
+                            symbol,
+                            Inventory::on_snapshot(
+                                Venue::MarketMaking,
+                                *snapshot_balance,
+                                fetched_at,
+                            ),
+                            now,
+                        )
+                    })
+            }
+
+            OnchainUsdc { usdc_balance, .. } => self.update_usdc(
+                Inventory::on_snapshot(Venue::MarketMaking, *usdc_balance, fetched_at),
+                now,
+            ),
+
+            OffchainEquity { positions, .. } => {
+                positions
+                    .iter()
+                    .try_fold(self, |view, (symbol, snapshot_balance)| {
+                        view.update_equity(
+                            symbol,
+                            Inventory::on_snapshot(Venue::Hedging, *snapshot_balance, fetched_at),
+                            now,
+                        )
+                    })
+            }
+
+            OffchainUsd {
+                usd_balance_cents, ..
+            } => {
+                let usdc = Usdc::from_cents(*usd_balance_cents)
+                    .ok_or(InventoryViewError::UsdBalanceConversion(*usd_balance_cents))?;
+                self.update_usdc(
+                    Inventory::on_snapshot(Venue::Hedging, usdc, fetched_at),
+                    now,
+                )
+            }
+
+            EthereumUsdc { .. }
+            | BaseWalletUsdc { .. }
+            | AlpacaWalletUsdc { .. }
+            | BaseWalletUnwrappedEquity { .. }
+            | BaseWalletWrappedEquity { .. } => Ok(self),
+
+            InflightEquity {
+                mints, redemptions, ..
+            } => self.apply_inflight_snapshot(mints, redemptions, fetched_at, now),
+        }
+    }
+
+    /// Recovery path for [`Self::apply_snapshot_event`] failures.
+    /// Bypasses the inflight staleness guard via
+    /// [`Inventory::force_on_snapshot`] so the view can catch up after
+    /// a desync. `reason` is attached to the new balances so the
+    /// force-write is auditable.
+    ///
+    /// `OffchainUsd` and `InflightEquity` intentionally reuse the
+    /// non-forced conversion: silently inventing a Usdc from an invalid
+    /// cents payload would corrupt financial state, so the original
+    /// error resurfaces instead of being masked.
+    pub(crate) fn force_apply_snapshot_event(
+        self,
+        event: &InventorySnapshotEvent,
+        now: DateTime<Utc>,
+        reason: Arc<InventoryViewError>,
+    ) -> Result<Self, InventoryViewError> {
+        use InventorySnapshotEvent::*;
+
+        match event {
+            OnchainEquity { balances, .. } => {
+                balances
+                    .iter()
+                    .try_fold(self, |view, (symbol, snapshot_balance)| {
+                        view.update_equity(
+                            symbol,
+                            Inventory::force_on_snapshot(
+                                Venue::MarketMaking,
+                                *snapshot_balance,
+                                reason.clone(),
+                            ),
+                            now,
+                        )
+                    })
+            }
+
+            OnchainUsdc { usdc_balance, .. } => self.update_usdc(
+                Inventory::force_on_snapshot(Venue::MarketMaking, *usdc_balance, reason),
+                now,
+            ),
+
+            OffchainEquity { positions, .. } => {
+                positions
+                    .iter()
+                    .try_fold(self, |view, (symbol, snapshot_balance)| {
+                        view.update_equity(
+                            symbol,
+                            Inventory::force_on_snapshot(
+                                Venue::Hedging,
+                                *snapshot_balance,
+                                reason.clone(),
+                            ),
+                            now,
+                        )
+                    })
+            }
+
+            OffchainUsd {
+                usd_balance_cents, ..
+            } => {
+                let usdc = Usdc::from_cents(*usd_balance_cents)
+                    .ok_or(InventoryViewError::UsdBalanceConversion(*usd_balance_cents))?;
+                self.update_usdc(
+                    Inventory::force_on_snapshot(Venue::Hedging, usdc, reason),
+                    now,
+                )
+            }
+
+            EthereumUsdc { .. }
+            | BaseWalletUsdc { .. }
+            | AlpacaWalletUsdc { .. }
+            | BaseWalletUnwrappedEquity { .. }
+            | BaseWalletWrappedEquity { .. } => Ok(self),
+
+            InflightEquity {
+                mints,
+                redemptions,
+                fetched_at,
+            } => self.apply_inflight_snapshot(mints, redemptions, *fetched_at, now),
+        }
     }
 }
 

@@ -30,7 +30,8 @@ use crate::config::{AssetsConfig, Ctx, CtxError};
 use crate::dashboard::EventBroadcaster;
 use crate::equity_redemption::symbols_with_stuck_redemptions;
 use crate::inventory::{
-    BroadcastingInventory, Inventory, InventoryPollingService, InventorySnapshot, Venue,
+    BroadcastingInventory, Inventory, InventoryPollingService, InventoryProjection,
+    InventorySnapshot, Venue,
 };
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::{
@@ -230,7 +231,11 @@ impl Conductor {
                 )
             } else {
                 let (position, position_projection) = build_position_cqrs(&pool).await?;
+                // Without the trigger, the projection is the only
+                // subscriber keeping the dashboard view in sync.
+                let inventory_projection = Arc::new(InventoryProjection::new(inventory.clone()));
                 let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
+                    .with(inventory_projection)
                     .build(())
                     .await?;
                 (position, position_projection, snapshot, None, None, None)
