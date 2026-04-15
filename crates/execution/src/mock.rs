@@ -299,7 +299,7 @@ mod tests {
                 quantity: shares("100"),
                 market_value: Some(Float::parse("15000".to_string()).unwrap()),
             }],
-            cash_balance_cents: 5_000_000,
+            usd_balance_cents: 5_000_000,
         };
 
         let executor = MockExecutor::new().with_inventory(inventory.clone());
@@ -311,7 +311,7 @@ mod tests {
                 assert_eq!(fetched.positions.len(), 1);
                 assert_eq!(fetched.positions[0].symbol, Symbol::new("AAPL").unwrap());
                 assert_eq!(fetched.positions[0].quantity, shares("100"));
-                assert_eq!(fetched.cash_balance_cents, 5_000_000);
+                assert_eq!(fetched.usd_balance_cents, 5_000_000);
             }
             InventoryResult::Unimplemented => {
                 panic!("Expected Fetched, got Unimplemented")
@@ -333,7 +333,7 @@ mod tests {
     async fn with_inventory_preserves_other_settings() {
         let inventory = crate::Inventory {
             positions: vec![],
-            cash_balance_cents: 10_000,
+            usd_balance_cents: 10_000,
         };
 
         let executor = MockExecutor::new().with_inventory(inventory);

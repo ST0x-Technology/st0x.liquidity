@@ -507,7 +507,7 @@ impl RebalancingTrigger {
                     },
                 ),
 
-                OnchainCash { usdc_balance, .. } => inventory.clone().update_usdc(
+                OnchainUsdc { usdc_balance, .. } => inventory.clone().update_usdc(
                     Inventory::on_snapshot(Venue::MarketMaking, *usdc_balance, fetched_at),
                     now,
                 ),
@@ -523,21 +523,20 @@ impl RebalancingTrigger {
                     },
                 ),
 
-                OffchainCash {
-                    cash_balance_cents, ..
+                OffchainUsd {
+                    usd_balance_cents, ..
                 } => {
-                    let usdc = Usdc::from_cents(*cash_balance_cents).ok_or(
-                        InventoryViewError::CashBalanceConversion(*cash_balance_cents),
-                    )?;
+                    let usdc = Usdc::from_cents(*usd_balance_cents)
+                        .ok_or(InventoryViewError::UsdBalanceConversion(*usd_balance_cents))?;
                     inventory.clone().update_usdc(
                         Inventory::on_snapshot(Venue::Hedging, usdc, fetched_at),
                         now,
                     )
                 }
 
-                EthereumCash { .. }
-                | BaseWalletCash { .. }
-                | AlpacaWalletCash { .. }
+                EthereumUsdc { .. }
+                | BaseWalletUsdc { .. }
+                | AlpacaWalletUsdc { .. }
                 | BaseWalletUnwrappedEquity { .. }
                 | BaseWalletWrappedEquity { .. } => Ok(inventory.clone()),
 
@@ -607,7 +606,7 @@ impl RebalancingTrigger {
                     })
             }
 
-            OnchainCash { usdc_balance, .. } => inventory.clone().update_usdc(
+            OnchainUsdc { usdc_balance, .. } => inventory.clone().update_usdc(
                 Inventory::force_on_snapshot(
                     Venue::MarketMaking,
                     *usdc_balance,
@@ -632,21 +631,20 @@ impl RebalancingTrigger {
                     })
             }
 
-            OffchainCash {
-                cash_balance_cents, ..
+            OffchainUsd {
+                usd_balance_cents, ..
             } => {
-                let usdc = Usdc::from_cents(*cash_balance_cents).ok_or(
-                    InventoryViewError::CashBalanceConversion(*cash_balance_cents),
-                )?;
+                let usdc = Usdc::from_cents(*usd_balance_cents)
+                    .ok_or(InventoryViewError::UsdBalanceConversion(*usd_balance_cents))?;
                 inventory.clone().update_usdc(
                     Inventory::force_on_snapshot(Venue::Hedging, usdc, recovery_reason),
                     now,
                 )
             }
 
-            EthereumCash { .. }
-            | BaseWalletCash { .. }
-            | AlpacaWalletCash { .. }
+            EthereumUsdc { .. }
+            | BaseWalletUsdc { .. }
+            | AlpacaWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
             | BaseWalletWrappedEquity { .. } => Ok(inventory.clone()),
 
@@ -687,12 +685,12 @@ impl RebalancingTrigger {
                     self.check_and_trigger_equity(symbol).await?;
                 }
             }
-            OnchainCash { .. } | OffchainCash { .. } => {
+            OnchainUsdc { .. } | OffchainUsd { .. } => {
                 self.check_and_trigger_usdc().await;
             }
-            EthereumCash { .. }
-            | BaseWalletCash { .. }
-            | AlpacaWalletCash { .. }
+            EthereumUsdc { .. }
+            | BaseWalletUsdc { .. }
+            | AlpacaWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
             | BaseWalletWrappedEquity { .. }
             // Inflight snapshots don't trigger rebalancing -- they indicate
@@ -3081,7 +3079,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_onchain_cash_via_reactor_updates_usdc_balance() {
+    async fn snapshot_onchain_usdc_via_reactor_updates_usdc_balance() {
         // Start with 500 onchain, 500 offchain = balanced
         let inventory = InventoryView::default().with_usdc(usdc(500), usdc(500));
 
@@ -3105,7 +3103,7 @@ mod tests {
         harness
             .receive::<InventorySnapshot>(
                 id.clone(),
-                InventorySnapshotEvent::OnchainCash {
+                InventorySnapshotEvent::OnchainUsdc {
                     usdc_balance: usdc(900),
                     fetched_at: Utc::now(),
                 },
@@ -3128,7 +3126,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_offchain_cash_via_reactor_updates_usdc_balance() {
+    async fn snapshot_offchain_usd_via_reactor_updates_usdc_balance() {
         // Start with 900 onchain, 100 offchain = 90% ratio -> TooMuchOnchain
         let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
 
@@ -3154,8 +3152,8 @@ mod tests {
         harness
             .receive::<InventorySnapshot>(
                 id.clone(),
-                InventorySnapshotEvent::OffchainCash {
-                    cash_balance_cents: 90000,
+                InventorySnapshotEvent::OffchainUsd {
+                    usd_balance_cents: 90000,
                     fetched_at: Utc::now(),
                 },
             )

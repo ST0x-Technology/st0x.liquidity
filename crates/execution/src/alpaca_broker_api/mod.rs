@@ -156,8 +156,8 @@ pub enum AlpacaBrokerApiError {
         max_decimals: u8,
     },
 
-    #[error("Cash balance {} cannot be converted to cents", format_float_with_fallback(.0))]
-    CashBalanceConversion(Float),
+    #[error("USD balance {} cannot be converted to cents", format_float_with_fallback(.0))]
+    UsdBalanceConversion(Float),
 
     #[error("Cash balance {} has fractional cents after conversion", format_float_with_fallback(.0))]
     FractionalCents(Float),
