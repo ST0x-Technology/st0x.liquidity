@@ -738,13 +738,13 @@ impl RebalancingService {
             }
             ConversionConfirmed {
                 direction: RebalanceDirection::BaseToAlpaca,
-                filled_amount,
+                conversion,
                 ..
             } => {
                 self.complete_usdc_rebalance(
                     id,
                     UsdcTrackingEvent::ConversionConfirmed,
-                    *filled_amount,
+                    conversion.received_amount,
                 )
                 .await?;
             }
@@ -1237,7 +1237,7 @@ mod tests {
 
     use super::*;
     use crate::inventory::InventoryView;
-    use crate::usdc_rebalance::TransferRef;
+    use crate::usdc_rebalance::{ConversionAmounts, TransferRef};
 
     #[test]
     fn test_guard_releases_on_drop() {
@@ -1961,7 +1961,7 @@ mod tests {
     ) -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::ConversionConfirmed {
             direction,
-            filled_amount,
+            conversion: ConversionAmounts::new(filled_amount, filled_amount),
             converted_at: ts(102),
         }
     }

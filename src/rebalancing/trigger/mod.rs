@@ -4851,7 +4851,7 @@ mod tests {
         TokenizationRequestId, TokenizedEquityMintCommand, issuer_request_id,
     };
     use crate::usdc_rebalance::{
-        TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
+        ConversionAmounts, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
     };
     use crate::vault_lookup::MockVaultLookup;
     use crate::vault_registry::VaultRegistryCommand;
@@ -9431,7 +9431,11 @@ mod tests {
         harness
             .receive::<UsdcRebalance>(
                 id,
-                make_usdc_conversion_confirmed(RebalanceDirection::BaseToAlpaca, usdc(499)),
+                make_usdc_conversion_confirmed(
+                    RebalanceDirection::BaseToAlpaca,
+                    usdc(500),
+                    usdc(499),
+                ),
             )
             .await
             .unwrap();
@@ -9450,7 +9454,7 @@ mod tests {
         assert_eq!(
             inventory.usdc_available(Venue::Hedging),
             Some(usdc(599)),
-            "terminal conversion should credit offchain cash-equivalent with the filled amount"
+            "terminal conversion should credit offchain cash-equivalent with actual proceeds"
         );
         assert_eq!(
             inventory.usdc_inflight(Venue::Hedging),
@@ -9547,7 +9551,7 @@ mod tests {
         harness
             .receive::<UsdcRebalance>(
                 id.clone(),
-                make_usdc_conversion_confirmed(RebalanceDirection::AlpacaToBase, usdc(399)),
+                make_usdc_conversion_confirmed(RebalanceDirection::AlpacaToBase, usdc(399), usdc(399)),
             )
             .await
             .unwrap();
@@ -9822,7 +9826,7 @@ mod tests {
         harness
             .receive::<UsdcRebalance>(
                 id.clone(),
-                make_usdc_conversion_confirmed(RebalanceDirection::BaseToAlpaca, usdc(399)),
+                make_usdc_conversion_confirmed(RebalanceDirection::BaseToAlpaca, usdc(399), usdc(399)),
             )
             .await
             .unwrap();
@@ -9850,7 +9854,7 @@ mod tests {
                 name: "conversion_failed_before_withdrawal",
                 events: vec![
                     make_usdc_conversion_initiated(RebalanceDirection::AlpacaToBase, usdc(400)),
-                    make_usdc_conversion_confirmed(RebalanceDirection::AlpacaToBase, usdc(399)),
+                    make_usdc_conversion_confirmed(RebalanceDirection::AlpacaToBase, usdc(399), usdc(399)),
                     make_usdc_conversion_failed(),
                 ],
             },
@@ -9858,7 +9862,7 @@ mod tests {
                 name: "withdrawal_failed_after_initiated",
                 events: vec![
                     make_usdc_conversion_initiated(RebalanceDirection::AlpacaToBase, usdc(400)),
-                    make_usdc_conversion_confirmed(RebalanceDirection::AlpacaToBase, usdc(399)),
+                    make_usdc_conversion_confirmed(RebalanceDirection::AlpacaToBase, usdc(399), usdc(399)),
                     make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(399)),
                     make_usdc_withdrawal_failed(),
                 ],
@@ -9867,7 +9871,7 @@ mod tests {
                 name: "bridging_failed_before_burn",
                 events: vec![
                     make_usdc_conversion_initiated(RebalanceDirection::AlpacaToBase, usdc(400)),
-                    make_usdc_conversion_confirmed(RebalanceDirection::AlpacaToBase, usdc(399)),
+                    make_usdc_conversion_confirmed(RebalanceDirection::AlpacaToBase, usdc(399), usdc(399)),
                     make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(399)),
                     make_usdc_withdrawal_confirmed(),
                     make_usdc_pre_burn_bridging_failed(),
@@ -9982,7 +9986,7 @@ mod tests {
         harness
             .receive::<UsdcRebalance>(
                 id.clone(),
-                make_usdc_conversion_confirmed(RebalanceDirection::AlpacaToBase, usdc(399)),
+                make_usdc_conversion_confirmed(RebalanceDirection::AlpacaToBase, usdc(399), usdc(399)),
             )
             .await
             .unwrap();
@@ -11820,11 +11824,12 @@ mod tests {
 
     fn make_usdc_conversion_confirmed(
         direction: RebalanceDirection,
-        filled_amount: Usdc,
+        source_amount: Usdc,
+        received_amount: Usdc,
     ) -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::ConversionConfirmed {
             direction,
-            filled_amount,
+            conversion: ConversionAmounts::new(source_amount, received_amount),
             converted_at: Utc::now(),
         }
     }
@@ -11908,7 +11913,11 @@ mod tests {
         harness
             .receive::<UsdcRebalance>(
                 id,
-                make_usdc_conversion_confirmed(RebalanceDirection::BaseToAlpaca, usdc(999)),
+                make_usdc_conversion_confirmed(
+                    RebalanceDirection::BaseToAlpaca,
+                    usdc(1000),
+                    usdc(999),
+                ),
             )
             .await
             .unwrap();
@@ -11956,7 +11965,7 @@ mod tests {
         harness
             .receive::<UsdcRebalance>(
                 id,
-                make_usdc_conversion_confirmed(RebalanceDirection::BaseToAlpaca, usdc(999)),
+                make_usdc_conversion_confirmed(RebalanceDirection::BaseToAlpaca, usdc(999), usdc(999)),
             )
             .await
             .unwrap();
@@ -17177,7 +17186,7 @@ mod tests {
                 id.clone(),
                 UsdcRebalanceEvent::ConversionConfirmed {
                     direction: RebalanceDirection::AlpacaToBase,
-                    filled_amount: usdc(399),
+                    conversion: ConversionAmounts::new(usdc(399), usdc(399)),
                     converted_at,
                 },
             )
@@ -17263,7 +17272,11 @@ mod tests {
         harness
             .receive::<UsdcRebalance>(
                 id.clone(),
-                make_usdc_conversion_confirmed(RebalanceDirection::BaseToAlpaca, usdc(999)),
+                make_usdc_conversion_confirmed(
+                    RebalanceDirection::BaseToAlpaca,
+                    usdc(1000),
+                    usdc(999),
+                ),
             )
             .await
             .unwrap();
@@ -17312,7 +17325,11 @@ mod tests {
         let error = harness
             .receive::<UsdcRebalance>(
                 id.clone(),
-                make_usdc_conversion_confirmed(RebalanceDirection::BaseToAlpaca, usdc(1001)),
+                make_usdc_conversion_confirmed(
+                    RebalanceDirection::BaseToAlpaca,
+                    usdc(1000),
+                    usdc(1001),
+                ),
             )
             .await
             .unwrap_err();
@@ -17397,7 +17414,11 @@ mod tests {
     fn conversion_confirmed_is_terminal_for_base_to_alpaca() {
         // For BaseToAlpaca, ConversionConfirmed IS the terminal event.
         assert!(RebalancingService::is_terminal_usdc_rebalance_event(
-            &make_usdc_conversion_confirmed(RebalanceDirection::BaseToAlpaca, usdc(998))
+            &make_usdc_conversion_confirmed(
+                RebalanceDirection::BaseToAlpaca,
+                usdc(1000),
+                usdc(998),
+            )
         ));
     }
 
@@ -17406,7 +17427,11 @@ mod tests {
         // For AlpacaToBase, ConversionConfirmed is NOT terminal (flow continues
         // to withdrawal).
         assert!(!RebalancingService::is_terminal_usdc_rebalance_event(
-            &make_usdc_conversion_confirmed(RebalanceDirection::AlpacaToBase, usdc(998))
+            &make_usdc_conversion_confirmed(
+                RebalanceDirection::AlpacaToBase,
+                usdc(1000),
+                usdc(998),
+            )
         ));
     }
 
@@ -18021,7 +18046,10 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::ConfirmConversion {
-                    filled_amount: Usdc::new(float!(499)), // ~0.2% slippage
+                    conversion: ConversionAmounts::new(
+                        Usdc::new(float!(500)),
+                        Usdc::new(float!(499)),
+                    ), // ~0.2% slippage
                 },
             )
             .await
@@ -21047,7 +21075,7 @@ mod tests {
         let error = harness
             .receive::<UsdcRebalance>(
                 id.clone(),
-                make_usdc_conversion_confirmed(RebalanceDirection::BaseToAlpaca, usdc(200)),
+                make_usdc_conversion_confirmed(RebalanceDirection::BaseToAlpaca, usdc(200), usdc(200)),
             )
             .await
             .unwrap_err();
@@ -21180,7 +21208,7 @@ mod tests {
         harness
             .receive::<UsdcRebalance>(
                 id.clone(),
-                make_usdc_conversion_confirmed(RebalanceDirection::AlpacaToBase, usdc(400)),
+                make_usdc_conversion_confirmed(RebalanceDirection::AlpacaToBase, usdc(400), usdc(400)),
             )
             .await
             .unwrap();
