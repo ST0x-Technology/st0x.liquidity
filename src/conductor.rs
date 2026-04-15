@@ -16,14 +16,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use task_supervisor::SupervisorHandle;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use st0x_dto::ServerMessage;
 use st0x_event_sorcery::{Projection, Store, StoreBuilder};
 use st0x_evm::Wallet;
-use st0x_execution::{Executor, FractionalShares, Symbol};
+use st0x_execution::{
+    CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason, ExecutionError,
+    Executor, FractionalShares, MarketOrder, Symbol,
+};
 
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::bindings::IOrderBookV6::{self, IOrderBookV6Instance};
@@ -82,6 +85,7 @@ pub(crate) struct TradeProcessingCqrs {
     pub(crate) offchain_order: Arc<Store<OffchainOrder>>,
     pub(crate) execution_threshold: ExecutionThreshold,
     pub(crate) assets: AssetsConfig,
+    pub(crate) counter_trade_submission_lock: Arc<Mutex<()>>,
 }
 
 /// Orchestrates the bot's runtime by composing long-running supervised tasks
@@ -93,8 +97,8 @@ pub(crate) struct Conductor {
     supervisor: SupervisorHandle,
     /// Runs the apalis job queue workers that process trade accounting jobs.
     monitor: JoinHandle<()>,
-    /// Periodic executor upkeep. Absent when the executor requires no
-    /// background maintenance.
+    /// Periodic executor upkeep (e.g. Schwab token refresh). Absent when
+    /// the executor requires no background maintenance.
     executor_maintenance: Option<JoinHandle<()>>,
     /// Periodic rebalancing loop. Absent when rebalancing is not configured.
     rebalancer: Option<JoinHandle<()>>,
@@ -128,6 +132,15 @@ pub(crate) struct VaultDiscoveryCtx<'a> {
     pub(crate) vault_registry: &'a Store<VaultRegistry>,
     pub(crate) orderbook: Address,
     pub(crate) order_owner: Address,
+}
+
+pub(crate) struct AccumulatedPositionExecutionCtx<'a> {
+    pub(crate) position: &'a Store<Position>,
+    pub(crate) position_projection: &'a Projection<Position>,
+    pub(crate) offchain_order: &'a Arc<Store<OffchainOrder>>,
+    pub(crate) counter_trade_submission_lock: &'a Mutex<()>,
+    pub(crate) threshold: &'a ExecutionThreshold,
+    pub(crate) assets: &'a AssetsConfig,
 }
 
 impl Conductor {
@@ -707,6 +720,7 @@ fn spawn_periodic_accumulated_position_check<E>(
     position: Arc<Store<Position>>,
     position_projection: Arc<Projection<Position>>,
     offchain_order: Arc<Store<OffchainOrder>>,
+    counter_trade_submission_lock: Arc<Mutex<()>>,
     execution_threshold: ExecutionThreshold,
     check_interval: Duration,
     ctx: Ctx,
@@ -726,11 +740,14 @@ where
             debug!("Running periodic accumulated position check");
             if let Err(error) = check_and_execute_accumulated_positions(
                 &executor,
-                &position,
-                &position_projection,
-                &offchain_order,
-                &execution_threshold,
-                &ctx.assets,
+                AccumulatedPositionExecutionCtx {
+                    position: &position,
+                    position_projection: &position_projection,
+                    offchain_order: &offchain_order,
+                    counter_trade_submission_lock: &counter_trade_submission_lock,
+                    threshold: &execution_threshold,
+                    assets: &ctx.assets,
+                },
                 |symbol| ctx.is_trading_enabled(symbol),
             )
             .await
@@ -981,7 +998,10 @@ pub(crate) async fn process_queued_trade<E: Executor>(
     trade: OnchainTrade,
     cqrs: &TradeProcessingCqrs,
     asset_enabled: bool,
-) -> Result<Option<OffchainOrderId>, TradeAccountingError> {
+) -> Result<Option<OffchainOrderId>, TradeAccountingError>
+where
+    TradeAccountingError: From<E::Error>,
+{
     let trade_id = OnChainTradeId {
         tx_hash: trade.tx_hash,
         log_index: trade.log_index,
@@ -1023,7 +1043,195 @@ pub(crate) async fn process_queued_trade<E: Executor>(
         return Ok(None);
     };
 
+    let _counter_trade_submission_guard = cqrs.counter_trade_submission_lock.lock().await;
+
+    if matches!(
+        preflight_counter_trade_submission(executor, &execution, None).await?,
+        CounterTradeSubmissionCheck::Skipped
+    ) {
+        return Ok(None);
+    }
+
     place_offchain_order(&execution, cqrs).await
+}
+
+#[derive(Default)]
+struct CounterTradeBatchBudget {
+    reserved_buying_power_cents: i64,
+    remaining_equity: HashMap<Symbol, FractionalShares>,
+}
+
+impl CounterTradeBatchBudget {
+    fn reserve_buying_power(&mut self, estimated_cost_cents: i64) -> Result<(), ExecutionError> {
+        self.reserved_buying_power_cents = self
+            .reserved_buying_power_cents
+            .checked_add(estimated_cost_cents)
+            .ok_or(ExecutionError::BuyingPowerReservationOverflow {
+                current_reserved_cents: self.reserved_buying_power_cents,
+                additional_cents: estimated_cost_cents,
+            })?;
+
+        Ok(())
+    }
+
+    fn check_reservation(
+        &self,
+        reservation: &CounterTradeReservation,
+    ) -> Result<Option<CounterTradeSkipReason>, ExecutionError> {
+        match reservation {
+            CounterTradeReservation::Equity {
+                required,
+                available,
+                symbol,
+            } => {
+                let remaining = self
+                    .remaining_equity
+                    .get(symbol)
+                    .copied()
+                    .unwrap_or(*available);
+
+                if !remaining
+                    .inner()
+                    .gte(required.inner().inner())
+                    .map_err(ExecutionError::from)?
+                {
+                    return Ok(Some(CounterTradeSkipReason::InsufficientEquity {
+                        required: *required,
+                        available: remaining,
+                    }));
+                }
+
+                Ok(None)
+            }
+            CounterTradeReservation::BuyingPower {
+                estimated_cost_cents,
+                available_buying_power_cents,
+            } => {
+                let remaining = available_buying_power_cents
+                    .checked_sub(self.reserved_buying_power_cents)
+                    .ok_or(ExecutionError::BuyingPowerReservationOverflow {
+                        current_reserved_cents: self.reserved_buying_power_cents,
+                        additional_cents: *available_buying_power_cents,
+                    })?;
+
+                if remaining < *estimated_cost_cents {
+                    return Ok(Some(CounterTradeSkipReason::InsufficientBuyingPower {
+                        estimated_cost_cents: *estimated_cost_cents,
+                        available_buying_power_cents: remaining,
+                    }));
+                }
+
+                Ok(None)
+            }
+        }
+    }
+
+    fn commit_reservation(
+        &mut self,
+        reservation: &CounterTradeReservation,
+    ) -> Result<Option<CounterTradeSkipReason>, ExecutionError> {
+        if let Some(reason) = self.check_reservation(reservation)? {
+            return Ok(Some(reason));
+        }
+
+        match reservation {
+            CounterTradeReservation::Equity {
+                symbol,
+                required,
+                available,
+            } => {
+                let remaining = self
+                    .remaining_equity
+                    .entry(symbol.clone())
+                    .or_insert(*available);
+                *remaining = (*remaining - required.inner()).map_err(ExecutionError::from)?;
+                Ok(None)
+            }
+            CounterTradeReservation::BuyingPower {
+                estimated_cost_cents,
+                ..
+            } => {
+                self.reserve_buying_power(*estimated_cost_cents)?;
+                Ok(None)
+            }
+        }
+    }
+}
+
+enum CounterTradeSubmissionCheck {
+    Allowed {
+        reservation: Option<CounterTradeReservation>,
+    },
+    Skipped,
+}
+
+fn log_counter_trade_skip(
+    execution: &ExecutionCtx,
+    source: &'static str,
+    reason: &CounterTradeSkipReason,
+) {
+    match reason {
+        CounterTradeSkipReason::InsufficientEquity {
+            required,
+            available,
+        } => {
+            warn!(
+                symbol = %execution.symbol,
+                shares = %execution.shares,
+                direction = ?execution.direction,
+                source,
+                required_shares = %required,
+                available_shares = %available,
+                "Skipping counter trade before broker submission: insufficient offchain equity"
+            );
+        }
+        CounterTradeSkipReason::InsufficientBuyingPower {
+            estimated_cost_cents,
+            available_buying_power_cents,
+        } => {
+            warn!(
+                symbol = %execution.symbol,
+                shares = %execution.shares,
+                direction = ?execution.direction,
+                source,
+                estimated_cost_cents,
+                available_buying_power_cents,
+                "Skipping counter trade before broker submission: insufficient buying power"
+            );
+        }
+    }
+}
+
+async fn preflight_counter_trade_submission<E: Executor>(
+    executor: &E,
+    execution: &ExecutionCtx,
+    batch_budget: Option<&CounterTradeBatchBudget>,
+) -> Result<CounterTradeSubmissionCheck, TradeAccountingError>
+where
+    TradeAccountingError: From<E::Error>,
+{
+    let order = MarketOrder {
+        symbol: execution.symbol.clone(),
+        shares: execution.shares,
+        direction: execution.direction,
+    };
+
+    match executor.preflight_counter_trade(order).await? {
+        CounterTradePreflight::Allowed { reservation } => {
+            if let (Some(batch_budget), Some(reservation)) = (batch_budget, reservation.as_ref())
+                && let Some(reason) = batch_budget.check_reservation(reservation)?
+            {
+                log_counter_trade_skip(execution, "reservation_budget", &reason);
+                return Ok(CounterTradeSubmissionCheck::Skipped);
+            }
+
+            Ok(CounterTradeSubmissionCheck::Allowed { reservation })
+        }
+        CounterTradePreflight::Skipped(reason) => {
+            log_counter_trade_skip(execution, "broker_preflight", &reason);
+            Ok(CounterTradeSubmissionCheck::Skipped)
+        }
+    }
 }
 
 async fn place_offchain_order(
@@ -1143,17 +1351,23 @@ async fn execute_create_offchain_order(
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 pub(crate) async fn check_and_execute_accumulated_positions<E>(
     executor: &E,
-    position: &Store<Position>,
-    position_projection: &Projection<Position>,
-    offchain_order: &Arc<Store<OffchainOrder>>,
-    threshold: &ExecutionThreshold,
-    assets: &AssetsConfig,
+    execution_ctx: AccumulatedPositionExecutionCtx<'_>,
     is_trading_enabled: impl Fn(&Symbol) -> bool,
 ) -> Result<(), TradeAccountingError>
 where
     E: Executor + Clone + Send + 'static,
     TradeAccountingError: From<E::Error>,
 {
+    let AccumulatedPositionExecutionCtx {
+        position,
+        position_projection,
+        offchain_order,
+        counter_trade_submission_lock,
+        threshold,
+        assets,
+    } = execution_ctx;
+
+    let _counter_trade_submission_guard = counter_trade_submission_lock.lock().await;
     let executor_type = executor.to_supported_executor();
     let ready_positions = check_all_positions(
         executor,
@@ -1174,7 +1388,17 @@ where
         ready_positions.len()
     );
 
+    let mut batch_budget = CounterTradeBatchBudget::default();
+
     for execution in ready_positions {
+        let reservation =
+            match preflight_counter_trade_submission(executor, &execution, Some(&batch_budget))
+                .await?
+            {
+                CounterTradeSubmissionCheck::Allowed { reservation } => reservation,
+                CounterTradeSubmissionCheck::Skipped => continue,
+            };
+
         let offchain_order_id = OffchainOrderId::new();
 
         info!(
@@ -1216,7 +1440,9 @@ where
             executor: execution.executor,
         };
 
-        match offchain_order.send(&offchain_order_id, command).await {
+        let place_result = offchain_order.send(&offchain_order_id, command).await;
+
+        match &place_result {
             Ok(()) => info!(
                 %offchain_order_id,
                 symbol = %execution.symbol,
@@ -1229,9 +1455,12 @@ where
             ),
         }
 
+        let mut broker_rejected_immediately = false;
+
         if let Ok(Some(OffchainOrder::Failed { error, .. })) =
             offchain_order.load(&offchain_order_id).await
         {
+            broker_rejected_immediately = true;
             warn!(
                 %offchain_order_id,
                 symbol = %execution.symbol,
@@ -1240,6 +1469,14 @@ where
             );
             execute_fail_offchain_order_position(position, offchain_order_id, &execution, error)
                 .await;
+        }
+
+        if place_result.is_ok()
+            && !broker_rejected_immediately
+            && let Some(reservation) = reservation.as_ref()
+            && let Some(reason) = batch_budget.commit_reservation(reservation)?
+        {
+            log_counter_trade_skip(&execution, "reservation_commit", &reason);
         }
     }
 
@@ -1254,11 +1491,15 @@ mod tests {
     use rain_math_float::Float;
     use std::collections::HashSet;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::broadcast;
 
     use st0x_dto::ServerMessage;
     use st0x_event_sorcery::{StoreBuilder, test_store};
-    use st0x_execution::{Direction, ExecutorOrderId, MarketOrder, MockExecutor, Positive, Symbol};
+    use st0x_execution::{
+        Direction, EquityPosition, ExecutorOrderId, Inventory as ExecutionInventory, MarketOrder,
+        MockExecutor, Positive, Symbol,
+    };
     use st0x_finance::{Usd, Usdc};
 
     use super::*;
@@ -1557,6 +1798,45 @@ mod tests {
             .build()
     }
 
+    fn test_trade_with_amount_and_direction(
+        amount: Float,
+        log_index: u64,
+        direction: Direction,
+    ) -> OnchainTrade {
+        let mut trade = test_trade_with_amount(amount, log_index);
+        trade.direction = direction;
+        trade
+    }
+
+    async fn acknowledge_fill(
+        position: &Store<Position>,
+        symbol: &str,
+        amount: &str,
+        direction: Direction,
+        log_index: u64,
+    ) {
+        let symbol = Symbol::new(symbol).unwrap();
+
+        position
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        tx_hash: B256::ZERO,
+                        log_index,
+                    },
+                    amount: FractionalShares::new(Float::parse(amount.to_string()).unwrap()),
+                    direction,
+                    price_usdc: float!(150),
+                    block_timestamp: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
     fn create_vault_discovery_context(
         vault_registry: &Store<VaultRegistry>,
     ) -> VaultDiscoveryCtx<'_> {
@@ -1807,6 +2087,7 @@ mod tests {
                 equities: EquitiesConfig::default(),
                 cash: None,
             },
+            counter_trade_submission_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -1912,6 +2193,51 @@ mod tests {
         assert!(
             matches!(offchain_order, OffchainOrder::Submitted { .. }),
             "Offchain order should be Submitted after successful placement, got: {offchain_order:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn trade_above_threshold_skips_counter_trade_without_offchain_inventory() {
+        let pool = setup_test_db().await;
+        let (frameworks, offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs =
+            trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+
+        let trade_event = make_trade_event(21);
+        let trade = test_trade_with_amount_and_direction(float!(1.5), 21, Direction::Buy);
+        let executor = MockExecutor::new().with_inventory(ExecutionInventory {
+            positions: vec![],
+            usd_balance_cents: 100_000,
+        });
+
+        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result, None,
+            "Counter trade should be skipped when the broker cannot preflight a sell"
+        );
+
+        let position = cqrs
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .expect("position should exist");
+
+        assert!(
+            position.pending_offchain_order_id.is_none(),
+            "Skipped counter trades must not leave the position pending"
+        );
+        assert!(
+            offchain_order_projection
+                .load_all()
+                .await
+                .unwrap()
+                .is_empty(),
+            "Skipped counter trades must not create offchain orders"
         );
     }
 
@@ -2066,11 +2392,14 @@ mod tests {
 
         check_and_execute_accumulated_positions(
             &executor,
-            &cqrs.position,
-            &cqrs.position_projection,
-            &cqrs.offchain_order,
-            &cqrs.execution_threshold,
-            &cqrs.assets,
+            AccumulatedPositionExecutionCtx {
+                position: &cqrs.position,
+                position_projection: &cqrs.position_projection,
+                offchain_order: &cqrs.offchain_order,
+                counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
+                threshold: &cqrs.execution_threshold,
+                assets: &cqrs.assets,
+            },
             |_| true,
         )
         .await
@@ -2091,6 +2420,196 @@ mod tests {
             position.pending_offchain_order_id.unwrap(),
             first_order_id,
             "New order should have a different ID than the completed one"
+        );
+    }
+
+    #[tokio::test]
+    async fn periodic_checker_skips_counter_trade_without_buying_power() {
+        let pool = setup_test_db().await;
+        let (frameworks, offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs =
+            trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+
+        acknowledge_fill(&cqrs.position, "AAPL", "1", Direction::Sell, 1).await;
+
+        let executor = MockExecutor::new()
+            .with_inventory(ExecutionInventory {
+                positions: vec![],
+                usd_balance_cents: 10_000,
+            })
+            .with_preflight_price(float!(100));
+
+        check_and_execute_accumulated_positions(
+            &executor,
+            AccumulatedPositionExecutionCtx {
+                position: &cqrs.position,
+                position_projection: &cqrs.position_projection,
+                offchain_order: &cqrs.offchain_order,
+                counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
+                threshold: &cqrs.execution_threshold,
+                assets: &cqrs.assets,
+            },
+            |_| true,
+        )
+        .await
+        .unwrap();
+
+        let position = cqrs
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .expect("position should exist");
+
+        assert!(
+            position.pending_offchain_order_id.is_none(),
+            "Skipped accumulated counter trades must not leave the position pending"
+        );
+        assert!(
+            offchain_order_projection
+                .load_all()
+                .await
+                .unwrap()
+                .is_empty(),
+            "Skipped accumulated counter trades must not create offchain orders"
+        );
+    }
+
+    #[tokio::test]
+    async fn periodic_checker_reserves_buying_power_across_batch() {
+        let pool = setup_test_db().await;
+        let (frameworks, offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs =
+            trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+
+        acknowledge_fill(&cqrs.position, "AAPL", "1", Direction::Sell, 1).await;
+        acknowledge_fill(&cqrs.position, "MSFT", "1", Direction::Sell, 2).await;
+
+        let executor = MockExecutor::new()
+            .with_inventory(ExecutionInventory {
+                positions: vec![EquityPosition {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: FractionalShares::new(float!(5)),
+                    market_value: None,
+                }],
+                usd_balance_cents: 15_000,
+            })
+            .with_preflight_price(float!(100));
+
+        check_and_execute_accumulated_positions(
+            &executor,
+            AccumulatedPositionExecutionCtx {
+                position: &cqrs.position,
+                position_projection: &cqrs.position_projection,
+                offchain_order: &cqrs.offchain_order,
+                counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
+                threshold: &cqrs.execution_threshold,
+                assets: &cqrs.assets,
+            },
+            |_| true,
+        )
+        .await
+        .unwrap();
+
+        let pending_positions = cqrs
+            .position_projection
+            .load_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_symbol, position)| position)
+            .filter(|position| position.pending_offchain_order_id.is_some())
+            .count();
+
+        assert_eq!(
+            pending_positions, 1,
+            "Buying-power reservations should allow only one accumulated buy in the batch"
+        );
+        assert_eq!(
+            offchain_order_projection.load_all().await.unwrap().len(),
+            1,
+            "Only one offchain order should be created when batch buying power is exhausted"
+        );
+    }
+
+    #[tokio::test]
+    async fn periodic_checker_reuses_buying_power_after_immediate_broker_rejection() {
+        struct FailOnceOrderPlacer {
+            attempts: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl OrderPlacer for FailOnceOrderPlacer {
+            async fn place_market_order(
+                &self,
+                order: MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err("Broker rejected first order".into());
+                }
+
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("TEST_BROKER_ORD"),
+                    placed_shares: order.shares,
+                })
+            }
+        }
+
+        let pool = setup_test_db().await;
+        let order_placer: Arc<dyn OrderPlacer> = Arc::new(FailOnceOrderPlacer {
+            attempts: AtomicUsize::new(0),
+        });
+        let (frameworks, offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, order_placer).await;
+        let cqrs =
+            trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+
+        acknowledge_fill(&cqrs.position, "AAPL", "1", Direction::Sell, 1).await;
+        acknowledge_fill(&cqrs.position, "MSFT", "1", Direction::Sell, 2).await;
+
+        let executor = MockExecutor::new()
+            .with_inventory(ExecutionInventory {
+                positions: vec![],
+                usd_balance_cents: 15_000,
+            })
+            .with_preflight_price(float!(100));
+
+        check_and_execute_accumulated_positions(
+            &executor,
+            AccumulatedPositionExecutionCtx {
+                position: &cqrs.position,
+                position_projection: &cqrs.position_projection,
+                offchain_order: &cqrs.offchain_order,
+                counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
+                threshold: &cqrs.execution_threshold,
+                assets: &cqrs.assets,
+            },
+            |_| true,
+        )
+        .await
+        .unwrap();
+
+        let pending_positions = cqrs
+            .position_projection
+            .load_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_symbol, position)| position)
+            .filter(|position| position.pending_offchain_order_id.is_some())
+            .count();
+
+        assert_eq!(
+            pending_positions, 1,
+            "Buying power released after immediate rejection should let the next accumulated buy proceed"
+        );
+        assert_eq!(
+            offchain_order_projection.load_all().await.unwrap().len(),
+            2,
+            "Both accumulated orders should be attempted when the first rejection releases its reservation"
         );
     }
 
@@ -2775,11 +3294,14 @@ mod tests {
 
         check_and_execute_accumulated_positions(
             &executor,
-            &cqrs.position,
-            &cqrs.position_projection,
-            &cqrs.offchain_order,
-            &cqrs.execution_threshold,
-            &cqrs.assets,
+            AccumulatedPositionExecutionCtx {
+                position: &cqrs.position,
+                position_projection: &cqrs.position_projection,
+                offchain_order: &cqrs.offchain_order,
+                counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
+                threshold: &cqrs.execution_threshold,
+                assets: &cqrs.assets,
+            },
             |_| true,
         )
         .await
@@ -2859,11 +3381,14 @@ mod tests {
         let executor = MockExecutor::new();
         check_and_execute_accumulated_positions(
             &executor,
-            &cqrs.position,
-            &cqrs.position_projection,
-            &cqrs.offchain_order,
-            &cqrs.execution_threshold,
-            &cqrs.assets,
+            AccumulatedPositionExecutionCtx {
+                position: &cqrs.position,
+                position_projection: &cqrs.position_projection,
+                offchain_order: &cqrs.offchain_order,
+                counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
+                threshold: &cqrs.execution_threshold,
+                assets: &cqrs.assets,
+            },
             |_| true,
         )
         .await

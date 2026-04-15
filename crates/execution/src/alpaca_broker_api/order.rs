@@ -14,6 +14,8 @@ use crate::{
     deserialize_option_float_from_number_or_string, serialize_float_as_string,
 };
 
+const ALPACA_CRYPTO_MAX_DECIMAL_PLACES: u8 = 6;
+
 /// Order side
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -448,6 +450,25 @@ fn truncate_shares_to_alpaca_precision(
     Ok(Positive::new(FractionalShares::new(truncated_float))?)
 }
 
+fn validate_usdc_amount_for_alpaca_precision(amount: Float) -> Result<Float, AlpacaBrokerApiError> {
+    let truncated_amount =
+        crate::truncate_to_decimal_places(amount, ALPACA_CRYPTO_MAX_DECIMAL_PLACES)?.ok_or(
+            AlpacaBrokerApiError::UsdcBelowPrecision {
+                amount,
+                max_decimals: ALPACA_CRYPTO_MAX_DECIMAL_PLACES,
+            },
+        )?;
+
+    if !truncated_amount.eq(amount)? {
+        return Err(AlpacaBrokerApiError::UsdcPrecisionExceeded {
+            amount,
+            max_decimals: ALPACA_CRYPTO_MAX_DECIMAL_PLACES,
+        });
+    }
+
+    Ok(amount)
+}
+
 /// Convert USDC to/from USD on Alpaca.
 ///
 /// This uses the USDC/USD trading pair:
@@ -458,16 +479,17 @@ pub(crate) async fn convert_usdc_usd(
     amount: Float,
     direction: ConversionDirection,
 ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
+    let placed_amount = validate_usdc_amount_for_alpaca_precision(amount)?;
     let side = match direction {
         ConversionDirection::UsdcToUsd => OrderSide::Sell,
         ConversionDirection::UsdToUsdc => OrderSide::Buy,
     };
 
-    debug!(?side, ?amount, "Placing USDC/USD conversion order");
+    debug!(?side, amount = ?placed_amount, "Placing USDC/USD conversion order");
 
     let request = CryptoOrderRequest {
         symbol: "USDCUSD".to_string(),
-        quantity: amount,
+        quantity: placed_amount,
         side,
         order_type: "market",
         time_in_force: "gtc",
@@ -538,6 +560,7 @@ mod tests {
             mode: Some(mode),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::Day,
+            counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
         }
     }
 
@@ -1028,6 +1051,32 @@ mod tests {
         assert_eq!(order.symbol, "USDCUSD");
         assert!(order.quantity.eq(float!(500)).unwrap());
         assert_eq!(order.status_display(), "filled");
+    }
+
+    #[tokio::test]
+    async fn test_convert_usdc_usd_rejects_excess_precision() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        let error = convert_usdc_usd(
+            &client,
+            float!(1000.1234567),
+            ConversionDirection::UsdToUsdc,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AlpacaBrokerApiError::UsdcPrecisionExceeded {
+                    amount,
+                    max_decimals: 6,
+                } if amount.eq(float!(1000.1234567)).unwrap()
+            ),
+            "Expected UsdcPrecisionExceeded error, got: {error:?}"
+        );
     }
 
     #[tokio::test]

@@ -15,8 +15,10 @@ use super::journal::JournalResponse;
 use super::order::{AlpacaLimitOrder, ConversionDirection, CryptoOrderResponse};
 use super::{AlpacaBrokerApiError, AssetStatus, TimeInForce};
 use crate::{
-    Executor, FractionalShares, MarketOrder, OrderPlacement, OrderState, OrderStatus, Positive,
-    SupportedExecutor, Symbol, TryIntoExecutor,
+    CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason, Direction, Executor,
+    FractionalShares, InventoryResult, MarketOrder, OrderPlacement, OrderState, OrderStatus,
+    Positive, SupportedExecutor, Symbol, TryIntoExecutor, buying_power_counter_trade_preflight,
+    estimate_buffered_cost_cents,
 };
 
 /// Response from the asset endpoint
@@ -54,6 +56,7 @@ pub struct AlpacaBrokerApi {
     asset_cache: Arc<RwLock<HashMap<String, CachedAsset>>>,
     asset_cache_ttl: Duration,
     time_in_force: TimeInForce,
+    counter_trade_slippage_bps: u16,
 }
 
 impl Clone for AlpacaBrokerApi {
@@ -63,6 +66,7 @@ impl Clone for AlpacaBrokerApi {
             asset_cache: Arc::clone(&self.asset_cache),
             asset_cache_ttl: self.asset_cache_ttl,
             time_in_force: self.time_in_force,
+            counter_trade_slippage_bps: self.counter_trade_slippage_bps,
         }
     }
 }
@@ -73,6 +77,10 @@ impl std::fmt::Debug for AlpacaBrokerApi {
             .field("client", &self.client)
             .field("asset_cache_ttl", &self.asset_cache_ttl)
             .field("time_in_force", &self.time_in_force)
+            .field(
+                "counter_trade_slippage_bps",
+                &self.counter_trade_slippage_bps,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -107,6 +115,7 @@ impl Executor for AlpacaBrokerApi {
             asset_cache: Arc::new(RwLock::new(HashMap::new())),
             asset_cache_ttl: ctx.asset_cache_ttl,
             time_in_force: ctx.time_in_force,
+            counter_trade_slippage_bps: ctx.counter_trade_slippage_bps,
         })
     }
 
@@ -168,7 +177,59 @@ impl Executor for AlpacaBrokerApi {
 
     async fn get_inventory(&self) -> Result<crate::InventoryResult, Self::Error> {
         let inventory = super::positions::fetch_inventory(&self.client).await?;
-        Ok(crate::InventoryResult::Fetched(inventory))
+        Ok(InventoryResult::Fetched(inventory))
+    }
+
+    async fn preflight_counter_trade(
+        &self,
+        order: MarketOrder,
+    ) -> Result<CounterTradePreflight, Self::Error> {
+        match order.direction {
+            Direction::Sell => {
+                let inventory = super::positions::fetch_inventory(&self.client).await?;
+                let available = inventory
+                    .positions
+                    .into_iter()
+                    .find(|position| position.symbol == order.symbol)
+                    .map_or(FractionalShares::ZERO, |position| position.quantity);
+
+                if available.inner().gte(order.shares.inner().inner())? {
+                    Ok(CounterTradePreflight::Allowed {
+                        reservation: Some(CounterTradeReservation::Equity {
+                            symbol: order.symbol,
+                            required: order.shares,
+                            available,
+                        }),
+                    })
+                } else {
+                    Ok(CounterTradePreflight::Skipped(
+                        CounterTradeSkipReason::InsufficientEquity {
+                            required: order.shares,
+                            available,
+                        },
+                    ))
+                }
+            }
+            Direction::Buy => {
+                let latest_trade_price = crate::alpaca_market_data::fetch_latest_trade_price(
+                    self.client.market_data_http_client(),
+                    self.client.market_data_base_url(),
+                    &order.symbol,
+                )
+                .await?;
+                let account_funds = super::positions::get_account_funds(&self.client).await?;
+                let estimated_cost_cents = estimate_buffered_cost_cents(
+                    order.shares,
+                    latest_trade_price.inner(),
+                    self.counter_trade_slippage_bps,
+                )?;
+
+                Ok(buying_power_counter_trade_preflight(
+                    estimated_cost_cents,
+                    account_funds.margin_safe_buying_power_cents,
+                ))
+            }
+        }
     }
 }
 
@@ -281,6 +342,7 @@ impl AlpacaBrokerApi {
 mod tests {
     use httpmock::prelude::*;
     use serde_json::json;
+    use st0x_float_macro::float;
     use std::thread;
 
     use super::*;
@@ -288,7 +350,9 @@ mod tests {
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
     };
     use crate::alpaca_broker_api::order::AlpacaLimitPrice;
-    use crate::{Direction, FractionalShares, Positive, Usd};
+    use crate::{
+        CounterTradePreflight, CounterTradeSkipReason, Direction, FractionalShares, Positive, Usd,
+    };
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b"));
@@ -433,6 +497,7 @@ mod tests {
             mode: Some(mode),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::Day,
+            counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
         }
     }
 
@@ -566,7 +631,8 @@ mod tests {
                 .json_body(json!({
                     "id": "904837e3-3b76-47ec-b432-046db621571b",
                     "status": "ACTIVE",
-                    "cash": "50000.00"
+                    "cash": "50000.00",
+                    "non_marginable_buying_power": "50000.00"
                 }));
         });
 
@@ -578,7 +644,7 @@ mod tests {
                 .json_body(json!([
                     {
                         "symbol": "AAPL",
-                        "qty": "10.5",
+                        "qty_available": "10.5",
                         "market_value": "1575.00"
                     }
                 ]));
@@ -593,6 +659,62 @@ mod tests {
         account_mock.assert_calls(2);
         positions_mock.assert();
         assert!(matches!(result, crate::InventoryResult::Fetched(_)));
+    }
+
+    fn create_latest_trade_mock<'a>(
+        server: &'a MockServer,
+        price: &'static str,
+    ) -> httpmock::Mock<'a> {
+        server.mock(|when, then| {
+            when.method(GET).path("/v2/stocks/AAPL/trades/latest");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "trade": {
+                        "p": price
+                    }
+                }));
+        })
+    }
+
+    #[tokio::test]
+    async fn test_preflight_counter_trade_skips_buy_without_margin_safe_buying_power() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let account_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "status": "ACTIVE",
+                    "cash": "1000.00",
+                    "non_marginable_buying_power": "100.00"
+                }));
+        });
+        let latest_trade_mock = create_latest_trade_mock(&server, "100.00");
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        let preflight = executor
+            .preflight_counter_trade(MarketOrder {
+                symbol: Symbol::new("AAPL").unwrap(),
+                shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
+                direction: Direction::Buy,
+            })
+            .await
+            .unwrap();
+
+        account_mock.assert_calls(2);
+        latest_trade_mock.assert();
+        assert!(matches!(
+            preflight,
+            CounterTradePreflight::Skipped(CounterTradeSkipReason::InsufficientBuyingPower {
+                estimated_cost_cents,
+                available_buying_power_cents,
+            }) if estimated_cost_cents == 20_200 && available_buying_power_cents == 10_000
+        ));
     }
 
     fn create_asset_mock<'a>(
@@ -833,6 +955,7 @@ mod tests {
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
             asset_cache_ttl: std::time::Duration::ZERO,
             time_in_force: TimeInForce::Day,
+            counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
         };
 
         let account_mock = create_account_mock(&server);

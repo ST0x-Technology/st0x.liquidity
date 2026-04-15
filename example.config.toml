@@ -5,6 +5,9 @@ hyperdx.service_name = "st0x-hedge"
 
 # Travel Rule info for Alpaca whitelist creation (required since 2026-03-27).
 # Only needed when using Alpaca Broker API.
+[broker]
+counter_trade_slippage_bps = 100
+
 [broker.travel_rule]
 beneficiary_entity_name = "Acme Corp"
 

@@ -171,7 +171,7 @@ async fn multi_asset_sustained_load() -> anyhow::Result<()> {
             ("TSLA", tsla_broker),
             ("MSFT", msft_broker),
         ],
-        vec![],
+        vec![("TSLA", float!(100))],
     )
     .await?;
 

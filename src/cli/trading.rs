@@ -689,6 +689,7 @@ mod tests {
             account_id: TEST_ACCOUNT_ID,
             mode: Some(AlpacaBrokerApiMode::Mock(mock_server.base_url())),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
+            counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
             time_in_force: TimeInForce::Day,
         });
         ctx

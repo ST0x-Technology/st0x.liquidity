@@ -23,7 +23,8 @@ use st0x_event_sorcery::Projection;
 use st0x_evm::Wallet;
 use st0x_execution::alpaca_broker_api::{AlpacaBrokerMock, TEST_API_KEY, TEST_API_SECRET};
 use st0x_execution::{
-    AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Symbol, TimeInForce,
+    AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
+    DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, FractionalShares, Symbol, TimeInForce,
 };
 use st0x_hedge::config::{BrokerCtx, Ctx};
 use st0x_hedge::mock_api::REDEMPTION_WALLET;
@@ -64,6 +65,7 @@ fn build_full_system_ctx<P: Provider + Clone>(
         mode: Some(AlpacaBrokerApiMode::Mock(broker.base_url())),
         asset_cache_ttl: Duration::from_secs(3600),
         time_in_force: TimeInForce::Day,
+        counter_trade_slippage_bps: DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
     };
     let broker_ctx = BrokerCtx::AlpacaBrokerApi(alpaca_auth.clone());
 

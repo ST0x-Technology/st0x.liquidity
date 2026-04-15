@@ -159,6 +159,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
         mode: Some(AlpacaBrokerApiMode::Mock(broker.base_url())),
         asset_cache_ttl: Duration::from_secs(3600),
         time_in_force: TimeInForce::Day,
+        counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
     };
     let broker_ctx = BrokerCtx::AlpacaBrokerApi(alpaca_auth.clone());
 
@@ -240,6 +241,7 @@ where
         mode: Some(AlpacaBrokerApiMode::Mock(broker.base_url())),
         asset_cache_ttl: Duration::from_secs(3600),
         time_in_force: TimeInForce::Day,
+        counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
     };
     let broker_ctx = BrokerCtx::AlpacaBrokerApi(alpaca_auth.clone());
 

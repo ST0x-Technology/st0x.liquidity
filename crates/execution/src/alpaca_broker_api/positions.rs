@@ -12,12 +12,18 @@ use crate::{
     deserialize_option_float_from_number_or_string,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AccountFunds {
+    pub(super) cash_balance_cents: i64,
+    pub(super) margin_safe_buying_power_cents: i64,
+}
+
 /// Position response from Alpaca Broker API.
 #[derive(Debug, Deserialize)]
 struct PositionResponse {
     symbol: String,
     #[serde(
-        rename = "qty",
+        rename = "qty_available",
         deserialize_with = "deserialize_float_from_number_or_string"
     )]
     quantity: Float,
@@ -33,13 +39,15 @@ struct PositionResponse {
 struct AccountDetailsResponse {
     #[serde(deserialize_with = "deserialize_float_from_number_or_string")]
     cash: Float,
+    #[serde(deserialize_with = "deserialize_float_from_number_or_string")]
+    non_marginable_buying_power: Float,
 }
 
 pub(super) async fn fetch_inventory(
     client: &AlpacaBrokerApiClient,
 ) -> Result<Inventory, AlpacaBrokerApiError> {
     let positions = list_positions(client).await?;
-    let account = get_account_details(client).await?;
+    let account_funds = get_account_funds(client).await?;
 
     let broker_positions = positions
         .into_iter()
@@ -62,32 +70,23 @@ pub(super) async fn fetch_inventory(
         })
         .collect::<Result<Vec<_>, AlpacaBrokerApiError>>()?;
 
-    let hundred = float!(100);
-    let cents = (account.cash * hundred).map_err(AlpacaBrokerApiError::FloatConversion)?;
-    let frac = cents
-        .frac()
-        .map_err(AlpacaBrokerApiError::FloatConversion)?;
-
-    if !frac
-        .is_zero()
-        .map_err(AlpacaBrokerApiError::FloatConversion)?
-    {
-        return Err(AlpacaBrokerApiError::FractionalCents(account.cash));
-    }
-
-    let integer_cents = cents
-        .integer()
-        .map_err(AlpacaBrokerApiError::FloatConversion)?;
-    let formatted = integer_cents
-        .format_with_scientific(false)
-        .map_err(AlpacaBrokerApiError::FloatConversion)?;
-    let usd_balance_cents: i64 = formatted
-        .parse()
-        .map_err(|_| AlpacaBrokerApiError::UsdBalanceConversion(account.cash))?;
-
     Ok(Inventory {
         positions: broker_positions,
-        usd_balance_cents,
+        usd_balance_cents: account_funds.cash_balance_cents,
+    })
+}
+
+pub(super) async fn get_account_funds(
+    client: &AlpacaBrokerApiClient,
+) -> Result<AccountFunds, AlpacaBrokerApiError> {
+    let account = get_account_details(client).await?;
+    let cash_balance_cents = to_cash_value_cents(account.cash)?;
+    let margin_safe_buying_power_cents =
+        to_cash_value_cents(account.non_marginable_buying_power)?.min(cash_balance_cents);
+
+    Ok(AccountFunds {
+        cash_balance_cents,
+        margin_safe_buying_power_cents,
     })
 }
 
@@ -117,6 +116,32 @@ async fn get_account_details(
     debug!("Fetching account details from {}", url);
 
     client.get(&url).await
+}
+
+fn to_cash_value_cents(cash: Float) -> Result<i64, AlpacaBrokerApiError> {
+    let hundred = float!(100);
+    let cents = (cash * hundred).map_err(AlpacaBrokerApiError::FloatConversion)?;
+    let frac = cents
+        .frac()
+        .map_err(AlpacaBrokerApiError::FloatConversion)?;
+
+    if !frac
+        .is_zero()
+        .map_err(AlpacaBrokerApiError::FloatConversion)?
+    {
+        return Err(AlpacaBrokerApiError::FractionalCents(cash));
+    }
+
+    let integer_cents = cents
+        .integer()
+        .map_err(AlpacaBrokerApiError::FloatConversion)?;
+    let formatted = integer_cents
+        .format_with_scientific(false)
+        .map_err(AlpacaBrokerApiError::FloatConversion)?;
+
+    formatted
+        .parse()
+        .map_err(|_| AlpacaBrokerApiError::UsdBalanceConversion(cash))
 }
 
 #[cfg(test)]
@@ -154,6 +179,7 @@ mod tests {
             mode: Some(mode),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::Day,
+            counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
         }
     }
 
@@ -170,12 +196,12 @@ mod tests {
                 .json_body(json!([
                     {
                         "symbol": "AAPL",
-                        "qty": "10.5",
+                        "qty_available": "10.5",
                         "market_value": "1575.00"
                     },
                     {
                         "symbol": "GOOGL",
-                        "qty": "5.0",
+                        "qty_available": "5.0",
                         "market_value": "750.00"
                     }
                 ]));
@@ -187,7 +213,8 @@ mod tests {
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
-                    "cash": "50000.00"
+                    "cash": "50000.00",
+                    "non_marginable_buying_power": "50000.00"
                 }));
         });
 
@@ -231,7 +258,8 @@ mod tests {
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
-                    "cash": "100000.00"
+                    "cash": "100000.00",
+                    "non_marginable_buying_power": "100000.00"
                 }));
         });
 
@@ -258,7 +286,7 @@ mod tests {
                 .json_body(json!([
                     {
                         "symbol": "",
-                        "qty": "10.0",
+                        "qty_available": "10.0",
                         "market_value": "1000.00"
                     }
                 ]));
@@ -270,7 +298,8 @@ mod tests {
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
-                    "cash": "50000.00"
+                    "cash": "50000.00",
+                    "non_marginable_buying_power": "50000.00"
                 }));
         });
 
@@ -296,7 +325,7 @@ mod tests {
                 .json_body(json!([
                     {
                         "symbol": "AAPL",
-                        "qty": "10.0",
+                        "qty_available": "10.0",
                         "market_value": "1575.005"
                     }
                 ]));
@@ -308,7 +337,8 @@ mod tests {
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
-                    "cash": "50000.00"
+                    "cash": "50000.00",
+                    "non_marginable_buying_power": "50000.00"
                 }));
         });
 
@@ -352,7 +382,8 @@ mod tests {
                 .header("content-type", "application/json")
                 .json_body(json!({
                     // 0.001 fractional cents after multiplying by 100
-                    "cash": "100.001"
+                    "cash": "100.001",
+                    "non_marginable_buying_power": "100.001"
                 }));
         });
 
@@ -378,7 +409,7 @@ mod tests {
                 .json_body(json!([
                     {
                         "symbol": "RKLB",
-                        "qty": "6.803019322",
+                        "qty_available": "6.803019322",
                         "market_value": "511.6476"
                     }
                 ]));
@@ -390,7 +421,8 @@ mod tests {
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
-                    "cash": "50000.00"
+                    "cash": "50000.00",
+                    "non_marginable_buying_power": "50000.00"
                 }));
         });
 
@@ -424,7 +456,7 @@ mod tests {
                 .json_body(json!([
                     {
                         "symbol": "AAPL",
-                        "qty": 10.5,
+                        "qty_available": 10.5,
                         "market_value": 1575.00
                     }
                 ]));
@@ -435,7 +467,10 @@ mod tests {
                 .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body(json!({ "cash": "50000.00" }));
+                .json_body(json!({
+                    "cash": "50000.00",
+                    "non_marginable_buying_power": "50000.00"
+                }));
         });
 
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
@@ -452,5 +487,34 @@ mod tests {
             aapl.market_value,
             Some(Float::parse("1575".to_string()).unwrap())
         ));
+    }
+
+    #[tokio::test]
+    async fn fetch_inventory_requires_non_marginable_buying_power() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([]));
+        });
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "cash": "50000.00"
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let error = fetch_inventory(&client).await.unwrap_err();
+
+        assert!(matches!(error, AlpacaBrokerApiError::HttpClient(_)));
     }
 }

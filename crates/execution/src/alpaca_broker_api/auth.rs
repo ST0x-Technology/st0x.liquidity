@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::TimeInForce;
-
 /// Strongly typed Alpaca account identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AlpacaAccountId(Uuid);
@@ -52,6 +51,14 @@ impl AlpacaBrokerApiMode {
             Self::Mock(url) => url,
         }
     }
+
+    pub(super) fn market_data_base_url(&self) -> &str {
+        match self {
+            Self::Sandbox | Self::Production => "https://data.alpaca.markets",
+            #[cfg(any(test, feature = "mock"))]
+            Self::Mock(url) => url,
+        }
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -67,6 +74,7 @@ pub struct AlpacaBrokerApiCtx {
     pub asset_cache_ttl: std::time::Duration,
     #[serde(default)]
     pub time_in_force: TimeInForce,
+    pub counter_trade_slippage_bps: u16,
 }
 
 fn default_asset_cache_ttl_secs() -> std::time::Duration {
@@ -109,6 +117,10 @@ impl std::fmt::Debug for AlpacaBrokerApiCtx {
             .field("mode", &self.mode())
             .field("asset_cache_ttl", &self.asset_cache_ttl)
             .field("time_in_force", &self.time_in_force)
+            .field(
+                "counter_trade_slippage_bps",
+                &self.counter_trade_slippage_bps,
+            )
             .finish()
     }
 }
@@ -153,6 +165,7 @@ mod tests {
             mode: Some(mode),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::Day,
+            counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
         }
     }
 
@@ -205,6 +218,7 @@ mod tests {
             mode: None,
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::Day,
+            counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
         };
 
         let debug_output = format!("{ctx:?}");

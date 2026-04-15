@@ -35,8 +35,11 @@ use st0x_float_macro::float;
 static ALPACA_MIN_DOLLARS: LazyLock<Usdc> = LazyLock::new(|| Usdc::new(float!(2)));
 
 /// Dry-run minimum execution threshold: 1 share.
-static DRY_RUN_MIN_SHARES: LazyLock<FractionalShares> =
-    LazyLock::new(|| FractionalShares::new(float!(1)));
+static DRY_RUN_MIN_SHARES: LazyLock<Positive<FractionalShares>> = LazyLock::new(|| {
+    Positive::new(FractionalShares::new(float!(1))).unwrap_or_else(|_| unreachable!())
+});
+const MIN_COUNTER_TRADE_SLIPPAGE_BPS: u16 = 1;
+const MAX_COUNTER_TRADE_SLIPPAGE_BPS: u16 = 10_000;
 
 #[derive(Parser, Debug)]
 pub struct Env {
@@ -154,7 +157,8 @@ struct Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BrokerConfig {
-    travel_rule: TravelRuleConfig,
+    counter_trade_slippage_bps: Option<u16>,
+    travel_rule: Option<TravelRuleConfig>,
 }
 
 /// Alpaca Travel Rule beneficiary identity, required for whitelist
@@ -188,6 +192,25 @@ impl TravelRuleConfig {
         Ok(Self {
             beneficiary_entity_name: trimmed.to_owned(),
         })
+    }
+}
+
+impl BrokerConfig {
+    fn counter_trade_slippage_bps(&self) -> Result<u16, CtxError> {
+        let configured = self
+            .counter_trade_slippage_bps
+            .ok_or(CtxError::MissingCounterTradeSlippageBps)?;
+
+        if !(MIN_COUNTER_TRADE_SLIPPAGE_BPS..=MAX_COUNTER_TRADE_SLIPPAGE_BPS).contains(&configured)
+        {
+            return Err(CtxError::CounterTradeSlippageBpsOutOfRange {
+                configured,
+                min: MIN_COUNTER_TRADE_SLIPPAGE_BPS,
+                max: MAX_COUNTER_TRADE_SLIPPAGE_BPS,
+            });
+        }
+
+        Ok(configured)
     }
 }
 
@@ -273,36 +296,35 @@ impl BrokerCtx {
     fn execution_threshold(&self) -> Result<ExecutionThreshold, CtxError> {
         match self {
             Self::AlpacaBrokerApi(_) => Ok(ExecutionThreshold::dollar_value(*ALPACA_MIN_DOLLARS)?),
-            Self::DryRun => {
-                let shares = Positive::new(*DRY_RUN_MIN_SHARES).map_err(|error| {
-                    CtxError::InvalidDryRunMinimumShares {
-                        configured: error.value,
-                    }
-                })?;
-                Ok(ExecutionThreshold::shares(shares))
-            }
+            Self::DryRun => Ok(ExecutionThreshold::shares(*DRY_RUN_MIN_SHARES)),
         }
     }
 }
 
-impl From<BrokerSecrets> for BrokerCtx {
-    fn from(secrets: BrokerSecrets) -> Self {
+impl BrokerCtx {
+    fn from_parts(
+        secrets: BrokerSecrets,
+        broker_config: Option<&BrokerConfig>,
+    ) -> Result<Self, CtxError> {
         match secrets {
             BrokerSecrets::AlpacaBrokerApi {
                 api_key,
                 api_secret,
                 account_id,
                 mode,
-            } => Self::AlpacaBrokerApi(AlpacaBrokerApiCtx {
+            } => Ok(Self::AlpacaBrokerApi(AlpacaBrokerApiCtx {
                 api_key,
                 api_secret,
                 account_id,
                 mode,
                 asset_cache_ttl: std::time::Duration::from_secs(3600),
                 time_in_force: TimeInForce::default(),
-            }),
+                counter_trade_slippage_bps: broker_config
+                    .ok_or(CtxError::MissingCounterTradeSlippageBps)?
+                    .counter_trade_slippage_bps()?,
+            })),
 
-            BrokerSecrets::DryRun => Self::DryRun,
+            BrokerSecrets::DryRun => Ok(Self::DryRun),
         }
     }
 }
@@ -397,7 +419,7 @@ impl Ctx {
                 source,
             })?;
 
-        let broker = BrokerCtx::from(secrets.broker);
+        let broker = BrokerCtx::from_parts(secrets.broker, config.broker.as_ref())?;
         let telemetry = TelemetryCtx::new(config.telemetry, secrets.telemetry)?;
 
         // Execution threshold is determined by broker capabilities:
@@ -471,7 +493,7 @@ impl Ctx {
         let travel_rule = config
             .broker
             .as_ref()
-            .map(|broker_config| &broker_config.travel_rule);
+            .and_then(|broker_config| broker_config.travel_rule.as_ref());
 
         if matches!(broker, BrokerCtx::AlpacaBrokerApi(_)) && travel_rule.is_none() {
             return Err(CtxError::MissingTravelRule);
@@ -493,7 +515,8 @@ impl Ctx {
             assets: config.assets,
             travel_rule: config
                 .broker
-                .map(|broker_config| broker_config.travel_rule.validated())
+                .and_then(|broker_config| broker_config.travel_rule)
+                .map(TravelRuleConfig::validated)
                 .transpose()?,
         })
     }
@@ -635,6 +658,16 @@ pub enum CtxError {
         field: &'static str,
         reason: &'static str,
     },
+    #[error(
+        "[broker] counter_trade_slippage_bps is required when using Alpaca \
+         Trading API or Alpaca Broker API"
+    )]
+    MissingCounterTradeSlippageBps,
+    #[error(
+        "[broker] counter_trade_slippage_bps {configured} is out of range; \
+         expected {min}..={max}"
+    )]
+    CounterTradeSlippageBpsOutOfRange { configured: u16, min: u16, max: u16 },
     #[error(transparent)]
     Telemetry(#[from] crate::telemetry::TelemetryAssemblyError),
     #[error("operation requires rebalancing mode")]
@@ -670,8 +703,6 @@ pub enum CtxError {
          -- Alpaca rejects whitelist requests without it since 2026-03-27"
     )]
     MissingTravelRule,
-    #[error("dry-run minimum shares must be positive, got {configured}")]
-    InvalidDryRunMinimumShares { configured: FractionalShares },
     #[error("Float comparison failed during config validation: {0}")]
     FloatComparison(#[from] rain_math_float::FloatError),
 }
@@ -694,6 +725,10 @@ impl CtxError {
             Self::ConfigToml { .. } => "failed to parse config",
             Self::SecretsToml { .. } => "failed to parse secrets",
             Self::InvalidThreshold(_) => "invalid execution threshold",
+            Self::MissingCounterTradeSlippageBps => "missing counter trade slippage bps",
+            Self::CounterTradeSlippageBpsOutOfRange { .. } => {
+                "counter trade slippage bps out of range"
+            }
             Self::Telemetry(_) => "telemetry assembly error",
             Self::RebalancingSecretsMissing => "rebalancing secrets missing",
             Self::RebalancingConfigMissing => "rebalancing config missing",
@@ -709,7 +744,6 @@ impl CtxError {
             Self::FloatComparison(_) => "float comparison failed",
             Self::InvalidTravelRule { .. } => "invalid travel rule config",
             Self::MissingTravelRule => "missing travel rule config",
-            Self::InvalidDryRunMinimumShares { .. } => "invalid dry-run minimum shares",
         }
     }
 }
@@ -813,8 +847,29 @@ pub(crate) mod tests {
             order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             deployment_block = 1
 
+            [broker]
+            counter_trade_slippage_bps = 100
+
             [broker.travel_rule]
             beneficiary_entity_name = "Test Entity"
+        "#,
+        )
+    }
+
+    fn alpaca_trading_config_toml() -> NamedTempFile {
+        toml_file(
+            r#"
+            database_url = ":memory:"
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            deployment_block = 1
+
+            [broker]
+            counter_trade_slippage_bps = 100
         "#,
         )
     }
@@ -1099,6 +1154,9 @@ pub(crate) mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
 
+            [broker]
+            counter_trade_slippage_bps = 100
+
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
@@ -1199,6 +1257,9 @@ pub(crate) mod tests {
 
             [hyperdx]
             service_name = "st0x-hedge"
+
+            [broker]
+            counter_trade_slippage_bps = 100
 
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -1359,6 +1420,9 @@ pub(crate) mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
 
+            [broker]
+            counter_trade_slippage_bps = 100
+
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
@@ -1411,6 +1475,78 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn alpaca_broker_api_requires_counter_trade_slippage_config() {
+        let config = minimal_config_toml();
+        let secrets = toml_file(
+            r#"
+            [evm]
+            ws_rpc_url = "ws://localhost:8545"
+
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+        "#,
+        );
+
+        let err = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, CtxError::MissingCounterTradeSlippageBps),
+            "Expected MissingCounterTradeSlippageBps, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn alpaca_broker_api_counter_trade_slippage_must_be_positive_and_at_most_10_000_bps() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            deployment_block = 1
+
+            [broker]
+            counter_trade_slippage_bps = 0
+        "#,
+        );
+        let secrets = toml_file(
+            r#"
+            [evm]
+            ws_rpc_url = "ws://localhost:8545"
+
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+        "#,
+        );
+
+        let err = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                CtxError::CounterTradeSlippageBpsOutOfRange {
+                    configured: 0,
+                    min: 1,
+                    max: 10_000,
+                }
+            ),
+            "Expected CounterTradeSlippageBpsOutOfRange, got: {err:?}"
+        );
+    }
+    #[tokio::test]
     async fn alpaca_broker_api_executor_uses_dollar_threshold() {
         let config = alpaca_config_toml();
         let secrets = toml_file(
@@ -1435,7 +1571,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn alpaca_broker_without_travel_rule_fails_at_startup() {
-        let config = minimal_config_toml();
+        let config = alpaca_trading_config_toml();
         let secrets = toml_file(
             r#"
             [evm]
@@ -1482,9 +1618,10 @@ pub(crate) mod tests {
         assert!(matches!(error, CtxError::NotRebalancing));
     }
 
-    fn validate_server_config(env: &str, config_str: &str) {
-        let config: Config = toml::from_str(config_str)
-            .unwrap_or_else(|err| panic!("{env} config parse failed: {err}"));
+    #[test]
+    fn server_config_toml_is_valid() {
+        let config_str = include_str!("../config/prod/st0x-hedge.toml");
+        let config: Config = toml::from_str(config_str).unwrap();
 
         let global_limit = config
             .assets
@@ -1492,14 +1629,19 @@ pub(crate) mod tests {
             .operational_limit
             .map(Positive::inner);
 
-        let broker = config.broker.unwrap_or_else(|| {
-            panic!(
-                "{env} config must include [broker.travel_rule] — \
-                 Alpaca rejects whitelist requests without it, effective 2026-03-27"
-            )
-        });
+        let broker = config.broker.expect(
+            "prod config must include [broker.travel_rule] — \
+             Alpaca rejects whitelist requests without it, effective 2026-03-27",
+        );
 
-        broker.travel_rule.validated().unwrap();
+        broker
+            .counter_trade_slippage_bps
+            .expect("prod config must set [broker].counter_trade_slippage_bps");
+        broker
+            .travel_rule
+            .expect("prod config must include [broker.travel_rule]")
+            .validated()
+            .unwrap();
 
         for (symbol, equity) in &config.assets.equities.symbols {
             if equity.rebalancing == OperationMode::Enabled
@@ -1508,23 +1650,13 @@ pub(crate) mod tests {
             {
                 assert!(
                     limit.inner() < global,
-                    "{env}/{symbol}: per-asset operational_limit ({}) must be \
+                    "{symbol}: per-asset operational_limit ({}) must be \
                      stricter than global equities operational_limit ({global}) \
                      to provide meaningful per-asset safety",
                     limit.inner()
                 );
             }
         }
-    }
-
-    #[test]
-    fn prod_config_toml_is_valid() {
-        validate_server_config("prod", include_str!("../config/prod/st0x-hedge.toml"));
-    }
-
-    #[test]
-    fn staging_config_toml_is_valid() {
-        validate_server_config("staging", include_str!("../config/staging/st0x-hedge.toml"));
     }
 
     #[test]
@@ -1543,7 +1675,14 @@ pub(crate) mod tests {
              Alpaca rejects whitelist requests without it, effective 2026-03-27",
         );
 
-        broker.travel_rule.validated().unwrap();
+        broker
+            .counter_trade_slippage_bps
+            .expect("prod config must set [broker].counter_trade_slippage_bps");
+        broker
+            .travel_rule
+            .expect("prod config must include [broker.travel_rule]")
+            .validated()
+            .unwrap();
 
         for (symbol, equity) in &config.assets.equities.symbols {
             if equity.rebalancing == OperationMode::Enabled

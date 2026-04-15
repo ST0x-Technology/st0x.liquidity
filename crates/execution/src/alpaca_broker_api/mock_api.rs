@@ -576,6 +576,7 @@ fn register_endpoints(server: &MockServer, state: &Arc<Mutex<MockState>>) {
     register_calendar_endpoint(server, state);
     register_positions_endpoint(server, state);
     register_wallet_get_endpoint(server, state);
+    register_latest_trade_endpoint(server, state);
     register_asset_endpoint(server);
     register_order_placement_endpoint(server, state);
     register_order_status_endpoint(server, state);
@@ -598,6 +599,7 @@ fn register_account_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>)
                     "status": "ACTIVE",
                     "cash": cash,
                     "buying_power": buying_power,
+                    "non_marginable_buying_power": buying_power,
                 }),
             )
         });
@@ -645,7 +647,7 @@ fn register_positions_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>
                         let abs_qty = pos.quantity.abs()?;
                         Ok(json!({
                             "symbol": pos.symbol,
-                            "qty": format_float_with_fallback(&abs_qty),
+                            "qty_available": format_float_with_fallback(&abs_qty),
                             "market_value": format_float_with_fallback(&pos.market_value),
                             "side": side,
                             "avg_entry_price": "0",
@@ -661,6 +663,41 @@ fn register_positions_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>
                     &json!({"message": format!("Mock /positions FloatError: {error}")}),
                 ),
             }
+        });
+    });
+}
+
+fn register_latest_trade_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {
+    let state = Arc::clone(state);
+    let prefix = "/v2/stocks/";
+
+    server.mock(|when, then| {
+        when.method(GET).path_prefix(prefix);
+        then.respond_with(move |request: &HttpMockRequest| {
+            let request_path = request.uri().path().to_owned();
+            let Some(symbol) = request_path
+                .strip_prefix(prefix)
+                .and_then(|path| path.strip_suffix("/trades/latest"))
+            else {
+                return json_response(404, &json!({"message": "not found"}));
+            };
+
+            let Ok(symbol) = Symbol::new(symbol) else {
+                return json_response(404, &json!({"message": "unknown symbol"}));
+            };
+
+            let Some(price) = lock(&state).symbol_fill_prices.get(&symbol).copied() else {
+                return json_response(404, &json!({"message": "no latest trade configured"}));
+            };
+
+            json_response(
+                200,
+                &json!({
+                    "trade": {
+                        "p": format_float_with_fallback(&price),
+                    }
+                }),
+            )
         });
     });
 }
@@ -779,9 +816,42 @@ fn handle_crypto_order(
     quantity: Float,
     side: OrderSide,
 ) -> HttpMockResponse {
+    let quantized_quantity = match crate::truncate_to_decimal_places(quantity, 6) {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            return json_response(
+                422,
+                &json!({"message": "crypto quantity is below USDC precision"}),
+            );
+        }
+        Err(error) => {
+            return json_response(
+                500,
+                &json!({"message": format!("crypto quantity conversion error: {error}")}),
+            );
+        }
+    };
+
+    let matches_requested_precision = match quantized_quantity.eq(quantity) {
+        Ok(result) => result,
+        Err(error) => {
+            return json_response(
+                500,
+                &json!({"message": format!("crypto quantity comparison error: {error}")}),
+            );
+        }
+    };
+
+    if !matches_requested_precision {
+        return json_response(
+            422,
+            &json!({"message": "crypto quantity exceeds USDC precision"}),
+        );
+    }
+
     // Cash ledger is USD-denominated and modeled at cent precision in inventory.
     // Match equity fill handling by quantizing crypto conversion cash deltas to 2dp.
-    let cash_delta = match quantity
+    let cash_delta = match quantized_quantity
         .to_fixed_decimal_lossy(2)
         .and_then(|(fixed, _lossless)| Float::from_fixed_decimal(fixed, 2))
     {
@@ -809,14 +879,14 @@ fn handle_crypto_order(
     }
 
     let fill_price = float!(1);
-    let quantity_formatted = format_float_with_fallback(&quantity);
+    let quantity_formatted = format_float_with_fallback(&quantized_quantity);
     let fill_price_formatted = format_float_with_fallback(&fill_price);
 
     state.orders.insert(
         order_id.to_string(),
         MockOrder {
             symbol: symbol.clone(),
-            quantity,
+            quantity: quantized_quantity,
             side,
             status: OrderStatus::Filled,
             poll_count: 0,
@@ -1463,5 +1533,36 @@ mod tests {
 
         let order = state.orders.get("order-1").unwrap();
         assert!(order.quantity.eq(float!(12.345678)).unwrap());
+    }
+
+    #[test]
+    fn crypto_quantity_with_excess_precision_is_rejected() {
+        let mut state = MockState {
+            account: MockAccount {
+                cash: float!(100),
+                buying_power: float!(100),
+                positions: HashMap::new(),
+            },
+            orders: HashMap::new(),
+            symbol_fill_prices: HashMap::new(),
+            mode: MockMode::HappyPath,
+            symbol_fill_delays: HashMap::new(),
+            calendar_entries: vec![],
+            wallet_transfers: vec![],
+            alpaca_deposit_address: format!("{:#x}", Address::ZERO),
+            wallet_balances: HashMap::new(),
+            whitelisted_addresses: vec![],
+        };
+
+        let response = handle_crypto_order(
+            &mut state,
+            "order-1",
+            &Symbol::new("USDCUSD").unwrap(),
+            float!(12.3456789),
+            OrderSide::Buy,
+        );
+
+        assert_eq!(response.status, Some(422));
+        assert!(!state.orders.contains_key("order-1"));
     }
 }

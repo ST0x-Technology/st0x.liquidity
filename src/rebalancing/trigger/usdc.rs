@@ -5,6 +5,7 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::Utc;
+use rain_math_float::{Float, FloatError};
 
 use st0x_float_macro::float;
 use tracing::{debug, trace, warn};
@@ -55,6 +56,9 @@ impl UsdcRebalanceTracking {
 /// we use $51 to ensure we always meet the minimum after conversion slippage.
 pub(crate) static ALPACA_MINIMUM_WITHDRAWAL: LazyLock<Usdc> =
     LazyLock::new(|| Usdc::new(float!(51)));
+
+/// Maximum decimal places for rebalanceable USDC token amounts.
+const USDC_TRANSFER_MAX_DECIMAL_PLACES: u8 = 6;
 
 /// Why a USDC trigger check did not produce an operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,7 +139,13 @@ pub(super) async fn check_imbalance_and_build_operation(
 
     match imbalance {
         Imbalance::TooMuchOffchain { excess } => {
-            let capped = cap_usdc(excess, usdc_limit);
+            let capped = truncate_for_transfer(cap_usdc(excess, usdc_limit)).map_err(|error| {
+                warn!(
+                    ?error,
+                    "Failed to truncate offchain USDC imbalance for transfer"
+                );
+                UsdcTriggerSkip::ArithmeticError
+            })?;
 
             if capped
                 .lt(&ALPACA_MINIMUM_WITHDRAWAL)
@@ -151,9 +161,29 @@ pub(super) async fn check_imbalance_and_build_operation(
                 Ok(TriggeredOperation::UsdcAlpacaToBase { amount: capped })
             }
         }
-        Imbalance::TooMuchOnchain { excess } => Ok(TriggeredOperation::UsdcBaseToAlpaca {
-            amount: cap_usdc(excess, usdc_limit),
-        }),
+        Imbalance::TooMuchOnchain { excess } => {
+            let amount = truncate_for_transfer(cap_usdc(excess, usdc_limit)).map_err(|error| {
+                warn!(
+                    ?error,
+                    "Failed to truncate onchain USDC imbalance for transfer"
+                );
+                UsdcTriggerSkip::ArithmeticError
+            })?;
+
+            if amount
+                .inner()
+                .is_zero()
+                .map_err(|_| UsdcTriggerSkip::NoImbalance)?
+            {
+                debug!(
+                    excess = ?excess,
+                    "Skipping onchain USDC rebalance because truncation collapsed the transfer to zero"
+                );
+                return Err(UsdcTriggerSkip::NoImbalance);
+            }
+
+            Ok(TriggeredOperation::UsdcBaseToAlpaca { amount })
+        }
     }
 }
 
@@ -172,6 +202,25 @@ fn cap_usdc(amount: Usdc, usdc_limit: Option<Usdc>) -> Usdc {
     } else {
         amount
     }
+}
+
+fn truncate_for_transfer(amount: Usdc) -> Result<Usdc, FloatError> {
+    let (fixed, _lossless) = amount
+        .inner()
+        .to_fixed_decimal_lossy(USDC_TRANSFER_MAX_DECIMAL_PLACES)?;
+    let truncated_value = Float::from_fixed_decimal(fixed, USDC_TRANSFER_MAX_DECIMAL_PLACES)?;
+    let truncated = Usdc::new(truncated_value);
+
+    if truncated != amount {
+        warn!(
+            original = ?amount,
+            truncated = ?truncated,
+            "Truncated USDC rebalance amount to {} decimal places for transfer",
+            USDC_TRANSFER_MAX_DECIMAL_PLACES
+        );
+    }
+
+    Ok(truncated)
 }
 
 impl RebalancingTrigger {

@@ -110,11 +110,14 @@ where
         context.frameworks.position.clone(),
     );
 
+    let counter_trade_submission_lock = Arc::new(tokio::sync::Mutex::new(()));
+
     let position_checker_handle = spawn_periodic_accumulated_position_check()
         .executor(context.executor.clone())
         .position(context.frameworks.position.clone())
         .position_projection(context.frameworks.position_projection.clone())
         .offchain_order(context.frameworks.offchain_order.clone())
+        .counter_trade_submission_lock(counter_trade_submission_lock.clone())
         .execution_threshold(context.execution_threshold)
         .check_interval(std::time::Duration::from_secs(
             context.ctx.position_check_interval,
@@ -129,6 +132,7 @@ where
         offchain_order: context.frameworks.offchain_order,
         execution_threshold: context.execution_threshold,
         assets: context.ctx.assets.clone(),
+        counter_trade_submission_lock,
     };
 
     let accountant_ctx = Arc::new(AccountantCtx {

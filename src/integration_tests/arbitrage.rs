@@ -32,8 +32,8 @@ use crate::bindings::{
     TOFUTokenDecimals,
 };
 use crate::conductor::{
-    TradeProcessingCqrs, VaultDiscoveryCtx, check_and_execute_accumulated_positions,
-    discover_vaults_for_trade, process_queued_trade,
+    AccumulatedPositionExecutionCtx, TradeProcessingCqrs, VaultDiscoveryCtx,
+    check_and_execute_accumulated_positions, discover_vaults_for_trade, process_queued_trade,
 };
 use crate::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
 use crate::offchain::order_poller::{OrderPollerCtx, OrderStatusPoller};
@@ -606,6 +606,7 @@ async fn create_test_cqrs_with_assets(
         offchain_order: offchain_order.clone(),
         execution_threshold: ExecutionThreshold::whole_share(),
         assets,
+        counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 
     (
@@ -848,13 +849,16 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
     // Position checker finds the unexecuted position and retries
     check_and_execute_accumulated_positions(
         &MockExecutor::new(),
-        &position,
-        &position_query,
-        &offchain_order,
-        &ExecutionThreshold::whole_share(),
-        &AssetsConfig {
-            equities: EquitiesConfig::default(),
-            cash: None,
+        AccumulatedPositionExecutionCtx {
+            position: &position,
+            position_projection: &position_query,
+            offchain_order: &offchain_order,
+            counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
+            threshold: &ExecutionThreshold::whole_share(),
+            assets: &AssetsConfig {
+                equities: EquitiesConfig::default(),
+                cash: None,
+            },
         },
         |_| true,
     )
@@ -1367,13 +1371,16 @@ async fn position_checker_noop_when_hedged() -> Result<(), Box<dyn std::error::E
     // Position checker should find nothing to do
     check_and_execute_accumulated_positions(
         &MockExecutor::new(),
-        &position,
-        &position_query,
-        &offchain_order,
-        &ExecutionThreshold::whole_share(),
-        &AssetsConfig {
-            equities: EquitiesConfig::default(),
-            cash: None,
+        AccumulatedPositionExecutionCtx {
+            position: &position,
+            position_projection: &position_query,
+            offchain_order: &offchain_order,
+            counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
+            threshold: &ExecutionThreshold::whole_share(),
+            assets: &AssetsConfig {
+                equities: EquitiesConfig::default(),
+                cash: None,
+            },
         },
         |_| true,
     )
@@ -2069,11 +2076,14 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
     // Cycle 2: max_amount still the binding constraint at 1 share
     check_and_execute_accumulated_positions(
         &MockExecutor::new(),
-        &position,
-        &position_query,
-        &offchain_order,
-        &ExecutionThreshold::whole_share(),
-        &assets,
+        AccumulatedPositionExecutionCtx {
+            position: &position,
+            position_projection: &position_query,
+            offchain_order: &offchain_order,
+            counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
+            threshold: &ExecutionThreshold::whole_share(),
+            assets: &assets,
+        },
         |_| true,
     )
     .await?;
@@ -2098,11 +2108,14 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
     // Cycle 3: 1 remaining share, still capped to 1 (but matches)
     check_and_execute_accumulated_positions(
         &MockExecutor::new(),
-        &position,
-        &position_query,
-        &offchain_order,
-        &ExecutionThreshold::whole_share(),
-        &assets,
+        AccumulatedPositionExecutionCtx {
+            position: &position,
+            position_projection: &position_query,
+            offchain_order: &offchain_order,
+            counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
+            threshold: &ExecutionThreshold::whole_share(),
+            assets: &assets,
+        },
         |_| true,
     )
     .await?;
@@ -2139,11 +2152,14 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
     let events_before = fetch_events(&pool).await;
     check_and_execute_accumulated_positions(
         &MockExecutor::new(),
-        &position,
-        &position_query,
-        &offchain_order,
-        &ExecutionThreshold::whole_share(),
-        &assets,
+        AccumulatedPositionExecutionCtx {
+            position: &position,
+            position_projection: &position_query,
+            offchain_order: &offchain_order,
+            counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
+            threshold: &ExecutionThreshold::whole_share(),
+            assets: &assets,
+        },
         |_| true,
     )
     .await?;
@@ -2261,11 +2277,14 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
     // Position checker retries: also limited to 2 shares by max_shares
     check_and_execute_accumulated_positions(
         &MockExecutor::new(),
-        &position,
-        &position_query,
-        &offchain_order,
-        &ExecutionThreshold::whole_share(),
-        &assets,
+        AccumulatedPositionExecutionCtx {
+            position: &position,
+            position_projection: &position_query,
+            offchain_order: &offchain_order,
+            counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
+            threshold: &ExecutionThreshold::whole_share(),
+            assets: &assets,
+        },
         |_| true,
     )
     .await?;
@@ -2294,11 +2313,14 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
     let events_before = fetch_events(&pool).await;
     check_and_execute_accumulated_positions(
         &MockExecutor::new(),
-        &position,
-        &position_query,
-        &offchain_order,
-        &ExecutionThreshold::whole_share(),
-        &assets,
+        AccumulatedPositionExecutionCtx {
+            position: &position,
+            position_projection: &position_query,
+            offchain_order: &offchain_order,
+            counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
+            threshold: &ExecutionThreshold::whole_share(),
+            assets: &assets,
+        },
         |_| true,
     )
     .await?;
