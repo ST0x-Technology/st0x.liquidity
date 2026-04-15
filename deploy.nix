@@ -30,6 +30,7 @@ let
       "mkdir -p /run/st0x"
       "install -D -m 0640 -o root -g st0x ${configFile} ${cfg.configPath}"
       "${rage} -d -i ${hostKey} ${secretsFile} | install -D -m 0640 -o root -g st0x /dev/stdin ${cfg.decryptedSecretPath}"
+      "(chown st0x:st0x /mnt/data/*.db /mnt/data/*.db-wal /mnt/data/*.db-shm /mnt/data/*.db-journal 2>/dev/null || true)"
       "echo '${gitRev}' > /run/st0x/${name}.git-rev"
       "touch ${cfg.markerFile}"
       "systemctl restart ${name}"

@@ -37,8 +37,8 @@ let
     };
 
     serviceConfig = {
-      DynamicUser = true;
-      SupplementaryGroups = [ "st0x" ];
+      User = "st0x";
+      Group = "st0x";
       ExecStart = builtins.concatStringsSep " " [
         "${cfg.profilePath}/bin/${cfg.bin}"
         "--config"
@@ -48,7 +48,6 @@ let
       ];
       Restart = "always";
       RestartSec = 5;
-      ReadWritePaths = [ "/mnt/data" ];
     };
   };
 
@@ -147,7 +146,12 @@ in {
           };
         in {
           "/".tryFiles = "$uri $uri/ /index.html";
-          "/api/alpaca/ws" = wsProxy 8081;
+          # The dashboard frontend opens ws://host/api/<broker>/ws — the
+          # `broker` segment is a frontend-side discriminator, not a
+          # backend route. Nginx rewrites both onto the single
+          # `/api/ws` endpoint served by the hedge server on 8001.
+          "/api/alpaca/ws" = wsProxy 8001;
+          "/api/schwab/ws" = wsProxy 8001;
         };
       };
     };
@@ -165,7 +169,14 @@ in {
     };
   };
 
-  users.users.root.openssh.authorizedKeys.keys = envRoles.ssh;
+  users = {
+    users.root.openssh.authorizedKeys.keys = envRoles.ssh;
+    users.st0x = {
+      isSystemUser = true;
+      group = "st0x";
+    };
+    groups.st0x = { };
+  };
 
   networking.firewall = {
     enable = true;
@@ -198,7 +209,6 @@ in {
     };
   };
 
-  users.groups.st0x = { };
   programs.bash.interactiveShellInit = "set -o vi";
 
   age.secrets = {
@@ -212,7 +222,10 @@ in {
       mode = "0400";
     };
   };
-  systemd.tmpfiles.rules = [ "d /mnt/data/grafana 0750 grafana grafana -" ];
+  systemd.tmpfiles.rules = [
+    "d /mnt/data 0755 st0x st0x -"
+    "d /mnt/data/grafana 0750 grafana grafana -"
+  ];
   systemd.services = lib.mapAttrs mkService enabledServices;
 
   environment.systemPackages = with pkgs; [
@@ -227,8 +240,27 @@ in {
     cli
   ];
 
-  system.activationScripts.per-service-profiles.text =
-    "mkdir -p /nix/var/nix/profiles/per-service";
+  system.activationScripts.per-service-profiles.text = ''
+    mkdir -p /nix/var/nix/profiles/per-service
+
+    # Managed services use restartIfChanged = false + ConditionPathExists so
+    # that deploy.nix's per-service profile owns stop/install/restart. But if
+    # a previous deploy left one crash-looping (Restart = always), its failed
+    # state persists into the next activation and switch-to-configuration's
+    # final "units failed" check exits 4, which makes deploy-rs roll back
+    # before it ever reaches the per-service profile that would install the
+    # fix. Stop + reset-failed any managed service that is currently broken
+    # so activation can complete; the service profile restarts it afterwards.
+    for svc in ${
+      builtins.concatStringsSep " " (builtins.attrNames enabledServices)
+    }; do
+      state=$(${pkgs.systemd}/bin/systemctl show -p ActiveState --value "$svc.service" 2>/dev/null || echo "")
+      if [ "$state" = "failed" ] || [ "$state" = "activating" ]; then
+        ${pkgs.systemd}/bin/systemctl stop "$svc.service" 2>/dev/null || true
+        ${pkgs.systemd}/bin/systemctl reset-failed "$svc.service" 2>/dev/null || true
+      fi
+    done
+  '';
 
   system.stateVersion = "24.11";
 }
