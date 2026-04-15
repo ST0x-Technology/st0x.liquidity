@@ -138,19 +138,13 @@ let
 
       resolveHost = ''
         ${parseIdentity}
-        ${if env == "prod" then ''
-          if tailscale status >/dev/null 2>&1; then
-            host_ip="${tailscaleHost}"
-          else
-            ${remoteFile.decrypt}
-            host_ip=$(cat ${remoteFile.path})
-            rm -f ${remoteFile.path}
-          fi
-        '' else ''
+        if tailscale status >/dev/null 2>&1; then
+          host_ip="${tailscaleHost.${env}}"
+        else
           ${remoteFile.decrypt}
           host_ip=$(cat ${remoteFile.path})
           rm -f ${remoteFile.path}
-        ''}
+        fi
       '';
 
     in {

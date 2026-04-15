@@ -49,6 +49,17 @@ jobs:
 
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+
+      - name: Resolve deploy host via Tailscale
+        run: |
+          DEPLOY_HOST=$(nix eval --raw --file keys.nix tailscaleHost.prod)
+          echo "DEPLOY_HOST=$DEPLOY_HOST" >> "$GITHUB_ENV"
+          echo "::add-mask::$DEPLOY_HOST"
+
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh

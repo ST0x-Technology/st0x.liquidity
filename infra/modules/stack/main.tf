@@ -54,15 +54,9 @@ resource "digitalocean_firewall" "st0x" {
   name        = "st0x-liquidity-${var.environment}"
   droplet_ids = [digitalocean_droplet.nixos.id]
 
-  # SSH -- needed for bootstrap (nixos-anywhere) and deploy-rs
-  inbound_rule {
-    protocol         = "tcp"
-    port_range       = "22"
-    source_addresses = ["0.0.0.0/0", "::/0"]
-  }
-
   # Tailscale WireGuard -- must be publicly reachable for NAT traversal.
   # Authentication is handled by WireGuard's Noise protocol, not by IP filtering.
+  # All other access (SSH, dashboard) goes through the tailnet.
   inbound_rule {
     protocol         = "udp"
     port_range       = "41641"
