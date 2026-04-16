@@ -51,6 +51,11 @@ pub(crate) enum UsdcTransferError {
          filled_quantity is missing"
     )]
     MissingFilledQuantity { order_id: uuid::Uuid },
+    #[error(
+        "Conversion order {order_id} filled but \
+         filled_average_price is missing"
+    )]
+    MissingFilledAveragePrice { order_id: uuid::Uuid },
 }
 
 impl From<SendError<crate::usdc_rebalance::UsdcRebalance>> for UsdcTransferError {

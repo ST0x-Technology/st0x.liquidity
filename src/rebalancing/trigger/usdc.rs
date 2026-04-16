@@ -247,13 +247,13 @@ impl RebalancingTrigger {
 
             ConversionConfirmed {
                 direction: RebalanceDirection::BaseToAlpaca,
-                filled_amount,
+                conversion,
                 ..
             } => {
                 self.complete_usdc_rebalance(
                     &id,
                     UsdcTrackingEvent::ConversionConfirmed,
-                    *filled_amount,
+                    conversion.received_amount,
                 )
                 .await?;
             }
