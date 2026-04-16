@@ -1,4 +1,4 @@
-//! Mock implementation of CrossVenueTransfer for equity, used in testing.
+//! Mock implementation of `CrossVenueTransfer` for equity, used in testing.
 
 use async_trait::async_trait;
 use std::sync::Mutex;

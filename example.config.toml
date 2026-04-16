@@ -23,8 +23,12 @@ usdc = { mode = "enabled", target = 0.5, deviation = 0.3 }
 # Wallet provider — select via `kind`:
 #   "turnkey"     — Turnkey secure enclave signing   (requires --features wallet-turnkey)
 #   "private-key" — local raw private key signing     (requires --features wallet-private-key)
+#
+# The `kind` here must match `[rebalancing.wallet].kind` in the secrets file.
+# For "private-key", `address` must match the address derived from the secret key.
 [rebalancing.wallet]
 kind = "private-key"
+address = "0xfcad0b19bb29d4674531d6f115237e16afce377c"
 
 # For kind = "turnkey", use instead:
 # [rebalancing.wallet]
@@ -44,3 +48,4 @@ rebalancing = "disabled"
 rebalancing = "enabled"
 # vault_id = "0xcd34"
 # operational_limit = 10000.0
+# reserved = 50000.0

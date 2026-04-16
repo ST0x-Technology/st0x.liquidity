@@ -248,6 +248,7 @@ impl AlpacaBrokerMock {
     pub async fn start(
         symbol_fill_prices: Vec<(Symbol, Float)>,
         symbol_positions: Vec<MockPosition>,
+        #[builder(default = float!(100000))] initial_cash: Float,
     ) -> Self {
         let today = Utc::now().format("%Y-%m-%d").to_string();
 
@@ -265,8 +266,8 @@ impl AlpacaBrokerMock {
 
         let state = Arc::new(Mutex::new(MockState {
             account: MockAccount {
-                cash: float!(100000),
-                buying_power: float!(100000),
+                cash: initial_cash,
+                buying_power: initial_cash,
                 positions,
             },
             orders: HashMap::new(),
@@ -286,6 +287,7 @@ impl AlpacaBrokerMock {
         Self { server, state }
     }
 
+    #[must_use]
     pub fn base_url(&self) -> String {
         self.server.base_url()
     }
@@ -297,6 +299,7 @@ impl AlpacaBrokerMock {
     /// The conductor resolves all Alpaca services (broker, tokenization,
     /// wallet) from `AlpacaBrokerApiCtx.base_url()`, which points at this
     /// mock server in e2e tests.
+    #[must_use]
     pub fn server(&self) -> &MockServer {
         &self.server
     }
@@ -349,6 +352,7 @@ impl AlpacaBrokerMock {
     }
 
     /// Returns a snapshot of all orders placed through this mock.
+    #[must_use]
     pub fn orders(&self) -> Vec<MockOrderSnapshot> {
         let state = lock(&self.state);
         state
@@ -392,6 +396,7 @@ impl AlpacaBrokerMock {
     }
 
     /// Returns a snapshot of all wallet transfers.
+    #[must_use]
     pub fn wallet_transfers(&self) -> Vec<MockWalletTransferSnapshot> {
         let state = lock(&self.state);
         state
@@ -408,6 +413,7 @@ impl AlpacaBrokerMock {
     }
 
     /// Returns a snapshot of all current positions.
+    #[must_use]
     pub fn positions(&self) -> Vec<MockPositionSnapshot> {
         let state = lock(&self.state);
         state
@@ -427,10 +433,16 @@ impl AlpacaBrokerMock {
     /// wallet transfer records in mock state so the bot's deposit polling
     /// succeeds.
     ///
-    /// In the BaseToAlpaca flow, CCTP mints USDC to `mint_recipient` (the
-    /// bot's Ethereum wallet). The bot then polls Alpaca for a deposit
-    /// matching the mint tx hash. This watcher simulates Alpaca detecting
-    /// the on-chain mint and creating the corresponding transfer record.
+    /// In the `BaseToAlpaca` flow, CCTP mints USDC to `mint_recipient`
+    /// (the bot's Ethereum wallet). The bot then polls Alpaca for a
+    /// deposit matching the mint tx hash. This watcher simulates Alpaca
+    /// detecting the on-chain mint and creating the corresponding
+    /// transfer record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the provider fails to fetch the current block
+    /// number.
     pub async fn start_deposit_watcher<P>(
         &self,
         provider: P,

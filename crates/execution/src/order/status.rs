@@ -8,6 +8,7 @@ pub enum OrderStatus {
 }
 
 impl OrderStatus {
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "PENDING",
