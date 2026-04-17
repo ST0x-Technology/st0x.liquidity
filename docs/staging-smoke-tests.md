@@ -240,57 +240,158 @@ for round in 1..=max_rounds:
 | `min_amount`     | 0.1 shares | `--min-amount`        |
 | `max_amount`     | 1.0 shares | `--max-amount`        |
 
-### Phase 3: Observation Window
+### Phase 3: Observation & Assertions
 
-After the trade phase, wait for the bot to finish processing:
+The smoke test connects to the bot's WebSocket (`/api/ws`) to observe its
+reaction in real time. On connect, the bot sends a `CurrentState` snapshot
+containing recent trades, inventory, positions, active transfers, and settings.
+After that, it streams events: `TradeFill`, `PositionUpdate`,
+`InventorySnapshot`, and `TransferUpdate`.
 
-1. **Wait for hedging**: poll Alpaca sandbox for new orders matching the trades
-   we generated. Timeout: 120 seconds (real broker fills take longer than
-   mocks).
-2. **Wait for rebalancing** (if triggered): monitor vault balances for
-   mint/redeem activity. Timeout: 10 minutes (tokenization + CCTP bridging can
-   take minutes).
+The smoke test correlates each onchain trade it placed with the bot's response.
 
-### Phase 4: Assertions
+#### 3a. Counter-Trading Assertions
 
-Assertions are **softer** than e2e tests because we don't control fill prices or
-timing:
+For **each trade the smoke test places onchain**, assert that the bot:
 
-| Assertion                   | e2e (strict)         | Smoke (relaxed)                   |
-| --------------------------- | -------------------- | --------------------------------- |
-| Hedge placed for each trade | Exact match          | Within 120s, correct direction    |
-| Fill price                  | Exact mock price     | Within 5% of market price         |
-| Position net-zero           | Exact zero           | Within threshold tolerance        |
-| Rebalancing triggered       | Exact event sequence | Vault balance moved toward target |
-| No bot crash                | Task panics          | Health endpoint still 200         |
+1. **Detects the onchain fill**: a `TradeFill` event with `venue: Raindex`
+   appears for the correct symbol and direction. The smoke test knows the
+   tx_hash it submitted, so it can match against the trade's `id`
+   (`tx_hash:log_index`). **Timeout: 60s** (block propagation + WebSocket
+   delivery).
 
-**Hard failures** (test fails immediately):
+2. **Places the opposite hedge on Alpaca**: a second `TradeFill` event with
+   `venue: Alpaca` appears for the same symbol with the **opposite direction**.
+   If the onchain trade was a SellEquity (user sold equity to bot), the bot
+   should buy on Alpaca. If BuyEquity, bot should sell on Alpaca. **Timeout:
+   120s** (real Alpaca order placement + fill).
 
-- Bot health check returns non-200
-- Smoke wallet runs out of funds mid-test
-- Trade revert on a vault that should have liquidity
-- No hedge activity after 120s for any trade
+3. **Position converges toward zero**: after the hedge fill, the
+   `PositionUpdate` for that symbol should show `net` within the configured
+   execution threshold of zero. The bot batches hedges by threshold, so `net`
+   won't be exactly zero after every single trade -- but it should never grow
+   unbounded. Assert: `|position.net| <= execution_threshold` after the hedge
+   fills.
 
-**Soft warnings** (logged, not failures):
+4. **Hedge direction is correct**: for every Alpaca `TradeFill`, verify the
+   direction is opposite to the accumulated net position. A positive net
+   (accumulated long) must produce a sell hedge; negative net must produce a buy
+   hedge.
 
-- Fill price deviation > 2%
-- Rebalancing not triggered (may be below threshold)
-- Hedge latency > 30s (slow but not broken)
+**Tracking state:** The smoke test maintains a local ledger:
 
-### Phase 5: Report
+```
+per_symbol:
+  onchain_trades: [(tx_hash, direction, shares, timestamp)]
+  alpaca_fills:   [(order_id, direction, shares, timestamp)]
+  position_net:   Float  (from PositionUpdate events)
+```
 
-Print a summary:
+After the trade phase ends and the observation window closes, assert:
+
+- Every onchain trade has a matching Alpaca fill (by symbol + opposite
+  direction)
+- `position.net` for each symbol is within threshold of zero
+- Total Alpaca fill shares approximately equal total onchain trade shares
+  (within Alpaca's 9-decimal truncation epsilon)
+
+#### 3b. Rebalancing Assertions (When Enabled)
+
+If rebalancing is enabled for the test assets, the smoke test additionally
+asserts that inventory stays balanced. The bot streams `InventorySnapshot`
+events containing per-symbol breakdowns:
+
+```
+SymbolInventory {
+  symbol, onchain_available, onchain_inflight,
+  offchain_available, offchain_inflight
+}
+```
+
+**Equity rebalancing assertions:**
+
+1. **Imbalance detection**: after sustained one-directional trading (e.g., many
+   SellEquity fills drain offchain inventory), the ratio
+   `onchain / (onchain + offchain)` should deviate beyond `target +/- deviation`
+   (default 0.5 +/- 0.2).
+
+2. **Transfer initiated**: a `TransferUpdate` event should appear with the
+   correct type:
+   - Too much offchain (ratio < 0.3) -> `Mint` transfer (Alpaca -> tokenize ->
+     wrap -> deposit into Raindex)
+   - Too much onchain (ratio > 0.7) -> `Redemption` transfer (Raindex -> unwrap
+     -> send to Alpaca redemption wallet)
+
+3. **Transfer completes**: the `TransferUpdate` should reach terminal state
+   (`Completed`). **Timeout: 10 minutes** (tokenization API + onchain
+   transactions).
+
+4. **Inventory converges**: after the transfer completes, the next
+   `InventorySnapshot` should show the ratio moved back toward the target (0.5).
+   Assert: `|ratio - target| < deviation` eventually.
+
+**USDC rebalancing assertions:**
+
+1. **Cash imbalance detection**: `UsdcInventory` ratio
+   `onchain / (onchain + offchain)` deviates beyond threshold.
+
+2. **Bridge initiated**: a `TransferUpdate` of type USDC bridge appears:
+   - Too much onchain -> `BaseToAlpaca` (withdraw from Raindex, CCTP bridge Base
+     -> Ethereum, deposit into Alpaca)
+   - Too much offchain -> `AlpacaToBase` (convert USD -> USDC on Alpaca,
+     withdraw, CCTP bridge Ethereum -> Base, deposit into Raindex)
+
+3. **Bridge completes**: transfer reaches `Completed`. **Timeout: 15 minutes**
+   (CCTP attestation ~40-70s + Alpaca withdrawal processing).
+
+4. **USDC inventory converges**: ratio moves back toward target.
+
+#### 3c. Invariant Assertions (Continuous)
+
+These are checked throughout the entire test, not just after trades:
+
+1. **Bot stays alive**: WebSocket connection remains open. If the connection
+   drops, attempt reconnect once. If it fails again, the test fails.
+
+2. **No stuck transfers**: any `TransferUpdate` that enters a non-terminal state
+   must reach a terminal state (`Completed` or `Failed`) within
+   `transfer_timeout_secs` (default 1800s / 30 min). A transfer stuck in
+   `Minting`, `Bridging`, etc. beyond this window is a hard failure.
+
+3. **No position blowup**: `|position.net|` for any symbol must never exceed a
+   safety bound (e.g., 50 shares). If the bot stops hedging, this catches it
+   before real exposure accumulates.
+
+4. **Inventory consistency**: `onchain_available` and `offchain_available` in
+   `InventorySnapshot` must never go negative.
+
+5. **Smoke wallet solvency**: before each trade, check the smoke wallet has
+   sufficient balance to take the order. If not, skip the round and log a
+   warning. If the wallet is empty for 5 consecutive rounds, fail (the
+   round-robin should keep it funded).
+
+### Phase 4: Report
+
+Print a summary after the observation window closes:
 
 ```
 Staging Smoke Test Report
 =========================
-Duration:        4m 12s
-Trades placed:   50 (25 RKLB, 25 SGOV)
-Trades filled:   48 (2 reverted - vault drain, refilled by rebalance)
-Hedges observed: 48/48
-Avg hedge delay:  8.3s
-Rebalances:      2 (1 equity mint, 1 USDC bridge)
-Bot status:      healthy
+Duration:           4m 12s
+Trades placed:      50 (25 RKLB, 25 SGOV)
+Trades filled:      48 (2 reverted - vault drain, refilled by rebalance)
+Hedges observed:    48/48
+Avg hedge latency:  8.3s
+Max hedge latency:  23.1s
+Position RKLB net:  0.00 (threshold: 1.0)
+Position SGOV net:  -0.12 (threshold: 1.0)
+Rebalances:         2 (1 equity mint, 1 USDC bridge)
+Transfers completed: 2/2
+Inventory RKLB:     52% onchain / 48% offchain (target: 50%)
+Inventory SGOV:     49% onchain / 51% offchain (target: 50%)
+USDC:               55% onchain / 45% offchain (target: 50%)
+Bot status:         healthy (WebSocket connected)
+Warnings:           1 (hedge latency > 30s on round 17)
 
 RESULT: PASS
 ```
