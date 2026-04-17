@@ -49,10 +49,10 @@ The staging bot has two assets with `trading = "enabled"`:
 
 ### Broker
 
-- **Alpaca Broker API** in **sandbox mode**
-- The staging bot already uses sandbox credentials
-- Sandbox provides paper trading with real API behavior (rate limits, order
-  lifecycle, position tracking) but no real money
+- **Alpaca Broker API** in **production mode** (real money, real orders)
+- Staging uses the real Alpaca API -- not sandbox -- which is why we restrict
+  testing to low-value assets (RKLB, SGOV) and small amounts
+- All trades are real executions with real settlement
 
 ### CCTP
 
@@ -67,7 +67,7 @@ The staging bot has two assets with `trading = "enabled"`:
 | Component    | e2e (current)                        | Smoke test (proposed)                 |
 | ------------ | ------------------------------------ | ------------------------------------- |
 | Chains       | Local Anvil (fresh state)            | Base mainnet (persistent state)       |
-| Broker       | `AlpacaBrokerMock` (httpmock)        | Real Alpaca sandbox API               |
+| Broker       | `AlpacaBrokerMock` (httpmock)        | Real Alpaca production API            |
 | Tokenization | `AlpacaTokenizationMock`             | Real Alpaca tokenization API          |
 | CCTP         | `CctpAttestationMock` (local signer) | Real Circle attestation service       |
 | Contracts    | Freshly deployed per test            | Existing staging contracts            |
@@ -102,8 +102,8 @@ The smoke test observes the bot's behavior through:
 1. **Bot HTTP API** (`/health`, `/inventory`, dashboard WebSocket) -- confirms
    the bot is alive and processing
 2. **Onchain state** -- vault balances, token balances, transaction receipts
-3. **Alpaca sandbox API** -- broker positions, order history, account state
-   (using the same sandbox credentials)
+3. **Alpaca API** -- broker positions, order history, account state (using the
+   same production credentials as the staging bot)
 
 The smoke test does **not** read the bot's SQLite database directly (it runs on
 a remote server). All assertions use externally observable state.
@@ -353,13 +353,15 @@ Add a `nix run .#smoke-test` command that:
 
 - **Smoke wallet holds real assets** (small amounts on Base mainnet). Key must
   be encrypted at rest (agenix) and only decrypted on the staging server.
-- **Alpaca sandbox credentials** are already managed via agenix. The smoke test
-  reuses them read-only (observing positions/orders). It does **not** place
-  broker orders -- that's the bot's job.
-- **No production access**: the smoke test targets staging config only. A
-  runtime guard should reject `--config` paths not containing "staging".
-- **Rate limiting**: Alpaca sandbox has rate limits. The observation polling
-  should use 2-5s intervals, not 200ms like e2e tests.
+- **Alpaca production credentials** are already managed via agenix. The smoke
+  test reuses them read-only (observing positions/orders). It does **not** place
+  broker orders -- that's the bot's job. Since this is a real broker account,
+  the small trade sizes and low-value assets (RKLB, SGOV) are the primary risk
+  controls.
+- **No production bot interference**: the smoke test targets staging config
+  only. A runtime guard should reject `--config` paths not containing "staging".
+- **Rate limiting**: Alpaca production API has rate limits. The observation
+  polling should use 2-5s intervals, not 200ms like e2e tests.
 
 ## Open Questions
 
