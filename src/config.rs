@@ -832,6 +832,23 @@ pub(crate) mod tests {
         file
     }
 
+    fn minimal_config_toml_without_order_owner() -> NamedTempFile {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(
+            br#"
+            database_url = ":memory:"
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            deployment_block = 1
+        "#,
+        )
+        .unwrap();
+        file
+    }
+
     /// Minimal config with `[broker.travel_rule]` included, for tests
     /// that use Alpaca Broker API secrets (which now require travel rule
     /// at startup).
@@ -887,6 +904,21 @@ pub(crate) mod tests {
         )
         .unwrap();
         file
+    }
+
+    fn unsupported_schwab_secrets_toml() -> NamedTempFile {
+        toml_file(
+            r#"
+            [evm]
+            ws_rpc_url = "ws://localhost:8545"
+
+            [broker]
+            type = "schwab"
+            app_key = "test_key"
+            app_secret = "test_secret"
+            encryption_key = "0x0000000000000000000000000000000000000000000000000000000000000000"
+        "#,
+        )
     }
 
     fn example_config_toml() -> &'static Path {
@@ -1159,6 +1191,7 @@ pub(crate) mod tests {
 
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            transfer_timeout_secs = 1800
 
             [rebalancing.wallet]
             kind = "private-key"
@@ -1222,6 +1255,91 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn rebalancing_with_schwab_fails() {
+        let secrets = toml_file(
+            r#"
+            [evm]
+            ws_rpc_url = "ws://localhost:8545"
+
+            [broker]
+            type = "schwab"
+            app_key = "test_key"
+            app_secret = "test_secret"
+            encryption_key = "0x0000000000000000000000000000000000000000000000000000000000000000"
+
+            [rebalancing]
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://mainnet.infura.io"
+
+            [rebalancing.wallet]
+            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        "#,
+        );
+
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            deployment_block = 1
+
+            [rebalancing]
+            redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            transfer_timeout_secs = 1800
+
+            [rebalancing.wallet]
+            kind = "private-key"
+            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+            [rebalancing.equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [rebalancing.usdc]
+            mode = "enabled"
+            target = "0.5"
+            deviation = "0.3"
+        "#,
+        );
+
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, CtxError::SecretsToml { .. }),
+            "Expected unsupported Schwab broker secrets to fail during parsing, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_schwab_broker_without_order_owner_fails_during_secret_parsing() {
+        let config = minimal_config_toml_without_order_owner();
+        let secrets = unsupported_schwab_secrets_toml();
+        let result = Ctx::load_files(config.path(), secrets.path()).await;
+        assert!(
+            matches!(result, Err(CtxError::SecretsToml { .. })),
+            "Expected unsupported Schwab broker secrets to fail during parsing, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_schwab_broker_with_order_owner_fails_during_secret_parsing() {
+        let config = minimal_config_toml();
+        let secrets = unsupported_schwab_secrets_toml();
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            "failed to parse secrets",
+            "Unsupported Schwab broker should be rejected during secrets parsing"
+        );
+    }
+
+    #[tokio::test]
     async fn example_config_and_secrets_parse_successfully() {
         let ctx = Ctx::load_files(example_config_toml(), example_secrets_toml())
             .await
@@ -1263,6 +1381,7 @@ pub(crate) mod tests {
 
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            transfer_timeout_secs = 1800
 
             [rebalancing.wallet]
             kind = "private-key"
@@ -1425,6 +1544,7 @@ pub(crate) mod tests {
 
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            transfer_timeout_secs = 1800
 
             [rebalancing.wallet]
             kind = "private-key"
@@ -1605,6 +1725,68 @@ pub(crate) mod tests {
     fn config_error_kind_invalid_threshold() {
         let err = CtxError::InvalidThreshold(InvalidThresholdError::ZeroDollarValue);
         assert_eq!(err.kind(), "invalid execution threshold");
+    }
+
+    #[tokio::test]
+    async fn rebalancing_with_schwab_logs_error_kind() {
+        let secrets = toml_file(
+            r#"
+            [evm]
+            ws_rpc_url = "ws://localhost:8545"
+
+            [broker]
+            type = "schwab"
+            app_key = "test_key"
+            app_secret = "test_secret"
+            encryption_key = "0x0000000000000000000000000000000000000000000000000000000000000000"
+
+            [rebalancing]
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://mainnet.infura.io"
+
+            [rebalancing.wallet]
+            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        "#,
+        );
+
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            deployment_block = 1
+
+            [rebalancing]
+            redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            transfer_timeout_secs = 1800
+
+            [rebalancing.wallet]
+            kind = "private-key"
+            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+            [rebalancing.equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [rebalancing.usdc]
+            mode = "enabled"
+            target = "0.5"
+            deviation = "0.3"
+        "#,
+        );
+
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::SecretsToml { .. }),
+            "expected unsupported Schwab broker secrets to fail during parsing, got: {error:?}"
+        );
+        assert_eq!(error.kind(), "failed to parse secrets");
     }
 
     #[tokio::test]

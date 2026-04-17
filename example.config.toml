@@ -17,6 +17,9 @@ deployment_block = 1
 
 [rebalancing]
 redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+# transfer timeout in seconds before stuck inflight state is tombstoned and cleared
+# 1800 = 30 minutes
+transfer_timeout_secs = 1800
 equity = { target = 0.5, deviation = 0.2 }
 usdc = { mode = "enabled", target = 0.5, deviation = 0.3 }
 

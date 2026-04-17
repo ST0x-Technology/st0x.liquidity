@@ -16,6 +16,7 @@ use serde_json::json;
 use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 
 use rain_math_float::Float;
@@ -119,6 +120,7 @@ fn test_trigger_config() -> RebalancingTriggerConfig {
             target: float!(0.5),
             deviation: float!(0.2),
         }),
+        transfer_timeout: Duration::from_secs(30 * 60),
         assets: AssetsConfig {
             equities: EquitiesConfig {
                 operational_limit: None,
@@ -1289,6 +1291,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
             target: float!(0.5),
             deviation: float!(0.2),
         }),
+        transfer_timeout: Duration::from_secs(30 * 60),
         assets,
         disabled_assets: HashSet::new(),
     };
@@ -1418,6 +1421,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
             target: float!(0.5),
             deviation: float!(0.2),
         }),
+        transfer_timeout: Duration::from_secs(30 * 60),
         assets,
         disabled_assets: HashSet::new(),
     };
@@ -1519,6 +1523,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
                 target: float!(0.5),
                 deviation: float!(0.4),
             }),
+            transfer_timeout: Duration::from_secs(30 * 60),
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
                 cash: Some(CashAssetConfig {
@@ -1578,6 +1583,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
                 target: float!(0.5),
                 deviation: float!(0.1),
             }),
+            transfer_timeout: Duration::from_secs(30 * 60),
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
                 cash: Some(CashAssetConfig {

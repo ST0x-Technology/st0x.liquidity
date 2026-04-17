@@ -16,6 +16,9 @@ deployment_block = 43259507
 
 [rebalancing]
 redemption_wallet = "0x1c66D6708914C40239D54919320b4C48cAE3D1A9"
+# transfer timeout in seconds before stuck inflight state is tombstoned and cleared
+# 1800 = 30 minutes
+transfer_timeout_secs = 1800
 # started implementing a proper noop, realized there are more things
 # to improve about the config, so decided on soft noop for now
 equity = { target = 0.5, deviation = 1 }

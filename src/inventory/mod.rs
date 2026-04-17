@@ -11,6 +11,7 @@ pub(crate) use broadcasting::BroadcastingInventory;
 pub(crate) use polling::{InventoryPollingService, WalletPollingCtx};
 pub(crate) use projection::InventoryProjection;
 pub(crate) use snapshot::InventorySnapshot;
+pub(crate) use venue_balance::InventoryError;
 pub use view::ImbalanceThreshold;
 pub(crate) use view::{
     EquityImbalanceError, Imbalance, Inventory, InventoryView, InventoryViewError, Operator,

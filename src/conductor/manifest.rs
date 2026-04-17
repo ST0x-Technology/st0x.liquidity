@@ -118,6 +118,7 @@ impl QueryManifest {
 mod tests {
     use alloy::primitives::Address;
     use std::collections::{BTreeMap, HashSet};
+    use std::time::Duration;
     use tokio::sync::{broadcast, mpsc};
 
     use st0x_event_sorcery::test_store;
@@ -144,6 +145,7 @@ mod tests {
                 target: float!(0.6),
                 deviation: float!(0.15),
             }),
+            transfer_timeout: Duration::from_secs(30 * 60),
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
                 cash: None,

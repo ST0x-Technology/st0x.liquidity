@@ -841,6 +841,44 @@ impl InventoryView {
         })
     }
 
+    pub(crate) fn clear_equity_inflight(
+        self,
+        symbol: &Symbol,
+        venue: Venue,
+        now: DateTime<Utc>,
+    ) -> Result<Self, InventoryViewError> {
+        let Some(inventory) = self.equities.get(symbol).cloned() else {
+            return Ok(self);
+        };
+
+        let cleared = Inventory::set_inflight(venue, FractionalShares::ZERO)(inventory)?;
+        let cleared = Inventory::with_last_rebalancing(now)(cleared)?;
+
+        let mut equities = self.equities;
+        equities.insert(symbol.clone(), cleared);
+
+        Ok(Self {
+            equities,
+            last_updated: now,
+            usdc: self.usdc,
+        })
+    }
+
+    pub(crate) fn clear_usdc_inflight(
+        self,
+        venue: Venue,
+        now: DateTime<Utc>,
+    ) -> Result<Self, InventoryViewError> {
+        let cleared = Inventory::set_inflight(venue, Usdc::ZERO)(self.usdc)?;
+        let cleared = Inventory::with_last_rebalancing(now)(cleared)?;
+
+        Ok(Self {
+            usdc: cleared,
+            last_updated: now,
+            equities: self.equities,
+        })
+    }
+
     /// Returns the set of symbols that currently have inflight balances
     /// at any venue.
     #[cfg(test)]

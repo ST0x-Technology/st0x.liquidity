@@ -1201,8 +1201,8 @@ async fn pending_requests_filtered_by_wallet() -> anyhow::Result<()> {
 
     let pool = connect_db(&infra.db_path).await?;
 
-    // Verify exactly one mint aggregate completed (the foreign request
-    // didn't cause additional mint operations).
+    // Verify the mint completed and the foreign pending request did not
+    // inflate the conductor's own inflight polling.
     let mint_events = fetch_events_by_type(&pool, "TokenizedEquityMint").await?;
     assert_event_subsequence(
         &mint_events,
@@ -1215,18 +1215,44 @@ async fn pending_requests_filtered_by_wallet() -> anyhow::Result<()> {
         ],
     );
 
-    // Verify only one mint aggregate exists (no spurious second mint
-    // triggered by inflated inflight from the foreign request).
-    let mint_aggregate_ids: std::collections::HashSet<&str> = mint_events
+    let snapshot_events = fetch_events_by_type(&pool, "InventorySnapshot").await?;
+    let inflight_events: Vec<_> = snapshot_events
         .iter()
-        .map(|event| event.aggregate_id.as_str())
+        .filter(|event| event.event_type == "InventorySnapshotEvent::InflightEquity")
         .collect();
-    assert_eq!(
-        mint_aggregate_ids.len(),
-        1,
-        "Expected exactly 1 mint aggregate (foreign wallet request should be filtered), \
-         got {}: {mint_aggregate_ids:?}",
-        mint_aggregate_ids.len(),
+
+    assert!(
+        !inflight_events.is_empty(),
+        "Expected InflightEquity polling events while the mint was pending"
+    );
+
+    let mut saw_aapl_inflight = false;
+
+    for inflight_event in inflight_events {
+        let Some(quantity_value) = inflight_event
+            .payload
+            .get("InflightEquity")
+            .and_then(|inner| inner.get("mints"))
+            .and_then(|mints| mints.get("AAPL"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+
+        saw_aapl_inflight = true;
+
+        let quantity = float!(quantity_value);
+        assert!(
+            quantity.lt(float!(1000))?,
+            "Foreign wallet pending mint should be filtered out of inflight polling, \
+             got AAPL mint quantity {quantity_value} in payload {}",
+            inflight_event.payload,
+        );
+    }
+
+    assert!(
+        saw_aapl_inflight,
+        "Expected at least one InflightEquity snapshot containing the bot's own AAPL mint"
     );
 
     // Verify the foreign request still exists in the mock but was not

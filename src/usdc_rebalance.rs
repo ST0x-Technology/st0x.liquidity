@@ -21,11 +21,19 @@
 //! DEPOSIT PHASE:                                             InitiateDeposit
 //!                                                                      |
 //!                                                                      v
-//!   DepositInitiated --ConfirmDeposit--> DepositConfirmed (success)
-//!          |
-//!          +--FailDeposit--> DepositFailed (failure)
+//!   DepositInitiated --ConfirmDeposit--> DepositConfirmed
+//!          |                                    |
+//!          +--FailDeposit--> DepositFailed      +--BaseToAlpaca--> ConversionInitiated
+//!                                                               |
+//!                                                               v
+//!                                                   ConversionConfirmed (success)
 //!
-//! Terminal states: WithdrawalFailed, BridgingFailed, DepositFailed, DepositConfirmed
+//! Terminal states:
+//! - WithdrawalFailed
+//! - BridgingFailed
+//! - DepositFailed
+//! - DepositConfirmed for AlpacaToBase
+//! - ConversionConfirmed for BaseToAlpaca
 //! ```
 //!
 //! # Direction
@@ -53,8 +61,7 @@
 //! - `BridgingFailed`: Preserves `burn_tx_hash` and `cctp_nonce` when available
 //! - `DepositFailed`: Preserves `deposit_ref` for tracking the failed deposit
 //!
-//! Terminal states (`*Failed`, `DepositConfirmed`) reject all commands to prevent
-//! invalid state transitions.
+//! Terminal states reject all commands to prevent invalid state transitions.
 //!
 //! [`AlpacaWalletService`]: crate::alpaca_wallet::AlpacaWalletService
 

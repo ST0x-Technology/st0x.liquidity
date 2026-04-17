@@ -490,6 +490,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             RebalancingTriggerConfig {
                 equity: rebalancing_ctx.equity,
                 usdc: rebalancing_ctx.usdc,
+                transfer_timeout: rebalancing_ctx.transfer_timeout,
                 assets: deps.ctx.assets.clone(),
                 disabled_assets,
             },
@@ -2692,7 +2693,7 @@ mod tests {
                     target: float!(0.5),
                     deviation: float!(0.2),
                 }),
-
+                transfer_timeout: Duration::from_secs(30 * 60),
                 assets: AssetsConfig {
                     equities: EquitiesConfig::default(),
                     cash: None,
@@ -2782,7 +2783,7 @@ mod tests {
             RebalancingTriggerConfig {
                 equity: threshold,
                 usdc: Some(threshold),
-
+                transfer_timeout: Duration::from_secs(30 * 60),
                 assets: AssetsConfig {
                     equities: EquitiesConfig::default(),
                     cash: None,
@@ -2901,7 +2902,7 @@ mod tests {
                     target: float!(0.5),
                     deviation: float!(0.2),
                 }),
-
+                transfer_timeout: Duration::from_secs(30 * 60),
                 assets: AssetsConfig {
                     equities: EquitiesConfig::default(),
                     cash: None,
@@ -3029,7 +3030,7 @@ mod tests {
                     target: float!(0.5),
                     deviation: float!(0.2),
                 }),
-
+                transfer_timeout: Duration::from_secs(30 * 60),
                 assets: AssetsConfig {
                     equities: EquitiesConfig::default(),
                     cash: None,

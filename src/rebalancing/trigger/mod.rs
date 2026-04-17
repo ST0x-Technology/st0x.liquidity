@@ -10,13 +10,14 @@ use alloy::providers::RootProvider;
 use alloy::rpc::client::RpcClient;
 use alloy::transports::layers::RetryBackoffLayer;
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::{RwLock, mpsc};
-use tracing::{debug, info, warn};
+use std::time::Duration;
+use tokio::sync::{Mutex, RwLock, mpsc};
+use tracing::{debug, error, info, warn};
 use url::Url;
 
 use rain_math_float::Float;
@@ -27,11 +28,11 @@ use st0x_finance::Usdc;
 
 use crate::config::AssetsConfig;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent, RedemptionAggregateId};
-use crate::inventory::projection::{InventoryProjection, InventoryProjectionError};
+use crate::inventory::projection::InventoryProjectionError;
 use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::{
-    BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryViewError, Operator, TransferOp,
-    Venue,
+    BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, InventoryViewError,
+    Operator, TransferOp, Venue,
 };
 use crate::position::{Position, PositionEvent};
 use crate::tokenized_equity_mint::{
@@ -87,6 +88,8 @@ pub(crate) enum TokenAddressError {
 pub enum RebalancingCtxError {
     #[error("rebalancing requires alpaca-broker-api broker type")]
     NotAlpacaBroker,
+    #[error("rebalancing transfer_timeout_secs must be non-zero")]
+    ZeroTransferTimeout,
     #[error("invalid wallet config: {0}")]
     WalletConfig(#[from] toml::de::Error),
     #[error(transparent)]
@@ -151,6 +154,7 @@ impl std::fmt::Debug for RebalancingSecrets {
 pub(crate) struct RebalancingConfig {
     pub(crate) equity: ImbalanceThreshold,
     pub(crate) usdc: UsdcRebalancing,
+    pub(crate) transfer_timeout_secs: u64,
     pub(crate) redemption_wallet: Address,
     pub(crate) wallet: toml::Value,
 }
@@ -168,6 +172,7 @@ pub(crate) struct RebalancingConfig {
 pub struct RebalancingCtx {
     pub(crate) equity: ImbalanceThreshold,
     pub(crate) usdc: Option<ImbalanceThreshold>,
+    pub(crate) transfer_timeout: Duration,
     /// Issuer's wallet for tokenized equity redemptions.
     pub(crate) redemption_wallet: Address,
     pub(crate) alpaca_broker_auth: AlpacaBrokerApiCtx,
@@ -243,6 +248,10 @@ impl RebalancingCtx {
         secrets: RebalancingSecrets,
         broker_auth: AlpacaBrokerApiCtx,
     ) -> Result<Self, RebalancingCtxError> {
+        if config.transfer_timeout_secs == 0 {
+            return Err(RebalancingCtxError::ZeroTransferTimeout);
+        }
+
         let WalletKindTag { kind } = WalletKindTag::deserialize(config.wallet.clone())?;
 
         let (base_wallet, ethereum_wallet) = tokio::try_join!(
@@ -275,6 +284,7 @@ impl RebalancingCtx {
         Ok(Self {
             equity: config.equity,
             usdc,
+            transfer_timeout: Duration::from_secs(config.transfer_timeout_secs),
             redemption_wallet: config.redemption_wallet,
             alpaca_broker_auth: broker_auth,
             base_wallet,
@@ -313,6 +323,7 @@ impl RebalancingCtx {
     pub(crate) fn stub(
         equity: ImbalanceThreshold,
         usdc: Option<ImbalanceThreshold>,
+        #[builder(default = Duration::from_secs(30 * 60))] transfer_timeout: Duration,
         redemption_wallet: Address,
         alpaca_broker_auth: AlpacaBrokerApiCtx,
     ) -> Self {
@@ -321,6 +332,7 @@ impl RebalancingCtx {
         Self {
             equity,
             usdc,
+            transfer_timeout,
             redemption_wallet,
             alpaca_broker_auth,
             base_wallet: wallet.clone(),
@@ -344,6 +356,7 @@ impl RebalancingCtx {
     pub fn with_wallets(
         equity: ImbalanceThreshold,
         usdc: UsdcRebalancing,
+        #[builder(default = Duration::from_secs(30 * 60))] transfer_timeout: Duration,
         redemption_wallet: Address,
         alpaca_broker_auth: AlpacaBrokerApiCtx,
         base_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
@@ -359,6 +372,7 @@ impl RebalancingCtx {
         Self {
             equity,
             usdc,
+            transfer_timeout,
             redemption_wallet,
             alpaca_broker_auth,
             base_wallet,
@@ -408,8 +422,150 @@ impl std::fmt::Debug for RebalancingCtx {
 pub(crate) struct RebalancingTriggerConfig {
     pub(crate) equity: ImbalanceThreshold,
     pub(crate) usdc: Option<ImbalanceThreshold>,
+    pub(crate) transfer_timeout: Duration,
     pub(crate) assets: AssetsConfig,
     pub(crate) disabled_assets: HashSet<Symbol>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MintTrackingStage {
+    Requested,
+    Accepted,
+    TokensReceived,
+    TokensWrapped,
+}
+
+impl std::fmt::Display for MintTrackingStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Requested => write!(formatter, "MintRequested"),
+            Self::Accepted => write!(formatter, "MintAccepted"),
+            Self::TokensReceived => write!(formatter, "TokensReceived"),
+            Self::TokensWrapped => write!(formatter, "TokensWrapped"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MintTracking {
+    symbol: Symbol,
+    quantity: FractionalShares,
+    stage: MintTrackingStage,
+    last_progress_at: DateTime<Utc>,
+}
+
+impl MintTracking {
+    fn from_requested_event(event: &TokenizedEquityMintEvent) -> Option<Self> {
+        let TokenizedEquityMintEvent::MintRequested {
+            symbol,
+            quantity,
+            requested_at,
+            ..
+        } = event
+        else {
+            return None;
+        };
+
+        Some(Self {
+            symbol: symbol.clone(),
+            quantity: FractionalShares::new(*quantity),
+            stage: MintTrackingStage::Requested,
+            last_progress_at: *requested_at,
+        })
+    }
+
+    fn track_progress(&mut self, event: &TokenizedEquityMintEvent) {
+        match event {
+            TokenizedEquityMintEvent::MintAccepted { accepted_at, .. } => {
+                self.stage = MintTrackingStage::Accepted;
+                self.last_progress_at = *accepted_at;
+            }
+            TokenizedEquityMintEvent::TokensReceived { received_at, .. } => {
+                self.stage = MintTrackingStage::TokensReceived;
+                self.last_progress_at = *received_at;
+            }
+            TokenizedEquityMintEvent::TokensWrapped { wrapped_at, .. } => {
+                self.stage = MintTrackingStage::TokensWrapped;
+                self.last_progress_at = *wrapped_at;
+            }
+            TokenizedEquityMintEvent::MintRequested { .. }
+            | TokenizedEquityMintEvent::MintRejected { .. }
+            | TokenizedEquityMintEvent::MintAcceptanceFailed { .. }
+            | TokenizedEquityMintEvent::WrappingFailed { .. }
+            | TokenizedEquityMintEvent::DepositedIntoRaindex { .. }
+            | TokenizedEquityMintEvent::RaindexDepositFailed { .. } => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedemptionTrackingStage {
+    WithdrawnFromRaindex,
+    TokensUnwrapped,
+    TokensSent,
+    Detected,
+}
+
+impl std::fmt::Display for RedemptionTrackingStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WithdrawnFromRaindex => write!(formatter, "WithdrawnFromRaindex"),
+            Self::TokensUnwrapped => write!(formatter, "TokensUnwrapped"),
+            Self::TokensSent => write!(formatter, "TokensSent"),
+            Self::Detected => write!(formatter, "Detected"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RedemptionTracking {
+    symbol: Symbol,
+    quantity: FractionalShares,
+    stage: RedemptionTrackingStage,
+    last_progress_at: DateTime<Utc>,
+}
+
+impl RedemptionTracking {
+    fn from_withdrawn_event(event: &EquityRedemptionEvent) -> Option<Self> {
+        let EquityRedemptionEvent::WithdrawnFromRaindex {
+            symbol,
+            quantity,
+            withdrawn_at,
+            ..
+        } = event
+        else {
+            return None;
+        };
+
+        Some(Self {
+            symbol: symbol.clone(),
+            quantity: FractionalShares::new(*quantity),
+            stage: RedemptionTrackingStage::WithdrawnFromRaindex,
+            last_progress_at: *withdrawn_at,
+        })
+    }
+
+    fn track_progress(&mut self, event: &EquityRedemptionEvent) {
+        match event {
+            EquityRedemptionEvent::TokensUnwrapped { unwrapped_at, .. } => {
+                self.stage = RedemptionTrackingStage::TokensUnwrapped;
+                self.last_progress_at = *unwrapped_at;
+            }
+            EquityRedemptionEvent::TokensSent { sent_at, .. } => {
+                self.stage = RedemptionTrackingStage::TokensSent;
+                self.last_progress_at = *sent_at;
+            }
+            EquityRedemptionEvent::Detected { detected_at, .. } => {
+                self.stage = RedemptionTrackingStage::Detected;
+                self.last_progress_at = *detected_at;
+            }
+            EquityRedemptionEvent::WithdrawnFromRaindex { .. }
+            | EquityRedemptionEvent::TransferFailed { .. }
+            | EquityRedemptionEvent::DetectionFailed { .. }
+            | EquityRedemptionEvent::RedemptionRejected { .. }
+            | EquityRedemptionEvent::Completed { .. } => {}
+        }
+    }
 }
 
 /// Operations triggered by inventory imbalances.
@@ -442,24 +598,38 @@ pub(crate) struct RebalancingTrigger {
     orderbook: Address,
     order_owner: Address,
     inventory: Arc<BroadcastingInventory>,
-    /// Folds snapshot events into the view before threshold checks run.
-    /// Gating the checks on a successful apply keeps stale-view
-    /// rebalancing decisions from slipping past a projection failure.
-    projection: Arc<InventoryProjection>,
     pub(crate) equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
     pub(crate) usdc_in_progress: Arc<AtomicBool>,
     sender: mpsc::Sender<TriggeredOperation>,
     wrapper: Arc<dyn Wrapper>,
     /// Tracks symbol/quantity for in-flight mints. The initial `MintRequested`
     /// event carries this data; follow-up events don't.
-    mint_tracking: Arc<RwLock<HashMap<IssuerRequestId, (Symbol, FractionalShares)>>>,
+    mint_tracking: Arc<RwLock<HashMap<IssuerRequestId, MintTracking>>>,
     /// Tracks symbol/quantity for in-flight redemptions. The initial
     /// `WithdrawnFromRaindex` event carries this data; follow-up events don't.
-    redemption_tracking: Arc<RwLock<HashMap<RedemptionAggregateId, (Symbol, FractionalShares)>>>,
+    redemption_tracking: Arc<RwLock<HashMap<RedemptionAggregateId, RedemptionTracking>>>,
     /// Tracks USDC rebalance lifecycle data needed to settle inventory on
     /// terminal events with the actual amount received.
     usdc_tracking: Arc<RwLock<HashMap<UsdcRebalanceId, usdc::UsdcRebalanceTracking>>>,
+    suppressed_inflight_symbols: Arc<RwLock<HashMap<Symbol, DateTime<Utc>>>>,
+    timed_out_mints: Arc<RwLock<HashMap<IssuerRequestId, DateTime<Utc>>>>,
+    timed_out_redemptions: Arc<RwLock<HashMap<RedemptionAggregateId, DateTime<Utc>>>>,
+    timed_out_usdc_rebalances: Arc<RwLock<HashMap<UsdcRebalanceId, DateTime<Utc>>>>,
+    mint_event_sync: Arc<Mutex<()>>,
+    redemption_event_sync: Arc<Mutex<()>>,
+    usdc_event_sync: Arc<Mutex<()>>,
 }
+
+type EquityInventoryUpdate = Box<
+    dyn FnOnce(
+            Inventory<FractionalShares>,
+        ) -> Result<
+            Inventory<FractionalShares>,
+            crate::inventory::InventoryError<FractionalShares>,
+        > + Send,
+>;
+
+const TIMEOUT_TOMBSTONE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 
 impl RebalancingTrigger {
     pub(crate) fn new(
@@ -471,14 +641,12 @@ impl RebalancingTrigger {
         sender: mpsc::Sender<TriggeredOperation>,
         wrapper: Arc<dyn Wrapper>,
     ) -> Self {
-        let projection = Arc::new(InventoryProjection::new(inventory.clone()));
         Self {
             config,
             vault_registry,
             orderbook,
             order_owner,
             inventory,
-            projection,
             equity_in_progress: Arc::new(std::sync::RwLock::new(HashSet::new())),
             usdc_in_progress: Arc::new(AtomicBool::new(false)),
             sender,
@@ -486,6 +654,381 @@ impl RebalancingTrigger {
             mint_tracking: Arc::new(RwLock::new(HashMap::new())),
             redemption_tracking: Arc::new(RwLock::new(HashMap::new())),
             usdc_tracking: Arc::new(RwLock::new(HashMap::new())),
+            suppressed_inflight_symbols: Arc::new(RwLock::new(HashMap::new())),
+            timed_out_mints: Arc::new(RwLock::new(HashMap::new())),
+            timed_out_redemptions: Arc::new(RwLock::new(HashMap::new())),
+            timed_out_usdc_rebalances: Arc::new(RwLock::new(HashMap::new())),
+            mint_event_sync: Arc::new(Mutex::new(())),
+            redemption_event_sync: Arc::new(Mutex::new(())),
+            usdc_event_sync: Arc::new(Mutex::new(())),
+        }
+    }
+
+    async fn expire_stuck_operations(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<(), RebalancingTriggerError> {
+        self.prune_timeout_markers(now).await;
+        self.expire_stuck_mints(now).await?;
+        self.expire_stuck_redemptions(now).await?;
+        self.expire_stuck_usdc_rebalances(now).await?;
+        Ok(())
+    }
+
+    fn elapsed_since_timeout_start(
+        last_progress_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Option<Duration> {
+        now.signed_duration_since(last_progress_at).to_std().ok()
+    }
+
+    fn timeout_marker_expired(marked_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+        Self::elapsed_since_timeout_start(marked_at, now)
+            .is_some_and(|elapsed| elapsed > TIMEOUT_TOMBSTONE_RETENTION)
+    }
+
+    async fn prune_timeout_markers(&self, now: DateTime<Utc>) {
+        self.suppressed_inflight_symbols
+            .write()
+            .await
+            .retain(|_, cleared_at| !Self::timeout_marker_expired(*cleared_at, now));
+        self.timed_out_mints
+            .write()
+            .await
+            .retain(|_, timed_out_at| !Self::timeout_marker_expired(*timed_out_at, now));
+        self.timed_out_redemptions
+            .write()
+            .await
+            .retain(|_, timed_out_at| !Self::timeout_marker_expired(*timed_out_at, now));
+        self.timed_out_usdc_rebalances
+            .write()
+            .await
+            .retain(|_, timed_out_at| !Self::timeout_marker_expired(*timed_out_at, now));
+    }
+
+    async fn expire_stuck_mints(&self, now: DateTime<Utc>) -> Result<(), RebalancingTriggerError> {
+        let timed_out_ids = {
+            let tracking = self.mint_tracking.read().await;
+            tracking
+                .iter()
+                .filter_map(|(id, tracking)| {
+                    let elapsed =
+                        Self::elapsed_since_timeout_start(tracking.last_progress_at, now)?;
+
+                    if elapsed >= self.config.transfer_timeout {
+                        Some(id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for id in timed_out_ids {
+            let Some((tracking, elapsed)) = self.cleanup_timed_out_mint(&id, now).await? else {
+                continue;
+            };
+
+            error!(
+                aggregate_id = %id,
+                symbol = %tracking.symbol,
+                stage = %tracking.stage,
+                ?elapsed,
+                "Mint transfer timed out; clearing trigger guard and inventory inflight"
+            );
+
+            self.clear_equity_in_progress(&tracking.symbol);
+        }
+
+        Ok(())
+    }
+
+    async fn expire_stuck_redemptions(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<(), RebalancingTriggerError> {
+        let timed_out_ids = {
+            let tracking = self.redemption_tracking.read().await;
+            tracking
+                .iter()
+                .filter_map(|(id, tracking)| {
+                    let elapsed =
+                        Self::elapsed_since_timeout_start(tracking.last_progress_at, now)?;
+
+                    if elapsed >= self.config.transfer_timeout {
+                        Some(id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for id in timed_out_ids {
+            let Some((tracking, elapsed)) = self.cleanup_timed_out_redemption(&id, now).await?
+            else {
+                continue;
+            };
+
+            error!(
+                aggregate_id = %id,
+                symbol = %tracking.symbol,
+                stage = %tracking.stage,
+                ?elapsed,
+                "Redemption transfer timed out; clearing trigger guard and inventory inflight"
+            );
+
+            self.clear_equity_in_progress(&tracking.symbol);
+        }
+
+        Ok(())
+    }
+
+    async fn expire_stuck_usdc_rebalances(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<(), RebalancingTriggerError> {
+        let timed_out_ids = {
+            let tracking = self.usdc_tracking.read().await;
+            tracking
+                .iter()
+                .filter_map(|(id, tracking)| {
+                    let elapsed =
+                        Self::elapsed_since_timeout_start(tracking.last_progress_at, now)?;
+
+                    if elapsed >= self.config.transfer_timeout {
+                        Some(id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for id in timed_out_ids {
+            let Some((tracking, elapsed)) = self.cleanup_timed_out_usdc_rebalance(&id, now).await?
+            else {
+                continue;
+            };
+
+            error!(
+                aggregate_id = %id,
+                direction = ?tracking.direction,
+                stage = %tracking.stage,
+                ?elapsed,
+                "USDC transfer timed out; clearing trigger guard and inventory inflight"
+            );
+
+            self.clear_usdc_in_progress();
+        }
+
+        Ok(())
+    }
+
+    async fn retire_stale_suppression_and_collect_active_symbols(
+        &self,
+        fetched_at: DateTime<Utc>,
+    ) -> HashSet<Symbol> {
+        let mut suppressed_symbols = self.suppressed_inflight_symbols.write().await;
+        suppressed_symbols.retain(|_, cleared_at| *cleared_at >= fetched_at);
+        suppressed_symbols.keys().cloned().collect()
+    }
+
+    fn filter_suppressed_inflight_snapshot(
+        mints: &std::collections::BTreeMap<Symbol, FractionalShares>,
+        redemptions: &std::collections::BTreeMap<Symbol, FractionalShares>,
+        active_suppressed_symbols: &HashSet<Symbol>,
+    ) -> (
+        std::collections::BTreeMap<Symbol, FractionalShares>,
+        std::collections::BTreeMap<Symbol, FractionalShares>,
+    ) {
+        let filtered_mints = mints
+            .iter()
+            .filter(|(symbol, _)| {
+                let keep = !active_suppressed_symbols.contains(*symbol);
+
+                if !keep {
+                    debug!(
+                        %symbol,
+                        "Ignoring inflight mint snapshot after timeout cleanup"
+                    );
+                }
+
+                keep
+            })
+            .map(|(symbol, quantity)| (symbol.clone(), *quantity))
+            .collect();
+
+        let filtered_redemptions = redemptions
+            .iter()
+            .filter(|(symbol, _)| {
+                let keep = !active_suppressed_symbols.contains(*symbol);
+
+                if !keep {
+                    debug!(
+                        %symbol,
+                        "Ignoring inflight redemption snapshot after timeout cleanup"
+                    );
+                }
+
+                keep
+            })
+            .map(|(symbol, quantity)| (symbol.clone(), *quantity))
+            .collect();
+
+        (filtered_mints, filtered_redemptions)
+    }
+
+    async fn cleanup_timed_out_mint(
+        &self,
+        id: &IssuerRequestId,
+        now: DateTime<Utc>,
+    ) -> Result<Option<(MintTracking, Duration)>, RebalancingTriggerError> {
+        let _event_sync_guard = self.mint_event_sync.lock().await;
+        let mut tracking_guard = self.mint_tracking.write().await;
+        let Some(tracking) = tracking_guard.get(id).cloned() else {
+            return Ok(None);
+        };
+
+        let Some(elapsed) = Self::elapsed_since_timeout_start(tracking.last_progress_at, now)
+        else {
+            return Ok(None);
+        };
+
+        if elapsed < self.config.transfer_timeout {
+            return Ok(None);
+        }
+
+        let mut inventory = self.inventory.write().await;
+        *inventory =
+            inventory
+                .clone()
+                .clear_equity_inflight(&tracking.symbol, Venue::Hedging, now)?;
+        drop(inventory);
+
+        self.timed_out_mints.write().await.insert(id.clone(), now);
+        self.suppressed_inflight_symbols
+            .write()
+            .await
+            .insert(tracking.symbol.clone(), now);
+        tracking_guard.remove(id);
+        drop(tracking_guard);
+
+        Ok(Some((tracking, elapsed)))
+    }
+
+    async fn cleanup_timed_out_redemption(
+        &self,
+        id: &RedemptionAggregateId,
+        now: DateTime<Utc>,
+    ) -> Result<Option<(RedemptionTracking, Duration)>, RebalancingTriggerError> {
+        let _event_sync_guard = self.redemption_event_sync.lock().await;
+        let mut tracking_guard = self.redemption_tracking.write().await;
+        let Some(tracking) = tracking_guard.get(id).cloned() else {
+            return Ok(None);
+        };
+
+        let Some(elapsed) = Self::elapsed_since_timeout_start(tracking.last_progress_at, now)
+        else {
+            return Ok(None);
+        };
+
+        if elapsed < self.config.transfer_timeout {
+            return Ok(None);
+        }
+
+        let mut inventory = self.inventory.write().await;
+        *inventory =
+            inventory
+                .clone()
+                .clear_equity_inflight(&tracking.symbol, Venue::MarketMaking, now)?;
+        drop(inventory);
+
+        self.timed_out_redemptions
+            .write()
+            .await
+            .insert(id.clone(), now);
+        self.suppressed_inflight_symbols
+            .write()
+            .await
+            .insert(tracking.symbol.clone(), now);
+        tracking_guard.remove(id);
+        drop(tracking_guard);
+
+        Ok(Some((tracking, elapsed)))
+    }
+
+    async fn cleanup_timed_out_usdc_rebalance(
+        &self,
+        id: &UsdcRebalanceId,
+        now: DateTime<Utc>,
+    ) -> Result<Option<(usdc::UsdcRebalanceTracking, Duration)>, RebalancingTriggerError> {
+        let _event_sync_guard = self.usdc_event_sync.lock().await;
+        let mut tracking_guard = self.usdc_tracking.write().await;
+        let Some(tracking) = tracking_guard.get(id).cloned() else {
+            return Ok(None);
+        };
+
+        let Some(elapsed) = Self::elapsed_since_timeout_start(tracking.last_progress_at, now)
+        else {
+            return Ok(None);
+        };
+
+        if elapsed < self.config.transfer_timeout {
+            return Ok(None);
+        }
+
+        let mut inventory = self.inventory.write().await;
+        *inventory = inventory
+            .clone()
+            .clear_usdc_inflight(tracking.source_venue(), now)?;
+        drop(inventory);
+
+        self.timed_out_usdc_rebalances
+            .write()
+            .await
+            .insert(id.clone(), now);
+        tracking_guard.remove(id);
+        drop(tracking_guard);
+
+        Ok(Some((tracking, elapsed)))
+    }
+
+    async fn mint_timed_out(&self, id: &IssuerRequestId) -> bool {
+        self.timed_out_mints.read().await.contains_key(id)
+    }
+
+    async fn redemption_timed_out(&self, id: &RedemptionAggregateId) -> bool {
+        self.timed_out_redemptions.read().await.contains_key(id)
+    }
+
+    async fn track_mint_progress(&self, id: &IssuerRequestId, event: &TokenizedEquityMintEvent) {
+        let mut tracking = self.mint_tracking.write().await;
+
+        if let Some(existing) = tracking.get_mut(id) {
+            existing.track_progress(event);
+            return;
+        }
+
+        if let Some(created) = MintTracking::from_requested_event(event) {
+            tracking.insert(id.clone(), created);
+        }
+    }
+
+    async fn track_redemption_progress(
+        &self,
+        id: &RedemptionAggregateId,
+        event: &EquityRedemptionEvent,
+    ) {
+        let mut tracking = self.redemption_tracking.write().await;
+
+        if let Some(existing) = tracking.get_mut(id) {
+            existing.track_progress(event);
+            return;
+        }
+
+        if let Some(created) = RedemptionTracking::from_withdrawn_event(event) {
+            tracking.insert(id.clone(), created);
         }
     }
 
@@ -496,7 +1039,232 @@ impl RebalancingTrigger {
         &self,
         event: InventorySnapshotEvent,
     ) -> Result<(), RebalancingTriggerError> {
-        self.projection.apply(&event).await?;
+        let now = Utc::now();
+        let fetched_at = event.timestamp();
+        self.expire_stuck_operations(now).await?;
+
+        let filtered_inflight = match &event {
+            InventorySnapshotEvent::InflightEquity {
+                mints, redemptions, ..
+            } => {
+                let active_suppressed_symbols = self
+                    .retire_stale_suppression_and_collect_active_symbols(fetched_at)
+                    .await;
+
+                Some(Self::filter_suppressed_inflight_snapshot(
+                    mints,
+                    redemptions,
+                    &active_suppressed_symbols,
+                ))
+            }
+            _ => None,
+        };
+
+        let mut inventory = self.inventory.write().await;
+
+        use InventorySnapshotEvent::*;
+        let updated = match &event {
+            OnchainEquity { balances, .. } => {
+                balances
+                    .iter()
+                    .try_fold(inventory.clone(), |view, (symbol, snapshot_balance)| {
+                        view.update_equity(
+                            symbol,
+                            Inventory::on_snapshot(
+                                Venue::MarketMaking,
+                                *snapshot_balance,
+                                fetched_at,
+                            ),
+                            now,
+                        )
+                    })
+            }
+
+            OnchainUsdc { usdc_balance, .. } => inventory.clone().update_usdc(
+                Inventory::on_snapshot(Venue::MarketMaking, *usdc_balance, fetched_at),
+                now,
+            ),
+
+            OffchainEquity { positions, .. } => {
+                positions
+                    .iter()
+                    .try_fold(inventory.clone(), |view, (symbol, snapshot_balance)| {
+                        view.update_equity(
+                            symbol,
+                            Inventory::on_snapshot(Venue::Hedging, *snapshot_balance, fetched_at),
+                            now,
+                        )
+                    })
+            }
+
+            OffchainUsd {
+                usd_balance_cents, ..
+            } => {
+                let usdc = Usdc::from_cents(*usd_balance_cents)
+                    .ok_or(InventoryViewError::UsdBalanceConversion(*usd_balance_cents))?;
+                inventory.clone().update_usdc(
+                    Inventory::on_snapshot(Venue::Hedging, usdc, fetched_at),
+                    now,
+                )
+            }
+
+            EthereumUsdc { .. }
+            | BaseWalletUsdc { .. }
+            | AlpacaWalletUsdc { .. }
+            | BaseWalletUnwrappedEquity { .. }
+            | BaseWalletWrappedEquity { .. } => Ok(inventory.clone()),
+
+            InflightEquity { .. } => {
+                if let Some((mints, redemptions)) = &filtered_inflight {
+                    inventory
+                        .clone()
+                        .apply_inflight_snapshot(mints, redemptions, fetched_at, now)
+                } else {
+                    Ok(inventory.clone())
+                }
+            }
+        }?;
+
+        *inventory = updated;
+        drop(inventory);
+
+        debug!("Applied inventory snapshot event");
+
+        self.check_and_trigger_after_snapshot(&event).await
+    }
+
+    /// Reprocess a snapshot event after the normal handler failed.
+    ///
+    /// Resets the inventory, then force-applies the snapshot --
+    /// bypassing inflight guards that may have caused the
+    /// original failure.
+    async fn on_snapshot_recovery(
+        &self,
+        error: RebalancingTriggerError,
+        event: InventorySnapshotEvent,
+    ) -> Result<(), RebalancingTriggerError> {
+        self.expire_stuck_operations_with_logging().await;
+
+        let inventory_error = match error {
+            RebalancingTriggerError::Inventory(inventory_error) => inventory_error,
+            other @ (RebalancingTriggerError::Projection(_)
+            | RebalancingTriggerError::EquityTrigger(_)
+            | RebalancingTriggerError::Float(_)
+            | RebalancingTriggerError::MissingUsdcTrackingContext { .. }
+            | RebalancingTriggerError::MissingUsdcBridgedAmount { .. }
+            | RebalancingTriggerError::SettledUsdcExceedsInitiatedAmount { .. }) => {
+                return Err(other);
+            }
+        };
+
+        warn!(
+            ?inventory_error,
+            "Resetting inventory and force-applying snapshot to recover"
+        );
+
+        // Wrap in Arc so it can be cloned across multiple force_on_snapshot calls
+        let recovery_reason = Arc::new(inventory_error);
+
+        let now = Utc::now();
+        let filtered_inflight = match &event {
+            InventorySnapshotEvent::InflightEquity {
+                mints,
+                redemptions,
+                fetched_at,
+            } => {
+                let active_suppressed_symbols = self
+                    .retire_stale_suppression_and_collect_active_symbols(*fetched_at)
+                    .await;
+
+                Some(Self::filter_suppressed_inflight_snapshot(
+                    mints,
+                    redemptions,
+                    &active_suppressed_symbols,
+                ))
+            }
+            _ => None,
+        };
+        let mut inventory = self.inventory.write().await;
+        *inventory = InventoryView::default();
+
+        use InventorySnapshotEvent::*;
+        let updated = match &event {
+            OnchainEquity { balances, .. } => {
+                balances
+                    .iter()
+                    .try_fold(inventory.clone(), |view, (symbol, snapshot_balance)| {
+                        view.update_equity(
+                            symbol,
+                            Inventory::force_on_snapshot(
+                                Venue::MarketMaking,
+                                *snapshot_balance,
+                                recovery_reason.clone(),
+                            ),
+                            now,
+                        )
+                    })
+            }
+
+            OnchainUsdc { usdc_balance, .. } => inventory.clone().update_usdc(
+                Inventory::force_on_snapshot(
+                    Venue::MarketMaking,
+                    *usdc_balance,
+                    recovery_reason.clone(),
+                ),
+                now,
+            ),
+
+            OffchainEquity { positions, .. } => {
+                positions
+                    .iter()
+                    .try_fold(inventory.clone(), |view, (symbol, snapshot_balance)| {
+                        view.update_equity(
+                            symbol,
+                            Inventory::force_on_snapshot(
+                                Venue::Hedging,
+                                *snapshot_balance,
+                                recovery_reason.clone(),
+                            ),
+                            now,
+                        )
+                    })
+            }
+
+            OffchainUsd {
+                usd_balance_cents, ..
+            } => {
+                let usdc = Usdc::from_cents(*usd_balance_cents)
+                    .ok_or(InventoryViewError::UsdBalanceConversion(*usd_balance_cents))?;
+                inventory.clone().update_usdc(
+                    Inventory::force_on_snapshot(Venue::Hedging, usdc, recovery_reason),
+                    now,
+                )
+            }
+
+            EthereumUsdc { .. }
+            | BaseWalletUsdc { .. }
+            | AlpacaWalletUsdc { .. }
+            | BaseWalletUnwrappedEquity { .. }
+            | BaseWalletWrappedEquity { .. } => Ok(inventory.clone()),
+
+            // Recovery for inflight snapshots: forward the original fetched_at
+            // so is_stale_for_symbol still rejects pre-rebalancing polls.
+            InflightEquity { fetched_at, .. } => {
+                if let Some((mints, redemptions)) = &filtered_inflight {
+                    inventory
+                        .clone()
+                        .apply_inflight_snapshot(mints, redemptions, *fetched_at, now)
+                } else {
+                    Ok(inventory.clone())
+                }
+            }
+        }?;
+
+        *inventory = updated;
+        drop(inventory);
+
+        debug!("Force-applied inventory snapshot after recovery");
+
         self.check_and_trigger_after_snapshot(&event).await
     }
 
@@ -622,30 +1390,34 @@ impl Reactor for RebalancingTrigger {
             .on(|id, event| async move { self.on_mint(id, event).await })
             .on(|id, event| async move { self.on_redemption(id, event).await })
             .on(|id, event| async move { self.on_usdc_rebalance(id, event).await })
-            .on(|_id, event| async move { self.on_snapshot(event).await })
+            .on(|_id, event| async move {
+                let recovery_event = event.clone();
+
+                match self.on_snapshot(event).await {
+                    Ok(()) => Ok(()),
+                    Err(error) => self.on_snapshot_recovery(error, recovery_event).await,
+                }
+            })
             .exhaustive()
             .await
     }
 }
 
 impl RebalancingTrigger {
-    /// Checks inventory for equity imbalance and triggers operation if needed.
-    pub(crate) async fn check_and_trigger_equity(
+    async fn expire_stuck_operations_with_logging(&self) {
+        if let Err(error) = self.expire_stuck_operations(Utc::now()).await {
+            error!(?error, "Failed to expire stuck rebalancing operations");
+        }
+    }
+
+    fn try_claim_equity_guard(&self, symbol: &Symbol) -> Option<equity::InProgressGuard> {
+        equity::InProgressGuard::try_claim(symbol.clone(), Arc::clone(&self.equity_in_progress))
+    }
+
+    async fn build_equity_operation(
         &self,
         symbol: &Symbol,
-    ) -> Result<(), equity::EquityTriggerError> {
-        if self.config.disabled_assets.contains(symbol) {
-            return Ok(());
-        }
-
-        let Some(guard) = equity::InProgressGuard::try_claim(
-            symbol.clone(),
-            Arc::clone(&self.equity_in_progress),
-        ) else {
-            debug!(%symbol, "Skipped equity trigger: already in progress");
-            return Ok(());
-        };
-
+    ) -> Result<Option<TriggeredOperation>, equity::EquityTriggerError> {
         let wrapped_token = self
             .load_token_address(symbol)
             .await?
@@ -653,7 +1425,6 @@ impl RebalancingTrigger {
 
         let unwrapped_token = self.wrapper.lookup_underlying(symbol)?;
         let vault_ratio = self.wrapper.get_ratio_for_symbol(symbol).await?;
-
         let shares_limit = self
             .config
             .assets
@@ -662,7 +1433,7 @@ impl RebalancingTrigger {
             .get(symbol)
             .and_then(|config| config.operational_limit);
 
-        let Some(operation) = equity::check_imbalance_and_build_operation(
+        equity::check_imbalance_and_build_operation(
             symbol,
             &self.config.equity,
             &self.inventory,
@@ -671,13 +1442,165 @@ impl RebalancingTrigger {
             &vault_ratio,
             shares_limit,
         )
-        .await?
-        else {
+        .await
+    }
+
+    fn try_claim_usdc_guard(&self) -> Option<usdc::InProgressGuard> {
+        usdc::InProgressGuard::try_claim(Arc::clone(&self.usdc_in_progress))
+    }
+
+    fn try_send_operation(&self, operation: &TriggeredOperation, context: &'static str) -> bool {
+        match self.sender.try_send(operation.clone()) {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(%error, context, "Failed to send triggered operation");
+                false
+            }
+        }
+    }
+
+    async fn load_mint_tracking(&self, id: &IssuerRequestId) -> Option<MintTracking> {
+        let Some(tracking) = self.mint_tracking.read().await.get(id).cloned() else {
+            warn!(id = %id, "Mint event for untracked aggregate");
+            return None;
+        };
+
+        Some(tracking)
+    }
+
+    fn start_equity_transfer_update(
+        venue: Venue,
+        quantity: FractionalShares,
+    ) -> EquityInventoryUpdate {
+        Box::new(Inventory::transfer(venue, TransferOp::Start, quantity))
+    }
+
+    fn cancel_equity_transfer_update(
+        venue: Venue,
+        quantity: FractionalShares,
+    ) -> EquityInventoryUpdate {
+        let now = Utc::now();
+        Box::new(move |inventory| {
+            let cancelled = Inventory::transfer(venue, TransferOp::Cancel, quantity)(inventory)?;
+            Inventory::with_last_rebalancing(now)(cancelled)
+        })
+    }
+
+    fn complete_equity_transfer_update(
+        venue: Venue,
+        quantity: FractionalShares,
+    ) -> EquityInventoryUpdate {
+        let now = Utc::now();
+        Box::new(move |inventory| {
+            let transferred =
+                Inventory::transfer(venue, TransferOp::Complete, quantity)(inventory)?;
+            Inventory::with_last_rebalancing(now)(transferred)
+        })
+    }
+
+    fn last_rebalancing_update() -> EquityInventoryUpdate {
+        Box::new(Inventory::with_last_rebalancing(Utc::now()))
+    }
+
+    fn mint_inventory_update(
+        event: &TokenizedEquityMintEvent,
+        quantity: FractionalShares,
+    ) -> Option<EquityInventoryUpdate> {
+        use TokenizedEquityMintEvent::*;
+
+        match event {
+            MintAccepted { .. } => {
+                Some(Self::start_equity_transfer_update(Venue::Hedging, quantity))
+            }
+            MintAcceptanceFailed { .. } => Some(Self::cancel_equity_transfer_update(
+                Venue::Hedging,
+                quantity,
+            )),
+            TokensReceived { .. } => Some(Self::complete_equity_transfer_update(
+                Venue::Hedging,
+                quantity,
+            )),
+            DepositedIntoRaindex { .. } => Some(Self::last_rebalancing_update()),
+            MintRequested { .. }
+            | MintRejected { .. }
+            | TokensWrapped { .. }
+            | WrappingFailed { .. }
+            | RaindexDepositFailed { .. } => None,
+        }
+    }
+
+    async fn apply_equity_update(
+        &self,
+        symbol: &Symbol,
+        update: EquityInventoryUpdate,
+    ) -> Result<(), RebalancingTriggerError> {
+        let now = Utc::now();
+        let mut inventory = self.inventory.write().await;
+        *inventory = inventory.clone().update_equity(symbol, update, now)?;
+        drop(inventory);
+        Ok(())
+    }
+
+    async fn load_redemption_tracking(
+        &self,
+        id: &RedemptionAggregateId,
+    ) -> Option<RedemptionTracking> {
+        let Some(tracking) = self.redemption_tracking.read().await.get(id).cloned() else {
+            warn!(id = %id, "Redemption event for untracked aggregate");
+            return None;
+        };
+
+        Some(tracking)
+    }
+
+    fn redemption_inventory_update(
+        event: &EquityRedemptionEvent,
+        quantity: FractionalShares,
+    ) -> Option<EquityInventoryUpdate> {
+        use EquityRedemptionEvent::*;
+
+        match event {
+            WithdrawnFromRaindex { .. } => Some(Self::start_equity_transfer_update(
+                Venue::MarketMaking,
+                quantity,
+            )),
+            Completed { .. } => Some(Self::complete_equity_transfer_update(
+                Venue::MarketMaking,
+                quantity,
+            )),
+            TransferFailed { .. } => Some(Self::cancel_equity_transfer_update(
+                Venue::MarketMaking,
+                quantity,
+            )),
+            TokensUnwrapped { .. }
+            | TokensSent { .. }
+            | DetectionFailed { .. }
+            | Detected { .. }
+            | RedemptionRejected { .. } => None,
+        }
+    }
+
+    /// Checks inventory for equity imbalance and triggers operation if needed.
+    pub(crate) async fn check_and_trigger_equity(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<(), equity::EquityTriggerError> {
+        self.expire_stuck_operations_with_logging().await;
+
+        if self.config.disabled_assets.contains(symbol) {
+            return Ok(());
+        }
+
+        let Some(guard) = self.try_claim_equity_guard(symbol) else {
+            debug!(%symbol, "Skipped equity trigger: already in progress");
             return Ok(());
         };
 
-        if let Err(error) = self.sender.try_send(operation.clone()) {
-            warn!(%error, "Failed to send triggered operation");
+        let Some(operation) = self.build_equity_operation(symbol).await? else {
+            return Ok(());
+        };
+
+        if !self.try_send_operation(&operation, "equity") {
             return Ok(());
         }
 
@@ -721,12 +1644,13 @@ impl RebalancingTrigger {
 
     /// Checks inventory for USDC imbalance and triggers operation if needed.
     pub(crate) async fn check_and_trigger_usdc(&self) {
+        self.expire_stuck_operations_with_logging().await;
+
         let Some((threshold, usdc_limit)) = self.usdc_rebalancing_params() else {
             return;
         };
 
-        let Some(guard) = usdc::InProgressGuard::try_claim(Arc::clone(&self.usdc_in_progress))
-        else {
+        let Some(guard) = self.try_claim_usdc_guard() else {
             debug!("Skipped USDC trigger: already in progress");
             return;
         };
@@ -739,8 +1663,7 @@ impl RebalancingTrigger {
             return;
         };
 
-        if let Err(error) = self.sender.try_send(operation.clone()) {
-            warn!(%error, "Failed to send USDC triggered operation");
+        if !self.try_send_operation(&operation, "usdc") {
             return;
         }
 
@@ -767,87 +1690,36 @@ impl RebalancingTrigger {
         id: IssuerRequestId,
         event: TokenizedEquityMintEvent,
     ) -> Result<(), RebalancingTriggerError> {
-        if let Some((symbol, quantity)) = Self::extract_mint_info(&event) {
-            self.mint_tracking
-                .write()
-                .await
-                .insert(id.clone(), (symbol, quantity));
+        let event_sync_guard = self.mint_event_sync.lock().await;
+
+        if self.mint_timed_out(&id).await {
+            warn!(id = %id, "Ignoring late mint event after timeout cleanup");
+            return Ok(());
         }
 
-        let Some((symbol, quantity)) = self.mint_tracking.read().await.get(&id).cloned() else {
-            warn!(id = %id, "Mint event for untracked aggregate");
+        self.track_mint_progress(&id, &event).await;
+
+        let Some(tracking) = self.load_mint_tracking(&id).await else {
             return Ok(());
         };
+        let symbol = tracking.symbol;
 
-        use TokenizedEquityMintEvent::*;
-
-        let update = match &event {
-            MintAccepted { .. } => Some(Inventory::transfer(
-                Venue::Hedging,
-                TransferOp::Start,
-                quantity,
-            )),
-            MintAcceptanceFailed { .. } => {
-                let now = Utc::now();
-                let composed: Box<
-                    dyn FnOnce(
-                            Inventory<FractionalShares>,
-                        ) -> Result<Inventory<FractionalShares>, _>
-                        + Send,
-                > = Box::new(move |inventory| {
-                    let cancelled =
-                        Inventory::transfer(Venue::Hedging, TransferOp::Cancel, quantity)(
-                            inventory,
-                        )?;
-                    Inventory::with_last_rebalancing(now)(cancelled)
-                });
-                Some(composed)
-            }
-            TokensReceived { .. } => {
-                // Compose TransferOp::Complete with with_last_rebalancing so that the
-                // staleness guard is active the instant inflight is cleared. Without this,
-                // a stale snapshot fetched before the mint could slip through between
-                // inflight clearing and DepositedIntoRaindex.
-                //
-                // Uses Utc::now() (wall-clock) instead of the block timestamp because
-                // the staleness guard compares against snapshot fetched_at which is also
-                // wall-clock. On Anvil, block timestamps can lag behind wall-clock,
-                // allowing stale snapshots to slip through.
-                let now = Utc::now();
-                let composed: Box<
-                    dyn FnOnce(
-                            Inventory<FractionalShares>,
-                        ) -> Result<Inventory<FractionalShares>, _>
-                        + Send,
-                > = Box::new(move |inventory| {
-                    let transferred =
-                        Inventory::transfer(Venue::Hedging, TransferOp::Complete, quantity)(
-                            inventory,
-                        )?;
-                    Inventory::with_last_rebalancing(now)(transferred)
-                });
-                Some(composed)
-            }
-            DepositedIntoRaindex { .. } => Some(Inventory::with_last_rebalancing(Utc::now())),
-            MintRequested { .. }
-            | MintRejected { .. }
-            | TokensWrapped { .. }
-            | WrappingFailed { .. }
-            | RaindexDepositFailed { .. } => None,
-        };
-
-        if let Some(update) = update {
-            let mut inventory = self.inventory.write().await;
-            *inventory = inventory
-                .clone()
-                .update_equity(&symbol, update, Utc::now())?;
+        if let Some(update) = Self::mint_inventory_update(&event, tracking.quantity) {
+            self.apply_equity_update(&symbol, update).await?;
         }
 
-        if Self::is_terminal_mint_event(&event) {
+        let should_check_usdc = if Self::is_terminal_mint_event(&event) {
             self.mint_tracking.write().await.remove(&id);
             self.clear_equity_in_progress(&symbol);
             debug!(%symbol, "Cleared equity in-progress flag after mint terminal event");
+            true
+        } else {
+            false
+        };
 
+        drop(event_sync_guard);
+
+        if should_check_usdc {
             self.check_and_trigger_usdc().await;
         }
 
@@ -859,105 +1731,49 @@ impl RebalancingTrigger {
         id: RedemptionAggregateId,
         event: EquityRedemptionEvent,
     ) -> Result<(), RebalancingTriggerError> {
-        if let Some((symbol, quantity)) = Self::extract_redemption_info(&event) {
-            self.redemption_tracking
-                .write()
-                .await
-                .insert(id.clone(), (symbol, quantity));
+        let event_sync_guard = self.redemption_event_sync.lock().await;
+
+        if self.redemption_timed_out(&id).await {
+            warn!(id = %id, "Ignoring late redemption event after timeout cleanup");
+            return Ok(());
         }
 
-        let Some((symbol, quantity)) = self.redemption_tracking.read().await.get(&id).cloned()
-        else {
-            warn!(id = %id, "Redemption event for untracked aggregate");
+        self.track_redemption_progress(&id, &event).await;
+
+        let Some(tracking) = self.load_redemption_tracking(&id).await else {
             return Ok(());
         };
+        let symbol = tracking.symbol;
 
-        use EquityRedemptionEvent::*;
-
-        let update = match &event {
-            WithdrawnFromRaindex { .. } => Some(Inventory::transfer(
-                Venue::MarketMaking,
-                TransferOp::Start,
-                quantity,
-            )),
-
-            Completed { .. } => {
-                let now = Utc::now();
-                let composed: Box<
-                    dyn FnOnce(
-                            Inventory<FractionalShares>,
-                        ) -> Result<Inventory<FractionalShares>, _>
-                        + Send,
-                > = Box::new(move |inventory| {
-                    let transferred =
-                        Inventory::transfer(Venue::MarketMaking, TransferOp::Complete, quantity)(
-                            inventory,
-                        )?;
-                    Inventory::with_last_rebalancing(now)(transferred)
-                });
-                Some(composed)
-            }
-
-            // Tokens failed to reach Alpaca's wallet -- still in ours.
-            // Cancel the inflight started at WithdrawnFromRaindex.
-            // Compose with with_last_rebalancing so the staleness guard
-            // prevents a stale snapshot from overwriting the restored balance.
-            TransferFailed { .. } => {
-                let now = Utc::now();
-                let composed: Box<
-                    dyn FnOnce(
-                            Inventory<FractionalShares>,
-                        ) -> Result<Inventory<FractionalShares>, _>
-                        + Send,
-                > = Box::new(move |inventory| {
-                    let cancelled =
-                        Inventory::transfer(Venue::MarketMaking, TransferOp::Cancel, quantity)(
-                            inventory,
-                        )?;
-                    Inventory::with_last_rebalancing(now)(cancelled)
-                });
-                Some(composed)
-            }
-
-            TokensUnwrapped { .. }
-            | TokensSent { .. }
-            | DetectionFailed { .. }
-            | Detected { .. }
-            | RedemptionRejected { .. } => None,
-        };
-
-        if let Some(update) = update {
-            let mut inventory = self.inventory.write().await;
-            *inventory = inventory
-                .clone()
-                .update_equity(&symbol, update, Utc::now())?;
+        if let Some(update) = Self::redemption_inventory_update(&event, tracking.quantity) {
+            self.apply_equity_update(&symbol, update).await?;
         }
 
-        if Self::is_terminal_redemption_event(&event) {
+        let should_check_usdc = if Self::is_terminal_redemption_event(&event) {
             self.redemption_tracking.write().await.remove(&id);
             self.clear_equity_in_progress(&symbol);
             debug!(
                 %symbol,
                 "Cleared equity in-progress flag after redemption terminal event"
             );
+            true
+        } else {
+            false
+        };
 
+        drop(event_sync_guard);
+
+        if should_check_usdc {
             self.check_and_trigger_usdc().await;
         }
 
         Ok(())
     }
 
+    #[cfg(test)]
     fn extract_mint_info(event: &TokenizedEquityMintEvent) -> Option<(Symbol, FractionalShares)> {
-        use TokenizedEquityMintEvent::*;
-
-        if let MintRequested {
-            symbol, quantity, ..
-        } = event
-        {
-            Some((symbol.clone(), FractionalShares::new(*quantity)))
-        } else {
-            None
-        }
+        MintTracking::from_requested_event(event)
+            .map(|tracking| (tracking.symbol, tracking.quantity))
     }
 
     fn is_terminal_mint_event(event: &TokenizedEquityMintEvent) -> bool {
@@ -977,19 +1793,12 @@ impl RebalancingTrigger {
         }
     }
 
+    #[cfg(test)]
     fn extract_redemption_info(
         event: &EquityRedemptionEvent,
     ) -> Option<(Symbol, FractionalShares)> {
-        use EquityRedemptionEvent::*;
-
-        if let WithdrawnFromRaindex {
-            symbol, quantity, ..
-        } = event
-        {
-            Some((symbol.clone(), FractionalShares::new(*quantity)))
-        } else {
-            None
-        }
+        RedemptionTracking::from_withdrawn_event(event)
+            .map(|tracking| (tracking.symbol, tracking.quantity))
     }
 
     fn is_terminal_redemption_event(event: &EquityRedemptionEvent) -> bool {
@@ -1032,7 +1841,7 @@ impl RebalancingTrigger {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, B256, TxHash, U256, address, fixed_bytes};
-    use chrono::Utc;
+    use chrono::{Duration as ChronoDuration, Utc};
     use rain_math_float::Float;
     use sqlx::SqlitePool;
     use st0x_event_sorcery::{EntityList, Never, ReactorHarness, TestStore, deps, test_store};
@@ -1041,6 +1850,7 @@ mod tests {
     use std::collections::{BTreeMap, HashSet};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use std::time::Duration;
     use tokio::sync::broadcast;
     use tokio::sync::mpsc;
     use tokio::sync::mpsc::error::TryRecvError;
@@ -1055,7 +1865,7 @@ mod tests {
     use crate::equity_redemption::DetectionFailure;
     use crate::inventory::snapshot::{InventorySnapshotEvent, InventorySnapshotId};
     use crate::inventory::view::Operator;
-    use crate::inventory::{InventoryView, TransferOp, Venue};
+    use crate::inventory::{InventoryError, InventoryView, TransferOp, Venue};
     use crate::offchain_order::OffchainOrderId;
     use crate::position::{PositionEvent, TradeId};
     use crate::threshold::ExecutionThreshold;
@@ -1076,6 +1886,7 @@ mod tests {
                 target: float!(0.5),
                 deviation: float!(0.2),
             }),
+            transfer_timeout: Duration::from_secs(30 * 60),
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
                 cash: Some(CashAssetConfig {
@@ -1085,6 +1896,13 @@ mod tests {
                 }),
             },
             disabled_assets: HashSet::new(),
+        }
+    }
+
+    fn test_config_with_timeout(timeout: Duration) -> RebalancingTriggerConfig {
+        RebalancingTriggerConfig {
+            transfer_timeout: timeout,
+            ..test_config()
         }
     }
 
@@ -1133,7 +1951,13 @@ mod tests {
             guard.insert(symbol.clone());
         }
 
-        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            trigger.check_and_trigger_equity(&symbol),
+        )
+        .await
+        .expect("equity timeout cleanup should complete promptly")
+        .unwrap();
         assert!(
             matches!(
                 receiver.try_recv().unwrap_err(),
@@ -1174,6 +1998,7 @@ mod tests {
             RebalancingTriggerConfig {
                 equity: test_config().equity,
                 usdc: None,
+                transfer_timeout: test_config().transfer_timeout,
                 assets: AssetsConfig {
                     equities: EquitiesConfig::default(),
                     cash: None,
@@ -1215,6 +2040,7 @@ mod tests {
             RebalancingTriggerConfig {
                 equity: test_config().equity,
                 usdc: test_config().usdc,
+                transfer_timeout: test_config().transfer_timeout,
                 assets: AssetsConfig {
                     equities: EquitiesConfig::default(),
                     cash: None,
@@ -1347,6 +2173,13 @@ mod tests {
     async fn make_trigger_with_inventory(
         inventory: InventoryView,
     ) -> (Arc<RebalancingTrigger>, mpsc::Receiver<TriggeredOperation>) {
+        make_trigger_with_inventory_config(inventory, test_config()).await
+    }
+
+    async fn make_trigger_with_inventory_config(
+        inventory: InventoryView,
+        config: RebalancingTriggerConfig,
+    ) -> (Arc<RebalancingTrigger>, mpsc::Receiver<TriggeredOperation>) {
         let (sender, receiver) = mpsc::channel(10);
         let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
         let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
@@ -1354,7 +2187,7 @@ mod tests {
 
         (
             Arc::new(RebalancingTrigger::new(
-                test_config(),
+                config,
                 Arc::new(test_store::<VaultRegistry>(pool, ())),
                 TEST_ORDERBOOK,
                 TEST_ORDER_OWNER,
@@ -1370,10 +2203,19 @@ mod tests {
         inventory: InventoryView,
         symbol: &Symbol,
     ) -> (Arc<RebalancingTrigger>, mpsc::Receiver<TriggeredOperation>) {
+        make_trigger_with_inventory_and_registry_config(inventory, symbol, test_config()).await
+    }
+
+    async fn make_trigger_with_inventory_and_registry_config(
+        inventory: InventoryView,
+        symbol: &Symbol,
+        config: RebalancingTriggerConfig,
+    ) -> (Arc<RebalancingTrigger>, mpsc::Receiver<TriggeredOperation>) {
         make_trigger_with_inventory_registry_and_wrapper(
             inventory,
             symbol,
             Arc::new(MockWrapper::new()),
+            config,
         )
         .await
     }
@@ -1382,6 +2224,7 @@ mod tests {
         inventory: InventoryView,
         symbol: &Symbol,
         wrapper: Arc<MockWrapper>,
+        config: RebalancingTriggerConfig,
     ) -> (Arc<RebalancingTrigger>, mpsc::Receiver<TriggeredOperation>) {
         let (sender, receiver) = mpsc::channel(10);
         let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
@@ -1392,7 +2235,7 @@ mod tests {
 
         (
             Arc::new(RebalancingTrigger::new(
-                test_config(),
+                config,
                 Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
                 TEST_ORDERBOOK,
                 TEST_ORDER_OWNER,
@@ -1653,8 +2496,13 @@ mod tests {
         let wrapper = Arc::new(MockWrapper::with_ratio(U256::from(
             1_500_000_000_000_000_000u64,
         )));
-        let (trigger, mut receiver) =
-            make_trigger_with_inventory_registry_and_wrapper(inventory, &symbol, wrapper).await;
+        let (trigger, mut receiver) = make_trigger_with_inventory_registry_and_wrapper(
+            inventory,
+            &symbol,
+            wrapper,
+            test_config(),
+        )
+        .await;
 
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
 
@@ -2918,6 +3766,482 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn alpaca_to_base_usdc_lifecycle_tracks_started_and_cleared_inflight() {
+        let inventory = InventoryView::default().with_usdc(usdc(100), usdc(900));
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_conversion_initiated(RebalanceDirection::AlpacaToBase, usdc(400)),
+            )
+            .await
+            .unwrap();
+        assert_usdc_tracking_state(
+            &trigger,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            usdc(400),
+            None,
+            usdc::UsdcRebalanceStage::ConversionInitiated,
+        )
+        .await;
+        assert_usdc_inventory_balances(&trigger, usdc(100), Usdc::ZERO, usdc(900), Usdc::ZERO)
+            .await;
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_conversion_confirmed(RebalanceDirection::AlpacaToBase, usdc(399)),
+            )
+            .await
+            .unwrap();
+        assert_usdc_tracking_state(
+            &trigger,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            usdc(400),
+            None,
+            usdc::UsdcRebalanceStage::ConversionConfirmed,
+        )
+        .await;
+        assert_usdc_inventory_balances(&trigger, usdc(100), Usdc::ZERO, usdc(900), Usdc::ZERO)
+            .await;
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(399)),
+            )
+            .await
+            .unwrap();
+        assert_usdc_tracking_state(
+            &trigger,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            usdc(399),
+            None,
+            usdc::UsdcRebalanceStage::Initiated,
+        )
+        .await;
+        assert_usdc_inventory_balances(&trigger, usdc(100), Usdc::ZERO, usdc(501), usdc(399)).await;
+
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_withdrawal_confirmed())
+            .await
+            .unwrap();
+        assert_usdc_tracking_state(
+            &trigger,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            usdc(399),
+            None,
+            usdc::UsdcRebalanceStage::WithdrawalConfirmed,
+        )
+        .await;
+        assert_usdc_inventory_balances(&trigger, usdc(100), Usdc::ZERO, usdc(501), usdc(399)).await;
+
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_bridging_initiated())
+            .await
+            .unwrap();
+        assert_usdc_tracking_state(
+            &trigger,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            usdc(399),
+            None,
+            usdc::UsdcRebalanceStage::BridgingInitiated,
+        )
+        .await;
+        assert_usdc_inventory_balances(&trigger, usdc(100), Usdc::ZERO, usdc(501), usdc(399)).await;
+
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_bridge_attestation_received())
+            .await
+            .unwrap();
+        assert_usdc_tracking_state(
+            &trigger,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            usdc(399),
+            None,
+            usdc::UsdcRebalanceStage::BridgeAttestationReceived,
+        )
+        .await;
+        assert_usdc_inventory_balances(&trigger, usdc(100), Usdc::ZERO, usdc(501), usdc(399)).await;
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_bridged_with_amounts(usdc(398), usdc(1)),
+            )
+            .await
+            .unwrap();
+        assert_usdc_tracking_state(
+            &trigger,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            usdc(399),
+            Some(usdc(398)),
+            usdc::UsdcRebalanceStage::Bridged,
+        )
+        .await;
+        assert_usdc_inventory_balances(&trigger, usdc(100), Usdc::ZERO, usdc(501), usdc(399)).await;
+
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_deposit_initiated())
+            .await
+            .unwrap();
+        assert_usdc_tracking_state(
+            &trigger,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            usdc(399),
+            Some(usdc(398)),
+            usdc::UsdcRebalanceStage::DepositInitiated,
+        )
+        .await;
+        assert_usdc_inventory_balances(&trigger, usdc(100), Usdc::ZERO, usdc(501), usdc(399)).await;
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_deposit_confirmed(RebalanceDirection::AlpacaToBase),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "terminal AlpacaToBase deposit confirmation should clear tracking"
+        );
+        assert_usdc_inventory_balances(&trigger, usdc(498), Usdc::ZERO, usdc(501), Usdc::ZERO)
+            .await;
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "terminal AlpacaToBase success should clear the in-progress guard"
+        );
+    }
+
+    #[tokio::test]
+    async fn base_to_alpaca_usdc_lifecycle_tracks_started_and_cleared_inflight() {
+        let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(400)),
+            )
+            .await
+            .unwrap();
+        assert_usdc_tracking_state(
+            &trigger,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            None,
+            usdc::UsdcRebalanceStage::Initiated,
+        )
+        .await;
+        assert_usdc_inventory_balances(&trigger, usdc(500), usdc(400), usdc(100), Usdc::ZERO).await;
+
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_withdrawal_confirmed())
+            .await
+            .unwrap();
+        assert_usdc_tracking_state(
+            &trigger,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            None,
+            usdc::UsdcRebalanceStage::WithdrawalConfirmed,
+        )
+        .await;
+        assert_usdc_inventory_balances(&trigger, usdc(500), usdc(400), usdc(100), Usdc::ZERO).await;
+
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_bridging_initiated())
+            .await
+            .unwrap();
+        assert_usdc_tracking_state(
+            &trigger,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            None,
+            usdc::UsdcRebalanceStage::BridgingInitiated,
+        )
+        .await;
+        assert_usdc_inventory_balances(&trigger, usdc(500), usdc(400), usdc(100), Usdc::ZERO).await;
+
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_bridge_attestation_received())
+            .await
+            .unwrap();
+        assert_usdc_tracking_state(
+            &trigger,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            None,
+            usdc::UsdcRebalanceStage::BridgeAttestationReceived,
+        )
+        .await;
+        assert_usdc_inventory_balances(&trigger, usdc(500), usdc(400), usdc(100), Usdc::ZERO).await;
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_bridged_with_amounts(usdc(399), usdc(1)),
+            )
+            .await
+            .unwrap();
+        assert_usdc_tracking_state(
+            &trigger,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            Some(usdc(399)),
+            usdc::UsdcRebalanceStage::Bridged,
+        )
+        .await;
+        assert_usdc_inventory_balances(&trigger, usdc(500), usdc(400), usdc(100), Usdc::ZERO).await;
+
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_deposit_initiated())
+            .await
+            .unwrap();
+        assert_usdc_tracking_state(
+            &trigger,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            Some(usdc(399)),
+            usdc::UsdcRebalanceStage::DepositInitiated,
+        )
+        .await;
+        assert_usdc_inventory_balances(&trigger, usdc(500), usdc(400), usdc(100), Usdc::ZERO).await;
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_deposit_confirmed(RebalanceDirection::BaseToAlpaca),
+            )
+            .await
+            .unwrap();
+        assert_usdc_tracking_state(
+            &trigger,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            Some(usdc(399)),
+            usdc::UsdcRebalanceStage::DepositConfirmed,
+        )
+        .await;
+        assert_usdc_inventory_balances(&trigger, usdc(500), usdc(400), usdc(100), Usdc::ZERO).await;
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_conversion_initiated(RebalanceDirection::BaseToAlpaca, usdc(399)),
+            )
+            .await
+            .unwrap();
+        assert_usdc_tracking_state(
+            &trigger,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            Some(usdc(399)),
+            usdc::UsdcRebalanceStage::ConversionInitiated,
+        )
+        .await;
+        assert_usdc_inventory_balances(&trigger, usdc(500), usdc(400), usdc(100), Usdc::ZERO).await;
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_conversion_confirmed(RebalanceDirection::BaseToAlpaca, usdc(399)),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "terminal BaseToAlpaca conversion confirmation should clear tracking"
+        );
+        assert_usdc_inventory_balances(&trigger, usdc(500), Usdc::ZERO, usdc(499), Usdc::ZERO)
+            .await;
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "terminal BaseToAlpaca success should clear the in-progress guard"
+        );
+    }
+
+    #[tokio::test]
+    async fn alpaca_to_base_usdc_failures_cancel_inflight_end_to_end() {
+        struct Scenario {
+            name: &'static str,
+            events: Vec<UsdcRebalanceEvent>,
+        }
+
+        let scenarios = vec![
+            Scenario {
+                name: "conversion_failed_before_withdrawal",
+                events: vec![
+                    make_usdc_conversion_initiated(RebalanceDirection::AlpacaToBase, usdc(400)),
+                    make_usdc_conversion_confirmed(RebalanceDirection::AlpacaToBase, usdc(399)),
+                    make_usdc_conversion_failed(),
+                ],
+            },
+            Scenario {
+                name: "withdrawal_failed_after_initiated",
+                events: vec![
+                    make_usdc_conversion_initiated(RebalanceDirection::AlpacaToBase, usdc(400)),
+                    make_usdc_conversion_confirmed(RebalanceDirection::AlpacaToBase, usdc(399)),
+                    make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(399)),
+                    make_usdc_withdrawal_failed(),
+                ],
+            },
+            Scenario {
+                name: "bridging_failed_after_initiated",
+                events: vec![
+                    make_usdc_conversion_initiated(RebalanceDirection::AlpacaToBase, usdc(400)),
+                    make_usdc_conversion_confirmed(RebalanceDirection::AlpacaToBase, usdc(399)),
+                    make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(399)),
+                    make_usdc_withdrawal_confirmed(),
+                    make_usdc_bridging_initiated(),
+                    make_usdc_bridging_failed(),
+                ],
+            },
+            Scenario {
+                name: "deposit_failed_after_initiated",
+                events: vec![
+                    make_usdc_conversion_initiated(RebalanceDirection::AlpacaToBase, usdc(400)),
+                    make_usdc_conversion_confirmed(RebalanceDirection::AlpacaToBase, usdc(399)),
+                    make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(399)),
+                    make_usdc_withdrawal_confirmed(),
+                    make_usdc_bridging_initiated(),
+                    make_usdc_bridge_attestation_received(),
+                    make_usdc_bridged_with_amounts(usdc(398), usdc(1)),
+                    make_usdc_deposit_initiated(),
+                    make_usdc_deposit_failed(),
+                ],
+            },
+        ];
+
+        for scenario in scenarios {
+            let inventory = InventoryView::default().with_usdc(usdc(100), usdc(900));
+            let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+            let harness = ReactorHarness::new(Arc::clone(&trigger));
+            let id = UsdcRebalanceId(Uuid::new_v4());
+
+            trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+            for event in scenario.events {
+                harness
+                    .receive::<UsdcRebalance>(id.clone(), event)
+                    .await
+                    .unwrap();
+            }
+
+            assert!(
+                !trigger.usdc_tracking.read().await.contains_key(&id),
+                "{} should clear tracking after terminal failure",
+                scenario.name
+            );
+            assert_usdc_inventory_balances(&trigger, usdc(100), Usdc::ZERO, usdc(900), Usdc::ZERO)
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn base_to_alpaca_usdc_failures_cancel_inflight_end_to_end() {
+        struct Scenario {
+            name: &'static str,
+            events: Vec<UsdcRebalanceEvent>,
+        }
+
+        let scenarios = vec![
+            Scenario {
+                name: "withdrawal_failed_after_initiated",
+                events: vec![
+                    make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(400)),
+                    make_usdc_withdrawal_failed(),
+                ],
+            },
+            Scenario {
+                name: "bridging_failed_after_initiated",
+                events: vec![
+                    make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(400)),
+                    make_usdc_withdrawal_confirmed(),
+                    make_usdc_bridging_initiated(),
+                    make_usdc_bridging_failed(),
+                ],
+            },
+            Scenario {
+                name: "deposit_failed_after_initiated",
+                events: vec![
+                    make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(400)),
+                    make_usdc_withdrawal_confirmed(),
+                    make_usdc_bridging_initiated(),
+                    make_usdc_bridge_attestation_received(),
+                    make_usdc_bridged_with_amounts(usdc(399), usdc(1)),
+                    make_usdc_deposit_initiated(),
+                    make_usdc_deposit_failed(),
+                ],
+            },
+            Scenario {
+                name: "conversion_failed_after_deposit",
+                events: vec![
+                    make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(400)),
+                    make_usdc_withdrawal_confirmed(),
+                    make_usdc_bridging_initiated(),
+                    make_usdc_bridge_attestation_received(),
+                    make_usdc_bridged_with_amounts(usdc(399), usdc(1)),
+                    make_usdc_deposit_initiated(),
+                    make_usdc_deposit_confirmed(RebalanceDirection::BaseToAlpaca),
+                    make_usdc_conversion_initiated(RebalanceDirection::BaseToAlpaca, usdc(399)),
+                    make_usdc_conversion_failed(),
+                ],
+            },
+        ];
+
+        for scenario in scenarios {
+            let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
+            let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+            let harness = ReactorHarness::new(Arc::clone(&trigger));
+            let id = UsdcRebalanceId(Uuid::new_v4());
+
+            trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+            for event in scenario.events {
+                harness
+                    .receive::<UsdcRebalance>(id.clone(), event)
+                    .await
+                    .unwrap();
+            }
+
+            assert!(
+                !trigger.usdc_tracking.read().await.contains_key(&id),
+                "{} should clear tracking after terminal failure",
+                scenario.name
+            );
+            assert_usdc_inventory_balances(&trigger, usdc(900), Usdc::ZERO, usdc(100), Usdc::ZERO)
+                .await;
+        }
+    }
+
+    #[tokio::test]
     async fn snapshot_onchain_usdc_via_reactor_updates_usdc_balance() {
         // Start with 500 onchain, 500 offchain = balanced
         let inventory = InventoryView::default().with_usdc(usdc(500), usdc(500));
@@ -3164,6 +4488,18 @@ mod tests {
         }
     }
 
+    fn make_usdc_conversion_initiated(
+        direction: RebalanceDirection,
+        amount: Usdc,
+    ) -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::ConversionInitiated {
+            direction,
+            amount,
+            order_id: Uuid::new_v4(),
+            initiated_at: Utc::now(),
+        }
+    }
+
     fn make_usdc_withdrawal_confirmed() -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::WithdrawalConfirmed {
             confirmed_at: Utc::now(),
@@ -3181,6 +4517,14 @@ mod tests {
         UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash: TxHash::random(),
             burned_at: Utc::now(),
+        }
+    }
+
+    fn make_usdc_bridge_attestation_received() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::BridgeAttestationReceived {
+            attestation: vec![1, 2, 3, 4],
+            cctp_nonce: 42,
+            attested_at: Utc::now(),
         }
     }
 
@@ -3216,6 +4560,13 @@ mod tests {
         }
     }
 
+    fn make_usdc_deposit_initiated() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::DepositInitiated {
+            deposit_ref: TransferRef::OnchainTx(TxHash::random()),
+            deposit_initiated_at: Utc::now(),
+        }
+    }
+
     fn make_usdc_deposit_failed() -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::DepositFailed {
             deposit_ref: Some(TransferRef::OnchainTx(TxHash::random())),
@@ -3240,6 +4591,56 @@ mod tests {
             reason: "Order rejected".to_string(),
             failed_at: Utc::now(),
         }
+    }
+
+    async fn assert_usdc_tracking_state(
+        trigger: &Arc<RebalancingTrigger>,
+        id: &UsdcRebalanceId,
+        direction: RebalanceDirection,
+        initiated_amount: Usdc,
+        bridged_amount_received: Option<Usdc>,
+        stage: usdc::UsdcRebalanceStage,
+    ) {
+        let tracking = trigger
+            .usdc_tracking
+            .read()
+            .await
+            .get(id)
+            .cloned()
+            .expect("USDC rebalance should still be tracked");
+
+        assert_eq!(tracking.direction, direction);
+        assert_eq!(tracking.initiated_amount, initiated_amount);
+        assert_eq!(tracking.bridged_amount_received, bridged_amount_received);
+        assert_eq!(tracking.stage, stage);
+    }
+
+    async fn assert_usdc_inventory_balances(
+        trigger: &Arc<RebalancingTrigger>,
+        market_making_available: Usdc,
+        market_making_inflight: Usdc,
+        hedging_available: Usdc,
+        hedging_inflight: Usdc,
+    ) {
+        let inventory = trigger.inventory.read().await;
+
+        assert_eq!(
+            inventory.usdc_available(Venue::MarketMaking),
+            Some(market_making_available)
+        );
+        assert_eq!(
+            inventory.usdc_inflight(Venue::MarketMaking),
+            Some(market_making_inflight)
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::Hedging),
+            Some(hedging_available)
+        );
+        assert_eq!(
+            inventory.usdc_inflight(Venue::Hedging),
+            Some(hedging_inflight)
+        );
+        drop(inventory);
     }
 
     #[tokio::test]
@@ -3408,6 +4809,228 @@ mod tests {
             "terminal failure should clear offchain USDC inflight"
         );
         drop(inventory);
+    }
+
+    #[tokio::test]
+    async fn timed_out_usdc_rebalance_clears_guards_and_ignores_late_events() {
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(100), usdc(900))
+            .update_usdc(
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, usdc(400)),
+                Utc::now(),
+            )
+            .unwrap();
+        let (trigger, mut receiver) = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::AlpacaToBase,
+                initiated_amount: usdc(400),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::Initiated,
+                last_progress_at: Utc::now() - ChronoDuration::minutes(31),
+            },
+        );
+
+        trigger.check_and_trigger_usdc().await;
+
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "USDC timeout should remove in-flight tracking"
+        );
+        assert!(
+            trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "USDC timeout should remember the aggregate so late events are ignored"
+        );
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_inflight(Venue::Hedging),
+            Some(Usdc::ZERO),
+            "USDC timeout should zero offchain inflight balance"
+        );
+        assert_eq!(
+            inventory.usdc_inflight(Venue::MarketMaking),
+            Some(Usdc::ZERO),
+            "USDC timeout should not leave onchain inflight behind"
+        );
+        drop(inventory);
+
+        let triggered = receiver.try_recv();
+        assert!(
+            matches!(triggered, Ok(TriggeredOperation::UsdcAlpacaToBase { .. })),
+            "USDC timeout should allow the next trigger cycle to proceed, got {triggered:?}"
+        );
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "the next USDC trigger should be allowed to claim the in-progress guard"
+        );
+
+        trigger.clear_usdc_in_progress();
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_deposit_confirmed(RebalanceDirection::AlpacaToBase),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "late terminal events must not recreate timed-out USDC tracking"
+        );
+    }
+
+    #[tokio::test]
+    async fn usdc_post_deposit_conversion_refreshes_timeout_tracking() {
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(900), usdc(100))
+            .update_usdc(
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, usdc(400)),
+                Utc::now(),
+            )
+            .unwrap();
+        let (trigger, _receiver) = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(60)),
+        )
+        .await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let refreshed_at = Utc::now() - ChronoDuration::seconds(30);
+
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::BaseToAlpaca,
+                initiated_amount: usdc(400),
+                bridged_amount_received: Some(usdc(399)),
+                stage: usdc::UsdcRebalanceStage::DepositConfirmed,
+                last_progress_at: Utc::now() - ChronoDuration::minutes(5),
+            },
+        );
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                UsdcRebalanceEvent::ConversionInitiated {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: usdc(400),
+                    order_id: Uuid::new_v4(),
+                    initiated_at: refreshed_at,
+                },
+            )
+            .await
+            .unwrap();
+
+        let tracking = trigger
+            .usdc_tracking
+            .read()
+            .await
+            .get(&id)
+            .cloned()
+            .expect("conversion initiation should preserve USDC tracking");
+        assert_eq!(
+            tracking.stage,
+            usdc::UsdcRebalanceStage::ConversionInitiated
+        );
+        assert_eq!(tracking.last_progress_at, refreshed_at);
+        assert_eq!(tracking.bridged_amount_received, Some(usdc(399)));
+
+        trigger.expire_stuck_operations(Utc::now()).await.unwrap();
+
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "a refreshed conversion step should not time out an active USDC rebalance"
+        );
+        assert!(
+            !trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "refreshing conversion progress should avoid creating a timeout tombstone"
+        );
+    }
+
+    #[tokio::test]
+    async fn usdc_pre_withdrawal_conversion_confirmation_refreshes_timeout_tracking() {
+        let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
+        let (trigger, _receiver) = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(60)),
+        )
+        .await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let initiated_at = Utc::now() - ChronoDuration::minutes(5);
+        let converted_at = Utc::now() - ChronoDuration::seconds(30);
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                UsdcRebalanceEvent::ConversionInitiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: usdc(400),
+                    order_id: Uuid::new_v4(),
+                    initiated_at,
+                },
+            )
+            .await
+            .unwrap();
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                UsdcRebalanceEvent::ConversionConfirmed {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    filled_amount: usdc(399),
+                    converted_at,
+                },
+            )
+            .await
+            .unwrap();
+
+        let tracking = trigger
+            .usdc_tracking
+            .read()
+            .await
+            .get(&id)
+            .cloned()
+            .expect("pre-withdrawal conversion should remain tracked after confirmation");
+        assert_eq!(
+            tracking.stage,
+            usdc::UsdcRebalanceStage::ConversionConfirmed
+        );
+        assert_eq!(tracking.last_progress_at, converted_at);
+
+        trigger.expire_stuck_operations(Utc::now()).await.unwrap();
+
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "conversion confirmation should refresh timeout tracking before withdrawal starts"
+        );
+        assert!(
+            !trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "refreshed pre-withdrawal conversion progress should not tombstone the aggregate"
+        );
     }
 
     #[tokio::test]
@@ -3609,6 +5232,7 @@ mod tests {
     fn valid_rebalancing_config_toml() -> &'static str {
         r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
+            transfer_timeout_secs = 1800
 
             [wallet]
             kind = "private-key"
@@ -3654,6 +5278,7 @@ mod tests {
             config.redemption_wallet,
             address!("1234567890123456789012345678901234567890")
         );
+        assert_eq!(config.transfer_timeout_secs, 1800);
     }
 
     #[test]
@@ -3667,6 +5292,7 @@ mod tests {
         let config: RebalancingConfig = toml::from_str(
             r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
+            transfer_timeout_secs = 1800
 
             [wallet]
             type = "private-key"
@@ -3697,6 +5323,8 @@ mod tests {
     #[test]
     fn deserialize_missing_redemption_wallet_fails() {
         let toml_str = r#"
+            transfer_timeout_secs = 1800
+
             [wallet]
             type = "private-key"
             address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -3719,6 +5347,32 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_missing_transfer_timeout_secs_fails() {
+        let toml_str = r#"
+            redemption_wallet = "0x1234567890123456789012345678901234567890"
+
+            [wallet]
+            type = "private-key"
+            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+            [equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [usdc]
+            mode = "enabled"
+            target = "0.5"
+            deviation = "0.3"
+        "#;
+
+        let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
+        assert!(
+            error.message().contains("transfer_timeout_secs"),
+            "Expected missing transfer_timeout_secs error, got: {error}"
+        );
+    }
+
+    #[test]
     fn deserialize_missing_wallet_secrets_fails() {
         let toml_str = r#"
             base_rpc_url = "https://base.example.com"
@@ -3736,6 +5390,7 @@ mod tests {
     fn deserialize_missing_equity_fails() {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
+            transfer_timeout_secs = 1800
 
             [wallet]
             type = "private-key"
@@ -3769,6 +5424,7 @@ mod tests {
                     deviation: float!(0.2),
                 },
                 usdc: None,
+                transfer_timeout: Duration::from_secs(30 * 60),
                 assets: AssetsConfig {
                     equities: EquitiesConfig::default(),
                     cash: None,
@@ -3799,6 +5455,7 @@ mod tests {
     fn deserialize_missing_usdc_fails() {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
+            transfer_timeout_secs = 1800
 
             [wallet]
             type = "private-key"
@@ -5456,6 +7113,828 @@ mod tests {
             matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
             "InflightEquity after MintAcceptanceFailed should not \
              trigger extra rebalancing"
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_redemption_clears_guards_and_suppresses_inflight_snapshots() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .update_equity(
+                &symbol,
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, shares(10)),
+                Utc::now(),
+            )
+            .unwrap();
+        let (trigger, mut receiver) = make_trigger_with_inventory_and_registry_config(
+            inventory,
+            &symbol,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = RedemptionAggregateId::new("timed-out-redemption");
+
+        {
+            let mut guard = trigger.equity_in_progress.write().unwrap();
+            guard.insert(symbol.clone());
+        }
+
+        trigger.redemption_tracking.write().await.insert(
+            id.clone(),
+            RedemptionTracking {
+                symbol: symbol.clone(),
+                quantity: shares(10),
+                stage: RedemptionTrackingStage::TokensSent,
+                last_progress_at: Utc::now() - ChronoDuration::minutes(31),
+            },
+        );
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert!(
+            !trigger.equity_in_progress.read().unwrap().contains(&symbol),
+            "equity timeout should clear the symbol in-progress guard"
+        );
+        assert!(
+            !trigger.redemption_tracking.read().await.contains_key(&id),
+            "equity timeout should remove stale redemption tracking"
+        );
+        assert!(
+            trigger.timed_out_redemptions.read().await.contains_key(&id),
+            "equity timeout should remember the aggregate so late events are ignored"
+        );
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::MarketMaking),
+            Some(FractionalShares::ZERO),
+            "equity timeout should zero onchain inflight balance"
+        );
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::Hedging),
+            Some(FractionalShares::ZERO),
+            "equity timeout should not leave offchain inflight behind"
+        );
+        drop(inventory);
+
+        assert!(
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+            "balanced inventory should not immediately trigger another equity transfer after timeout"
+        );
+
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+        let mut redemptions = BTreeMap::new();
+        redemptions.insert(symbol.clone(), shares(10));
+
+        let stale_snapshot_time = *trigger
+            .timed_out_redemptions
+            .read()
+            .await
+            .get(&id)
+            .expect("timeout should record a cleanup timestamp");
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            harness.receive::<InventorySnapshot>(
+                snapshot_id.clone(),
+                InventorySnapshotEvent::InflightEquity {
+                    mints: BTreeMap::new(),
+                    redemptions,
+                    fetched_at: stale_snapshot_time,
+                },
+            ),
+        )
+        .await
+        .expect("stale inflight snapshot should process promptly")
+        .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::MarketMaking),
+            Some(FractionalShares::ZERO),
+            "suppressed inflight snapshots should not reintroduce timed-out redemption inventory"
+        );
+        drop(inventory);
+
+        let mut newer_redemptions = BTreeMap::new();
+        newer_redemptions.insert(symbol.clone(), shares(4));
+        let newer_snapshot_time = trigger
+            .timed_out_redemptions
+            .read()
+            .await
+            .get(&id)
+            .expect("timeout should record a cleanup timestamp")
+            .checked_add_signed(ChronoDuration::seconds(1))
+            .expect("timestamp arithmetic should succeed");
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            harness.receive::<InventorySnapshot>(
+                snapshot_id,
+                InventorySnapshotEvent::InflightEquity {
+                    mints: BTreeMap::new(),
+                    redemptions: newer_redemptions,
+                    fetched_at: newer_snapshot_time,
+                },
+            ),
+        )
+        .await
+        .expect("newer inflight snapshot should process promptly")
+        .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::MarketMaking),
+            Some(shares(4)),
+            "a newer inflight snapshot should replace the stale-snapshot suppression"
+        );
+        drop(inventory);
+        assert!(
+            !trigger
+                .suppressed_inflight_symbols
+                .read()
+                .await
+                .contains_key(&symbol),
+            "a newer inflight snapshot should retire suppression for the symbol"
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_redemption_keeps_stale_snapshot_suppressed_after_retrigger() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(80), shares(20))
+            .update_equity(
+                &symbol,
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, shares(10)),
+                Utc::now(),
+            )
+            .unwrap();
+        let (trigger, mut receiver) = make_trigger_with_inventory_and_registry_config(
+            inventory,
+            &symbol,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = RedemptionAggregateId::new("timed-out-redemption-retrigger");
+
+        {
+            let mut guard = trigger.equity_in_progress.write().unwrap();
+            guard.insert(symbol.clone());
+        }
+
+        trigger.redemption_tracking.write().await.insert(
+            id.clone(),
+            RedemptionTracking {
+                symbol: symbol.clone(),
+                quantity: shares(10),
+                stage: RedemptionTrackingStage::TokensSent,
+                last_progress_at: Utc::now() - ChronoDuration::minutes(31),
+            },
+        );
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        let retriggered = receiver.try_recv();
+        assert!(
+            matches!(retriggered, Ok(TriggeredOperation::Redemption { .. })),
+            "timeout cleanup should still allow the next redemption trigger, got {retriggered:?}"
+        );
+
+        let cleared_at = *trigger
+            .timed_out_redemptions
+            .read()
+            .await
+            .get(&id)
+            .expect("timeout cleanup should record a tombstone timestamp");
+
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+        let mut stale_redemptions = BTreeMap::new();
+        stale_redemptions.insert(symbol.clone(), shares(10));
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            harness.receive::<InventorySnapshot>(
+                snapshot_id,
+                InventorySnapshotEvent::InflightEquity {
+                    mints: BTreeMap::new(),
+                    redemptions: stale_redemptions,
+                    fetched_at: cleared_at,
+                },
+            ),
+        )
+        .await
+        .expect("stale inflight snapshot should process promptly")
+        .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::MarketMaking),
+            Some(FractionalShares::ZERO),
+            "stale inflight snapshots must stay suppressed even after a new redemption is sent"
+        );
+        drop(inventory);
+
+        assert!(
+            trigger
+                .suppressed_inflight_symbols
+                .read()
+                .await
+                .contains_key(&symbol),
+            "suppression should remain active until a newer inflight poll arrives"
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_mint_cleanup_rechecks_progress_before_clearing() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .update_equity(
+                &symbol,
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, shares(10)),
+                now,
+            )
+            .unwrap();
+        let (trigger, _receiver) = make_trigger_with_inventory_and_registry_config(
+            inventory,
+            &symbol,
+            test_config_with_timeout(Duration::from_secs(60)),
+        )
+        .await;
+        let id = IssuerRequestId::new("timed-out-mint-recheck");
+
+        trigger.mint_tracking.write().await.insert(
+            id.clone(),
+            MintTracking {
+                symbol: symbol.clone(),
+                quantity: shares(10),
+                stage: MintTrackingStage::Accepted,
+                last_progress_at: now - ChronoDuration::minutes(5),
+            },
+        );
+
+        trigger
+            .mint_tracking
+            .write()
+            .await
+            .get_mut(&id)
+            .expect("tracking entry should exist")
+            .last_progress_at = now - ChronoDuration::seconds(30);
+
+        let cleanup = trigger.cleanup_timed_out_mint(&id, now).await.unwrap();
+
+        assert!(
+            cleanup.is_none(),
+            "cleanup should skip a mint that refreshed after the initial timeout scan"
+        );
+        assert!(
+            trigger.mint_tracking.read().await.contains_key(&id),
+            "rechecked mint tracking should remain when the timeout no longer applies"
+        );
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(10)),
+            "rechecked cleanup must not clear inflight for a refreshed mint"
+        );
+        drop(inventory);
+    }
+
+    #[tokio::test]
+    async fn timed_out_mint_cleanup_tombstones_before_late_requested_event() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .update_equity(
+                &symbol,
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, shares(3)),
+                now,
+            )
+            .unwrap()
+            .update_equity(
+                &symbol,
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, shares(10)),
+                now,
+            )
+            .unwrap();
+        let (trigger, _receiver) = make_trigger_with_inventory_and_registry_config(
+            inventory,
+            &symbol,
+            test_config_with_timeout(Duration::from_secs(60)),
+        )
+        .await;
+        let id = IssuerRequestId::new("timed-out-mint-late-request");
+
+        trigger.mint_tracking.write().await.insert(
+            id.clone(),
+            MintTracking {
+                symbol: symbol.clone(),
+                quantity: shares(10),
+                stage: MintTrackingStage::Accepted,
+                last_progress_at: now - ChronoDuration::minutes(5),
+            },
+        );
+
+        let cleanup = trigger.cleanup_timed_out_mint(&id, now).await.unwrap();
+
+        assert!(
+            cleanup.is_some(),
+            "cleanup should tombstone the stale mint before returning"
+        );
+        assert!(
+            trigger.timed_out_mints.read().await.contains_key(&id),
+            "mint tombstone should already exist after cleanup"
+        );
+        assert!(
+            trigger
+                .suppressed_inflight_symbols
+                .read()
+                .await
+                .contains_key(&symbol),
+            "inflight suppression should already exist after cleanup"
+        );
+
+        trigger
+            .on_mint(id.clone(), make_mint_requested(&symbol, float!(10)))
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.mint_tracking.read().await.contains_key(&id),
+            "late requested events must not recreate tombstoned mint tracking"
+        );
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::Hedging),
+            Some(FractionalShares::ZERO),
+            "mint cleanup should clear only hedging inflight"
+        );
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::MarketMaking),
+            Some(shares(3)),
+            "mint cleanup must preserve unrelated market-making inflight"
+        );
+        drop(inventory);
+    }
+
+    #[tokio::test]
+    async fn mint_event_rechecks_tombstone_after_waiting_for_sync_gate() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let (trigger, _receiver) = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
+            &symbol,
+        )
+        .await;
+        let id = IssuerRequestId::new("mint-sync-gate-tombstone");
+        let sync_guard = trigger.mint_event_sync.lock().await;
+        let trigger_for_task = Arc::clone(&trigger);
+        let task_symbol = symbol.clone();
+        let task_id = id.clone();
+
+        let event_task = tokio::spawn(async move {
+            trigger_for_task
+                .on_mint(task_id, make_mint_requested(&task_symbol, float!(10)))
+                .await
+        });
+
+        trigger
+            .timed_out_mints
+            .write()
+            .await
+            .insert(id.clone(), Utc::now());
+        drop(sync_guard);
+
+        event_task.await.unwrap().unwrap();
+
+        assert!(
+            !trigger.mint_tracking.read().await.contains_key(&id),
+            "blocked mint events must recheck tombstones before recreating tracking"
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_redemption_cleanup_tombstones_before_late_withdrawal_event() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .update_equity(
+                &symbol,
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, shares(10)),
+                now,
+            )
+            .unwrap()
+            .update_equity(
+                &symbol,
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, shares(3)),
+                now,
+            )
+            .unwrap();
+        let (trigger, _receiver) = make_trigger_with_inventory_and_registry_config(
+            inventory,
+            &symbol,
+            test_config_with_timeout(Duration::from_secs(60)),
+        )
+        .await;
+        let id = RedemptionAggregateId::new("timed-out-redemption-late-withdrawal");
+
+        trigger.redemption_tracking.write().await.insert(
+            id.clone(),
+            RedemptionTracking {
+                symbol: symbol.clone(),
+                quantity: shares(10),
+                stage: RedemptionTrackingStage::TokensSent,
+                last_progress_at: now - ChronoDuration::minutes(5),
+            },
+        );
+
+        let cleanup = trigger
+            .cleanup_timed_out_redemption(&id, now)
+            .await
+            .unwrap();
+
+        assert!(
+            cleanup.is_some(),
+            "cleanup should tombstone the stale redemption before returning"
+        );
+        assert!(
+            trigger.timed_out_redemptions.read().await.contains_key(&id),
+            "redemption tombstone should already exist after cleanup"
+        );
+        assert!(
+            trigger
+                .suppressed_inflight_symbols
+                .read()
+                .await
+                .contains_key(&symbol),
+            "inflight suppression should already exist after cleanup"
+        );
+
+        trigger
+            .on_redemption(id.clone(), make_withdrawn_from_raindex(&symbol, float!(10)))
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.redemption_tracking.read().await.contains_key(&id),
+            "late withdrawal events must not recreate tombstoned redemption tracking"
+        );
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::MarketMaking),
+            Some(FractionalShares::ZERO),
+            "redemption cleanup should clear only market-making inflight"
+        );
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(3)),
+            "redemption cleanup must preserve unrelated hedging inflight"
+        );
+        drop(inventory);
+    }
+
+    #[tokio::test]
+    async fn redemption_event_rechecks_tombstone_after_waiting_for_sync_gate() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let (trigger, _receiver) = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
+            &symbol,
+        )
+        .await;
+        let id = RedemptionAggregateId::new("redemption-sync-gate-tombstone");
+        let sync_guard = trigger.redemption_event_sync.lock().await;
+        let trigger_for_task = Arc::clone(&trigger);
+        let task_symbol = symbol.clone();
+        let task_id = id.clone();
+
+        let event_task = tokio::spawn(async move {
+            trigger_for_task
+                .on_redemption(
+                    task_id,
+                    make_withdrawn_from_raindex(&task_symbol, float!(10)),
+                )
+                .await
+        });
+
+        trigger
+            .timed_out_redemptions
+            .write()
+            .await
+            .insert(id.clone(), Utc::now());
+        drop(sync_guard);
+
+        event_task.await.unwrap().unwrap();
+
+        assert!(
+            !trigger.redemption_tracking.read().await.contains_key(&id),
+            "blocked redemption events must recheck tombstones before recreating tracking"
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_usdc_cleanup_tombstones_before_late_conversion_event() {
+        let now = Utc::now();
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(5000), usdc(5000))
+            .update_usdc(
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, usdc(700)),
+                now,
+            )
+            .unwrap()
+            .update_usdc(
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, usdc(300)),
+                now,
+            )
+            .unwrap();
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::BaseToAlpaca,
+                initiated_amount: usdc(700),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::DepositConfirmed,
+                last_progress_at: now - ChronoDuration::minutes(40),
+            },
+        );
+
+        let cleanup = trigger
+            .cleanup_timed_out_usdc_rebalance(&id, now)
+            .await
+            .unwrap();
+
+        assert!(
+            cleanup.is_some(),
+            "cleanup should tombstone the stale USDC rebalance before returning"
+        );
+        assert!(
+            trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "USDC tombstone should already exist after cleanup"
+        );
+
+        trigger
+            .on_usdc_rebalance(
+                id.clone(),
+                UsdcRebalanceEvent::ConversionInitiated {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: usdc(700),
+                    order_id: Uuid::new_v4(),
+                    initiated_at: now,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "late conversion events must not recreate tombstoned USDC tracking"
+        );
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_inflight(Venue::MarketMaking),
+            Some(Usdc::ZERO),
+            "USDC cleanup should clear only the source venue inflight"
+        );
+        assert_eq!(
+            inventory.usdc_inflight(Venue::Hedging),
+            Some(usdc(300)),
+            "USDC cleanup must preserve unrelated destination inflight"
+        );
+        drop(inventory);
+    }
+
+    #[tokio::test]
+    async fn usdc_event_rechecks_tombstone_after_waiting_for_sync_gate() {
+        let (trigger, _receiver) =
+            make_trigger_with_inventory(InventoryView::default().with_usdc(usdc(5000), usdc(5000)))
+                .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let sync_guard = trigger.usdc_event_sync.lock().await;
+        let trigger_for_task = Arc::clone(&trigger);
+        let task_id = id.clone();
+
+        let event_task = tokio::spawn(async move {
+            trigger_for_task
+                .on_usdc_rebalance(
+                    task_id,
+                    UsdcRebalanceEvent::ConversionInitiated {
+                        direction: RebalanceDirection::BaseToAlpaca,
+                        amount: usdc(700),
+                        order_id: Uuid::new_v4(),
+                        initiated_at: Utc::now(),
+                    },
+                )
+                .await
+        });
+
+        trigger
+            .timed_out_usdc_rebalances
+            .write()
+            .await
+            .insert(id.clone(), Utc::now());
+        drop(sync_guard);
+
+        event_task.await.unwrap().unwrap();
+
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "blocked USDC events must recheck tombstones before recreating tracking"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_path_reuses_inflight_suppression_filter() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let (trigger, _receiver) = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
+            &symbol,
+        )
+        .await;
+        let cleared_at = Utc::now();
+
+        trigger
+            .suppressed_inflight_symbols
+            .write()
+            .await
+            .insert(symbol.clone(), cleared_at);
+
+        trigger
+            .on_snapshot_recovery(
+                RebalancingTriggerError::Inventory(InventoryViewError::Equity(
+                    InventoryError::NegativeInflight {
+                        value: FractionalShares::new(float!(-1)),
+                    },
+                )),
+                InventorySnapshotEvent::InflightEquity {
+                    mints: BTreeMap::new(),
+                    redemptions: BTreeMap::from([(symbol.clone(), shares(10))]),
+                    fetched_at: cleared_at,
+                },
+            )
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::MarketMaking),
+            None,
+            "recovery should not reintroduce stale inflight for suppressed symbols"
+        );
+        drop(inventory);
+
+        assert!(
+            trigger
+                .suppressed_inflight_symbols
+                .read()
+                .await
+                .contains_key(&symbol),
+            "stale recovery snapshots should keep suppression active"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_path_expires_timed_out_mints_before_reapplying_inflight() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let fetched_at = Utc::now();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .update_equity(
+                &symbol,
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, shares(10)),
+                fetched_at,
+            )
+            .unwrap();
+        let (trigger, _receiver) = make_trigger_with_inventory_and_registry_config(
+            inventory,
+            &symbol,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+        let id = IssuerRequestId::new("recovery-timeout-sweep");
+
+        trigger.mint_tracking.write().await.insert(
+            id.clone(),
+            MintTracking {
+                symbol: symbol.clone(),
+                quantity: shares(10),
+                stage: MintTrackingStage::Accepted,
+                last_progress_at: fetched_at - ChronoDuration::minutes(5),
+            },
+        );
+
+        trigger
+            .on_snapshot_recovery(
+                RebalancingTriggerError::Inventory(InventoryViewError::Equity(
+                    InventoryError::NegativeInflight {
+                        value: FractionalShares::new(float!(-1)),
+                    },
+                )),
+                InventorySnapshotEvent::InflightEquity {
+                    mints: BTreeMap::from([(symbol.clone(), shares(10))]),
+                    redemptions: BTreeMap::new(),
+                    fetched_at,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            trigger.timed_out_mints.read().await.contains_key(&id),
+            "recovery should run the timeout sweep before filtering inflight snapshots"
+        );
+        assert!(
+            trigger
+                .suppressed_inflight_symbols
+                .read()
+                .await
+                .contains_key(&symbol),
+            "recovery timeout sweep should suppress the stale inflight snapshot"
+        );
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::Hedging),
+            None,
+            "recovery should not reapply inflight for a mint that timed out on this pass"
+        );
+        drop(inventory);
+    }
+
+    #[tokio::test]
+    async fn timeout_markers_are_pruned_after_retention_window() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let (trigger, _receiver) = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
+            &symbol,
+        )
+        .await;
+        let stale_time = Utc::now()
+            - ChronoDuration::from_std(TIMEOUT_TOMBSTONE_RETENTION).unwrap()
+            - ChronoDuration::seconds(1);
+        let mint_id = IssuerRequestId::new("stale-mint");
+        let redemption_id = RedemptionAggregateId::new("stale-redemption");
+        let usdc_id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger
+            .suppressed_inflight_symbols
+            .write()
+            .await
+            .insert(symbol.clone(), stale_time);
+        trigger
+            .timed_out_mints
+            .write()
+            .await
+            .insert(mint_id, stale_time);
+        trigger
+            .timed_out_redemptions
+            .write()
+            .await
+            .insert(redemption_id, stale_time);
+        trigger
+            .timed_out_usdc_rebalances
+            .write()
+            .await
+            .insert(usdc_id, stale_time);
+
+        trigger.expire_stuck_operations(Utc::now()).await.unwrap();
+
+        assert!(
+            trigger.suppressed_inflight_symbols.read().await.is_empty(),
+            "expired snapshot suppressions should be pruned"
+        );
+        assert!(
+            trigger.timed_out_mints.read().await.is_empty(),
+            "expired mint tombstones should be pruned"
+        );
+        assert!(
+            trigger.timed_out_redemptions.read().await.is_empty(),
+            "expired redemption tombstones should be pruned"
+        );
+        assert!(
+            trigger.timed_out_usdc_rebalances.read().await.is_empty(),
+            "expired USDC tombstones should be pruned"
         );
     }
 

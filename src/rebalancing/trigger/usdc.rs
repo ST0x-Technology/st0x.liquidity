@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rain_math_float::{Float, FloatError};
 
 use st0x_float_macro::float;
@@ -20,6 +20,7 @@ use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceEvent, UsdcRebalanc
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UsdcTrackingEvent {
+    Initiated,
     Bridged,
     DepositConfirmed,
     ConversionConfirmed,
@@ -28,6 +29,7 @@ pub(crate) enum UsdcTrackingEvent {
 impl std::fmt::Display for UsdcTrackingEvent {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Initiated => write!(formatter, "Initiated"),
             Self::Bridged => write!(formatter, "Bridged"),
             Self::DepositConfirmed => write!(formatter, "DepositConfirmed"),
             Self::ConversionConfirmed => write!(formatter, "ConversionConfirmed"),
@@ -37,16 +39,132 @@ impl std::fmt::Display for UsdcTrackingEvent {
 
 #[derive(Debug, Clone)]
 pub(super) struct UsdcRebalanceTracking {
-    direction: RebalanceDirection,
-    initiated_amount: Usdc,
-    bridged_amount_received: Option<Usdc>,
+    pub(super) direction: RebalanceDirection,
+    pub(super) initiated_amount: Usdc,
+    pub(super) bridged_amount_received: Option<Usdc>,
+    pub(super) stage: UsdcRebalanceStage,
+    pub(super) last_progress_at: DateTime<Utc>,
 }
 
 impl UsdcRebalanceTracking {
-    fn source_venue(&self) -> Venue {
+    pub(super) fn source_venue(&self) -> Venue {
         match self.direction {
             RebalanceDirection::AlpacaToBase => Venue::Hedging,
             RebalanceDirection::BaseToAlpaca => Venue::MarketMaking,
+        }
+    }
+
+    fn source_transfer_started(&self) -> bool {
+        match self.direction {
+            RebalanceDirection::AlpacaToBase => !matches!(
+                self.stage,
+                UsdcRebalanceStage::ConversionInitiated | UsdcRebalanceStage::ConversionConfirmed
+            ),
+            RebalanceDirection::BaseToAlpaca => true,
+        }
+    }
+
+    fn track_progress(&mut self, event: &UsdcRebalanceEvent) {
+        let Some(stage) = UsdcRebalanceStage::from_event(event) else {
+            return;
+        };
+        let Some(last_progress_at) = stage.timestamp(event) else {
+            return;
+        };
+
+        self.stage = stage;
+        self.last_progress_at = last_progress_at;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UsdcRebalanceStage {
+    ConversionInitiated,
+    ConversionConfirmed,
+    Initiated,
+    WithdrawalConfirmed,
+    BridgingInitiated,
+    BridgeAttestationReceived,
+    Bridged,
+    DepositInitiated,
+    DepositConfirmed,
+}
+
+impl std::fmt::Display for UsdcRebalanceStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConversionInitiated => write!(formatter, "ConversionInitiated"),
+            Self::ConversionConfirmed => write!(formatter, "ConversionConfirmed"),
+            Self::Initiated => write!(formatter, "Initiated"),
+            Self::WithdrawalConfirmed => write!(formatter, "WithdrawalConfirmed"),
+            Self::BridgingInitiated => write!(formatter, "BridgingInitiated"),
+            Self::BridgeAttestationReceived => write!(formatter, "BridgeAttestationReceived"),
+            Self::Bridged => write!(formatter, "Bridged"),
+            Self::DepositInitiated => write!(formatter, "DepositInitiated"),
+            Self::DepositConfirmed => write!(formatter, "DepositConfirmed"),
+        }
+    }
+}
+
+impl UsdcRebalanceStage {
+    pub(super) fn from_event(event: &UsdcRebalanceEvent) -> Option<Self> {
+        use UsdcRebalanceEvent::*;
+
+        match event {
+            ConversionInitiated { .. } => Some(Self::ConversionInitiated),
+            ConversionConfirmed {
+                direction: RebalanceDirection::AlpacaToBase,
+                ..
+            } => Some(Self::ConversionConfirmed),
+            Initiated { .. } => Some(Self::Initiated),
+            WithdrawalConfirmed { .. } => Some(Self::WithdrawalConfirmed),
+            BridgingInitiated { .. } => Some(Self::BridgingInitiated),
+            BridgeAttestationReceived { .. } => Some(Self::BridgeAttestationReceived),
+            Bridged { .. } => Some(Self::Bridged),
+            DepositInitiated { .. } => Some(Self::DepositInitiated),
+            DepositConfirmed { .. } => Some(Self::DepositConfirmed),
+            ConversionConfirmed { .. }
+            | ConversionFailed { .. }
+            | WithdrawalFailed { .. }
+            | BridgingFailed { .. }
+            | DepositFailed { .. } => None,
+        }
+    }
+
+    fn timestamp(self, event: &UsdcRebalanceEvent) -> Option<DateTime<Utc>> {
+        use UsdcRebalanceEvent::*;
+
+        match (self, event) {
+            (Self::ConversionInitiated, ConversionInitiated { initiated_at, .. }) => {
+                Some(*initiated_at)
+            }
+            (Self::ConversionConfirmed, ConversionConfirmed { converted_at, .. }) => {
+                Some(*converted_at)
+            }
+            (Self::Initiated, Initiated { initiated_at, .. }) => Some(*initiated_at),
+            (Self::WithdrawalConfirmed, WithdrawalConfirmed { confirmed_at }) => {
+                Some(*confirmed_at)
+            }
+            (Self::BridgingInitiated, BridgingInitiated { burned_at, .. }) => Some(*burned_at),
+            (Self::BridgeAttestationReceived, BridgeAttestationReceived { attested_at, .. }) => {
+                Some(*attested_at)
+            }
+            (Self::Bridged, Bridged { minted_at, .. }) => Some(*minted_at),
+            (
+                Self::DepositInitiated,
+                DepositInitiated {
+                    deposit_initiated_at,
+                    ..
+                },
+            ) => Some(*deposit_initiated_at),
+            (
+                Self::DepositConfirmed,
+                DepositConfirmed {
+                    deposit_confirmed_at,
+                    ..
+                },
+            ) => Some(*deposit_confirmed_at),
+            _ => None,
         }
     }
 }
@@ -229,54 +347,60 @@ impl RebalancingTrigger {
         id: UsdcRebalanceId,
         event: UsdcRebalanceEvent,
     ) -> Result<(), RebalancingTriggerError> {
+        let event_sync_guard = self.usdc_event_sync.lock().await;
+
+        if self
+            .timed_out_usdc_rebalances
+            .read()
+            .await
+            .contains_key(&id)
+        {
+            warn!(id = %id, "Ignoring late USDC rebalance event after timeout cleanup");
+            return Ok(());
+        }
+
+        self.apply_usdc_rebalance_event(&id, &event).await?;
+
+        let is_terminal = Self::is_terminal_usdc_rebalance_event(&event);
+        if is_terminal {
+            self.usdc_tracking.write().await.remove(&id);
+            self.clear_usdc_in_progress();
+            debug!("Cleared USDC in-progress flag after rebalance terminal event");
+        }
+
+        drop(event_sync_guard);
+
+        if is_terminal {
+            self.check_and_trigger_usdc().await;
+        }
+
+        Ok(())
+    }
+
+    async fn apply_usdc_rebalance_event(
+        &self,
+        id: &UsdcRebalanceId,
+        event: &UsdcRebalanceEvent,
+    ) -> Result<(), RebalancingTriggerError> {
         use UsdcRebalanceEvent::*;
 
-        match &event {
+        match event {
+            ConversionInitiated {
+                direction, amount, ..
+            } => {
+                self.upsert_conversion_tracking(id, direction, *amount, event)
+                    .await;
+            }
             Initiated {
                 direction, amount, ..
             } => {
-                self.track_initiated_usdc_rebalance(&id, direction, *amount)
+                self.track_initiated_usdc_rebalance(id, direction, *amount, event)
                     .await?;
             }
-
-            Bridged {
-                amount_received, ..
-            } => {
-                self.track_bridged_amount(&id, *amount_received).await?;
-            }
-
-            ConversionConfirmed {
-                direction: RebalanceDirection::BaseToAlpaca,
-                filled_amount,
-                ..
-            } => {
-                self.complete_usdc_rebalance(
-                    &id,
-                    UsdcTrackingEvent::ConversionConfirmed,
-                    *filled_amount,
-                )
-                .await?;
-            }
-
-            DepositConfirmed {
-                direction: RebalanceDirection::AlpacaToBase,
-                ..
-            } => {
-                self.complete_alpaca_to_base_deposit(&id).await?;
-            }
-
-            WithdrawalFailed { .. }
-            | BridgingFailed { .. }
-            | DepositFailed { .. }
-            | ConversionFailed { .. } => {
-                self.cancel_tracked_usdc_rebalance(&id).await?;
-            }
-
             WithdrawalConfirmed { .. }
             | BridgingInitiated { .. }
             | BridgeAttestationReceived { .. }
             | DepositInitiated { .. }
-            | ConversionInitiated { .. }
             | DepositConfirmed {
                 direction: RebalanceDirection::BaseToAlpaca,
                 ..
@@ -284,15 +408,39 @@ impl RebalancingTrigger {
             | ConversionConfirmed {
                 direction: RebalanceDirection::AlpacaToBase,
                 ..
-            } => {}
-        }
-
-        if Self::is_terminal_usdc_rebalance_event(&event) {
-            self.usdc_tracking.write().await.remove(&id);
-            self.clear_usdc_in_progress();
-            debug!("Cleared USDC in-progress flag after rebalance terminal event");
-
-            self.check_and_trigger_usdc().await;
+            } => {
+                self.track_usdc_stage_progress(id, event).await;
+            }
+            Bridged {
+                amount_received, ..
+            } => {
+                self.track_bridged_amount(id, *amount_received).await?;
+                self.track_usdc_stage_progress(id, event).await;
+            }
+            ConversionConfirmed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                filled_amount,
+                ..
+            } => {
+                self.complete_usdc_rebalance(
+                    id,
+                    UsdcTrackingEvent::ConversionConfirmed,
+                    *filled_amount,
+                )
+                .await?;
+            }
+            DepositConfirmed {
+                direction: RebalanceDirection::AlpacaToBase,
+                ..
+            } => {
+                self.complete_alpaca_to_base_deposit(id).await?;
+            }
+            WithdrawalFailed { .. }
+            | BridgingFailed { .. }
+            | DepositFailed { .. }
+            | ConversionFailed { .. } => {
+                self.cancel_tracked_usdc_rebalance(id).await?;
+            }
         }
 
         Ok(())
@@ -303,13 +451,63 @@ impl RebalancingTrigger {
         id: &UsdcRebalanceId,
         direction: &RebalanceDirection,
         amount: Usdc,
+        event: &UsdcRebalanceEvent,
     ) -> Result<(), RebalancingTriggerError> {
-        let tracking = UsdcRebalanceTracking {
+        let stage = UsdcRebalanceStage::from_event(event).ok_or(
+            RebalancingTriggerError::MissingUsdcTrackingContext {
+                id: id.clone(),
+                event: UsdcTrackingEvent::Initiated,
+            },
+        )?;
+        let last_progress_at =
+            stage
+                .timestamp(event)
+                .ok_or(RebalancingTriggerError::MissingUsdcTrackingContext {
+                    id: id.clone(),
+                    event: UsdcTrackingEvent::Initiated,
+                })?;
+        let mut tracking = self.usdc_tracking.write().await;
+        if let Some(existing) = tracking.get_mut(id) {
+            let tracking_entry = UsdcRebalanceTracking {
+                direction: direction.clone(),
+                initiated_amount: amount,
+                bridged_amount_received: existing.bridged_amount_received,
+                stage,
+                last_progress_at,
+            };
+
+            if existing.source_transfer_started() {
+                *existing = tracking_entry;
+                return Ok(());
+            }
+
+            drop(tracking);
+
+            let update =
+                Inventory::transfer(tracking_entry.source_venue(), TransferOp::Start, amount);
+
+            let mut inventory = self.inventory.write().await;
+            *inventory = inventory.clone().update_usdc(update, Utc::now())?;
+            drop(inventory);
+
+            self.usdc_tracking
+                .write()
+                .await
+                .insert(id.clone(), tracking_entry);
+
+            return Ok(());
+        }
+        drop(tracking);
+
+        let tracking_entry = UsdcRebalanceTracking {
             direction: direction.clone(),
             initiated_amount: amount,
             bridged_amount_received: None,
+            stage,
+            last_progress_at,
         };
-        let update = Inventory::transfer(tracking.source_venue(), TransferOp::Start, amount);
+
+        let update = Inventory::transfer(tracking_entry.source_venue(), TransferOp::Start, amount);
 
         let mut inventory = self.inventory.write().await;
         *inventory = inventory.clone().update_usdc(update, Utc::now())?;
@@ -318,9 +516,56 @@ impl RebalancingTrigger {
         self.usdc_tracking
             .write()
             .await
-            .insert(id.clone(), tracking);
+            .insert(id.clone(), tracking_entry);
 
         Ok(())
+    }
+
+    async fn upsert_conversion_tracking(
+        &self,
+        id: &UsdcRebalanceId,
+        direction: &RebalanceDirection,
+        amount: Usdc,
+        event: &UsdcRebalanceEvent,
+    ) {
+        let Some(stage) = UsdcRebalanceStage::from_event(event) else {
+            warn!(
+                id = %id,
+                ?event,
+                "Skipping conversion tracking update: event yielded no timeout stage"
+            );
+            return;
+        };
+        let Some(last_progress_at) = stage.timestamp(event) else {
+            warn!(
+                id = %id,
+                ?stage,
+                ?event,
+                "Skipping conversion tracking update: stage had no timestamp"
+            );
+            return;
+        };
+        let mut tracking = self.usdc_tracking.write().await;
+
+        if let Some(existing) = tracking.get_mut(id) {
+            existing.direction = direction.clone();
+            if !existing.source_transfer_started() {
+                existing.initiated_amount = amount;
+            }
+            existing.stage = stage;
+            existing.last_progress_at = last_progress_at;
+            return;
+        }
+
+        let tracking_entry = UsdcRebalanceTracking {
+            direction: direction.clone(),
+            initiated_amount: amount,
+            bridged_amount_received: None,
+            stage,
+            last_progress_at,
+        };
+
+        tracking.insert(id.clone(), tracking_entry);
     }
 
     async fn track_bridged_amount(
@@ -378,6 +623,10 @@ impl RebalancingTrigger {
             );
             return Ok(());
         };
+
+        if !tracking.source_transfer_started() {
+            return Ok(());
+        }
 
         let source_venue = tracking.source_venue();
         let initiated_amount = tracking.initiated_amount;
@@ -442,6 +691,20 @@ impl RebalancingTrigger {
         drop(inventory);
 
         Ok(())
+    }
+
+    async fn track_usdc_stage_progress(&self, id: &UsdcRebalanceId, event: &UsdcRebalanceEvent) {
+        let tracked = {
+            let mut tracking = self.usdc_tracking.write().await;
+            tracking.get_mut(id).is_some_and(|existing| {
+                existing.track_progress(event);
+                true
+            })
+        };
+
+        if !tracked {
+            warn!(id = %id, "USDC progress event missing tracking context");
+        }
     }
 }
 

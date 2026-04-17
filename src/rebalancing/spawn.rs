@@ -223,6 +223,7 @@ mod tests {
         let trigger_config = RebalancingTriggerConfig {
             equity: ctx.equity,
             usdc: ctx.usdc,
+            transfer_timeout: ctx.transfer_timeout,
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
                 cash: None,
@@ -241,6 +242,7 @@ mod tests {
         let trigger_config = RebalancingTriggerConfig {
             equity: ctx.equity,
             usdc: ctx.usdc,
+            transfer_timeout: ctx.transfer_timeout,
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
                 cash: None,
