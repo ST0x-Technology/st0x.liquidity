@@ -30,8 +30,9 @@ kind = "private-key"
 # organization_id = "org-example-turnkey-org-id"
 
 # Optional — only needed for automatic rebalancing.
-# Without this section, the bot runs in Standalone mode (observe-only)
-# but the wallet (above) is still available for manual CLI operations.
+# Without this section (and with raindex.order_owner set above), the bot
+# runs in Standalone mode — the wallet is still available for manual CLI
+# operations.
 [rebalancing]
 redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 # transfer timeout in seconds before stuck inflight state is tombstoned and cleared

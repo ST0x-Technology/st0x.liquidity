@@ -435,6 +435,14 @@ impl Ctx {
 
         let evm = EvmCtx::new(&config.raindex, secrets.evm);
 
+        // Fail fast on rebalancing + order_owner conflict before wallet
+        // construction, so operators see the real misconfiguration first.
+        if config.rebalancing.is_some() {
+            if let Some(configured) = config.raindex.order_owner {
+                return Err(CtxError::OrderOwnerConflictsWithRebalancing { configured });
+            }
+        }
+
         // Build wallet from top-level [wallet] config + secrets + RPC URLs.
         let wallet = match (config.wallet, secrets.wallet) {
             (Some(wallet_config), Some(wallet_secrets)) => {
@@ -502,6 +510,7 @@ impl Ctx {
 
                 TradingMode::Rebalancing(Box::new(RebalancingCtx::new(&rebalancing_config)?))
             }
+            // Unreachable: early conflict check above returns before this point.
             (Some(_), Some(configured)) => {
                 return Err(CtxError::OrderOwnerConflictsWithRebalancing { configured });
             }
@@ -1686,6 +1695,104 @@ pub(crate) mod tests {
         assert!(
             matches!(result, Err(CtxError::WalletNotConfigured)),
             "Expected WalletNotConfigured error, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wallet_config_without_wallet_secrets_fails() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            deployment_block = 1
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+            [broker]
+            counter_trade_slippage_bps = 100
+
+            [broker.travel_rule]
+            beneficiary_entity_name = "Test Corp"
+
+            [wallet]
+            kind = "private-key"
+        "#,
+        );
+
+        let secrets = toml_file(
+            r#"
+            [evm]
+            ws_rpc_url = "ws://localhost:8545"
+
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+            mode = "sandbox"
+        "#,
+        );
+
+        let result = Ctx::load_files(config.path(), secrets.path()).await;
+        assert!(
+            matches!(result, Err(CtxError::WalletSecretsMissing)),
+            "Expected WalletSecretsMissing error, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wallet_without_rpc_urls_fails() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            deployment_block = 1
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+            [broker]
+            counter_trade_slippage_bps = 100
+
+            [broker.travel_rule]
+            beneficiary_entity_name = "Test Corp"
+
+            [wallet]
+            kind = "private-key"
+        "#,
+        );
+
+        let secrets = toml_file(
+            r#"
+            [evm]
+            ws_rpc_url = "ws://localhost:8545"
+
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+            mode = "sandbox"
+
+            [wallet]
+            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        "#,
+        );
+
+        let result = Ctx::load_files(config.path(), secrets.path()).await;
+        assert!(
+            matches!(
+                result,
+                Err(CtxError::WalletMissingRpcUrl {
+                    field: "base_rpc_url"
+                })
+            ),
+            "Expected WalletMissingRpcUrl for base_rpc_url, got {result:?}"
         );
     }
 
