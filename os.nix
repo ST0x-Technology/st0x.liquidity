@@ -12,8 +12,8 @@ let
     runtimeInputs = [ st0x-cli ];
     text = ''
       exec cli \
-        --config "''${STOX_CONFIG:-/run/st0x/st0x-hedge.config}" \
-        --secrets "''${STOX_SECRETS:-/run/agenix/st0x-hedge.toml}" \
+        --config "''${STOX_CONFIG:-/run/st0x/cli.config}" \
+        --secrets "''${STOX_SECRETS:-/run/agenix/cli.toml}" \
         "$@"
     '';
   };
@@ -210,6 +210,11 @@ in {
   programs.bash.interactiveShellInit = "set -o vi";
 
   age.secrets = {
+    "cli.toml" = {
+      file = ./secret/cli.toml.age;
+      group = "st0x";
+      mode = "0640";
+    };
     "tailscale-authkey-${environment}" = {
       file = ./secret/tailscale-authkey-${environment}.age;
       mode = "0400";
@@ -242,27 +247,34 @@ in {
     cli
   ];
 
-  system.activationScripts.per-service-profiles.text = ''
-    mkdir -p /nix/var/nix/profiles/per-service
+  system = {
+    activationScripts.install-cli-config.text = ''
+      mkdir -p /run/st0x
+      install -m 0640 -o root -g st0x ${./config/cli.toml} /run/st0x/cli.config
+    '';
 
-    # Managed services use restartIfChanged = false + ConditionPathExists so
-    # that deploy.nix's per-service profile owns stop/install/restart. But if
-    # a previous deploy left one crash-looping (Restart = always), its failed
-    # state persists into the next activation and switch-to-configuration's
-    # final "units failed" check exits 4, which makes deploy-rs roll back
-    # before it ever reaches the per-service profile that would install the
-    # fix. Stop + reset-failed any managed service that is currently broken
-    # so activation can complete; the service profile restarts it afterwards.
-    for svc in ${
-      builtins.concatStringsSep " " (builtins.attrNames enabledServices)
-    }; do
-      state=$(${pkgs.systemd}/bin/systemctl show -p ActiveState --value "$svc.service" 2>/dev/null || echo "")
-      if [ "$state" = "failed" ] || [ "$state" = "activating" ]; then
-        ${pkgs.systemd}/bin/systemctl stop "$svc.service" 2>/dev/null || true
-        ${pkgs.systemd}/bin/systemctl reset-failed "$svc.service" 2>/dev/null || true
-      fi
-    done
-  '';
+    activationScripts.per-service-profiles.text = ''
+      mkdir -p /nix/var/nix/profiles/per-service
 
-  system.stateVersion = "24.11";
+      # Managed services use restartIfChanged = false + ConditionPathExists so
+      # that deploy.nix's per-service profile owns stop/install/restart. But if
+      # a previous deploy left one crash-looping (Restart = always), its failed
+      # state persists into the next activation and switch-to-configuration's
+      # final "units failed" check exits 4, which makes deploy-rs roll back
+      # before it ever reaches the per-service profile that would install the
+      # fix. Stop + reset-failed any managed service that is currently broken
+      # so activation can complete; the service profile restarts it afterwards.
+      for svc in ${
+        builtins.concatStringsSep " " (builtins.attrNames enabledServices)
+      }; do
+        state=$(${pkgs.systemd}/bin/systemctl show -p ActiveState --value "$svc.service" 2>/dev/null || echo "")
+        if [ "$state" = "failed" ] || [ "$state" = "activating" ]; then
+          ${pkgs.systemd}/bin/systemctl stop "$svc.service" 2>/dev/null || true
+          ${pkgs.systemd}/bin/systemctl reset-failed "$svc.service" 2>/dev/null || true
+        fi
+      done
+    '';
+
+    stateVersion = "24.11";
+  };
 }

@@ -604,10 +604,11 @@ pub(super) async fn alpaca_convert_command<W: Write>(
     writeln!(stdout, "Converting {direction_str} on Alpaca")?;
     writeln!(stdout, "   Amount: {amount} USDC")?;
 
-    let rebalancing_ctx = ctx.rebalancing_ctx()?;
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
+        anyhow::bail!("alpaca-convert requires Alpaca Broker API configuration");
+    };
 
-    let executor =
-        AlpacaBrokerApi::try_from_ctx(rebalancing_ctx.alpaca_broker_auth.clone()).await?;
+    let executor = AlpacaBrokerApi::try_from_ctx(alpaca_auth.clone()).await?;
 
     let conversion_direction = match direction {
         ConvertDirection::ToUsd => ConversionDirection::UsdcToUsd,
@@ -943,6 +944,23 @@ mod tests {
         assert!(
             output.contains("USD → USDC"),
             "Expected USD to USDC in output, got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_alpaca_convert_requires_alpaca_config() {
+        let ctx = create_ctx_without_alpaca();
+        let amount = Usdc::new(float!(100));
+
+        let mut stdout = Vec::new();
+        let err_msg = alpaca_convert_command(&mut stdout, ConvertDirection::ToUsd, amount, &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err_msg.contains("alpaca-convert requires Alpaca Broker API"),
+            "Expected Alpaca config error, got: {err_msg}"
         );
     }
 
