@@ -86,13 +86,13 @@ fn build_full_system_ctx<P: Provider + Clone>(
         })
         .collect::<anyhow::Result<_>>()?;
 
-    let _base_wallet: Arc<dyn Wallet<Provider = RootProvider>> = Arc::new(TestWallet::new(
+    let base_wallet: Arc<dyn Wallet<Provider = RootProvider>> = Arc::new(TestWallet::new(
         &chain.owner_key,
         chain.endpoint().parse()?,
         1,
     )?);
 
-    let _ethereum_wallet: Arc<dyn Wallet<Provider = RootProvider>> = Arc::new(TestWallet::new(
+    let ethereum_wallet: Arc<dyn Wallet<Provider = RootProvider>> = Arc::new(TestWallet::new(
         &chain.owner_key,
         ethereum_endpoint.parse()?,
         1,
@@ -109,6 +109,9 @@ fn build_full_system_ctx<P: Provider + Clone>(
         .with_circle_api_base(cctp.attestation_base_url)
         .with_cctp_addresses(cctp.token_messenger, cctp.message_transmitter);
 
+    let wallet_ctx =
+        st0x_hedge::wallet::OnchainWalletCtx::from_wallets(base_wallet, ethereum_wallet);
+
     Ctx::for_test()
         .database_url(db_path.display().to_string())
         .ws_rpc_url(chain.ws_endpoint()?)
@@ -116,6 +119,7 @@ fn build_full_system_ctx<P: Provider + Clone>(
         .deployment_block(deployment_block)
         .broker(broker_ctx)
         .trading_mode(TradingMode::Rebalancing(Box::new(rebalancing_ctx)))
+        .wallet(wallet_ctx)
         .assets(AssetsConfig {
             equities: EquitiesConfig {
                 symbols: equities,

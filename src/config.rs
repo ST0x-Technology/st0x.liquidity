@@ -17,7 +17,7 @@ use st0x_finance::Usdc;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
-use tracing::Level;
+use tracing::{Level, warn};
 
 #[cfg(any(test, feature = "test-support"))]
 use url::Url;
@@ -442,11 +442,15 @@ impl Ctx {
         let wallet = match (config.wallet, secrets.wallet) {
             (Some(wallet_config), Some(wallet_secrets)) => {
                 let Some(base_url) = base_rpc_url else {
-                    return Err(CtxError::WalletMissingRpcUrls);
+                    return Err(CtxError::WalletMissingRpcUrl {
+                        field: "base_rpc_url",
+                    });
                 };
 
                 let Some(eth_url) = ethereum_rpc_url else {
-                    return Err(CtxError::WalletMissingRpcUrls);
+                    return Err(CtxError::WalletMissingRpcUrl {
+                        field: "ethereum_rpc_url",
+                    });
                 };
 
                 Some(
@@ -460,9 +464,17 @@ impl Ctx {
                 )
             }
             (Some(_), None) => return Err(CtxError::WalletSecretsMissing),
-            // Extra wallet secrets without config are silently ignored
-            // (operator may share one secrets file across bot + CLI).
-            (None, _) => None,
+            (None, Some(_)) => {
+                // Wallet secrets present but no [wallet] in config.
+                // Common when sharing one secrets file across bot + CLI
+                // where the bot config doesn't need a wallet.
+                warn!(
+                    "[wallet] secrets present but no [wallet] config section -- \
+                     wallet signing will not be available"
+                );
+                None
+            }
+            (None, None) => None,
         };
 
         let trading_mode = match (
@@ -726,11 +738,8 @@ pub enum CtxError {
     WalletNotConfigured,
     #[error(transparent)]
     Wallet(#[from] crate::wallet::WalletCtxError),
-    #[error(
-        "[evm] base_rpc_url and ethereum_rpc_url are required \
-         when [wallet] is configured"
-    )]
-    WalletMissingRpcUrls,
+    #[error("[evm] {field} is required when [wallet] is configured")]
+    WalletMissingRpcUrl { field: &'static str },
     #[error("[wallet] config present but [wallet] secrets missing")]
     WalletSecretsMissing,
     #[error("rebalancing config present in config but rebalancing secrets missing")]
@@ -807,7 +816,7 @@ impl CtxError {
             Self::MissingTravelRule => "missing travel rule config",
             Self::WalletNotConfigured => "wallet not configured",
             Self::Wallet(_) => "wallet construction error",
-            Self::WalletMissingRpcUrls => "wallet missing RPC URLs",
+            Self::WalletMissingRpcUrl { .. } => "wallet missing RPC URL",
             Self::WalletSecretsMissing => "wallet secrets missing",
         }
     }
@@ -1638,6 +1647,62 @@ pub(crate) mod tests {
         assert!(
             matches!(result, Err(CtxError::RebalancingSecretsMissing)),
             "Expected RebalancingSecretsMissing error, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebalancing_without_wallet_config_fails() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            deployment_block = 1
+
+            [broker]
+            counter_trade_slippage_bps = 100
+
+            [broker.travel_rule]
+            beneficiary_entity_name = "Test Corp"
+
+            [rebalancing]
+            redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            transfer_timeout_secs = 1800
+
+            [rebalancing.equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [rebalancing.usdc]
+            mode = "enabled"
+            target = "0.5"
+            deviation = "0.3"
+        "#,
+        );
+
+        let secrets = toml_file(
+            r#"
+            [evm]
+            ws_rpc_url = "ws://localhost:8545"
+
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+            mode = "sandbox"
+
+            [rebalancing]
+        "#,
+        );
+
+        let result = Ctx::load_files(config.path(), secrets.path()).await;
+        assert!(
+            matches!(result, Err(CtxError::WalletNotConfigured)),
+            "Expected WalletNotConfigured error, got {result:?}"
         );
     }
 

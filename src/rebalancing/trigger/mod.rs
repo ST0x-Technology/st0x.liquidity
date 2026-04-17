@@ -118,8 +118,10 @@ impl std::fmt::Debug for RebalancingSecrets {
     }
 }
 
+/// Does not use `deny_unknown_fields` to tolerate legacy config files
+/// that still have `wallet.*` keys under `[rebalancing]` (wallet config
+/// has moved to the top-level `[wallet]` section).
 #[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct RebalancingConfig {
     pub(crate) equity: ImbalanceThreshold,
     pub(crate) usdc: UsdcRebalancing,
