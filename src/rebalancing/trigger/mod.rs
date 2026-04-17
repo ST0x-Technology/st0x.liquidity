@@ -104,24 +104,8 @@ pub enum UsdcRebalancing {
     Disabled,
 }
 
-/// Rebalancing secrets from the encrypted TOML.
-///
-/// Does not use `deny_unknown_fields` to tolerate legacy secrets files
-/// that still have `base_rpc_url`, `ethereum_rpc_url`, and `wallet`
-/// under `[rebalancing]` (these have moved to `[evm]` and `[wallet]`).
-#[derive(Deserialize)]
-pub(crate) struct RebalancingSecrets {}
-
-impl std::fmt::Debug for RebalancingSecrets {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("RebalancingSecrets").finish()
-    }
-}
-
-/// Does not use `deny_unknown_fields` to tolerate legacy config files
-/// that still have `wallet.*` keys under `[rebalancing]` (wallet config
-/// has moved to the top-level `[wallet]` section).
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RebalancingConfig {
     pub(crate) equity: ImbalanceThreshold,
     pub(crate) usdc: UsdcRebalancing,
@@ -5137,12 +5121,6 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_secrets_succeeds() {
-        let _secrets: RebalancingSecrets =
-            toml::from_str(&valid_rebalancing_secrets_toml()).unwrap();
-    }
-
-    #[test]
     fn deserialize_with_custom_thresholds() {
         let config: RebalancingConfig = toml::from_str(
             r#"
@@ -5213,19 +5191,6 @@ mod tests {
             error.message().contains("transfer_timeout_secs"),
             "Expected missing transfer_timeout_secs error, got: {error}"
         );
-    }
-
-    #[test]
-    fn deserialize_rebalancing_secrets_ignores_legacy_fields() {
-        let toml_str = r#"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://eth.example.com"
-        "#;
-
-        // RebalancingSecrets is now an empty struct that silently
-        // ignores legacy fields (base_rpc_url, ethereum_rpc_url, wallet)
-        // for backward compatibility.
-        let _secrets: RebalancingSecrets = toml::from_str(toml_str).unwrap();
     }
 
     #[test]
@@ -7769,18 +7734,6 @@ mod tests {
         assert!(
             trigger.timed_out_usdc_rebalances.read().await.is_empty(),
             "expired USDC tombstones should be pruned"
-        );
-    }
-
-    #[test]
-    fn rebalancing_secrets_debug_has_no_fields() {
-        let secrets = RebalancingSecrets {};
-
-        let debug = format!("{secrets:?}");
-
-        assert_eq!(
-            debug, "RebalancingSecrets",
-            "empty stub struct should have no fields in debug output"
         );
     }
 }

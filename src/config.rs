@@ -24,9 +24,7 @@ use url::Url;
 
 use crate::offchain::order_poller::OrderPollerCtx;
 use crate::onchain::{EvmConfig, EvmCtx, EvmSecrets};
-use crate::rebalancing::{
-    RebalancingConfig, RebalancingCtx, RebalancingCtxError, RebalancingSecrets,
-};
+use crate::rebalancing::{RebalancingConfig, RebalancingCtx, RebalancingCtxError};
 use crate::telemetry::{TelemetryConfig, TelemetryCtx, TelemetrySecrets};
 use crate::threshold::{ExecutionThreshold, InvalidThresholdError};
 use st0x_float_macro::float;
@@ -231,7 +229,6 @@ struct Secrets {
     broker: BrokerSecrets,
     #[serde(rename = "hyperdx")]
     telemetry: Option<TelemetrySecrets>,
-    rebalancing: Option<RebalancingSecrets>,
     wallet: Option<toml::Value>,
 }
 
@@ -477,13 +474,9 @@ impl Ctx {
             (None, None) => None,
         };
 
-        let trading_mode = match (
-            config.rebalancing,
-            secrets.rebalancing,
-            config.raindex.order_owner,
-        ) {
-            (Some(rebalancing_config), Some(rebalancing_secrets), None) => {
-                let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &broker else {
+        let trading_mode = match (config.rebalancing, config.raindex.order_owner) {
+            (Some(rebalancing_config), None) => {
+                let BrokerCtx::AlpacaBrokerApi(_) = &broker else {
                     return Err(RebalancingCtxError::NotAlpacaBroker.into());
                 };
 
@@ -509,13 +502,11 @@ impl Ctx {
 
                 TradingMode::Rebalancing(Box::new(RebalancingCtx::new(&rebalancing_config)?))
             }
-            (Some(_), Some(_), Some(configured)) => {
+            (Some(_), Some(configured)) => {
                 return Err(CtxError::OrderOwnerConflictsWithRebalancing { configured });
             }
-            (None, None, Some(order_owner)) => TradingMode::Standalone { order_owner },
-            (None, None, None) => return Err(CtxError::MissingOrderOwner),
-            (Some(_), None, _) => return Err(CtxError::RebalancingSecretsMissing),
-            (None, Some(_), _) => return Err(CtxError::RebalancingConfigMissing),
+            (None, Some(order_owner)) => TradingMode::Standalone { order_owner },
+            (None, None) => return Err(CtxError::MissingOrderOwner),
         };
 
         let log_level = config.log_level.unwrap_or(LogLevel::Debug);
@@ -660,6 +651,10 @@ impl Ctx {
             None => broker.execution_threshold()?,
         };
 
+        if matches!(trading_mode, TradingMode::Rebalancing(_)) && wallet.is_none() {
+            return Err(CtxError::WalletNotConfigured);
+        }
+
         Ok(Self {
             database_url,
             log_level: LogLevel::Debug,
@@ -742,10 +737,6 @@ pub enum CtxError {
     WalletMissingRpcUrl { field: &'static str },
     #[error("[wallet] config present but [wallet] secrets missing")]
     WalletSecretsMissing,
-    #[error("rebalancing config present in config but rebalancing secrets missing")]
-    RebalancingSecretsMissing,
-    #[error("rebalancing secrets present but rebalancing config missing in config")]
-    RebalancingConfigMissing,
     #[error(
         "order_owner {configured} must not be set when rebalancing \
          is enabled (address comes from the configured wallet)"
@@ -800,8 +791,6 @@ impl CtxError {
                 "counter trade slippage bps out of range"
             }
             Self::Telemetry(_) => "telemetry assembly error",
-            Self::RebalancingSecretsMissing => "rebalancing secrets missing",
-            Self::RebalancingConfigMissing => "rebalancing config missing",
             Self::OrderOwnerConflictsWithRebalancing { .. } => {
                 "order_owner conflicts with rebalancing"
             }
@@ -1240,8 +1229,6 @@ pub(crate) mod tests {
             account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
             mode = "sandbox"
 
-            [rebalancing]
-
             [wallet]
             private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         "#,
@@ -1487,8 +1474,6 @@ pub(crate) mod tests {
             account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
             mode = "sandbox"
 
-            [rebalancing]
-
             [wallet]
             private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         "#,
@@ -1645,8 +1630,8 @@ pub(crate) mod tests {
 
         let result = Ctx::load_files(config.path(), secrets.path()).await;
         assert!(
-            matches!(result, Err(CtxError::RebalancingSecretsMissing)),
-            "Expected RebalancingSecretsMissing error, got {result:?}"
+            matches!(result, Err(CtxError::WalletNotConfigured)),
+            "Expected WalletNotConfigured error, got {result:?}"
         );
     }
 
@@ -1694,8 +1679,6 @@ pub(crate) mod tests {
             api_secret = "test-secret"
             account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
             mode = "sandbox"
-
-            [rebalancing]
         "#,
         );
 
