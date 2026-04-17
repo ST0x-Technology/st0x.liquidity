@@ -14,18 +14,20 @@ orderbook = "0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D"
 # what block to backfill from
 deployment_block = 43259507
 
+[wallet]
+kind = "turnkey"
+address = "0xA9C16673F65AE808688cB18952AFE3d9658C808f"
+organization_id = "b100145e-7894-4c17-b3e7-160435f84803"
+
+# Rebalancing section is only needed for CLI commands that interact
+# with Alpaca tokenization (mint/redeem). The bot does NOT auto-rebalance
+# with this config because there is no order_owner and trading is
+# disabled on all equities.
 [rebalancing]
 redemption_wallet = "0x1c66D6708914C40239D54919320b4C48cAE3D1A9"
-# transfer timeout in seconds before stuck inflight state is tombstoned and cleared
-# 1800 = 30 minutes
 transfer_timeout_secs = 1800
-# started implementing a proper noop, realized there are more things
-# to improve about the config, so decided on soft noop for now
 equity = { target = 0.5, deviation = 1 }
 usdc = { mode = "disabled" }
-wallet.kind = "turnkey"
-wallet.address = "0xA9C16673F65AE808688cB18952AFE3d9658C808f"
-wallet.organization_id = "b100145e-7894-4c17-b3e7-160435f84803"
 
 [assets.cash]
 vault_id = "0xfab"

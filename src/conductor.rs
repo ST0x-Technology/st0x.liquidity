@@ -30,7 +30,7 @@ use st0x_execution::{
 
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::bindings::IOrderBookV6::{self, IOrderBookV6Instance};
-use crate::config::{AssetsConfig, Ctx, CtxError};
+use crate::config::{AssetsConfig, BrokerCtx, Ctx, CtxError};
 use crate::dashboard::EventBroadcaster;
 use crate::equity_redemption::symbols_with_stuck_redemptions;
 use crate::inventory::{
@@ -209,8 +209,9 @@ impl Conductor {
 
         let (position, position_projection, snapshot, rebalancer, wallet_polling, tokenizer) =
             if let Some(rebalancing_ctx) = rebalancing {
-                let ethereum_wallet = rebalancing_ctx.ethereum_wallet().clone();
-                let base_wallet = rebalancing_ctx.base_wallet().clone();
+                let wallet_ctx = ctx.wallet()?;
+                let ethereum_wallet = wallet_ctx.ethereum_wallet().clone();
+                let base_wallet = wallet_ctx.base_wallet().clone();
                 let infra = spawn_rebalancing_infrastructure(
                     rebalancing_ctx,
                     ethereum_wallet.clone(),
@@ -442,6 +443,10 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
     Box::pin(async move {
         info!("Initializing rebalancing infrastructure");
 
+        let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &deps.ctx.broker else {
+            anyhow::bail!("rebalancing requires Alpaca Broker API configuration");
+        };
+
         let market_maker_wallet = base_wallet.address();
 
         const OPERATION_CHANNEL_CAPACITY: usize = 100;
@@ -455,10 +460,10 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         ));
 
         let tokenization = Arc::new(AlpacaTokenizationService::new(
-            rebalancing_ctx.alpaca_broker_auth.base_url().to_string(),
-            rebalancing_ctx.alpaca_broker_auth.account_id,
-            rebalancing_ctx.alpaca_broker_auth.api_key.clone(),
-            rebalancing_ctx.alpaca_broker_auth.api_secret.clone(),
+            alpaca_auth.base_url().to_string(),
+            alpaca_auth.account_id,
+            alpaca_auth.api_key.clone(),
+            alpaca_auth.api_secret.clone(),
             base_wallet.clone(),
             rebalancing_ctx.redemption_wallet,
         ));
@@ -517,14 +522,15 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         };
 
         let alpaca_wallet = Arc::new(AlpacaWalletService::new(
-            rebalancing_ctx.alpaca_broker_auth.base_url().to_string(),
-            rebalancing_ctx.alpaca_broker_auth.account_id,
-            rebalancing_ctx.alpaca_broker_auth.api_key.clone(),
-            rebalancing_ctx.alpaca_broker_auth.api_secret.clone(),
+            alpaca_auth.base_url().to_string(),
+            alpaca_auth.account_id,
+            alpaca_auth.api_key.clone(),
+            alpaca_auth.api_secret.clone(),
         ));
 
         let services = RebalancerServices::new(
             rebalancing_ctx.clone(),
+            alpaca_auth.clone(),
             Arc::clone(&alpaca_wallet),
             deps.ctx.assets.equities.symbols.clone(),
             ethereum_wallet,

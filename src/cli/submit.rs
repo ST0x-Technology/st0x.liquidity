@@ -183,8 +183,8 @@ pub(super) async fn submit_command<Writer: Write>(
     skip_confirmation: bool,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    let rebalancing_ctx = ctx.rebalancing_ctx()?;
-    let wallet = rebalancing_ctx.base_wallet();
+    let wallet_ctx = ctx.wallet()?;
+    let wallet = wallet_ctx.base_wallet();
     let signer = wallet.address();
 
     render_review(stdout, signer, &transactions)?;

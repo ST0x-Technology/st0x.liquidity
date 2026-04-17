@@ -45,6 +45,10 @@ pub use tokenization::mock_api;
 mod tokenized_equity_mint;
 mod usdc_rebalance;
 mod vault_registry;
+#[cfg(any(test, feature = "test-support"))]
+pub mod wallet;
+#[cfg(not(any(test, feature = "test-support")))]
+pub(crate) mod wallet;
 mod wrapper;
 
 pub use telemetry::{TelemetryError, TelemetryGuard, mk_env_filter, setup_tracing};

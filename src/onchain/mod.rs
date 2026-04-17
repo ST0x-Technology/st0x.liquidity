@@ -43,8 +43,15 @@ pub(crate) struct EvmConfig {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_field_names)]
 pub(crate) struct EvmSecrets {
     pub(crate) ws_rpc_url: Url,
+    /// Base chain RPC URL for wallet operations. Required when `[wallet]`
+    /// is configured.
+    pub(crate) base_rpc_url: Option<Url>,
+    /// Ethereum mainnet RPC URL for wallet operations. Required when
+    /// `[wallet]` is configured.
+    pub(crate) ethereum_rpc_url: Option<Url>,
 }
 
 #[derive(Clone)]

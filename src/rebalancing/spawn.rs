@@ -10,7 +10,9 @@ use tracing::info;
 use st0x_bridge::cctp::{CctpBridge, CctpCtx, CctpError};
 use st0x_event_sorcery::Store;
 use st0x_evm::Wallet;
-use st0x_execution::{AlpacaBrokerApi, AlpacaBrokerApiError, EmptySymbolError, Executor, Symbol};
+use st0x_execution::{
+    AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiError, EmptySymbolError, Executor, Symbol,
+};
 
 use super::equity::CrossVenueEquityTransfer;
 use super::usdc::CrossVenueCashTransfer;
@@ -63,6 +65,7 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
     /// must happen before this constructor is called.
     pub(crate) async fn new(
         ctx: RebalancingCtx,
+        broker_auth: AlpacaBrokerApiCtx,
         wallet: Arc<AlpacaWalletService>,
         equities: HashMap<Symbol, EquityAssetConfig>,
         ethereum_wallet: Chain,
@@ -70,7 +73,7 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
         raindex: Arc<RaindexService<Chain>>,
         tokenizer: Arc<dyn Tokenizer>,
     ) -> Result<Self, SpawnRebalancerError> {
-        let broker = Arc::new(AlpacaBrokerApi::try_from_ctx(ctx.alpaca_broker_auth.clone()).await?);
+        let broker = Arc::new(AlpacaBrokerApi::try_from_ctx(broker_auth).await?);
 
         let cctp = Arc::new(
             CctpBridge::try_from_ctx(CctpCtx {
@@ -203,16 +206,6 @@ mod tests {
                 deviation: float!(0.15),
             })
             .redemption_wallet(address!("0x1234567890123456789012345678901234567890"))
-            .alpaca_broker_auth(AlpacaBrokerApiCtx {
-                api_key: "test_key".to_string(),
-                api_secret: "test_secret".to_string(),
-                account_id: AlpacaAccountId::new(Uuid::nil()),
-                mode: Some(AlpacaBrokerApiMode::Sandbox),
-                asset_cache_ttl: std::time::Duration::from_secs(3600),
-                time_in_force: TimeInForce::default(),
-                counter_trade_slippage_bps:
-                    st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
-            })
             .call()
     }
 
@@ -265,6 +258,7 @@ mod tests {
         let base_provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
 
         let rebalancing_ctx = make_ctx();
+        let account_id = AlpacaAccountId::new(Uuid::nil());
 
         let evm_private_key =
             b256!("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
@@ -276,7 +270,7 @@ mod tests {
 
         let tokenization = Arc::new(AlpacaTokenizationService::new(
             server.base_url(),
-            rebalancing_ctx.alpaca_broker_auth.account_id,
+            account_id,
             "test_key".into(),
             "test_secret".into(),
             base_wallet.clone(),
@@ -284,14 +278,12 @@ mod tests {
         ));
 
         let _account_mock = server.mock(|when, then| {
-            when.method(GET).path(format!(
-                "/v1/trading/accounts/{}/account",
-                rebalancing_ctx.alpaca_broker_auth.account_id
-            ));
+            when.method(GET)
+                .path(format!("/v1/trading/accounts/{account_id}/account",));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
-                    "id": rebalancing_ctx.alpaca_broker_auth.account_id.to_string(),
+                    "id": account_id.to_string(),
                     "status": "ACTIVE"
                 }));
         });
@@ -299,7 +291,7 @@ mod tests {
         let broker_auth = AlpacaBrokerApiCtx {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
-            account_id: rebalancing_ctx.alpaca_broker_auth.account_id,
+            account_id,
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::default(),
@@ -313,7 +305,7 @@ mod tests {
 
         let wallet = Arc::new(AlpacaWalletService::new(
             server.base_url(),
-            rebalancing_ctx.alpaca_broker_auth.account_id,
+            account_id,
             "test_key".into(),
             "test_secret".into(),
         ));
@@ -372,11 +364,10 @@ mod tests {
                 .json_body(json!({"message": "Invalid API credentials"}));
         });
 
-        let rebalancing_ctx = make_ctx();
         let broker_auth = AlpacaBrokerApiCtx {
             api_key: "invalid_key".to_string(),
             api_secret: "invalid_secret".to_string(),
-            account_id: rebalancing_ctx.alpaca_broker_auth.account_id,
+            account_id: AlpacaAccountId::new(Uuid::nil()),
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::default(),

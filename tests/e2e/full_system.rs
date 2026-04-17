@@ -67,7 +67,7 @@ fn build_full_system_ctx<P: Provider + Clone>(
         time_in_force: TimeInForce::Day,
         counter_trade_slippage_bps: DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
     };
-    let broker_ctx = BrokerCtx::AlpacaBrokerApi(alpaca_auth.clone());
+    let broker_ctx = BrokerCtx::AlpacaBrokerApi(alpaca_auth);
 
     let equities: HashMap<Symbol, EquityAssetConfig> = equity_tokens
         .iter()
@@ -86,13 +86,13 @@ fn build_full_system_ctx<P: Provider + Clone>(
         })
         .collect::<anyhow::Result<_>>()?;
 
-    let base_wallet: Arc<dyn Wallet<Provider = RootProvider>> = Arc::new(TestWallet::new(
+    let _base_wallet: Arc<dyn Wallet<Provider = RootProvider>> = Arc::new(TestWallet::new(
         &chain.owner_key,
         chain.endpoint().parse()?,
         1,
     )?);
 
-    let ethereum_wallet: Arc<dyn Wallet<Provider = RootProvider>> = Arc::new(TestWallet::new(
+    let _ethereum_wallet: Arc<dyn Wallet<Provider = RootProvider>> = Arc::new(TestWallet::new(
         &chain.owner_key,
         ethereum_endpoint.parse()?,
         1,
@@ -105,9 +105,6 @@ fn build_full_system_ctx<P: Provider + Clone>(
             deviation: float!(0.1),
         })
         .redemption_wallet(REDEMPTION_WALLET)
-        .alpaca_broker_auth(alpaca_auth)
-        .base_wallet(base_wallet)
-        .ethereum_wallet(ethereum_wallet)
         .call()
         .with_circle_api_base(cctp.attestation_base_url)
         .with_cctp_addresses(cctp.token_messenger, cctp.message_transmitter);
