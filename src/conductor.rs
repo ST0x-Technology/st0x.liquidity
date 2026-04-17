@@ -43,7 +43,9 @@ use crate::offchain_order::{
 };
 use crate::onchain::OnchainTrade;
 use crate::onchain::USDC_BASE;
-use crate::onchain::accumulator::{ExecutionCtx, check_all_positions, check_execution_readiness};
+#[cfg(test)]
+use crate::onchain::accumulator::check_all_positions;
+use crate::onchain::accumulator::{ExecutionCtx, check_execution_readiness};
 use crate::onchain::backfill::{backfill_events, get_backfill_retry_strat};
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::onchain::trade::{RaindexTradeEvent, extract_owned_vaults, extract_vaults_from_clear};
@@ -134,6 +136,7 @@ pub(crate) struct VaultDiscoveryCtx<'a> {
     pub(crate) order_owner: Address,
 }
 
+#[cfg(test)]
 pub(crate) struct AccumulatedPositionExecutionCtx<'a> {
     pub(crate) position: &'a Store<Position>,
     pub(crate) position_projection: &'a Projection<Position>,
@@ -724,50 +727,6 @@ fn spawn_order_poller<E: Executor + Clone + Send + 'static>(
     })
 }
 
-#[bon::builder]
-fn spawn_periodic_accumulated_position_check<E>(
-    executor: E,
-    position: Arc<Store<Position>>,
-    position_projection: Arc<Projection<Position>>,
-    offchain_order: Arc<Store<OffchainOrder>>,
-    counter_trade_submission_lock: Arc<Mutex<()>>,
-    execution_threshold: ExecutionThreshold,
-    check_interval: Duration,
-    ctx: Ctx,
-) -> JoinHandle<()>
-where
-    E: Executor + Clone + Send + 'static,
-    TradeAccountingError: From<E::Error>,
-{
-    info!("Starting periodic accumulated position checker");
-
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(check_interval);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        loop {
-            interval.tick().await;
-            debug!("Running periodic accumulated position check");
-            if let Err(error) = check_and_execute_accumulated_positions(
-                &executor,
-                AccumulatedPositionExecutionCtx {
-                    position: &position,
-                    position_projection: &position_projection,
-                    offchain_order: &offchain_order,
-                    counter_trade_submission_lock: &counter_trade_submission_lock,
-                    threshold: &execution_threshold,
-                    assets: &ctx.assets,
-                },
-                |symbol| ctx.is_trading_enabled(symbol),
-            )
-            .await
-            {
-                error!(?error, "Periodic accumulated position check failed");
-            }
-        }
-    })
-}
-
 fn spawn_inventory_poller<Chain, Exe>(
     service: InventoryPollingService<Chain, Exe>,
     poll_interval: std::time::Duration,
@@ -1072,18 +1031,6 @@ struct CounterTradeBatchBudget {
 }
 
 impl CounterTradeBatchBudget {
-    fn reserve_buying_power(&mut self, estimated_cost_cents: i64) -> Result<(), ExecutionError> {
-        self.reserved_buying_power_cents = self
-            .reserved_buying_power_cents
-            .checked_add(estimated_cost_cents)
-            .ok_or(ExecutionError::BuyingPowerReservationOverflow {
-                current_reserved_cents: self.reserved_buying_power_cents,
-                additional_cents: estimated_cost_cents,
-            })?;
-
-        Ok(())
-    }
-
     fn check_reservation(
         &self,
         reservation: &CounterTradeReservation,
@@ -1135,6 +1082,21 @@ impl CounterTradeBatchBudget {
             }
         }
     }
+}
+
+#[cfg(test)]
+impl CounterTradeBatchBudget {
+    fn reserve_buying_power(&mut self, estimated_cost_cents: i64) -> Result<(), ExecutionError> {
+        self.reserved_buying_power_cents = self
+            .reserved_buying_power_cents
+            .checked_add(estimated_cost_cents)
+            .ok_or(ExecutionError::BuyingPowerReservationOverflow {
+                current_reserved_cents: self.reserved_buying_power_cents,
+                additional_cents: estimated_cost_cents,
+            })?;
+
+        Ok(())
+    }
 
     fn commit_reservation(
         &mut self,
@@ -1170,6 +1132,9 @@ impl CounterTradeBatchBudget {
 
 enum CounterTradeSubmissionCheck {
     Allowed {
+        // Read by the #[cfg(test)] batch-execution path;
+        // the production single-trade path only checks Skipped.
+        #[cfg_attr(not(test), allow(dead_code))]
         reservation: Option<CounterTradeReservation>,
     },
     Skipped,
@@ -1358,6 +1323,7 @@ async fn execute_create_offchain_order(
     }
 }
 
+#[cfg(test)]
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 pub(crate) async fn check_and_execute_accumulated_positions<E>(
     executor: &E,
