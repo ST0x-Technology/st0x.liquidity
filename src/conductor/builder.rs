@@ -15,10 +15,7 @@ use st0x_execution::Executor;
 use super::job::work;
 use super::monitor::order_fills::{DexEventStreams, OrderFillMonitor};
 use super::monitor::positions::PositionMonitor;
-use super::{
-    Conductor, spawn_inventory_poller, spawn_order_poller,
-    spawn_periodic_accumulated_position_check,
-};
+use super::{Conductor, spawn_inventory_poller, spawn_order_poller};
 use crate::config::Ctx;
 use crate::inventory::{InventoryPollingService, InventorySnapshot, WalletPollingCtx};
 use crate::offchain_order::OffchainOrder;
@@ -117,19 +114,6 @@ where
 
     let counter_trade_submission_lock = Arc::new(tokio::sync::Mutex::new(()));
 
-    let position_checker_handle = spawn_periodic_accumulated_position_check()
-        .executor(context.executor.clone())
-        .position(context.frameworks.position.clone())
-        .position_projection(context.frameworks.position_projection.clone())
-        .offchain_order(context.frameworks.offchain_order.clone())
-        .counter_trade_submission_lock(counter_trade_submission_lock.clone())
-        .execution_threshold(context.execution_threshold)
-        .check_interval(std::time::Duration::from_secs(
-            context.ctx.position_check_interval,
-        ))
-        .ctx(context.ctx.clone())
-        .call();
-
     let hedge_ctx = Arc::new(HedgeCtx {
         position: context.frameworks.position.clone(),
         offchain_order: context.frameworks.offchain_order.clone(),
@@ -207,9 +191,6 @@ where
             }
             _ = order_poller_handle => {
                 error!("Order poller exited unexpectedly");
-            }
-            _ = position_checker_handle => {
-                error!("Position checker exited unexpectedly");
             }
         }
     });
