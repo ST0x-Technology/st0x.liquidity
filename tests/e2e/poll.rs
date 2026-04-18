@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
-use st0x_dto::ServerMessage;
+use st0x_dto::Statement;
 use st0x_execution::FractionalShares;
 use st0x_execution::alpaca_broker_api::OrderStatus;
 use st0x_hedge::config::Ctx;
@@ -25,30 +25,9 @@ pub fn spawn_bot(ctx: Ctx) -> JoinHandle<anyhow::Result<()>> {
 /// allowing tests to inspect `receiver_count()` for dashboard auto-detect.
 pub fn spawn_bot_with_event_channel(
     ctx: Ctx,
-    event_sender: broadcast::Sender<ServerMessage>,
+    event_sender: broadcast::Sender<Statement>,
 ) -> JoinHandle<anyhow::Result<()>> {
     tokio::spawn(run_bot_session_with_event_channel(ctx, event_sender))
-}
-
-/// After assertions complete, keeps the server alive while dashboard
-/// clients are connected. Waits up to `grace` for a client to connect,
-/// then stays alive until all clients disconnect.
-pub async fn await_dashboard_disconnect(
-    sender: &broadcast::Sender<ServerMessage>,
-    grace: Duration,
-) {
-    let deadline = tokio::time::Instant::now() + grace;
-
-    while sender.receiver_count() == 0 && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    if sender.receiver_count() > 0 {
-        eprintln!("Dashboard connected -- keeping server alive until disconnect");
-        while sender.receiver_count() > 0 {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-    }
 }
 
 /// Polls the bot's health endpoint until it responds, panicking if the
@@ -226,6 +205,75 @@ pub async fn poll_for_aggregate_events_containing(
                 tokio::time::Instant::now() < deadline,
                 "Timed out after {timeout:?} waiting for {context} (found {count})",
             ),
+            Err(query_error) => assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out after {timeout:?} waiting for {context} \
+                 (query failed: {query_error})",
+            ),
+        }
+    }
+}
+
+/// Polls the Position projection view until the given symbol has no
+/// pending offchain order (hedge cycle completed).
+///
+/// Uses `pending_offchain_order_id == null` instead of `net == 0`
+/// because Float precision truncation at the broker API boundary
+/// can leave a tiny non-zero residual that never reaches exact zero.
+pub async fn poll_for_hedge_completion(
+    bot: &mut JoinHandle<anyhow::Result<()>>,
+    db_path: &std::path::Path,
+    symbol: &str,
+    timeout: Duration,
+) {
+    let connect_opts = SqliteConnectOptions::new().filename(db_path);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let context = format!("Position({symbol}) hedge completed");
+
+    loop {
+        sleep_or_crash(bot, &context).await;
+
+        let Ok(pool) = SqlitePool::connect_with(connect_opts.clone()).await else {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out after {timeout:?} waiting for {context} (database not ready)",
+            );
+            continue;
+        };
+
+        let query_result =
+            sqlx::query_as::<_, (String,)>("SELECT payload FROM position_view WHERE view_id = ?")
+                .bind(symbol)
+                .fetch_optional(&pool)
+                .await;
+
+        pool.close().await;
+
+        match query_result {
+            Ok(Some((payload,))) => {
+                if let Ok(lifecycle) = serde_json::from_str::<serde_json::Value>(&payload)
+                    && let Some(live) = lifecycle.get("Live")
+                {
+                    let pending = live
+                        .get("pending_offchain_order_id")
+                        .and_then(|value| value.as_str());
+
+                    if pending.is_none() {
+                        return;
+                    }
+                }
+
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "Timed out after {timeout:?} waiting for {context}",
+                );
+            }
+
+            Ok(None) => assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out after {timeout:?} waiting for {context} (position not found)",
+            ),
+
             Err(query_error) => assert!(
                 tokio::time::Instant::now() < deadline,
                 "Timed out after {timeout:?} waiting for {context} \

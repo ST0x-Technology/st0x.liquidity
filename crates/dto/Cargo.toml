@@ -6,8 +6,6 @@ license.workspace = true
 homepage.workspace = true
 
 [dependencies]
-alloy.workspace = true
-alloy-primitives.workspace = true
 chrono = { workspace = true, features = ["serde"] }
 clap = { workspace = true, features = ["derive"] }
 rain-math-float.workspace = true
@@ -15,9 +13,11 @@ serde = { workspace = true, features = ["derive"] }
 st0x-finance.workspace = true
 st0x-float-macro.workspace = true
 st0x-float-serde.workspace = true
+strum = { version = "0.28.0", features = ["derive"] }
 ts-rs.workspace = true
 
 [dev-dependencies]
+alloy-primitives.workspace = true
 serde_json.workspace = true
 
 [lints]

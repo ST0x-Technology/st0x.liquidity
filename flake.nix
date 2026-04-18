@@ -144,16 +144,24 @@
             '';
           };
 
-          e2e = rainix.mkTask.${system} {
-            name = "e2e";
-            body = ''
-              set -euxo pipefail
-              (cd dashboard && bun run dev) &
-              dev_pid=$!
-              trap 'kill $dev_pid 2>/dev/null' EXIT
-              sleep 2
-              open http://localhost:5173 || true
-              cargo nextest run --test e2e full_system --nocapture
+          # Mock infra + bot + dashboard + continuous user trades.
+          # Run with `nix run .#simulate`, press `q` to exit
+          simulate = pkgs.writeShellApplication {
+            name = "simulate";
+            runtimeInputs = [
+              pkgs.mprocs
+              pkgs.bun
+              pkgs.cargo-nextest
+              rainix.rust-toolchain.${system}
+            ];
+            text = let
+              backend =
+                "cargo nextest run --test e2e -E 'test(=full_system::simulate)' --run-ignored ignored-only --no-capture";
+
+              dashboard = "cd dashboard && bun run dev";
+
+            in ''
+              exec mprocs "${backend}" "${dashboard}"
             '';
           };
 

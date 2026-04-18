@@ -7,8 +7,9 @@ use tracing::warn;
 use std::fmt::Debug;
 use std::str::FromStr;
 
-use st0x_dto::{TransferCategory, TransferOperation, Warning};
+use st0x_dto::{TransferOperation, TransferWarning};
 use st0x_event_sorcery::{EventSourced, load_all_ids, load_entity};
+use st0x_finance::Id;
 
 use crate::equity_redemption::EquityRedemption;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
@@ -18,7 +19,7 @@ use crate::usdc_rebalance::UsdcRebalance;
 pub(crate) struct LoadedTransfers {
     pub(crate) active: Vec<TransferOperation>,
     pub(crate) recent: Vec<TransferOperation>,
-    pub(crate) warnings: Vec<Warning>,
+    pub(crate) warnings: Vec<TransferWarning>,
 }
 
 /// Load all transfer aggregates, classified into active and recent.
@@ -29,24 +30,33 @@ pub(crate) async fn load_transfers(pool: &SqlitePool) -> LoadedTransfers {
     let cutoff = Utc::now() - Duration::hours(24);
 
     let categories = [
-        load_category::<TokenizedEquityMint, _>(
+        load_category::<TokenizedEquityMint, _, _>(
             pool,
-            TransferCategory::EquityMint,
             &cutoff,
+            TransferWarning::MintCategoryUnavailable,
+            |id| TransferWarning::MintReplayFailed {
+                id: Id::new(id.to_string()),
+            },
             TokenizedEquityMint::to_dto,
         )
         .await,
-        load_category::<EquityRedemption, _>(
+        load_category::<EquityRedemption, _, _>(
             pool,
-            TransferCategory::EquityRedemption,
             &cutoff,
+            TransferWarning::RedemptionCategoryUnavailable,
+            |id| TransferWarning::RedemptionReplayFailed {
+                id: Id::new(id.to_string()),
+            },
             EquityRedemption::to_dto,
         )
         .await,
-        load_category::<UsdcRebalance, _>(
+        load_category::<UsdcRebalance, _, _>(
             pool,
-            TransferCategory::UsdcBridge,
             &cutoff,
+            TransferWarning::BridgeCategoryUnavailable,
+            |id| TransferWarning::BridgeReplayFailed {
+                id: Id::new(id.to_string()),
+            },
             UsdcRebalance::to_dto,
         )
         .await,
@@ -78,7 +88,7 @@ pub(crate) async fn load_transfers(pool: &SqlitePool) -> LoadedTransfers {
 struct CategoryResult {
     active: Vec<TransferOperation>,
     recent: Vec<TransferOperation>,
-    warnings: Vec<Warning>,
+    warnings: Vec<TransferWarning>,
 }
 
 impl CategoryResult {
@@ -93,59 +103,52 @@ impl CategoryResult {
 
 /// Replay an aggregate from the event store, returning the entity on success
 /// or a dashboard warning on failure.
-async fn replay_aggregate<Entity>(
+async fn replay_aggregate<Entity, MakeWarning>(
     pool: &SqlitePool,
     id: &Entity::Id,
-    category: &TransferCategory,
-) -> Result<Entity, Warning>
+    make_warning: &MakeWarning,
+) -> Result<Entity, TransferWarning>
 where
     Entity: EventSourced,
     Entity::Id: Debug,
     <Entity::Id as FromStr>::Err: Debug,
+    MakeWarning: Fn(&Entity::Id) -> TransferWarning + Send + Sync,
 {
     match load_entity::<Entity>(pool, id).await {
         Ok(Some(entity)) => Ok(entity),
 
         Ok(None) => {
-            warn!(
-                ?id,
-                ?category,
-                "Aggregate has events but replayed to empty state"
-            );
-            Err(Warning::AggregateReplayFailed {
-                category: category.clone(),
-                aggregate_id: id.to_string(),
-            })
+            warn!(?id, "Aggregate has events but replayed to empty state");
+            Err(make_warning(id))
         }
 
         Err(error) => {
-            warn!(?error, ?id, ?category, "Failed to load aggregate");
-            Err(Warning::AggregateReplayFailed {
-                category: category.clone(),
-                aggregate_id: id.to_string(),
-            })
+            warn!(?error, ?id, "Failed to load aggregate");
+            Err(make_warning(id))
         }
     }
 }
 
-async fn load_category<Entity, Convert>(
+async fn load_category<Entity, MakeWarning, Convert>(
     pool: &SqlitePool,
-    category: TransferCategory,
     cutoff: &chrono::DateTime<Utc>,
+    category_unavailable: TransferWarning,
+    make_replay_warning: MakeWarning,
     convert: Convert,
 ) -> CategoryResult
 where
     Entity: EventSourced,
     Entity::Id: Debug,
     <Entity::Id as FromStr>::Err: Debug,
-    Convert: Fn(&Entity, &Entity::Id) -> TransferOperation,
+    MakeWarning: Fn(&Entity::Id) -> TransferWarning + Send + Sync,
+    Convert: Fn(&Entity, &Entity::Id) -> TransferOperation + Send + Sync,
 {
     let ids = match load_all_ids::<Entity>(pool).await {
         Ok(ids) => ids,
         Err(error) => {
-            warn!(?error, ?category, "Failed to load aggregate IDs");
+            warn!(?error, "Failed to load aggregate IDs");
             return CategoryResult {
-                warnings: vec![Warning::CategoryUnavailable { category }],
+                warnings: vec![category_unavailable],
                 ..CategoryResult::empty()
             };
         }
@@ -154,10 +157,13 @@ where
     let mut replayed = Vec::with_capacity(ids.len());
 
     for id in &ids {
-        replayed.push((id, replay_aggregate::<Entity>(pool, id, &category).await));
+        replayed.push((
+            id,
+            replay_aggregate::<Entity, _>(pool, id, &make_replay_warning).await,
+        ));
     }
 
-    let warnings: Vec<Warning> = replayed
+    let warnings: Vec<TransferWarning> = replayed
         .iter()
         .filter_map(|(_, result)| result.as_ref().err().cloned())
         .collect();
@@ -187,8 +193,8 @@ mod tests {
 
     use st0x_dto::{
         EquityMintOperation, EquityMintStatus, EquityMintTag, EquityRedemptionOperation,
-        EquityRedemptionStatus, EquityRedemptionTag, TransferOperation, UsdcBridgeDirection,
-        UsdcBridgeOperation, UsdcBridgeStatus, UsdcBridgeTag,
+        EquityRedemptionStatus, EquityRedemptionTag, TransferOperation, TransferWarning,
+        UsdcBridgeDirection, UsdcBridgeOperation, UsdcBridgeStatus, UsdcBridgeTag,
     };
     use st0x_execution::{FractionalShares, Symbol};
     use st0x_finance::{Id, Usdc};
@@ -581,6 +587,35 @@ mod tests {
             loaded.warnings.is_empty(),
             "expected no warnings, got: {:?}",
             loaded.warnings
+        );
+    }
+
+    #[tokio::test]
+    async fn load_transfers_produces_warning_for_malformed_aggregate() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+
+        // Insert an event with a payload that can't be deserialized as a
+        // TokenizedEquityMintEvent — this triggers a MintReplayFailed warning.
+        insert_event(
+            &pool,
+            "TokenizedEquityMint",
+            "bad-mint-1",
+            1,
+            "TokenizedEquityMintEvent::MintRequested",
+            serde_json::json!({"malformed": true}),
+        )
+        .await;
+
+        let loaded = load_transfers(&pool).await;
+
+        assert!(loaded.active.is_empty());
+        assert!(loaded.recent.is_empty());
+        assert_eq!(loaded.warnings.len(), 1, "expected one replay warning");
+        assert!(
+            matches!(loaded.warnings[0], TransferWarning::MintReplayFailed { .. }),
+            "expected MintReplayFailed, got: {:?}",
+            loaded.warnings[0]
         );
     }
 }

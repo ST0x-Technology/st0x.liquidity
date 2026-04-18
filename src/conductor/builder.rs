@@ -2,6 +2,7 @@
 
 use alloy::providers::Provider;
 use apalis::prelude::{Monitor, WorkerBuilder};
+use sqlx::SqlitePool;
 use std::sync::Arc;
 use task_supervisor::SupervisorBuilder;
 use tokio::task::JoinHandle;
@@ -12,7 +13,8 @@ use st0x_evm::ReadOnlyEvm;
 use st0x_execution::Executor;
 
 use super::job::work;
-use super::order_fill_monitor::{DexEventStreams, OrderFillMonitor};
+use super::monitor::order_fills::{DexEventStreams, OrderFillMonitor};
+use super::monitor::positions::PositionMonitor;
 use super::{
     Conductor, spawn_inventory_poller, spawn_order_poller,
     spawn_periodic_accumulated_position_check,
@@ -27,6 +29,7 @@ use crate::position::Position;
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::ExecutionThreshold;
 use crate::tokenization::Tokenizer;
+use crate::trading::offchain::hedge::{HedgeCtx, HedgeJobQueue};
 use crate::trading::onchain::trade_accountant::{
     AccountantCtx, DexTradeAccountingJobQueue, TradeAccountingError,
 };
@@ -51,6 +54,7 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
     pub(crate) executor: Exec,
     pub(crate) execution_threshold: ExecutionThreshold,
     pub(crate) frameworks: CqrsFrameworks,
+    pub(crate) pool: SqlitePool,
     pub(crate) poll_notify: Arc<tokio::sync::Notify>,
     pub(crate) wallet_polling: Option<WalletPollingCtx>,
     pub(crate) tokenizer: Option<Arc<dyn Tokenizer>>,
@@ -61,6 +65,7 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
 pub(crate) fn spawn<Prov, Exec>(
     context: ConductorCtx<Prov, Exec>,
     job_queue: DexTradeAccountingJobQueue,
+    hedge_queue: HedgeJobQueue,
     dex_streams: DexEventStreams,
     executor_maintenance: Option<JoinHandle<()>>,
     rebalancer: Option<JoinHandle<()>>,
@@ -125,6 +130,20 @@ where
         .ctx(context.ctx.clone())
         .call();
 
+    let hedge_ctx = Arc::new(HedgeCtx {
+        position: context.frameworks.position.clone(),
+        offchain_order: context.frameworks.offchain_order.clone(),
+    });
+
+    let position_monitor = PositionMonitor::new(
+        context.executor.clone(),
+        context.frameworks.position_projection.clone(),
+        hedge_queue.clone(),
+        std::time::Duration::from_secs(context.ctx.position_check_interval),
+        context.ctx.clone(),
+        context.pool,
+    );
+
     let trade_cqrs = super::TradeProcessingCqrs {
         onchain_trade: context.frameworks.onchain_trade,
         position: context.frameworks.position,
@@ -157,13 +176,14 @@ where
     // so we will be able to get rid of this task-supervisor inconsistency
     let supervisor = SupervisorBuilder::default()
         .with_task("order-fill-monitor", order_fill_monitor)
+        .with_task("position-monitor", position_monitor)
         .build()
         .run();
 
     let monitor = tokio::spawn(async move {
         let apalis_monitor = Monitor::new()
             .should_restart(|_ctx, _error, attempt| {
-                info!(attempt, "Restarting order fill worker");
+                info!(attempt, "Restarting worker");
                 true
             })
             .register(move |index| {
@@ -171,6 +191,12 @@ where
                     .backend(job_queue.clone().into_storage())
                     .data(accountant_ctx.clone())
                     .build(work::<AccountantCtx<Prov, Exec>, _>)
+            })
+            .register(move |index| {
+                WorkerBuilder::new(format!("hedge-worker-{index}"))
+                    .backend(hedge_queue.clone().into_storage())
+                    .data(hedge_ctx.clone())
+                    .build(work::<HedgeCtx, _>)
             });
 
         tokio::select! {

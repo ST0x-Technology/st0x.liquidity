@@ -77,62 +77,6 @@ let quotient = (a / b)?;
 let negated = (-a)?;
 ```
 
-### CRITICAL: Solidity-Backed Operations
-
-Every `Float` operation executes via Solidity bytecode (the `DecimalFloat`
-contract compiled into the Rust binary via `revm`). This ensures identical
-behavior to the onchain implementation.
-
-**NEVER use Rust's native `==`, `<`, `>` operators on `Float` values.** Float
-wraps a `B256` — Rust's `PartialEq`/`PartialOrd` would compare raw bytes, not
-mathematical values. Two Floats with different internal representations can be
-mathematically equal.
-
-Always use the Solidity-backed methods:
-
-```rust
-// Equality — uses DecimalFloat::eq() in Solidity
-value_a.eq(value_b)?        // -> Result<bool, FloatError>
-
-// Ordering — uses DecimalFloat::lt/gt/lte/gte()
-value_a.lt(value_b)?
-value_a.gt(value_b)?
-value_a.lte(value_b)?
-value_a.gte(value_b)?
-
-// Zero check — uses DecimalFloat::isZero()
-value.is_zero()?
-```
-
-**In tests**, always include `Float::format()` in assert messages for useful
-debug output:
-
-```rust
-assert!(
-    result.eq(expected).unwrap(),
-    "expected {}, got {}",
-    expected.format().unwrap(),
-    result.format().unwrap(),
-);
-```
-
-### Precision Truncation
-
-When converting to systems with lower precision (e.g., Alpaca's 9 decimal place
-limit), use `to_fixed_decimal_lossy` followed by `from_fixed_decimal` to perform
-numeric truncation. **Never truncate via string manipulation** — truncation is
-an arithmetic operation.
-
-```rust
-// Truncate to 9 decimal places
-let (fixed_u256, lossless) = value.to_fixed_decimal_lossy(9)?;
-// Convert back to Float with the truncated precision
-let truncated = Float::from_fixed_decimal(fixed_u256, 9)?;
-```
-
-The `lossless` flag indicates whether precision was lost. The remainder
-(`original - truncated`) represents inventory that wasn't sent to the broker.
-
 ## Where `Float` Replaced `Decimal`
 
 | Domain type         | Before                      | After                     |
@@ -150,17 +94,8 @@ The `lossless` flag indicates whether precision was lost. The remainder
 
 `num_decimal::Num` is still used at the Alpaca API boundary as a private
 implementation detail inside `st0x-execution`. The broker API (via the `apca`
-crate) expects `Num` values, so conversion happens at the edge:
-
-1. **Numeric truncation**: `Float::to_fixed_decimal_lossy(9)` +
-   `Float::from_fixed_decimal(fixed, 9)` to limit precision
-2. **String formatting**: `Float::format_with_scientific(false)` to produce the
-   decimal string
-3. **Parsing**: `str::parse::<Num>()` for the `apca` crate
-
-Truncation happens at the numeric level before formatting. The executor returns
-the actual truncated shares in `OrderPlacement`, so position accounting knows
-the real placed quantity (not the pre-truncation request).
+crate) expects `Num` values, so conversion happens at the edge via
+`Float::format_with_scientific(false)` and string parsing.
 
 These converters live in `st0x-execution` and are not part of the public API.
 `num-decimal` remains as a dependency of `st0x-execution` only.

@@ -178,6 +178,43 @@ The trade accounting worker starts only after backfill completes. The WS
 subscription is established in phase 1, so no events are missed -- they buffer
 until the monitor starts.
 
+## Error handling in jobs
+
+> **Known issue**: the current design uses `Ok(())` for permanent business
+> rejections to avoid retries. This conflates success with rejection. Tracked in
+> [RAI-210](https://linear.app/makeitrain/issue/RAI-210/job-error-handling-dont-represent-business-rejections-as-ok).
+
+Jobs return `Result<(), Self::Error>`. The `work` handler retries on `Err` with
+exponential backoff (3 attempts by default). This means the error semantics of
+`Job::perform` directly control retry behavior:
+
+- **Return `Err`** for transient/infrastructure failures (DB errors, aggregate
+  conflicts, network issues). The job will be retried.
+- **Return `Ok(())`** for permanent business rejections where retrying would
+  produce the same result (e.g., position already has a pending order, threshold
+  no longer met).
+
+### Matching CQRS errors
+
+`Store::send()` returns `SendError<Entity>`, which is
+`AggregateError<LifecycleError<Entity>>` from cqrs-es. The variants:
+
+| Variant                                         | Meaning                     | Retry?               |
+| ----------------------------------------------- | --------------------------- | -------------------- |
+| `UserError(LifecycleError::Apply(DomainError))` | Domain rejected the command | Depends on variant   |
+| `UserError(LifecycleError::EventCantOriginate)` | Lifecycle state machine bug | Yes (or investigate) |
+| `UserError(LifecycleError::UnexpectedEvent)`    | Lifecycle state machine bug | Yes (or investigate) |
+| `UserError(LifecycleError::AlreadyFailed)`      | Entity in failed state      | Yes (or investigate) |
+| `AggregateConflict`                             | Optimistic locking conflict | Yes                  |
+| `DatabaseConnectionError`                       | DB unavailable              | Yes                  |
+| `DeserializationError`                          | Corrupt event data          | No (investigate)     |
+| `UnexpectedError`                               | Unknown technical error     | Yes                  |
+
+**Never blanket-match `UserError`.** Always match on the inner
+`LifecycleError::Apply(specific_domain_error)` variants to distinguish expected
+business rejections from lifecycle bugs. Only the specific domain error variants
+that represent permanent, expected conditions should return `Ok(())`.
+
 ## SQLite migration coexistence
 
 apalis uses its own sqlx migrations for internal tables. Both migration sets

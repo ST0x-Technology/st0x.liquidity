@@ -1,0 +1,369 @@
+//! Loads filled trades from the event store for the initial dashboard state.
+
+use sqlx::SqlitePool;
+use tracing::warn;
+
+use st0x_dto::Trade;
+use st0x_event_sorcery::{load_all_ids, load_entity};
+
+use crate::offchain_order::OffchainOrder;
+use crate::onchain_trade::OnChainTrade;
+
+use super::event::{direction_to_dto, executor_to_venue};
+
+const MAX_TRADES: usize = 100;
+
+/// Load recent filled trades from both onchain and offchain sources.
+///
+/// Returns up to [`MAX_TRADES`] trades sorted by fill time (newest first).
+pub(crate) async fn load_trades(pool: &SqlitePool) -> Vec<Trade> {
+    let mut trades = Vec::new();
+
+    trades.extend(load_onchain_trades(pool).await);
+    trades.extend(load_offchain_trades(pool).await);
+
+    trades.sort_by(|lhs, rhs| rhs.filled_at.cmp(&lhs.filled_at));
+    trades.truncate(MAX_TRADES);
+
+    trades
+}
+
+fn onchain_to_trade(id: &crate::onchain_trade::OnChainTradeId, entity: &OnChainTrade) -> Trade {
+    Trade {
+        id: id.to_string(),
+        filled_at: entity.filled_at,
+        venue: st0x_dto::TradingVenue::Raindex,
+        direction: direction_to_dto(entity.direction),
+        symbol: entity.symbol.clone(),
+        shares: st0x_finance::FractionalShares::new(entity.amount),
+    }
+}
+
+fn offchain_to_trade(
+    id: &crate::offchain_order::OffchainOrderId,
+    order: &OffchainOrder,
+) -> Option<Trade> {
+    let OffchainOrder::Filled {
+        symbol,
+        shares,
+        direction,
+        executor,
+        filled_at,
+        ..
+    } = order
+    else {
+        return None;
+    };
+
+    Some(Trade {
+        id: id.to_string(),
+        filled_at: *filled_at,
+        venue: executor_to_venue(*executor),
+        direction: direction_to_dto(*direction),
+        symbol: symbol.clone(),
+        shares: st0x_finance::FractionalShares::new(shares.inner().inner()),
+    })
+}
+
+async fn load_onchain_trades(pool: &SqlitePool) -> Vec<Trade> {
+    let ids = match load_all_ids::<OnChainTrade>(pool).await {
+        Ok(ids) => ids,
+        Err(error) => {
+            warn!(?error, "Failed to load OnChainTrade IDs for trade history");
+            return Vec::new();
+        }
+    };
+
+    let mut trades = Vec::with_capacity(ids.len());
+
+    for id in &ids {
+        if let Some(trade) = replay_onchain(pool, id).await {
+            trades.push(trade);
+        }
+    }
+
+    trades
+}
+
+async fn replay_onchain(
+    pool: &SqlitePool,
+    id: &crate::onchain_trade::OnChainTradeId,
+) -> Option<Trade> {
+    match load_entity::<OnChainTrade>(pool, id).await {
+        Ok(Some(entity)) => Some(onchain_to_trade(id, &entity)),
+        Ok(None) => {
+            warn!(?id, "OnChainTrade replayed to empty state");
+            None
+        }
+        Err(error) => {
+            warn!(?error, ?id, "Failed to load OnChainTrade");
+            None
+        }
+    }
+}
+
+async fn load_offchain_trades(pool: &SqlitePool) -> Vec<Trade> {
+    let ids = match load_all_ids::<OffchainOrder>(pool).await {
+        Ok(ids) => ids,
+        Err(error) => {
+            warn!(?error, "Failed to load OffchainOrder IDs for trade history");
+            return Vec::new();
+        }
+    };
+
+    let mut trades = Vec::with_capacity(ids.len());
+
+    for id in &ids {
+        if let Some(trade) = replay_offchain(pool, id).await {
+            trades.push(trade);
+        }
+    }
+
+    trades
+}
+
+async fn replay_offchain(
+    pool: &SqlitePool,
+    id: &crate::offchain_order::OffchainOrderId,
+) -> Option<Trade> {
+    match load_entity::<OffchainOrder>(pool, id).await {
+        Ok(Some(order)) => offchain_to_trade(id, &order),
+        Ok(None) => {
+            warn!(?id, "OffchainOrder replayed to empty state");
+            None
+        }
+        Err(error) => {
+            warn!(?error, ?id, "Failed to load OffchainOrder");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+
+    use st0x_execution::{Direction, FractionalShares, Positive, Symbol};
+    use st0x_float_macro::float;
+
+    use super::*;
+    use crate::offchain_order::{OffchainOrderCommand, OffchainOrderId, noop_order_placer};
+    use crate::onchain_trade::{OnChainTradeCommand, OnChainTradeId};
+    use crate::test_utils::setup_test_db;
+
+    #[tokio::test]
+    async fn load_trades_empty_database() {
+        let pool = setup_test_db().await;
+        let trades = load_trades(&pool).await;
+        assert!(trades.is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_trades_includes_onchain_fills() {
+        let pool = setup_test_db().await;
+        let now = Utc::now();
+
+        let id = OnChainTradeId {
+            tx_hash: alloy::primitives::TxHash::ZERO,
+            log_index: 0,
+        };
+
+        let store = st0x_event_sorcery::StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        store
+            .send(
+                &id,
+                OnChainTradeCommand::Witness {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    amount: float!(10),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_number: 12345,
+                    block_timestamp: now,
+                },
+            )
+            .await
+            .unwrap();
+
+        let trades = load_trades(&pool).await;
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].symbol, Symbol::new("AAPL").unwrap());
+        assert!(matches!(trades[0].venue, st0x_dto::TradingVenue::Raindex));
+        assert!(matches!(trades[0].direction, st0x_dto::TradeDirection::Buy));
+    }
+
+    #[tokio::test]
+    async fn load_trades_includes_offchain_fills() {
+        let pool = setup_test_db().await;
+        let order_placer = noop_order_placer();
+
+        let (store, _projection) =
+            st0x_event_sorcery::StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(order_placer.clone())
+                .await
+                .unwrap();
+
+        let id = OffchainOrderId::new();
+
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::Place {
+                    symbol: Symbol::new("TSLA").unwrap(),
+                    shares: Positive::new(FractionalShares::new(float!(50))).unwrap(),
+                    direction: Direction::Sell,
+                    executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::CompleteFill {
+                    price: st0x_finance::Usd::new(float!(200)),
+                },
+            )
+            .await
+            .unwrap();
+
+        let trades = load_trades(&pool).await;
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].symbol, Symbol::new("TSLA").unwrap());
+        assert!(matches!(trades[0].venue, st0x_dto::TradingVenue::Alpaca));
+        assert!(matches!(
+            trades[0].direction,
+            st0x_dto::TradeDirection::Sell
+        ));
+    }
+
+    #[tokio::test]
+    async fn load_trades_sorted_newest_first() {
+        let pool = setup_test_db().await;
+
+        let store = st0x_event_sorcery::StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let now = Utc::now();
+
+        let older_id = OnChainTradeId {
+            tx_hash: alloy::primitives::TxHash::ZERO,
+            log_index: 0,
+        };
+        let newer_id = OnChainTradeId {
+            tx_hash: alloy::primitives::TxHash::ZERO,
+            log_index: 1,
+        };
+
+        store
+            .send(
+                &older_id,
+                OnChainTradeCommand::Witness {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    amount: float!(10),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_number: 1,
+                    block_timestamp: now,
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .send(
+                &newer_id,
+                OnChainTradeCommand::Witness {
+                    symbol: Symbol::new("TSLA").unwrap(),
+                    amount: float!(5),
+                    direction: Direction::Sell,
+                    price_usdc: float!(200),
+                    block_number: 2,
+                    block_timestamp: now,
+                },
+            )
+            .await
+            .unwrap();
+
+        let trades = load_trades(&pool).await;
+        assert_eq!(trades.len(), 2);
+        assert!(
+            trades[0].filled_at >= trades[1].filled_at,
+            "trades should be sorted newest first: {:?} >= {:?}",
+            trades[0].filled_at,
+            trades[1].filled_at
+        );
+    }
+
+    #[tokio::test]
+    async fn load_trades_capped_at_max() {
+        let pool = setup_test_db().await;
+
+        let store = st0x_event_sorcery::StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let now = Utc::now();
+
+        for log_index in 0..=(MAX_TRADES as u64) {
+            let id = OnChainTradeId {
+                tx_hash: alloy::primitives::TxHash::ZERO,
+                log_index,
+            };
+            store
+                .send(
+                    &id,
+                    OnChainTradeCommand::Witness {
+                        symbol: Symbol::new("AAPL").unwrap(),
+                        amount: float!(1),
+                        direction: Direction::Buy,
+                        price_usdc: float!(100),
+                        block_number: log_index,
+                        block_timestamp: now,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let trades = load_trades(&pool).await;
+        assert_eq!(trades.len(), MAX_TRADES, "should be capped at {MAX_TRADES}");
+    }
+
+    #[tokio::test]
+    async fn load_trades_excludes_unfilled_offchain_orders() {
+        let pool = setup_test_db().await;
+        let order_placer = noop_order_placer();
+
+        let (store, _projection) =
+            st0x_event_sorcery::StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(order_placer)
+                .await
+                .unwrap();
+
+        let id = OffchainOrderId::new();
+
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::Place {
+                    symbol: Symbol::new("NVDA").unwrap(),
+                    shares: Positive::new(FractionalShares::new(float!(10))).unwrap(),
+                    direction: Direction::Buy,
+                    executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                },
+            )
+            .await
+            .unwrap();
+
+        let trades = load_trades(&pool).await;
+        assert!(trades.is_empty(), "unfilled orders should not appear");
+    }
+}

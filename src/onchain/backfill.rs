@@ -178,15 +178,13 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
         })
         .collect::<Vec<_>>();
 
-    let mut enqueued_count = 0;
+    let enqueued_count = trade_events.len();
 
     for trade_event in trade_events {
         job_queue
             .push(AccountForDexTrade { trade: trade_event })
             .await
             .map_err(OnChainError::JobQueue)?;
-
-        enqueued_count += 1;
     }
 
     Ok(enqueued_count)

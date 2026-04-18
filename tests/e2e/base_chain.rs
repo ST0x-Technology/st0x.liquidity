@@ -127,6 +127,11 @@ pub struct BaseChain<P> {
     /// collisions with the bot's concurrent transactions from the owner.
     pub taker: Address,
     taker_provider: P,
+    /// Separate minter account (Anvil account #2) used by the mock
+    /// tokenization mint executor to transfer underlying tokens without
+    /// nonce collisions with the bot's concurrent owner transactions.
+    pub minter: Address,
+    pub minter_provider: P,
     pub orderbook: Address,
     deployer: Address,
     interpreter: Address,
@@ -214,6 +219,18 @@ impl BaseChain<()> {
         let million_usdc: U256 = parse_units("1000000", 6)?.into();
         mint_usdc(&provider, taker, million_usdc).await?;
 
+        let minter_key = B256::from_slice(&anvil.keys()[2].to_bytes());
+        let minter_signer = PrivateKeySigner::from_bytes(&minter_key)?;
+        let minter = minter_signer.address();
+        let minter_wallet = EthereumWallet::from(minter_signer);
+
+        let minter_provider = ProviderBuilder::new()
+            .wallet(minter_wallet)
+            .connect(&anvil.endpoint())
+            .await?;
+
+        provider.anvil_set_balance(minter, hundred_eth).await?;
+
         Ok(BaseChain {
             anvil,
             provider,
@@ -221,6 +238,8 @@ impl BaseChain<()> {
             owner_key: key,
             taker,
             taker_provider,
+            minter,
+            minter_provider,
             orderbook,
             deployer,
             interpreter,
@@ -285,12 +304,21 @@ impl<P: Provider + Clone> BaseChain<P> {
             .get_receipt()
             .await?;
 
-        // Deposit half the supply into the vault so the owner has vault
-        // shares for orderbook orders. The remaining underlying stays
-        // available for the wrapping step after tokenization mints.
+        // Split supply: 1/2 into vault (owner gets vault shares for orders),
+        // 1/4 stays with owner (wrapping after redemption), 1/4 to minter
+        // (mock mint executor needs its own tokens to avoid nonce collisions).
         let half_supply = supply / U256::from(2);
+        let quarter_supply = supply / U256::from(4);
+
         vault
             .deposit(half_supply, self.owner)
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        underlying
+            .transfer(self.minter, quarter_supply)
             .send()
             .await?
             .get_receipt()
@@ -398,6 +426,7 @@ impl<P: Provider + Clone> BaseChain<P> {
         price: Float,
         direction: TakeDirection,
         usdc_vault_id: Option<B256>,
+        equity_vault_id: Option<B256>,
         rain_expression_override: Option<String>,
     ) -> anyhow::Result<PreparedOrder> {
         let equity_vault_addr = *self
@@ -421,14 +450,12 @@ impl<P: Provider + Clone> BaseChain<P> {
         };
 
         let price_str = format_float(price)?;
-        let (max_amount_base, io_ratio_str) = if is_sell {
-            let base: U256 = parse_units(&amount_str, 18)?.into();
-            (base, price_str)
+        let (max_output_str, io_ratio_str) = if is_sell {
+            (amount_str.clone(), price_str)
         } else {
-            let base: U256 = parse_units(&usdc_total_str, 6)?.into();
-            (base, format!("inv({price_str})"))
+            (usdc_total_str.clone(), format!("inv({price_str})"))
         };
-        let default_expression = format!("_ _: {max_amount_base} {io_ratio_str};:;");
+        let default_expression = format!("_ _: {max_output_str} {io_ratio_str};:;");
         let expression = rain_expression_override.unwrap_or(default_expression);
         let parsed_bytecode = deployer_instance
             .parse2(Bytes::copy_from_slice(expression.as_bytes()))
@@ -444,10 +471,10 @@ impl<P: Provider + Clone> BaseChain<P> {
         let input_vault_id = if is_usdc_input {
             usdc_vault_id.unwrap_or_else(B256::random)
         } else {
-            B256::random()
+            equity_vault_id.unwrap_or_else(B256::random)
         };
         let output_vault_id = if is_usdc_input {
-            B256::random()
+            equity_vault_id.unwrap_or_else(B256::random)
         } else {
             usdc_vault_id.unwrap_or_else(B256::random)
         };
@@ -486,39 +513,49 @@ impl<P: Provider + Clone> BaseChain<P> {
             .ok_or_else(|| anyhow::anyhow!("AddOrderV3 event not found"))?;
         let order = add_event.data().order.clone();
 
-        let deposit_amount_str = if is_sell {
-            &amount_str
+        // Only deposit into the output vault if it wasn't pre-funded.
+        // SellEquity outputs equity: skip if equity_vault_id was provided.
+        // BuyEquity outputs USDC: skip if usdc_vault_id was provided.
+        let output_vault_pre_funded = if is_sell {
+            equity_vault_id.is_some()
         } else {
-            &usdc_total_str
-        };
-        let deposit_micro: U256 = parse_units(deposit_amount_str, 6)?.into();
-        let deposit_float = Float::from_fixed_decimal_lossy(deposit_micro, 6)
-            .map_err(|err| anyhow::anyhow!("Float conversion: {err:?}"))?
-            .0
-            .get_inner();
-
-        // Over-approve for Rain float precision rounding
-        let deposit_approve: U256 = if is_sell {
-            let base: U256 = parse_units(&amount_str, 18)?.into();
-            base * U256::from(2)
-        } else {
-            let base: U256 = parse_units(&usdc_total_str, 6)?.into();
-            base * U256::from(2)
+            usdc_vault_id.is_some()
         };
 
-        DeployableERC20::new(output_token, &self.provider)
-            .approve(*orderbook.address(), deposit_approve)
-            .send()
-            .await?
-            .get_receipt()
-            .await?;
+        if !output_vault_pre_funded {
+            let deposit_amount_str = if is_sell {
+                &amount_str
+            } else {
+                &usdc_total_str
+            };
+            let deposit_micro: U256 = parse_units(deposit_amount_str, 6)?.into();
+            let deposit_float = Float::from_fixed_decimal_lossy(deposit_micro, 6)
+                .map_err(|err| anyhow::anyhow!("Float conversion: {err:?}"))?
+                .0
+                .get_inner();
 
-        orderbook
-            .deposit4(output_token, output_vault_id, deposit_float, vec![])
-            .send()
-            .await?
-            .get_receipt()
-            .await?;
+            let deposit_approve: U256 = if is_sell {
+                let base: U256 = parse_units(&amount_str, 18)?.into();
+                base * U256::from(2)
+            } else {
+                let base: U256 = parse_units(&usdc_total_str, 6)?.into();
+                base * U256::from(2)
+            };
+
+            DeployableERC20::new(output_token, &self.provider)
+                .approve(*orderbook.address(), deposit_approve)
+                .send()
+                .await?
+                .get_receipt()
+                .await?;
+
+            orderbook
+                .deposit4(output_token, output_vault_id, deposit_float, vec![])
+                .send()
+                .await?
+                .get_receipt()
+                .await?;
+        }
 
         Ok(PreparedOrder {
             order,
@@ -538,6 +575,14 @@ impl<P: Provider + Clone> BaseChain<P> {
     pub async fn take_prepared_order(
         &self,
         prepared: &PreparedOrder,
+    ) -> anyhow::Result<TakeOrderResult> {
+        self.take_prepared_order_with_max(prepared, None).await
+    }
+
+    pub async fn take_prepared_order_with_max(
+        &self,
+        prepared: &PreparedOrder,
+        max_amount: Option<Float>,
     ) -> anyhow::Result<TakeOrderResult> {
         let orderbook =
             IOrderBookV6::IOrderBookV6Instance::new(self.orderbook, &self.taker_provider);
@@ -559,12 +604,15 @@ impl<P: Provider + Clone> BaseChain<P> {
             .call()
             .await?;
 
+        let default_max = Float::from_fixed_decimal_lossy(U256::from(1_000_000), 0)
+            .map_err(|err| anyhow::anyhow!("Float conversion: {err:?}"))?
+            .0
+            .get_inner();
+        let max_io = max_amount.map_or(default_max, |f| f.get_inner());
+
         let take_config = IOrderBookV6::TakeOrdersConfigV5 {
             minimumIO: B256::ZERO,
-            maximumIO: Float::from_fixed_decimal_lossy(U256::from(1_000_000), 0)
-                .map_err(|err| anyhow::anyhow!("Float conversion: {err:?}"))?
-                .0
-                .get_inner(),
+            maximumIO: max_io,
             maximumIORatio: Float::from_fixed_decimal_lossy(U256::from(1_000_000), 0)
                 .map_err(|err| anyhow::anyhow!("Float conversion: {err:?}"))?
                 .0
@@ -669,14 +717,12 @@ impl<P: Provider + Clone> BaseChain<P> {
         // Buy:  output = USDC, input = equity, ioRatio = inv(price)
         // Keep the reciprocal inside Rainlang to avoid precomputing it in Rust.
         let price_str = format_float(price)?;
-        let (max_amount_base, io_ratio_str) = if is_sell {
-            let base: U256 = parse_units(&amount_str, 18)?.into();
-            (base, price_str)
+        let (max_output_str, io_ratio_str) = if is_sell {
+            (amount_str.clone(), price_str)
         } else {
-            let base: U256 = parse_units(&usdc_total_str, 6)?.into();
-            (base, format!("inv({price_str})"))
+            (usdc_total_str.clone(), format!("inv({price_str})"))
         };
-        let default_expression = format!("_ _: {max_amount_base} {io_ratio_str};:;");
+        let default_expression = format!("_ _: {max_output_str} {io_ratio_str};:;");
         let expression = rain_expression_override.unwrap_or(default_expression);
 
         let parsed_bytecode = deployer_instance
