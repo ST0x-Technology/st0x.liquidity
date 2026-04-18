@@ -15,6 +15,24 @@ beneficiary_entity_name = "Acme Corp"
 orderbook = "0x1111111111111111111111111111111111111111"
 deployment_block = 1
 
+# Wallet provider — select via `kind`:
+#   "turnkey"     — Turnkey secure enclave signing   (requires --features wallet-turnkey)
+#   "private-key" — local raw private key signing     (requires --features wallet-private-key)
+# Independent of rebalancing: enables CLI commands that sign on-chain
+# transactions (vault ops, CCTP bridging, wrapping, deposits/withdrawals).
+[wallet]
+kind = "private-key"
+
+# For kind = "turnkey", use instead:
+# [wallet]
+# kind = "turnkey"
+# address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+# organization_id = "org-example-turnkey-org-id"
+
+# Optional — only needed for automatic rebalancing.
+# Without this section (and with raindex.order_owner set above), the bot
+# runs in Standalone mode — the wallet is still available for manual CLI
+# operations.
 [rebalancing]
 redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 # transfer timeout in seconds before stuck inflight state is tombstoned and cleared
@@ -22,18 +40,6 @@ redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 transfer_timeout_secs = 1800
 equity = { target = 0.5, deviation = 0.2 }
 usdc = { mode = "enabled", target = 0.5, deviation = 0.3 }
-
-# Wallet provider — select via `kind`:
-#   "turnkey"     — Turnkey secure enclave signing   (requires --features wallet-turnkey)
-#   "private-key" — local raw private key signing     (requires --features wallet-private-key)
-[rebalancing.wallet]
-kind = "private-key"
-
-# For kind = "turnkey", use instead:
-# [rebalancing.wallet]
-# kind = "turnkey"
-# address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-# organization_id = "org-example-turnkey-org-id"
 
 [assets.equities.EXAMPLE]
 tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"

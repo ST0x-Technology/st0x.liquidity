@@ -32,16 +32,16 @@ pub(super) async fn cctp_bridge_command<Registry: IntoErrorRegistry, Writer: Wri
     from: CctpChain,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    let rebalancing_ctx = ctx.rebalancing_ctx()?;
+    let wallet_ctx = ctx.wallet()?;
 
     let (source_wallet, recipient_wallet) = match from {
         CctpChain::Ethereum => (
-            rebalancing_ctx.ethereum_wallet().address(),
-            rebalancing_ctx.base_wallet().address(),
+            wallet_ctx.ethereum_wallet().address(),
+            wallet_ctx.base_wallet().address(),
         ),
         CctpChain::Base => (
-            rebalancing_ctx.base_wallet().address(),
-            rebalancing_ctx.ethereum_wallet().address(),
+            wallet_ctx.base_wallet().address(),
+            wallet_ctx.ethereum_wallet().address(),
         ),
     };
 
@@ -51,13 +51,13 @@ pub(super) async fn cctp_bridge_command<Registry: IntoErrorRegistry, Writer: Wri
         };
         let balance = match from {
             CctpChain::Ethereum => {
-                rebalancing_ctx
+                wallet_ctx
                     .ethereum_wallet()
                     .call::<Registry, _>(USDC_ETHEREUM, balance_call)
                     .await?
             }
             CctpChain::Base => {
-                rebalancing_ctx
+                wallet_ctx
                     .base_wallet()
                     .call::<Registry, _>(USDC_BASE, balance_call)
                     .await?
@@ -90,8 +90,8 @@ pub(super) async fn cctp_bridge_command<Registry: IntoErrorRegistry, Writer: Wri
     let cctp_bridge = CctpBridge::try_from_ctx(CctpCtx {
         usdc_ethereum: USDC_ETHEREUM,
         usdc_base: USDC_BASE,
-        ethereum_wallet: rebalancing_ctx.ethereum_wallet().clone(),
-        base_wallet: rebalancing_ctx.base_wallet().clone(),
+        ethereum_wallet: wallet_ctx.ethereum_wallet().clone(),
+        base_wallet: wallet_ctx.base_wallet().clone(),
         #[cfg(feature = "test-support")]
         circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
         #[cfg(feature = "test-support")]
@@ -137,7 +137,7 @@ pub(super) async fn cctp_recover_command<Writer: Write>(
     writeln!(stdout, "   Burn tx: {burn_tx}")?;
     writeln!(stdout, "   Source chain: {source_chain:?}")?;
 
-    let rebalancing_ctx = ctx.rebalancing_ctx()?;
+    let wallet_ctx = ctx.wallet()?;
 
     let direction = source_chain.to_bridge_direction();
     let dest_chain = match source_chain {
@@ -150,8 +150,8 @@ pub(super) async fn cctp_recover_command<Writer: Write>(
     let cctp_bridge = CctpBridge::try_from_ctx(CctpCtx {
         usdc_ethereum: USDC_ETHEREUM,
         usdc_base: USDC_BASE,
-        ethereum_wallet: rebalancing_ctx.ethereum_wallet().clone(),
-        base_wallet: rebalancing_ctx.base_wallet().clone(),
+        ethereum_wallet: wallet_ctx.ethereum_wallet().clone(),
+        base_wallet: wallet_ctx.base_wallet().clone(),
         #[cfg(feature = "test-support")]
         circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
         #[cfg(feature = "test-support")]
@@ -185,20 +185,20 @@ pub(super) async fn reset_allowance_command<Registry: IntoErrorRegistry, Writer:
     chain: CctpChain,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    let rebalancing_ctx = ctx.rebalancing_ctx()?;
+    let wallet_ctx = ctx.wallet()?;
 
     let (usdc_address, spender, chain_name, caller) = match chain {
         CctpChain::Ethereum => (
             USDC_ETHEREUM,
             ctx.evm.orderbook,
             "Ethereum",
-            rebalancing_ctx.ethereum_wallet(),
+            wallet_ctx.ethereum_wallet(),
         ),
         CctpChain::Base => (
             USDC_BASE,
             ctx.evm.orderbook,
             "Base",
-            rebalancing_ctx.base_wallet(),
+            wallet_ctx.base_wallet(),
         ),
     };
 
@@ -273,6 +273,7 @@ mod tests {
             trading_mode: TradingMode::Standalone {
                 order_owner: Address::ZERO,
             },
+            wallet: None,
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
@@ -283,7 +284,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cctp_bridge_requires_rebalancing_ctx() {
+    async fn test_cctp_bridge_requires_wallet_config() {
         let ctx = create_ctx_without_rebalancing();
         let amount = Some(Usdc::new(Float::parse("100".to_string()).unwrap()));
 
@@ -301,14 +302,14 @@ mod tests {
         assert!(
             matches!(
                 error.downcast_ref::<CtxError>(),
-                Some(CtxError::NotRebalancing)
+                Some(CtxError::WalletNotConfigured)
             ),
-            "Expected CtxError::NotRebalancing, got: {error:?}"
+            "Expected CtxError::WalletNotConfigured, got: {error:?}"
         );
     }
 
     #[tokio::test]
-    async fn test_cctp_recover_requires_rebalancing_ctx() {
+    async fn test_cctp_recover_requires_wallet_config() {
         let ctx = create_ctx_without_rebalancing();
         let burn_tx = B256::ZERO;
 
@@ -320,14 +321,14 @@ mod tests {
         assert!(
             matches!(
                 error.downcast_ref::<CtxError>(),
-                Some(CtxError::NotRebalancing)
+                Some(CtxError::WalletNotConfigured)
             ),
-            "Expected CtxError::NotRebalancing, got: {error:?}"
+            "Expected CtxError::WalletNotConfigured, got: {error:?}"
         );
     }
 
     #[tokio::test]
-    async fn test_reset_allowance_requires_rebalancing_ctx() {
+    async fn test_reset_allowance_requires_wallet_config() {
         let ctx = create_ctx_without_rebalancing();
 
         let mut stdout = Vec::new();
@@ -342,9 +343,9 @@ mod tests {
         assert!(
             matches!(
                 error.downcast_ref::<CtxError>(),
-                Some(CtxError::NotRebalancing)
+                Some(CtxError::WalletNotConfigured)
             ),
-            "Expected CtxError::NotRebalancing, got: {error:?}"
+            "Expected CtxError::WalletNotConfigured, got: {error:?}"
         );
     }
 }

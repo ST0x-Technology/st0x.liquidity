@@ -14,8 +14,8 @@ pub(super) async fn wrap_equity_command<Writer: Write>(
     quantity: Positive<FractionalShares>,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    let rebalancing_ctx = ctx.rebalancing_ctx()?;
-    let base_wallet = rebalancing_ctx.base_wallet().clone();
+    let wallet_ctx = ctx.wallet()?;
+    let base_wallet = wallet_ctx.base_wallet().clone();
     let owner = base_wallet.address();
     let wrapper = WrapperService::new(base_wallet, ctx.assets.equities.symbols.clone());
 
@@ -75,8 +75,8 @@ pub(super) async fn unwrap_equity_command<Writer: Write>(
     quantity: Positive<FractionalShares>,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    let rebalancing_ctx = ctx.rebalancing_ctx()?;
-    let base_wallet = rebalancing_ctx.base_wallet().clone();
+    let wallet_ctx = ctx.wallet()?;
+    let base_wallet = wallet_ctx.base_wallet().clone();
     let owner = base_wallet.address();
     let wrapper = WrapperService::new(base_wallet, ctx.assets.equities.symbols.clone());
 
@@ -160,6 +160,7 @@ mod tests {
             trading_mode: TradingMode::Standalone {
                 order_owner: Address::ZERO,
             },
+            wallet: None,
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
@@ -170,7 +171,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wrap_equity_requires_rebalancing_ctx() {
+    async fn wrap_equity_requires_wallet_config() {
         let ctx = create_ctx_without_rebalancing();
         let mut stdout = Vec::new();
 
@@ -184,15 +185,13 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            error
-                .to_string()
-                .contains("operation requires rebalancing mode"),
-            "expected rebalancing error, got: {error}"
+            error.to_string().contains("configured [wallet] section"),
+            "expected wallet config error, got: {error}"
         );
     }
 
     #[tokio::test]
-    async fn unwrap_equity_requires_rebalancing_ctx() {
+    async fn unwrap_equity_requires_wallet_config() {
         let ctx = create_ctx_without_rebalancing();
         let mut stdout = Vec::new();
 
@@ -206,10 +205,8 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            error
-                .to_string()
-                .contains("operation requires rebalancing mode"),
-            "expected rebalancing error, got: {error}"
+            error.to_string().contains("configured [wallet] section"),
+            "expected wallet config error, got: {error}"
         );
     }
 
