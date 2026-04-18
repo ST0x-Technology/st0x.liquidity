@@ -127,4 +127,18 @@ in {
       homepage = "https://github.com/ST0x-Technology/st0x.liquidity";
     };
   });
+
+  # Float decoder used by status scripts to render Raindex vault balances
+  decodeFloats = craneLib.buildPackage (commonArgs // {
+    pname = "decode-floats";
+    inherit cargoArtifacts;
+
+    cargoExtraArgs = "--bin decode-floats";
+    doCheck = false;
+
+    meta = {
+      description = "Decode Rain Float hex values to human-readable decimals";
+      homepage = "https://github.com/ST0x-Technology/st0x.liquidity";
+    };
+  });
 }

@@ -753,7 +753,7 @@ where
             )
             .await
             {
-                error!("Periodic accumulated position check failed: {error}");
+                error!(?error, "Periodic accumulated position check failed");
             }
         }
     })
@@ -2210,6 +2210,7 @@ mod tests {
         let executor = MockExecutor::new().with_inventory(ExecutionInventory {
             positions: vec![],
             usd_balance_cents: 100_000,
+            margin_safe_buying_power_cents: Some(100_000),
         });
 
         let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, true)
@@ -2434,10 +2435,13 @@ mod tests {
 
         acknowledge_fill(&cqrs.position, "AAPL", "1", Direction::Sell, 1).await;
 
+        // margin_safe_buying_power_cents deliberately differs from usd_balance_cents
+        // to verify buying power is display-only and does not affect trade decisions.
         let executor = MockExecutor::new()
             .with_inventory(ExecutionInventory {
                 positions: vec![],
                 usd_balance_cents: 10_000,
+                margin_safe_buying_power_cents: Some(1_000_000),
             })
             .with_preflight_price(float!(100));
 
@@ -2496,6 +2500,7 @@ mod tests {
                     market_value: None,
                 }],
                 usd_balance_cents: 15_000,
+                margin_safe_buying_power_cents: Some(15_000),
             })
             .with_preflight_price(float!(100));
 
@@ -2575,6 +2580,7 @@ mod tests {
             .with_inventory(ExecutionInventory {
                 positions: vec![],
                 usd_balance_cents: 15_000,
+                margin_safe_buying_power_cents: Some(15_000),
             })
             .with_preflight_price(float!(100));
 

@@ -73,6 +73,7 @@ pub(super) async fn fetch_inventory(
     Ok(Inventory {
         positions: broker_positions,
         usd_balance_cents: account_funds.cash_balance_cents,
+        margin_safe_buying_power_cents: Some(account_funds.margin_safe_buying_power_cents),
     })
 }
 
@@ -226,6 +227,7 @@ mod tests {
 
         assert_eq!(state.positions.len(), 2);
         assert_eq!(state.usd_balance_cents, 5_000_000);
+        assert_eq!(state.margin_safe_buying_power_cents, Some(5_000_000));
 
         let aapl = state
             .positions
@@ -271,6 +273,7 @@ mod tests {
 
         assert!(state.positions.is_empty());
         assert_eq!(state.usd_balance_cents, 10_000_000);
+        assert_eq!(state.margin_safe_buying_power_cents, Some(10_000_000));
     }
 
     #[tokio::test]

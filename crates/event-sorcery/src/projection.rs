@@ -15,6 +15,7 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::str::FromStr;
 use std::sync::Arc;
+use tokio::time::{Duration, sleep};
 use tracing::{error, info, warn};
 
 use crate::EventSourced;
@@ -533,7 +534,12 @@ where
         let (id, event) = event.into_inner();
         let view_id = id.to_string();
 
-        let max_retries = 3;
+        // Retry with exponential backoff: 10ms, 20ms, 40ms, ... capped at 1s.
+        // 10 retries gives ~4.3s of total retry budget, enough for any
+        // realistic burst of concurrent writers on the same aggregate.
+        let max_retries = 10u32;
+        let base_delay_ms = 10u64;
+        let max_delay_ms = 1000u64;
 
         for attempt in 0..=max_retries {
             let (mut lifecycle, context) = match self.repo.load_with_context(&view_id).await {
@@ -550,10 +556,12 @@ where
             match self.repo.update_view(lifecycle, context).await {
                 Ok(()) => return Ok(()),
                 Err(PersistenceError::OptimisticLockError) if attempt < max_retries => {
+                    let delay_ms = (base_delay_ms * 2u64.pow(attempt)).min(max_delay_ms);
                     warn!(
-                        %view_id, attempt = attempt + 1, max_retries,
+                        %view_id, attempt = attempt + 1, max_retries, delay_ms,
                         "Optimistic lock conflict, retrying view update"
                     );
+                    sleep(Duration::from_millis(delay_ms)).await;
                 }
                 Err(PersistenceError::OptimisticLockError) => {
                     error!(
@@ -834,11 +842,11 @@ mod tests {
 
     #[tokio::test]
     async fn react_gives_up_after_max_retries() {
-        // 4 conflicts exceeds the max of 3 retries (attempts 0..=3)
+        // 11 conflicts exceeds the max of 10 retries (attempts 0..=10)
         let entity = TestEntity {
             name: "original".to_string(),
         };
-        let repo = Arc::new(ConflictingRepo::new(4).with_entity("id-1", entity.clone()));
+        let repo = Arc::new(ConflictingRepo::new(11).with_entity("id-1", entity.clone()));
         let projection = Projection::new(Arc::clone(&repo));
 
         let event: OneOf<(String, TestEvent), Never> = OneOf::Here(("id-1".to_string(), TestEvent));
@@ -846,7 +854,7 @@ mod tests {
         // Should not panic -- react swallows the error
         projection.react(event).await.unwrap();
 
-        // All 4 attempts were made (counter decremented from 4 to 0)
+        // All 11 attempts were made (counter decremented from 11 to 0)
         assert_eq!(repo.remaining_conflicts.load(Ordering::SeqCst), 0);
 
         // View should still have the original entity (update never succeeded)
