@@ -437,10 +437,10 @@ impl Ctx {
 
         // Fail fast on rebalancing + order_owner conflict before wallet
         // construction, so operators see the real misconfiguration first.
-        if config.rebalancing.is_some() {
-            if let Some(configured) = config.raindex.order_owner {
-                return Err(CtxError::OrderOwnerConflictsWithRebalancing { configured });
-            }
+        if config.rebalancing.is_some()
+            && let Some(configured) = config.raindex.order_owner
+        {
+            return Err(CtxError::OrderOwnerConflictsWithRebalancing { configured });
         }
 
         // Build wallet from top-level [wallet] config + secrets + RPC URLs.

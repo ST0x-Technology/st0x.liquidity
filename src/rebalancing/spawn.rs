@@ -73,6 +73,10 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
         raindex: Arc<RaindexService<Chain>>,
         tokenizer: Arc<dyn Tokenizer>,
     ) -> Result<Self, SpawnRebalancerError> {
+        // ctx is only consumed behind #[cfg(feature = "test-support")]
+        #[cfg(not(feature = "test-support"))]
+        let _ = ctx;
+
         let broker = Arc::new(AlpacaBrokerApi::try_from_ctx(broker_auth).await?);
 
         let cctp = Arc::new(

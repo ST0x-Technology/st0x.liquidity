@@ -18,7 +18,7 @@ use tracing::{debug, error, warn};
 
 use rain_math_float::Float;
 use st0x_event_sorcery::{AggregateError, EntityList, LifecycleError, Reactor, Store, deps};
-use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Positive, Symbol};
+use st0x_execution::{FractionalShares, Positive, Symbol};
 use st0x_finance::Usdc;
 
 use crate::config::AssetsConfig;
@@ -5095,10 +5095,6 @@ mod tests {
             target = "0.5"
             deviation = "0.3"
         "#
-    }
-
-    fn valid_rebalancing_secrets_toml() -> &'static str {
-        ""
     }
 
     #[test]
