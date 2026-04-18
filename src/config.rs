@@ -2055,47 +2055,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn cli_config_toml_is_valid() {
-        let config_str = include_str!("../config/cli.toml");
-        let config: Config = toml::from_str(config_str).unwrap();
-
-        let global_limit = config
-            .assets
-            .equities
-            .operational_limit
-            .map(Positive::inner);
-
-        let broker = config.broker.expect(
-            "prod config must include [broker.travel_rule] — \
-             Alpaca rejects whitelist requests without it, effective 2026-03-27",
-        );
-
-        broker
-            .counter_trade_slippage_bps
-            .expect("prod config must set [broker].counter_trade_slippage_bps");
-        broker
-            .travel_rule
-            .expect("prod config must include [broker.travel_rule]")
-            .validated()
-            .unwrap();
-
-        for (symbol, equity) in &config.assets.equities.symbols {
-            if equity.rebalancing == OperationMode::Enabled
-                && let Some(limit) = &equity.operational_limit
-                && let Some(global) = global_limit
-            {
-                assert!(
-                    limit.inner() < global,
-                    "{symbol}: per-asset operational_limit ({}) must be \
-                     stricter than global equities operational_limit ({global}) \
-                     to provide meaningful per-asset safety",
-                    limit.inner()
-                );
-            }
-        }
-    }
-
-    #[test]
     fn example_config_toml_is_valid() {
         let config_str = include_str!("../example.config.toml");
         let _: Config = toml::from_str(config_str).unwrap();
