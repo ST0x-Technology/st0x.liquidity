@@ -105,7 +105,8 @@ in {
   package = craneLib.buildPackage (commonArgs // {
     inherit cargoArtifacts;
 
-    cargoExtraArgs = "--bin server --features wallet-turnkey";
+    cargoExtraArgs =
+      "--bin server --bin validate-config --features wallet-turnkey";
     doCheck = false;
 
     meta = {
