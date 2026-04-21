@@ -9,15 +9,48 @@ permissions:
   contents: read
 
 jobs:
-  backend:
+  backend-validation:
+    name: backend ${{ matrix.name }}
     concurrency:
-      group: ${{ github.ref }}-backend
+      group: ${{ github.ref }}-backend-${{ matrix.name }}
       cancel-in-progress: true
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: check
+            cache_target: check
+            command: nix develop -c cargo check --workspace
+          - name: test 1 of 4
+            cache_target: test
+            command: >
+              nix develop -c cargo nextest run --workspace --all-features
+              --profile ci --partition hash:1/4
+          - name: test 2 of 4
+            cache_target: test
+            command: >
+              nix develop -c cargo nextest run --workspace --all-features
+              --profile ci --partition hash:2/4
+          - name: test 3 of 4
+            cache_target: test
+            command: >
+              nix develop -c cargo nextest run --workspace --all-features
+              --profile ci --partition hash:3/4
+          - name: test 4 of 4
+            cache_target: test
+            command: >
+              nix develop -c cargo nextest run --workspace --all-features
+              --profile ci --partition hash:4/4
+          - name: clippy
+            cache_target: clippy
+            command: >
+              nix develop -c cargo clippy --workspace --all-targets
+              --all-features -- -D clippy::all -D warnings
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_DIR: target/${{ matrix.cache_target }}
     steps:
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@v1.3.1
-
       - uses: actions/checkout@v4
 
       - name: Compute submodule cache key
@@ -55,28 +88,50 @@ jobs:
 
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
+      - name: Cache Solidity artifacts
+        id: cache-sol
+        uses: actions/cache@v4
+        with:
+          path: |
+            lib/**/cache/
+            lib/**/out/
+          key: sol-artifacts-${{ hashFiles('.gitmodules', 'flake.lock', 'lib/**/*.sol', 'lib/**/foundry.toml', 'lib/**/remappings.txt') }}
+          restore-keys: sol-artifacts-
+
       - name: Build Solidity artifacts
+        if: steps.cache-sol.outputs.cache-hit != 'true'
         run: nix run .#prepSolArtifacts
 
-      - name: Initialize dev shell
-        run: nix develop -c true
+      - name: Cache cargo artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/git/db/
+            ~/.cargo/registry/cache/
+            ~/.cargo/registry/index/
+            target/${{ matrix.cache_target }}/
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ matrix.cache_target }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'flake.lock', 'flake.nix', 'rust.nix') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-${{ matrix.cache_target }}-
 
       - name: Setup database
         run: nix develop -c sqlx db reset -y
 
-      - name: Validate standalone build
-        run: nix develop -c cargo check --workspace
+      - name: ${{ matrix.name }}
+        run: ${{ matrix.command }}
 
-      - name: Test
+  backend:
+    name: backend
+    needs: backend-validation
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check backend validation
         run: |
-          nix develop -c cargo nextest run \
-            --workspace --all-features --profile ci
-
-      - name: Clippy
-        run: |
-          nix develop -c cargo clippy \
-            --workspace --all-targets --all-features \
-            -- -D clippy::all -D warnings
+          if [ "${{ needs.backend-validation.result }}" != "success" ]; then
+            echo "backend validation failed"
+            exit 1
+          fi
 
   dashboard:
     concurrency:
