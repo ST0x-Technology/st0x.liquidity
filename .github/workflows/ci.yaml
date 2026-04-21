@@ -9,15 +9,39 @@ permissions:
   contents: read
 
 jobs:
-  backend:
+  backend-validation:
+    name: backend ${{ matrix.name }}
     concurrency:
-      group: ${{ github.ref }}-backend
+      group: ${{ github.ref }}-backend-${{ matrix.name }}
       cancel-in-progress: true
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: check
+            command: nix develop -c cargo check --workspace
+          - name: test 1 of 4
+            command: >
+              nix develop -c cargo nextest run --workspace --all-features
+              --profile ci --partition hash:1/4
+          - name: test 2 of 4
+            command: >
+              nix develop -c cargo nextest run --workspace --all-features
+              --profile ci --partition hash:2/4
+          - name: test 3 of 4
+            command: >
+              nix develop -c cargo nextest run --workspace --all-features
+              --profile ci --partition hash:3/4
+          - name: test 4 of 4
+            command: >
+              nix develop -c cargo nextest run --workspace --all-features
+              --profile ci --partition hash:4/4
+          - name: clippy
+            command: >
+              nix develop -c cargo clippy --workspace --all-targets
+              --all-features -- -D clippy::all -D warnings
     steps:
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@v1.3.1
-
       - uses: actions/checkout@v4
 
       - name: Compute submodule cache key
@@ -64,25 +88,27 @@ jobs:
       - name: Setup database
         run: nix develop -c sqlx db reset -y
 
-      - name: Validate standalone build
-        run: nix develop -c cargo check --workspace
+      - name: ${{ matrix.name }}
+        run: ${{ matrix.command }}
 
-      - name: Test
+  backend:
+    name: backend
+    needs: backend-validation
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check backend validation
         run: |
-          nix develop -c cargo nextest run \
-            --workspace --all-features --profile ci
-
-      - name: Clippy
-        run: |
-          nix develop -c cargo clippy \
-            --workspace --all-targets --all-features \
-            -- -D clippy::all -D warnings
+          if [ "${{ needs.backend-validation.result }}" != "success" ]; then
+            echo "backend validation failed"
+            exit 1
+          fi
 
   dashboard:
     concurrency:
       group: ${{ github.ref }}-dashboard
       cancel-in-progress: true
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
 
@@ -137,7 +163,7 @@ jobs:
     concurrency:
       group: ${{ github.ref }}-flake
       cancel-in-progress: true
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
         with:
