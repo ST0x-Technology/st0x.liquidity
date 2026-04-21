@@ -137,7 +137,7 @@ jobs:
     concurrency:
       group: ${{ github.ref }}-dashboard
       cancel-in-progress: true
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
 
@@ -176,7 +176,18 @@ jobs:
 
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
+      - name: Cache Solidity artifacts
+        id: cache-sol
+        uses: actions/cache@v4
+        with:
+          path: |
+            lib/**/cache/
+            lib/**/out/
+          key: sol-artifacts-${{ hashFiles('.gitmodules', 'flake.lock', 'lib/**/*.sol', 'lib/**/foundry.toml', 'lib/**/remappings.txt') }}
+          restore-keys: sol-artifacts-
+
       - name: Build Solidity artifacts
+        if: steps.cache-sol.outputs.cache-hit != 'true'
         run: nix run .#prepSolArtifacts
 
       - name: Check bun.nix is up to date
