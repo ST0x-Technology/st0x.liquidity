@@ -161,7 +161,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
         time_in_force: TimeInForce::Day,
         counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
     };
-    let broker_ctx = BrokerCtx::AlpacaBrokerApi(alpaca_auth.clone());
+    let broker_ctx = BrokerCtx::AlpacaBrokerApi(alpaca_auth);
 
     let equities: HashMap<Symbol, EquityAssetConfig> = equity_tokens
         .iter()
@@ -180,20 +180,18 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
         })
         .collect::<anyhow::Result<_>>()?;
 
-    let wallet: Arc<dyn st0x_evm::Wallet<Provider = RootProvider>> = Arc::new(TestWallet::new(
-        &chain.owner_key,
-        chain.endpoint().parse()?,
-        1,
-    )?);
+    let base_wallet: Arc<dyn st0x_evm::Wallet<Provider = RootProvider>> = Arc::new(
+        TestWallet::new(&chain.owner_key, chain.endpoint().parse()?, 1)?,
+    );
 
     let rebalancing_ctx = st0x_hedge::RebalancingCtx::with_wallets()
         .equity(ImbalanceThreshold::new(float!(0.5), float!(0.1))?)
         .usdc(usdc_rebalancing)
         .redemption_wallet(redemption_wallet)
-        .alpaca_broker_auth(alpaca_auth)
-        .base_wallet(wallet.clone())
-        .ethereum_wallet(wallet)
         .call();
+
+    let wallet_ctx =
+        st0x_hedge::wallet::OnchainWalletCtx::from_wallets(base_wallet.clone(), base_wallet);
 
     let assets = AssetsConfig {
         equities: EquitiesConfig {
@@ -214,6 +212,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
         .deployment_block(deployment_block)
         .broker(broker_ctx)
         .trading_mode(TradingMode::Rebalancing(Box::new(rebalancing_ctx)))
+        .wallet(wallet_ctx)
         .assets(assets)
         .call()
         .map_err(Into::into)
@@ -243,7 +242,7 @@ where
         time_in_force: TimeInForce::Day,
         counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
     };
-    let broker_ctx = BrokerCtx::AlpacaBrokerApi(alpaca_auth.clone());
+    let broker_ctx = BrokerCtx::AlpacaBrokerApi(alpaca_auth);
 
     let equities: HashMap<Symbol, EquityAssetConfig> = equity_tokens
         .iter()
@@ -277,12 +276,12 @@ where
             deviation: float!(0.1),
         })
         .redemption_wallet(Address::random())
-        .alpaca_broker_auth(alpaca_auth)
-        .base_wallet(base_wallet)
-        .ethereum_wallet(ethereum_wallet)
         .call()
         .with_circle_api_base(cctp.attestation_base_url)
         .with_cctp_addresses(cctp.token_messenger, cctp.message_transmitter);
+
+    let wallet_ctx =
+        st0x_hedge::wallet::OnchainWalletCtx::from_wallets(base_wallet, ethereum_wallet);
 
     Ctx::for_test()
         .database_url(db_path.display().to_string())
@@ -291,6 +290,7 @@ where
         .deployment_block(deployment_block)
         .broker(broker_ctx)
         .trading_mode(TradingMode::Rebalancing(Box::new(rebalancing_ctx)))
+        .wallet(wallet_ctx)
         .assets(AssetsConfig {
             equities: EquitiesConfig {
                 symbols: equities,

@@ -7,3 +7,4 @@ disallowed-methods = [
 ]
 
 too-many-lines-threshold = 200
+too-many-arguments-threshold = 8

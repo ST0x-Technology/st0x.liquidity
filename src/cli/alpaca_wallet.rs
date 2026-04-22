@@ -33,14 +33,14 @@ pub(super) async fn alpaca_deposit_command<Registry: IntoErrorRegistry, W: Write
         anyhow::bail!("alpaca-deposit requires Alpaca Broker API configuration");
     };
 
-    let rebalancing_ctx = ctx.rebalancing_ctx()?;
-    let sender_address = rebalancing_ctx.base_wallet().address();
+    let wallet_ctx = ctx.wallet()?;
+    let sender_address = wallet_ctx.base_wallet().address();
 
     writeln!(stdout, "   Sender wallet: {sender_address}")?;
 
     let alpaca_wallet = AlpacaWalletService::new(
         alpaca_auth.base_url().to_string(),
-        rebalancing_ctx.alpaca_broker_auth.account_id,
+        alpaca_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
     );
@@ -63,7 +63,7 @@ pub(super) async fn alpaca_deposit_command<Registry: IntoErrorRegistry, W: Write
     };
     writeln!(stdout, "   Network: {network}")?;
     writeln!(stdout, "   USDC contract: {usdc_address}")?;
-    let balance = rebalancing_ctx
+    let balance = wallet_ctx
         .ethereum_wallet()
         .call::<Registry, _>(
             usdc_address,
@@ -79,7 +79,7 @@ pub(super) async fn alpaca_deposit_command<Registry: IntoErrorRegistry, W: Write
     }
 
     writeln!(stdout, "   Sending USDC transfer...")?;
-    let ethereum_wallet = rebalancing_ctx.ethereum_wallet().clone();
+    let ethereum_wallet = wallet_ctx.ethereum_wallet().clone();
     let tx_receipt = ethereum_wallet
         .submit::<Registry, _>(
             usdc_address,
@@ -204,11 +204,11 @@ pub(super) async fn alpaca_withdraw_command<Registry: IntoErrorRegistry, W: Writ
         anyhow::bail!("alpaca-withdraw requires Alpaca Broker API configuration");
     };
 
-    let rebalancing_ctx = ctx.rebalancing_ctx()?;
+    let wallet_ctx = ctx.wallet()?;
 
     let alpaca_wallet = AlpacaWalletService::new(
         alpaca_auth.base_url().to_string(),
-        rebalancing_ctx.alpaca_broker_auth.account_id,
+        alpaca_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
     );
@@ -257,7 +257,7 @@ pub(super) async fn alpaca_withdraw_command<Registry: IntoErrorRegistry, W: Writ
     writeln!(stdout, "   USDC contract: {usdc_address}")?;
 
     // Capture on-chain balance before the side-effecting withdrawal call
-    let balance_before = rebalancing_ctx
+    let balance_before = wallet_ctx
         .ethereum_wallet()
         .call::<Registry, _>(
             usdc_address,
@@ -296,7 +296,7 @@ pub(super) async fn alpaca_withdraw_command<Registry: IntoErrorRegistry, W: Writ
                 writeln!(stdout, "   Transaction hash: {tx_hash}")?;
             }
 
-            let balance_after = rebalancing_ctx
+            let balance_after = wallet_ctx
                 .ethereum_wallet()
                 .call::<Registry, _>(
                     usdc_address,
@@ -343,8 +343,10 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
         anyhow::bail!("alpaca-whitelist requires Alpaca Broker API configuration");
     };
 
-    let rebalancing_ctx = ctx.rebalancing_ctx()?;
-    let target_address = address.unwrap_or_else(|| rebalancing_ctx.base_wallet().address());
+    let target_address = match address {
+        Some(target_address) => target_address,
+        None => ctx.wallet()?.ethereum_wallet().address(),
+    };
 
     writeln!(stdout, "Whitelisting address for Alpaca withdrawals")?;
     writeln!(stdout, "   Address: {target_address}")?;
@@ -360,7 +362,7 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
 
     let alpaca_wallet = AlpacaWalletService::new(
         alpaca_auth.base_url().to_string(),
-        rebalancing_ctx.alpaca_broker_auth.account_id,
+        alpaca_auth.account_id,
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
     );
@@ -604,10 +606,11 @@ pub(super) async fn alpaca_convert_command<W: Write>(
     writeln!(stdout, "Converting {direction_str} on Alpaca")?;
     writeln!(stdout, "   Amount: {amount} USDC")?;
 
-    let rebalancing_ctx = ctx.rebalancing_ctx()?;
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
+        anyhow::bail!("alpaca-convert requires Alpaca Broker API configuration");
+    };
 
-    let executor =
-        AlpacaBrokerApi::try_from_ctx(rebalancing_ctx.alpaca_broker_auth.clone()).await?;
+    let executor = AlpacaBrokerApi::try_from_ctx(alpaca_auth.clone()).await?;
 
     let conversion_direction = match direction {
         ConvertDirection::ToUsd => ConversionDirection::UsdcToUsd,
@@ -737,6 +740,7 @@ mod tests {
             trading_mode: TradingMode::Standalone {
                 order_owner: Address::ZERO,
             },
+            wallet: None,
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
@@ -799,7 +803,7 @@ mod tests {
                 api_key: "test-key".to_string(),
                 api_secret: "test-secret".to_string(),
                 account_id: alpaca_account_id,
-                mode: Some(mode.clone()),
+                mode: Some(mode),
                 asset_cache_ttl: std::time::Duration::from_secs(3600),
                 time_in_force: TimeInForce::default(),
                 counter_trade_slippage_bps:
@@ -821,25 +825,16 @@ mod tests {
                         deviation: Float::zero().unwrap(),
                     })
                     .redemption_wallet(Address::ZERO)
-                    .alpaca_broker_auth(AlpacaBrokerApiCtx {
-                        api_key: "test-key".to_string(),
-                        api_secret: "test-secret".to_string(),
-                        account_id: alpaca_account_id,
-                        mode: Some(mode),
-                        asset_cache_ttl: std::time::Duration::from_secs(3600),
-                        time_in_force: TimeInForce::default(),
-                        counter_trade_slippage_bps:
-                            st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
-                    })
                     .call(),
             )),
+            wallet: Some(crate::wallet::OnchainWalletCtx::stub()),
             execution_threshold: ExecutionThreshold::whole_share(),
             travel_rule: None,
         }
     }
 
     #[tokio::test]
-    async fn test_alpaca_deposit_requires_rebalancing_ctx() {
+    async fn test_alpaca_deposit_requires_wallet_config() {
         let ctx = create_alpaca_ctx_without_rebalancing();
         let amount = Usdc::new(float!(100));
 
@@ -849,8 +844,8 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err_msg.contains("requires rebalancing mode"),
-            "Expected rebalancing config error, got: {err_msg}"
+            err_msg.contains("configured [wallet] section"),
+            "Expected wallet config error, got: {err_msg}"
         );
     }
 
@@ -872,7 +867,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_alpaca_withdraw_requires_rebalancing_ctx() {
+    async fn test_alpaca_withdraw_requires_wallet_config() {
         let ctx = create_alpaca_ctx_without_rebalancing();
         let amount = Usdc::new(float!(100));
         let destination = address!("0x1234567890abcdef1234567890abcdef12345678");
@@ -888,13 +883,13 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            err_msg.contains("requires rebalancing mode"),
-            "Expected rebalancing config error, got: {err_msg}"
+            err_msg.contains("configured [wallet] section"),
+            "Expected wallet config error, got: {err_msg}"
         );
     }
 
     #[tokio::test]
-    async fn test_alpaca_whitelist_requires_rebalancing_ctx() {
+    async fn test_alpaca_whitelist_requires_wallet_config() {
         let ctx = create_alpaca_ctx_without_rebalancing();
 
         let mut stdout = Vec::new();
@@ -903,8 +898,8 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err_msg.contains("requires rebalancing mode"),
-            "Expected rebalancing config error, got: {err_msg}"
+            err_msg.contains("configured [wallet] section"),
+            "Expected wallet config error, got: {err_msg}"
         );
     }
 

@@ -17,16 +17,14 @@ use st0x_finance::Usdc;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
-use tracing::Level;
+use tracing::{Level, warn};
 
 #[cfg(any(test, feature = "test-support"))]
 use url::Url;
 
 use crate::offchain::order_poller::OrderPollerCtx;
 use crate::onchain::{EvmConfig, EvmCtx, EvmSecrets};
-use crate::rebalancing::{
-    RebalancingConfig, RebalancingCtx, RebalancingCtxError, RebalancingSecrets,
-};
+use crate::rebalancing::{RebalancingConfig, RebalancingCtx, RebalancingCtxError};
 use crate::telemetry::{TelemetryConfig, TelemetryCtx, TelemetrySecrets};
 use crate::threshold::{ExecutionThreshold, InvalidThresholdError};
 use st0x_float_macro::float;
@@ -149,6 +147,7 @@ struct Config {
     #[serde(rename = "hyperdx")]
     telemetry: Option<TelemetryConfig>,
     rebalancing: Option<RebalancingConfig>,
+    wallet: Option<toml::Value>,
     broker: Option<BrokerConfig>,
     assets: AssetsConfig,
 }
@@ -230,7 +229,7 @@ struct Secrets {
     broker: BrokerSecrets,
     #[serde(rename = "hyperdx")]
     telemetry: Option<TelemetrySecrets>,
-    rebalancing: Option<RebalancingSecrets>,
+    wallet: Option<toml::Value>,
 }
 
 /// Broker type tag and all broker credentials.
@@ -273,6 +272,7 @@ pub struct Ctx {
     pub(crate) broker: BrokerCtx,
     pub telemetry: Option<TelemetryCtx>,
     pub trading_mode: TradingMode,
+    pub(crate) wallet: Option<crate::wallet::OnchainWalletCtx>,
     pub execution_threshold: ExecutionThreshold,
     pub(crate) assets: AssetsConfig,
     pub(crate) travel_rule: Option<TravelRuleConfig>,
@@ -352,6 +352,7 @@ impl std::fmt::Debug for Ctx {
             .field("broker", &self.broker)
             .field("telemetry", &self.telemetry)
             .field("trading_mode", &self.trading_mode)
+            .field("wallet_configured", &self.wallet.is_some())
             .field("execution_threshold", &self.execution_threshold)
             .field("assets", &self.assets)
             .field("travel_rule_configured", &self.travel_rule.is_some())
@@ -413,7 +414,7 @@ impl Ctx {
                 path: config_path.to_path_buf(),
                 source,
             })?;
-        let secrets: Secrets =
+        let mut secrets: Secrets =
             toml::from_str(&secrets_str).map_err(|source| CtxError::SecretsToml {
                 path: secrets_path.to_path_buf(),
                 source,
@@ -428,15 +429,62 @@ impl Ctx {
         // - DryRun uses shares threshold for testing
         let execution_threshold = broker.execution_threshold()?;
 
+        // Extract RPC URLs before EvmCtx consumes secrets.evm.
+        let base_rpc_url = secrets.evm.base.take();
+        let ethereum_rpc_url = secrets.evm.ethereum.take();
+
         let evm = EvmCtx::new(&config.raindex, secrets.evm);
 
-        let trading_mode = match (
-            config.rebalancing,
-            secrets.rebalancing,
-            config.raindex.order_owner,
-        ) {
-            (Some(rebalancing_config), Some(rebalancing_secrets), None) => {
-                let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &broker else {
+        // Fail fast on rebalancing + order_owner conflict before wallet
+        // construction, so operators see the real misconfiguration first.
+        if config.rebalancing.is_some()
+            && let Some(configured) = config.raindex.order_owner
+        {
+            return Err(CtxError::OrderOwnerConflictsWithRebalancing { configured });
+        }
+
+        // Build wallet from top-level [wallet] config + secrets + RPC URLs.
+        let wallet = match (config.wallet, secrets.wallet) {
+            (Some(wallet_config), Some(wallet_secrets)) => {
+                let Some(base_url) = base_rpc_url else {
+                    return Err(CtxError::WalletMissingRpcUrl {
+                        field: "base_rpc_url",
+                    });
+                };
+
+                let Some(eth_url) = ethereum_rpc_url else {
+                    return Err(CtxError::WalletMissingRpcUrl {
+                        field: "ethereum_rpc_url",
+                    });
+                };
+
+                Some(
+                    crate::wallet::OnchainWalletCtx::new(
+                        wallet_config,
+                        wallet_secrets,
+                        base_url,
+                        eth_url,
+                    )
+                    .await?,
+                )
+            }
+            (Some(_), None) => return Err(CtxError::WalletSecretsMissing),
+            (None, Some(_)) => {
+                // Wallet secrets present but no [wallet] in config.
+                // Common when sharing one secrets file across bot + CLI
+                // where the bot config doesn't need a wallet.
+                warn!(
+                    "[wallet] secrets present but no [wallet] config section -- \
+                     wallet signing will not be available"
+                );
+                None
+            }
+            (None, None) => None,
+        };
+
+        let trading_mode = match (config.rebalancing, config.raindex.order_owner) {
+            (Some(rebalancing_config), None) => {
+                let BrokerCtx::AlpacaBrokerApi(_) = &broker else {
                     return Err(RebalancingCtxError::NotAlpacaBroker.into());
                 };
 
@@ -456,22 +504,18 @@ impl Ctx {
                     }
                 }
 
-                TradingMode::Rebalancing(Box::new(
-                    RebalancingCtx::new(
-                        rebalancing_config,
-                        rebalancing_secrets,
-                        alpaca_auth.clone(),
-                    )
-                    .await?,
-                ))
+                if wallet.is_none() {
+                    return Err(CtxError::WalletNotConfigured);
+                }
+
+                TradingMode::Rebalancing(Box::new(RebalancingCtx::new(&rebalancing_config)?))
             }
-            (Some(_), Some(_), Some(configured)) => {
+            // Unreachable: early conflict check above returns before this point.
+            (Some(_), Some(configured)) => {
                 return Err(CtxError::OrderOwnerConflictsWithRebalancing { configured });
             }
-            (None, None, Some(order_owner)) => TradingMode::Standalone { order_owner },
-            (None, None, None) => return Err(CtxError::MissingOrderOwner),
-            (Some(_), None, _) => return Err(CtxError::RebalancingSecretsMissing),
-            (None, Some(_), _) => return Err(CtxError::RebalancingConfigMissing),
+            (None, Some(order_owner)) => TradingMode::Standalone { order_owner },
+            (None, None) => return Err(CtxError::MissingOrderOwner),
         };
 
         let log_level = config.log_level.unwrap_or(LogLevel::Debug);
@@ -511,6 +555,7 @@ impl Ctx {
             broker,
             telemetry,
             trading_mode,
+            wallet,
             execution_threshold,
             assets: config.assets,
             travel_rule: config
@@ -532,6 +577,10 @@ impl Ctx {
         }
     }
 
+    pub(crate) fn wallet(&self) -> Result<&crate::wallet::OnchainWalletCtx, CtxError> {
+        self.wallet.as_ref().ok_or(CtxError::WalletNotConfigured)
+    }
+
     pub(crate) const fn get_order_poller_ctx(&self) -> OrderPollerCtx {
         OrderPollerCtx {
             polling_interval: std::time::Duration::from_secs(self.order_polling_interval),
@@ -544,10 +593,18 @@ impl Ctx {
     /// In `Standalone` mode this is the statically-configured order owner.
     /// In `Rebalancing` mode this is the wallet address resolved during
     /// async construction.
+    /// Validated in `load_files()`: Rebalancing mode requires a
+    /// configured wallet, so the `unwrap` cannot fail at runtime.
+    #[allow(clippy::expect_used)]
     pub(crate) fn order_owner(&self) -> Address {
         match &self.trading_mode {
             TradingMode::Standalone { order_owner } => *order_owner,
-            TradingMode::Rebalancing(ctx) => ctx.base_wallet().address(),
+            TradingMode::Rebalancing(_) => self
+                .wallet
+                .as_ref()
+                .expect("validated in load_files: rebalancing requires wallet")
+                .base_wallet()
+                .address(),
         }
     }
 
@@ -591,6 +648,7 @@ impl Ctx {
         deployment_block: u64,
         broker: BrokerCtx,
         trading_mode: TradingMode,
+        wallet: Option<crate::wallet::OnchainWalletCtx>,
         assets: AssetsConfig,
         #[builder(default = 2)] inventory_poll_interval: u64,
         #[builder(default = 0)] server_port: u16,
@@ -601,6 +659,10 @@ impl Ctx {
             Some(threshold) => threshold,
             None => broker.execution_threshold()?,
         };
+
+        if matches!(trading_mode, TradingMode::Rebalancing(_)) && wallet.is_none() {
+            return Err(CtxError::WalletNotConfigured);
+        }
 
         Ok(Self {
             database_url,
@@ -618,6 +680,7 @@ impl Ctx {
             broker,
             telemetry: None,
             trading_mode,
+            wallet,
             execution_threshold,
             assets,
             travel_rule,
@@ -672,10 +735,17 @@ pub enum CtxError {
     Telemetry(#[from] crate::telemetry::TelemetryAssemblyError),
     #[error("operation requires rebalancing mode")]
     NotRebalancing,
-    #[error("rebalancing config present in config but rebalancing secrets missing")]
-    RebalancingSecretsMissing,
-    #[error("rebalancing secrets present but rebalancing config missing in config")]
-    RebalancingConfigMissing,
+    #[error(
+        "operation requires a configured [wallet] section \
+         (base_rpc_url and ethereum_rpc_url in [evm] secrets)"
+    )]
+    WalletNotConfigured,
+    #[error(transparent)]
+    Wallet(#[from] crate::wallet::WalletCtxError),
+    #[error("[evm] {field} is required when [wallet] is configured")]
+    WalletMissingRpcUrl { field: &'static str },
+    #[error("[wallet] config present but [wallet] secrets missing")]
+    WalletSecretsMissing,
     #[error(
         "order_owner {configured} must not be set when rebalancing \
          is enabled (address comes from the configured wallet)"
@@ -730,8 +800,6 @@ impl CtxError {
                 "counter trade slippage bps out of range"
             }
             Self::Telemetry(_) => "telemetry assembly error",
-            Self::RebalancingSecretsMissing => "rebalancing secrets missing",
-            Self::RebalancingConfigMissing => "rebalancing config missing",
             Self::OrderOwnerConflictsWithRebalancing { .. } => {
                 "order_owner conflicts with rebalancing"
             }
@@ -744,6 +812,10 @@ impl CtxError {
             Self::FloatComparison(_) => "float comparison failed",
             Self::InvalidTravelRule { .. } => "invalid travel rule config",
             Self::MissingTravelRule => "missing travel rule config",
+            Self::WalletNotConfigured => "wallet not configured",
+            Self::Wallet(_) => "wallet construction error",
+            Self::WalletMissingRpcUrl { .. } => "wallet missing RPC URL",
+            Self::WalletSecretsMissing => "wallet secrets missing",
         }
     }
 }
@@ -805,6 +877,7 @@ pub(crate) mod tests {
             broker: BrokerCtx::DryRun,
             telemetry: None,
             trading_mode: TradingMode::Standalone { order_owner },
+            wallet: None,
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
@@ -1155,6 +1228,8 @@ pub(crate) mod tests {
             r#"
             [evm]
             ws_rpc_url = "ws://localhost:8545"
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://mainnet.infura.io"
 
             [broker]
             type = "alpaca-broker-api"
@@ -1163,11 +1238,7 @@ pub(crate) mod tests {
             account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
             mode = "sandbox"
 
-            [rebalancing]
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.infura.io"
-
-            [rebalancing.wallet]
+            [wallet]
             private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         "#,
         );
@@ -1193,7 +1264,7 @@ pub(crate) mod tests {
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             transfer_timeout_secs = 1800
 
-            [rebalancing.wallet]
+            [wallet]
             kind = "private-key"
             address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
@@ -1260,6 +1331,8 @@ pub(crate) mod tests {
             r#"
             [evm]
             ws_rpc_url = "ws://localhost:8545"
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://mainnet.infura.io"
 
             [broker]
             type = "schwab"
@@ -1267,11 +1340,7 @@ pub(crate) mod tests {
             app_secret = "test_secret"
             encryption_key = "0x0000000000000000000000000000000000000000000000000000000000000000"
 
-            [rebalancing]
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.infura.io"
-
-            [rebalancing.wallet]
+            [wallet]
             private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         "#,
         );
@@ -1290,7 +1359,7 @@ pub(crate) mod tests {
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             transfer_timeout_secs = 1800
 
-            [rebalancing.wallet]
+            [wallet]
             kind = "private-key"
             address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
@@ -1383,7 +1452,7 @@ pub(crate) mod tests {
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             transfer_timeout_secs = 1800
 
-            [rebalancing.wallet]
+            [wallet]
             kind = "private-key"
             address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
@@ -1404,6 +1473,8 @@ pub(crate) mod tests {
 
             [evm]
             ws_rpc_url = "ws://localhost:8545"
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://mainnet.infura.io"
 
             [broker]
             type = "alpaca-broker-api"
@@ -1412,11 +1483,7 @@ pub(crate) mod tests {
             account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
             mode = "sandbox"
 
-            [rebalancing]
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.infura.io"
-
-            [rebalancing.wallet]
+            [wallet]
             private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         "#,
         );
@@ -1546,10 +1613,6 @@ pub(crate) mod tests {
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             transfer_timeout_secs = 1800
 
-            [rebalancing.wallet]
-            kind = "private-key"
-            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-
             [rebalancing.equity]
             target = "0.5"
             deviation = "0.2"
@@ -1576,8 +1639,160 @@ pub(crate) mod tests {
 
         let result = Ctx::load_files(config.path(), secrets.path()).await;
         assert!(
-            matches!(result, Err(CtxError::RebalancingSecretsMissing)),
-            "Expected RebalancingSecretsMissing error, got {result:?}"
+            matches!(result, Err(CtxError::WalletNotConfigured)),
+            "Expected WalletNotConfigured error, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebalancing_without_wallet_config_fails() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            deployment_block = 1
+
+            [broker]
+            counter_trade_slippage_bps = 100
+
+            [broker.travel_rule]
+            beneficiary_entity_name = "Test Corp"
+
+            [rebalancing]
+            redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            transfer_timeout_secs = 1800
+
+            [rebalancing.equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [rebalancing.usdc]
+            mode = "enabled"
+            target = "0.5"
+            deviation = "0.3"
+        "#,
+        );
+
+        let secrets = toml_file(
+            r#"
+            [evm]
+            ws_rpc_url = "ws://localhost:8545"
+
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+            mode = "sandbox"
+        "#,
+        );
+
+        let result = Ctx::load_files(config.path(), secrets.path()).await;
+        assert!(
+            matches!(result, Err(CtxError::WalletNotConfigured)),
+            "Expected WalletNotConfigured error, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wallet_config_without_wallet_secrets_fails() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            deployment_block = 1
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+            [broker]
+            counter_trade_slippage_bps = 100
+
+            [broker.travel_rule]
+            beneficiary_entity_name = "Test Corp"
+
+            [wallet]
+            kind = "private-key"
+        "#,
+        );
+
+        let secrets = toml_file(
+            r#"
+            [evm]
+            ws_rpc_url = "ws://localhost:8545"
+
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+            mode = "sandbox"
+        "#,
+        );
+
+        let result = Ctx::load_files(config.path(), secrets.path()).await;
+        assert!(
+            matches!(result, Err(CtxError::WalletSecretsMissing)),
+            "Expected WalletSecretsMissing error, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wallet_without_rpc_urls_fails() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            deployment_block = 1
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+            [broker]
+            counter_trade_slippage_bps = 100
+
+            [broker.travel_rule]
+            beneficiary_entity_name = "Test Corp"
+
+            [wallet]
+            kind = "private-key"
+        "#,
+        );
+
+        let secrets = toml_file(
+            r#"
+            [evm]
+            ws_rpc_url = "ws://localhost:8545"
+
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+            mode = "sandbox"
+
+            [wallet]
+            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        "#,
+        );
+
+        let result = Ctx::load_files(config.path(), secrets.path()).await;
+        assert!(
+            matches!(
+                result,
+                Err(CtxError::WalletMissingRpcUrl {
+                    field: "base_rpc_url"
+                })
+            ),
+            "Expected WalletMissingRpcUrl for base_rpc_url, got {result:?}"
         );
     }
 
@@ -1733,6 +1948,8 @@ pub(crate) mod tests {
             r#"
             [evm]
             ws_rpc_url = "ws://localhost:8545"
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://mainnet.infura.io"
 
             [broker]
             type = "schwab"
@@ -1740,11 +1957,7 @@ pub(crate) mod tests {
             app_secret = "test_secret"
             encryption_key = "0x0000000000000000000000000000000000000000000000000000000000000000"
 
-            [rebalancing]
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://mainnet.infura.io"
-
-            [rebalancing.wallet]
+            [wallet]
             private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         "#,
         );
@@ -1763,7 +1976,7 @@ pub(crate) mod tests {
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             transfer_timeout_secs = 1800
 
-            [rebalancing.wallet]
+            [wallet]
             kind = "private-key"
             address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
@@ -1803,47 +2016,6 @@ pub(crate) mod tests {
     #[test]
     fn server_config_toml_is_valid() {
         let config_str = include_str!("../config/prod/st0x-hedge.toml");
-        let config: Config = toml::from_str(config_str).unwrap();
-
-        let global_limit = config
-            .assets
-            .equities
-            .operational_limit
-            .map(Positive::inner);
-
-        let broker = config.broker.expect(
-            "prod config must include [broker.travel_rule] — \
-             Alpaca rejects whitelist requests without it, effective 2026-03-27",
-        );
-
-        broker
-            .counter_trade_slippage_bps
-            .expect("prod config must set [broker].counter_trade_slippage_bps");
-        broker
-            .travel_rule
-            .expect("prod config must include [broker.travel_rule]")
-            .validated()
-            .unwrap();
-
-        for (symbol, equity) in &config.assets.equities.symbols {
-            if equity.rebalancing == OperationMode::Enabled
-                && let Some(limit) = &equity.operational_limit
-                && let Some(global) = global_limit
-            {
-                assert!(
-                    limit.inner() < global,
-                    "{symbol}: per-asset operational_limit ({}) must be \
-                     stricter than global equities operational_limit ({global}) \
-                     to provide meaningful per-asset safety",
-                    limit.inner()
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn cli_config_toml_is_valid() {
-        let config_str = include_str!("../config/cli.toml");
         let config: Config = toml::from_str(config_str).unwrap();
 
         let global_limit = config

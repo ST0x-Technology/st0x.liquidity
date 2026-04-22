@@ -6,9 +6,6 @@ mod usdc;
 pub(crate) use usdc::ALPACA_MINIMUM_WITHDRAWAL;
 
 use alloy::primitives::Address;
-use alloy::providers::RootProvider;
-use alloy::rpc::client::RpcClient;
-use alloy::transports::layers::RetryBackoffLayer;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -17,13 +14,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, mpsc};
-use tracing::{debug, error, info, warn};
-use url::Url;
+use tracing::{debug, error, warn};
 
 use rain_math_float::Float;
 use st0x_event_sorcery::{AggregateError, EntityList, LifecycleError, Reactor, Store, deps};
-use st0x_evm::{Wallet, WalletCtx, WalletKind};
-use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Positive, Symbol};
+use st0x_execution::{FractionalShares, Positive, Symbol};
 use st0x_finance::Usdc;
 
 use crate::config::AssetsConfig;
@@ -109,46 +104,6 @@ pub enum UsdcRebalancing {
     Disabled,
 }
 
-/// Extracts just the `kind` discriminant from the wallet TOML table,
-/// ignoring backend-specific fields that vary by wallet type.
-#[derive(Deserialize)]
-struct WalletKindTag {
-    kind: WalletKind,
-}
-
-/// Newtype over [`toml::Value`] implementing [`Parser`] so
-/// [`WalletKind::try_into_wallet`] can deserialize any
-/// `DeserializeOwned` type from raw TOML config/secrets.
-struct TomlValue(toml::Value);
-
-impl st0x_evm::Parser for TomlValue {
-    type Error = st0x_evm::EvmError;
-
-    fn parse<Target: serde::de::DeserializeOwned>(self) -> Result<Target, Self::Error> {
-        Target::deserialize(self.0)
-            .map_err(|error| st0x_evm::EvmError::WalletConfigParse(Box::new(error)))
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RebalancingSecrets {
-    pub(crate) base_rpc_url: Url,
-    pub(crate) ethereum_rpc_url: Url,
-    pub(crate) wallet: toml::Value,
-}
-
-impl std::fmt::Debug for RebalancingSecrets {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("RebalancingSecrets")
-            .field("base_rpc_url", &self.base_rpc_url)
-            .field("ethereum_rpc_url", &self.ethereum_rpc_url)
-            .field("wallet", &"[REDACTED]")
-            .finish()
-    }
-}
-
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RebalancingConfig {
@@ -156,7 +111,6 @@ pub(crate) struct RebalancingConfig {
     pub(crate) usdc: UsdcRebalancing,
     pub(crate) transfer_timeout_secs: u64,
     pub(crate) redemption_wallet: Address,
-    pub(crate) wallet: toml::Value,
 }
 
 /// Runtime configuration for rebalancing operations.
@@ -175,11 +129,6 @@ pub struct RebalancingCtx {
     pub(crate) transfer_timeout: Duration,
     /// Issuer's wallet for tokenized equity redemptions.
     pub(crate) redemption_wallet: Address,
-    pub(crate) alpaca_broker_auth: AlpacaBrokerApiCtx,
-    /// Pre-built wallet for the base chain (e.g. Base mainnet).
-    base_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
-    /// Pre-built wallet for Ethereum mainnet.
-    ethereum_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
     /// Circle attestation/fee API base URL (test-only override).
     #[cfg(feature = "test-support")]
     pub circle_api_base: String,
@@ -191,88 +140,16 @@ pub struct RebalancingCtx {
     pub message_transmitter: Address,
 }
 
-/// Number of block confirmations to wait after transactions before subsequent
-/// operations that depend on the state change. This ensures state propagates
-/// across load-balanced RPC providers (like dRPC) that may route requests to
-/// different backend nodes.
-const REQUIRED_CONFIRMATIONS: u64 = 3;
-const RPC_MAX_RETRIES: u32 = 10;
-const RPC_INITIAL_BACKOFF_MS: u64 = 1000;
-const RPC_COMPUTE_UNITS_PER_SECOND: u64 = 100;
-
-/// Creates an HTTP RPC client with retry layer for transient errors.
-///
-/// Use with `ProviderBuilder::new().connect_client(client)` for read-only calls,
-/// or `ProviderBuilder::new().wallet(w).connect_client(client)` for signing.
-fn http_client_with_retry(url: Url) -> RpcClient {
-    let retry_layer = RetryBackoffLayer::new(
-        RPC_MAX_RETRIES,
-        RPC_INITIAL_BACKOFF_MS,
-        RPC_COMPUTE_UNITS_PER_SECOND,
-    );
-    RpcClient::builder().layer(retry_layer).http(url)
-}
-
-async fn build_wallet(
-    kind: &WalletKind,
-    wallet_config: toml::Value,
-    wallet_secrets: toml::Value,
-    rpc_url: Url,
-) -> Result<Arc<dyn Wallet<Provider = RootProvider>>, RebalancingCtxError> {
-    let provider = RootProvider::new(http_client_with_retry(rpc_url));
-
-    Ok(kind
-        .try_into_wallet(WalletCtx {
-            settings: TomlValue(wallet_config),
-            credentials: TomlValue(wallet_secrets),
-            provider,
-            required_confirmations: REQUIRED_CONFIRMATIONS,
-        })
-        .await?)
-}
-
 impl RebalancingCtx {
-    /// Construct from config, secrets, and broker auth.
+    /// Construct from config and secrets.
     ///
-    /// Builds wallets for both chains (Turnkey or raw private key,
-    /// selected by TOML `kind` tag) and stores them immutably.
-    /// Without wallet features, `WalletKind` is uninhabited so
-    /// deserialization always fails at the `?` — making later clones
-    /// appear redundant to clippy.
-    #[cfg_attr(
-        not(any(feature = "wallet-turnkey", feature = "wallet-private-key")),
-        allow(clippy::redundant_clone)
-    )]
-    pub(crate) async fn new(
-        config: RebalancingConfig,
-        secrets: RebalancingSecrets,
-        broker_auth: AlpacaBrokerApiCtx,
-    ) -> Result<Self, RebalancingCtxError> {
+    /// Wallets are now built separately via [`OnchainWalletCtx`] —
+    /// this constructor only validates and stores rebalancing-specific
+    /// trigger thresholds and the redemption wallet.
+    pub(crate) fn new(config: &RebalancingConfig) -> Result<Self, RebalancingCtxError> {
         if config.transfer_timeout_secs == 0 {
             return Err(RebalancingCtxError::ZeroTransferTimeout);
         }
-
-        let WalletKindTag { kind } = WalletKindTag::deserialize(config.wallet.clone())?;
-
-        let (base_wallet, ethereum_wallet) = tokio::try_join!(
-            build_wallet(
-                &kind,
-                config.wallet.clone(),
-                secrets.wallet.clone(),
-                secrets.base_rpc_url,
-            ),
-            build_wallet(
-                &kind,
-                config.wallet,
-                secrets.wallet,
-                secrets.ethereum_rpc_url,
-            ),
-        )?;
-
-        info!(
-            wallet = %base_wallet.address(),
-            "Initialized rebalancing wallet"
-        );
 
         let usdc = match config.usdc {
             UsdcRebalancing::Enabled { target, deviation } => {
@@ -286,9 +163,6 @@ impl RebalancingCtx {
             usdc,
             transfer_timeout: Duration::from_secs(config.transfer_timeout_secs),
             redemption_wallet: config.redemption_wallet,
-            alpaca_broker_auth: broker_auth,
-            base_wallet,
-            ethereum_wallet,
             #[cfg(feature = "test-support")]
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
             #[cfg(feature = "test-support")]
@@ -296,19 +170,6 @@ impl RebalancingCtx {
             #[cfg(feature = "test-support")]
             message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
         })
-    }
-
-    /// Validate RPC connectivity for both chain wallets.
-    ///
-    /// Turnkey wallets validate connectivity during construction, but
-    /// the private-key path builds wallets locally without any RPC
-    /// calls. This method ensures misconfigured or unreachable
-    pub(crate) fn base_wallet(&self) -> &Arc<dyn Wallet<Provider = RootProvider>> {
-        &self.base_wallet
-    }
-
-    pub(crate) fn ethereum_wallet(&self) -> &Arc<dyn Wallet<Provider = RootProvider>> {
-        &self.ethereum_wallet
     }
 }
 
@@ -325,18 +186,12 @@ impl RebalancingCtx {
         usdc: Option<ImbalanceThreshold>,
         #[builder(default = Duration::from_secs(30 * 60))] transfer_timeout: Duration,
         redemption_wallet: Address,
-        alpaca_broker_auth: AlpacaBrokerApiCtx,
     ) -> Self {
-        let wallet = crate::test_utils::StubWallet::stub(Address::ZERO);
-
         Self {
             equity,
             usdc,
             transfer_timeout,
             redemption_wallet,
-            alpaca_broker_auth,
-            base_wallet: wallet.clone(),
-            ethereum_wallet: wallet,
             #[cfg(feature = "test-support")]
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
             #[cfg(feature = "test-support")]
@@ -358,9 +213,6 @@ impl RebalancingCtx {
         usdc: UsdcRebalancing,
         #[builder(default = Duration::from_secs(30 * 60))] transfer_timeout: Duration,
         redemption_wallet: Address,
-        alpaca_broker_auth: AlpacaBrokerApiCtx,
-        base_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
-        ethereum_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
     ) -> Self {
         let usdc = match usdc {
             UsdcRebalancing::Enabled { target, deviation } => {
@@ -374,9 +226,6 @@ impl RebalancingCtx {
             usdc,
             transfer_timeout,
             redemption_wallet,
-            alpaca_broker_auth,
-            base_wallet,
-            ethereum_wallet,
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
             token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
             message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
@@ -411,8 +260,6 @@ impl std::fmt::Debug for RebalancingCtx {
             .field("equity", &self.equity)
             .field("usdc", &self.usdc)
             .field("redemption_wallet", &self.redemption_wallet)
-            .field("alpaca_broker_auth", &"[REDACTED]")
-            .field("wallet", &self.base_wallet.address())
             .finish_non_exhaustive()
     }
 }
@@ -1845,7 +1692,7 @@ impl RebalancingTrigger {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, B256, TxHash, U256, address, fixed_bytes};
+    use alloy::primitives::{Address, TxHash, U256, address, fixed_bytes};
     use chrono::{Duration as ChronoDuration, Utc};
     use rain_math_float::Float;
     use sqlx::SqlitePool;
@@ -5239,10 +5086,6 @@ mod tests {
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             transfer_timeout_secs = 1800
 
-            [wallet]
-            kind = "private-key"
-            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-
             [equity]
             target = "0.5"
             deviation = "0.2"
@@ -5252,19 +5095,6 @@ mod tests {
             target = "0.5"
             deviation = "0.3"
         "#
-    }
-
-    fn valid_rebalancing_secrets_toml() -> String {
-        let key = B256::random();
-        format!(
-            r#"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://eth.example.com"
-
-            [wallet]
-            private_key = "{key}"
-        "#
-        )
     }
 
     #[test]
@@ -5287,21 +5117,11 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_secrets_succeeds() {
-        let _secrets: RebalancingSecrets =
-            toml::from_str(&valid_rebalancing_secrets_toml()).unwrap();
-    }
-
-    #[test]
     fn deserialize_with_custom_thresholds() {
         let config: RebalancingConfig = toml::from_str(
             r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             transfer_timeout_secs = 1800
-
-            [wallet]
-            type = "private-key"
-            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
             [equity]
             target = "0.6"
@@ -5330,10 +5150,6 @@ mod tests {
         let toml_str = r#"
             transfer_timeout_secs = 1800
 
-            [wallet]
-            type = "private-key"
-            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-
             [equity]
             target = "0.5"
             deviation = "0.2"
@@ -5356,10 +5172,6 @@ mod tests {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
 
-            [wallet]
-            type = "private-key"
-            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-
             [equity]
             target = "0.5"
             deviation = "0.2"
@@ -5378,28 +5190,10 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_missing_wallet_secrets_fails() {
-        let toml_str = r#"
-            base_rpc_url = "https://base.example.com"
-            ethereum_rpc_url = "https://eth.example.com"
-        "#;
-
-        let error = toml::from_str::<RebalancingSecrets>(toml_str).unwrap_err();
-        assert!(
-            error.message().contains("wallet"),
-            "Expected missing wallet error, got: {error}"
-        );
-    }
-
-    #[test]
     fn deserialize_missing_equity_fails() {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             transfer_timeout_secs = 1800
-
-            [wallet]
-            type = "private-key"
-            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
             [usdc]
             mode = "enabled"
@@ -5461,10 +5255,6 @@ mod tests {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             transfer_timeout_secs = 1800
-
-            [wallet]
-            type = "private-key"
-            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
             [equity]
             target = "0.5"
@@ -6359,8 +6149,8 @@ mod tests {
             private_key = private_key_str
         };
 
-        let wallet = build_wallet(
-            &WalletKind::PrivateKey,
+        let wallet = crate::wallet::build_wallet(
+            &st0x_evm::WalletKind::PrivateKey,
             wallet_config.into(),
             wallet_secrets.into(),
             "https://example.com".parse().unwrap(),
@@ -7940,29 +7730,6 @@ mod tests {
         assert!(
             trigger.timed_out_usdc_rebalances.read().await.is_empty(),
             "expired USDC tombstones should be pruned"
-        );
-    }
-
-    #[test]
-    fn rebalancing_secrets_debug_redacts_wallet() {
-        let secrets = RebalancingSecrets {
-            base_rpc_url: "https://base-rpc.example.com".parse().unwrap(),
-            ethereum_rpc_url: "https://eth-rpc.example.com".parse().unwrap(),
-            wallet: toml::toml! {
-                api_private_key = "super-secret-key"
-            }
-            .into(),
-        };
-
-        let debug = format!("{secrets:?}");
-
-        assert!(
-            debug.contains("[REDACTED]"),
-            "expected redaction marker, got {debug}"
-        );
-        assert!(
-            !debug.contains("super-secret-key"),
-            "debug output leaked wallet secrets: {debug}"
         );
     }
 }

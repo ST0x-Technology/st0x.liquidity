@@ -75,8 +75,8 @@ pub(super) async fn vault_deposit_command<Writer: Write>(
         return Err(VaultCliError::NegativeAmount(amount).into());
     }
 
-    let rebalancing_ctx = ctx.rebalancing_ctx()?;
-    let sender_address = rebalancing_ctx.base_wallet().address();
+    let wallet_ctx = ctx.wallet()?;
+    let sender_address = wallet_ctx.base_wallet().address();
 
     writeln!(stdout, "   Sender wallet: {sender_address}")?;
     writeln!(stdout, "   Orderbook: {}", ctx.evm.orderbook)?;
@@ -88,13 +88,13 @@ pub(super) async fn vault_deposit_command<Writer: Write>(
             .await?;
 
     let raindex_service = RaindexService::new(
-        rebalancing_ctx.base_wallet().clone(),
+        wallet_ctx.base_wallet().clone(),
         ctx.evm.orderbook,
         vault_registry_projection,
         sender_address,
     );
 
-    let token_decimals = get_token_decimals(rebalancing_ctx.base_wallet(), token).await?;
+    let token_decimals = get_token_decimals(wallet_ctx.base_wallet(), token).await?;
     writeln!(stdout, "   Decimals: {token_decimals}")?;
     let amount_u256 = float_to_u256(amount, token_decimals)?;
     writeln!(stdout, "   Amount (smallest unit): {amount_u256}")?;
@@ -135,8 +135,8 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
         return Err(VaultCliError::NegativeAmount(amount).into());
     }
 
-    let rebalancing_ctx = ctx.rebalancing_ctx()?;
-    let sender_address = rebalancing_ctx.base_wallet().address();
+    let wallet_ctx = ctx.wallet()?;
+    let sender_address = wallet_ctx.base_wallet().address();
 
     writeln!(stdout, "   Recipient wallet: {sender_address}")?;
     writeln!(stdout, "   Orderbook: {}", ctx.evm.orderbook)?;
@@ -148,13 +148,13 @@ pub(super) async fn vault_withdraw_command<Writer: Write>(
             .await?;
 
     let raindex_service = RaindexService::new(
-        rebalancing_ctx.base_wallet().clone(),
+        wallet_ctx.base_wallet().clone(),
         ctx.evm.orderbook,
         vault_registry_projection,
         sender_address,
     );
 
-    let token_decimals = get_token_decimals(rebalancing_ctx.base_wallet(), token).await?;
+    let token_decimals = get_token_decimals(wallet_ctx.base_wallet(), token).await?;
     writeln!(stdout, "   Decimals: {token_decimals}")?;
     let amount_u256 = float_to_u256(amount, token_decimals)?;
     writeln!(stdout, "   Amount (smallest unit): {amount_u256}")?;
@@ -176,7 +176,7 @@ pub(super) async fn vault_withdraw_usdc_command<Writer: Write>(
     ctx: &Ctx,
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
-    ctx.rebalancing_ctx()?;
+    ctx.wallet()?;
 
     let vault_id = ctx
         .assets
@@ -202,7 +202,7 @@ mod tests {
     use url::Url;
 
     use st0x_evm::ReadOnlyEvm;
-    use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
+
     use st0x_finance::Usdc;
 
     use super::*;
@@ -236,6 +236,7 @@ mod tests {
             trading_mode: TradingMode::Standalone {
                 order_owner: Address::ZERO,
             },
+            wallet: None,
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
@@ -246,16 +247,6 @@ mod tests {
     }
 
     fn create_ctx_with_rebalancing(cash: Option<CashAssetConfig>) -> Ctx {
-        let alpaca_broker_auth = AlpacaBrokerApiCtx {
-            api_key: "test-key".to_string(),
-            api_secret: "test-secret".to_string(),
-            account_id: AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b")),
-            mode: Some(AlpacaBrokerApiMode::Sandbox),
-            asset_cache_ttl: std::time::Duration::from_secs(3600),
-            time_in_force: TimeInForce::default(),
-            counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
-        };
-
         Ctx {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
@@ -282,9 +273,9 @@ mod tests {
                         deviation: float!(0.1),
                     })
                     .redemption_wallet(Address::ZERO)
-                    .alpaca_broker_auth(alpaca_broker_auth)
                     .call(),
             )),
+            wallet: Some(crate::wallet::OnchainWalletCtx::stub()),
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
@@ -299,7 +290,7 @@ mod tests {
         b256!("0000000000000000000000000000000000000000000000000000000000000001");
 
     #[tokio::test]
-    async fn test_vault_deposit_requires_rebalancing_ctx() {
+    async fn test_vault_deposit_requires_wallet_config() {
         let ctx = create_ctx_without_rebalancing();
         let amount = float!(100);
 
@@ -319,13 +310,13 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("requires rebalancing mode"),
-            "Expected rebalancing config error, got: {err_msg}"
+            err_msg.contains("configured [wallet] section"),
+            "Expected wallet config error, got: {err_msg}"
         );
     }
 
     #[tokio::test]
-    async fn test_vault_withdraw_requires_rebalancing_ctx() {
+    async fn test_vault_withdraw_requires_wallet_config() {
         let ctx = create_ctx_without_rebalancing();
         let withdraw = Withdraw {
             amount: float!(100),
@@ -344,8 +335,8 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("requires rebalancing mode"),
-            "Expected rebalancing config error, got: {err_msg}"
+            err_msg.contains("configured [wallet] section"),
+            "Expected wallet config error, got: {err_msg}"
         );
     }
 
@@ -551,7 +542,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn withdraw_usdc_requires_rebalancing_ctx_before_cash_vault_lookup() {
+    async fn withdraw_usdc_requires_wallet_config_before_cash_vault_lookup() {
         let amount = Usdc::new(float!(100));
 
         let mut stdout = Vec::new();
@@ -566,8 +557,8 @@ mod tests {
         .to_string();
 
         assert!(
-            err_msg.contains("requires rebalancing mode"),
-            "Expected rebalancing mode error, got: {err_msg}"
+            err_msg.contains("configured [wallet] section"),
+            "Expected wallet config error, got: {err_msg}"
         );
     }
 

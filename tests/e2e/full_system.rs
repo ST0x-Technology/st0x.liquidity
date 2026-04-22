@@ -67,7 +67,7 @@ fn build_full_system_ctx<P: Provider + Clone>(
         time_in_force: TimeInForce::Day,
         counter_trade_slippage_bps: DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
     };
-    let broker_ctx = BrokerCtx::AlpacaBrokerApi(alpaca_auth.clone());
+    let broker_ctx = BrokerCtx::AlpacaBrokerApi(alpaca_auth);
 
     let equities: HashMap<Symbol, EquityAssetConfig> = equity_tokens
         .iter()
@@ -105,12 +105,12 @@ fn build_full_system_ctx<P: Provider + Clone>(
             deviation: float!(0.1),
         })
         .redemption_wallet(REDEMPTION_WALLET)
-        .alpaca_broker_auth(alpaca_auth)
-        .base_wallet(base_wallet)
-        .ethereum_wallet(ethereum_wallet)
         .call()
         .with_circle_api_base(cctp.attestation_base_url)
         .with_cctp_addresses(cctp.token_messenger, cctp.message_transmitter);
+
+    let wallet_ctx =
+        st0x_hedge::wallet::OnchainWalletCtx::from_wallets(base_wallet, ethereum_wallet);
 
     Ctx::for_test()
         .database_url(db_path.display().to_string())
@@ -119,6 +119,7 @@ fn build_full_system_ctx<P: Provider + Clone>(
         .deployment_block(deployment_block)
         .broker(broker_ctx)
         .trading_mode(TradingMode::Rebalancing(Box::new(rebalancing_ctx)))
+        .wallet(wallet_ctx)
         .assets(AssetsConfig {
             equities: EquitiesConfig {
                 symbols: equities,

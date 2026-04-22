@@ -44,7 +44,16 @@ pub(crate) struct EvmConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EvmSecrets {
-    pub(crate) ws_rpc_url: Url,
+    #[serde(rename = "ws_rpc_url")]
+    pub(crate) ws: Url,
+    /// Base chain RPC URL for wallet operations. Required when `[wallet]`
+    /// is configured.
+    #[serde(rename = "base_rpc_url")]
+    pub(crate) base: Option<Url>,
+    /// Ethereum mainnet RPC URL for wallet operations. Required when
+    /// `[wallet]` is configured.
+    #[serde(rename = "ethereum_rpc_url")]
+    pub(crate) ethereum: Option<Url>,
 }
 
 #[derive(Clone)]
@@ -67,7 +76,7 @@ impl std::fmt::Debug for EvmCtx {
 impl EvmCtx {
     pub(crate) fn new(config: &EvmConfig, secrets: EvmSecrets) -> Self {
         Self {
-            ws_rpc_url: secrets.ws_rpc_url,
+            ws_rpc_url: secrets.ws,
             orderbook: config.orderbook,
             deployment_block: config.deployment_block,
         }

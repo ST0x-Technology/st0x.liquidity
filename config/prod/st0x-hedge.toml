@@ -15,6 +15,11 @@ orderbook = "0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D"
 deployment_block = 43259507
 order_owner = "0xA9C16673F65AE808688cB18952AFE3d9658C808f"
 
+[wallet]
+kind = "turnkey"
+address = "0xA9C16673F65AE808688cB18952AFE3d9658C808f"
+organization_id = "b100145e-7894-4c17-b3e7-160435f84803"
+
 [assets.cash]
 vault_id = "0xfab"
 rebalancing = "disabled"
