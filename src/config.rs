@@ -19,7 +19,6 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use tracing::{Level, warn};
 
-#[cfg(any(test, feature = "test-support"))]
 use url::Url;
 
 use crate::offchain::order_poller::OrderPollerCtx;
@@ -394,6 +393,215 @@ impl From<&LogLevel> for Level {
     }
 }
 
+/// Intermediate result from [`parse_and_validate`]. Contains everything
+/// needed to construct [`Ctx`] after async wallet initialization.
+struct ValidatedParts {
+    database_url: String,
+    log_level: LogLevel,
+    server_port: u16,
+    evm: EvmCtx,
+    order_polling_interval: u64,
+    order_polling_max_jitter: u64,
+    position_check_interval: u64,
+    inventory_poll_interval: u64,
+    broker: BrokerCtx,
+    telemetry: Option<TelemetryCtx>,
+    execution_threshold: ExecutionThreshold,
+    trading_mode: TradingMode,
+    assets: AssetsConfig,
+    travel_rule: Option<TravelRuleConfig>,
+    /// Wallet construction inputs. `Some` when both config and secrets
+    /// contain a `[wallet]` section and the required RPC URLs are present.
+    /// The actual async wallet construction is deferred to `load_files`.
+    wallet_inputs: Option<WalletInputs>,
+}
+
+struct WalletInputs {
+    config: toml::Value,
+    secrets: toml::Value,
+    base_rpc_url: Url,
+    ethereum_rpc_url: Url,
+}
+
+/// Single validation path shared by [`Ctx::load_files`] and
+/// [`Ctx::validate_files`]. All config/secrets business-rule checks live
+/// here — neither caller duplicates validation logic.
+fn parse_and_validate(
+    config_str: &str,
+    config_path: &Path,
+    secrets_str: &str,
+    secrets_path: &Path,
+) -> Result<ValidatedParts, CtxError> {
+    let config: Config = toml::from_str(config_str).map_err(|source| CtxError::ConfigToml {
+        path: config_path.to_path_buf(),
+        source,
+    })?;
+    let mut secrets: Secrets =
+        toml::from_str(secrets_str).map_err(|source| CtxError::SecretsToml {
+            path: secrets_path.to_path_buf(),
+            source,
+        })?;
+
+    let broker = BrokerCtx::from_parts(secrets.broker, config.broker.as_ref())?;
+    let telemetry = TelemetryCtx::new(config.telemetry, secrets.telemetry)?;
+
+    // Execution threshold is determined by broker capabilities:
+    // - Alpaca requires $1 minimum for fractional trading. We use $2 to provide buffer
+    //   for slippage, fees, and price discrepancies that could push fills below $1.
+    // - DryRun uses shares threshold for testing
+    let execution_threshold = broker.execution_threshold()?;
+
+    // Extract RPC URLs before EvmCtx consumes secrets.evm.
+    let base_rpc_url = secrets.evm.base.take();
+    let ethereum_rpc_url = secrets.evm.ethereum.take();
+
+    let evm = EvmCtx::new(&config.raindex, secrets.evm);
+
+    // Fail fast on rebalancing + order_owner conflict before wallet
+    // validation, so operators see the real misconfiguration first.
+    if config.rebalancing.is_some()
+        && let Some(configured) = config.raindex.order_owner
+    {
+        return Err(CtxError::OrderOwnerConflictsWithRebalancing { configured });
+    }
+
+    // Validate wallet config/secrets pairing and required RPC URLs.
+    // Actual wallet construction (async, connects to RPC) is deferred.
+    let wallet_inputs = match (config.wallet, secrets.wallet) {
+        (Some(wallet_config), Some(wallet_secrets)) => {
+            let Some(base_url) = base_rpc_url else {
+                return Err(CtxError::WalletMissingRpcUrl {
+                    field: "base_rpc_url",
+                });
+            };
+
+            let Some(eth_url) = ethereum_rpc_url else {
+                return Err(CtxError::WalletMissingRpcUrl {
+                    field: "ethereum_rpc_url",
+                });
+            };
+
+            Some(WalletInputs {
+                config: wallet_config,
+                secrets: wallet_secrets,
+                base_rpc_url: base_url,
+                ethereum_rpc_url: eth_url,
+            })
+        }
+        (Some(_), None) => return Err(CtxError::WalletSecretsMissing),
+        (None, Some(_)) => {
+            // Wallet secrets present but no [wallet] in config.
+            // Common when sharing one secrets file across bot + CLI
+            // where the bot config doesn't need a wallet.
+            warn!(
+                "[wallet] secrets present but no [wallet] config section -- \
+                 wallet signing will not be available"
+            );
+            None
+        }
+        (None, None) => None,
+    };
+
+    let wallet_available = wallet_inputs.is_some();
+
+    let trading_mode = match (config.rebalancing, config.raindex.order_owner) {
+        (Some(rebalancing_config), None) => {
+            let BrokerCtx::AlpacaBrokerApi(_) = &broker else {
+                return Err(RebalancingCtxError::NotAlpacaBroker.into());
+            };
+
+            let minimum = *crate::rebalancing::trigger::ALPACA_MINIMUM_WITHDRAWAL;
+
+            if let Some(cash) = &config.assets.cash
+                && cash.rebalancing == OperationMode::Enabled
+                && let Some(cash_limit) = &cash.operational_limit
+            {
+                let below_minimum = cash_limit.inner().lt(&minimum)?;
+
+                if below_minimum {
+                    return Err(CtxError::CashOperationalLimitBelowMinimumWithdrawal {
+                        configured: cash_limit.inner(),
+                        minimum,
+                    });
+                }
+            }
+
+            if !wallet_available {
+                return Err(CtxError::WalletNotConfigured);
+            }
+
+            TradingMode::Rebalancing(Box::new(RebalancingCtx::new(&rebalancing_config)?))
+        }
+        // Unreachable: early conflict check above returns before this point.
+        (Some(_), Some(configured)) => {
+            return Err(CtxError::OrderOwnerConflictsWithRebalancing { configured });
+        }
+        (None, Some(order_owner)) => TradingMode::Standalone { order_owner },
+        (None, None) => return Err(CtxError::MissingOrderOwner),
+    };
+
+    let log_level = config.log_level.unwrap_or(LogLevel::Debug);
+
+    let order_polling_interval = config.order_polling_interval.unwrap_or(15);
+    if order_polling_interval == 0 {
+        return Err(CtxError::ZeroPollingInterval {
+            field: "order_polling_interval",
+        });
+    }
+
+    let position_check_interval = config.position_check_interval.unwrap_or(60);
+    if position_check_interval == 0 {
+        return Err(CtxError::ZeroPollingInterval {
+            field: "position_check_interval",
+        });
+    }
+
+    let inventory_poll_interval = config.inventory_poll_interval.unwrap_or(60);
+    if inventory_poll_interval == 0 {
+        return Err(CtxError::ZeroPollingInterval {
+            field: "inventory_poll_interval",
+        });
+    }
+
+    let travel_rule = config
+        .broker
+        .as_ref()
+        .and_then(|broker_config| broker_config.travel_rule.as_ref());
+
+    let broker_requires_travel_rule = match &broker {
+        BrokerCtx::AlpacaBrokerApi(_) => true,
+        BrokerCtx::DryRun => false,
+    };
+
+    if broker_requires_travel_rule && travel_rule.is_none() {
+        return Err(CtxError::MissingTravelRule);
+    }
+
+    let travel_rule = config
+        .broker
+        .and_then(|broker_config| broker_config.travel_rule)
+        .map(TravelRuleConfig::validated)
+        .transpose()?;
+
+    Ok(ValidatedParts {
+        database_url: config.database_url,
+        log_level,
+        server_port: config.server_port.unwrap_or(8080),
+        evm,
+        order_polling_interval,
+        order_polling_max_jitter: config.order_polling_max_jitter.unwrap_or(5),
+        position_check_interval,
+        inventory_poll_interval,
+        broker,
+        telemetry,
+        execution_threshold,
+        trading_mode,
+        assets: config.assets,
+        travel_rule,
+        wallet_inputs,
+    })
+}
+
 impl Ctx {
     pub async fn load_files(config_path: &Path, secrets_path: &Path) -> Result<Self, CtxError> {
         let config_str = tokio::fs::read_to_string(config_path)
@@ -409,161 +617,63 @@ impl Ctx {
                 source,
             })?;
 
-        let config: Config =
-            toml::from_str(&config_str).map_err(|source| CtxError::ConfigToml {
+        let parts = parse_and_validate(&config_str, config_path, &secrets_str, secrets_path)?;
+
+        // Async wallet construction — the only step that requires network
+        // access and cannot run in the deploy-time validator.
+        let wallet = match parts.wallet_inputs {
+            Some(inputs) => Some(
+                crate::wallet::OnchainWalletCtx::new(
+                    inputs.config,
+                    inputs.secrets,
+                    inputs.base_rpc_url,
+                    inputs.ethereum_rpc_url,
+                )
+                .await?,
+            ),
+            None => None,
+        };
+
+        Ok(Self {
+            database_url: parts.database_url,
+            log_level: parts.log_level,
+            server_port: parts.server_port,
+            evm: parts.evm,
+            order_polling_interval: parts.order_polling_interval,
+            order_polling_max_jitter: parts.order_polling_max_jitter,
+            position_check_interval: parts.position_check_interval,
+            inventory_poll_interval: parts.inventory_poll_interval,
+            broker: parts.broker,
+            telemetry: parts.telemetry,
+            trading_mode: parts.trading_mode,
+            wallet,
+            execution_threshold: parts.execution_threshold,
+            assets: parts.assets,
+            travel_rule: parts.travel_rule,
+        })
+    }
+
+    /// Validates config and secrets files without constructing runtime objects.
+    ///
+    /// Calls the same [`parse_and_validate`] function as [`load_files`](Self::load_files),
+    /// ensuring identical validation. The only difference is that `load_files`
+    /// additionally performs async wallet construction (which connects to RPC
+    /// endpoints). Suitable for pre-deploy validation where we want to catch
+    /// config errors before restarting the service.
+    pub fn validate_files(config_path: &Path, secrets_path: &Path) -> Result<(), CtxError> {
+        let config_str =
+            std::fs::read_to_string(config_path).map_err(|source| CtxError::ConfigIo {
                 path: config_path.to_path_buf(),
                 source,
             })?;
-        let mut secrets: Secrets =
-            toml::from_str(&secrets_str).map_err(|source| CtxError::SecretsToml {
+        let secrets_str =
+            std::fs::read_to_string(secrets_path).map_err(|source| CtxError::SecretsIo {
                 path: secrets_path.to_path_buf(),
                 source,
             })?;
 
-        let broker = BrokerCtx::from_parts(secrets.broker, config.broker.as_ref())?;
-        let telemetry = TelemetryCtx::new(config.telemetry, secrets.telemetry)?;
-
-        // Execution threshold is determined by broker capabilities:
-        // - Alpaca requires $1 minimum for fractional trading. We use $2 to provide buffer
-        //   for slippage, fees, and price discrepancies that could push fills below $1.
-        // - DryRun uses shares threshold for testing
-        let execution_threshold = broker.execution_threshold()?;
-
-        // Extract RPC URLs before EvmCtx consumes secrets.evm.
-        let base_rpc_url = secrets.evm.base.take();
-        let ethereum_rpc_url = secrets.evm.ethereum.take();
-
-        let evm = EvmCtx::new(&config.raindex, secrets.evm);
-
-        // Fail fast on rebalancing + order_owner conflict before wallet
-        // construction, so operators see the real misconfiguration first.
-        if config.rebalancing.is_some()
-            && let Some(configured) = config.raindex.order_owner
-        {
-            return Err(CtxError::OrderOwnerConflictsWithRebalancing { configured });
-        }
-
-        // Build wallet from top-level [wallet] config + secrets + RPC URLs.
-        let wallet = match (config.wallet, secrets.wallet) {
-            (Some(wallet_config), Some(wallet_secrets)) => {
-                let Some(base_url) = base_rpc_url else {
-                    return Err(CtxError::WalletMissingRpcUrl {
-                        field: "base_rpc_url",
-                    });
-                };
-
-                let Some(eth_url) = ethereum_rpc_url else {
-                    return Err(CtxError::WalletMissingRpcUrl {
-                        field: "ethereum_rpc_url",
-                    });
-                };
-
-                Some(
-                    crate::wallet::OnchainWalletCtx::new(
-                        wallet_config,
-                        wallet_secrets,
-                        base_url,
-                        eth_url,
-                    )
-                    .await?,
-                )
-            }
-            (Some(_), None) => return Err(CtxError::WalletSecretsMissing),
-            (None, Some(_)) => {
-                // Wallet secrets present but no [wallet] in config.
-                // Common when sharing one secrets file across bot + CLI
-                // where the bot config doesn't need a wallet.
-                warn!(
-                    "[wallet] secrets present but no [wallet] config section -- \
-                     wallet signing will not be available"
-                );
-                None
-            }
-            (None, None) => None,
-        };
-
-        let trading_mode = match (config.rebalancing, config.raindex.order_owner) {
-            (Some(rebalancing_config), None) => {
-                let BrokerCtx::AlpacaBrokerApi(_) = &broker else {
-                    return Err(RebalancingCtxError::NotAlpacaBroker.into());
-                };
-
-                let minimum = *crate::rebalancing::trigger::ALPACA_MINIMUM_WITHDRAWAL;
-
-                if let Some(cash) = &config.assets.cash
-                    && cash.rebalancing == OperationMode::Enabled
-                    && let Some(cash_limit) = &cash.operational_limit
-                {
-                    let below_minimum = cash_limit.inner().lt(&minimum)?;
-
-                    if below_minimum {
-                        return Err(CtxError::CashOperationalLimitBelowMinimumWithdrawal {
-                            configured: cash_limit.inner(),
-                            minimum,
-                        });
-                    }
-                }
-
-                if wallet.is_none() {
-                    return Err(CtxError::WalletNotConfigured);
-                }
-
-                TradingMode::Rebalancing(Box::new(RebalancingCtx::new(&rebalancing_config)?))
-            }
-            // Unreachable: early conflict check above returns before this point.
-            (Some(_), Some(configured)) => {
-                return Err(CtxError::OrderOwnerConflictsWithRebalancing { configured });
-            }
-            (None, Some(order_owner)) => TradingMode::Standalone { order_owner },
-            (None, None) => return Err(CtxError::MissingOrderOwner),
-        };
-
-        let log_level = config.log_level.unwrap_or(LogLevel::Debug);
-
-        let position_check_interval = config.position_check_interval.unwrap_or(60);
-        if position_check_interval == 0 {
-            return Err(CtxError::ZeroPollingInterval {
-                field: "position_check_interval",
-            });
-        }
-
-        let inventory_poll_interval = config.inventory_poll_interval.unwrap_or(60);
-        if inventory_poll_interval == 0 {
-            return Err(CtxError::ZeroPollingInterval {
-                field: "inventory_poll_interval",
-            });
-        }
-
-        let travel_rule = config
-            .broker
-            .as_ref()
-            .and_then(|broker_config| broker_config.travel_rule.as_ref());
-
-        if matches!(broker, BrokerCtx::AlpacaBrokerApi(_)) && travel_rule.is_none() {
-            return Err(CtxError::MissingTravelRule);
-        }
-
-        Ok(Self {
-            database_url: config.database_url,
-            log_level,
-            server_port: config.server_port.unwrap_or(8080),
-            evm,
-            order_polling_interval: config.order_polling_interval.unwrap_or(15),
-            order_polling_max_jitter: config.order_polling_max_jitter.unwrap_or(5),
-            position_check_interval,
-            inventory_poll_interval,
-            broker,
-            telemetry,
-            trading_mode,
-            wallet,
-            execution_threshold,
-            assets: config.assets,
-            travel_rule: config
-                .broker
-                .and_then(|broker_config| broker_config.travel_rule)
-                .map(TravelRuleConfig::validated)
-                .transpose()?,
-        })
+        parse_and_validate(&config_str, config_path, &secrets_str, secrets_path)?;
+        Ok(())
     }
 
     pub async fn get_sqlite_pool(&self) -> Result<SqlitePool, sqlx::Error> {
@@ -2081,15 +2191,37 @@ pub(crate) mod tests {
     #[test]
     fn all_repo_config_tomls_are_valid() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut config_paths: Vec<PathBuf> = std::fs::read_dir(repo_root.join("config"))
-            .unwrap()
-            .filter_map(std::result::Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
-            .collect();
+        let config_dir = repo_root.join("config");
+
+        // Walk config/ subdirectories (config/prod/, config/staging/) to
+        // find all .toml files. The previous flat read_dir missed these
+        // because the direct children are directories, not .toml files.
+        let mut config_paths: Vec<PathBuf> = Vec::new();
+        for entry in std::fs::read_dir(&config_dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+
+            if path.is_dir() {
+                for sub_entry in std::fs::read_dir(&path).unwrap() {
+                    let sub_path = sub_entry.unwrap().path();
+                    if sub_path.extension().is_some_and(|ext| ext == "toml") {
+                        config_paths.push(sub_path);
+                    }
+                }
+            } else if path.extension().is_some_and(|ext| ext == "toml") {
+                config_paths.push(path);
+            }
+        }
 
         config_paths.push(repo_root.join("example.config.toml"));
         config_paths.push(repo_root.join("e2e/config.toml"));
+
+        assert!(
+            config_paths.len() >= 3,
+            "Expected at least 3 config files (prod, staging, example), \
+             found {}: {config_paths:?}",
+            config_paths.len()
+        );
 
         for path in config_paths {
             let contents = std::fs::read_to_string(&path).unwrap_or_else(|error| {
@@ -2951,5 +3083,307 @@ pub(crate) mod tests {
                  as unknown variant (kebab-case required), but got: {error}"
             );
         }
+    }
+
+    #[test]
+    fn validate_files_accepts_valid_config_and_secrets() {
+        let config = minimal_config_toml();
+        let secrets = dry_run_secrets_toml();
+        Ctx::validate_files(config.path(), secrets.path()).unwrap();
+    }
+
+    #[test]
+    fn validate_files_accepts_example_config_and_secrets() {
+        Ctx::validate_files(example_config_toml(), example_secrets_toml()).unwrap();
+    }
+
+    #[test]
+    fn validate_files_rejects_invalid_config_toml() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            bogus_field = "should fail"
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            deployment_block = 1
+        "#,
+        );
+        let secrets = dry_run_secrets_toml();
+
+        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        assert!(
+            matches!(error, CtxError::ConfigToml { .. }),
+            "Expected config parse error for unknown field, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn validate_files_rejects_invalid_secrets_toml() {
+        let config = minimal_config_toml();
+        let secrets = toml_file(
+            r#"
+            [evm]
+            ws_rpc_url = "ws://localhost:8545"
+            extra_secret = "should fail"
+
+            [broker]
+            type = "dry-run"
+        "#,
+        );
+
+        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        assert!(
+            matches!(error, CtxError::SecretsToml { .. }),
+            "Expected secrets parse error for unknown field, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn validate_files_rejects_missing_order_owner() {
+        let config = minimal_config_toml_without_order_owner();
+        let secrets = dry_run_secrets_toml();
+
+        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        assert!(
+            matches!(error, CtxError::MissingOrderOwner),
+            "Expected MissingOrderOwner, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn validate_files_rejects_wallet_config_without_secrets() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            deployment_block = 1
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+            [broker]
+            counter_trade_slippage_bps = 100
+
+            [broker.travel_rule]
+            beneficiary_entity_name = "Test Corp"
+
+            [wallet]
+            kind = "private-key"
+        "#,
+        );
+        let secrets = toml_file(
+            r#"
+            [evm]
+            ws_rpc_url = "ws://localhost:8545"
+
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+            mode = "sandbox"
+        "#,
+        );
+
+        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        assert!(
+            matches!(error, CtxError::WalletSecretsMissing),
+            "Expected WalletSecretsMissing, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn validate_files_rejects_wallet_without_rpc_urls() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            deployment_block = 1
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+            [broker]
+            counter_trade_slippage_bps = 100
+
+            [broker.travel_rule]
+            beneficiary_entity_name = "Test Corp"
+
+            [wallet]
+            kind = "private-key"
+        "#,
+        );
+        let secrets = toml_file(
+            r#"
+            [evm]
+            ws_rpc_url = "ws://localhost:8545"
+
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+            mode = "sandbox"
+
+            [wallet]
+            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        "#,
+        );
+
+        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                CtxError::WalletMissingRpcUrl {
+                    field: "base_rpc_url"
+                }
+            ),
+            "Expected WalletMissingRpcUrl for base_rpc_url, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn validate_files_rejects_alpaca_without_travel_rule() {
+        let config = alpaca_trading_config_toml();
+        let secrets = toml_file(
+            r#"
+            [evm]
+            ws_rpc_url = "ws://localhost:8545"
+
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+        "#,
+        );
+
+        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        assert!(
+            matches!(error, CtxError::MissingTravelRule),
+            "Expected MissingTravelRule, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn validate_files_rejects_rebalancing_with_order_owner() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            order_owner = "0xcccccccccccccccccccccccccccccccccccccccc"
+            deployment_block = 1
+
+            [broker]
+            counter_trade_slippage_bps = 100
+
+            [rebalancing]
+            redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            transfer_timeout_secs = 1800
+
+            [wallet]
+            kind = "private-key"
+            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+            [rebalancing.equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [rebalancing.usdc]
+            mode = "enabled"
+            target = "0.5"
+            deviation = "0.3"
+        "#,
+        );
+        let secrets = toml_file(
+            r#"
+            [evm]
+            ws_rpc_url = "ws://localhost:8545"
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://mainnet.infura.io"
+
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "test_key"
+            api_secret = "test_secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+            mode = "sandbox"
+
+            [wallet]
+            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        "#,
+        );
+
+        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        assert!(
+            matches!(error, CtxError::OrderOwnerConflictsWithRebalancing { .. }),
+            "Expected OrderOwnerConflictsWithRebalancing, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn validate_files_rejects_placeholder_travel_rule() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            deployment_block = 1
+
+            [broker.travel_rule]
+            beneficiary_entity_name = "PLACEHOLDER"
+        "#,
+        );
+        let secrets = dry_run_secrets_toml();
+
+        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                CtxError::InvalidTravelRule {
+                    field: "beneficiary_entity_name",
+                    ..
+                }
+            ),
+            "Expected InvalidTravelRule for entity_name, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn validate_files_rejects_zero_polling_interval() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            position_check_interval = 0
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            deployment_block = 1
+        "#,
+        );
+        let secrets = dry_run_secrets_toml();
+
+        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        assert!(
+            matches!(error, CtxError::ZeroPollingInterval { .. }),
+            "Expected ZeroPollingInterval, got {error:?}"
+        );
     }
 }
