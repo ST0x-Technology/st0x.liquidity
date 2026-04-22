@@ -8,21 +8,25 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
-use st0x_dto::{InitialState, ServerMessage};
+use st0x_dto::{CurrentState, Statement};
 
+use crate::config::OperationMode;
 use crate::inventory::BroadcastingInventory;
+use crate::threshold::ExecutionThreshold;
 
 mod event;
+mod trade_loader;
 mod transfer_loader;
-pub(crate) use event::EventBroadcaster;
+pub(crate) use event::Broadcaster;
 
 pub(crate) struct Broadcast {
-    pub(crate) sender: broadcast::Sender<ServerMessage>,
+    pub(crate) sender: broadcast::Sender<Statement>,
 }
 
 pub(crate) struct DashboardState {
     pub(crate) inventory: Arc<BroadcastingInventory>,
     pub(crate) pool: SqlitePool,
+    pub(crate) settings: st0x_dto::Settings,
 }
 
 #[get("/ws")]
@@ -34,21 +38,26 @@ fn ws_endpoint<'r>(
     let mut receiver = broadcast.sender.subscribe();
     let inventory = Arc::clone(&dashboard.inventory);
     let pool = dashboard.pool.clone();
+    let settings = dashboard.settings.clone();
 
     ws.channel(move |mut stream| {
         Box::pin(async move {
             let inventory_dto = inventory.read().await.to_dto();
             let transfers = transfer_loader::load_transfers(&pool).await;
+            let trades = trade_loader::load_trades(&pool).await;
+            let positions = load_positions(&pool).await;
 
-            let initial_state = InitialState {
+            let state = CurrentState {
+                trades,
                 inventory: inventory_dto,
+                positions,
+                settings,
                 active_transfers: transfers.active,
                 recent_transfers: transfers.recent,
                 warnings: transfers.warnings,
-                ..InitialState::default()
             };
 
-            let initial = ServerMessage::Initial(Box::new(initial_state));
+            let initial = Statement::CurrentState(Box::new(state));
             let json = match serde_json::to_string(&initial) {
                 Ok(serialized) => serialized,
                 Err(error) => {
@@ -98,6 +107,127 @@ pub(crate) fn routes() -> Vec<Route> {
     routes![ws_endpoint]
 }
 
+pub(crate) fn settings_from_ctx(ctx: &crate::config::Ctx) -> st0x_dto::Settings {
+    let (equity_target, equity_deviation, usdc_target, usdc_deviation) =
+        ctx.rebalancing_ctx().map_or_else(
+            |_| (0.5, 0.2, None, None),
+            |rebalancing| {
+                let (ut, ud) = rebalancing.usdc.as_ref().map_or((None, None), |threshold| {
+                    (
+                        Some(float_to_f64(threshold.target, 0.5)),
+                        Some(float_to_f64(threshold.deviation, 0.3)),
+                    )
+                });
+
+                (
+                    float_to_f64(rebalancing.equity.target, 0.5),
+                    float_to_f64(rebalancing.equity.deviation, 0.2),
+                    ut,
+                    ud,
+                )
+            },
+        );
+
+    let execution_threshold = match &ctx.execution_threshold {
+        ExecutionThreshold::Shares(shares) => {
+            let formatted = shares
+                .inner()
+                .inner()
+                .format()
+                .unwrap_or_else(|_| "?".to_string());
+
+            format!("{formatted} shares")
+        }
+        ExecutionThreshold::DollarValue(usd) => {
+            let formatted = usd.inner().format().unwrap_or_else(|_| "?".to_string());
+
+            format!("${formatted}")
+        }
+    };
+
+    let assets = ctx
+        .assets
+        .equities
+        .symbols
+        .iter()
+        .map(|(symbol, config)| {
+            let limit = config.operational_limit.map(|limit| {
+                limit
+                    .inner()
+                    .inner()
+                    .format()
+                    .unwrap_or_else(|_| "?".to_string())
+            });
+
+            st0x_dto::AssetSettings {
+                symbol: symbol.clone(),
+                trading: config.trading == OperationMode::Enabled,
+                rebalancing: config.rebalancing == OperationMode::Enabled,
+                operational_limit: limit,
+            }
+        })
+        .collect();
+
+    st0x_dto::Settings {
+        equity_target,
+        equity_deviation,
+        usdc_target,
+        usdc_deviation,
+        execution_threshold,
+        assets,
+    }
+}
+
+fn float_to_f64(value: rain_math_float::Float, fallback: f64) -> f64 {
+    let result = value
+        .format()
+        .ok()
+        .and_then(|formatted| formatted.parse::<f64>().ok());
+
+    if result.is_none() {
+        warn!(%fallback, "Float conversion failed for dashboard settings, using fallback");
+    }
+
+    result.unwrap_or(fallback)
+}
+
+async fn load_positions(pool: &SqlitePool) -> Vec<st0x_dto::Position> {
+    let rows: Vec<(String, Option<String>)> = match sqlx::query_as(
+        "SELECT symbol, net_position FROM position_view WHERE symbol IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            warn!(%error, "Failed to load positions for dashboard");
+            return Vec::new();
+        }
+    };
+
+    rows.into_iter()
+        .filter_map(|(raw_symbol, net_str)| {
+            let symbol = st0x_execution::Symbol::new(&raw_symbol)
+                .inspect_err(|error| {
+                    warn!(%error, %raw_symbol, "Invalid symbol in position view, skipping");
+                })
+                .ok()?;
+
+            let net = net_str
+                .and_then(|value| match rain_math_float::Float::parse(value) {
+                    Ok(float) => Some(float),
+                    Err(error) => {
+                        warn!(%error, %raw_symbol, "Unparseable net_position, skipping");
+                        None
+                    }
+                })
+                .unwrap_or_else(|| st0x_float_macro::float!(0));
+
+            Some(st0x_dto::Position { symbol, net })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use futures_util::StreamExt;
@@ -105,12 +235,42 @@ mod tests {
     use rocket::config::Config;
     use rocket::fairing::AdHoc;
     use serde_json::json;
-    use st0x_dto::EventStoreEntry;
+    use st0x_dto::{Trade, TradeDirection, TradingVenue};
     use std::sync::Mutex;
     use tokio::sync::oneshot;
     use tokio_tungstenite::connect_async;
 
     use super::*;
+
+    fn dummy_fill(symbol: &str) -> Statement {
+        Statement::TradeFill(Trade {
+            id: format!("test-fill-{symbol}"),
+            filled_at: chrono::Utc::now(),
+            venue: TradingVenue::Raindex,
+            direction: TradeDirection::Buy,
+            symbol: st0x_finance::Symbol::new(symbol).unwrap(),
+            shares: st0x_finance::FractionalShares::new(st0x_float_macro::float!(1)),
+        })
+    }
+
+    fn empty_current_state() -> Box<CurrentState> {
+        Box::new(CurrentState {
+            trades: Vec::new(),
+            inventory: st0x_dto::Inventory::empty(),
+            positions: Vec::new(),
+            settings: st0x_dto::Settings {
+                equity_target: 0.5,
+                equity_deviation: 0.2,
+                usdc_target: None,
+                usdc_deviation: None,
+                execution_threshold: "$2".to_string(),
+                assets: Vec::new(),
+            },
+            active_transfers: Vec::new(),
+            recent_transfers: Vec::new(),
+            warnings: Vec::new(),
+        })
+    }
 
     fn create_test_broadcast() -> Broadcast {
         let (sender, _) = broadcast::channel(256);
@@ -118,7 +278,7 @@ mod tests {
     }
 
     async fn create_test_dashboard_state(
-        event_sender: broadcast::Sender<ServerMessage>,
+        event_sender: broadcast::Sender<Statement>,
     ) -> DashboardState {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
@@ -128,24 +288,51 @@ mod tests {
                 event_sender,
             )),
             pool,
+            settings: st0x_dto::Settings {
+                equity_target: 0.5,
+                equity_deviation: 0.2,
+                usdc_target: None,
+                usdc_deviation: None,
+                execution_threshold: "$2".to_string(),
+                assets: Vec::new(),
+            },
         }
     }
 
     #[tokio::test]
-    async fn initial_state_stub_serializes_correctly() {
-        let initial = InitialState::default();
-        let json = serde_json::to_string(&initial).expect("serialization should succeed");
-        assert!(json.contains("recentTrades"));
-        assert!(json.contains("inventory"));
-        assert!(json.contains("metrics"));
-        assert!(json.contains("circuitBreaker"));
+    async fn current_state_serializes_all_fields() {
+        let state = CurrentState {
+            trades: Vec::new(),
+            inventory: st0x_dto::Inventory::empty(),
+            positions: Vec::new(),
+            settings: st0x_dto::Settings {
+                equity_target: 0.5,
+                equity_deviation: 0.2,
+                usdc_target: None,
+                usdc_deviation: None,
+                execution_threshold: "$2".to_string(),
+                assets: Vec::new(),
+            },
+            active_transfers: Vec::new(),
+            recent_transfers: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let json = serde_json::to_value(&state).expect("serialization should succeed");
+        assert_eq!(json["trades"], json!([]));
+        assert_eq!(json["positions"], json!([]));
+        assert_eq!(json["activeTransfers"], json!([]));
+        assert_eq!(json["recentTransfers"], json!([]));
+        assert_eq!(json["warnings"], json!([]));
+        assert_eq!(json["settings"]["equityTarget"], json!(0.5));
+        assert_eq!(json["settings"]["executionThreshold"], json!("$2"));
+        assert!(json["inventory"].is_object());
     }
 
     #[tokio::test]
     async fn server_message_initial_serializes_with_type_tag() {
-        let msg = ServerMessage::Initial(Box::default());
+        let msg = Statement::CurrentState(empty_current_state());
         let json = serde_json::to_string(&msg).expect("serialization should succeed");
-        assert!(json.contains(r#""type":"initial""#));
+        assert!(json.contains(r#""type":"current_state""#));
         assert!(json.contains(r#""data":"#));
     }
 
@@ -154,7 +341,7 @@ mod tests {
         let broadcast = create_test_broadcast();
         let mut rx = broadcast.sender.subscribe();
 
-        let sent_msg = ServerMessage::Initial(Box::default());
+        let sent_msg = Statement::CurrentState(empty_current_state());
         broadcast
             .sender
             .send(sent_msg.clone())
@@ -172,7 +359,7 @@ mod tests {
         let mut receiver1 = broadcast.sender.subscribe();
         let mut receiver2 = broadcast.sender.subscribe();
 
-        let msg = ServerMessage::Initial(Box::default());
+        let msg = Statement::CurrentState(empty_current_state());
         broadcast.sender.send(msg).expect("send should succeed");
 
         receiver1
@@ -242,8 +429,8 @@ mod tests {
         let text = msg.into_text().expect("expected text message");
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("invalid JSON");
 
-        assert_eq!(parsed["type"], "initial");
-        assert!(parsed["data"]["recentTrades"].is_array());
+        assert_eq!(parsed["type"], "current_state");
+        assert!(parsed["data"]["trades"].is_array());
         assert!(parsed["data"]["inventory"].is_object());
 
         shutdown_handle.notify();
@@ -334,8 +521,8 @@ mod tests {
 
             assert_eq!(
                 parsed["type"],
-                "initial",
-                "client{} should receive initial message",
+                "current_state",
+                "client{} should receive current_state message",
                 i + 1
             );
         }
@@ -359,19 +546,11 @@ mod tests {
         client1.next().await.expect("client1 initial").unwrap();
         client2.next().await.expect("client2 initial").unwrap();
 
-        // Broadcast an event message
-        let event = EventStoreEntry {
-            aggregate_type: "TestAggregate".to_string(),
-            aggregate_id: "test-123".to_string(),
-            sequence: 1,
-            event_type: "TestEvent".to_string(),
-            timestamp: chrono::Utc::now(),
-        };
-        let broadcast_msg = ServerMessage::Event(event);
+        // Broadcast a fill message
         server
             .broadcast
             .sender
-            .send(broadcast_msg)
+            .send(dummy_fill("AAPL"))
             .expect("broadcast send");
 
         // Both clients should receive the broadcast
@@ -387,12 +566,11 @@ mod tests {
 
             assert_eq!(
                 parsed["type"],
-                "event",
-                "client{} should receive event message",
+                "trade_fill",
+                "client{} should receive trade_fill message",
                 i + 1
             );
-            assert_eq!(parsed["data"]["aggregate_type"], "TestAggregate");
-            assert_eq!(parsed["data"]["aggregate_id"], "test-123");
+            assert_eq!(parsed["data"]["symbol"], "AAPL");
         }
 
         server.shutdown.notify();
@@ -420,17 +598,10 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Broadcast a message - should still reach client1
-        let event = EventStoreEntry {
-            aggregate_type: "StillWorking".to_string(),
-            aggregate_id: "after-disconnect".to_string(),
-            sequence: 1,
-            event_type: "TestEvent".to_string(),
-            timestamp: chrono::Utc::now(),
-        };
         server
             .broadcast
             .sender
-            .send(ServerMessage::Event(event))
+            .send(dummy_fill("TSLA"))
             .expect("broadcast send");
 
         // client1 should still receive messages
@@ -443,8 +614,8 @@ mod tests {
         let text = msg.into_text().expect("expected text");
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("invalid JSON");
 
-        assert_eq!(parsed["type"], "event");
-        assert_eq!(parsed["data"]["aggregate_type"], "StillWorking");
+        assert_eq!(parsed["type"], "trade_fill");
+        assert_eq!(parsed["data"]["symbol"], "TSLA");
 
         server.shutdown.notify();
     }
@@ -463,17 +634,10 @@ mod tests {
         client1.next().await.expect("client1 initial").unwrap();
 
         // Broadcast a message (client1 will receive it)
-        let event = EventStoreEntry {
-            aggregate_type: "OldEvent".to_string(),
-            aggregate_id: "before-client2".to_string(),
-            sequence: 1,
-            event_type: "TestEvent".to_string(),
-            timestamp: chrono::Utc::now(),
-        };
         server
             .broadcast
             .sender
-            .send(ServerMessage::Event(event))
+            .send(dummy_fill("MSFT"))
             .expect("broadcast send");
 
         // Consume the broadcast on client1
@@ -494,8 +658,8 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("invalid JSON");
 
         assert_eq!(
-            parsed["type"], "initial",
-            "new client should receive initial, not previous broadcast"
+            parsed["type"], "current_state",
+            "new client should receive current_state, not previous broadcast"
         );
 
         server.shutdown.notify();
@@ -534,8 +698,8 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("invalid JSON");
 
         assert_eq!(
-            parsed["type"], "snapshot",
-            "expected snapshot message after inventory mutation, got: {parsed}"
+            parsed["type"], "inventory_snapshot",
+            "expected inventory_snapshot message after inventory mutation, got: {parsed}"
         );
         let aapl = &parsed["data"]["inventory"]["perSymbol"][0];
         assert_eq!(aapl["symbol"], json!("AAPL"));

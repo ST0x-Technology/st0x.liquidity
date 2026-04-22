@@ -217,6 +217,7 @@ where
         + Sub<Output = Result<T, FloatError>>
         + Copy
         + HasZero
+        + std::fmt::Display
         + std::fmt::Debug,
 {
     fn has_inflight(&self) -> Result<bool, FloatError> {
@@ -266,6 +267,7 @@ where
         + Copy
         + HasZero
         + Into<Float>
+        + std::fmt::Display
         + std::fmt::Debug,
 {
     /// Returns the ratio of onchain to total inventory.
@@ -416,6 +418,7 @@ where
         + Sub<Output = Result<T, FloatError>>
         + Copy
         + HasZero
+        + std::fmt::Display
         + std::fmt::Debug
         + Send
         + 'static,
@@ -711,7 +714,11 @@ impl InventoryView {
 
 fn venue_balances<T>(venue: Option<VenueBalance<T>>) -> (T, T)
 where
-    T: Add<Output = Result<T, FloatError>> + Sub<Output = Result<T, FloatError>> + Copy + HasZero,
+    T: Add<Output = Result<T, FloatError>>
+        + Sub<Output = Result<T, FloatError>>
+        + Copy
+        + HasZero
+        + std::fmt::Display,
 {
     venue.map_or((T::ZERO, T::ZERO), |balance| {
         (balance.available(), balance.inflight())
@@ -2014,5 +2021,86 @@ mod tests {
 
         assert_eq!(dto.usdc.onchain_available, Usdc::ZERO);
         assert_eq!(dto.usdc.offchain_available, Usdc::ZERO);
+    }
+
+    #[test]
+    fn inflight_from_transfer_survives_empty_polling_snapshot() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let transfer_quantity = shares(10);
+
+        // Start with equity on both venues
+        let view = InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50));
+
+        // Simulate WithdrawnFromRaindex: trigger sets inflight
+        let view = view
+            .update_equity(
+                &symbol,
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, transfer_quantity),
+                Utc::now(),
+            )
+            .unwrap();
+
+        // Verify inflight is set in DTO
+        let dto = view.to_dto();
+        let aapl = &dto.per_symbol[0];
+        assert_eq!(
+            aapl.onchain_inflight, transfer_quantity,
+            "Inflight should be set after transfer start"
+        );
+
+        // Simulate polling: Alpaca hasn't detected the transfer yet,
+        // so the inflight snapshot has empty maps.
+        let view = view
+            .apply_inflight_snapshot(&BTreeMap::new(), &BTreeMap::new(), Utc::now(), Utc::now())
+            .unwrap();
+
+        // Inflight MUST still be present — the polling snapshot
+        // should not clear inflight set by the transfer trigger.
+        let dto = view.to_dto();
+        let aapl = &dto.per_symbol[0];
+        assert_eq!(
+            aapl.onchain_inflight, transfer_quantity,
+            "Inflight must survive an empty polling snapshot \
+             (Alpaca hasn't detected the transfer yet)"
+        );
+    }
+
+    #[test]
+    fn inflight_from_transfer_survives_balance_snapshot() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let transfer_quantity = shares(10);
+
+        let view = InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50));
+
+        // Trigger sets inflight
+        let view = view
+            .update_equity(
+                &symbol,
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, transfer_quantity),
+                Utc::now(),
+            )
+            .unwrap();
+
+        // Balance polling reports updated onchain balance.
+        // on_snapshot should skip because inflight is active.
+        let view = view
+            .update_equity(
+                &symbol,
+                Inventory::on_snapshot(Venue::MarketMaking, shares(40), Utc::now()),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let dto = view.to_dto();
+        let aapl = &dto.per_symbol[0];
+        assert_eq!(
+            aapl.onchain_inflight, transfer_quantity,
+            "Inflight must survive a balance snapshot during active transfer"
+        );
+        assert_eq!(
+            aapl.onchain_available,
+            shares(40),
+            "Available should reflect the transfer (50 - 10 moved to inflight)"
+        );
     }
 }

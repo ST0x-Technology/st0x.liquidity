@@ -61,7 +61,7 @@ use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use tracing::{info, warn};
 
@@ -1116,6 +1116,70 @@ pub(crate) async fn symbols_with_stuck_redemptions(
     Ok(result)
 }
 
+/// Returns the set of symbols that have at least one in-progress
+/// EquityRedemption aggregate (i.e. an equity transfer is in progress).
+///
+/// Only `EquityRedemption` aggregates are checked, not `TokenizedEquityMint`,
+/// because mints do not move tokens out of Raindex vaults. A mint in flight
+/// does not create the same vault-drain risk that a redemption does, so
+/// suppressing hedges during mints would be overly conservative.
+///
+/// Uses an explicit allowlist of active event types (not a denylist of terminal
+/// events) so that adding a new event variant does not silently suppress hedges
+/// until the SQL is updated.
+///
+/// Queries the event store directly so the result is durable across
+/// restarts — no runtime state required.
+pub(crate) async fn symbols_with_active_transfers(
+    pool: &SqlitePool,
+) -> Result<HashSet<Symbol>, sqlx::Error> {
+    let rows: Vec<(Option<String>,)> = sqlx::query_as(
+        "
+        WITH latest AS (
+            SELECT aggregate_id, MAX(sequence) AS max_seq
+            FROM events
+            WHERE aggregate_type = 'EquityRedemption'
+            GROUP BY aggregate_id
+        )
+        SELECT DISTINCT json_extract(first_ev.payload,
+               '$.WithdrawnFromRaindex.symbol')
+        FROM events last_ev
+        INNER JOIN latest
+            ON last_ev.aggregate_id = latest.aggregate_id
+           AND last_ev.sequence = latest.max_seq
+        INNER JOIN events first_ev
+            ON first_ev.aggregate_type = 'EquityRedemption'
+           AND first_ev.aggregate_id = latest.aggregate_id
+           AND first_ev.sequence = 0
+        WHERE last_ev.aggregate_type = 'EquityRedemption'
+          AND last_ev.event_type IN (
+              'EquityRedemptionEvent::WithdrawnFromRaindex',
+              'EquityRedemptionEvent::TokensUnwrapped',
+              'EquityRedemptionEvent::TokensSent',
+              'EquityRedemptionEvent::Detected'
+          )
+        ",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|(raw_symbol,)| {
+            let value = raw_symbol.or_else(|| {
+                warn!("Active transfer has NULL symbol in payload, skipping");
+                None
+            })?;
+
+            Symbol::new(&value)
+                .inspect_err(|error| {
+                    warn!(%error, raw_symbol = %value, "Active transfer has invalid symbol, skipping");
+                })
+                .ok()
+        })
+        .collect())
+}
+
 fn parse_stuck_symbol(aggregate_id: &str, raw: Option<String>) -> Option<Symbol> {
     let value = raw.or_else(|| {
         warn!(
@@ -2162,6 +2226,155 @@ mod tests {
         );
         assert_eq!(op.started_at, now);
         assert_eq!(op.updated_at, later);
+    }
+
+    #[tokio::test]
+    async fn active_transfers_includes_active_event_types() {
+        let pool = crate::test_utils::setup_test_db().await;
+
+        // AAPL: latest event is WithdrawnFromRaindex (active)
+        insert_event(
+            &pool,
+            "redemption-active-1",
+            0,
+            "EquityRedemptionEvent::WithdrawnFromRaindex",
+            &withdrawn_payload("AAPL"),
+        )
+        .await;
+
+        // TSLA: latest event is Detected (active)
+        insert_event(
+            &pool,
+            "redemption-active-2",
+            0,
+            "EquityRedemptionEvent::WithdrawnFromRaindex",
+            &withdrawn_payload("TSLA"),
+        )
+        .await;
+        insert_event(
+            &pool,
+            "redemption-active-2",
+            1,
+            "EquityRedemptionEvent::TokensSent",
+            r#"{"TokensSent":{"sent_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .await;
+        insert_event(
+            &pool,
+            "redemption-active-2",
+            2,
+            "EquityRedemptionEvent::Detected",
+            r#"{"Detected":{"tokenization_request_id":"TOK001","detected_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .await;
+
+        let result = symbols_with_active_transfers(&pool).await.unwrap();
+        assert_eq!(result.len(), 2, "both active redemptions should appear");
+        assert!(result.contains(&Symbol::new("AAPL").unwrap()));
+        assert!(result.contains(&Symbol::new("TSLA").unwrap()));
+    }
+
+    #[tokio::test]
+    async fn active_transfers_excludes_terminal_states() {
+        let pool = crate::test_utils::setup_test_db().await;
+
+        // AAPL: completed (terminal) — should be excluded
+        insert_event(
+            &pool,
+            "redemption-terminal-1",
+            0,
+            "EquityRedemptionEvent::WithdrawnFromRaindex",
+            &withdrawn_payload("AAPL"),
+        )
+        .await;
+        insert_event(
+            &pool,
+            "redemption-terminal-1",
+            1,
+            "EquityRedemptionEvent::Completed",
+            r#"{"Completed":{"redemption_tx":"0x0000000000000000000000000000000000000000000000000000000000000001","tokenization_request_id":"TOK001","completed_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .await;
+
+        // TSLA: detection failed (terminal) — should be excluded
+        insert_event(
+            &pool,
+            "redemption-terminal-2",
+            0,
+            "EquityRedemptionEvent::WithdrawnFromRaindex",
+            &withdrawn_payload("TSLA"),
+        )
+        .await;
+        insert_event(
+            &pool,
+            "redemption-terminal-2",
+            1,
+            "EquityRedemptionEvent::DetectionFailed",
+            r#"{"DetectionFailed":{"failure":"Timeout","failed_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .await;
+
+        let result = symbols_with_active_transfers(&pool).await.unwrap();
+        assert!(
+            result.is_empty(),
+            "terminal redemptions should not appear, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_transfers_deduplicates_same_symbol() {
+        let pool = crate::test_utils::setup_test_db().await;
+
+        // Two active redemptions for the same symbol
+        insert_event(
+            &pool,
+            "redemption-dup-1",
+            0,
+            "EquityRedemptionEvent::WithdrawnFromRaindex",
+            &withdrawn_payload("AAPL"),
+        )
+        .await;
+        insert_event(
+            &pool,
+            "redemption-dup-2",
+            0,
+            "EquityRedemptionEvent::WithdrawnFromRaindex",
+            &withdrawn_payload("AAPL"),
+        )
+        .await;
+
+        let result = symbols_with_active_transfers(&pool).await.unwrap();
+        assert_eq!(result.len(), 1, "duplicate symbol should appear only once");
+        assert!(result.contains(&Symbol::new("AAPL").unwrap()));
+    }
+
+    #[tokio::test]
+    async fn active_transfers_skips_null_symbol_rows() {
+        let pool = crate::test_utils::setup_test_db().await;
+
+        // Row with NULL symbol in payload (corrupt data)
+        insert_event(
+            &pool,
+            "redemption-null",
+            0,
+            "EquityRedemptionEvent::WithdrawnFromRaindex",
+            r#"{"WithdrawnFromRaindex":{}}"#,
+        )
+        .await;
+
+        // Valid row alongside the corrupt one
+        insert_event(
+            &pool,
+            "redemption-valid",
+            0,
+            "EquityRedemptionEvent::WithdrawnFromRaindex",
+            &withdrawn_payload("NVDA"),
+        )
+        .await;
+
+        let result = symbols_with_active_transfers(&pool).await.unwrap();
+        assert_eq!(result.len(), 1, "null symbol row should be skipped");
+        assert!(result.contains(&Symbol::new("NVDA").unwrap()));
     }
 
     #[test]

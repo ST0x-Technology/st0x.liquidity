@@ -2,7 +2,7 @@
 //!
 //! [`BroadcastingInventory`] wraps an [`InventoryView`] behind an [`RwLock`]
 //! and holds a [`broadcast::Sender`]. When a [`BroadcastingWriteGuard`] is
-//! dropped, it automatically sends a [`ServerMessage::Snapshot`] with the
+//! dropped, it automatically sends a [`Statement::InventorySnapshot`] with the
 //! current inventory state to all connected dashboard clients.
 
 use chrono::Utc;
@@ -10,7 +10,7 @@ use std::ops::{Deref, DerefMut};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, broadcast};
 use tracing::warn;
 
-use st0x_dto::{InventorySnapshot, ServerMessage};
+use st0x_dto::{InventorySnapshot, Statement};
 
 use super::InventoryView;
 
@@ -18,11 +18,11 @@ use super::InventoryView;
 /// whenever the write guard is released.
 pub(crate) struct BroadcastingInventory {
     view: RwLock<InventoryView>,
-    sender: broadcast::Sender<ServerMessage>,
+    sender: broadcast::Sender<Statement>,
 }
 
 impl BroadcastingInventory {
-    pub(crate) fn new(view: InventoryView, sender: broadcast::Sender<ServerMessage>) -> Self {
+    pub(crate) fn new(view: InventoryView, sender: broadcast::Sender<Statement>) -> Self {
         Self {
             view: RwLock::new(view),
             sender,
@@ -44,7 +44,7 @@ impl BroadcastingInventory {
 /// Write guard that broadcasts the current inventory snapshot on drop.
 pub(crate) struct BroadcastingWriteGuard<'a> {
     guard: RwLockWriteGuard<'a, InventoryView>,
-    sender: &'a broadcast::Sender<ServerMessage>,
+    sender: &'a broadcast::Sender<Statement>,
 }
 
 impl Deref for BroadcastingWriteGuard<'_> {
@@ -74,7 +74,7 @@ impl Drop for BroadcastingWriteGuard<'_> {
 
         if let Err(error) = self
             .sender
-            .send(ServerMessage::Snapshot(Box::new(snapshot)))
+            .send(Statement::InventorySnapshot(Box::new(snapshot)))
         {
             warn!("Failed to broadcast inventory snapshot: {error}");
         }
@@ -88,8 +88,7 @@ mod tests {
 
     use super::*;
 
-    fn create_broadcasting_inventory() -> (BroadcastingInventory, broadcast::Receiver<ServerMessage>)
-    {
+    fn create_broadcasting_inventory() -> (BroadcastingInventory, broadcast::Receiver<Statement>) {
         let (sender, receiver) = broadcast::channel(16);
         (
             BroadcastingInventory::new(InventoryView::default(), sender),
@@ -142,7 +141,7 @@ mod tests {
         let msg = receiver.recv().await.unwrap();
 
         match msg {
-            ServerMessage::Snapshot(snapshot) => {
+            Statement::InventorySnapshot(snapshot) => {
                 assert_eq!(snapshot.inventory.per_symbol.len(), 1);
                 assert_eq!(snapshot.inventory.per_symbol[0].symbol, symbol);
                 assert_eq!(snapshot.inventory.per_symbol[0].onchain_available, onchain);
@@ -184,7 +183,7 @@ mod tests {
         let second = receiver.recv().await.unwrap();
 
         match first {
-            ServerMessage::Snapshot(snapshot) => {
+            Statement::InventorySnapshot(snapshot) => {
                 assert_eq!(snapshot.inventory.per_symbol.len(), 1);
                 assert_eq!(snapshot.inventory.per_symbol[0].symbol, aapl);
             }
@@ -192,7 +191,7 @@ mod tests {
         }
 
         match second {
-            ServerMessage::Snapshot(snapshot) => {
+            Statement::InventorySnapshot(snapshot) => {
                 assert_eq!(snapshot.inventory.per_symbol.len(), 2);
             }
             other => panic!("expected Snapshot, got {other:?}"),

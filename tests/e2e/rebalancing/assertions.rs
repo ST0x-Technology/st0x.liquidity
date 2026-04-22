@@ -51,7 +51,7 @@ use crate::base_chain::{self, TakeOrderResult};
 pub(crate) use crate::cctp::{CctpInfra, CctpOverrides, USDC_ETHEREUM};
 pub(crate) use crate::poll::{
     DEFAULT_POLL_TIMEOUT_SECS, connect_db, fetch_events_by_type, poll_for_events_with_timeout,
-    sleep_or_crash, spawn_bot,
+    poll_for_hedge_completion, sleep_or_crash, spawn_bot,
 };
 pub(crate) use crate::test_infra::TestInfra;
 use st0x_float_macro::float;

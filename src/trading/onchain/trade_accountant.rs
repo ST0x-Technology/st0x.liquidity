@@ -188,6 +188,10 @@ pub(crate) enum TradeAccountingError {
     OnChain(#[from] OnChainError),
     #[error("Vault registry command failed: {0}")]
     VaultRegistry(#[from] SendError<VaultRegistry>),
+    #[error("Position command failed: {0}")]
+    PositionCommand(#[from] SendError<crate::position::Position>),
+    #[error("Offchain order command failed: {0}")]
+    OffchainOrderCommand(#[from] SendError<crate::offchain_order::OffchainOrder>),
     #[error("Execution error: {0}")]
     Execution(#[from] ExecutionError),
     // TODO: TradeAccountingError should not be coupled to a concrete executor error type.

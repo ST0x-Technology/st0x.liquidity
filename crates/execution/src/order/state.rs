@@ -5,7 +5,7 @@ use rain_math_float::Float;
 use super::OrderStatus;
 
 /// Runtime representation of an offchain order's lifecycle state.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum OrderState {
     Pending,
     Submitted {
@@ -20,6 +20,36 @@ pub enum OrderState {
         failed_at: DateTime<Utc>,
         error_reason: Option<String>,
     },
+}
+
+impl std::fmt::Debug for OrderState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => write!(f, "Pending"),
+            Self::Submitted { order_id } => f
+                .debug_struct("Submitted")
+                .field("order_id", order_id)
+                .finish(),
+            Self::Filled {
+                executed_at,
+                order_id,
+                price,
+            } => f
+                .debug_struct("Filled")
+                .field("executed_at", executed_at)
+                .field("order_id", order_id)
+                .field("price", &st0x_float_serde::DebugFloat(price))
+                .finish(),
+            Self::Failed {
+                failed_at,
+                error_reason,
+            } => f
+                .debug_struct("Failed")
+                .field("failed_at", failed_at)
+                .field("error_reason", error_reason)
+                .finish(),
+        }
+    }
 }
 
 impl PartialEq for OrderState {
@@ -74,6 +104,25 @@ impl OrderState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filled_debug_formats_price_as_decimal() {
+        let state = OrderState::Filled {
+            executed_at: Utc::now(),
+            order_id: "ORDER123".to_string(),
+            price: Float::parse("150.00".to_string()).unwrap(),
+        };
+
+        let debug_output = format!("{state:?}");
+        assert!(
+            debug_output.contains("150"),
+            "Debug output should contain decimal price, got: {debug_output}"
+        );
+        assert!(
+            !debug_output.contains("0x"),
+            "Debug output should not contain hex representation, got: {debug_output}"
+        );
+    }
 
     #[test]
     fn test_status_extraction() {

@@ -12,8 +12,14 @@ use st0x_float_serde::{
 use crate::HasZero;
 
 /// A USDC dollar amount.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct Usdc(Float);
+
+impl std::fmt::Debug for Usdc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Usdc({})", format_float_with_fallback(&self.0))
+    }
+}
 
 impl Usdc {
     #[must_use]
@@ -244,6 +250,20 @@ mod tests {
         let json = serde_json::to_string(&usdc).unwrap();
         let roundtripped: Usdc = serde_json::from_str(&json).unwrap();
         assert_eq!(usdc, roundtripped);
+    }
+
+    #[test]
+    fn debug_formats_as_decimal() {
+        let usdc = Usdc::new(float!(123.45));
+        let output = format!("{usdc:?}");
+        assert_eq!(output, "Usdc(123.45)");
+    }
+
+    #[test]
+    fn display_formats_as_decimal() {
+        let usdc = Usdc::new(float!(123.45));
+        let output = format!("{usdc}");
+        assert_eq!(output, "123.45");
     }
 
     use alloy_primitives::U256;

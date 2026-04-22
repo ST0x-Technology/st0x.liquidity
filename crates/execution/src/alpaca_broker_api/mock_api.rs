@@ -248,6 +248,7 @@ impl AlpacaBrokerMock {
     pub async fn start(
         symbol_fill_prices: Vec<(Symbol, Float)>,
         symbol_positions: Vec<MockPosition>,
+        initial_cash: Option<Float>,
     ) -> Self {
         let today = Utc::now().format("%Y-%m-%d").to_string();
 
@@ -263,10 +264,12 @@ impl AlpacaBrokerMock {
             .map(|pos| (pos.symbol.clone(), pos))
             .collect();
 
+        let cash = initial_cash.unwrap_or(float!(100000));
+
         let state = Arc::new(Mutex::new(MockState {
             account: MockAccount {
-                cash: float!(100000),
-                buying_power: float!(100000),
+                cash,
+                buying_power: cash,
                 positions,
             },
             orders: HashMap::new(),
@@ -420,6 +423,40 @@ impl AlpacaBrokerMock {
                 market_value: pos.market_value,
             })
             .collect()
+    }
+
+    /// Adjusts a position's quantity by `delta`. Positive delta adds shares,
+    /// negative removes. Used by the mock tokenizer to reflect that minting
+    /// locks shares (deducts from position) and redeeming releases them.
+    pub fn adjust_position(
+        &self,
+        symbol: &Symbol,
+        delta: Float,
+    ) -> Result<(), rain_math_float::FloatError> {
+        let mut state = lock(&self.state);
+        let price = state.symbol_fill_prices.get(symbol).copied();
+
+        if let Some(position) = state.account.positions.get_mut(symbol) {
+            position.quantity = (position.quantity + delta)?;
+            if let Some(price) = price {
+                position.market_value = (position.quantity * price)?;
+            }
+        } else {
+            let market_value =
+                price.map_or(Ok(st0x_float_macro::float!(0)), |price| delta * price)?;
+
+            state.account.positions.insert(
+                symbol.clone(),
+                MockPosition {
+                    symbol: symbol.clone(),
+                    quantity: delta,
+                    market_value,
+                },
+            );
+        }
+
+        drop(state);
+        Ok(())
     }
 
     /// Starts a background watcher that monitors the Ethereum chain for USDC

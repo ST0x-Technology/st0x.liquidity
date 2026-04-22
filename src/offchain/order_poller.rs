@@ -5,7 +5,7 @@ use rand::Rng;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{Interval, interval};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use st0x_event_sorcery::{Column, Projection, ProjectionError, SendError, Store};
 use st0x_execution::{
@@ -90,22 +90,22 @@ impl<E: Executor> OrderStatusPoller<E> {
 
     pub async fn run(mut self) -> Result<(), OrderPollingError> {
         info!(
-            "Starting order status poller with interval: {:?}",
-            self.ctx.polling_interval
+            polling_interval = ?self.ctx.polling_interval,
+            "Starting order status poller..."
         );
 
         loop {
             self.interval.tick().await;
 
             if let Err(error) = self.poll_pending_orders().await {
-                error!("Polling cycle failed: {error}");
+                error!("Order polling failed: {error}");
             }
         }
     }
 
     #[tracing::instrument(skip(self), level = tracing::Level::DEBUG)]
     pub(crate) async fn poll_pending_orders(&self) -> Result<(), OrderPollingError> {
-        debug!("Starting polling cycle for submitted orders");
+        trace!("Starting polling cycle for submitted orders");
 
         let executor_type = self.executor.to_supported_executor();
         let submitted_executions: Vec<_> = self
@@ -117,7 +117,7 @@ impl<E: Executor> OrderStatusPoller<E> {
             .collect();
 
         if submitted_executions.is_empty() {
-            debug!("No submitted orders to poll");
+            trace!("No submitted orders to poll");
             return Ok(());
         }
 
@@ -185,10 +185,10 @@ impl<E: Executor> OrderStatusPoller<E> {
                     .await
             }
             OrderState::Pending | OrderState::Submitted { .. } => {
-                debug!(
+                trace!(
                     %offchain_order_id,
                     %symbol,
-                    "Order still pending"
+                    "Polling order..."
                 );
                 Ok(())
             }
@@ -207,7 +207,7 @@ impl<E: Executor> OrderStatusPoller<E> {
 
         info!(
             %offchain_order_id,
-            ?price,
+            %price,
             %symbol,
             "Order filled"
         );

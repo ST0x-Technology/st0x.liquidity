@@ -16,8 +16,14 @@ use std::str::FromStr;
 use crate::HasZero;
 
 /// An offchain US dollar amount.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct Usd(Float);
+
+impl std::fmt::Debug for Usd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Usd({})", format_float_with_fallback(&self.0))
+    }
+}
 
 impl Usd {
     #[must_use]
@@ -242,5 +248,19 @@ mod tests {
         let json = serde_json::to_string(&usd).unwrap();
         let roundtripped: Usd = serde_json::from_str(&json).unwrap();
         assert_eq!(usd, roundtripped);
+    }
+
+    #[test]
+    fn debug_formats_as_decimal() {
+        let usd = Usd::new(float!(123.45));
+        let output = format!("{usd:?}");
+        assert_eq!(output, "Usd(123.45)");
+    }
+
+    #[test]
+    fn display_formats_as_decimal() {
+        let usd = Usd::new(float!(123.45));
+        let output = format!("{usd}");
+        assert_eq!(output, "123.45");
     }
 }

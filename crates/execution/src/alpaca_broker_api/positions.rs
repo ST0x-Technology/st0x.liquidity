@@ -3,6 +3,7 @@
 use rain_math_float::Float;
 use serde::Deserialize;
 use st0x_float_macro::float;
+use st0x_float_serde::{DebugFloat, DebugOptionFloat};
 use tracing::{debug, error};
 
 use super::AlpacaBrokerApiError;
@@ -19,7 +20,7 @@ pub(super) struct AccountFunds {
 }
 
 /// Position response from Alpaca Broker API.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct PositionResponse {
     symbol: String,
     #[serde(
@@ -34,13 +35,35 @@ struct PositionResponse {
     market_value: Option<Float>,
 }
 
+impl std::fmt::Debug for PositionResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PositionResponse")
+            .field("symbol", &self.symbol)
+            .field("quantity", &DebugFloat(&self.quantity))
+            .field("market_value", &DebugOptionFloat(&self.market_value))
+            .finish()
+    }
+}
+
 /// Account details response from Alpaca Broker API.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct AccountDetailsResponse {
     #[serde(deserialize_with = "deserialize_float_from_number_or_string")]
     cash: Float,
     #[serde(deserialize_with = "deserialize_float_from_number_or_string")]
     non_marginable_buying_power: Float,
+}
+
+impl std::fmt::Debug for AccountDetailsResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountDetailsResponse")
+            .field("cash", &DebugFloat(&self.cash))
+            .field(
+                "non_marginable_buying_power",
+                &DebugFloat(&self.non_marginable_buying_power),
+            )
+            .finish()
+    }
 }
 
 pub(super) async fn fetch_inventory(

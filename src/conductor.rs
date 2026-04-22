@@ -4,7 +4,7 @@
 mod builder;
 pub(crate) mod job;
 mod manifest;
-mod order_fill_monitor;
+pub(crate) mod monitor;
 
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
@@ -20,7 +20,7 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use st0x_dto::ServerMessage;
+use st0x_dto::Statement;
 use st0x_event_sorcery::{Projection, Store, StoreBuilder};
 use st0x_evm::Wallet;
 use st0x_execution::{
@@ -31,7 +31,7 @@ use st0x_execution::{
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::bindings::IOrderBookV6::{self, IOrderBookV6Instance};
 use crate::config::{AssetsConfig, BrokerCtx, Ctx, CtxError};
-use crate::dashboard::EventBroadcaster;
+use crate::dashboard::Broadcaster;
 use crate::equity_redemption::symbols_with_stuck_redemptions;
 use crate::inventory::{
     BroadcastingInventory, Inventory, InventoryPollingService, InventoryProjection,
@@ -149,7 +149,7 @@ impl Conductor {
         ctx: Ctx,
         pool: SqlitePool,
         executor_maintenance: Option<JoinHandle<()>>,
-        event_sender: broadcast::Sender<ServerMessage>,
+        event_sender: broadcast::Sender<Statement>,
         inventory: Arc<BroadcastingInventory>,
     ) -> anyhow::Result<()>
     where
@@ -277,10 +277,12 @@ impl Conductor {
             snapshot,
         };
 
-        let dex_streams = order_fill_monitor::DexEventStreams {
+        let dex_streams = monitor::order_fills::DexEventStreams {
             clear: Box::pin(clear_stream),
             take: Box::pin(take_stream),
         };
+
+        let hedge_queue = crate::conductor::job::JobQueue::new(&pool);
 
         let conductor_ctx = builder::ConductorCtx {
             ctx: ctx.clone(),
@@ -289,6 +291,7 @@ impl Conductor {
             executor,
             execution_threshold: ctx.execution_threshold,
             frameworks,
+            pool,
             poll_notify: Arc::new(tokio::sync::Notify::new()),
             wallet_polling,
             tokenizer,
@@ -297,6 +300,7 @@ impl Conductor {
         let mut conductor = builder::spawn()
             .context(conductor_ctx)
             .job_queue(job_queue)
+            .hedge_queue(hedge_queue)
             .dex_streams(dex_streams)
             .maybe_executor_maintenance(executor_maintenance)
             .maybe_rebalancer(rebalancer)
@@ -362,7 +366,7 @@ struct RebalancingDeps {
     pool: SqlitePool,
     ctx: Ctx,
     inventory: Arc<BroadcastingInventory>,
-    event_sender: broadcast::Sender<ServerMessage>,
+    event_sender: broadcast::Sender<Statement>,
     vault_registry: Arc<Store<VaultRegistry>>,
     vault_registry_projection: Arc<Projection<VaultRegistry>>,
 }
@@ -507,9 +511,8 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             wrapper,
         ));
 
-        let event_broadcaster =
-            Arc::new(EventBroadcaster::new(deps.event_sender, deps.pool.clone()));
-        let manifest = QueryManifest::new(rebalancing_trigger, event_broadcaster);
+        let broadcaster = Arc::new(Broadcaster::new(deps.event_sender, deps.pool.clone()));
+        let manifest = QueryManifest::new(rebalancing_trigger, broadcaster);
 
         let built = manifest
             .build(deps.pool.clone(), equity_transfer_services)
@@ -1501,7 +1504,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::broadcast;
 
-    use st0x_dto::ServerMessage;
+    use st0x_dto::Statement;
     use st0x_event_sorcery::{StoreBuilder, test_store};
     use st0x_execution::{
         Direction, EquityPosition, ExecutorOrderId, Inventory as ExecutionInventory, MarketOrder,
@@ -2686,7 +2689,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
             imbalanced_inventory(&symbol),
             event_sender,
@@ -2785,7 +2788,7 @@ mod tests {
             )
             .unwrap();
 
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(initial_inventory, event_sender));
         let (operation_sender, _operation_receiver) = mpsc::channel(10);
 
@@ -2898,7 +2901,7 @@ mod tests {
             )
             .unwrap();
 
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(initial_inventory, event_sender));
         let (operation_sender, mut receiver) = mpsc::channel(10);
 
@@ -3026,7 +3029,7 @@ mod tests {
             )
             .unwrap();
 
-        let (event_sender, _) = broadcast::channel::<ServerMessage>(16);
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(initial_inventory, event_sender));
         let (operation_sender, receiver) = mpsc::channel(10);
 

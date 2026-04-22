@@ -1,6 +1,6 @@
 <script lang="ts">
   import { Badge } from '$lib/components/ui/badge'
-  import type { ConnectionState } from '$lib/websocket.svelte'
+  import type { ConnectionState } from '$lib/websocket'
 
   type Props = {
     connectionStatus: ConnectionState

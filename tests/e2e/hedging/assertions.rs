@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, B256};
 pub(crate) use alloy::providers::Provider;
 use rain_math_float::Float;
 use sqlx::SqlitePool;
@@ -147,16 +147,18 @@ async fn assert_onchain_vaults<P: Provider>(
     owner: Address,
     take_result: &TakeOrderResult,
 ) -> anyhow::Result<()> {
+    let fmt = |raw: B256| -> String {
+        Float::from_raw(raw)
+            .format_with_scientific(false)
+            .unwrap_or_else(|_| format!("{raw}"))
+    };
+
     let orderbook = IOrderBookV6::IOrderBookV6Instance::new(orderbook, provider);
 
     let output_balance_now = orderbook
         .vaultBalance2(owner, take_result.output_token, take_result.output_vault_id)
         .call()
         .await?;
-    assert_eq!(
-        output_balance_now, take_result.output_vault_balance_after_take,
-        "Output vault current balance should match recorded post-take balance"
-    );
 
     let output_decimals = vault_token_decimals(take_result.output_token);
     let output_before_units = Float::from_raw(take_result.output_vault_balance_before_take)
@@ -174,39 +176,53 @@ async fn assert_onchain_vaults<P: Provider>(
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "Output vault should not increase across take (before={}, after={})",
-                Float::from_raw(take_result.output_vault_balance_before_take)
-                    .format_with_scientific(false)
-                    .unwrap_or_else(|_| "???".to_string()),
-                Float::from_raw(take_result.output_vault_balance_after_take)
-                    .format_with_scientific(false)
-                    .unwrap_or_else(|_| "???".to_string())
+                fmt(take_result.output_vault_balance_before_take),
+                fmt(take_result.output_vault_balance_after_take),
             )
         })?;
+
     assert_eq!(
         output_delta_units, expected_output_delta_units,
-        "Output vault delta should match TakeOrderV3 fill amount"
-    );
-    assert_eq!(
-        output_after_units,
-        U256::ZERO,
-        "Output vault should be fully consumed"
-    );
-    assert_eq!(
-        output_balance_now,
-        B256::ZERO,
-        "Output vault should be fully consumed, got {}",
-        Float::from_raw(output_balance_now)
-            .format_with_scientific(false)
-            .unwrap_or_else(|_| "???".to_string())
+        "Output vault delta should match TakeOrderV3 fill amount \
+         (delta={output_delta_units}, expected={expected_output_delta_units})",
     );
 
+    // Dedicated vault (entire balance was the order's deposit): should be
+    // fully consumed. Shared vault (pre-existing balance): only the delta
+    // matters, verified above.
+    let was_dedicated_vault = output_before_units == expected_output_delta_units;
+    if was_dedicated_vault {
+        assert_eq!(
+            output_balance_now,
+            B256::ZERO,
+            "Dedicated output vault should be fully consumed, got {}",
+            fmt(output_balance_now),
+        );
+    } else {
+        assert!(
+            output_balance_now <= take_result.output_vault_balance_before_take,
+            "Shared output vault balance should not exceed pre-take value \
+             (now={}, before={})",
+            fmt(output_balance_now),
+            fmt(take_result.output_vault_balance_before_take),
+        );
+    }
+
+    // Input vault may have been modified by concurrent operations (e.g. USDC
+    // rebalancer withdrawing from a shared vault). Verify the balance hasn't
+    // grown beyond the recorded post-take value — concurrent withdrawals are
+    // expected, concurrent deposits are not.
     let input_balance_now = orderbook
         .vaultBalance2(owner, take_result.input_token, take_result.input_vault_id)
         .call()
         .await?;
-    assert_eq!(
-        input_balance_now, take_result.input_vault_balance_after_take,
-        "Input vault current balance should match recorded post-take balance"
+
+    assert!(
+        input_balance_now <= take_result.input_vault_balance_after_take,
+        "Input vault balance should not exceed recorded post-take value \
+         (now={}, recorded={}). Unexpected deposit into vault?",
+        fmt(input_balance_now),
+        fmt(take_result.input_vault_balance_after_take),
     );
 
     let input_decimals = vault_token_decimals(take_result.input_token);
@@ -224,14 +240,11 @@ async fn assert_onchain_vaults<P: Provider>(
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "Input vault should not decrease across take (before={}, after={})",
-                Float::from_raw(take_result.input_vault_balance_before_take)
-                    .format_with_scientific(false)
-                    .unwrap_or_else(|_| "???".to_string()),
-                Float::from_raw(take_result.input_vault_balance_after_take)
-                    .format_with_scientific(false)
-                    .unwrap_or_else(|_| "???".to_string())
+                fmt(take_result.input_vault_balance_before_take),
+                fmt(take_result.input_vault_balance_after_take),
             )
         })?;
+
     assert_eq!(
         input_delta_units, expected_input_delta_units,
         "Input vault delta should match TakeOrderV3 fill amount"

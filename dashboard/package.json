@@ -16,7 +16,7 @@
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "e2e": "bun run dev & DEV_PID=$!; sleep 2; open http://localhost:5173; cargo nextest run --test e2e full_system --nocapture; kill $DEV_PID 2>/dev/null"
+    "simulate": "bun run dev & DEV_PID=$!; trap 'STATUS=$?; kill $DEV_PID 2>/dev/null || true; exit $STATUS' EXIT; sleep 2; open http://localhost:5173; cargo nextest run --test e2e -E 'test(=full_system::simulate)' --run-ignored ignored-only --no-capture"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",

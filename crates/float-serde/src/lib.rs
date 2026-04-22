@@ -15,6 +15,32 @@ pub fn format_float_with_fallback(value: &Float) -> String {
         .unwrap_or_else(|_| format!("{value:?}"))
 }
 
+/// Wrapper for formatting a `Float` as decimal in `Debug` output.
+///
+/// Use in manual `Debug` impls to avoid hex representation:
+/// ```ignore
+/// .field("price", &DebugFloat(&self.price))
+/// ```
+pub struct DebugFloat<'a>(pub &'a Float);
+
+impl std::fmt::Debug for DebugFloat<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", format_float_with_fallback(self.0))
+    }
+}
+
+/// Wrapper for formatting an `Option<Float>` as decimal in `Debug` output.
+pub struct DebugOptionFloat<'a>(pub &'a Option<Float>);
+
+impl std::fmt::Debug for DebugOptionFloat<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(value) => write!(f, "Some({})", format_float_with_fallback(value)),
+            None => write!(f, "None"),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum FloatSerdeInput {
@@ -266,5 +292,26 @@ mod tests {
         let parsed: WithOptionalSerdeModule =
             serde_json::from_value(json!({"value": null})).unwrap();
         assert!(parsed.value.is_none());
+    }
+
+    #[test]
+    fn debug_float_formats_as_decimal() {
+        let value = Float::parse("12.5".to_string()).unwrap();
+        let output = format!("{:?}", DebugFloat(&value));
+        assert_eq!(output, "12.5");
+    }
+
+    #[test]
+    fn debug_option_float_formats_some_as_decimal() {
+        let value = Some(Float::parse("42".to_string()).unwrap());
+        let output = format!("{:?}", DebugOptionFloat(&value));
+        assert_eq!(output, "Some(42)");
+    }
+
+    #[test]
+    fn debug_option_float_formats_none() {
+        let value: Option<Float> = None;
+        let output = format!("{:?}", DebugOptionFloat(&value));
+        assert_eq!(output, "None");
     }
 }
