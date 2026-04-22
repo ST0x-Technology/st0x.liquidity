@@ -6892,6 +6892,7 @@ dependencies = [
 name = "st0x-float-serde"
 version = "0.1.0"
 dependencies = [
+ "alloy",
  "rain-math-float",
  "serde",
  "serde_json",
