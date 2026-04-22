@@ -337,6 +337,11 @@ pub struct EquityPosition {
 pub struct Inventory {
     pub positions: Vec<EquityPosition>,
     pub usd_balance_cents: i64,
+    /// Margin-safe buying power reported by the broker (`non_marginable_buying_power`
+    /// capped at cash balance). This is the same value used for counter-trade
+    /// preflight checks. Display-only; `None` when the broker omits the field
+    /// or the value cannot be converted.
+    pub margin_safe_buying_power_cents: Option<i64>,
 }
 
 /// Result of fetching inventory from an executor.

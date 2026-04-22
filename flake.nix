@@ -112,6 +112,7 @@
           st0x-dto = st0xRust.dto;
           st0x-liquidity = st0xRust.package;
           st0x-cli = st0xRust.cli;
+          decode-floats = st0xRust.decodeFloats;
 
           st0x-dashboard = pkgs.callPackage ./dashboard {
             bun2nix = bun2nix.packages.${system}.default;

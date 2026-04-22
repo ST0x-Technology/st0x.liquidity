@@ -1112,7 +1112,8 @@ impl RebalancingTrigger {
             | BaseWalletUsdc { .. }
             | AlpacaWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
-            | BaseWalletWrappedEquity { .. } => Ok(inventory.clone()),
+            | BaseWalletWrappedEquity { .. }
+            | OffchainMarginSafeBuyingPower { .. } => Ok(inventory.clone()),
 
             InflightEquity { .. } => {
                 if let Some((mints, redemptions)) = &filtered_inflight {
@@ -1245,7 +1246,8 @@ impl RebalancingTrigger {
             | BaseWalletUsdc { .. }
             | AlpacaWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
-            | BaseWalletWrappedEquity { .. } => Ok(inventory.clone()),
+            | BaseWalletWrappedEquity { .. }
+            | OffchainMarginSafeBuyingPower { .. } => Ok(inventory.clone()),
 
             // Recovery for inflight snapshots: forward the original fetched_at
             // so is_stale_for_symbol still rejects pre-rebalancing polls.
@@ -1294,6 +1296,9 @@ impl RebalancingTrigger {
             | AlpacaWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
             | BaseWalletWrappedEquity { .. }
+            // Buying power is display-only and doesn't feed venue balances,
+            // so it never drives a rebalance.
+            | OffchainMarginSafeBuyingPower { .. }
             // Inflight snapshots don't trigger rebalancing -- they indicate
             // transfers already in progress, not new balances to rebalance.
             | InflightEquity { .. } => {}
