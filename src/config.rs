@@ -143,6 +143,7 @@ struct Config {
     order_polling_max_jitter: Option<u64>,
     position_check_interval: Option<u64>,
     inventory_poll_interval: Option<u64>,
+    apalis_finished_job_cleanup_interval_secs: u64,
     #[serde(rename = "hyperdx")]
     telemetry: Option<TelemetryConfig>,
     rebalancing: Option<RebalancingConfig>,
@@ -268,6 +269,7 @@ pub struct Ctx {
     pub(crate) order_polling_max_jitter: u64,
     pub(crate) position_check_interval: u64,
     pub(crate) inventory_poll_interval: u64,
+    pub(crate) apalis_finished_job_cleanup_interval_secs: u64,
     pub(crate) broker: BrokerCtx,
     pub telemetry: Option<TelemetryCtx>,
     pub trading_mode: TradingMode,
@@ -348,6 +350,10 @@ impl std::fmt::Debug for Ctx {
             .field("order_polling_max_jitter", &self.order_polling_max_jitter)
             .field("position_check_interval", &self.position_check_interval)
             .field("inventory_poll_interval", &self.inventory_poll_interval)
+            .field(
+                "apalis_finished_job_cleanup_interval_secs",
+                &self.apalis_finished_job_cleanup_interval_secs,
+            )
             .field("broker", &self.broker)
             .field("telemetry", &self.telemetry)
             .field("trading_mode", &self.trading_mode)
@@ -404,6 +410,7 @@ struct ValidatedParts {
     order_polling_max_jitter: u64,
     position_check_interval: u64,
     inventory_poll_interval: u64,
+    apalis_finished_job_cleanup_interval_secs: u64,
     broker: BrokerCtx,
     telemetry: Option<TelemetryCtx>,
     execution_threshold: ExecutionThreshold,
@@ -563,6 +570,14 @@ fn parse_and_validate(
         });
     }
 
+    let apalis_finished_job_cleanup_interval_secs =
+        config.apalis_finished_job_cleanup_interval_secs;
+    if apalis_finished_job_cleanup_interval_secs == 0 {
+        return Err(CtxError::ZeroPollingInterval {
+            field: "apalis_finished_job_cleanup_interval_secs",
+        });
+    }
+
     let travel_rule = config
         .broker
         .as_ref()
@@ -592,6 +607,7 @@ fn parse_and_validate(
         order_polling_max_jitter: config.order_polling_max_jitter.unwrap_or(5),
         position_check_interval,
         inventory_poll_interval,
+        apalis_finished_job_cleanup_interval_secs,
         broker,
         telemetry,
         execution_threshold,
@@ -643,6 +659,8 @@ impl Ctx {
             order_polling_max_jitter: parts.order_polling_max_jitter,
             position_check_interval: parts.position_check_interval,
             inventory_poll_interval: parts.inventory_poll_interval,
+            apalis_finished_job_cleanup_interval_secs: parts
+                .apalis_finished_job_cleanup_interval_secs,
             broker: parts.broker,
             telemetry: parts.telemetry,
             trading_mode: parts.trading_mode,
@@ -671,7 +689,6 @@ impl Ctx {
                 path: secrets_path.to_path_buf(),
                 source,
             })?;
-
         parse_and_validate(&config_str, config_path, &secrets_str, secrets_path)?;
         Ok(())
     }
@@ -761,6 +778,7 @@ impl Ctx {
         wallet: Option<crate::wallet::OnchainWalletCtx>,
         assets: AssetsConfig,
         #[builder(default = 2)] inventory_poll_interval: u64,
+        #[builder(default = 3600)] apalis_finished_job_cleanup_interval_secs: u64,
         #[builder(default = 0)] server_port: u16,
         execution_threshold_override: Option<ExecutionThreshold>,
         travel_rule: Option<TravelRuleConfig>,
@@ -787,6 +805,7 @@ impl Ctx {
             order_polling_max_jitter: 0,
             position_check_interval: 2,
             inventory_poll_interval,
+            apalis_finished_job_cleanup_interval_secs,
             broker,
             telemetry: None,
             trading_mode,
@@ -958,11 +977,11 @@ pub(crate) mod tests {
     use tempfile::NamedTempFile;
 
     use st0x_execution::{MockExecutor, MockExecutorCtx, TryIntoExecutor};
+    use st0x_float_macro::float;
 
     use super::*;
     use crate::onchain::EvmCtx;
     use crate::threshold::ExecutionThreshold;
-    use st0x_float_macro::float;
 
     fn toml_file(content: &str) -> NamedTempFile {
         let mut file = NamedTempFile::new().unwrap();
@@ -984,6 +1003,7 @@ pub(crate) mod tests {
             order_polling_max_jitter: 5,
             position_check_interval: 60,
             inventory_poll_interval: 60,
+            apalis_finished_job_cleanup_interval_secs: 3600,
             broker: BrokerCtx::DryRun,
             telemetry: None,
             trading_mode: TradingMode::Standalone { order_owner },
@@ -1002,6 +1022,7 @@ pub(crate) mod tests {
         file.write_all(
             br#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
 
@@ -1020,6 +1041,7 @@ pub(crate) mod tests {
         file.write_all(
             br#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
 
@@ -1039,6 +1061,7 @@ pub(crate) mod tests {
         toml_file(
             r#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
 
@@ -1060,6 +1083,7 @@ pub(crate) mod tests {
         toml_file(
             r#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
 
@@ -1171,6 +1195,7 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
 
@@ -1207,6 +1232,7 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
 
@@ -1244,6 +1270,7 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
 
@@ -1278,6 +1305,7 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
 
@@ -1333,6 +1361,69 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn apalis_finished_job_cleanup_interval_is_required() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            deployment_block = 1
+        "#,
+        );
+        let secrets = dry_run_secrets_toml();
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::ConfigToml { .. }),
+            "expected config parse failure for missing cleanup interval, got: {error:#}"
+        );
+
+        let source = std::error::Error::source(&error).unwrap();
+        let source_display = source.to_string();
+        assert!(
+            source_display.contains("apalis_finished_job_cleanup_interval_secs"),
+            "expected parse error to mention cleanup interval field, got: {source_display}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apalis_finished_job_cleanup_interval_must_be_non_zero() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 0
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            deployment_block = 1
+        "#,
+        );
+        let secrets = dry_run_secrets_toml();
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::ZeroPollingInterval {
+                    field: "apalis_finished_job_cleanup_interval_secs"
+                }
+            ),
+            "expected ZeroPollingInterval for cleanup interval, got: {error:#}"
+        );
+    }
+
+    #[tokio::test]
     async fn rebalancing_with_low_cash_operational_limit_fails() {
         let secrets = toml_file(
             r#"
@@ -1356,6 +1447,7 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
 
@@ -1407,6 +1499,7 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
             log_level = "warn"
             server_port = 9090
             order_polling_interval = 30
@@ -1458,6 +1551,7 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
 
@@ -1540,6 +1634,7 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities.EXAMPLE]
             tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -1611,6 +1706,7 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
 
@@ -1650,6 +1746,7 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
 
@@ -1709,6 +1806,7 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
 
@@ -1759,6 +1857,7 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
 
@@ -1813,6 +1912,7 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
 
@@ -1858,6 +1958,7 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
 
@@ -1950,6 +2051,7 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
 
@@ -2075,6 +2177,7 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
 
@@ -2256,6 +2359,7 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
             bogus_field = "should fail"
 
             [raindex]
@@ -2280,6 +2384,7 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets]
             bogus_field = "should fail"
@@ -2308,6 +2413,7 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities.AAPL]
             tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -2338,6 +2444,7 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.cash]
             rebalancing = "disabled"
@@ -2421,6 +2528,7 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
             bogus_field = "should fail"
 
             [raindex]
@@ -3157,6 +3265,7 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
 
@@ -3201,6 +3310,7 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
 
@@ -3276,6 +3386,7 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
 
@@ -3336,6 +3447,7 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
 
@@ -3368,6 +3480,7 @@ pub(crate) mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
             position_check_interval = 0
 
             [assets.equities]

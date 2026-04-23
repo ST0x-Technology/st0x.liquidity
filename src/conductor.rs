@@ -17,7 +17,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use task_supervisor::SupervisorHandle;
 use tokio::sync::{Mutex, broadcast, mpsc};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
+use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};
 
 use st0x_dto::Statement;
@@ -30,6 +31,7 @@ use st0x_execution::{
 
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::bindings::IOrderBookV6::{self, IOrderBookV6Instance};
+use crate::conductor::job::cleanup_finished_jobs;
 use crate::config::{AssetsConfig, BrokerCtx, Ctx, CtxError};
 use crate::dashboard::Broadcaster;
 use crate::equity_redemption::symbols_with_stuck_redemptions;
@@ -107,6 +109,8 @@ pub(crate) struct Conductor {
     /// Polls wallet balances and onchain state on a timer. Absent when
     /// rebalancing (and therefore wallet context) is not configured.
     inventory_poller: Option<JoinHandle<()>>,
+    /// Periodically removes terminal rows from the persistent job queue.
+    job_cleanup: JoinHandle<()>,
 }
 
 fn base_wallet_unwrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Address> {
@@ -185,6 +189,7 @@ impl Conductor {
         backfill_events(
             &provider,
             &ctx.evm,
+            &pool,
             cutoff_block,
             get_backfill_retry_strat(),
             job_queue.clone(),
@@ -286,6 +291,10 @@ impl Conductor {
         };
 
         let hedge_queue = crate::conductor::job::JobQueue::new(&pool);
+        let job_cleanup = spawn_finished_job_cleanup(
+            pool.clone(),
+            Duration::from_secs(ctx.apalis_finished_job_cleanup_interval_secs),
+        );
 
         let conductor_ctx = builder::ConductorCtx {
             ctx: ctx.clone(),
@@ -307,6 +316,7 @@ impl Conductor {
             .dex_streams(dex_streams)
             .maybe_executor_maintenance(executor_maintenance)
             .maybe_rebalancer(rebalancer)
+            .job_cleanup(job_cleanup)
             .call();
 
         info!("Conductor running");
@@ -318,22 +328,13 @@ impl Conductor {
 
 impl Conductor {
     pub(crate) async fn wait_for_completion(&mut self) -> anyhow::Result<()> {
-        tokio::select! {
-            result = self.supervisor.wait() => {
-                result?;
-                info!("Supervisor exited");
-            }
-            result = &mut self.monitor => {
-                if let Err(join_error) = result
-                    && !join_error.is_cancelled()
-                {
-                    return Err(anyhow::anyhow!("Apalis monitor failed: {join_error}"));
-                }
-                info!("Apalis monitor exited");
-            }
-        }
+        let exit = tokio::select! {
+            result = self.supervisor.wait() => ConductorExit::Supervisor(result.map_err(anyhow::Error::new)),
+            result = &mut self.monitor => ConductorExit::Monitor(result),
+            result = &mut self.job_cleanup => ConductorExit::JobCleanup(result),
+        };
 
-        Ok(())
+        handle_conductor_exit(exit)
     }
 
     pub(crate) fn abort_all(&self) {
@@ -352,7 +353,73 @@ impl Conductor {
         if let Some(ref handle) = self.executor_maintenance {
             handle.abort();
         }
+        self.job_cleanup.abort();
     }
+}
+
+enum ConductorExit {
+    Supervisor(anyhow::Result<()>),
+    Monitor(Result<(), JoinError>),
+    JobCleanup(Result<(), JoinError>),
+}
+
+fn handle_conductor_exit(exit: ConductorExit) -> anyhow::Result<()> {
+    match exit {
+        ConductorExit::Supervisor(result) => {
+            result?;
+            info!("Supervisor exited");
+        }
+        ConductorExit::Monitor(result) => {
+            handle_task_exit(result, "Apalis monitor")?;
+            info!("Apalis monitor exited");
+        }
+        ConductorExit::JobCleanup(result) => {
+            handle_required_background_task_exit(result, "Job cleanup")?;
+            info!("Job cleanup exited");
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_task_exit(result: Result<(), JoinError>, task: &'static str) -> anyhow::Result<()> {
+    if let Err(join_error) = result
+        && !join_error.is_cancelled()
+    {
+        return Err(anyhow::Error::new(join_error).context(format!("{task} failed")));
+    }
+
+    Ok(())
+}
+
+fn handle_required_background_task_exit(
+    result: Result<(), JoinError>,
+    task: &'static str,
+) -> anyhow::Result<()> {
+    match result {
+        Ok(()) => Err(anyhow::anyhow!("{task} exited unexpectedly")),
+        Err(join_error) => handle_task_exit(Err(join_error), task),
+    }
+}
+
+fn spawn_finished_job_cleanup(pool: SqlitePool, cleanup_interval: Duration) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(cleanup_interval);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        loop {
+            interval.tick().await;
+
+            match cleanup_finished_jobs(&pool).await {
+                Ok(deleted) => {
+                    debug!(deleted, "Cleaned up finished job queue rows");
+                }
+                Err(error) => {
+                    error!(%error, "Failed to clean up finished job queue rows");
+                }
+            }
+        }
+    })
 }
 
 struct RebalancingInfrastructure {
@@ -1464,10 +1531,14 @@ mod tests {
     use alloy::primitives::{Address, B256, TxHash, U256, address, bytes, fixed_bytes};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
+    use apalis::prelude::Status;
     use rain_math_float::Float;
+    use sqlx::SqlitePool;
     use std::collections::HashSet;
+    use std::future::pending;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use task_supervisor::SupervisorBuilder;
     use tokio::sync::broadcast;
 
     use st0x_dto::Statement;
@@ -1477,6 +1548,7 @@ mod tests {
         MockExecutor, Positive, Symbol,
     };
     use st0x_finance::{Usd, Usdc};
+    use st0x_float_macro::float;
 
     use super::*;
     use crate::bindings::IOrderBookV6::{
@@ -1495,10 +1567,113 @@ mod tests {
     use crate::trading::onchain::inclusion::EmittedOnChain;
     use crate::wrapper::mock::MockWrapper;
     use crate::wrapper::{RATIO_ONE, UnderlyingPerWrapped};
-    use st0x_float_macro::float;
 
     fn one_to_one_ratio() -> UnderlyingPerWrapped {
         UnderlyingPerWrapped::new(RATIO_ONE).unwrap()
+    }
+
+    fn conductor_with_job_cleanup(job_cleanup: JoinHandle<()>) -> Conductor {
+        let supervisor = SupervisorBuilder::default().build().run();
+        let monitor = tokio::spawn(pending::<()>());
+
+        Conductor {
+            supervisor,
+            monitor,
+            executor_maintenance: None,
+            rebalancer: None,
+            inventory_poller: None,
+            job_cleanup,
+        }
+    }
+
+    async fn insert_finished_job(pool: &SqlitePool, id: &str) {
+        sqlx::query(
+            "INSERT INTO Jobs \
+             (job, id, job_type, status, attempts, max_attempts, run_at, priority) \
+             VALUES (?, ?, 'test', ?, 1, 25, 0, 0)",
+        )
+        .bind(vec![0_u8])
+        .bind(id)
+        .bind(Status::Done.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn job_count(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM Jobs")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn wait_for_job_count(pool: &SqlitePool, expected_count: i64) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let count = job_count(pool).await;
+                if count == expected_count {
+                    return;
+                }
+
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_for_completion_reports_unexpected_job_cleanup_exit() {
+        let job_cleanup = tokio::spawn(async {});
+        let mut conductor = conductor_with_job_cleanup(job_cleanup);
+
+        let error = conductor.wait_for_completion().await.unwrap_err();
+        conductor.abort_all();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Job cleanup exited unexpectedly"),
+            "expected unexpected job cleanup exit, got: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_completion_reports_job_cleanup_failure() {
+        let job_cleanup = tokio::spawn(async {
+            panic!("job cleanup failure for test");
+        });
+        let mut conductor = conductor_with_job_cleanup(job_cleanup);
+
+        let error = conductor.wait_for_completion().await.unwrap_err();
+        conductor.abort_all();
+
+        assert!(
+            error.to_string().contains("Job cleanup failed"),
+            "expected job cleanup failure context, got: {error:#}"
+        );
+        assert!(
+            error.source().is_some(),
+            "expected preserved JoinError source"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_finished_job_cleanup_runs_until_aborted() {
+        let pool = setup_test_db().await;
+        setup_apalis_tables(&pool).await.unwrap();
+        insert_finished_job(&pool, "done").await;
+
+        let handle = spawn_finished_job_cleanup(pool.clone(), Duration::from_secs(60));
+
+        wait_for_job_count(&pool, 0).await;
+        handle.abort();
+        let join_error = handle.await.unwrap_err();
+
+        assert!(
+            join_error.is_cancelled(),
+            "expected cleanup task to be cancelled, got: {join_error}"
+        );
     }
 
     #[test]

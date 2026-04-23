@@ -170,6 +170,23 @@ historical events are processed before live events. The WebSocket subscription
 is established early, so no events are missed -- they buffer until the runtime
 starts.
 
+Historical backfill resumes from a persisted database checkpoint. The configured
+`deployment_block` is only the initial seed for the first startup or for an
+empty checkpoint; after a successful backfill, the service records the last
+processed block and the next startup begins at the following block. The
+checkpoint is updated only after the full backfill range succeeds, so a partial
+failure cannot skip unprocessed history.
+
+Completed apalis jobs are operational queue records, not audit history. The
+runtime periodically deletes terminal job rows and vacuums SQLite at the
+configured `apalis_finished_job_cleanup_interval_secs` cadence so the durable
+queue cannot grow without bound during normal operation or repeated restarts.
+The cadence must be explicitly configured and non-zero.
+
+Deployed systemd services must use bounded restart loops with a restart delay
+long enough to avoid runaway RPC consumption. After the restart limit is hit,
+the service stays stopped until an operator investigates.
+
 ##### Future: Lifecycle Workflows
 
 Business processes with multiple steps will be modeled as durable workflows via
@@ -2103,9 +2120,10 @@ sequenceDiagram
     end
 ```
 
-On startup, backfill pushes historical events as `AccountForDexTrade` jobs into
-the same queue. The worker starts after backfill completes, processing
-historical events before live events in FIFO order.
+On startup, backfill pushes historical events after the persisted backfill
+checkpoint as `AccountForDexTrade` jobs into the same queue. The worker starts
+after backfill completes, so historical jobs are enqueued before live events are
+processed. Successful backfill advances the checkpoint to the cutoff block.
 
 **Target Flow** (lifecycle workflows, future):
 

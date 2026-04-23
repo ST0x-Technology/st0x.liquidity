@@ -78,7 +78,9 @@ code, a regular shell is fine.
 
 The application uses TOML configuration files split into plaintext config and
 encrypted secrets. See `example.config.toml` and `example.secrets.toml` for all
-available options.
+available options. Operational intervals such as
+`apalis_finished_job_cleanup_interval_secs` must be explicitly configured and
+non-zero.
 
 Current broker support is limited to `alpaca-broker-api` and `dry-run`.
 

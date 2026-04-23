@@ -1,6 +1,7 @@
 server_port = 8080
 log_level = "debug"
 database_url = ":memory:"
+apalis_finished_job_cleanup_interval_secs = 3600
 hyperdx.service_name = "st0x-hedge"
 
 # Travel Rule info for Alpaca whitelist creation (required since 2026-03-27).

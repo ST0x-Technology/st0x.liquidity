@@ -64,6 +64,7 @@ pub(crate) fn spawn<Prov, Exec>(
     job_queue: DexTradeAccountingJobQueue,
     hedge_queue: HedgeJobQueue,
     dex_streams: DexEventStreams,
+    job_cleanup: JoinHandle<()>,
     executor_maintenance: Option<JoinHandle<()>>,
     rebalancer: Option<JoinHandle<()>>,
 ) -> Conductor
@@ -201,6 +202,7 @@ where
         executor_maintenance,
         rebalancer,
         inventory_poller,
+        job_cleanup,
     }
 }
 

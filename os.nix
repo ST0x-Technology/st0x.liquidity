@@ -30,6 +30,8 @@ let
 
     unitConfig = {
       "X-OnlyManualStart" = true;
+      StartLimitBurst = 10;
+      StartLimitIntervalSec = 300;
 
       # Marker file created ONLY by service profile activation.
       # Guarantees service is SKIPPED (not failed) during system activation.
@@ -47,7 +49,7 @@ let
         cfg.decryptedSecretPath
       ];
       Restart = "always";
-      RestartSec = 5;
+      RestartSec = 30;
     };
   };
 

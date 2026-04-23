@@ -1,6 +1,7 @@
 server_port = 8001
 log_level = "info"
 database_url = ":memory:"
+apalis_finished_job_cleanup_interval_secs = 3600
 hyperdx.service_name = "st0x-hedge-e2e"
 
 [assets.equities.EXAMPLE]

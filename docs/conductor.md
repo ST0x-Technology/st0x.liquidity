@@ -170,13 +170,23 @@ executor, CQRS frameworks, execution threshold, wallet polling config).
 ```
 Phase 1 (parallel):  connect_ws | setup_cqrs | setup_apalis_tables
 Phase 2 (parallel):  get_cutoff_block | seed_vaults | setup_rebalancing
-Phase 3 (sequential): backfill historical events to job queue
+Phase 3 (sequential): backfill checkpoint gap to job queue
 Phase 4:              builder::spawn() starts the runtime
 ```
 
 The trade accounting worker starts only after backfill completes. The WS
 subscription is established in phase 1, so no events are missed -- they buffer
 until the monitor starts.
+
+Backfill reads the last successful checkpoint from SQLite. The configured
+`deployment_block` seeds only the first run; subsequent runs start at
+`checkpoint + 1`. The checkpoint advances only after the full requested range
+has been enqueued successfully.
+
+The conductor also runs periodic cleanup for terminal apalis jobs at the
+configured `apalis_finished_job_cleanup_interval_secs` cadence. Those rows are
+queue bookkeeping, while trade history lives in CQRS events and projections. The
+cadence is required config and must be non-zero.
 
 ## Error handling in jobs
 

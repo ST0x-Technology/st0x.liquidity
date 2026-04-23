@@ -5,7 +5,7 @@
 //! `SqliteStorage`; the generic [`work`] handler deserializes
 //! it and calls [`Job::perform`] with the shared context.
 
-use apalis::prelude::{Data, TaskSink};
+use apalis::prelude::{Data, Status, TaskSink};
 use apalis_sqlite::SqliteStorage;
 use backon::{ExponentialBuilder, Retryable};
 use serde::Serialize;
@@ -112,5 +112,107 @@ where
 
     if let Err(error) = result {
         error!(%label, %error, "Job failed after retries");
+    }
+}
+
+pub(crate) async fn cleanup_finished_jobs(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
+    let deleted = sqlx::query(
+        "DELETE FROM Jobs \
+         WHERE status = ? \
+         OR status = ? \
+         OR (status = ? AND max_attempts <= attempts)",
+    )
+    .bind(Status::Done.to_string())
+    .bind(Status::Killed.to_string())
+    .bind(Status::Failed.to_string())
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    Ok(deleted)
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlx::SqlitePool;
+
+    use super::*;
+    use crate::conductor::setup_apalis_tables;
+    use crate::test_utils::setup_test_db;
+
+    async fn insert_job(
+        pool: &SqlitePool,
+        id: &str,
+        status: Status,
+        attempts: i64,
+        max_attempts: i64,
+    ) {
+        sqlx::query(
+            "INSERT INTO Jobs \
+             (job, id, job_type, status, attempts, max_attempts, run_at, priority) \
+             VALUES (?, ?, 'test', ?, ?, ?, 0, 0)",
+        )
+        .bind(vec![0_u8])
+        .bind(id)
+        .bind(status.to_string())
+        .bind(attempts)
+        .bind(max_attempts)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn job_ids(pool: &SqlitePool) -> Vec<String> {
+        sqlx::query_scalar::<_, String>("SELECT id FROM Jobs ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cleanup_finished_jobs_deletes_terminal_rows() {
+        let pool = setup_test_db().await;
+        setup_apalis_tables(&pool).await.unwrap();
+
+        insert_job(&pool, "done", Status::Done, 1, 25).await;
+        insert_job(&pool, "killed", Status::Killed, 1, 25).await;
+        insert_job(&pool, "failed-terminal", Status::Failed, 25, 25).await;
+        insert_job(&pool, "failed-retryable", Status::Failed, 3, 25).await;
+        insert_job(&pool, "pending", Status::Pending, 0, 25).await;
+        insert_job(&pool, "running", Status::Running, 1, 25).await;
+
+        let deleted = cleanup_finished_jobs(&pool).await.unwrap();
+
+        assert_eq!(deleted, 3);
+        assert_eq!(
+            job_ids(&pool).await,
+            vec![
+                "failed-retryable".to_string(),
+                "pending".to_string(),
+                "running".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_finished_jobs_keeps_non_terminal_rows() {
+        let pool = setup_test_db().await;
+        setup_apalis_tables(&pool).await.unwrap();
+
+        insert_job(&pool, "failed-retryable", Status::Failed, 3, 25).await;
+        insert_job(&pool, "pending", Status::Pending, 0, 25).await;
+        insert_job(&pool, "running", Status::Running, 1, 25).await;
+
+        let deleted = cleanup_finished_jobs(&pool).await.unwrap();
+
+        assert_eq!(deleted, 0);
+        assert_eq!(
+            job_ids(&pool).await,
+            vec![
+                "failed-retryable".to_string(),
+                "pending".to_string(),
+                "running".to_string()
+            ]
+        );
     }
 }

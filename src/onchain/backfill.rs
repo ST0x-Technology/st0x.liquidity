@@ -2,10 +2,8 @@
 //!
 //! Scans past blocks for `ClearV3` and `TakeOrderV3` events and pushes them
 //! into the apalis job queue for processing, ensuring no trades are missed
-//! after downtime.
-//!
-//! Always backfills from `deployment_block` — the CQRS pipeline rejects
-//! duplicate fills via aggregate idempotency, so re-pushing is safe.
+//! after downtime. A persisted checkpoint records the last block that was
+//! fully enqueued.
 
 use alloy::providers::Provider;
 use alloy::rpc::types::Filter;
@@ -13,6 +11,7 @@ use alloy::sol_types::SolEvent;
 use backon::{BackoffBuilder, ExponentialBuilder, Retryable};
 use futures_util::future;
 use itertools::Itertools;
+use sqlx::SqlitePool;
 use std::time::Duration;
 use tracing::{debug, info, trace, warn};
 
@@ -36,24 +35,27 @@ pub(crate) fn get_backfill_retry_strat() -> ExponentialBuilder {
 }
 
 #[tracing::instrument(
-    skip(provider, evm_ctx, retry_strategy, job_queue),
+    skip(provider, evm_ctx, pool, retry_strategy, job_queue),
     fields(end_block),
     level = tracing::Level::INFO,
 )]
 pub(crate) async fn backfill_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
     provider: &P,
     evm_ctx: &EvmCtx,
+    pool: &SqlitePool,
     end_block: u64,
     retry_strategy: B,
     job_queue: DexTradeAccountingJobQueue,
 ) -> Result<(), OnChainError> {
-    let start_block = evm_ctx.deployment_block;
+    let start_block = backfill_start_block(pool, evm_ctx).await?;
 
     if start_block > end_block {
         info!(
             "Already caught up to block {}, skipping backfill",
             end_block
         );
+
+        save_backfill_checkpoint(pool, evm_ctx, end_block).await?;
         return Ok(());
     }
 
@@ -89,6 +91,57 @@ pub(crate) async fn backfill_events<P: Provider + Clone, B: BackoffBuilder + Clo
         .sum::<usize>();
 
     info!("Backfill completed: {total_enqueued} events enqueued");
+
+    save_backfill_checkpoint(pool, evm_ctx, end_block).await?;
+
+    Ok(())
+}
+
+async fn backfill_start_block(pool: &SqlitePool, evm_ctx: &EvmCtx) -> Result<u64, OnChainError> {
+    load_backfill_checkpoint(pool, evm_ctx)
+        .await?
+        .map_or(Ok(evm_ctx.deployment_block), |last_processed_block| {
+            Ok((last_processed_block + 1).max(evm_ctx.deployment_block))
+        })
+}
+
+async fn load_backfill_checkpoint(
+    pool: &SqlitePool,
+    evm_ctx: &EvmCtx,
+) -> Result<Option<u64>, OnChainError> {
+    let row = sqlx::query_as::<_, (i64,)>(
+        "SELECT last_processed_block FROM backfill_checkpoints WHERE orderbook = ?",
+    )
+    .bind(evm_ctx.orderbook.to_string())
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(|(last_processed_block,)| u64::try_from(last_processed_block))
+        .transpose()
+        .map_err(OnChainError::IntConversion)
+}
+
+async fn save_backfill_checkpoint(
+    pool: &SqlitePool,
+    evm_ctx: &EvmCtx,
+    last_processed_block: u64,
+) -> Result<(), OnChainError> {
+    let last_processed_block = i64::try_from(last_processed_block)?;
+
+    sqlx::query(
+        "INSERT INTO backfill_checkpoints (orderbook, last_processed_block) \
+         VALUES (?, ?) \
+         ON CONFLICT(orderbook) DO UPDATE SET \
+         last_processed_block = MAX( \
+             excluded.last_processed_block, \
+             backfill_checkpoints.last_processed_block \
+         ), \
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+    )
+    .bind(evm_ctx.orderbook.to_string())
+    .bind(last_processed_block)
+    .execute(pool)
+    .await?;
 
     Ok(())
 }
@@ -241,6 +294,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_backfill_start_block_uses_deployment_block_without_checkpoint() {
+        let pool = setup_test_db().await;
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            orderbook: address!("0x1111111111111111111111111111111111111111"),
+            deployment_block: 50,
+        };
+
+        let start_block = backfill_start_block(&pool, &evm_ctx).await.unwrap();
+
+        assert_eq!(start_block, 50);
+    }
+
+    #[tokio::test]
+    async fn test_backfill_start_block_resumes_after_checkpoint() {
+        let pool = setup_test_db().await;
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            orderbook: address!("0x1111111111111111111111111111111111111111"),
+            deployment_block: 50,
+        };
+
+        save_backfill_checkpoint(&pool, &evm_ctx, 80).await.unwrap();
+
+        let start_block = backfill_start_block(&pool, &evm_ctx).await.unwrap();
+
+        assert_eq!(start_block, 81);
+    }
+
+    #[tokio::test]
+    async fn test_backfill_start_block_respects_deployment_block_floor() {
+        let pool = setup_test_db().await;
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            orderbook: address!("0x1111111111111111111111111111111111111111"),
+            deployment_block: 50,
+        };
+
+        save_backfill_checkpoint(&pool, &evm_ctx, 20).await.unwrap();
+
+        let start_block = backfill_start_block(&pool, &evm_ctx).await.unwrap();
+
+        assert_eq!(start_block, 50);
+    }
+
+    #[tokio::test]
     async fn test_backfill_events_empty_results() {
         let pool = setup_test_db().await;
         let job_queue = setup_job_queue(&pool).await;
@@ -256,11 +355,111 @@ mod tests {
             deployment_block: 1,
         };
 
-        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), job_queue)
+        backfill_events(
+            &provider,
+            &evm_ctx,
+            &pool,
+            100,
+            test_retry_strategy(),
+            job_queue,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(job_count(&pool).await, 0);
+        assert_eq!(
+            load_backfill_checkpoint(&pool, &evm_ctx).await.unwrap(),
+            Some(100)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backfill_events_skips_when_checkpoint_is_caught_up() {
+        let pool = setup_test_db().await;
+        let job_queue = setup_job_queue(&pool).await;
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            orderbook: address!("0x1111111111111111111111111111111111111111"),
+            deployment_block: 1,
+        };
+
+        save_backfill_checkpoint(&pool, &evm_ctx, 100)
             .await
             .unwrap();
 
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        backfill_events(
+            &provider,
+            &evm_ctx,
+            &pool,
+            100,
+            test_retry_strategy(),
+            job_queue,
+        )
+        .await
+        .unwrap();
+
         assert_eq!(job_count(&pool).await, 0);
+        assert_eq!(
+            load_backfill_checkpoint(&pool, &evm_ctx).await.unwrap(),
+            Some(100)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backfill_events_skip_preserves_newer_checkpoint() {
+        let pool = setup_test_db().await;
+        let job_queue = setup_job_queue(&pool).await;
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            orderbook: address!("0x1111111111111111111111111111111111111111"),
+            deployment_block: 1,
+        };
+
+        save_backfill_checkpoint(&pool, &evm_ctx, 100)
+            .await
+            .unwrap();
+
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        backfill_events(
+            &provider,
+            &evm_ctx,
+            &pool,
+            99,
+            test_retry_strategy(),
+            job_queue,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            load_backfill_checkpoint(&pool, &evm_ctx).await.unwrap(),
+            Some(100)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_save_backfill_checkpoint_is_monotonic() {
+        let pool = setup_test_db().await;
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            orderbook: address!("0x1111111111111111111111111111111111111111"),
+            deployment_block: 1,
+        };
+
+        save_backfill_checkpoint(&pool, &evm_ctx, 100)
+            .await
+            .unwrap();
+        save_backfill_checkpoint(&pool, &evm_ctx, 80).await.unwrap();
+
+        assert_eq!(
+            load_backfill_checkpoint(&pool, &evm_ctx).await.unwrap(),
+            Some(100)
+        );
     }
 
     #[test]
@@ -408,9 +607,16 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), job_queue)
-            .await
-            .unwrap();
+        backfill_events(
+            &provider,
+            &evm_ctx,
+            &pool,
+            100,
+            test_retry_strategy(),
+            job_queue,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(job_count(&pool).await, 1);
     }
@@ -466,9 +672,16 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), job_queue)
-            .await
-            .unwrap();
+        backfill_events(
+            &provider,
+            &evm_ctx,
+            &pool,
+            100,
+            test_retry_strategy(),
+            job_queue,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(job_count(&pool).await, 1);
     }
@@ -555,9 +768,16 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), job_queue)
-            .await
-            .unwrap();
+        backfill_events(
+            &provider,
+            &evm_ctx,
+            &pool,
+            100,
+            test_retry_strategy(),
+            job_queue,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(job_count(&pool).await, 2);
     }
@@ -584,10 +804,21 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        let result =
-            backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), job_queue).await;
+        let result = backfill_events(
+            &provider,
+            &evm_ctx,
+            &pool,
+            100,
+            test_retry_strategy(),
+            job_queue,
+        )
+        .await;
 
         assert!(matches!(result.unwrap_err(), OnChainError::RpcTransport(_)));
+        assert_eq!(
+            load_backfill_checkpoint(&pool, &evm_ctx).await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -606,9 +837,16 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), job_queue)
-            .await
-            .unwrap();
+        backfill_events(
+            &provider,
+            &evm_ctx,
+            &pool,
+            100,
+            test_retry_strategy(),
+            job_queue,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(job_count(&pool).await, 0);
     }
@@ -696,9 +934,16 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), job_queue)
-            .await
-            .unwrap();
+        backfill_events(
+            &provider,
+            &evm_ctx,
+            &pool,
+            100,
+            test_retry_strategy(),
+            job_queue,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(job_count(&pool).await, 2);
     }
@@ -725,9 +970,16 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&provider, &evm_ctx, 2500, test_retry_strategy(), job_queue)
-            .await
-            .unwrap();
+        backfill_events(
+            &provider,
+            &evm_ctx,
+            &pool,
+            2500,
+            test_retry_strategy(),
+            job_queue,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(job_count(&pool).await, 0);
     }
@@ -757,6 +1009,7 @@ mod tests {
         backfill_events(
             &provider,
             &evm_ctx,
+            &pool,
             1900,
             get_backfill_retry_strat(),
             job_queue,
@@ -830,6 +1083,7 @@ mod tests {
         backfill_events(
             &provider,
             &evm_ctx,
+            &pool,
             3000,
             get_backfill_retry_strat(),
             job_queue,
@@ -881,9 +1135,16 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), job_queue)
-            .await
-            .unwrap();
+        backfill_events(
+            &provider,
+            &evm_ctx,
+            &pool,
+            100,
+            test_retry_strategy(),
+            job_queue,
+        )
+        .await
+        .unwrap();
 
         // Both events should be enqueued (filtering happens during processing, not backfill)
         assert_eq!(job_count(&pool).await, 2);
@@ -951,9 +1212,16 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), job_queue)
-            .await
-            .unwrap();
+        backfill_events(
+            &provider,
+            &evm_ctx,
+            &pool,
+            100,
+            test_retry_strategy(),
+            job_queue,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(job_count(&pool).await, 2);
     }
@@ -1024,6 +1292,10 @@ mod tests {
         .await;
 
         assert!(matches!(result.unwrap_err(), OnChainError::RpcTransport(_)));
+        assert_eq!(
+            load_backfill_checkpoint(&pool, &evm_ctx).await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -1054,10 +1326,21 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        let result =
-            backfill_events(&provider, &evm_ctx, 25000, test_retry_strategy(), job_queue).await;
+        let result = backfill_events(
+            &provider,
+            &evm_ctx,
+            &pool,
+            25000,
+            test_retry_strategy(),
+            job_queue,
+        )
+        .await;
 
         assert!(matches!(result.unwrap_err(), OnChainError::RpcTransport(_)));
+        assert_eq!(
+            load_backfill_checkpoint(&pool, &evm_ctx).await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -1095,9 +1378,16 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), job_queue)
-            .await
-            .unwrap();
+        backfill_events(
+            &provider,
+            &evm_ctx,
+            &pool,
+            100,
+            test_retry_strategy(),
+            job_queue,
+        )
+        .await
+        .unwrap();
 
         // Corrupted logs are silently ignored during backfill
         assert_eq!(job_count(&pool).await, 0);
@@ -1119,9 +1409,16 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&provider, &evm_ctx, 42, test_retry_strategy(), job_queue)
-            .await
-            .unwrap();
+        backfill_events(
+            &provider,
+            &evm_ctx,
+            &pool,
+            42,
+            test_retry_strategy(),
+            job_queue,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(job_count(&pool).await, 0);
     }
@@ -1297,9 +1594,16 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&provider, &evm_ctx, 3000, test_retry_strategy(), job_queue)
-            .await
-            .unwrap();
+        backfill_events(
+            &provider,
+            &evm_ctx,
+            &pool,
+            3000,
+            test_retry_strategy(),
+            job_queue,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(job_count(&pool).await, 1);
     }
@@ -1357,9 +1661,16 @@ mod tests {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&provider, &evm_ctx, 50, test_retry_strategy(), job_queue)
-            .await
-            .unwrap();
+        backfill_events(
+            &provider,
+            &evm_ctx,
+            &pool,
+            50,
+            test_retry_strategy(),
+            job_queue,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(job_count(&pool).await, 0);
     }
@@ -1456,9 +1767,16 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&provider, &evm_ctx, 100, test_retry_strategy(), job_queue)
-            .await
-            .unwrap();
+        backfill_events(
+            &provider,
+            &evm_ctx,
+            &pool,
+            100,
+            test_retry_strategy(),
+            job_queue,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(job_count(&pool).await, 0);
     }
