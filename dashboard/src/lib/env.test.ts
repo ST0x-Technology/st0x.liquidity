@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { getWebSocketUrl } from './env'
+import { getWebSocketUrl, getExplorerTxUrl } from './env'
 
 const mockEnv = { current: {} as Record<string, string | undefined> }
 
@@ -53,5 +53,27 @@ describe('getWebSocketUrl', () => {
     mockEnv.current = { PUBLIC_ALPACA_WS_URL: '  wss://trimmed.example.com/ws  ' }
 
     expect(getWebSocketUrl()).toBe('wss://trimmed.example.com/ws')
+  })
+})
+
+describe('getExplorerTxUrl', () => {
+  beforeEach(() => {
+    mockEnv.current = {}
+  })
+
+  it('defaults to flarescan when env is not set', () => {
+    expect(getExplorerTxUrl('0xabc123')).toBe('https://basescan.org/tx/0xabc123')
+  })
+
+  it('uses custom explorer URL from env', () => {
+    mockEnv.current = { PUBLIC_EXPLORER_URL: 'https://arbiscan.io' }
+
+    expect(getExplorerTxUrl('0xabc123')).toBe('https://arbiscan.io/tx/0xabc123')
+  })
+
+  it('trims whitespace from env value', () => {
+    mockEnv.current = { PUBLIC_EXPLORER_URL: '  https://arbiscan.io  ' }
+
+    expect(getExplorerTxUrl('0xabc123')).toBe('https://arbiscan.io/tx/0xabc123')
   })
 })

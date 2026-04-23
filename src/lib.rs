@@ -51,7 +51,7 @@ pub mod wallet;
 pub(crate) mod wallet;
 mod wrapper;
 
-pub use telemetry::{TelemetryError, TelemetryGuard, mk_env_filter, setup_tracing};
+pub use telemetry::{FileLogGuard, TelemetryError, TelemetryGuard, mk_env_filter, setup_tracing};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use config::TradingMode;

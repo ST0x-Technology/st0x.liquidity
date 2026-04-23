@@ -137,6 +137,7 @@ where
 struct Config {
     database_url: String,
     log_level: Option<LogLevel>,
+    log_dir: Option<String>,
     server_port: Option<u16>,
     raindex: EvmConfig,
     order_polling_interval: Option<u64>,
@@ -263,6 +264,7 @@ pub enum TradingMode {
 pub struct Ctx {
     pub(crate) database_url: String,
     pub log_level: LogLevel,
+    pub log_dir: Option<String>,
     pub(crate) server_port: u16,
     pub(crate) evm: EvmCtx,
     pub(crate) order_polling_interval: u64,
@@ -344,6 +346,7 @@ impl std::fmt::Debug for Ctx {
         f.debug_struct("Ctx")
             .field("database_url", &self.database_url)
             .field("log_level", &self.log_level)
+            .field("log_dir", &self.log_dir)
             .field("server_port", &self.server_port)
             .field("evm", &self.evm)
             .field("order_polling_interval", &self.order_polling_interval)
@@ -404,6 +407,7 @@ impl From<&LogLevel> for Level {
 struct ValidatedParts {
     database_url: String,
     log_level: LogLevel,
+    log_dir: Option<String>,
     server_port: u16,
     evm: EvmCtx,
     order_polling_interval: u64,
@@ -601,6 +605,7 @@ fn parse_and_validate(
     Ok(ValidatedParts {
         database_url: config.database_url,
         log_level,
+        log_dir: config.log_dir,
         server_port: config.server_port.unwrap_or(8080),
         evm,
         order_polling_interval,
@@ -653,6 +658,7 @@ impl Ctx {
         Ok(Self {
             database_url: parts.database_url,
             log_level: parts.log_level,
+            log_dir: parts.log_dir,
             server_port: parts.server_port,
             evm: parts.evm,
             order_polling_interval: parts.order_polling_interval,
@@ -795,6 +801,7 @@ impl Ctx {
         Ok(Self {
             database_url,
             log_level: LogLevel::Debug,
+            log_dir: None,
             server_port,
             evm: EvmCtx {
                 ws_rpc_url,
@@ -993,6 +1000,7 @@ pub(crate) mod tests {
         Ctx {
             database_url: ":memory:".to_owned(),
             log_level: LogLevel::Debug,
+            log_dir: None,
             server_port: 8080,
             evm: EvmCtx {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),

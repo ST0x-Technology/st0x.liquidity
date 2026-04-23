@@ -168,6 +168,16 @@ pub(crate) fn settings_from_ctx(ctx: &crate::config::Ctx) -> st0x_dto::Settings 
         })
         .collect();
 
+    let trading_mode = match &ctx.trading_mode {
+        crate::config::TradingMode::Standalone { .. } => "standalone",
+        crate::config::TradingMode::Rebalancing(_) => "rebalancing",
+    };
+
+    let broker = match &ctx.broker {
+        crate::config::BrokerCtx::AlpacaBrokerApi(_) => "alpaca",
+        crate::config::BrokerCtx::DryRun => "dry_run",
+    };
+
     st0x_dto::Settings {
         equity_target,
         equity_deviation,
@@ -175,6 +185,14 @@ pub(crate) fn settings_from_ctx(ctx: &crate::config::Ctx) -> st0x_dto::Settings 
         usdc_deviation,
         execution_threshold,
         assets,
+        log_level: format!("{:?}", ctx.log_level),
+        server_port: ctx.server_port,
+        orderbook: format!("{:#x}", ctx.evm.orderbook),
+        deployment_block: ctx.evm.deployment_block,
+        trading_mode: trading_mode.to_string(),
+        broker: broker.to_string(),
+        order_polling_interval: ctx.order_polling_interval,
+        inventory_poll_interval: ctx.inventory_poll_interval,
     }
 }
 
@@ -265,6 +283,14 @@ mod tests {
                 usdc_deviation: None,
                 execution_threshold: "$2".to_string(),
                 assets: Vec::new(),
+                log_level: "Debug".to_string(),
+                server_port: 8001,
+                orderbook: "0x0".to_string(),
+                deployment_block: 0,
+                trading_mode: "standalone".to_string(),
+                broker: "dry_run".to_string(),
+                order_polling_interval: 5,
+                inventory_poll_interval: 15,
             },
             active_transfers: Vec::new(),
             recent_transfers: Vec::new(),
@@ -295,6 +321,14 @@ mod tests {
                 usdc_deviation: None,
                 execution_threshold: "$2".to_string(),
                 assets: Vec::new(),
+                log_level: "Debug".to_string(),
+                server_port: 8001,
+                orderbook: "0x0".to_string(),
+                deployment_block: 0,
+                trading_mode: "standalone".to_string(),
+                broker: "dry_run".to_string(),
+                order_polling_interval: 5,
+                inventory_poll_interval: 15,
             },
         }
     }
@@ -312,6 +346,14 @@ mod tests {
                 usdc_deviation: None,
                 execution_threshold: "$2".to_string(),
                 assets: Vec::new(),
+                log_level: "Debug".to_string(),
+                server_port: 8001,
+                orderbook: "0x0".to_string(),
+                deployment_block: 0,
+                trading_mode: "standalone".to_string(),
+                broker: "dry_run".to_string(),
+                order_polling_interval: 5,
+                inventory_poll_interval: 15,
             },
             active_transfers: Vec::new(),
             recent_transfers: Vec::new(),

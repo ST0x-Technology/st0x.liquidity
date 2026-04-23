@@ -16,14 +16,6 @@
 
   let { symbols, usdc, positions, settings }: Props = $props()
 
-  const MAX_DECIMAL_PLACES = 6
-
-  const actualDecimalPlaces = (value: string): number => {
-    const dotIdx = value.indexOf('.')
-    if (dotIdx === -1) return 0
-    return value.length - dotIdx - 1
-  }
-
   const trimTrailingZeros = (formatted: string): string => {
     if (!formatted.includes('.')) return formatted
     return formatted.replace(/0+$/, '').replace(/\.$/, '')
@@ -32,14 +24,11 @@
   type Formatted = { display: string; full: string; truncated: boolean }
 
   const fmtValue = (value: string): Formatted => {
-    const actual = actualDecimalPlaces(value)
-    const display = Math.min(MAX_DECIMAL_PLACES, Math.max(2, actual))
-    const truncated = actual > display
-    const formatted = truncated
-      ? trimTrailingZeros(formatDecimal(value, MAX_DECIMAL_PLACES))
-      : trimTrailingZeros(formatDecimal(value, display))
+    const display = trimTrailingZeros(formatDecimal(value, 2))
+    const lossless = trimTrailingZeros(formatDecimal(value, 18))
+    const truncated = display !== lossless
     return {
-      display: truncated ? `~${formatted}` : formatted,
+      display,
       full: value,
       truncated,
     }
@@ -107,7 +96,12 @@
     ratio: number
     dislocation: number
     isCash: boolean
+    trading: boolean
   }
+
+  const tradingSet = $derived(
+    new Set(settings?.assets.filter((asset) => asset.trading).map((asset) => asset.symbol) ?? [])
+  )
 
   const equityRows = $derived<Row[]>(
     symbols.map((item) => {
@@ -116,15 +110,17 @@
         decimalAdd(item.onchainAvailable, item.offchainAvailable),
         inflight
       )
+      const stripped = stripPrefix(item.symbol)
       return {
-        asset: stripPrefix(item.symbol),
+        asset: stripped,
         alpaca: fmt(item.offchainAvailable),
         inflight: fmt(inflight),
         raindex: fmt(item.onchainAvailable),
         total: fmtValue(totalVal),
         ratio: computeRatio(item.onchainAvailable, item.offchainAvailable),
-        dislocation: positionMap.get(stripPrefix(item.symbol)) ?? 0,
+        dislocation: positionMap.get(stripped) ?? 0,
         isCash: false,
+        trading: tradingSet.has(stripped),
       }
     })
   )
@@ -147,6 +143,7 @@
       ratio: computeRatio(usdc.onchainAvailable, usdc.offchainAvailable),
       dislocation: 0,
       isCash: true,
+      trading: true,
     }
   })
 
@@ -163,12 +160,19 @@
   const sortedEquities = $derived.by(() => {
     const rows = [...equityRows]
 
-    if (sort.current) {
-      const { column, dir } = sort.current
-      const cmp = comparators[column]
-      const direction = dir === 'desc' ? -1 : 1
-      rows.sort((lhs, rhs) => direction * cmp(lhs, rhs))
-    }
+    rows.sort((lhs, rhs) => {
+      // Trading-enabled assets always come first
+      if (lhs.trading !== rhs.trading) return lhs.trading ? -1 : 1
+
+      if (sort.current) {
+        const { column, dir } = sort.current
+        const cmp = comparators[column]
+        const direction = dir === 'desc' ? -1 : 1
+        return direction * cmp(lhs, rhs)
+      }
+
+      return 0
+    })
 
     return rows
   })
@@ -200,46 +204,18 @@
     return 'text-muted-foreground'
   }
 
+  const isNegligible = (value: number): boolean => Math.abs(value) < 0.001
+
   const fmtDislocation = (value: number): string => {
     if (value === 0) return '0'
+    if (isNegligible(value)) return '~0'
     const sign = value > 0 ? '+' : '-'
     const abs = Math.abs(value)
-    const formatted = abs >= 1 ? abs.toFixed(2) : abs.toPrecision(4)
-    return `${sign}${formatted}`
+    if (abs < 0.01) return `${sign}${abs.toPrecision(2)}`
+    return `${sign}${abs.toFixed(2)}`
   }
 
-  const fmtPct = (value: number): string => `${(value * 100).toFixed(0)}%`
-
-  const equityBounds = $derived(settings ? `${fmtPct(settings.equityTarget - settings.equityDeviation)}–${fmtPct(settings.equityTarget + settings.equityDeviation)}` : '')
-
-  const usdcBounds = $derived(
-    settings?.usdcTarget != null && settings.usdcDeviation != null
-      ? `${fmtPct(settings.usdcTarget - settings.usdcDeviation)}–${fmtPct(settings.usdcTarget + settings.usdcDeviation)}`
-      : ''
-  )
 </script>
-
-{#if settings}
-  <div class="mb-4 flex flex-wrap gap-x-6 gap-y-1 text-xs text-muted-foreground">
-    <span>Equity ratio: <span class="font-mono">{fmtPct(settings.equityTarget)}</span> (allowed: <span class="font-mono">{equityBounds}</span>)</span>
-
-    {#if settings.usdcTarget != null}
-      <span>USDC ratio: <span class="font-mono">{fmtPct(settings.usdcTarget)}</span> (allowed: <span class="font-mono">{usdcBounds}</span>)</span>
-    {/if}
-
-    <span>Execution trigger: <span class="font-mono">{settings.executionThreshold}</span></span>
-
-    {#if settings.assets.length > 0}
-      <span>
-        Assets:
-        {#each settings.assets as asset, idx (asset.symbol)}
-          <span class="font-mono {asset.trading ? '' : 'line-through opacity-50'}">{asset.symbol}</span>{#if idx < settings.assets.length - 1},
-          {/if}
-        {/each}
-      </span>
-    {/if}
-  </div>
-{/if}
 
 <Table.Root>
   <Table.Header>
@@ -302,6 +278,10 @@
         <Table.Cell class="font-mono font-medium">Cash</Table.Cell>
         <Table.Cell class="text-right font-mono opacity-90">
           <span class={approxClass(cashRow.alpaca)} title={cashRow.alpaca.truncated ? cashRow.alpaca.full : undefined}>{cashRow.alpaca.display}</span>
+          {#if usdc?.buyingPower}
+            {@const bp = fmt(usdc.buyingPower.replace(/^\$/, ''))}
+            <div class="text-xs text-muted-foreground">BP: <span class={approxClass(bp)} title={bp.truncated ? bp.full : undefined}>{bp.display}</span></div>
+          {/if}
         </Table.Cell>
         <Table.Cell class="text-right font-mono opacity-50">
           <span class={approxClass(cashRow.inflight)} title={cashRow.inflight.truncated ? cashRow.inflight.full : undefined}>{cashRow.inflight.display}</span>
@@ -312,13 +292,16 @@
         <Table.Cell class="text-right font-mono font-semibold">
           <span class={approxClass(cashRow.total)} title={cashRow.total.truncated ? cashRow.total.full : undefined}>{cashRow.total.display}</span>
         </Table.Cell>
-        <Table.Cell class="font-mono">
-          {formatRatio(cashRow.ratio)}
-          {#if dev}
-            <span class={deviationColor(dev.style)}>
-              ({dev.text})
-            </span>
-          {/if}
+        <Table.Cell>
+          <div class="flex items-center gap-2">
+            <div class="h-1.5 w-16 overflow-hidden rounded-full bg-muted">
+              <div class="h-full rounded-full {dev?.style === 'high' ? 'bg-green-500' : dev?.style === 'low' ? 'bg-red-500' : 'bg-blue-400'}" style="width: {String(Math.min(cashRow.ratio * 100, 100))}%"></div>
+            </div>
+            <span class="font-mono text-xs">{formatRatio(cashRow.ratio)}</span>
+            {#if dev}
+              <span class="text-xs {deviationColor(dev.style)}">({dev.text})</span>
+            {/if}
+          </div>
         </Table.Cell>
         <Table.Cell class="font-mono text-muted-foreground">—</Table.Cell>
       </Table.Row>
@@ -331,9 +314,9 @@
   {/if}
 
   <Table.Body>
-    {#each sortedEquities as row (row.asset)}
+    {#each sortedEquities as row, idx (row.asset)}
       {@const dev = ratioDeviation(row.ratio, false)}
-      <Table.Row>
+      <Table.Row class="{idx % 2 === 0 ? 'bg-muted/40' : ''} {row.trading ? '' : 'opacity-40'}">
         <Table.Cell class="font-mono font-medium">{row.asset}</Table.Cell>
         <Table.Cell class="text-right font-mono opacity-90">
           <span class={approxClass(row.alpaca)} title={row.alpaca.truncated ? row.alpaca.full : undefined}>{row.alpaca.display}</span>
@@ -347,16 +330,26 @@
         <Table.Cell class="text-right font-mono font-semibold">
           <span class={approxClass(row.total)} title={row.total.truncated ? row.total.full : undefined}>{row.total.display}</span>
         </Table.Cell>
-        <Table.Cell class="font-mono">
-          {formatRatio(row.ratio)}
-          {#if dev}
-            <span class={deviationColor(dev.style)}>
-              ({dev.text})
-            </span>
-          {/if}
+        <Table.Cell>
+          <div class="flex items-center gap-2">
+            <div class="h-1.5 w-16 overflow-hidden rounded-full bg-muted">
+              <div class="h-full rounded-full {dev?.style === 'high' ? 'bg-green-500' : dev?.style === 'low' ? 'bg-red-500' : 'bg-blue-400'}" style="width: {String(Math.min(row.ratio * 100, 100))}%"></div>
+            </div>
+            <span class="font-mono text-xs">{formatRatio(row.ratio)}</span>
+            {#if dev}
+              <span class="text-xs {deviationColor(dev.style)}">({dev.text})</span>
+            {/if}
+          </div>
         </Table.Cell>
-        <Table.Cell class="font-mono {row.dislocation === 0 ? 'text-muted-foreground' : row.dislocation > 0 ? 'text-green-500' : 'text-red-500'}">
-          {fmtDislocation(row.dislocation)}
+        <Table.Cell>
+          <div class="flex items-center gap-1.5 font-mono text-xs">
+            {#if !isNegligible(row.dislocation) && row.dislocation !== 0}
+              <span class="text-base leading-none {row.dislocation > 0 ? 'text-green-500' : 'text-red-500'}">{row.dislocation > 0 ? '\u25B2' : '\u25BC'}</span>
+            {/if}
+            <span class={row.dislocation === 0 || isNegligible(row.dislocation) ? 'text-muted-foreground' : row.dislocation > 0 ? 'text-green-500' : 'text-red-500'}>
+              {fmtDislocation(row.dislocation)}
+            </span>
+          </div>
         </Table.Cell>
       </Table.Row>
     {/each}

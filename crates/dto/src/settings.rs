@@ -15,6 +15,19 @@ pub struct Settings {
     pub usdc_deviation: Option<f64>,
     pub execution_threshold: String,
     pub assets: Vec<AssetSettings>,
+
+    // Operational config
+    pub log_level: String,
+    pub server_port: u16,
+    pub orderbook: String,
+    #[ts(type = "number")]
+    pub deployment_block: u64,
+    pub trading_mode: String,
+    pub broker: String,
+    #[ts(type = "number")]
+    pub order_polling_interval: u64,
+    #[ts(type = "number")]
+    pub inventory_poll_interval: u64,
 }
 
 /// Per-asset operational settings.

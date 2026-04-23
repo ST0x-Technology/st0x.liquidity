@@ -955,12 +955,15 @@ impl RebalancingTrigger {
                 )
             }
 
+            OffchainMarginSafeBuyingPower { .. } => {
+                inventory.clone().apply_snapshot_event(&event, now)
+            }
+
             EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
             | AlpacaWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
-            | BaseWalletWrappedEquity { .. }
-            | OffchainMarginSafeBuyingPower { .. } => Ok(inventory.clone()),
+            | BaseWalletWrappedEquity { .. } => Ok(inventory.clone()),
 
             InflightEquity { .. } => {
                 if let Some((mints, redemptions)) = &filtered_inflight {
@@ -1089,12 +1092,17 @@ impl RebalancingTrigger {
                 )
             }
 
+            OffchainMarginSafeBuyingPower { .. } => {
+                inventory
+                    .clone()
+                    .force_apply_snapshot_event(&event, now, recovery_reason)
+            }
+
             EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
             | AlpacaWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
-            | BaseWalletWrappedEquity { .. }
-            | OffchainMarginSafeBuyingPower { .. } => Ok(inventory.clone()),
+            | BaseWalletWrappedEquity { .. } => Ok(inventory.clone()),
 
             // Recovery for inflight snapshots: forward the original fetched_at
             // so is_stale_for_symbol still rejects pre-rebalancing polls.

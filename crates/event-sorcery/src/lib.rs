@@ -442,6 +442,84 @@ where
     }
 }
 
+/// Load aggregate IDs with pagination, newest first (by highest rowid).
+///
+/// Returns up to `limit` IDs starting from `offset`, ordered by most
+/// recently created aggregate first (based on the maximum rowid of each
+/// aggregate's events).
+///
+/// # Errors
+///
+/// Returns `LoadAllIdsError` on database errors or unparseable IDs.
+pub async fn load_ids_paginated<Entity: EventSourced>(
+    pool: &SqlitePool,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<Entity::Id>, LoadAllIdsError>
+where
+    <Entity::Id as FromStr>::Err: Debug,
+{
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT aggregate_id FROM events \
+         WHERE aggregate_type = ?1 \
+         GROUP BY aggregate_id \
+         ORDER BY MAX(rowid) DESC \
+         LIMIT ?2 OFFSET ?3",
+    )
+    .bind(Entity::AGGREGATE_TYPE)
+    .bind(i64::try_from(limit)?)
+    .bind(i64::try_from(offset)?)
+    .fetch_all(pool)
+    .await?;
+
+    let (ids, invalid) = rows.into_iter().fold(
+        (Vec::new(), Vec::new()),
+        |(mut ids, mut invalid), (id_str,)| {
+            match id_str.parse::<Entity::Id>() {
+                Ok(id) => ids.push(id),
+                Err(parse_error) => {
+                    tracing::warn!(
+                        aggregate_id = id_str,
+                        aggregate_type = Entity::AGGREGATE_TYPE,
+                        ?parse_error,
+                        "Failed to parse aggregate ID (paginated)"
+                    );
+                    invalid.push(id_str);
+                }
+            }
+            (ids, invalid)
+        },
+    );
+
+    if invalid.is_empty() {
+        Ok(ids)
+    } else {
+        Err(LoadAllIdsError::InvalidIds {
+            aggregate_type: Entity::AGGREGATE_TYPE,
+            ids: invalid,
+        })
+    }
+}
+
+/// Count the total number of distinct aggregates of this type.
+///
+/// # Errors
+///
+/// Returns `LoadAllIdsError` on database failure or numeric conversion error.
+pub async fn count_aggregates<Entity: EventSourced>(
+    pool: &SqlitePool,
+) -> Result<usize, LoadAllIdsError> {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COUNT(DISTINCT aggregate_id) FROM events \
+         WHERE aggregate_type = ?1",
+    )
+    .bind(Entity::AGGREGATE_TYPE)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(usize::try_from(row.0)?)
+}
+
 /// Errors that can occur when loading all aggregate IDs.
 #[derive(Debug, thiserror::Error)]
 pub enum LoadAllIdsError {
@@ -455,6 +533,8 @@ pub enum LoadAllIdsError {
         aggregate_type: &'static str,
         ids: Vec<String>,
     },
+    #[error("Numeric conversion error: {0}")]
+    NumericConversion(#[from] std::num::TryFromIntError),
 }
 
 #[cfg(test)]
@@ -643,6 +723,9 @@ mod tests {
             }
             LoadAllIdsError::Sql(sql_error) => {
                 panic!("expected InvalidIds, got Sql: {sql_error}")
+            }
+            LoadAllIdsError::NumericConversion(conv_error) => {
+                panic!("expected InvalidIds, got NumericConversion: {conv_error}")
             }
         }
     }

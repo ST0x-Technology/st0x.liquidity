@@ -37,6 +37,8 @@ pub struct UsdcInventory {
     pub offchain_available: Usdc,
     #[ts(type = "string")]
     pub offchain_inflight: Usdc,
+    /// Margin-safe buying power from the offchain broker, formatted as USD string.
+    pub buying_power: Option<String>,
 }
 
 /// Full inventory snapshot across all symbols and USDC.
@@ -57,6 +59,7 @@ impl Inventory {
                 onchain_inflight: Usdc::ZERO,
                 offchain_available: Usdc::ZERO,
                 offchain_inflight: Usdc::ZERO,
+                buying_power: None,
             },
         }
     }
@@ -92,6 +95,7 @@ mod tests {
                 onchain_inflight: Usdc::ZERO,
                 offchain_available: Usdc::new(float!(5000)),
                 offchain_inflight: Usdc::new(float!(500)),
+                buying_power: Some("$4,500.00".to_string()),
             },
         };
 
@@ -109,5 +113,6 @@ mod tests {
         assert_eq!(usdc["onchainInflight"], json!("0"));
         assert_eq!(usdc["offchainAvailable"], json!("5000"));
         assert_eq!(usdc["offchainInflight"], json!("500"));
+        assert_eq!(usdc["buyingPower"], json!("$4,500.00"));
     }
 }

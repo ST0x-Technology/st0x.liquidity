@@ -73,6 +73,7 @@ const createMockQueryClient = (): MockQueryClient => {
 const WS_URL = 'ws://localhost:8001/api/ws'
 
 const makeTrade = (overrides: Partial<Trade> = {}): Trade => ({
+  id: 'trade-1',
   filledAt: '2024-01-01T12:00:00Z',
   venue: 'raindex',
   direction: 'buy',
@@ -189,9 +190,14 @@ describe('createWebSocket', () => {
         type: 'current_state',
         data: {
           trades: [trade],
-          inventory: { perSymbol: [], usdc: { onchainAvailable: '0', onchainInflight: '0', offchainAvailable: '0', offchainInflight: '0' } },
+          inventory: { perSymbol: [], usdc: { onchainAvailable: '0', onchainInflight: '0', offchainAvailable: '0', offchainInflight: '0', buyingPower: null } },
           positions: [],
-          settings: { equityTarget: 0.5, equityDeviation: 0.2, usdcTarget: null, usdcDeviation: null, executionThreshold: '$2', assets: [] },
+          settings: {
+            equityTarget: 0.5, equityDeviation: 0.2, usdcTarget: null, usdcDeviation: null,
+            executionThreshold: '$2', assets: [],
+            logLevel: 'Debug', serverPort: 8001, orderbook: '0x0', deploymentBlock: 0,
+            tradingMode: 'standalone', broker: 'dry_run', orderPollingInterval: 5, inventoryPollInterval: 15
+          },
           activeTransfers: [activeTransfer],
           recentTransfers: [recentTransfer],
           warnings: []
@@ -266,7 +272,7 @@ describe('createWebSocket', () => {
 
       const inventory = {
         perSymbol: [{ symbol: 'AAPL', onchainAvailable: '10', onchainInflight: '0', offchainAvailable: '5', offchainInflight: '0' }],
-        usdc: { onchainAvailable: '1000', onchainInflight: '0', offchainAvailable: '500', offchainInflight: '0' }
+        usdc: { onchainAvailable: '1000', onchainInflight: '0', offchainAvailable: '500', offchainInflight: '0', buyingPower: null }
       }
 
       const message: Statement = {

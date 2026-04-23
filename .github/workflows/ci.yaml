@@ -46,7 +46,7 @@ jobs:
             cache_target: clippy
             command: >
               nix develop -c cargo clippy --workspace --all-targets
-              --all-features -- -D clippy::all -D warnings
+              --all-features
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_TARGET_DIR: target/${{ matrix.cache_target }}

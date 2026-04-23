@@ -66,6 +66,18 @@ def trunc2 [val: string]: nothing -> string {
   }
 }
 
+# Query a GraphQL endpoint via curl.
+# nushell's `http post` hangs on Goldsky subgraphs (likely HTTP/2 negotiation),
+# so we shell out to curl which handles it reliably.
+def subgraph-query [url: string, query: string]: nothing -> record {
+  let body = ({ query: $query } | to json)
+  let result = (^curl -s --max-time 30 -X POST -H "Content-Type: application/json" -d $body $url | complete)
+  if $result.exit_code != 0 {
+    error make { msg: $"curl failed with exit code ($result.exit_code)" }
+  }
+  $result.stdout | from json
+}
+
 def fmt-short-date [ts: string]: nothing -> string {
   let parts = ($ts | split row "T")
   let date_parts = ($parts | first | split row "-")
@@ -94,13 +106,23 @@ def main [env_name: string] {
     if ($explicit | is-not-empty) {
       $explicit
     } else {
-      # Private-key wallets derive the address at runtime; try both
-      # config locations that could hold it.
-      let wallet_addr = (try { $config.rebalancing.wallet.address } catch { "" })
+      # Try config locations that hold an explicit address.
+      let wallet_addr = (try { $config.rebalancing.wallet.address } catch {
+        try { $config.wallet.address } catch {
+          try { $config.rebalancing.address } catch { "" }
+        }
+      })
       if ($wallet_addr | is-not-empty) {
         $wallet_addr
       } else {
-        try { $config.rebalancing.address } catch { "" }
+        # Private-key wallets derive the address at runtime.
+        # Fall back to reading the key from server secrets and deriving it with `cast`.
+        let pk = (ssh-run "cat /run/agenix/st0x-hedge.toml 2>/dev/null" | lines | where ($it | str contains "private_key") | first | default "" | parse --regex 'private_key\s*=\s*"(?P<key>[^"]+)"' | get -o key.0 | default "")
+        if ($pk | is-not-empty) {
+          try { with-env { ETH_PRIVATE_KEY: $pk } { ^cast wallet address | str trim } } catch { "" }
+        } else {
+          ""
+        }
       }
     }
   } else { "" }
@@ -223,12 +245,23 @@ def main [env_name: string] {
 
     let gql = ('{ orders(where: { owner: "' + $order_owner + '", active: true }, orderBy: timestampAdded, orderDirection: desc) { orderHash active timestampAdded inputs { token { symbol decimals } balance vaultId } outputs { token { symbol decimals } balance vaultId } trades(first: 5, orderBy: timestamp, orderDirection: desc) { timestamp inputVaultBalanceChange { amount vault { token { symbol decimals } } } outputVaultBalanceChange { amount vault { token { symbol decimals } } } } } }')
 
-    let orders_response = try {
-      http post --content-type "application/json" --max-time 15sec $subgraph { query: $gql }
-    } catch {
-      { data: { orders: [] } }
+    mut orders_response = { data: { orders: [] } }
+    for attempt in 1..4 {
+      try {
+        $orders_response = (subgraph-query $subgraph $gql)
+        break
+      } catch {|err|
+        if $attempt < 3 {
+          print $"  (ansi yellow)Subgraph request failed \(attempt ($attempt)/3\), retrying...(ansi reset)"
+          sleep 2sec
+        } else {
+          print $"  (ansi red)Subgraph query failed after 3 attempts -- order data may be incomplete(ansi reset)"
+          print $"  (ansi attr_dimmed)Error: ($err.msg)(ansi reset)"
+        }
+      }
     }
 
+    let orders_response = $orders_response
     let orders = ($orders_response | get -o data.orders | default [])
     $orders_response | to json | save -f $"($out_dir)/raindex-orders.json"
 
@@ -313,12 +346,22 @@ def main [env_name: string] {
         let skip = $page * $page_size
         let trade_gql = ('{ trades(first: ' + ($page_size | into string) + ', skip: ' + ($skip | into string) + ', orderBy: timestamp, orderDirection: desc, where: { order_: { orderHash: "' + $order_hash + '" } }) { timestamp inputVaultBalanceChange { amount vault { token { symbol } } } outputVaultBalanceChange { amount vault { token { symbol } } } tradeEvent { transaction { id blockNumber } } } }')
 
-        let page_data = try {
-          http post --content-type "application/json" --max-time 15sec $subgraph { query: $trade_gql }
-        } catch {
-          { data: { trades: [] } }
+        let current_page = $page
+        mut page_data = { data: { trades: [] } }
+        for attempt in 1..4 {
+          try {
+            $page_data = (subgraph-query $subgraph $trade_gql)
+            break
+          } catch {
+            if $attempt < 3 {
+              sleep 2sec
+            } else {
+              print $"  (ansi yellow)Trade fetch failed for ($short_hash) page ($current_page) after 3 attempts(ansi reset)"
+            }
+          }
         }
 
+        let page_data = $page_data
         let trades = ($page_data | get -o data.trades | default [])
         if ($trades | is-empty) { break }
 
@@ -395,10 +438,10 @@ def main [env_name: string] {
     print $"  (ansi red)Failed to fetch Raindex orders/trades(ansi reset)"
   }
 
-  # --- RKLB Position ---
+  # --- Positions ---
   try {
-    print $"(ansi attr_bold)(ansi cyan)▸ RKLB Position(ansi reset)"
-    let pos_data = (ssh-sqlite-json $db "SELECT symbol, net_position, last_updated FROM position_view WHERE symbol LIKE '%RKLB%';")
+    print $"(ansi attr_bold)(ansi cyan)▸ Positions(ansi reset)"
+    let pos_data = (ssh-sqlite-json $db "SELECT symbol, net_position, last_updated FROM position_view ORDER BY symbol;")
     if ($pos_data | is-not-empty) {
       for row in $pos_data {
         print $"  ($row.symbol)  net: (trunc2 ($row.net_position | into string))"
@@ -414,40 +457,49 @@ def main [env_name: string] {
   try {
     print ""
     print $"(ansi attr_bold)(ansi cyan)▸ Inventory Balance(ansi reset)"
+    # Collect configured equity symbols for dynamic inventory display
+    let equity_symbols = if $config != null {
+      try { $config.assets.equities | columns | sort } catch { [] }
+    } else { [] }
+
     print $"  (ansi yellow)Onchain:(ansi reset)"
 
     let onchain_equity_ts = (ssh-sqlite-scalar $db "SELECT json_extract(payload, '$.OnchainEquity.fetched_at') FROM events WHERE event_type = 'InventorySnapshotEvent::OnchainEquity' ORDER BY rowid DESC LIMIT 1;")
-    let onchain_equity_val = (ssh-sqlite-scalar $db "SELECT json_extract(payload, '$.OnchainEquity.balances.RKLB') FROM events WHERE event_type = 'InventorySnapshotEvent::OnchainEquity' ORDER BY rowid DESC LIMIT 1;")
-    if ($onchain_equity_val | is-not-empty) {
-      print $"    Equity: (ansi attr_bold)(ansi white)(trunc2 $onchain_equity_val) RKLB(ansi reset)  (ansi attr_dimmed)\((fmt-ts $onchain_equity_ts)\)(ansi reset)"
+    for symbol in $equity_symbols {
+      let onchain_equity_val = (ssh-sqlite-scalar $db $"SELECT json_extract\(payload, '$.OnchainEquity.balances.($symbol)'\) FROM events WHERE event_type = 'InventorySnapshotEvent::OnchainEquity' ORDER BY rowid DESC LIMIT 1;")
+      if ($onchain_equity_val | is-not-empty) {
+        print $"    ($symbol | fill -w 6 -a left): (ansi attr_bold)(ansi white)(trunc2 $onchain_equity_val)(ansi reset)  (ansi attr_dimmed)\((fmt-ts $onchain_equity_ts)\)(ansi reset)"
+      }
     }
 
     let onchain_usdc_ts = (ssh-sqlite-scalar $db "SELECT json_extract(payload, '$.OnchainUsdc.fetched_at') FROM events WHERE event_type = 'InventorySnapshotEvent::OnchainUsdc' ORDER BY rowid DESC LIMIT 1;")
     let onchain_usdc_val = (ssh-sqlite-scalar $db "SELECT json_extract(payload, '$.OnchainUsdc.usdc_balance') FROM events WHERE event_type = 'InventorySnapshotEvent::OnchainUsdc' ORDER BY rowid DESC LIMIT 1;")
     if ($onchain_usdc_val | is-not-empty) {
-      print $"    USDC:   (ansi attr_bold)(ansi white)(trunc2 $onchain_usdc_val) USDC(ansi reset)  (ansi attr_dimmed)\((fmt-ts $onchain_usdc_ts)\)(ansi reset)"
+      print $"    ("USDC" | fill -w 6 -a left): (ansi attr_bold)(ansi white)(trunc2 $onchain_usdc_val)(ansi reset)  (ansi attr_dimmed)\((fmt-ts $onchain_usdc_ts)\)(ansi reset)"
     }
 
     print $"  (ansi yellow)Offchain:(ansi reset)"
 
     let offchain_equity_ts = (ssh-sqlite-scalar $db "SELECT json_extract(payload, '$.OffchainEquity.fetched_at') FROM events WHERE event_type = 'InventorySnapshotEvent::OffchainEquity' ORDER BY rowid DESC LIMIT 1;")
-    let offchain_equity_val = (ssh-sqlite-scalar $db "SELECT json_extract(payload, '$.OffchainEquity.positions.RKLB') FROM events WHERE event_type = 'InventorySnapshotEvent::OffchainEquity' ORDER BY rowid DESC LIMIT 1;")
-    if ($offchain_equity_val | is-not-empty) {
-      print $"    Equity: (ansi attr_bold)(ansi white)(trunc2 $offchain_equity_val) RKLB(ansi reset)  (ansi attr_dimmed)\((fmt-ts $offchain_equity_ts)\)(ansi reset)"
+    for symbol in $equity_symbols {
+      let offchain_equity_val = (ssh-sqlite-scalar $db $"SELECT json_extract\(payload, '$.OffchainEquity.positions.($symbol)'\) FROM events WHERE event_type = 'InventorySnapshotEvent::OffchainEquity' ORDER BY rowid DESC LIMIT 1;")
+      if ($offchain_equity_val | is-not-empty) {
+        print $"    ($symbol | fill -w 6 -a left): (ansi attr_bold)(ansi white)(trunc2 $offchain_equity_val)(ansi reset)  (ansi attr_dimmed)\((fmt-ts $offchain_equity_ts)\)(ansi reset)"
+      }
     }
 
     let offchain_usd_ts = (ssh-sqlite-scalar $db "SELECT json_extract(payload, '$.OffchainUsd.fetched_at') FROM events WHERE event_type = 'InventorySnapshotEvent::OffchainUsd' ORDER BY rowid DESC LIMIT 1;")
     let offchain_usd_val = (ssh-sqlite-scalar $db "SELECT printf('%.2f', json_extract(payload, '$.OffchainUsd.usd_balance_cents') / 100.0) FROM events WHERE event_type = 'InventorySnapshotEvent::OffchainUsd' ORDER BY rowid DESC LIMIT 1;")
     if ($offchain_usd_val | is-not-empty) {
       let usd_display = "$" + $offchain_usd_val
-      print $"    USD:    (ansi attr_bold)(ansi white)($usd_display)(ansi reset)  (ansi attr_dimmed)\((fmt-ts $offchain_usd_ts)\)(ansi reset)"
+      print $"    ("USD" | fill -w 6 -a left): (ansi attr_bold)(ansi white)($usd_display)(ansi reset)  (ansi attr_dimmed)\((fmt-ts $offchain_usd_ts)\)(ansi reset)"
     }
 
     let bp_ts = (ssh-sqlite-scalar $db "SELECT json_extract(payload, '$.OffchainMarginSafeBuyingPower.fetched_at') FROM events WHERE event_type = 'InventorySnapshotEvent::OffchainMarginSafeBuyingPower' ORDER BY rowid DESC LIMIT 1;")
     let bp_val = (ssh-sqlite-scalar $db "SELECT printf('%.2f', json_extract(payload, '$.OffchainMarginSafeBuyingPower.margin_safe_buying_power_cents') / 100.0) FROM events WHERE event_type = 'InventorySnapshotEvent::OffchainMarginSafeBuyingPower' ORDER BY rowid DESC LIMIT 1;")
     if ($bp_val | is-not-empty) {
       let bp_display = "$" + $bp_val
-      print $"    BuyPwr: (ansi attr_bold)(ansi white)($bp_display)(ansi reset)  (ansi attr_dimmed)\((fmt-ts $bp_ts)\)(ansi reset)"
+      print $"    ("BuyPwr" | fill -w 6 -a left): (ansi attr_bold)(ansi white)($bp_display)(ansi reset)  (ansi attr_dimmed)\((fmt-ts $bp_ts)\)(ansi reset)"
     }
   } catch {
     print $"  (ansi attr_dimmed)\(no inventory data -- DB may not be initialized\)(ansi reset)"
@@ -523,7 +575,7 @@ def main [env_name: string] {
   print $"(ansi attr_dimmed)Saving full data to ($out_dir) ...(ansi reset)"
 
   mut saved_logs = false
-  let logs_result = (^ssh ...(ssh-flags) $"root@($env.host_ip)" "journalctl -u st0x-hedge --no-pager" | complete)
+  let logs_result = (^ssh ...(ssh-flags) $"root@($env.host_ip)" `journalctl -u st0x-hedge --no-pager --since "$(stat -c '%y' /nix/var/nix/profiles/per-service/st0x-hedge)"` | complete)
   if $logs_result.exit_code == 0 {
     $logs_result.stdout | save -f $"($out_dir)/logs.txt"
     $saved_logs = true

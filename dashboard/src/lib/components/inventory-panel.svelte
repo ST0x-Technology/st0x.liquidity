@@ -28,9 +28,17 @@
   const settings = $derived(settingsQuery.data)
 </script>
 
-<Card.Root class="flex shrink-0 flex-col overflow-hidden">
+<Card.Root class="flex h-full flex-col overflow-hidden border-l-4 border-l-blue-500/50">
   <Card.Header class="shrink-0 pb-3">
-    <Card.Title>Overview</Card.Title>
+    <Card.Title class="flex items-center gap-1.5">
+      Inventory
+      <span class="group relative cursor-help text-muted-foreground">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="h-3.5 w-3.5"><path fill-rule="evenodd" d="M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Zm-7-4a1 1 0 1 1-2 0 1 1 0 0 1 2 0ZM9 9a.75.75 0 0 0 0 1.5h.253a.25.25 0 0 1 .244.304l-.459 2.066A1.75 1.75 0 0 0 10.747 15H11a.75.75 0 0 0 0-1.5h-.253a.25.25 0 0 1-.244-.304l.459-2.066A1.75 1.75 0 0 0 9.253 9H9Z" clip-rule="evenodd" /></svg>
+        <span class="pointer-events-none absolute left-0 top-full z-50 mt-1 hidden w-56 rounded bg-popover px-3 py-2 text-xs font-normal text-popover-foreground shadow-lg group-hover:block">
+          Asset balances across Alpaca (offchain) and Raindex (onchain), with allocation ratios and directional exposure.
+        </span>
+      </span>
+    </Card.Title>
   </Card.Header>
   <Card.Content class="relative min-h-0 flex-1 overflow-auto px-6 pt-0">
     {#if !inventory}

@@ -10,18 +10,18 @@ async fn main() -> anyhow::Result<()> {
 
     let log_level: tracing::Level = (&ctx.log_level).into();
 
-    let telemetry_guard = if let Some(ref telemetry) = ctx.telemetry {
-        match telemetry.setup(log_level) {
-            Ok(guard) => Some(guard),
+    let (_file_log_guard, telemetry_guard) = if let Some(ref telemetry) = ctx.telemetry {
+        match telemetry.setup(log_level, ctx.log_dir.as_deref()) {
+            Ok((file_guard, tele_guard)) => (file_guard, Some(tele_guard)),
             Err(error) => {
                 eprintln!("Failed to setup telemetry: {error}");
-                setup_tracing(&ctx.log_level);
-                None
+                let file_guard = setup_tracing(&ctx.log_level, ctx.log_dir.as_deref());
+                (file_guard, None)
             }
         }
     } else {
-        setup_tracing(&ctx.log_level);
-        None
+        let file_guard = setup_tracing(&ctx.log_level, ctx.log_dir.as_deref());
+        (file_guard, None)
     };
 
     let result = run_bot_session(ctx).await;

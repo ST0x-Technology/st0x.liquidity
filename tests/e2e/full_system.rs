@@ -453,7 +453,9 @@ async fn full_system() -> anyhow::Result<()> {
 #[ignore = "infinite simulation -- run via nix run .#simulate"]
 #[allow(clippy::too_many_lines)]
 async fn simulate() -> anyhow::Result<()> {
-    crate::test_infra::init_tracing();
+    let log_dir = std::path::PathBuf::from("/tmp/st0x-simulate-logs");
+    std::fs::create_dir_all(&log_dir)?;
+    let _log_guard = crate::test_infra::init_tracing_with_log_dir(&log_dir);
 
     let aapl_broker_price = float!(150.25);
     let tsla_broker_price = float!(245.00);
@@ -546,7 +548,7 @@ async fn simulate() -> anyhow::Result<()> {
     let current_block = infra.base_chain.provider.get_block_number().await?;
     let (event_sender, _) = broadcast::channel::<Statement>(256);
 
-    let ctx = build_full_system_ctx()
+    let mut ctx = build_full_system_ctx()
         .chain(&infra.base_chain)
         .ethereum_endpoint(&cctp.ethereum_endpoint)
         .broker(&infra.broker_service)
@@ -557,6 +559,7 @@ async fn simulate() -> anyhow::Result<()> {
         .cash_vault_id(usdc_vault_id)
         .cctp(cctp.cctp_overrides())
         .call()?;
+    ctx.log_dir = Some(log_dir.display().to_string());
 
     debug!("Starting bot");
     let mut bot = spawn_bot_with_event_channel(ctx, event_sender);

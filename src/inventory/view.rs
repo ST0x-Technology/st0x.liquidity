@@ -634,6 +634,9 @@ pub(crate) struct InventoryView {
     usdc: Inventory<Usdc>,
     equities: HashMap<Symbol, Inventory<FractionalShares>>,
     last_updated: DateTime<Utc>,
+    /// Margin-safe buying power in cents from the offchain broker.
+    #[serde(default)]
+    buying_power_cents: Option<i64>,
 }
 
 impl InventoryView {
@@ -700,6 +703,14 @@ impl InventoryView {
 
         let (usdc_offchain_available, usdc_offchain_inflight) = venue_balances(self.usdc.offchain);
 
+        let buying_power = self.buying_power_cents.map(|cents| {
+            let sign = if cents < 0 { "-" } else { "" };
+            let abs = cents.unsigned_abs();
+            let whole = abs / 100;
+            let frac = abs % 100;
+            format!("{sign}${whole}.{frac:02}")
+        });
+
         st0x_dto::Inventory {
             per_symbol,
             usdc: UsdcInventory {
@@ -707,6 +718,7 @@ impl InventoryView {
                 onchain_inflight: usdc_onchain_inflight,
                 offchain_available: usdc_offchain_available,
                 offchain_inflight: usdc_offchain_inflight,
+                buying_power,
             },
         }
     }
@@ -731,6 +743,7 @@ impl Default for InventoryView {
             usdc: Inventory::default(),
             equities: HashMap::new(),
             last_updated: Utc::now(),
+            buying_power_cents: None,
         }
     }
 }
@@ -831,6 +844,7 @@ impl InventoryView {
             equities,
             last_updated: now,
             usdc: self.usdc,
+            buying_power_cents: self.buying_power_cents,
         })
     }
 
@@ -845,6 +859,7 @@ impl InventoryView {
             usdc: updated,
             last_updated: now,
             equities: self.equities,
+            buying_power_cents: self.buying_power_cents,
         })
     }
 
@@ -868,6 +883,7 @@ impl InventoryView {
             equities,
             last_updated: now,
             usdc: self.usdc,
+            buying_power_cents: self.buying_power_cents,
         })
     }
 
@@ -883,6 +899,7 @@ impl InventoryView {
             usdc: cleared,
             last_updated: now,
             equities: self.equities,
+            buying_power_cents: self.buying_power_cents,
         })
     }
 
@@ -1036,12 +1053,25 @@ impl InventoryView {
                 )
             }
 
+            OffchainMarginSafeBuyingPower {
+                margin_safe_buying_power_cents,
+                ..
+            } => {
+                debug!(
+                    ?margin_safe_buying_power_cents,
+                    "apply_snapshot_event: OffchainMarginSafeBuyingPower"
+                );
+                Ok(Self {
+                    buying_power_cents: *margin_safe_buying_power_cents,
+                    ..self
+                })
+            }
+
             EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
             | AlpacaWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
-            | BaseWalletWrappedEquity { .. }
-            | OffchainMarginSafeBuyingPower { .. } => Ok(self),
+            | BaseWalletWrappedEquity { .. } => Ok(self),
 
             InflightEquity {
                 mints, redemptions, ..
@@ -1116,12 +1146,19 @@ impl InventoryView {
                 )
             }
 
+            OffchainMarginSafeBuyingPower {
+                margin_safe_buying_power_cents,
+                ..
+            } => Ok(Self {
+                buying_power_cents: *margin_safe_buying_power_cents,
+                ..self
+            }),
+
             EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
             | AlpacaWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
-            | BaseWalletWrappedEquity { .. }
-            | OffchainMarginSafeBuyingPower { .. } => Ok(self),
+            | BaseWalletWrappedEquity { .. } => Ok(self),
 
             InflightEquity {
                 mints,
@@ -1385,6 +1422,7 @@ mod tests {
             usdc: usdc_make_inventory(1000, 0, 1000, 0),
             equities: equities.into_iter().collect(),
             last_updated: Utc::now(),
+            buying_power_cents: None,
         }
     }
 
@@ -1403,6 +1441,7 @@ mod tests {
             ),
             equities: HashMap::new(),
             last_updated: Utc::now(),
+            buying_power_cents: None,
         }
     }
 
@@ -1970,6 +2009,7 @@ mod tests {
             equities: std::iter::once((tsla, make_inventory(80, 20, 40, 10))).collect(),
             usdc: usdc_make_inventory(5000, 1000, 3000, 500),
             last_updated: Utc::now(),
+            buying_power_cents: None,
         };
 
         let dto = view.to_dto();
@@ -2010,6 +2050,7 @@ mod tests {
             .collect(),
             usdc: Inventory::default(),
             last_updated: Utc::now(),
+            buying_power_cents: None,
         };
 
         let dto = view.to_dto();

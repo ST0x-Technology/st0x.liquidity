@@ -5,7 +5,7 @@
 //! `CctpAttestationMock` into a single startup call.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Once};
 
 use alloy::primitives::{Address, U256, utils::parse_units};
@@ -13,6 +13,8 @@ use alloy::providers::Provider;
 use rain_math_float::Float;
 use tempfile::TempDir;
 use tracing::{debug, info};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use st0x_bridge::cctp::CctpAttestationMock;
 use st0x_execution::Symbol;
@@ -43,6 +45,44 @@ pub fn init_tracing() {
             .try_init()
             .expect("Failed to initialize tracing subscriber");
     });
+}
+
+/// Like [`init_tracing`] but also writes JSON log files to `log_dir` so the
+/// dashboard's `/logs` endpoint can serve them during simulation.
+///
+/// Returns a guard that must be held for the lifetime of the test -- dropping
+/// it flushes buffered writes.
+pub fn init_tracing_with_log_dir(log_dir: &Path) -> tracing_appender::non_blocking::WorkerGuard {
+    use tracing_subscriber::Layer;
+
+    let base_filter = mk_env_filter(tracing::Level::DEBUG);
+    let trace = tracing::Level::TRACE;
+    let directive: tracing_subscriber::filter::Directive = format!("e2e={trace}").parse().unwrap();
+    let console_filter = base_filter.add_directive(directive);
+
+    let file_appender = tracing_appender::rolling::daily(log_dir, "st0x-hedge.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+    let json_filter = mk_env_filter(tracing::Level::DEBUG);
+    let file_layer = tracing_subscriber::fmt::layer()
+        .json()
+        .with_writer(non_blocking)
+        .with_filter(json_filter);
+
+    let console_layer = tracing_subscriber::fmt::layer()
+        .compact()
+        .with_target(true)
+        .with_line_number(true)
+        .with_writer(std::io::stderr)
+        .with_filter(console_filter);
+
+    tracing_subscriber::registry()
+        .with(console_layer)
+        .with(file_layer)
+        .try_init()
+        .expect("Failed to initialize tracing subscriber with log dir");
+
+    guard
 }
 
 pub struct TestInfra<P> {

@@ -41,7 +41,7 @@ markets by providing continuous two-sided liquidity.
 
 - **Nix with flakes enabled** - For reproducible development environment
 - **[direnv](https://direnv.net/)** (recommended) - The repo includes an
-  `.envrc` that automatically loads the Nix dev shell when you `cd` into the
+- `.envrc` that automatically loads the Nix dev shell when you `cd` into the
   project. Without direnv, run `nix develop` manually in each terminal
 
 ### Development Setup

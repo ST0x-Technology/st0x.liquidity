@@ -31,8 +31,8 @@
 //! let log_level: tracing::Level = (&ctx.log_level).into();
 //!
 //! let telemetry_guard = if let Some(ref telemetry) = ctx.telemetry {
-//!     match telemetry.setup(log_level) {
-//!         Ok(guard) => Some(guard),
+//!     match telemetry.setup(log_level, ctx.log_dir.as_deref()) {
+//!         Ok((_file_guard, guard)) => Some(guard),
 //!         Err(e) => {
 //!             eprintln!("Failed to setup telemetry: {e}");
 //!             None
@@ -116,7 +116,11 @@ impl TelemetryCtx {
         }
     }
 
-    pub fn setup(&self, log_level: tracing::Level) -> Result<TelemetryGuard, TelemetryError> {
+    pub fn setup(
+        &self,
+        log_level: tracing::Level,
+        log_dir: Option<&str>,
+    ) -> Result<(Option<FileLogGuard>, TelemetryGuard), TelemetryError> {
         let headers = HashMap::from([("authorization".to_string(), self.api_key.clone())]);
 
         let http_client =
@@ -160,11 +164,32 @@ impl TelemetryCtx {
         let fmt_layer = tracing_subscriber::fmt::layer().with_filter(mk_env_filter(log_level));
         let telemetry_layer = telemetry_layer.with_filter(mk_telemetry_filter(log_level));
 
-        let subscriber = Registry::default().with(fmt_layer).with(telemetry_layer);
+        let file_guard = if let Some(dir) = log_dir {
+            let file_appender = tracing_appender::rolling::daily(dir, "st0x-hedge.log");
+            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
-        tracing::subscriber::set_global_default(subscriber)?;
+            let file_layer = tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(non_blocking)
+                .with_filter(mk_crate_filter(log_level));
 
-        Ok(TelemetryGuard { tracer_provider })
+            let subscriber = Registry::default()
+                .with(fmt_layer)
+                .with(telemetry_layer)
+                .with(file_layer);
+
+            tracing::subscriber::set_global_default(subscriber)?;
+
+            Some(FileLogGuard { _guard: guard })
+        } else {
+            let subscriber = Registry::default().with(fmt_layer).with(telemetry_layer);
+
+            tracing::subscriber::set_global_default(subscriber)?;
+
+            None
+        };
+
+        Ok((file_guard, TelemetryGuard { tracer_provider }))
     }
 }
 
@@ -234,14 +259,47 @@ impl From<Box<dyn std::any::Any + Send>> for TelemetryError {
 /// maintained for semantic clarity.
 const TRACER_NAME: &str = "st0x-tracer";
 
-pub fn setup_tracing(log_level: &crate::config::LogLevel) {
+/// Guard returned when file logging is enabled. Dropping flushes buffered writes.
+pub struct FileLogGuard {
+    _guard: tracing_appender::non_blocking::WorkerGuard,
+}
+
+pub fn setup_tracing(
+    log_level: &crate::config::LogLevel,
+    log_dir: Option<&str>,
+) -> Option<FileLogGuard> {
     let level: tracing::Level = log_level.into();
     let env_filter = mk_env_filter(level);
 
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .compact()
-        .init();
+    if let Some(dir) = log_dir {
+        let file_appender = tracing_appender::rolling::daily(dir, "st0x-hedge.log");
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+        let file_layer = tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(non_blocking)
+            .with_filter(mk_crate_filter(level));
+
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .compact()
+            .with_filter(env_filter);
+
+        let subscriber = Registry::default().with(fmt_layer).with(file_layer);
+
+        if tracing::subscriber::set_global_default(subscriber).is_err() {
+            eprintln!("Failed to set global subscriber (already set)");
+            return None;
+        }
+
+        Some(FileLogGuard { _guard: guard })
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .compact()
+            .init();
+
+        None
+    }
 }
 
 pub fn mk_env_filter(level: tracing::Level) -> EnvFilter {

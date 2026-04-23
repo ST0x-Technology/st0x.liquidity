@@ -1037,6 +1037,7 @@ mod tests {
         Ctx {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
+            log_dir: None,
             server_port: 8080,
             evm: EvmCtx {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),

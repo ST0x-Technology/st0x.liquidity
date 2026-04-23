@@ -23,3 +23,14 @@ export const getWebSocketUrl = (): string => {
   const val = env[envKey]?.trim()
   return val !== undefined && val !== '' ? val : getDefaultWsUrl()
 }
+
+export const getApiBaseUrl = (): string => {
+  return window.location.origin
+}
+
+export const getExplorerTxUrl = (txHash: string): string => {
+  const envKey = 'PUBLIC_EXPLORER_URL'
+  const base = env[envKey]?.trim()
+  const explorerUrl = base !== undefined && base !== '' ? base : 'https://basescan.org'
+  return `${explorerUrl}/tx/${txHash}`
+}
