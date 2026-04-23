@@ -20,27 +20,36 @@ jobs:
       matrix:
         include:
           - name: check
+            cache_target: check
             command: nix develop -c cargo check --workspace
           - name: test 1 of 4
+            cache_target: test
             command: >
               nix develop -c cargo nextest run --workspace --all-features
               --profile ci --partition hash:1/4
           - name: test 2 of 4
+            cache_target: test
             command: >
               nix develop -c cargo nextest run --workspace --all-features
               --profile ci --partition hash:2/4
           - name: test 3 of 4
+            cache_target: test
             command: >
               nix develop -c cargo nextest run --workspace --all-features
               --profile ci --partition hash:3/4
           - name: test 4 of 4
+            cache_target: test
             command: >
               nix develop -c cargo nextest run --workspace --all-features
               --profile ci --partition hash:4/4
           - name: clippy
+            cache_target: clippy
             command: >
               nix develop -c cargo clippy --workspace --all-targets
               --all-features -- -D clippy::all -D warnings
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_DIR: target/${{ matrix.cache_target }}
     steps:
       - uses: actions/checkout@v4
 
@@ -61,13 +70,13 @@ jobs:
       - name: Checkout submodules
         run: |
           if [ "${{ steps.cache-sub.outputs.cache-hit }}" = "true" ]; then
-            echo "Cache hit — trying no-fetch checkout"
+            echo "Cache hit - trying no-fetch checkout"
             git submodule update --init --recursive --no-fetch || {
-              echo "no-fetch failed — falling back to full fetch"
+              echo "no-fetch failed - falling back to full fetch"
               git submodule update --init --recursive
             }
           else
-            echo "Cache miss — full submodule fetch"
+            echo "Cache miss - full submodule fetch"
             git submodule update --init --recursive
           fi
 
@@ -79,11 +88,31 @@ jobs:
 
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
+      - name: Cache Solidity artifacts
+        id: cache-sol
+        uses: actions/cache@v4
+        with:
+          path: |
+            lib/**/cache/
+            lib/**/out/
+          key: sol-artifacts-${{ hashFiles('.gitmodules', 'flake.lock', 'lib/**/*.sol', 'lib/**/foundry.toml', 'lib/**/remappings.txt') }}
+          restore-keys: sol-artifacts-
+
       - name: Build Solidity artifacts
+        if: steps.cache-sol.outputs.cache-hit != 'true'
         run: nix run .#prepSolArtifacts
 
-      - name: Initialize dev shell
-        run: nix develop -c true
+      - name: Cache cargo artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/git/db/
+            ~/.cargo/registry/cache/
+            ~/.cargo/registry/index/
+            target/${{ matrix.cache_target }}/
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ matrix.cache_target }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'flake.lock', 'flake.nix', 'rust.nix') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-${{ matrix.cache_target }}-
 
       - name: Setup database
         run: nix develop -c sqlx db reset -y
@@ -129,13 +158,13 @@ jobs:
       - name: Checkout submodules
         run: |
           if [ "${{ steps.cache-sub.outputs.cache-hit }}" = "true" ]; then
-            echo "Cache hit — trying no-fetch checkout"
+            echo "Cache hit - trying no-fetch checkout"
             git submodule update --init --recursive --no-fetch || {
-              echo "no-fetch failed — falling back to full fetch"
+              echo "no-fetch failed - falling back to full fetch"
               git submodule update --init --recursive
             }
           else
-            echo "Cache miss — full submodule fetch"
+            echo "Cache miss - full submodule fetch"
             git submodule update --init --recursive
           fi
 
@@ -145,9 +174,18 @@ jobs:
             accept-flake-config = true
             fallback = true
 
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Cache Solidity artifacts
+        id: cache-sol
+        uses: actions/cache@v4
+        with:
+          path: |
+            lib/**/cache/
+            lib/**/out/
+          key: sol-artifacts-${{ hashFiles('.gitmodules', 'flake.lock', 'lib/**/*.sol', 'lib/**/foundry.toml', 'lib/**/remappings.txt') }}
+          restore-keys: sol-artifacts-
 
       - name: Build Solidity artifacts
+        if: steps.cache-sol.outputs.cache-hit != 'true'
         run: nix run .#prepSolArtifacts
 
       - name: Check bun.nix is up to date
@@ -166,16 +204,39 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
+
+      - name: Compute submodule cache key
+        id: sub-key
+        run: echo "hash=$(git submodule status | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache submodules
+        id: cache-sub
+        uses: actions/cache@v4
         with:
-          submodules: recursive
+          path: |
+            lib/
+            .git/modules/
+          key: submodules-${{ steps.sub-key.outputs.hash }}
+          restore-keys: submodules-
+
+      - name: Checkout submodules
+        run: |
+          if [ "${{ steps.cache-sub.outputs.cache-hit }}" = "true" ]; then
+            echo "Cache hit - trying no-fetch checkout"
+            git submodule update --init --recursive --no-fetch || {
+              echo "no-fetch failed - falling back to full fetch"
+              git submodule update --init --recursive
+            }
+          else
+            echo "Cache miss - full submodule fetch"
+            git submodule update --init --recursive
+          fi
 
       - uses: DeterminateSystems/nix-installer-action@main
         with:
           extra-conf: |
             accept-flake-config = true
             fallback = true
-
-      - uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: pre-commit hooks
         run: nix develop -c pre-commit run --all-files
