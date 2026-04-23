@@ -28,12 +28,38 @@ pub(crate) mod assertions;
 
 use std::collections::HashMap;
 
-use st0x_execution::SharesBlockchain;
+use st0x_execution::{FractionalShares, SharesBlockchain};
 use st0x_hedge::OperationMode;
 
 use self::assertions::*;
 
+use crate::assert::assert_single_clean_aggregate;
 use st0x_float_macro::float;
+
+fn aggregate_id_for_event(events: &[crate::assert::StoredEvent], event_type: &str) -> String {
+    events
+        .iter()
+        .find(|event| event.event_type == event_type)
+        .unwrap_or_else(|| panic!("Missing event type {event_type}"))
+        .aggregate_id
+        .clone()
+}
+
+fn count_tokenization_requests(
+    requests: &[st0x_hedge::mock_api::MockTokenizationRequestSnapshot],
+    request_type: TokenizationRequestType,
+    symbol: &str,
+    status: st0x_hedge::mock_api::TokenizationStatus,
+) -> usize {
+    requests
+        .iter()
+        .filter(|request| {
+            request.request_type == request_type
+                && request.symbol == symbol
+                && request.status == status
+        })
+        .count()
+}
 
 /// Control test: direct high-precision sell-side Raindex prices should not
 /// break equity rebalancing. This avoids buy-side reciprocal math and verifies
@@ -1223,44 +1249,41 @@ async fn pending_requests_filtered_by_wallet() -> anyhow::Result<()> {
         ],
     );
 
+    // The number of mint aggregates is timing-sensitive because later fills
+    // can legitimately trigger a follow-up mint after the first cycle
+    // completes. Assert on the inflight snapshots instead: the foreign
+    // wallet's 1000-share request must never appear in our conductor's
+    // polled inflight state.
     let snapshot_events = fetch_events_by_type(&pool, "InventorySnapshot").await?;
-    let inflight_events: Vec<_> = snapshot_events
+    let foreign_request_quantity = FractionalShares::new(float!("1000"));
+    let observed_inflight_mints: Vec<FractionalShares> = snapshot_events
         .iter()
         .filter(|event| event.event_type == "InventorySnapshotEvent::InflightEquity")
+        .filter_map(|event| {
+            event
+                .payload
+                .get("InflightEquity")?
+                .get("mints")?
+                .get("AAPL")?
+                .as_str()
+        })
+        .map(|quantity| {
+            quantity
+                .parse::<FractionalShares>()
+                .unwrap_or_else(|error| {
+                    panic!("Failed to parse InflightEquity AAPL quantity '{quantity}': {error:?}")
+                })
+        })
         .collect();
 
-    assert!(
-        !inflight_events.is_empty(),
-        "Expected InflightEquity polling events while the mint was pending"
-    );
-
-    let mut saw_aapl_inflight = false;
-
-    for inflight_event in inflight_events {
-        let Some(quantity_value) = inflight_event
-            .payload
-            .get("InflightEquity")
-            .and_then(|inner| inner.get("mints"))
-            .and_then(|mints| mints.get("AAPL"))
-            .and_then(serde_json::Value::as_str)
-        else {
-            continue;
-        };
-
-        saw_aapl_inflight = true;
-
-        let quantity = float!(quantity_value);
-        assert!(
-            quantity.lt(float!(1000))?,
-            "Foreign wallet pending mint should be filtered out of inflight polling, \
-             got AAPL mint quantity {quantity_value} in payload {}",
-            inflight_event.payload,
-        );
-    }
-
-    assert!(
-        saw_aapl_inflight,
-        "Expected at least one InflightEquity snapshot containing the bot's own AAPL mint"
+    assert_eq!(
+        observed_inflight_mints
+            .iter()
+            .filter(|quantity| **quantity >= foreign_request_quantity)
+            .count(),
+        0,
+        "Foreign wallet request should never appear in inflight polling: \
+         {observed_inflight_mints:?}",
     );
 
     // Verify the foreign request still exists in the mock but was not
@@ -1390,6 +1413,404 @@ async fn inflight_polling_emits_events_for_pending_requests() -> anyhow::Result<
 
     pool.close().await;
     bot.abort();
+    Ok(())
+}
+
+/// A mint accepted before shutdown must resume and complete after restart.
+#[test_log::test(tokio::test)]
+async fn interrupted_mint_resumes_after_restart() -> anyhow::Result<()> {
+    let onchain_price = float!(150.00);
+    let broker_fill_price = float!(148.00);
+    let amount_per_trade = float!(7.5);
+
+    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
+    infra.tokenization_service.set_polls_until_complete(4);
+
+    let wrapped_token = infra.equity_addresses[0].1;
+    let unwrapped_token = infra.equity_addresses[0].2;
+
+    let balance_skew: U256 = parse_units("1", 18)?.into();
+    crate::base_chain::IERC20::new(unwrapped_token, &infra.base_chain.provider)
+        .transfer(infra.base_chain.taker, balance_skew)
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+
+    let mut prepared_orders = Vec::new();
+    for _ in 0..3 {
+        prepared_orders.push(
+            infra
+                .base_chain
+                .setup_order()
+                .symbol("AAPL")
+                .amount(amount_per_trade)
+                .price(onchain_price)
+                .direction(TakeDirection::SellEquity)
+                .call()
+                .await?,
+        );
+    }
+
+    let owner_unwrapped_balance_before_takes =
+        crate::base_chain::IERC20::new(unwrapped_token, &infra.base_chain.provider)
+            .balanceOf(infra.base_chain.owner)
+            .call()
+            .await?;
+    let owner_wrapped_balance_before_takes =
+        crate::base_chain::IERC20::new(wrapped_token, &infra.base_chain.provider)
+            .balanceOf(infra.base_chain.owner)
+            .call()
+            .await?;
+    let owner_unwrapped_shares_before_takes =
+        st0x_execution::FractionalShares::from_u256_18_decimals(
+            owner_unwrapped_balance_before_takes,
+        )?;
+    let owner_wrapped_shares_before_takes =
+        st0x_execution::FractionalShares::from_u256_18_decimals(
+            owner_wrapped_balance_before_takes,
+        )?;
+
+    let current_block = infra.base_chain.provider.get_block_number().await?;
+    let cash_vault_id = prepared_orders[0].input_vault_id;
+    let equity_vault_ids = HashMap::from([("AAPL".to_owned(), prepared_orders[0].output_vault_id)]);
+
+    let ctx1 = build_rebalancing_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .equity_tokens(&infra.equity_addresses)
+        .equity_vault_ids(&equity_vault_ids)
+        .cash_vault_id(cash_vault_id)
+        .usdc_rebalancing(UsdcRebalancing::Disabled)
+        .cash_rebalancing(OperationMode::Disabled)
+        .redemption_wallet(REDEMPTION_WALLET)
+        .call()?;
+    let mut bot1 = spawn_bot(ctx1);
+
+    assert_initial_base_wallet_unwrapped_and_wrapped_equity_snapshot(
+        &mut bot1,
+        &infra.db_path,
+        "AAPL",
+        owner_unwrapped_shares_before_takes,
+        owner_wrapped_shares_before_takes,
+    )
+    .await?;
+
+    let mut take_results = Vec::new();
+    for prepared in &prepared_orders {
+        take_results.push(infra.base_chain.take_prepared_order(prepared).await?);
+    }
+
+    poll_for_events_with_timeout(
+        &mut bot1,
+        &infra.db_path,
+        "TokenizedEquityMintEvent::MintAccepted",
+        1,
+        Duration::from_secs(120),
+    )
+    .await;
+
+    let pool = connect_db(&infra.db_path).await?;
+    let mint_events_before_restart = fetch_events_by_type(&pool, "TokenizedEquityMint").await?;
+    let resumed_aggregate_id = aggregate_id_for_event(
+        &mint_events_before_restart,
+        "TokenizedEquityMintEvent::MintAccepted",
+    );
+    pool.close().await;
+
+    let requests_before_restart = infra.tokenization_service.tokenization_requests();
+    let pending_mints_before_restart = count_tokenization_requests(
+        &requests_before_restart,
+        TokenizationRequestType::Mint,
+        "AAPL",
+        st0x_hedge::mock_api::TokenizationStatus::Pending,
+    );
+    assert!(
+        pending_mints_before_restart >= 1,
+        "Expected the mint request to still be pending before restart"
+    );
+
+    bot1.abort();
+    let _ = bot1.await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let ctx2 = build_rebalancing_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .equity_tokens(&infra.equity_addresses)
+        .equity_vault_ids(&equity_vault_ids)
+        .cash_vault_id(cash_vault_id)
+        .usdc_rebalancing(UsdcRebalancing::Disabled)
+        .cash_rebalancing(OperationMode::Disabled)
+        .redemption_wallet(REDEMPTION_WALLET)
+        .call()?;
+    let mut bot2 = spawn_bot(ctx2);
+
+    poll_for_events_with_timeout(
+        &mut bot2,
+        &infra.db_path,
+        "TokenizedEquityMintEvent::DepositedIntoRaindex",
+        1,
+        Duration::from_secs(120),
+    )
+    .await;
+
+    let pool = connect_db(&infra.db_path).await?;
+    let mint_events_after_restart = fetch_events_by_type(&pool, "TokenizedEquityMint").await?;
+    assert_single_clean_aggregate(&mint_events_after_restart, &["Failed", "Rejected"]);
+    assert_event_subsequence(
+        &mint_events_after_restart,
+        &[
+            "TokenizedEquityMintEvent::MintRequested",
+            "TokenizedEquityMintEvent::MintAccepted",
+            "TokenizedEquityMintEvent::TokensReceived",
+            "TokenizedEquityMintEvent::TokensWrapped",
+            "TokenizedEquityMintEvent::DepositedIntoRaindex",
+        ],
+    );
+    assert_eq!(
+        aggregate_id_for_event(
+            &mint_events_after_restart,
+            "TokenizedEquityMintEvent::DepositedIntoRaindex",
+        ),
+        resumed_aggregate_id,
+        "Expected the interrupted mint aggregate to complete after restart",
+    );
+    pool.close().await;
+
+    let requests_after_restart = infra.tokenization_service.tokenization_requests();
+    let completed_mints_after_restart = count_tokenization_requests(
+        &requests_after_restart,
+        TokenizationRequestType::Mint,
+        "AAPL",
+        st0x_hedge::mock_api::TokenizationStatus::Completed,
+    );
+    assert!(
+        completed_mints_after_restart >= 1,
+        "Expected a completed mint request after restart"
+    );
+
+    let expected_positions = [ExpectedPosition::builder()
+        .symbol("AAPL")
+        .amount(float!(22.5))
+        .direction(TakeDirection::SellEquity)
+        .onchain_price(onchain_price)
+        .broker_fill_price(broker_fill_price)
+        .expected_accumulated_long(float!(0))
+        .expected_accumulated_short(float!(22.5))
+        .expected_net(float!(0))
+        .build()];
+
+    assert_equity_rebalancing_flow()
+        .expected_positions(&expected_positions)
+        .take_results(&take_results)
+        .provider(&infra.base_chain.provider)
+        .orderbook(infra.base_chain.orderbook)
+        .owner(infra.base_chain.owner)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .rebalance_type(EquityRebalanceType::Mint {
+            symbol: "AAPL",
+            tokenization: &infra.tokenization_service,
+        })
+        .call()
+        .await?;
+
+    bot2.abort();
+    Ok(())
+}
+
+/// A redemption detected before shutdown must resume and complete after restart.
+#[test_log::test(tokio::test)]
+async fn interrupted_redemption_resumes_after_restart() -> anyhow::Result<()> {
+    let onchain_price = float!(112.50);
+    let broker_fill_price = float!(113.60);
+    let trade_amount = float!(12.5);
+
+    let infra = TestInfra::start(
+        vec![("AAPL", broker_fill_price)],
+        vec![("AAPL", float!("20"))],
+    )
+    .await?;
+    infra.tokenization_service.set_polls_until_complete(4);
+
+    let prepared = infra
+        .base_chain
+        .setup_order()
+        .symbol("AAPL")
+        .amount(trade_amount)
+        .price(onchain_price)
+        .direction(TakeDirection::BuyEquity)
+        .call()
+        .await?;
+
+    let vault_addr = infra.equity_addresses[0].1;
+    let underlying_addr = infra.equity_addresses[0].2;
+    let redemption_wallet_balance_before =
+        crate::base_chain::IERC20::new(underlying_addr, &infra.base_chain.provider)
+            .balanceOf(REDEMPTION_WALLET)
+            .call()
+            .await?;
+    let equity_vault_id = prepared.input_vault_id;
+    let extra_equity: U256 = parse_units("20", 18)?.into();
+    infra
+        .base_chain
+        .deposit_into_raindex_vault(vault_addr, equity_vault_id, extra_equity, 18)
+        .await?;
+
+    let current_block = infra.base_chain.provider.get_block_number().await?;
+    let cash_vault_id = prepared.output_vault_id;
+    let equity_vault_ids = HashMap::from([("AAPL".to_owned(), prepared.input_vault_id)]);
+
+    let ctx1 = build_rebalancing_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .equity_tokens(&infra.equity_addresses)
+        .equity_vault_ids(&equity_vault_ids)
+        .cash_vault_id(cash_vault_id)
+        .usdc_rebalancing(UsdcRebalancing::Disabled)
+        .cash_rebalancing(OperationMode::Disabled)
+        .redemption_wallet(REDEMPTION_WALLET)
+        .call()?;
+    let mut bot1 = spawn_bot(ctx1);
+
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    let take_result = infra.base_chain.take_prepared_order(&prepared).await?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    poll_for_events_with_timeout(
+        &mut bot1,
+        &infra.db_path,
+        "EquityRedemptionEvent::Detected",
+        1,
+        Duration::from_secs(120),
+    )
+    .await;
+
+    let pool = connect_db(&infra.db_path).await?;
+    let redemption_events_before_restart = fetch_events_by_type(&pool, "EquityRedemption").await?;
+    let resumed_aggregate_id = aggregate_id_for_event(
+        &redemption_events_before_restart,
+        "EquityRedemptionEvent::Detected",
+    );
+    pool.close().await;
+
+    let requests_before_restart = infra.tokenization_service.tokenization_requests();
+    let pending_redemptions_before_restart = count_tokenization_requests(
+        &requests_before_restart,
+        TokenizationRequestType::Redeem,
+        "AAPL",
+        st0x_hedge::mock_api::TokenizationStatus::Pending,
+    );
+    assert!(
+        pending_redemptions_before_restart >= 1,
+        "Expected the redemption request to still be pending before restart"
+    );
+
+    bot1.abort();
+    let _ = bot1.await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let ctx2 = build_rebalancing_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .equity_tokens(&infra.equity_addresses)
+        .equity_vault_ids(&equity_vault_ids)
+        .cash_vault_id(cash_vault_id)
+        .usdc_rebalancing(UsdcRebalancing::Disabled)
+        .cash_rebalancing(OperationMode::Disabled)
+        .redemption_wallet(REDEMPTION_WALLET)
+        .call()?;
+    let mut bot2 = spawn_bot(ctx2);
+
+    poll_for_events_with_timeout(
+        &mut bot2,
+        &infra.db_path,
+        "EquityRedemptionEvent::Completed",
+        1,
+        Duration::from_secs(120),
+    )
+    .await;
+
+    let pool = connect_db(&infra.db_path).await?;
+    let redemption_events_after_restart = fetch_events_by_type(&pool, "EquityRedemption").await?;
+    assert_single_clean_aggregate(&redemption_events_after_restart, &["Failed", "Rejected"]);
+    assert_event_subsequence(
+        &redemption_events_after_restart,
+        &[
+            "EquityRedemptionEvent::WithdrawnFromRaindex",
+            "EquityRedemptionEvent::TokensUnwrapped",
+            "EquityRedemptionEvent::TokensSent",
+            "EquityRedemptionEvent::Detected",
+            "EquityRedemptionEvent::Completed",
+        ],
+    );
+    assert_eq!(
+        aggregate_id_for_event(
+            &redemption_events_after_restart,
+            "EquityRedemptionEvent::Completed",
+        ),
+        resumed_aggregate_id,
+        "Expected the interrupted redemption aggregate to complete after restart",
+    );
+    pool.close().await;
+
+    let requests_after_restart = infra.tokenization_service.tokenization_requests();
+    let completed_redemptions_after_restart = count_tokenization_requests(
+        &requests_after_restart,
+        TokenizationRequestType::Redeem,
+        "AAPL",
+        st0x_hedge::mock_api::TokenizationStatus::Completed,
+    );
+    assert!(
+        completed_redemptions_after_restart >= 1,
+        "Expected a completed redemption request after restart"
+    );
+
+    let expected_positions = [ExpectedPosition::builder()
+        .symbol("AAPL")
+        .amount(trade_amount)
+        .direction(TakeDirection::BuyEquity)
+        .onchain_price(onchain_price)
+        .broker_fill_price(broker_fill_price)
+        .expected_accumulated_long(float!(12.5))
+        .expected_accumulated_short(float!(0))
+        .expected_net(float!(0))
+        .build()];
+
+    let redemption_wallet_balance_after =
+        crate::base_chain::IERC20::new(underlying_addr, &infra.base_chain.provider)
+            .balanceOf(REDEMPTION_WALLET)
+            .call()
+            .await?;
+
+    assert_equity_rebalancing_flow()
+        .expected_positions(&expected_positions)
+        .take_results(&[take_result])
+        .provider(&infra.base_chain.provider)
+        .orderbook(infra.base_chain.orderbook)
+        .owner(infra.base_chain.owner)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .rebalance_type(EquityRebalanceType::Redeem {
+            symbol: "AAPL",
+            tokenization: &infra.tokenization_service,
+            redemption_wallet_balance_before,
+            redemption_wallet_balance_after,
+        })
+        .call()
+        .await?;
+
+    bot2.abort();
     Ok(())
 }
 

@@ -1540,9 +1540,143 @@ impl RebalancingTrigger {
         guard.remove(symbol);
     }
 
+    fn mark_equity_in_progress(&self, symbol: &Symbol) {
+        let mut guard = match self.equity_in_progress.write() {
+            Ok(guard) => guard,
+            Err(poison) => poison.into_inner(),
+        };
+        guard.insert(symbol.clone());
+    }
+
     /// Clears the in-progress flag for USDC rebalancing.
     pub(crate) fn clear_usdc_in_progress(&self) {
         self.usdc_in_progress.store(false, Ordering::SeqCst);
+    }
+
+    pub(crate) async fn recover_mint_state(
+        &self,
+        id: &IssuerRequestId,
+        entity: &TokenizedEquityMint,
+    ) -> Result<(), RebalancingTriggerError> {
+        use TokenizedEquityMint::*;
+
+        match entity {
+            MintRequested {
+                symbol, quantity, ..
+            }
+            | MintAccepted {
+                symbol, quantity, ..
+            }
+            | TokensReceived {
+                symbol, quantity, ..
+            }
+            | TokensWrapped {
+                symbol, quantity, ..
+            } => {
+                let quantity = FractionalShares::new(*quantity);
+
+                let (stage, last_progress_at) = match entity {
+                    MintRequested { requested_at, .. } => {
+                        (MintTrackingStage::Requested, *requested_at)
+                    }
+                    MintAccepted { accepted_at, .. } => {
+                        (MintTrackingStage::Accepted, *accepted_at)
+                    }
+                    TokensReceived { received_at, .. } => {
+                        (MintTrackingStage::TokensReceived, *received_at)
+                    }
+                    TokensWrapped { wrapped_at, .. } => {
+                        (MintTrackingStage::TokensWrapped, *wrapped_at)
+                    }
+                    _ => unreachable!(),
+                };
+
+                self.mint_tracking.write().await.insert(
+                    id.clone(),
+                    MintTracking {
+                        symbol: symbol.clone(),
+                        quantity,
+                        stage,
+                        last_progress_at,
+                    },
+                );
+                self.mark_equity_in_progress(symbol);
+
+                if matches!(entity, MintAccepted { .. }) {
+                    let mut inventory = self.inventory.write().await;
+                    *inventory = inventory.clone().update_equity(
+                        symbol,
+                        Inventory::set_inflight(Venue::Hedging, quantity),
+                        Utc::now(),
+                    )?;
+                }
+            }
+            DepositedIntoRaindex { .. } | Failed { .. } => {}
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn recover_redemption_state(
+        &self,
+        id: &RedemptionAggregateId,
+        entity: &EquityRedemption,
+    ) -> Result<(), RebalancingTriggerError> {
+        use EquityRedemption::*;
+
+        match entity {
+            WithdrawnFromRaindex {
+                symbol, quantity, ..
+            }
+            | TokensUnwrapped {
+                symbol, quantity, ..
+            }
+            | TokensSent {
+                symbol, quantity, ..
+            }
+            | Pending {
+                symbol, quantity, ..
+            } => {
+                let quantity = FractionalShares::new(*quantity);
+
+                let (stage, last_progress_at) = match entity {
+                    WithdrawnFromRaindex { withdrawn_at, .. } => {
+                        (RedemptionTrackingStage::WithdrawnFromRaindex, *withdrawn_at)
+                    }
+                    TokensUnwrapped { unwrapped_at, .. } => {
+                        (RedemptionTrackingStage::TokensUnwrapped, *unwrapped_at)
+                    }
+                    TokensSent { sent_at, .. } => {
+                        (RedemptionTrackingStage::TokensSent, *sent_at)
+                    }
+                    Pending { detected_at, .. } => {
+                        (RedemptionTrackingStage::Detected, *detected_at)
+                    }
+                    _ => unreachable!(),
+                };
+
+                self.redemption_tracking.write().await.insert(
+                    id.clone(),
+                    RedemptionTracking {
+                        symbol: symbol.clone(),
+                        quantity,
+                        stage,
+                        last_progress_at,
+                    },
+                );
+                self.mark_equity_in_progress(symbol);
+
+                let mut inventory = self.inventory.write().await;
+                *inventory = inventory.clone().update_equity(
+                    symbol,
+                    Inventory::set_inflight(Venue::MarketMaking, quantity),
+                    Utc::now(),
+                )?;
+            }
+            Completed { .. } | Failed { .. } => {}
+        }
+
+        Ok(())
     }
 
     async fn on_mint(
@@ -1788,6 +1922,75 @@ mod tests {
             )),
             receiver,
         )
+    }
+
+    #[tokio::test]
+    async fn recover_mint_state_restores_tracking_and_inflight() {
+        let (trigger, _receiver) = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mint_id = IssuerRequestId::new("mint-recovery");
+
+        trigger
+            .recover_mint_state(
+                &mint_id,
+                &TokenizedEquityMint::MintAccepted {
+                    symbol: symbol.clone(),
+                    quantity: float!(10),
+                    wallet: Address::ZERO,
+                    issuer_request_id: mint_id.clone(),
+                    tokenization_request_id: TokenizationRequestId("TOK-1".to_string()),
+                    requested_at: Utc::now(),
+                    accepted_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert_eq!(
+            trigger.mint_tracking.read().await.get(&mint_id),
+            Some(&(symbol.clone(), FractionalShares::new(float!(10))))
+        );
+
+        let inflight = {
+            let inventory = trigger.inventory.read().await;
+            inventory.equity_inflight(&symbol, Venue::Hedging)
+        };
+        assert_eq!(inflight, Some(FractionalShares::new(float!(10))));
+    }
+
+    #[tokio::test]
+    async fn recover_redemption_state_restores_tracking_and_inflight() {
+        let (trigger, _receiver) = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let redemption_id = RedemptionAggregateId::new("redemption-recovery");
+
+        trigger
+            .recover_redemption_state(
+                &redemption_id,
+                &EquityRedemption::Pending {
+                    symbol: symbol.clone(),
+                    quantity: float!(12),
+                    redemption_tx: TxHash::random(),
+                    tokenization_request_id: TokenizationRequestId("TOK-2".to_string()),
+                    sent_at: Utc::now(),
+                    detected_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(trigger.equity_in_progress.read().unwrap().contains(&symbol));
+        assert_eq!(
+            trigger.redemption_tracking.read().await.get(&redemption_id),
+            Some(&(symbol.clone(), FractionalShares::new(float!(12))))
+        );
+
+        let inflight = {
+            let inventory = trigger.inventory.read().await;
+            inventory.equity_inflight(&symbol, Venue::MarketMaking)
+        };
+        assert_eq!(inflight, Some(FractionalShares::new(float!(12))));
     }
 
     /// Mirrors the production wiring where [`InventoryProjection`] writes
