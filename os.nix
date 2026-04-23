@@ -139,8 +139,11 @@ in {
         root = "/nix/var/nix/profiles/per-service/dashboard";
 
         locations = let
-          wsProxy = port: {
-            proxyPass = "http://127.0.0.1:${toString port}/api/ws";
+          port = "8001";
+          backend = "http://127.0.0.1:${port}";
+          apiProxy = path: { proxyPass = "${backend}${path}"; };
+          wsProxy = {
+            proxyPass = "${backend}/api/ws";
             proxyWebsockets = true;
             extraConfig = ''
               proxy_connect_timeout 60;
@@ -150,7 +153,12 @@ in {
           };
         in {
           "/".tryFiles = "$uri $uri/ /index.html";
-          "/api/ws" = wsProxy 8001;
+          "/api/ws" = wsProxy;
+          "/health" = apiProxy "/health";
+          "/logs" = apiProxy "/logs";
+          "/orders/" = apiProxy "/orders/";
+          "/trades" = apiProxy "/trades";
+          "/transfers" = apiProxy "/transfers";
         };
       };
     };
@@ -220,6 +228,7 @@ in {
   systemd = {
     tmpfiles.rules = [
       "d /mnt/data 0755 st0x st0x -"
+      "d /mnt/data/logs 0755 st0x st0x -"
       "d /mnt/data/grafana 0750 grafana grafana -"
     ];
 

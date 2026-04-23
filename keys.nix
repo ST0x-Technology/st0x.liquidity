@@ -40,7 +40,7 @@ rec {
     infra = [ st0x-op ci ];
 
     prod = {
-      ssh = [ juan gleb alastair ci ];
+      ssh = [ juan gleb alastair st0x-op ci ];
       service = [ st0x-op host-prod ];
     };
 

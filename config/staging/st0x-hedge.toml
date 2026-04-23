@@ -1,5 +1,6 @@
 server_port = 8001
 log_level = "debug"
+log_dir = "/mnt/data/logs"
 database_url = "sqlite:///mnt/data/st0x-hedge.db"
 apalis_finished_job_cleanup_interval_secs = 3600
 hyperdx.service_name = "st0x-liquidity"

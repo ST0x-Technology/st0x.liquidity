@@ -105,30 +105,12 @@ in {
               export DEPLOY_HOST="$host_ip"
             fi
 
-            # Verify host key against keys.nix trust anchor
-            scanned=$(ssh-keyscan -t ed25519 "$host_ip" 2>/dev/null | grep -v '^#')
-            expected="$host_ip ${hostKey}"
-
-            if [ -z "$scanned" ]; then
-              echo "ERROR: ssh-keyscan returned no key for $host_ip" >&2
-              exit 1
-            fi
-
-            if [ "$(echo "$scanned" | wc -l)" -ne 1 ]; then
-              echo "ERROR: expected 1 key from $host_ip, got multiple:" >&2
-              echo "$scanned" >&2
-              exit 1
-            fi
-
-            if [ "$scanned" != "$expected" ]; then
-              echo "ERROR: host key mismatch for $host_ip" >&2
-              echo "  expected: $expected" >&2
-              echo "  got:      $scanned" >&2
-              exit 1
-            fi
-
+            # Pin the host key from keys.nix so SSH verifies it during
+            # the handshake. This is safer than ssh-keyscan (which is
+            # unauthenticated and fails silently on some CI runners).
+            mkdir -p "$HOME/.ssh"
             ssh-keygen -R "$host_ip" >/dev/null 2>&1 || true
-            echo "$expected" >> "$HOME/.ssh/known_hosts"
+            echo "$host_ip ${hostKey}" >> "$HOME/.ssh/known_hosts"
 
             identity="''${SSH_IDENTITY:-$HOME/.ssh/id_ed25519}"
             ssh_flag=""

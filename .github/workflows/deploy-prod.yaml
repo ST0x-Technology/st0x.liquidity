@@ -93,6 +93,9 @@ jobs:
           echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
 
+      - name: Warm up Tailscale tunnel
+        run: tailscale ping --c 1 "$DEPLOY_HOST"
+
       - name: Cache Solidity artifacts
         id: cache-sol
         uses: actions/cache@v4
