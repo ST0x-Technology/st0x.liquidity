@@ -1,0 +1,645 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Direct Taker Bot - Architecture Overview</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --red: #f85149;
+    --orange: #d29922;
+    --purple: #bc8cff;
+    --pink: #f778ba;
+    --cyan: #39d2c0;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; padding: 2rem; line-height: 1.6; }
+  h1 { font-size: 2rem; margin-bottom: 0.5rem; }
+  h2 { font-size: 1.4rem; color: var(--accent); margin: 2rem 0 1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.1rem; color: var(--purple); margin: 1.5rem 0 0.75rem; }
+  .subtitle { color: var(--muted); font-size: 1rem; margin-bottom: 2rem; }
+  .container { max-width: 1200px; margin: 0 auto; }
+
+  .stats { display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  .stat { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1rem 1.5rem; flex: 1; min-width: 140px; }
+  .stat-value { font-size: 1.8rem; font-weight: bold; }
+  .stat-label { color: var(--muted); font-size: 0.85rem; }
+  .stat-green .stat-value { color: var(--green); }
+  .stat-red .stat-value { color: var(--red); }
+  .stat-orange .stat-value { color: var(--orange); }
+  .stat-blue .stat-value { color: var(--accent); }
+  .stat-purple .stat-value { color: var(--purple); }
+  .stat-cyan .stat-value { color: var(--cyan); }
+
+  .diagram { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 2rem; margin-bottom: 2rem; overflow-x: auto; }
+  .diagram-title { font-size: 1rem; color: var(--muted); margin-bottom: 1.5rem; text-transform: uppercase; letter-spacing: 0.05em; }
+
+  svg text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; }
+
+  .concept-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  .concept { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.25rem; }
+  .concept-header { font-weight: 600; margin-bottom: 0.5rem; display: flex; align-items: center; gap: 0.5rem; }
+  .concept p { color: var(--muted); font-size: 0.9rem; }
+  .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.75rem; font-weight: 600; }
+  .badge-step { background: rgba(88, 166, 255, 0.15); color: var(--accent); }
+  .badge-shared { background: rgba(63, 185, 80, 0.15); color: var(--green); }
+  .badge-new { background: rgba(210, 153, 34, 0.15); color: var(--orange); }
+  .badge-critical { background: rgba(248, 81, 73, 0.15); color: var(--red); }
+
+  .note { background: #1c2128; border: 1px dashed var(--border); border-radius: 6px; padding: 0.75rem 1rem; margin: 1rem 0; font-size: 0.9rem; color: var(--muted); }
+  .note strong { color: var(--orange); }
+
+  @media (max-width: 800px) {
+    .concept-grid { grid-template-columns: 1fr; }
+    .stats { flex-direction: column; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>Direct Taker Bot</h1>
+<p class="subtitle">Architecture overview for the Raindex order taker &mdash; monitors third-party orders, evaluates profitability, and takes profitable ones</p>
+
+<div class="stats">
+  <div class="stat stat-blue"><div class="stat-value">5</div><div class="stat-label">Pipeline Stages</div></div>
+  <div class="stat stat-green"><div class="stat-value">2</div><div class="stat-label">Token Flow Scenarios</div></div>
+  <div class="stat stat-orange"><div class="stat-value">3</div><div class="stat-label">Raindex Events</div></div>
+  <div class="stat stat-purple"><div class="stat-value">CQRS</div><div class="stat-label">Architecture Pattern</div></div>
+  <div class="stat stat-cyan"><div class="stat-value">JIT</div><div class="stat-label">Minting Strategy</div></div>
+</div>
+
+<!-- ============================================================ -->
+<h2>1. What It Does (vs the Liquidity Bot)</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+<div class="diagram-title">Two Bots, Opposite Roles</div>
+<svg width="960" height="320" viewBox="0 0 960 320">
+  <!-- Liquidity Bot -->
+  <rect x="20" y="20" width="440" height="270" rx="10" fill="#1c2128" stroke="#30363d" stroke-width="1.5"/>
+  <text x="240" y="50" text-anchor="middle" fill="#8b949e" font-size="14" font-weight="700">LIQUIDITY BOT (existing)</text>
+
+  <text x="40" y="80" fill="#8b949e" font-size="12">Role:</text>
+  <text x="120" y="80" fill="#e6edf3" font-size="12">Passive market maker</text>
+  <text x="40" y="105" fill="#8b949e" font-size="12">Orders:</text>
+  <text x="120" y="105" fill="#e6edf3" font-size="12">Places its OWN orders on Raindex</text>
+  <text x="40" y="130" fill="#8b949e" font-size="12">Events:</text>
+  <text x="120" y="130" fill="#e6edf3" font-size="12">Listens for ClearV3, TakeOrderV3 (our fills)</text>
+  <text x="40" y="155" fill="#8b949e" font-size="12">Capital:</text>
+  <text x="120" y="155" fill="#e6edf3" font-size="12">Pre-funded Raindex vaults</text>
+  <text x="40" y="180" fill="#8b949e" font-size="12">Hedging:</text>
+  <text x="120" y="180" fill="#e6edf3" font-size="12">After fill, hedge on brokerage</text>
+  <text x="40" y="205" fill="#8b949e" font-size="12">Writes:</text>
+  <text x="120" y="205" fill="#e6edf3" font-size="12">Deposit/withdraw to vaults</text>
+
+  <rect x="40" y="225" width="400" height="45" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+  <text x="240" y="252" text-anchor="middle" fill="#8b949e" font-size="11">Wait for someone to take our order -> hedge the exposure</text>
+
+  <!-- Arrow -->
+  <text x="490" y="155" text-anchor="middle" fill="#30363d" font-size="28">vs</text>
+
+  <!-- Taker Bot -->
+  <rect x="520" y="20" width="420" height="270" rx="10" fill="#1c2128" stroke="#58a6ff" stroke-width="2"/>
+  <text x="730" y="50" text-anchor="middle" fill="#58a6ff" font-size="14" font-weight="700">DIRECT TAKER BOT (new)</text>
+
+  <text x="540" y="80" fill="#8b949e" font-size="12">Role:</text>
+  <text x="620" y="80" fill="#e6edf3" font-size="12">Active arbitrageur</text>
+  <text x="540" y="105" fill="#8b949e" font-size="12">Orders:</text>
+  <text x="620" y="105" fill="#e6edf3" font-size="12">Takes OTHERS' orders on Raindex</text>
+  <text x="540" y="130" fill="#8b949e" font-size="12">Events:</text>
+  <text x="620" y="130" fill="#e6edf3" font-size="12">AddOrderV3, RemoveOrderV3, TakeOrderV3</text>
+  <text x="540" y="155" fill="#8b949e" font-size="12">Capital:</text>
+  <text x="620" y="155" fill="#e6edf3" font-size="12">Gas + USDC + brokerage margin</text>
+  <text x="540" y="180" fill="#8b949e" font-size="12">Tokens:</text>
+  <text x="620" y="180" fill="#e6edf3" font-size="12">Mints/redeems via Alpaca API (JIT)</text>
+  <text x="540" y="205" fill="#8b949e" font-size="12">Writes:</text>
+  <text x="620" y="205" fill="#e6edf3" font-size="12">takeOrders4 calls (direct from wallet)</text>
+
+  <rect x="540" y="225" width="380" height="45" rx="6" fill="#0d2137" stroke="#58a6ff" stroke-width="1"/>
+  <text x="730" y="252" text-anchor="middle" fill="#58a6ff" font-size="11">Find profitable order -> acquire tokens -> take it -> profit</text>
+</svg>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. End-to-End Pipeline</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+<div class="diagram-title">Data flows from blockchain events through five stages to settlement</div>
+<svg width="960" height="720" viewBox="0 0 960 720">
+
+  <!-- ===== ROW 1: Stages 1-3 (horizontal) ===== -->
+
+  <!-- Stage 1: Order Collector -->
+  <rect x="20" y="20" width="270" height="150" rx="10" fill="#1c2128" stroke="#d29922" stroke-width="2"/>
+  <text x="155" y="48" text-anchor="middle" fill="#d29922" font-size="14" font-weight="700">1. ORDER COLLECTOR</text>
+  <text x="155" y="66" text-anchor="middle" fill="#8b949e" font-size="10">(TrackedOrder aggregate)</text>
+  <text x="40" y="90" fill="#3fb950" font-size="11">AddOrderV3</text>
+  <text x="145" y="90" fill="#8b949e" font-size="11">-> Discover + filter</text>
+  <text x="40" y="108" fill="#f85149" font-size="11">RemoveOrderV3</text>
+  <text x="145" y="108" fill="#8b949e" font-size="11">-> Mark Removed</text>
+  <text x="40" y="126" fill="#d29922" font-size="11">TakeOrderV3</text>
+  <text x="145" y="126" fill="#8b949e" font-size="11">-> Update remaining</text>
+  <text x="40" y="155" fill="#8b949e" font-size="10">Filters: excluded_owner, token pairs</text>
+
+  <!-- Arrow 1 -> 2 -->
+  <line x1="290" y1="95" x2="340" y2="95" stroke="#d29922" stroke-width="1.5"/>
+  <polygon points="335,90 345,95 335,100" fill="#d29922"/>
+
+  <!-- Stage 2: Order Classification -->
+  <rect x="345" y="20" width="270" height="150" rx="10" fill="#1c2128" stroke="#bc8cff" stroke-width="2"/>
+  <text x="480" y="48" text-anchor="middle" fill="#bc8cff" font-size="14" font-weight="700">2. CLASSIFICATION</text>
+  <text x="480" y="66" text-anchor="middle" fill="#8b949e" font-size="10">(Rainlang decompilation)</text>
+  <text x="365" y="92" fill="#e6edf3" font-size="11">Decompile bytecode to classify</text>
+  <text x="365" y="110" fill="#e6edf3" font-size="11">the order's pricing strategy:</text>
+  <rect x="365" y="120" width="115" height="22" rx="4" fill="#1b2d1b" stroke="#3fb950" stroke-width="1"/>
+  <text x="423" y="135" text-anchor="middle" fill="#3fb950" font-size="10">Fixed-price</text>
+  <rect x="490" y="120" width="115" height="22" rx="4" fill="#1b2d1b" stroke="#3fb950" stroke-width="1"/>
+  <text x="548" y="135" text-anchor="middle" fill="#3fb950" font-size="10">Pyth oracle</text>
+  <text x="365" y="162" fill="#f85149" font-size="10">Unsupported -> skip</text>
+
+  <!-- Arrow 2 -> 3 -->
+  <line x1="615" y1="95" x2="665" y2="95" stroke="#bc8cff" stroke-width="1.5"/>
+  <polygon points="660,90 670,95 660,100" fill="#bc8cff"/>
+
+  <!-- Stage 3: Profitability -->
+  <rect x="670" y="20" width="270" height="150" rx="10" fill="#1c2128" stroke="#3fb950" stroke-width="2"/>
+  <text x="805" y="48" text-anchor="middle" fill="#3fb950" font-size="14" font-weight="700">3. PROFITABILITY</text>
+  <text x="805" y="66" text-anchor="middle" fill="#8b949e" font-size="10">(continuous re-evaluation)</text>
+  <text x="690" y="92" fill="#e6edf3" font-size="11">Order price vs Alpaca price</text>
+  <text x="690" y="110" fill="#e6edf3" font-size="11">Include costs: gas, fees, mint</text>
+  <text x="690" y="128" fill="#e6edf3" font-size="11">Check hold pool inventory</text>
+  <text x="690" y="148" fill="#d29922" font-size="11">spread > costs + min_margin ?</text>
+  <text x="690" y="162" fill="#8b949e" font-size="10">Re-evaluates every cycle</text>
+
+  <!-- Price feed feeding into Stage 3 -->
+  <rect x="710" y="190" width="190" height="40" rx="6" fill="#1c2128" stroke="#39d2c0" stroke-width="1.5"/>
+  <text x="805" y="210" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="600">Alpaca / Pyth Prices</text>
+  <text x="805" y="222" text-anchor="middle" fill="#8b949e" font-size="9">real-time price feeds</text>
+  <line x1="805" y1="190" x2="805" y2="170" stroke="#39d2c0" stroke-width="1" stroke-dasharray="4,3"/>
+  <polygon points="800,175 805,168 810,175" fill="#39d2c0"/>
+
+  <!-- ===== Arrow from Row 1 down to Row 2 ===== -->
+  <!-- "Profitable" arrow from stage 3 down to center of stage 4 -->
+  <line x1="480" y1="170" x2="480" y2="260" stroke="#3fb950" stroke-width="2"/>
+  <polygon points="475,255 480,265 485,255" fill="#3fb950"/>
+  <text x="495" y="220" fill="#3fb950" font-size="10" font-weight="600">profitable!</text>
+
+  <!-- "Not profitable" from stage 3 right side -->
+  <rect x="855" y="90" width="85" height="28" rx="6" fill="#2d1b1b" stroke="#f85149" stroke-width="1"/>
+  <text x="898" y="108" text-anchor="middle" fill="#f85149" font-size="10">wait / skip</text>
+  <!-- loop arrow back to indicate re-eval -->
+  <path d="M 898,118 C 898,140 920,140 920,100 C 920,70 898,70 898,88" fill="none" stroke="#f85149" stroke-width="1" stroke-dasharray="3,3"/>
+  <polygon points="895,88 898,80 901,88" fill="#f85149"/>
+
+  <!-- ===== ROW 2: Stage 4 — Token Acquisition + Execution ===== -->
+  <rect x="130" y="268" width="700" height="170" rx="10" fill="#1c2128" stroke="#58a6ff" stroke-width="2"/>
+  <text x="480" y="295" text-anchor="middle" fill="#58a6ff" font-size="14" font-weight="700">4. TOKEN ACQUISITION + EXECUTION</text>
+
+  <!-- Scenario A -->
+  <rect x="155" y="310" width="310" height="110" rx="8" fill="#161b22" stroke="#39d2c0" stroke-width="1.5"/>
+  <text x="310" y="332" text-anchor="middle" fill="#39d2c0" font-size="12" font-weight="600">Scenario A: User sells wtToken</text>
+  <text x="310" y="352" text-anchor="middle" fill="#8b949e" font-size="10">Bot sends USDC, receives wtToken</text>
+  <text x="310" y="372" text-anchor="middle" fill="#e6edf3" font-size="10">Simple: just need USDC in wallet</text>
+  <text x="310" y="392" text-anchor="middle" fill="#e6edf3" font-size="10">-> call takeOrders4 immediately</text>
+  <text x="310" y="410" text-anchor="middle" fill="#8b949e" font-size="9">No minting needed. Instant execution.</text>
+
+  <!-- Scenario B -->
+  <rect x="495" y="310" width="310" height="110" rx="8" fill="#161b22" stroke="#f778ba" stroke-width="1.5"/>
+  <text x="650" y="332" text-anchor="middle" fill="#f778ba" font-size="12" font-weight="600">Scenario B: User buys wtToken</text>
+  <text x="650" y="352" text-anchor="middle" fill="#8b949e" font-size="10">Bot sends wtToken, receives USDC</text>
+  <text x="650" y="372" text-anchor="middle" fill="#e6edf3" font-size="10">Check hold pool first, otherwise JIT:</text>
+  <text x="650" y="392" text-anchor="middle" fill="#d29922" font-size="10">Buy AAPL -> Mint -> Wrap -> Re-validate -> Take</text>
+  <text x="650" y="410" text-anchor="middle" fill="#f85149" font-size="9">Latency risk: order may vanish during mint</text>
+
+  <!-- ===== HOLD POOL (left side, connected to Stage 4) ===== -->
+  <rect x="20" y="460" width="220" height="130" rx="10" fill="#1c2128" stroke="#d29922" stroke-width="2" stroke-dasharray="6,3"/>
+  <text x="130" y="488" text-anchor="middle" fill="#d29922" font-size="13" font-weight="700">HOLD POOL</text>
+  <text x="130" y="506" text-anchor="middle" fill="#8b949e" font-size="10">wtTokens in bot's wallet</text>
+  <text x="130" y="524" text-anchor="middle" fill="#e6edf3" font-size="10">Absorbs: Scenario A takes</text>
+  <text x="130" y="540" text-anchor="middle" fill="#e6edf3" font-size="10">+ orphaned Scenario B mints</text>
+  <text x="130" y="558" text-anchor="middle" fill="#e6edf3" font-size="10">Supplies: Scenario B (skip mint)</text>
+  <text x="130" y="578" text-anchor="middle" fill="#8b949e" font-size="10">Retention -> redeem if unused</text>
+
+  <!-- Arrow: Stage 4 Scenario A -> Hold Pool (tokens in) -->
+  <line x1="310" y1="438" x2="200" y2="460" stroke="#d29922" stroke-width="1.5"/>
+  <polygon points="203,455 197,463 207,463" fill="#d29922"/>
+  <text x="270" y="455" fill="#d29922" font-size="9">wtTokens in</text>
+
+  <!-- Arrow: Hold Pool -> Stage 4 Scenario B (tokens out) -->
+  <line x1="240" y1="490" x2="495" y2="370" stroke="#d29922" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <polygon points="490,365 500,370 492,375" fill="#d29922"/>
+  <text x="350" y="418" fill="#d29922" font-size="9">supply wtTokens</text>
+
+  <!-- ===== Arrows from Row 2 down to Row 3 ===== -->
+  <line x1="310" y1="438" x2="310" y2="480" stroke="#39d2c0" stroke-width="1.5"/>
+  <line x1="310" y1="480" x2="360" y2="480" stroke="#39d2c0" stroke-width="1.5"/>
+  <!-- redirect through to settlement -->
+  <line x1="360" y1="480" x2="360" y2="530" stroke="#39d2c0" stroke-width="1.5"/>
+  <!-- Scenario B arrow down -->
+  <line x1="650" y1="438" x2="650" y2="530" stroke="#f778ba" stroke-width="1.5"/>
+
+  <!-- Combined down arrows into Stage 5 -->
+  <polygon points="355,525 360,535 365,525" fill="#39d2c0"/>
+  <polygon points="645,525 650,535 655,525" fill="#f778ba"/>
+
+  <!-- ===== ROW 3: Stage 5 — Settlement ===== -->
+  <rect x="275" y="538" width="430" height="160" rx="10" fill="#1c2128" stroke="#3fb950" stroke-width="2"/>
+  <text x="490" y="563" text-anchor="middle" fill="#3fb950" font-size="14" font-weight="700">5. SETTLEMENT</text>
+
+  <!-- Scenario A settlement -->
+  <rect x="295" y="575" width="190" height="105" rx="8" fill="#161b22" stroke="#39d2c0" stroke-width="1.5"/>
+  <text x="390" y="593" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="600">Scenario A</text>
+  <text x="390" y="612" text-anchor="middle" fill="#e6edf3" font-size="10">wtToken -> Hold Pool</text>
+  <text x="390" y="628" text-anchor="middle" fill="#8b949e" font-size="10">or immediate redeem:</text>
+  <text x="390" y="644" text-anchor="middle" fill="#8b949e" font-size="10">Unwrap -> Redeem -> Sell</text>
+  <text x="390" y="665" text-anchor="middle" fill="#3fb950" font-size="10">Profit = sale - USDC spent</text>
+
+  <!-- Scenario B settlement -->
+  <rect x="500" y="575" width="190" height="105" rx="8" fill="#161b22" stroke="#f778ba" stroke-width="1.5"/>
+  <text x="595" y="593" text-anchor="middle" fill="#f778ba" font-size="11" font-weight="600">Scenario B</text>
+  <text x="595" y="612" text-anchor="middle" fill="#e6edf3" font-size="10">Already hedged</text>
+  <text x="595" y="628" text-anchor="middle" fill="#8b949e" font-size="10">(AAPL bought before mint)</text>
+  <text x="595" y="644" text-anchor="middle" fill="#8b949e" font-size="10">USDC received = revenue</text>
+  <text x="595" y="665" text-anchor="middle" fill="#3fb950" font-size="10">Profit = USDC - costs</text>
+
+</svg>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. Token Flow: The Two Scenarios</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+<div class="diagram-title">Scenario A: User Sells wtToken (e.g., wtAAPL -> USDC)</div>
+<svg width="960" height="220" viewBox="0 0 960 220">
+  <!-- User's Order -->
+  <rect x="20" y="40" width="160" height="70" rx="8" fill="#1c2128" stroke="#39d2c0" stroke-width="2"/>
+  <text x="100" y="65" text-anchor="middle" fill="#39d2c0" font-size="13" font-weight="600">User's Order</text>
+  <text x="100" y="85" text-anchor="middle" fill="#8b949e" font-size="10">Outputs: wtAAPL</text>
+  <text x="100" y="100" text-anchor="middle" fill="#8b949e" font-size="10">Inputs: USDC</text>
+
+  <!-- Arrow: USDC to order -->
+  <line x1="180" y1="60" x2="250" y2="60" stroke="#58a6ff" stroke-width="2"/>
+  <polygon points="245,55 255,60 245,65" fill="#58a6ff"/>
+  <text x="215" y="52" text-anchor="middle" fill="#58a6ff" font-size="10">USDC</text>
+
+  <!-- takeOrders4 -->
+  <rect x="255" y="40" width="140" height="70" rx="8" fill="#1c2128" stroke="#58a6ff" stroke-width="2"/>
+  <text x="325" y="65" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="600">takeOrders4</text>
+  <text x="325" y="85" text-anchor="middle" fill="#8b949e" font-size="10">Bot takes the order</text>
+  <text x="325" y="100" text-anchor="middle" fill="#8b949e" font-size="10">(onchain tx)</text>
+
+  <!-- Arrow: wtAAPL from order -->
+  <line x1="395" y1="60" x2="465" y2="60" stroke="#3fb950" stroke-width="2"/>
+  <polygon points="460,55 470,60 460,65" fill="#3fb950"/>
+  <text x="430" y="52" text-anchor="middle" fill="#3fb950" font-size="10">wtAAPL</text>
+
+  <!-- Bot wallet -->
+  <rect x="470" y="40" width="140" height="70" rx="8" fill="#1c2128" stroke="#3fb950" stroke-width="2"/>
+  <text x="540" y="62" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="600">Bot Wallet</text>
+  <text x="540" y="82" text-anchor="middle" fill="#8b949e" font-size="10">Receives wtAAPL</text>
+  <text x="540" y="98" text-anchor="middle" fill="#d29922" font-size="10">Decision point...</text>
+
+  <!-- Path A: Hold Pool -->
+  <line x1="610" y1="55" x2="680" y2="40" stroke="#d29922" stroke-width="1.5"/>
+  <polygon points="675,35 685,40 675,45" fill="#d29922"/>
+  <rect x="685" y="20" width="130" height="40" rx="6" fill="#1c2128" stroke="#d29922" stroke-width="1.5"/>
+  <text x="750" y="37" text-anchor="middle" fill="#d29922" font-size="11" font-weight="600">Hold Pool</text>
+  <text x="750" y="52" text-anchor="middle" fill="#8b949e" font-size="9">for Scenario B reuse</text>
+
+  <!-- Path B: Redeem -->
+  <line x1="610" y1="85" x2="680" y2="100" stroke="#f85149" stroke-width="1.5"/>
+  <polygon points="675,95 685,100 675,105" fill="#f85149"/>
+  <rect x="685" y="80" width="250" height="40" rx="6" fill="#1c2128" stroke="#f85149" stroke-width="1.5"/>
+  <text x="810" y="97" text-anchor="middle" fill="#f85149" font-size="11" font-weight="600">Unwrap -> Redeem -> Sell on Alpaca</text>
+  <text x="810" y="112" text-anchor="middle" fill="#8b949e" font-size="9">if hold pool at capacity or no demand</text>
+
+  <!-- Timeline -->
+  <rect x="20" y="150" width="920" height="50" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+  <text x="40" y="172" fill="#39d2c0" font-size="12" font-weight="600">Timing:</text>
+  <text x="115" y="172" fill="#e6edf3" font-size="12">Take is instant (onchain). Bot has USDC ready. Profit deferred until wtTokens are disposed of.</text>
+  <text x="40" y="190" fill="#8b949e" font-size="11">Capital needed: USDC in wallet. No minting required. Low latency risk.</text>
+</svg>
+</div>
+
+<div class="diagram">
+<div class="diagram-title">Scenario B: User Buys wtToken (e.g., USDC -> wtAAPL) &mdash; JIT Minting</div>
+<svg width="960" height="290" viewBox="0 0 960 290">
+  <!-- Step 1: Buy on Alpaca -->
+  <rect x="20" y="20" width="140" height="60" rx="8" fill="#1c2128" stroke="#f778ba" stroke-width="2"/>
+  <text x="90" y="43" text-anchor="middle" fill="#f778ba" font-size="12" font-weight="600">Buy AAPL</text>
+  <text x="90" y="60" text-anchor="middle" fill="#8b949e" font-size="10">on Alpaca</text>
+
+  <line x1="160" y1="50" x2="190" y2="50" stroke="#f778ba" stroke-width="1.5"/>
+  <polygon points="185,45 195,50 185,55" fill="#f778ba"/>
+
+  <!-- Step 2: Mint -->
+  <rect x="195" y="20" width="140" height="60" rx="8" fill="#1c2128" stroke="#f778ba" stroke-width="2"/>
+  <text x="265" y="43" text-anchor="middle" fill="#f778ba" font-size="12" font-weight="600">Request Mint</text>
+  <text x="265" y="60" text-anchor="middle" fill="#8b949e" font-size="10">Alpaca tokenizes</text>
+
+  <line x1="335" y1="50" x2="365" y2="50" stroke="#f778ba" stroke-width="1.5"/>
+  <polygon points="360,45 370,50 360,55" fill="#f778ba"/>
+
+  <!-- Step 3: Poll -->
+  <rect x="370" y="20" width="120" height="60" rx="8" fill="#1c2128" stroke="#d29922" stroke-width="2"/>
+  <text x="430" y="43" text-anchor="middle" fill="#d29922" font-size="12" font-weight="600">Poll</text>
+  <text x="430" y="60" text-anchor="middle" fill="#d29922" font-size="10">secs to mins...</text>
+
+  <line x1="490" y1="50" x2="520" y2="50" stroke="#d29922" stroke-width="1.5"/>
+  <polygon points="515,45 525,50 515,55" fill="#d29922"/>
+
+  <!-- Step 4: Wrap -->
+  <rect x="525" y="20" width="120" height="60" rx="8" fill="#1c2128" stroke="#3fb950" stroke-width="2"/>
+  <text x="585" y="43" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="600">Wrap</text>
+  <text x="585" y="60" text-anchor="middle" fill="#8b949e" font-size="10">tAAPL -> wtAAPL</text>
+
+  <line x1="645" y1="50" x2="675" y2="50" stroke="#3fb950" stroke-width="1.5"/>
+  <polygon points="670,45 680,50 670,55" fill="#3fb950"/>
+
+  <!-- Step 5: Re-validate -->
+  <rect x="680" y="20" width="130" height="60" rx="8" fill="#1c2128" stroke="#f85149" stroke-width="2"/>
+  <text x="745" y="40" text-anchor="middle" fill="#f85149" font-size="12" font-weight="600">Re-validate</text>
+  <text x="745" y="56" text-anchor="middle" fill="#8b949e" font-size="10">Still available?</text>
+  <text x="745" y="70" text-anchor="middle" fill="#8b949e" font-size="10">Still profitable?</text>
+
+  <!-- Yes path -->
+  <line x1="810" y1="50" x2="840" y2="50" stroke="#3fb950" stroke-width="1.5"/>
+  <polygon points="835,45 845,50 835,55" fill="#3fb950"/>
+  <rect x="845" y="20" width="100" height="60" rx="8" fill="#1b2d1b" stroke="#3fb950" stroke-width="2"/>
+  <text x="895" y="43" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="700">Take!</text>
+  <text x="895" y="60" text-anchor="middle" fill="#3fb950" font-size="10">takeOrders4</text>
+
+  <!-- No path: to hold pool -->
+  <line x1="745" y1="80" x2="745" y2="115" stroke="#f85149" stroke-width="1.5"/>
+  <polygon points="740,110 745,120 750,110" fill="#f85149"/>
+  <text x="770" y="100" fill="#f85149" font-size="9">order gone</text>
+  <rect x="680" y="120" width="130" height="35" rx="6" fill="#2d1b1b" stroke="#d29922" stroke-width="1.5"/>
+  <text x="745" y="142" text-anchor="middle" fill="#d29922" font-size="11">-> Hold Pool</text>
+
+  <!-- Latency warning -->
+  <rect x="20" y="175" width="920" height="95" rx="8" fill="#2d1b1b" stroke="#f85149" stroke-width="1"/>
+  <text x="40" y="200" fill="#f85149" font-size="12" font-weight="700">Latency Risk: The Primary Challenge</text>
+  <text x="40" y="222" fill="#e6edf3" font-size="11">Minting takes seconds to minutes. During this window, the order could be:</text>
+  <text x="40" y="242" fill="#e6edf3" font-size="11">- Taken by another bot (RemoveOrderV3 or TakeOrderV3 reduces remaining output to 0)</text>
+  <text x="40" y="258" fill="#e6edf3" font-size="11">- Removed by the owner (RemoveOrderV3 event)</text>
+  <text x="620" y="242" fill="#d29922" font-size="11">If this happens: tokens go to Hold Pool</text>
+  <text x="620" y="258" fill="#d29922" font-size="11">(available for future takes or redemption)</text>
+</svg>
+</div>
+
+<!-- ============================================================ -->
+<h2>4. Order Collector: CQRS Design</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+<div class="diagram-title">TrackedOrder Aggregate &mdash; State machine for discovered orders</div>
+<svg width="960" height="400" viewBox="0 0 960 400">
+  <!-- Blockchain events source -->
+  <rect x="20" y="20" width="200" height="90" rx="8" fill="#1c2128" stroke="#d29922" stroke-width="2"/>
+  <text x="120" y="45" text-anchor="middle" fill="#d29922" font-size="13" font-weight="700">Raindex Events</text>
+  <text x="120" y="68" text-anchor="middle" fill="#3fb950" font-size="10">AddOrderV3</text>
+  <text x="120" y="83" text-anchor="middle" fill="#f85149" font-size="10">RemoveOrderV3</text>
+  <text x="120" y="98" text-anchor="middle" fill="#d29922" font-size="10">TakeOrderV3</text>
+
+  <!-- Filtering -->
+  <line x1="220" y1="65" x2="280" y2="65" stroke="#d29922" stroke-width="1.5"/>
+  <polygon points="275,60 285,65 275,70" fill="#d29922"/>
+
+  <rect x="285" y="20" width="200" height="90" rx="8" fill="#1c2128" stroke="#bc8cff" stroke-width="2"/>
+  <text x="385" y="45" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="700">Filtering</text>
+  <text x="385" y="68" text-anchor="middle" fill="#e6edf3" font-size="10">excluded_owner? -> skip</text>
+  <text x="385" y="83" text-anchor="middle" fill="#e6edf3" font-size="10">supported pair? (USDC + wtToken)</text>
+  <text x="385" y="98" text-anchor="middle" fill="#8b949e" font-size="10">Compute order hash (keccak256)</text>
+
+  <!-- Commands -->
+  <line x1="485" y1="65" x2="545" y2="65" stroke="#bc8cff" stroke-width="1.5"/>
+  <polygon points="540,60 550,65 540,70" fill="#bc8cff"/>
+
+  <rect x="550" y="20" width="180" height="90" rx="8" fill="#1c2128" stroke="#58a6ff" stroke-width="2"/>
+  <text x="640" y="45" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="700">Commands</text>
+  <text x="640" y="68" text-anchor="middle" fill="#3fb950" font-size="10">Discover(OrderV4)</text>
+  <text x="640" y="83" text-anchor="middle" fill="#d29922" font-size="10">Fill(amount)</text>
+  <text x="640" y="98" text-anchor="middle" fill="#f85149" font-size="10">Remove</text>
+
+  <!-- State machine -->
+  <text x="160" y="165" text-anchor="middle" fill="#8b949e" font-size="12" font-weight="600">STATE MACHINE</text>
+
+  <!-- Active state -->
+  <rect x="40" y="185" width="180" height="80" rx="10" fill="#1b2d1b" stroke="#3fb950" stroke-width="2.5"/>
+  <text x="130" y="215" text-anchor="middle" fill="#3fb950" font-size="16" font-weight="700">Active</text>
+  <text x="130" y="235" text-anchor="middle" fill="#8b949e" font-size="10">remaining_output > 0</text>
+  <text x="130" y="250" text-anchor="middle" fill="#8b949e" font-size="10">eligible for takes</text>
+
+  <!-- Exhausted state -->
+  <rect x="310" y="185" width="180" height="80" rx="10" fill="#2d2a1b" stroke="#d29922" stroke-width="2.5"/>
+  <text x="400" y="215" text-anchor="middle" fill="#d29922" font-size="16" font-weight="700">Exhausted</text>
+  <text x="400" y="235" text-anchor="middle" fill="#8b949e" font-size="10">remaining_output = 0</text>
+  <text x="400" y="250" text-anchor="middle" fill="#8b949e" font-size="10">fully consumed by takes</text>
+
+  <!-- Removed state -->
+  <rect x="310" y="300" width="180" height="80" rx="10" fill="#2d1b1b" stroke="#f85149" stroke-width="2.5"/>
+  <text x="400" y="330" text-anchor="middle" fill="#f85149" font-size="16" font-weight="700">Removed</text>
+  <text x="400" y="350" text-anchor="middle" fill="#8b949e" font-size="10">owner withdrew order</text>
+  <text x="400" y="365" text-anchor="middle" fill="#8b949e" font-size="10">no longer takeable</text>
+
+  <!-- Transitions -->
+  <!-- Active -> Exhausted (Fill reduces to 0) -->
+  <line x1="220" y1="225" x2="310" y2="225" stroke="#d29922" stroke-width="1.5"/>
+  <polygon points="305,220 315,225 305,230" fill="#d29922"/>
+  <text x="265" y="215" text-anchor="middle" fill="#d29922" font-size="9">Fill (output -> 0)</text>
+
+  <!-- Active -> Active (Fill partial) -->
+  <path d="M 130,265 C 130,295 90,295 90,265" fill="none" stroke="#3fb950" stroke-width="1.5"/>
+  <polygon points="87,270 90,260 93,270" fill="#3fb950"/>
+  <text x="70" y="295" text-anchor="middle" fill="#3fb950" font-size="9">Fill (partial)</text>
+
+  <!-- Active -> Removed -->
+  <line x1="130" y1="265" x2="310" y2="330" stroke="#f85149" stroke-width="1.5"/>
+  <polygon points="305,325 315,330 307,335" fill="#f85149"/>
+  <text x="200" y="310" text-anchor="middle" fill="#f85149" font-size="9">Remove</text>
+
+  <!-- Aggregate ID note -->
+  <rect x="570" y="185" width="370" height="110" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+  <text x="590" y="210" fill="#58a6ff" font-size="12" font-weight="600">Aggregate Design</text>
+  <text x="590" y="235" fill="#e6edf3" font-size="11">ID: keccak256(abi.encode(OrderV4))</text>
+  <text x="590" y="255" fill="#e6edf3" font-size="11">Persistence: SQLite event store (st0x-event-sorcery)</text>
+  <text x="590" y="275" fill="#e6edf3" font-size="11">Projection: Active Orders View (in-memory order book)</text>
+  <text x="590" y="290" fill="#8b949e" font-size="10">Block cursor persisted for crash recovery (resume from last block)</text>
+
+  <!-- Events list -->
+  <rect x="570" y="310" width="370" height="70" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+  <text x="590" y="335" fill="#d29922" font-size="12" font-weight="600">Events Emitted</text>
+  <text x="590" y="355" fill="#3fb950" font-size="10">OrderDiscovered { order, block_number }</text>
+  <text x="590" y="370" fill="#d29922" font-size="10">OrderFilled { taker, input_amount, output_amount }</text>
+  <text x="820" y="355" fill="#f85149" font-size="10">OrderRemoved</text>
+  <text x="820" y="370" fill="#d29922" font-size="10">OrderExhausted</text>
+</svg>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. Startup &amp; Recovery</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+<div class="diagram-title">What happens when the bot starts (or restarts after a crash)</div>
+<svg width="960" height="280" viewBox="0 0 960 280">
+  <!-- Step 1 -->
+  <rect x="20" y="20" width="200" height="70" rx="8" fill="#1c2128" stroke="#58a6ff" stroke-width="2"/>
+  <text x="120" y="45" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="700">1. Load Block Cursor</text>
+  <text x="120" y="65" text-anchor="middle" fill="#8b949e" font-size="10">SQLite: last processed block</text>
+  <text x="120" y="80" text-anchor="middle" fill="#8b949e" font-size="10">or deployment_block if fresh</text>
+
+  <line x1="220" y1="55" x2="260" y2="55" stroke="#58a6ff" stroke-width="1.5"/>
+  <polygon points="255,50 265,55 255,60" fill="#58a6ff"/>
+
+  <!-- Step 2 -->
+  <rect x="265" y="20" width="200" height="70" rx="8" fill="#1c2128" stroke="#d29922" stroke-width="2"/>
+  <text x="365" y="45" text-anchor="middle" fill="#d29922" font-size="12" font-weight="700">2. Historical Backfill</text>
+  <text x="365" y="65" text-anchor="middle" fill="#8b949e" font-size="10">Scan Add/Remove/Take events</text>
+  <text x="365" y="80" text-anchor="middle" fill="#8b949e" font-size="10">from cursor to chain head</text>
+
+  <line x1="465" y1="55" x2="505" y2="55" stroke="#d29922" stroke-width="1.5"/>
+  <polygon points="500,50 510,55 500,60" fill="#d29922"/>
+
+  <!-- Step 3 -->
+  <rect x="510" y="20" width="200" height="70" rx="8" fill="#1c2128" stroke="#3fb950" stroke-width="2"/>
+  <text x="610" y="45" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="700">3. Rebuild Order Book</text>
+  <text x="610" y="65" text-anchor="middle" fill="#8b949e" font-size="10">Replay events through aggregate</text>
+  <text x="610" y="80" text-anchor="middle" fill="#8b949e" font-size="10">Active Orders View populated</text>
+
+  <line x1="710" y1="55" x2="750" y2="55" stroke="#3fb950" stroke-width="1.5"/>
+  <polygon points="745,50 755,55 745,60" fill="#3fb950"/>
+
+  <!-- Step 4 -->
+  <rect x="755" y="20" width="180" height="70" rx="8" fill="#1c2128" stroke="#bc8cff" stroke-width="2"/>
+  <text x="845" y="45" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="700">4. Set ERC20 Approvals</text>
+  <text x="845" y="65" text-anchor="middle" fill="#8b949e" font-size="10">Approve orderbook for</text>
+  <text x="845" y="80" text-anchor="middle" fill="#8b949e" font-size="10">USDC + all wtTokens</text>
+
+  <!-- Step 5: Live -->
+  <rect x="330" y="130" width="300" height="60" rx="8" fill="#1b2d1b" stroke="#3fb950" stroke-width="2.5"/>
+  <text x="480" y="155" text-anchor="middle" fill="#3fb950" font-size="14" font-weight="700">5. Live Event Subscription</text>
+  <text x="480" y="175" text-anchor="middle" fill="#8b949e" font-size="10">Stream new events + evaluate profitability on every cycle</text>
+
+  <line x1="610" y1="90" x2="530" y2="130" stroke="#3fb950" stroke-width="1.5"/>
+  <polygon points="530,125 530,135 525,125" fill="#3fb950"/>
+  <line x1="845" y1="90" x2="580" y2="130" stroke="#bc8cff" stroke-width="1.5"/>
+
+  <!-- Idempotency note -->
+  <rect x="20" y="210" width="920" height="50" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+  <text x="40" y="232" fill="#d29922" font-size="12" font-weight="600">Idempotency:</text>
+  <text x="145" y="232" fill="#e6edf3" font-size="11">Re-discovering an already-tracked order hash is a no-op. TakeAttempt uses dedup check (no duplicate attempts on same order).</text>
+  <text x="40" y="250" fill="#d29922" font-size="12" font-weight="600">Crash recovery:</text>
+  <text x="175" y="250" fill="#e6edf3" font-size="11">Incomplete TakeAttempt and HoldPoolEntry aggregates are resumed from their last persisted CQRS state.</text>
+</svg>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. Shared Infrastructure</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+<div class="diagram-title">What the taker bot reuses from the existing liquidity bot codebase</div>
+<svg width="960" height="300" viewBox="0 0 960 300">
+  <!-- Shared crates/traits -->
+  <text x="20" y="30" fill="#3fb950" font-size="14" font-weight="700">REUSED AS-IS</text>
+
+  <rect x="20" y="45" width="200" height="50" rx="6" fill="#1b2d1b" stroke="#3fb950" stroke-width="1.5"/>
+  <text x="120" y="65" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="600">Executor trait</text>
+  <text x="120" y="82" text-anchor="middle" fill="#8b949e" font-size="10">st0x-execution crate</text>
+
+  <rect x="240" y="45" width="200" height="50" rx="6" fill="#1b2d1b" stroke="#3fb950" stroke-width="1.5"/>
+  <text x="340" y="65" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="600">Tokenizer trait</text>
+  <text x="340" y="82" text-anchor="middle" fill="#8b949e" font-size="10">Alpaca mint/redeem API</text>
+
+  <rect x="460" y="45" width="200" height="50" rx="6" fill="#1b2d1b" stroke="#3fb950" stroke-width="1.5"/>
+  <text x="560" y="65" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="600">Wrapper trait</text>
+  <text x="560" y="82" text-anchor="middle" fill="#8b949e" font-size="10">ERC-4626 wrap/unwrap</text>
+
+  <rect x="680" y="45" width="260" height="50" rx="6" fill="#1b2d1b" stroke="#3fb950" stroke-width="1.5"/>
+  <text x="810" y="65" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="600">st0x-event-sorcery</text>
+  <text x="810" y="82" text-anchor="middle" fill="#8b949e" font-size="10">CQRS/ES framework + SQLite store</text>
+
+  <!-- New components -->
+  <text x="20" y="135" fill="#d29922" font-size="14" font-weight="700">NEW FOR TAKER BOT</text>
+
+  <rect x="20" y="150" width="180" height="50" rx="6" fill="#2d2a1b" stroke="#d29922" stroke-width="1.5"/>
+  <text x="110" y="170" text-anchor="middle" fill="#d29922" font-size="12" font-weight="600">Order Collector</text>
+  <text x="110" y="187" text-anchor="middle" fill="#8b949e" font-size="10">TrackedOrder aggregate</text>
+
+  <rect x="220" y="150" width="180" height="50" rx="6" fill="#2d2a1b" stroke="#d29922" stroke-width="1.5"/>
+  <text x="310" y="170" text-anchor="middle" fill="#d29922" font-size="12" font-weight="600">Order Classifier</text>
+  <text x="310" y="187" text-anchor="middle" fill="#8b949e" font-size="10">Rainlang decompilation</text>
+
+  <rect x="420" y="150" width="180" height="50" rx="6" fill="#2d2a1b" stroke="#d29922" stroke-width="1.5"/>
+  <text x="510" y="170" text-anchor="middle" fill="#d29922" font-size="12" font-weight="600">Profitability Engine</text>
+  <text x="510" y="187" text-anchor="middle" fill="#8b949e" font-size="10">Price comparison + costs</text>
+
+  <rect x="620" y="150" width="160" height="50" rx="6" fill="#2d2a1b" stroke="#d29922" stroke-width="1.5"/>
+  <text x="700" y="170" text-anchor="middle" fill="#d29922" font-size="12" font-weight="600">TakeAttempt</text>
+  <text x="700" y="187" text-anchor="middle" fill="#8b949e" font-size="10">CQRS aggregate</text>
+
+  <rect x="800" y="150" width="140" height="50" rx="6" fill="#2d2a1b" stroke="#d29922" stroke-width="1.5"/>
+  <text x="870" y="170" text-anchor="middle" fill="#d29922" font-size="12" font-weight="600">Hold Pool</text>
+  <text x="870" y="187" text-anchor="middle" fill="#8b949e" font-size="10">Token retention</text>
+
+  <!-- Taker-specific note -->
+  <text x="20" y="240" fill="#f85149" font-size="14" font-weight="700">KEY DIFFERENCE FROM REBALANCER</text>
+
+  <rect x="20" y="255" width="920" height="35" rx="6" fill="#2d1b1b" stroke="#f85149" stroke-width="1"/>
+  <text x="480" y="277" text-anchor="middle" fill="#e6edf3" font-size="11">No Raindex vault deposits/withdrawals. takeOrders4 pulls tokens directly from the bot's wallet via ERC20 transferFrom. Hold pool = wallet balance + metadata.</text>
+</svg>
+</div>
+
+<!-- ============================================================ -->
+<h2>7. Key Concepts at a Glance</h2>
+<!-- ============================================================ -->
+
+<div class="concept-grid">
+  <div class="concept">
+    <div class="concept-header"><span class="badge badge-step">STEP 1</span> Order Collector</div>
+    <p>Subscribes to AddOrderV3/RemoveOrderV3/TakeOrderV3 events. Filters by token pair (USDC + configured wtTokens) and excluded_owner. Persists TrackedOrder aggregates keyed by order hash. Backfills from deployment_block on first run.</p>
+  </div>
+  <div class="concept">
+    <div class="concept-header"><span class="badge badge-step">STEP 2</span> Order Classification</div>
+    <p>Decompiles Rainlang bytecode from AddOrderV3 to classify orders: fixed-price constants (literal IO ratio) or Pyth oracle pricing (reads price feed). Unsupported patterns are skipped. This determines HOW to evaluate profitability.</p>
+  </div>
+  <div class="concept">
+    <div class="concept-header"><span class="badge badge-step">STEP 3</span> Profitability Strategy</div>
+    <p>Continuously re-evaluates ALL active orders each cycle. Compares order's IO ratio against Alpaca price, including all costs (gas, fees, mint/redeem, slippage). Uses hold pool inventory to reduce costs. Must exceed min_margin.</p>
+  </div>
+  <div class="concept">
+    <div class="concept-header"><span class="badge badge-step">STEP 4</span> Token Acquisition</div>
+    <p>Scenario A: just needs USDC (simple). Scenario B: check hold pool first, otherwise JIT mint (buy AAPL on Alpaca -> mint tAAPL -> wrap to wtAAPL). The mint latency is the critical risk -- order may disappear during the wait.</p>
+  </div>
+  <div class="concept">
+    <div class="concept-header"><span class="badge badge-critical">CRITICAL</span> IO Ratio Semantics</div>
+    <p>Raindex IO ratio is from the ORDER OWNER's perspective. When we take: their output = our input, their input = our output. Scenario A: our buy price = 1/io_ratio. Scenario B: our sell price = io_ratio. Inverting this wrong = guaranteed losses.</p>
+  </div>
+  <div class="concept">
+    <div class="concept-header"><span class="badge badge-new">NEW</span> Hold Pool</div>
+    <p>wtTokens sitting in the bot's wallet (not in Raindex vaults). Fed by: Scenario A takes (received wtTokens) and orphaned Scenario B mints (order disappeared during mint). Drained by: profitable Scenario B takes or time-based redemption.</p>
+  </div>
+  <div class="concept">
+    <div class="concept-header"><span class="badge badge-shared">SHARED</span> Tokenization Flow</div>
+    <p>Reuses existing Tokenizer trait + AlpacaTokenizationService. Same as rebalancer EXCEPT: no vault deposit/withdrawal steps. Taker holds tokens in wallet, not Raindex vaults. takeOrders4 uses ERC20 transferFrom directly from wallet.</p>
+  </div>
+  <div class="concept">
+    <div class="concept-header"><span class="badge badge-new">NEW</span> Re-validation After Mint</div>
+    <p>After JIT minting in Scenario B, the bot MUST re-check: (1) order still exists? (2) still profitable at actual fill price? (3) simulation passes? If any check fails, tokens go to hold pool -- never waste gas on a doomed take.</p>
+  </div>
+</div>
+
+</div><!-- container -->
+</body>
+</html>
