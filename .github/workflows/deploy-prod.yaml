@@ -74,6 +74,8 @@ jobs:
             fallback = true
 
       - uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-gha-cache: false
 
       - name: Connect to Tailscale
         uses: tailscale/github-action@v4
