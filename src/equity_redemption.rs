@@ -965,21 +965,26 @@ impl EventSourced for EquityRedemption {
                     let token = *underlying_token;
                     let amount = *unwrapped_amount;
 
+                    let Some(redemption_wallet) =
+                        Tokenizer::redemption_wallet(services.tokenizer.as_ref())
+                    else {
+                        warn!("Redemption wallet not configured");
+                        return Ok(vec![TransferFailed {
+                            tx_hash: None,
+                            failed_at: Utc::now(),
+                        }]);
+                    };
+
                     info!(%token, %amount, "Sending unwrapped tokens for redemption");
 
                     match Tokenizer::send_for_redemption(services.tokenizer.as_ref(), token, amount)
                         .await
                     {
-                        Ok(redemption_tx) => {
-                            let redemption_wallet =
-                                Tokenizer::redemption_wallet(services.tokenizer.as_ref());
-
-                            Ok(vec![TokensSent {
-                                redemption_wallet,
-                                redemption_tx,
-                                sent_at: Utc::now(),
-                            }])
-                        }
+                        Ok(redemption_tx) => Ok(vec![TokensSent {
+                            redemption_wallet,
+                            redemption_tx,
+                            sent_at: Utc::now(),
+                        }]),
                         Err(error) => {
                             warn!(%error, %token, %amount, "Send for redemption failed");
                             Ok(vec![TransferFailed {

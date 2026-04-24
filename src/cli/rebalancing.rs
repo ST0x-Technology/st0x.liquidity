@@ -33,11 +33,19 @@ use crate::usdc_rebalance::UsdcRebalance;
 use crate::vault_registry::VaultRegistry;
 use crate::wrapper::{Wrapper, WrapperService};
 
+/// Resolves the redemption wallet address from CLI flag or config.
+///
+/// CLI flag takes precedence. Falls back to `[tokenization]` config.
+fn resolve_redemption_wallet(flag: Option<Address>, ctx: &Ctx) -> anyhow::Result<Address> {
+    flag.map_or_else(|| ctx.redemption_wallet().map_err(Into::into), Ok)
+}
+
 pub(super) async fn transfer_equity_command<Writer: Write>(
     stdout: &mut Writer,
     direction: TransferDirection,
     symbol: &Symbol,
     quantity: FractionalShares,
+    redemption_wallet_flag: Option<Address>,
     ctx: &Ctx,
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
@@ -54,7 +62,7 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
         anyhow::bail!("transfer-equity requires Alpaca Broker API configuration");
     };
 
-    let rebalancing_ctx = ctx.rebalancing_ctx()?;
+    let redemption_wallet = resolve_redemption_wallet(redemption_wallet_flag, ctx)?;
     let wallet_ctx = ctx.wallet()?;
     let wallet = wallet_ctx.base_wallet().address();
     let base_caller = wallet_ctx.base_wallet().clone();
@@ -65,7 +73,7 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
         base_caller.clone(),
-        rebalancing_ctx.redemption_wallet,
+        Some(redemption_wallet),
     ));
 
     let (_vault_store, vault_registry_projection) =
@@ -280,7 +288,6 @@ pub(super) async fn alpaca_tokenize_command<Writer: Write, Prov: Provider + Clon
         anyhow::bail!("alpaca-tokenize requires Alpaca Broker API configuration");
     };
 
-    let rebalancing_ctx = ctx.rebalancing_ctx()?;
     let wallet_ctx = ctx.wallet()?;
 
     let receiving_wallet = recipient.unwrap_or_else(|| wallet_ctx.base_wallet().address());
@@ -311,7 +318,7 @@ pub(super) async fn alpaca_tokenize_command<Writer: Write, Prov: Provider + Clon
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
         wallet_ctx.base_wallet().clone(),
-        rebalancing_ctx.redemption_wallet,
+        None,
     );
 
     writeln!(stdout, "   Sending mint request to Alpaca...")?;
@@ -400,6 +407,7 @@ pub(super) async fn alpaca_redeem_command<Writer: Write>(
     symbol: Symbol,
     quantity: FractionalShares,
     token: Address,
+    redemption_wallet_flag: Option<Address>,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
     writeln!(stdout, "🔄 Requesting redemption via Alpaca API")?;
@@ -411,10 +419,8 @@ pub(super) async fn alpaca_redeem_command<Writer: Write>(
         anyhow::bail!("alpaca-redeem requires Alpaca Broker API configuration");
     };
 
-    let rebalancing_ctx = ctx.rebalancing_ctx()?;
+    let redemption_wallet = resolve_redemption_wallet(redemption_wallet_flag, ctx)?;
     let wallet_ctx = ctx.wallet()?;
-
-    let redemption_wallet = rebalancing_ctx.redemption_wallet;
     writeln!(stdout, "   Redemption wallet: {redemption_wallet}")?;
 
     let tokenization_service = AlpacaTokenizationService::new(
@@ -423,7 +429,7 @@ pub(super) async fn alpaca_redeem_command<Writer: Write>(
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
         wallet_ctx.base_wallet().clone(),
-        redemption_wallet,
+        Some(redemption_wallet),
     );
 
     let amount = quantity.to_u256_18_decimals()?;
@@ -476,7 +482,6 @@ pub(super) async fn alpaca_tokenization_requests_command<Writer: Write>(
         anyhow::bail!("alpaca-tokenization-requests requires Alpaca Broker API configuration");
     };
 
-    let rebalancing_ctx = ctx.rebalancing_ctx()?;
     let wallet_ctx = ctx.wallet()?;
 
     let tokenization_service = AlpacaTokenizationService::new(
@@ -485,7 +490,7 @@ pub(super) async fn alpaca_tokenization_requests_command<Writer: Write>(
         alpaca_auth.api_key.clone(),
         alpaca_auth.api_secret.clone(),
         wallet_ctx.base_wallet().clone(),
-        rebalancing_ctx.redemption_wallet,
+        None,
     );
 
     let requests = tokenization_service.list_requests().await?;
@@ -594,6 +599,7 @@ mod tests {
             },
             travel_rule: None,
             rest_api: None,
+            redemption_wallet: None,
         }
     }
 
@@ -649,7 +655,6 @@ mod tests {
                         target: float!(0.5),
                         deviation: float!(0.1),
                     })
-                    .redemption_wallet(Address::ZERO)
                     .call(),
             )),
             wallet: Some(crate::wallet::OnchainWalletCtx::stub()),
@@ -660,6 +665,7 @@ mod tests {
             },
             travel_rule: None,
             rest_api: None,
+            redemption_wallet: Some(Address::ZERO),
         }
     }
 
@@ -676,6 +682,7 @@ mod tests {
             TransferDirection::ToRaindex,
             &symbol,
             quantity,
+            None,
             &ctx,
             &pool,
         )
@@ -689,7 +696,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_transfer_equity_requires_rebalancing_ctx() {
+    async fn test_transfer_equity_requires_tokenization_config() {
         let ctx = create_alpaca_ctx_without_rebalancing();
         let pool = setup_test_db().await;
         let symbol = Symbol::new("AAPL").unwrap();
@@ -701,6 +708,7 @@ mod tests {
             TransferDirection::ToRaindex,
             &symbol,
             quantity,
+            None,
             &ctx,
             &pool,
         )
@@ -708,8 +716,8 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("requires rebalancing mode"),
-            "Expected rebalancing config error, got: {err_msg}"
+            err_msg.contains("requires [tokenization]"),
+            "Expected tokenization config error, got: {err_msg}"
         );
     }
 
@@ -918,6 +926,40 @@ mod tests {
         assert!(
             output.contains("Vault ID:"),
             "Expected vault ID in output, got: {output}"
+        );
+    }
+
+    #[test]
+    fn resolve_redemption_wallet_flag_takes_precedence() {
+        let mut ctx = create_alpaca_ctx_without_rebalancing();
+        let config_wallet = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let flag_wallet = address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        ctx.redemption_wallet = Some(config_wallet);
+
+        let result = resolve_redemption_wallet(Some(flag_wallet), &ctx).unwrap();
+        assert_eq!(result, flag_wallet);
+    }
+
+    #[test]
+    fn resolve_redemption_wallet_falls_back_to_config() {
+        let mut ctx = create_alpaca_ctx_without_rebalancing();
+        let config_wallet = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        ctx.redemption_wallet = Some(config_wallet);
+
+        let result = resolve_redemption_wallet(None, &ctx).unwrap();
+        assert_eq!(result, config_wallet);
+    }
+
+    #[test]
+    fn resolve_redemption_wallet_errors_when_missing() {
+        let ctx = create_alpaca_ctx_without_rebalancing();
+        assert!(ctx.redemption_wallet.is_none());
+
+        let result = resolve_redemption_wallet(None, &ctx);
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("requires [tokenization]"),
+            "Expected tokenization config error, got: {err_msg}"
         );
     }
 }

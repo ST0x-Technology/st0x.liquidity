@@ -222,6 +222,7 @@ impl Conductor {
                 let base_wallet = wallet_ctx.base_wallet().clone();
                 let infra = spawn_rebalancing_infrastructure(
                     rebalancing_ctx,
+                    ctx.redemption_wallet()?,
                     ethereum_wallet.clone(),
                     base_wallet.clone(),
                     RebalancingDeps {
@@ -508,6 +509,7 @@ async fn seed_vault_registry_from_config(
 
 fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
     rebalancing_ctx: RebalancingCtx,
+    redemption_wallet: Address,
     ethereum_wallet: Chain,
     base_wallet: Chain,
     deps: RebalancingDeps,
@@ -539,7 +541,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             alpaca_auth.api_key.clone(),
             alpaca_auth.api_secret.clone(),
             base_wallet.clone(),
-            rebalancing_ctx.redemption_wallet,
+            Some(redemption_wallet),
         ));
 
         let tokenizer: Arc<dyn Tokenizer> = tokenization;

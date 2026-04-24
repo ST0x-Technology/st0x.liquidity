@@ -110,7 +110,6 @@ pub(crate) struct RebalancingConfig {
     pub(crate) equity: ImbalanceThreshold,
     pub(crate) usdc: UsdcRebalancing,
     pub(crate) transfer_timeout_secs: u64,
-    pub(crate) redemption_wallet: Address,
 }
 
 /// Runtime configuration for rebalancing operations.
@@ -127,8 +126,6 @@ pub struct RebalancingCtx {
     pub(crate) equity: ImbalanceThreshold,
     pub(crate) usdc: Option<ImbalanceThreshold>,
     pub(crate) transfer_timeout: Duration,
-    /// Issuer's wallet for tokenized equity redemptions.
-    pub(crate) redemption_wallet: Address,
     /// Circle attestation/fee API base URL (test-only override).
     #[cfg(feature = "test-support")]
     pub circle_api_base: String,
@@ -145,7 +142,7 @@ impl RebalancingCtx {
     ///
     /// Wallets are now built separately via [`OnchainWalletCtx`] —
     /// this constructor only validates and stores rebalancing-specific
-    /// trigger thresholds and the redemption wallet.
+    /// trigger thresholds.
     pub(crate) fn new(config: &RebalancingConfig) -> Result<Self, RebalancingCtxError> {
         if config.transfer_timeout_secs == 0 {
             return Err(RebalancingCtxError::ZeroTransferTimeout);
@@ -162,7 +159,6 @@ impl RebalancingCtx {
             equity: config.equity,
             usdc,
             transfer_timeout: Duration::from_secs(config.transfer_timeout_secs),
-            redemption_wallet: config.redemption_wallet,
             #[cfg(feature = "test-support")]
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
             #[cfg(feature = "test-support")]
@@ -185,13 +181,11 @@ impl RebalancingCtx {
         equity: ImbalanceThreshold,
         usdc: Option<ImbalanceThreshold>,
         #[builder(default = Duration::from_secs(30 * 60))] transfer_timeout: Duration,
-        redemption_wallet: Address,
     ) -> Self {
         Self {
             equity,
             usdc,
             transfer_timeout,
-            redemption_wallet,
             #[cfg(feature = "test-support")]
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
             #[cfg(feature = "test-support")]
@@ -212,7 +206,6 @@ impl RebalancingCtx {
         equity: ImbalanceThreshold,
         usdc: UsdcRebalancing,
         #[builder(default = Duration::from_secs(30 * 60))] transfer_timeout: Duration,
-        redemption_wallet: Address,
     ) -> Self {
         let usdc = match usdc {
             UsdcRebalancing::Enabled { target, deviation } => {
@@ -225,7 +218,6 @@ impl RebalancingCtx {
             equity,
             usdc,
             transfer_timeout,
-            redemption_wallet,
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
             token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
             message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
@@ -259,7 +251,6 @@ impl std::fmt::Debug for RebalancingCtx {
         f.debug_struct("RebalancingCtx")
             .field("equity", &self.equity)
             .field("usdc", &self.usdc)
-            .field("redemption_wallet", &self.redemption_wallet)
             .finish_non_exhaustive()
     }
 }
@@ -5091,7 +5082,6 @@ mod tests {
 
     fn valid_rebalancing_config_toml() -> &'static str {
         r#"
-            redemption_wallet = "0x1234567890123456789012345678901234567890"
             transfer_timeout_secs = 1800
 
             [equity]
@@ -5117,10 +5107,6 @@ mod tests {
         };
         assert!(target.eq(float!(0.5)).unwrap());
         assert!(deviation.eq(float!(0.3)).unwrap());
-        assert_eq!(
-            config.redemption_wallet,
-            address!("1234567890123456789012345678901234567890")
-        );
         assert_eq!(config.transfer_timeout_secs, 1800);
     }
 
@@ -5128,7 +5114,6 @@ mod tests {
     fn deserialize_with_custom_thresholds() {
         let config: RebalancingConfig = toml::from_str(
             r#"
-            redemption_wallet = "0x1234567890123456789012345678901234567890"
             transfer_timeout_secs = 1800
 
             [equity]
@@ -5154,32 +5139,8 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_missing_redemption_wallet_fails() {
-        let toml_str = r#"
-            transfer_timeout_secs = 1800
-
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
-
-            [usdc]
-            mode = "enabled"
-            target = "0.5"
-            deviation = "0.3"
-        "#;
-
-        let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
-        assert!(
-            error.message().contains("redemption_wallet"),
-            "Expected missing redemption_wallet error, got: {error}"
-        );
-    }
-
-    #[test]
     fn deserialize_missing_transfer_timeout_secs_fails() {
         let toml_str = r#"
-            redemption_wallet = "0x1234567890123456789012345678901234567890"
-
             [equity]
             target = "0.5"
             deviation = "0.2"

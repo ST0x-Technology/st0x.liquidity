@@ -217,8 +217,8 @@ impl Tokenizer for MockTokenizer {
         }
     }
 
-    fn redemption_wallet(&self) -> Address {
-        self.redemption_wallet
+    fn redemption_wallet(&self) -> Option<Address> {
+        Some(self.redemption_wallet)
     }
 
     async fn send_for_redemption(
