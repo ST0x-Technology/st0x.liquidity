@@ -64,6 +64,7 @@ fn build_full_system_ctx<P: Provider + Clone>(
     equity_vault_ids: &HashMap<String, B256>,
     cash_vault_id: B256,
     cctp: CctpOverrides,
+    rest_api_url: Option<&str>,
 ) -> anyhow::Result<Ctx> {
     let alpaca_auth = AlpacaBrokerApiCtx {
         api_key: TEST_API_KEY.to_owned(),
@@ -140,6 +141,10 @@ fn build_full_system_ctx<P: Provider + Clone>(
         })
         .inventory_poll_interval(15)
         .server_port(8001)
+        .maybe_rest_api(
+            rest_api_url
+                .map(|url| st0x_hedge::config::RestApiCtx::unauthenticated(url.to_string())),
+        )
         .call()
         .map_err(Into::into)
 }
@@ -558,6 +563,7 @@ async fn simulate() -> anyhow::Result<()> {
         .equity_vault_ids(&equity_vault_ids)
         .cash_vault_id(usdc_vault_id)
         .cctp(cctp.cctp_overrides())
+        .rest_api_url("http://localhost:8099")
         .call()?;
     ctx.log_dir = Some(log_dir.display().to_string());
 

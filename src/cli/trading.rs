@@ -681,6 +681,7 @@ mod tests {
                 cash: None,
             },
             travel_rule: None,
+            rest_api: None,
         }
     }
 

@@ -56,3 +56,9 @@ rebalancing = "disabled"
 rebalancing = "enabled"
 # vault_id = "0xcd34"
 # operational_limit = 10000.0
+
+# Optional — enables the Orders dashboard tab by querying the st0x REST API.
+# When absent, the Orders tab shows "unavailable in simulate mode".
+# Credentials go in the secrets file under [rest_api].
+# [rest_api]
+# url = "https://api.example.com"
