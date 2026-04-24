@@ -749,6 +749,7 @@ mod tests {
                 cash: None,
             },
             travel_rule: None,
+            rest_api: None,
         }
     }
 
@@ -834,6 +835,7 @@ mod tests {
             wallet: Some(crate::wallet::OnchainWalletCtx::stub()),
             execution_threshold: ExecutionThreshold::whole_share(),
             travel_rule: None,
+            rest_api: None,
         }
     }
 

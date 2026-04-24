@@ -160,8 +160,10 @@
 
               dashboard = "cd dashboard && bun run dev";
 
+              mockApi = "bun run e2e/mock-rest-api.ts";
+
             in ''
-              exec mprocs "${backend}" "${dashboard}"
+              exec mprocs "${backend}" "${dashboard}" "${mockApi}"
             '';
           };
 
