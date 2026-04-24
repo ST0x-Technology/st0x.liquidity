@@ -59,7 +59,7 @@ pub(crate) fn parse_stdin_lines(reader: impl BufRead) -> Result<Vec<Transaction>
         })?;
 
         let line = line.trim().to_string();
-        if line.is_empty() {
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
 
@@ -253,6 +253,38 @@ mod tests {
         let input = "\n0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913:0xaa\n\n";
         let txs = parse_stdin_lines(input.as_bytes()).unwrap();
         assert_eq!(txs.len(), 1);
+    }
+
+    #[test]
+    fn parse_skips_comment_lines() {
+        // Producers like `raindex strategy-builder` prefix each tx with a `#`
+        // comment describing what it does. Skip any line starting with `#`.
+        let input = "\
+            # approve WETH\n\
+            0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913:0xaabb\n\
+            # deploy order\n\
+            0x4200000000000000000000000000000000000006:0xccdd\n\
+            # emit metadata\n";
+        let txs = parse_stdin_lines(input.as_bytes()).unwrap();
+        assert_eq!(txs.len(), 2);
+        assert_eq!(txs[0].data, Bytes::from(vec![0xaa, 0xbb]));
+        assert_eq!(txs[1].data, Bytes::from(vec![0xcc, 0xdd]));
+    }
+
+    #[test]
+    fn parse_skips_indented_comment_lines() {
+        // Whitespace before `#` is also skipped (because we trim first).
+        let input =
+            "  # leading whitespace comment\n0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913:0xaa\n";
+        let txs = parse_stdin_lines(input.as_bytes()).unwrap();
+        assert_eq!(txs.len(), 1);
+    }
+
+    #[test]
+    fn parse_only_comments_returns_empty_input_error() {
+        let input = "# only a comment\n# another\n";
+        let result = parse_stdin_lines(input.as_bytes());
+        assert!(matches!(result, Err(SubmitError::EmptyInput)));
     }
 
     #[test]
