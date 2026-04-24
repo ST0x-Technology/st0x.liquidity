@@ -21,32 +21,38 @@ jobs:
         include:
           - name: check
             cache_target: check
-            command: nix develop -c cargo check --workspace
+            needs_database: false
+            command: nix develop -c env SQLX_OFFLINE=true cargo check --workspace
           - name: test 1 of 4
             cache_target: test
+            needs_database: true
             command: >
               nix develop -c cargo nextest run --workspace --all-features
               --profile ci --partition hash:1/4
           - name: test 2 of 4
             cache_target: test
+            needs_database: true
             command: >
               nix develop -c cargo nextest run --workspace --all-features
               --profile ci --partition hash:2/4
           - name: test 3 of 4
             cache_target: test
+            needs_database: true
             command: >
               nix develop -c cargo nextest run --workspace --all-features
               --profile ci --partition hash:3/4
           - name: test 4 of 4
             cache_target: test
+            needs_database: true
             command: >
               nix develop -c cargo nextest run --workspace --all-features
               --profile ci --partition hash:4/4
           - name: clippy
             cache_target: clippy
+            needs_database: false
             command: >
-              nix develop -c cargo clippy --workspace --all-targets
-              --all-features
+              nix develop -c env SQLX_OFFLINE=true cargo clippy --workspace
+              --all-targets --all-features
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_TARGET_DIR: target/${{ matrix.cache_target }}
@@ -115,6 +121,7 @@ jobs:
             cargo-${{ runner.os }}-${{ runner.arch }}-${{ matrix.cache_target }}-
 
       - name: Setup database
+        if: matrix.needs_database
         run: nix develop -c sqlx db reset -y
 
       - name: ${{ matrix.name }}
@@ -173,6 +180,8 @@ jobs:
           extra-conf: |
             accept-flake-config = true
             fallback = true
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: Cache Solidity artifacts
         id: cache-sol
@@ -237,6 +246,8 @@ jobs:
           extra-conf: |
             accept-flake-config = true
             fallback = true
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: pre-commit hooks
         run: nix develop -c pre-commit run --all-files
