@@ -148,6 +148,7 @@ struct Config {
     #[serde(rename = "hyperdx")]
     telemetry: Option<TelemetryConfig>,
     rebalancing: Option<RebalancingConfig>,
+    tokenization: Option<TokenizationConfig>,
     wallet: Option<toml::Value>,
     broker: Option<BrokerConfig>,
     assets: AssetsConfig,
@@ -220,6 +221,18 @@ impl RestApiCtx {
         Self::new(url, None, None)
             .expect("reqwest client with default TLS should never fail to build")
     }
+}
+
+/// Tokenization settings for Alpaca equity mint/redeem operations.
+///
+/// Required when `[rebalancing]` is configured. Also usable in standalone
+/// mode for CLI commands that send tokens (`alpaca-redeem`, `transfer-equity`).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TokenizationConfig {
+    /// Alpaca's issuer wallet — ERC-20 token transfers for redemption
+    /// are sent to this address.
+    redemption_wallet: Address,
 }
 
 /// Non-secret broker settings from the plaintext config TOML.
@@ -350,6 +363,9 @@ pub struct Ctx {
     pub(crate) assets: AssetsConfig,
     pub(crate) travel_rule: Option<TravelRuleConfig>,
     pub(crate) rest_api: Option<RestApiCtx>,
+    /// Alpaca redemption wallet from `[tokenization]`.
+    /// `Some` when the config includes a `[tokenization]` section.
+    pub(crate) redemption_wallet: Option<Address>,
 }
 
 /// Runtime broker configuration assembled from `BrokerSecrets`.
@@ -435,6 +451,7 @@ impl std::fmt::Debug for Ctx {
             .field("execution_threshold", &self.execution_threshold)
             .field("assets", &self.assets)
             .field("travel_rule_configured", &self.travel_rule.is_some())
+            .field("redemption_wallet", &self.redemption_wallet)
             .field("rest_api", &self.rest_api)
             .finish()
     }
@@ -494,6 +511,7 @@ struct ValidatedParts {
     assets: AssetsConfig,
     travel_rule: Option<TravelRuleConfig>,
     rest_api: Option<RestApiCtx>,
+    redemption_wallet: Option<Address>,
     /// Wallet construction inputs. `Some` when both config and secrets
     /// contain a `[wallet]` section and the required RPC URLs are present.
     /// The actual async wallet construction is deferred to `load_files`.
@@ -624,6 +642,12 @@ fn parse_and_validate(
         (None, None) => return Err(CtxError::MissingOrderOwner),
     };
 
+    let redemption_wallet = config.tokenization.map(|t| t.redemption_wallet);
+
+    if matches!(trading_mode, TradingMode::Rebalancing(_)) && redemption_wallet.is_none() {
+        return Err(CtxError::MissingTokenization);
+    }
+
     let log_level = config.log_level.unwrap_or(LogLevel::Debug);
 
     let order_polling_interval = config.order_polling_interval.unwrap_or(15);
@@ -707,6 +731,7 @@ fn parse_and_validate(
                 RestApiCtx::new(cfg.url, key_id, key_secret).map_err(CtxError::RestApiClient)
             })
             .transpose()?,
+        redemption_wallet,
         wallet_inputs,
     })
 }
@@ -763,6 +788,7 @@ impl Ctx {
             assets: parts.assets,
             travel_rule: parts.travel_rule,
             rest_api: parts.rest_api,
+            redemption_wallet: parts.redemption_wallet,
         })
     }
 
@@ -801,6 +827,11 @@ impl Ctx {
 
     pub(crate) fn wallet(&self) -> Result<&crate::wallet::OnchainWalletCtx, CtxError> {
         self.wallet.as_ref().ok_or(CtxError::WalletNotConfigured)
+    }
+
+    /// Returns the redemption wallet from the `[tokenization]` config section.
+    pub(crate) fn redemption_wallet(&self) -> Result<Address, CtxError> {
+        self.redemption_wallet.ok_or(CtxError::MissingTokenization)
     }
 
     pub(crate) const fn get_order_poller_ctx(&self) -> OrderPollerCtx {
@@ -878,6 +909,7 @@ impl Ctx {
         execution_threshold_override: Option<ExecutionThreshold>,
         travel_rule: Option<TravelRuleConfig>,
         rest_api: Option<RestApiCtx>,
+        redemption_wallet: Option<Address>,
     ) -> Result<Self, CtxError> {
         let execution_threshold = match execution_threshold_override {
             Some(threshold) => threshold,
@@ -886,6 +918,10 @@ impl Ctx {
 
         if matches!(trading_mode, TradingMode::Rebalancing(_)) && wallet.is_none() {
             return Err(CtxError::WalletNotConfigured);
+        }
+
+        if matches!(trading_mode, TradingMode::Rebalancing(_)) && redemption_wallet.is_none() {
+            return Err(CtxError::MissingTokenization);
         }
 
         Ok(Self {
@@ -911,6 +947,7 @@ impl Ctx {
             assets,
             travel_rule,
             rest_api,
+            redemption_wallet,
         })
     }
 }
@@ -965,6 +1002,11 @@ pub enum CtxError {
     #[error("operation requires rebalancing mode")]
     NotRebalancing,
     #[error(
+        "operation requires [tokenization] config section \
+         with redemption_wallet"
+    )]
+    MissingTokenization,
+    #[error(
         "operation requires a configured [wallet] section \
          (base_rpc_url and ethereum_rpc_url in [evm] secrets)"
     )]
@@ -1018,6 +1060,7 @@ impl CtxError {
         match self {
             Self::Rebalancing(_) => "rebalancing configuration error",
             Self::NotRebalancing => "operation requires rebalancing mode",
+            Self::MissingTokenization => "operation requires tokenization config",
             Self::MissingOrderOwner => "ORDER_OWNER required when rebalancing is disabled",
             Self::ConfigIo { .. } => "failed to read config file",
             Self::SecretsIo { .. } => "failed to read secrets file",
@@ -1117,6 +1160,7 @@ pub(crate) mod tests {
             },
             travel_rule: None,
             rest_api: None,
+            redemption_wallet: None,
         }
     }
 
@@ -1565,8 +1609,10 @@ pub(crate) mod tests {
             [broker]
             counter_trade_slippage_bps = 100
 
-            [rebalancing]
+            [tokenization]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+            [rebalancing]
             transfer_timeout_secs = 1800
 
             [wallet]
@@ -1662,8 +1708,10 @@ pub(crate) mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
 
-            [rebalancing]
+            [tokenization]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+            [rebalancing]
             transfer_timeout_secs = 1800
 
             [wallet]
@@ -1756,8 +1804,10 @@ pub(crate) mod tests {
             [broker]
             counter_trade_slippage_bps = 100
 
-            [rebalancing]
+            [tokenization]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+            [rebalancing]
             transfer_timeout_secs = 1800
 
             [wallet]
@@ -1920,8 +1970,10 @@ pub(crate) mod tests {
             [broker]
             counter_trade_slippage_bps = 100
 
-            [rebalancing]
+            [tokenization]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+            [rebalancing]
             transfer_timeout_secs = 1800
 
             [rebalancing.equity]
@@ -1974,8 +2026,10 @@ pub(crate) mod tests {
             [broker.travel_rule]
             beneficiary_entity_name = "Test Corp"
 
-            [rebalancing]
+            [tokenization]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+            [rebalancing]
             transfer_timeout_secs = 1800
 
             [rebalancing.equity]
@@ -2007,6 +2061,69 @@ pub(crate) mod tests {
         assert!(
             matches!(result, Err(CtxError::WalletNotConfigured)),
             "Expected WalletNotConfigured error, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebalancing_without_tokenization_config_fails() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            apalis_finished_job_cleanup_interval_secs = 3600
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            deployment_block = 1
+
+            [wallet]
+            kind = "private-key"
+            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+            [broker]
+            counter_trade_slippage_bps = 100
+
+            [broker.travel_rule]
+            beneficiary_entity_name = "Test Corp"
+
+            [rebalancing]
+            transfer_timeout_secs = 1800
+
+            [rebalancing.equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [rebalancing.usdc]
+            mode = "enabled"
+            target = "0.5"
+            deviation = "0.3"
+        "#,
+        );
+
+        let secrets = toml_file(
+            r#"
+            [evm]
+            ws_rpc_url = "ws://localhost:8545"
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://mainnet.example.com"
+
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+            mode = "sandbox"
+
+            [wallet]
+            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        "#,
+        );
+
+        let result = Ctx::load_files(config.path(), secrets.path()).await;
+        assert!(
+            matches!(result, Err(CtxError::MissingTokenization)),
+            "Expected MissingTokenization error, got {result:?}"
         );
     }
 
@@ -2288,8 +2405,10 @@ pub(crate) mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
 
-            [rebalancing]
+            [tokenization]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+            [rebalancing]
             transfer_timeout_secs = 1800
 
             [wallet]
@@ -3501,8 +3620,10 @@ pub(crate) mod tests {
             [broker]
             counter_trade_slippage_bps = 100
 
-            [rebalancing]
+            [tokenization]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+            [rebalancing]
             transfer_timeout_secs = 1800
 
             [wallet]

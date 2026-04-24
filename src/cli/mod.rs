@@ -143,6 +143,9 @@ pub enum Commands {
         /// Number of shares to transfer (supports fractional shares)
         #[arg(short = 'q', long = "quantity")]
         quantity: FractionalShares,
+        /// Alpaca redemption wallet (overrides [tokenization] config)
+        #[arg(long = "redemption-wallet")]
+        redemption_wallet: Option<Address>,
     },
 
     /// Wrap tokenized equity into wrapped ERC-4626 vault shares
@@ -348,7 +351,7 @@ pub enum Commands {
         /// Token contract address (to verify balance after tokenization)
         #[arg(short = 't', long = "token")]
         token: Address,
-        /// Recipient wallet address (defaults to rebalancing signer address)
+        /// Recipient wallet address (defaults to configured wallet address)
         #[arg(short = 'r', long = "recipient")]
         recipient: Option<Address>,
     },
@@ -368,6 +371,9 @@ pub enum Commands {
         /// Token contract address
         #[arg(short = 't', long = "token")]
         token: Address,
+        /// Alpaca redemption wallet (overrides [tokenization] config)
+        #[arg(long = "redemption-wallet")]
+        redemption_wallet: Option<Address>,
     },
 
     /// Convert USDC to/from USD on Alpaca
@@ -521,6 +527,7 @@ enum SimpleCommand {
         direction: TransferDirection,
         symbol: Symbol,
         quantity: FractionalShares,
+        redemption_wallet: Option<Address>,
     },
     WrapEquity {
         symbol: Symbol,
@@ -616,6 +623,7 @@ enum ProviderCommand {
         symbol: Symbol,
         quantity: FractionalShares,
         token: Address,
+        redemption_wallet: Option<Address>,
     },
     AlpacaTokenizationRequests,
 }
@@ -670,10 +678,12 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             direction,
             symbol,
             quantity,
+            redemption_wallet,
         } => Ok(SimpleCommand::TransferEquity {
             direction,
             symbol,
             quantity,
+            redemption_wallet,
         }),
         Commands::WrapEquity { symbol, quantity } => {
             Ok(SimpleCommand::WrapEquity { symbol, quantity })
@@ -754,10 +764,12 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             symbol,
             quantity,
             token,
+            redemption_wallet,
         } => Err(ProviderCommand::AlpacaRedeem {
             symbol,
             quantity,
             token,
+            redemption_wallet,
         }),
         Commands::OrderStatus { order_id } => Ok(SimpleCommand::OrderStatus { order_id }),
         Commands::Submit { to, data, yes } => Ok(SimpleCommand::Submit { to, data, yes }),
@@ -820,9 +832,18 @@ async fn run_simple_command<W: Write>(
             direction,
             symbol,
             quantity,
+            redemption_wallet,
         } => {
-            rebalancing::transfer_equity_command(stdout, direction, &symbol, quantity, ctx, pool)
-                .await
+            rebalancing::transfer_equity_command(
+                stdout,
+                direction,
+                &symbol,
+                quantity,
+                redemption_wallet,
+                ctx,
+                pool,
+            )
+            .await
         }
         SimpleCommand::WrapEquity { symbol, quantity } => {
             wrapper::wrap_equity_command(stdout, symbol, quantity, ctx).await
@@ -1014,7 +1035,18 @@ async fn run_provider_command<W: Write>(
             symbol,
             quantity,
             token,
-        } => rebalancing::alpaca_redeem_command(stdout, symbol, quantity, token, ctx).await,
+            redemption_wallet,
+        } => {
+            rebalancing::alpaca_redeem_command(
+                stdout,
+                symbol,
+                quantity,
+                token,
+                redemption_wallet,
+                ctx,
+            )
+            .await
+        }
         ProviderCommand::AlpacaTokenizationRequests => {
             rebalancing::alpaca_tokenization_requests_command(stdout, ctx).await
         }
@@ -1062,6 +1094,7 @@ mod tests {
             },
             travel_rule: None,
             rest_api: None,
+            redemption_wallet: None,
         }
     }
 

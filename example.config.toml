@@ -32,14 +32,21 @@ kind = "private-key"
 # address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 # organization_id = "org-example-turnkey-org-id"
 
+# Alpaca tokenization settings. Required when [rebalancing] is configured
+# (used for equity redemptions). Also needed for CLI commands: alpaca-redeem
+# and transfer-equity (overridable via --redemption-wallet flag).
+# Not needed for alpaca-tokenize or alpaca-tokenization-requests.
+[tokenization]
+# Alpaca's issuer wallet — ERC-20 transfers for redemption go here.
+redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
 # Optional — only needed for automatic rebalancing.
 # Without this section (and with raindex.order_owner set above), the bot
 # runs in Standalone mode — the wallet is still available for manual CLI
 # operations.
 [rebalancing]
-redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-# transfer timeout in seconds before stuck inflight state is tombstoned and cleared
-# 1800 = 30 minutes
+# Transfer timeout in seconds before stuck inflight state is tombstoned and cleared.
+# 1800 = 30 minutes.
 transfer_timeout_secs = 1800
 equity = { target = 0.5, deviation = 0.2 }
 usdc = { mode = "enabled", target = 0.5, deviation = 0.3 }
