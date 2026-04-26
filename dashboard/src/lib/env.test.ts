@@ -54,6 +54,41 @@ describe('getWebSocketUrl', () => {
 
     expect(getWebSocketUrl()).toBe('wss://trimmed.example.com/ws')
   })
+
+  it('uses default port 8001 in local dev when PUBLIC_BACKEND_PORT is unset', () => {
+    Object.defineProperty(globalThis, 'window', {
+      value: {
+        location: {
+          hostname: 'localhost',
+          port: '5173',
+          host: 'localhost:5173',
+          protocol: 'http:'
+        }
+      },
+      writable: true,
+      configurable: true
+    })
+
+    expect(getWebSocketUrl()).toBe('ws://localhost:8001/api/ws')
+  })
+
+  it('honors PUBLIC_BACKEND_PORT in local dev for concurrent simulate instances', () => {
+    mockEnv.current = { PUBLIC_BACKEND_PORT: '8002' }
+    Object.defineProperty(globalThis, 'window', {
+      value: {
+        location: {
+          hostname: 'localhost',
+          port: '5174',
+          host: 'localhost:5174',
+          protocol: 'http:'
+        }
+      },
+      writable: true,
+      configurable: true
+    })
+
+    expect(getWebSocketUrl()).toBe('ws://localhost:8002/api/ws')
+  })
 })
 
 describe('getExplorerTxUrl', () => {
