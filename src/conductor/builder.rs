@@ -11,13 +11,16 @@ use tracing::{error, info};
 use st0x_event_sorcery::{Projection, Store};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::Executor;
+use st0x_finance::{HasZero, Positive, Usd};
 
 use super::job::work;
 use super::monitor::order_fills::{DexEventStreams, OrderFillMonitor};
 use super::monitor::positions::PositionMonitor;
 use super::{Conductor, spawn_inventory_poller, spawn_order_poller};
 use crate::config::Ctx;
-use crate::inventory::{InventoryPollingService, InventorySnapshot, WalletPollingCtx};
+use crate::inventory::{
+    InventoryPollingService, InventorySnapshot, InventorySnapshotId, WalletPollingCtx,
+};
 use crate::offchain_order::OffchainOrder;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::raindex::RaindexService;
@@ -67,7 +70,7 @@ pub(crate) fn spawn<Prov, Exec>(
     job_cleanup: JoinHandle<()>,
     executor_maintenance: Option<JoinHandle<()>>,
     rebalancer: Option<JoinHandle<()>>,
-) -> Conductor
+) -> anyhow::Result<Conductor>
 where
     Prov: Provider + Clone + Send + Sync + 'static,
     Exec: Executor + Clone + Send + Sync + 'static,
@@ -87,16 +90,29 @@ where
         order_owner,
     ));
 
+    let reserved_cash = context
+        .ctx
+        .assets
+        .cash
+        .as_ref()
+        .and_then(|cash| cash.reserved)
+        .map_or(Usd::ZERO, Positive::inner);
+
+    let snapshot_id = InventorySnapshotId {
+        orderbook: context.ctx.evm.orderbook,
+        owner: order_owner,
+    };
+
     let polling_service = InventoryPollingService::new(
         raindex_service,
         context.executor.clone(),
         context.frameworks.vault_registry.clone(),
-        context.ctx.evm.orderbook,
-        order_owner,
+        snapshot_id,
         context.frameworks.snapshot,
         context.wallet_polling,
         context.tokenizer,
-    );
+        reserved_cash,
+    )?;
 
     let inventory_poller = Some(spawn_inventory_poller(
         polling_service,
@@ -196,14 +212,14 @@ where
         }
     });
 
-    Conductor {
+    Ok(Conductor {
         supervisor,
         monitor,
         executor_maintenance,
         rebalancer,
         inventory_poller,
         job_cleanup,
-    }
+    })
 }
 
 fn log_optional_task_status(task_name: &str, is_configured: bool) {

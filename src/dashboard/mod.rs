@@ -9,6 +9,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use st0x_dto::{CurrentState, Statement};
+use st0x_finance::Positive;
 
 use crate::config::OperationMode;
 use crate::inventory::BroadcastingInventory;
@@ -178,11 +179,19 @@ pub(crate) fn settings_from_ctx(ctx: &crate::config::Ctx) -> st0x_dto::Settings 
         crate::config::BrokerCtx::DryRun => "dry_run",
     };
 
+    let cash_reserved = ctx
+        .assets
+        .cash
+        .as_ref()
+        .and_then(|cash| cash.reserved)
+        .map(Positive::inner);
+
     st0x_dto::Settings {
         equity_target,
         equity_deviation,
         usdc_target,
         usdc_deviation,
+        cash_reserved,
         execution_threshold,
         assets,
         log_level: format!("{:?}", ctx.log_level),
@@ -281,6 +290,7 @@ mod tests {
                 equity_deviation: 0.2,
                 usdc_target: None,
                 usdc_deviation: None,
+                cash_reserved: None,
                 execution_threshold: "$2".to_string(),
                 assets: Vec::new(),
                 log_level: "Debug".to_string(),
@@ -319,6 +329,7 @@ mod tests {
                 equity_deviation: 0.2,
                 usdc_target: None,
                 usdc_deviation: None,
+                cash_reserved: None,
                 execution_threshold: "$2".to_string(),
                 assets: Vec::new(),
                 log_level: "Debug".to_string(),
@@ -344,6 +355,7 @@ mod tests {
                 equity_deviation: 0.2,
                 usdc_target: None,
                 usdc_deviation: None,
+                cash_reserved: None,
                 execution_threshold: "$2".to_string(),
                 assets: Vec::new(),
                 log_level: "Debug".to_string(),

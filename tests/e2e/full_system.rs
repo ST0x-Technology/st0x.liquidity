@@ -33,6 +33,7 @@ use st0x_execution::{
     AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
     DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, FractionalShares, Symbol, TimeInForce,
 };
+use st0x_finance::{Positive, Usd};
 use st0x_hedge::config::{BrokerCtx, Ctx};
 use st0x_hedge::mock_api::REDEMPTION_WALLET;
 use st0x_hedge::{
@@ -64,6 +65,7 @@ fn build_full_system_ctx<P: Provider + Clone>(
     equity_vault_ids: &HashMap<String, B256>,
     cash_vault_id: B256,
     cctp: CctpOverrides,
+    cash_reserved: Option<Positive<Usd>>,
 ) -> anyhow::Result<Ctx> {
     let alpaca_auth = AlpacaBrokerApiCtx {
         api_key: TEST_API_KEY.to_owned(),
@@ -136,6 +138,7 @@ fn build_full_system_ctx<P: Provider + Clone>(
                 vault_id: Some(cash_vault_id),
                 rebalancing: OperationMode::Enabled,
                 operational_limit: None,
+                reserved: cash_reserved,
             }),
         })
         .inventory_poll_interval(15)
@@ -558,6 +561,7 @@ async fn simulate() -> anyhow::Result<()> {
         .equity_vault_ids(&equity_vault_ids)
         .cash_vault_id(usdc_vault_id)
         .cctp(cctp.cctp_overrides())
+        .cash_reserved(Positive::new(Usd::new(float!(50000)))?)
         .call()?;
     ctx.log_dir = Some(log_dir.display().to_string());
 

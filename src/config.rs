@@ -13,7 +13,7 @@ use st0x_execution::{
     AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Positive,
     SupportedExecutor, Symbol, TimeInForce,
 };
-use st0x_finance::Usdc;
+use st0x_finance::{Usd, Usdc};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -77,6 +77,9 @@ pub struct CashAssetConfig {
     pub vault_id: Option<B256>,
     pub rebalancing: OperationMode,
     pub operational_limit: Option<Positive<Usdc>>,
+    /// USD amount subtracted from offchain cash to compute available balance.
+    /// Prevents the system from rebalancing funds that should remain untouched.
+    pub reserved: Option<Positive<Usd>>,
 }
 
 /// Equity assets configuration with an optional global operational limit.
@@ -250,8 +253,8 @@ enum BrokerSecrets {
 
 /// Encodes the two mutually exclusive operating modes at the type level.
 ///
-/// `Standalone`: order_owner comes from config, no rebalancing.
-/// `Rebalancing`: order_owner resolved from the wallet at runtime.
+/// `Standalone`: `order_owner` comes from config, no rebalancing.
+/// `Rebalancing`: `order_owner` resolved from the wallet at runtime.
 #[derive(Clone, Debug)]
 pub enum TradingMode {
     Standalone { order_owner: Address },
@@ -2863,16 +2866,16 @@ pub(crate) mod tests {
             /// zero-filled on the left to 64 chars.
             #[test]
             fn padded_b256_roundtrip(hex_digits in arb_hex_digits()) {
-                let toml_str = format!(
-                    r#"vault_id = "0x{hex_digits}""#,
-                );
-
                 #[derive(Deserialize)]
                 #[serde(rename_all = "snake_case")]
                 struct Wrapper {
                     #[serde(deserialize_with = "deserialize_padded_b256")]
                     vault_id: Option<B256>,
                 }
+
+                let toml_str = format!(
+                    r#"vault_id = "0x{hex_digits}""#,
+                );
 
                 let wrapper: Wrapper = toml::from_str(&toml_str).unwrap();
                 let parsed = wrapper.vault_id.unwrap();
@@ -2888,17 +2891,17 @@ pub(crate) mod tests {
                 bad_char in "[g-zG-Z!@#$%^&*]",
                 prefix in arb_hex_digits(),
             ) {
-                let hex_str = format!("{prefix}{bad_char}");
-                let toml_str = format!(
-                    r#"vault_id = "0x{hex_str}""#,
-                );
-
                 #[derive(Debug, Deserialize)]
                 #[serde(rename_all = "snake_case")]
                 struct Wrapper {
                     #[serde(deserialize_with = "deserialize_padded_b256")]
                     vault_id: Option<B256>,
                 }
+
+                let hex_str = format!("{prefix}{bad_char}");
+                let toml_str = format!(
+                    r#"vault_id = "0x{hex_str}""#,
+                );
 
                 let result = toml::from_str::<Wrapper>(&toml_str);
                 prop_assert!(
@@ -2939,13 +2942,13 @@ pub(crate) mod tests {
                         value != "enabled" && value != "disabled"
                     })
             ) {
-                let toml_str = format!(r#"mode = "{invalid}""#);
-
                 #[derive(Debug, Deserialize)]
                 struct Wrapper {
                     #[allow(dead_code)]
                     mode: OperationMode,
                 }
+
+                let toml_str = format!(r#"mode = "{invalid}""#);
 
                 let result = toml::from_str::<Wrapper>(&toml_str);
                 prop_assert!(
@@ -3010,6 +3013,59 @@ pub(crate) mod tests {
         }
 
         #[test]
+        fn cash_reserved_parses_positive_usd() {
+            let toml_str = r#"
+                rebalancing = "enabled"
+                reserved = 5000.00
+            "#;
+
+            let config: CashAssetConfig = toml::from_str(toml_str).unwrap();
+            let reserved = config.reserved.unwrap();
+            assert!(
+                reserved.inner().eq(&Usd::new(float!(5000))).unwrap(),
+                "Expected $5000 reserved, got {reserved}"
+            );
+        }
+
+        #[test]
+        fn cash_reserved_absent_is_none() {
+            let toml_str = r#"
+                rebalancing = "enabled"
+            "#;
+
+            let config: CashAssetConfig = toml::from_str(toml_str).unwrap();
+            assert!(config.reserved.is_none());
+        }
+
+        #[test]
+        fn cash_reserved_rejects_zero() {
+            let toml_str = r#"
+                rebalancing = "enabled"
+                reserved = 0
+            "#;
+
+            let result = toml::from_str::<CashAssetConfig>(toml_str);
+            assert!(
+                result.is_err(),
+                "Expected error for zero reserved, got {result:?}"
+            );
+        }
+
+        #[test]
+        fn cash_reserved_rejects_negative() {
+            let toml_str = r#"
+                rebalancing = "enabled"
+                reserved = -100
+            "#;
+
+            let result = toml::from_str::<CashAssetConfig>(toml_str);
+            assert!(
+                result.is_err(),
+                "Expected error for negative reserved, got {result:?}"
+            );
+        }
+
+        #[test]
         fn equity_asset_config_rejects_missing_tokenized_equity() {
             let toml_str = r#"
                 tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -3037,8 +3093,6 @@ pub(crate) mod tests {
 
         #[test]
         fn padded_b256_rejects_empty_hex() {
-            let toml_str = r#"vault_id = "0x""#;
-
             #[derive(Debug, Deserialize)]
             #[serde(rename_all = "snake_case")]
             struct Wrapper {
@@ -3046,6 +3100,8 @@ pub(crate) mod tests {
                 #[allow(dead_code)]
                 vault_id: Option<B256>,
             }
+
+            let toml_str = r#"vault_id = "0x""#;
 
             let result = toml::from_str::<Wrapper>(toml_str);
             assert!(
@@ -3056,9 +3112,6 @@ pub(crate) mod tests {
 
         #[test]
         fn padded_b256_rejects_too_long_hex() {
-            let long_hex = "a".repeat(65);
-            let toml_str = format!(r#"vault_id = "0x{long_hex}""#);
-
             #[derive(Debug, Deserialize)]
             #[serde(rename_all = "snake_case")]
             struct Wrapper {
@@ -3066,6 +3119,9 @@ pub(crate) mod tests {
                 #[allow(dead_code)]
                 vault_id: Option<B256>,
             }
+
+            let long_hex = "a".repeat(65);
+            let toml_str = format!(r#"vault_id = "0x{long_hex}""#);
 
             let result = toml::from_str::<Wrapper>(&toml_str);
             assert!(

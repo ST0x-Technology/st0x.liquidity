@@ -193,7 +193,7 @@ describe('createWebSocket', () => {
           inventory: { perSymbol: [], usdc: { onchainAvailable: '0', onchainInflight: '0', offchainAvailable: '0', offchainInflight: '0', buyingPower: null } },
           positions: [],
           settings: {
-            equityTarget: 0.5, equityDeviation: 0.2, usdcTarget: null, usdcDeviation: null,
+            equityTarget: 0.5, equityDeviation: 0.2, usdcTarget: null, usdcDeviation: null, cashReserved: null,
             executionThreshold: '$2', assets: [],
             logLevel: 'Debug', serverPort: 8001, orderbook: '0x0', deploymentBlock: 0,
             tradingMode: 'standalone', broker: 'dry_run', orderPollingInterval: 5, inventoryPollInterval: 15

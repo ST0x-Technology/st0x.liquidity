@@ -76,44 +76,91 @@ pub fn float(input: TokenStream) -> TokenStream {
     // spaces to recover the original literal.
     let joined: String = tokens.iter().map(ToString::to_string).collect();
 
-    if is_numeric_literal_str(&joined) {
-        compile_time_float(&joined)
+    let source = if is_numeric_literal_str(&joined) {
+        match compile_time_float_source(&joined, "float!") {
+            Ok(source) => source,
+            Err(compile_error) => return compile_error,
+        }
     } else {
-        // Runtime fallback: emit Float::parse($expr.to_string()).unwrap()
+        // Runtime fallback: Float::parse(...).unwrap_or_else(panic!).
         let expr: TokenStream = tokens.into_iter().collect();
         let expr_str = expr.to_string();
-
         format!(
             "match ::rain_math_float::Float::parse(({expr_str}).to_string()) {{ \
                 Ok(value) => value, \
                 Err(error) => panic!(\"float!({{}}) failed: {{error}}\", {expr_str:?}), \
             }}"
         )
-        .parse()
-        .expect("runtime float fallback TokenStream parse failed")
-    }
+    };
+
+    source.parse().expect("float TokenStream parse failed")
 }
 
-/// Parses a numeric literal string into a `TokenStream` that constructs
-/// a `Float` at compile time via `Float::from_raw`.
-fn compile_time_float(literal: &str) -> TokenStream {
-    let parsed = match Float::parse(literal.to_string()) {
-        Ok(value) => value,
-        Err(error) => {
-            let message = format!("float!({literal}) failed: {error}");
-            return format!("compile_error!({message:?})")
-                .parse()
-                .expect("compile_error! TokenStream parse failed");
+/// Fallible sibling of [`float!`] for production code.
+///
+/// Unlike [`float!`], this never panics at runtime: it always yields a
+/// `Result<Float, FloatError>` so callers can propagate failures with `?`.
+///
+/// For numeric literals the Float is parsed at compile time and wrapped
+/// in `Ok(...)` so it's free at runtime:
+///
+/// ```ignore
+/// use st0x_float_macro::float_result;
+/// use rain_math_float::{Float, FloatError};
+///
+/// fn doubled(value: &str) -> Result<Float, FloatError> {
+///     let two = float_result!(2)?;
+///     float_result!(value)? * two
+/// }
+/// ```
+///
+/// For runtime expressions (variables, method calls), emits
+/// `Float::parse($expr.to_string())` so the error propagates via `?`.
+#[proc_macro]
+pub fn float_result(input: TokenStream) -> TokenStream {
+    let tokens: Vec<TokenTree> = input.into_iter().collect();
+    let joined: String = tokens.iter().map(ToString::to_string).collect();
+
+    let source = if is_numeric_literal_str(&joined) {
+        match compile_time_float_source(&joined, "float_result!") {
+            Ok(float_expr) => format!(
+                "::core::result::Result::<::rain_math_float::Float, \
+                 ::rain_math_float::FloatError>::Ok({float_expr})"
+            ),
+            Err(compile_error) => return compile_error,
         }
+    } else {
+        let expr: TokenStream = tokens.into_iter().collect();
+        let expr_str = expr.to_string();
+        format!("::rain_math_float::Float::parse(({expr_str}).to_string())")
     };
+
+    source
+        .parse()
+        .expect("float_result TokenStream parse failed")
+}
+
+/// Parses a numeric literal into source code constructing a `Float` via
+/// `Float::from_raw`. Returns the generated source string on success, or a
+/// `compile_error!` TokenStream on parse failure.
+fn compile_time_float_source(
+    literal: &str,
+    caller_macro_name: &str,
+) -> Result<String, TokenStream> {
+    let parsed = Float::parse(literal.to_string()).map_err(|error| {
+        let message = format!("{caller_macro_name}({literal}) failed: {error}");
+        format!("compile_error!({message:?})")
+            .parse::<TokenStream>()
+            .expect("compile_error! TokenStream parse failed")
+    })?;
 
     let bytes = parsed.get_inner().0;
     let byte_tokens: Vec<String> = bytes.iter().map(|byte| format!("{byte:#04x}")).collect();
     let bytes_list = byte_tokens.join(", ");
 
-    format!("rain_math_float::Float::from_raw(alloy_primitives::FixedBytes([{bytes_list}]))")
-        .parse()
-        .expect("generated Float::from_raw TokenStream parse failed")
+    Ok(format!(
+        "::rain_math_float::Float::from_raw(::alloy_primitives::FixedBytes([{bytes_list}]))"
+    ))
 }
 
 #[cfg(test)]

@@ -6,7 +6,7 @@
 
 use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
-use st0x_float_macro::float;
+use st0x_float_macro::{float, float_result};
 use st0x_float_serde::{
     deserialize_float_from_number_or_string, format_float_with_fallback, serialize_float_as_string,
 };
@@ -18,6 +18,17 @@ use crate::HasZero;
 /// An offchain US dollar amount.
 #[derive(Clone, Copy)]
 pub struct Usd(Float);
+
+/// Error returned by [`Usd::to_cents`].
+#[derive(Debug, thiserror::Error)]
+pub enum UsdToCentsError {
+    #[error("USD value {0} has sub-cent precision; whole cents required")]
+    SubCentPrecision(Usd),
+    #[error("USD value {0} out of range for whole-cent representation")]
+    Overflow(Usd),
+    #[error(transparent)]
+    Float(#[from] FloatError),
+}
 
 impl std::fmt::Debug for Usd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -43,20 +54,24 @@ impl Usd {
     }
 
     /// Converts to cents exactly.
-    /// Returns `None` if the value overflows `i64` or has sub-cent precision.
-    pub fn to_cents(self) -> Option<i64> {
-        let hundred = Float::parse("100".to_string()).ok()?;
-        let scaled = (self.0 * hundred).ok()?;
-        let frac = scaled.frac().ok()?;
-        let frac_is_zero = frac.is_zero().ok()?;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UsdToCentsError`] if the value has sub-cent precision or
+    /// overflows `i64`.
+    pub fn to_cents(self) -> Result<i64, UsdToCentsError> {
+        let scaled = (self.0 * float_result!(100)?)?;
+        let frac = scaled.frac()?;
 
-        if !frac_is_zero {
-            return None;
+        if !frac.is_zero()? {
+            return Err(UsdToCentsError::SubCentPrecision(self));
         }
 
-        let formatted = scaled.format().ok()?;
+        let formatted = scaled.format()?;
         let integer_str = formatted.split('.').next().unwrap_or(&formatted);
-        integer_str.parse::<i64>().ok()
+        integer_str
+            .parse::<i64>()
+            .map_err(|_| UsdToCentsError::Overflow(self))
     }
 
     /// Fallible equality comparison.
@@ -234,7 +249,10 @@ mod tests {
     #[test]
     fn to_cents_rejects_sub_cent_precision() {
         let usd = Usd::new(float!(99.999));
-        assert_eq!(usd.to_cents(), None);
+        assert!(matches!(
+            usd.to_cents(),
+            Err(UsdToCentsError::SubCentPrecision { .. })
+        ));
     }
 
     #[test]

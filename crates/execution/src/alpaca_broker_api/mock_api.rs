@@ -351,6 +351,11 @@ impl AlpacaBrokerMock {
             .insert("USDC".to_string(), balance);
     }
 
+    /// Returns the current broker account cash balance.
+    pub fn cash_balance(&self) -> Float {
+        lock(&self.state).account.cash
+    }
+
     /// Returns a snapshot of all orders placed through this mock.
     pub fn orders(&self) -> Vec<MockOrderSnapshot> {
         let state = lock(&self.state);

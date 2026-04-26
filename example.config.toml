@@ -25,6 +25,7 @@ deployment_block = 1
 # transactions (vault ops, CCTP bridging, wrapping, deposits/withdrawals).
 [wallet]
 kind = "private-key"
+address = "0xfcad0b19bb29d4674531d6f115237e16afce377c"
 
 # For kind = "turnkey", use instead:
 # [wallet]
@@ -56,3 +57,4 @@ rebalancing = "disabled"
 rebalancing = "enabled"
 # vault_id = "0xcd34"
 # operational_limit = 10000.0
+# reserved = 50000.0
