@@ -1,7 +1,12 @@
 import { browser } from '$app/environment'
 import { env } from '$env/dynamic/public'
 
-const LOCAL_DEV_PORT = 8001
+const DEFAULT_LOCAL_DEV_PORT = '8001'
+
+const localDevPort = (): string => {
+  const configured = env['PUBLIC_BACKEND_PORT']?.trim()
+  return configured !== undefined && configured !== '' ? configured : DEFAULT_LOCAL_DEV_PORT
+}
 
 const isLocalDev = (): boolean => {
   if (!browser) return true
@@ -11,7 +16,7 @@ const isLocalDev = (): boolean => {
 
 const getDefaultWsUrl = (): string => {
   if (isLocalDev()) {
-    return `ws://localhost:${String(LOCAL_DEV_PORT)}/api/ws`
+    return `ws://localhost:${localDevPort()}/api/ws`
   }
 
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'

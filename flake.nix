@@ -145,7 +145,11 @@
           };
 
           # Mock infra + bot + dashboard + continuous user trades.
-          # Run with `nix run .#simulate`, press `q` to exit
+          #
+          # Run with `nix run .#simulate`, press `q` to exit. Pass an
+          # integer offset to spin up a second instance side-by-side with
+          # the default (e.g. `nix run .#simulate -- 1` -> bot 8002 / vite
+          # 5174). The dashboard auto-opens in the browser on start.
           simulate = pkgs.writeShellApplication {
             name = "simulate";
             runtimeInputs = [
@@ -154,14 +158,27 @@
               pkgs.cargo-nextest
               rainix.rust-toolchain.${system}
             ];
-            text = let
-              backend =
-                "cargo nextest run --test e2e -E 'test(=full_system::simulate)' --run-ignored ignored-only --no-capture";
+            text = ''
+              offset="''${1:-0}"
+              if ! [[ "$offset" =~ ^[0-9]+$ ]]; then
+                echo "simulate: offset must be a non-negative integer, got: $offset" >&2
+                exit 1
+              fi
 
-              dashboard = "cd dashboard && bun run dev";
+              bot_port=$((8001 + offset))
+              vite_port=$((5173 + offset))
 
-            in ''
-              exec mprocs "${backend}" "${dashboard}"
+              backend="SIMULATE_BOT_PORT=$bot_port \
+                cargo nextest run --test e2e \
+                -E 'test(=full_system::simulate)' \
+                --run-ignored ignored-only --no-capture"
+
+              dashboard="cd dashboard && \
+                BACKEND_PORT=$bot_port \
+                PUBLIC_BACKEND_PORT=$bot_port \
+                bun run dev --port=$vite_port --strictPort --open"
+
+              exec mprocs "$backend" "$dashboard"
             '';
           };
 
