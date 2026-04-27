@@ -13,6 +13,8 @@ use serde::de::DeserializeOwned;
 use sqlx::SqlitePool;
 use std::fmt;
 use std::sync::Arc;
+#[cfg(feature = "test-support")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{error, info, warn};
 
 type Storage<Task> = SqliteStorage<
@@ -84,16 +86,61 @@ impl fmt::Display for Label {
     }
 }
 
-/// Generic apalis handler that bridges [`Job`] implementations
-/// with apalis's function-based worker API.
+/// Allows e2e tests to force the next job to fail terminally.
+/// Decorates `Job::perform` — when armed, returns `Err` without
+/// calling the job. When not armed, delegates transparently.
+#[cfg(feature = "test-support")]
+#[derive(Clone)]
+pub struct FailureInjector(Arc<AtomicBool>);
+
+#[cfg(feature = "test-support")]
+impl FailureInjector {
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn arm(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    fn is_armed(&self) -> bool {
+        self.0.swap(false, Ordering::SeqCst)
+    }
+}
+
+/// Generic apalis handler — test-support build.
 ///
-/// Register with apalis via:
-/// ```text
-/// WorkerBuilder::new(name)
-///     .backend(storage)
-///     .data(ctx)
-///     .build(work::<MyCtx, MyJob>)
-/// ```
+/// Accepts a [`FailureInjector`] via apalis `Data`. When armed,
+/// the job fails without calling `perform`.
+#[cfg(feature = "test-support")]
+pub(crate) async fn work<Ctx, J>(job: J, ctx: Data<Arc<Ctx>>, injector: Data<FailureInjector>)
+where
+    Ctx: Send + Sync + 'static,
+    J: Job<Ctx> + Sync,
+{
+    if injector.is_armed() {
+        error!(label = %job.label(), "Injected terminal failure (test)");
+        return;
+    }
+
+    const MAX_RETRIES: usize = 3;
+    let label = job.label();
+    info!(%label, max_retries = MAX_RETRIES, "Starting job");
+
+    let result = (|| job.perform(&ctx))
+        .retry(ExponentialBuilder::default().with_max_times(MAX_RETRIES))
+        .notify(|error, duration| {
+            warn!(%label, %error, ?duration, "Retrying job after transient failure");
+        })
+        .await;
+
+    if let Err(error) = result {
+        error!(%label, %error, "Job failed after retries");
+    }
+}
+
+/// Generic apalis handler — production build.
+#[cfg(not(feature = "test-support"))]
 pub(crate) async fn work<Ctx, J>(job: J, ctx: Data<Arc<Ctx>>)
 where
     Ctx: Send + Sync + 'static,
@@ -139,6 +186,40 @@ mod tests {
     use super::*;
     use crate::conductor::setup_apalis_tables;
     use crate::test_utils::setup_test_db;
+
+    #[test]
+    fn failure_injector_not_armed_by_default() {
+        let injector = FailureInjector::new();
+        assert!(!injector.is_armed());
+    }
+
+    #[test]
+    fn failure_injector_arm_then_check_auto_disarms() {
+        let injector = FailureInjector::new();
+
+        injector.arm();
+        assert!(injector.is_armed());
+        assert!(
+            !injector.is_armed(),
+            "second check should be false (auto-disarmed)"
+        );
+    }
+
+    #[test]
+    fn failure_injector_shared_across_clones() {
+        let injector = FailureInjector::new();
+        let clone = injector.clone();
+
+        injector.arm();
+        assert!(
+            clone.is_armed(),
+            "arming original should be visible from clone"
+        );
+        assert!(
+            !injector.is_armed(),
+            "should be disarmed after clone consumed it"
+        );
+    }
 
     async fn insert_job(
         pool: &SqlitePool,

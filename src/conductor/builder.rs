@@ -12,6 +12,8 @@ use st0x_event_sorcery::{Projection, Store};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::Executor;
 
+#[cfg(feature = "test-support")]
+use super::job::FailureInjector;
 use super::job::work;
 use super::monitor::order_fills::{DexEventStreams, OrderFillMonitor};
 use super::monitor::positions::PositionMonitor;
@@ -55,6 +57,8 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
     pub(crate) poll_notify: Arc<tokio::sync::Notify>,
     pub(crate) wallet_polling: Option<WalletPollingCtx>,
     pub(crate) tokenizer: Option<Arc<dyn Tokenizer>>,
+    #[cfg(feature = "test-support")]
+    pub(crate) failure_injector: FailureInjector,
 }
 
 /// Wires all runtime components and returns a running [`Conductor`].
@@ -165,6 +169,11 @@ where
         .build()
         .run();
 
+    #[cfg(feature = "test-support")]
+    let failure_injector = context.failure_injector;
+    #[cfg(feature = "test-support")]
+    let failure_injector_for_hedge = failure_injector.clone();
+
     let monitor = tokio::spawn(async move {
         let apalis_monitor = Monitor::new()
             .should_restart(|_ctx, _error, attempt| {
@@ -172,16 +181,24 @@ where
                 true
             })
             .register(move |index| {
-                WorkerBuilder::new(format!("order-fill-worker-{index}"))
+                let builder = WorkerBuilder::new(format!("order-fill-worker-{index}"))
                     .backend(job_queue.clone().into_storage())
-                    .data(accountant_ctx.clone())
-                    .build(work::<AccountantCtx<Prov, Exec>, _>)
+                    .data(accountant_ctx.clone());
+
+                #[cfg(feature = "test-support")]
+                let builder = builder.data(failure_injector.clone());
+
+                builder.build(work::<AccountantCtx<Prov, Exec>, _>)
             })
             .register(move |index| {
-                WorkerBuilder::new(format!("hedge-worker-{index}"))
+                let builder = WorkerBuilder::new(format!("hedge-worker-{index}"))
                     .backend(hedge_queue.clone().into_storage())
-                    .data(hedge_ctx.clone())
-                    .build(work::<HedgeCtx, _>)
+                    .data(hedge_ctx.clone());
+
+                #[cfg(feature = "test-support")]
+                let builder = builder.data(failure_injector_for_hedge.clone());
+
+                builder.build(work::<HedgeCtx, _>)
             });
 
         tokio::select! {

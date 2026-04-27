@@ -362,10 +362,15 @@ pub struct Ctx {
     pub execution_threshold: ExecutionThreshold,
     pub(crate) assets: AssetsConfig,
     pub(crate) travel_rule: Option<TravelRuleConfig>,
+<<<<<<< HEAD
     pub(crate) rest_api: Option<RestApiCtx>,
     /// Alpaca redemption wallet from `[tokenization]`.
     /// `Some` when the config includes a `[tokenization]` section.
     pub(crate) redemption_wallet: Option<Address>,
+=======
+    #[cfg(feature = "test-support")]
+    pub failure_injector: crate::conductor::job::FailureInjector,
+>>>>>>> 304ecf3d1 (feat: failure injector)
 }
 
 /// Runtime broker configuration assembled from `BrokerSecrets`.
@@ -787,8 +792,13 @@ impl Ctx {
             execution_threshold: parts.execution_threshold,
             assets: parts.assets,
             travel_rule: parts.travel_rule,
+<<<<<<< HEAD
             rest_api: parts.rest_api,
             redemption_wallet: parts.redemption_wallet,
+=======
+            #[cfg(feature = "test-support")]
+            failure_injector: crate::conductor::job::FailureInjector::new(),
+>>>>>>> 304ecf3d1 (feat: failure injector)
         })
     }
 
@@ -946,8 +956,13 @@ impl Ctx {
             execution_threshold,
             assets,
             travel_rule,
+<<<<<<< HEAD
             rest_api,
             redemption_wallet,
+=======
+            #[cfg(feature = "test-support")]
+            failure_injector: crate::conductor::job::FailureInjector::new(),
+>>>>>>> 304ecf3d1 (feat: failure injector)
         })
     }
 }
@@ -1159,8 +1174,13 @@ pub(crate) mod tests {
                 cash: None,
             },
             travel_rule: None,
+<<<<<<< HEAD
             rest_api: None,
             redemption_wallet: None,
+=======
+            #[cfg(feature = "test-support")]
+            failure_injector: crate::conductor::job::FailureInjector::new(),
+>>>>>>> 304ecf3d1 (feat: failure injector)
         }
     }
 

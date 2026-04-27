@@ -282,8 +282,13 @@ mod tests {
                 cash: None,
             },
             travel_rule: None,
+<<<<<<< HEAD
             rest_api: None,
             redemption_wallet: None,
+=======
+            #[cfg(feature = "test-support")]
+            failure_injector: crate::conductor::job::FailureInjector::new(),
+>>>>>>> 304ecf3d1 (feat: failure injector)
         }
     }
 
