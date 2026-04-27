@@ -134,11 +134,111 @@ pub(crate) async fn cleanup_finished_jobs(pool: &SqlitePool) -> Result<u64, sqlx
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use apalis::prelude::{Monitor, WorkerBuilder};
     use sqlx::SqlitePool;
 
     use super::*;
     use crate::conductor::setup_apalis_tables;
     use crate::test_utils::setup_test_db;
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct TestJob {
+        /// When true, `perform` always returns an error.
+        should_fail: bool,
+    }
+
+    struct TestCtx {
+        /// Counts how many jobs completed successfully.
+        success_count: AtomicUsize,
+        /// Counts how many jobs were attempted (including failures).
+        attempt_count: AtomicUsize,
+    }
+
+    impl Job<TestCtx> for TestJob {
+        type Error = TestJobError;
+
+        fn label(&self) -> Label {
+            Label::new(format!("test-job(should_fail={})", self.should_fail))
+        }
+
+        async fn perform(&self, ctx: &TestCtx) -> Result<(), Self::Error> {
+            ctx.attempt_count.fetch_add(1, Ordering::SeqCst);
+
+            if self.should_fail {
+                return Err(TestJobError);
+            }
+
+            ctx.success_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("test job deliberately failed")]
+    struct TestJobError;
+
+    /// RAI-199 reproduction: a job that fails after all retries must halt
+    /// further job processing. Currently, the `work` handler swallows the
+    /// error and returns `()`, so apalis treats it as success and keeps
+    /// processing the queue.
+    ///
+    /// This test enqueues a failing job followed by a succeeding job, runs
+    /// them through a real apalis Monitor, and asserts that the succeeding
+    /// job was NOT processed. It FAILS with the current code because the
+    /// second job does get processed.
+    #[tokio::test]
+    async fn job_failure_after_retries_halts_processing() {
+        let pool = setup_test_db().await;
+        setup_apalis_tables(&pool).await.unwrap();
+
+        let mut queue: JobQueue<TestJob> = JobQueue::new(&pool);
+
+        // Enqueue: failing job first, then a succeeding job.
+        queue.push(TestJob { should_fail: true }).await.unwrap();
+        queue.push(TestJob { should_fail: false }).await.unwrap();
+
+        let ctx = Arc::new(TestCtx {
+            success_count: AtomicUsize::new(0),
+            attempt_count: AtomicUsize::new(0),
+        });
+
+        let ctx_for_assert = ctx.clone();
+
+        // Run the apalis monitor with a single worker, giving it enough
+        // time to process both jobs.
+        let monitor_handle = tokio::spawn({
+            let monitor = Monitor::new().register(move |index| {
+                WorkerBuilder::new(format!("test-worker-{index}"))
+                    .backend(queue.clone().into_storage())
+                    .data(ctx.clone())
+                    .build(work::<TestCtx, TestJob>)
+            });
+
+            async move { monitor.run().await }
+        });
+
+        // Give the worker time to pick up and process both jobs.
+        // The failing job retries 3 times with exponential backoff
+        // (backon defaults: 1s, 2s, 4s), so we need enough time for
+        // retries plus processing the second job.
+        tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+
+        monitor_handle.abort();
+
+        let successes = ctx_for_assert.success_count.load(Ordering::SeqCst);
+
+        // CORRECT BEHAVIOR: after the first job exhausts retries and fails,
+        // the worker should halt. The second job should NOT be processed.
+        assert_eq!(
+            successes, 0,
+            "The succeeding job should NOT have been processed after a \
+             prior job failed all retries, but it was. This means job \
+             failures are silently swallowed and processing continues \
+             with stale/incorrect state (RAI-199)."
+        );
+    }
 
     async fn insert_job(
         pool: &SqlitePool,
