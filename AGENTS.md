@@ -33,6 +33,8 @@ the limit:
 - [docs/float.md](docs/float.md) - Float type, precision-safe financial
   arithmetic, Solidity-backed operations for guaranteed compatibility with smart
   contracts
+- [docs/feature-flags.md](docs/feature-flags.md) - Cargo feature flags,
+  `test-support` vs `cfg(test)`, common pitfalls with dead code warnings
 
 **Update at the end:**
 
@@ -41,6 +43,11 @@ the limit:
 - **ROADMAP.md** — mark completed issues, link PRs. When a PR is chained
   (depends on a parent PR), mark both as done in the roadmap so it's up to date
   by the time they merge.
+- **`docs/`** — when research or trial-and-error reveals non-obvious patterns,
+  pitfalls, or framework behavior, document it in the relevant `docs/` file (or
+  create a new one). Future agents and developers should not have to rediscover
+  the same things. Prioritize documenting: framework-specific idioms,
+  integration gotchas, and "X doesn't work because Y" findings.
 
 ## Ownership Principles
 

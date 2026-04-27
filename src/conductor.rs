@@ -100,7 +100,7 @@ pub(crate) struct Conductor {
     /// Manages long-running tasks (order fill monitor) with automatic restart.
     supervisor: SupervisorHandle,
     /// Runs the apalis job queue workers that process trade accounting jobs.
-    monitor: JoinHandle<()>,
+    monitor: JoinHandle<anyhow::Result<()>>,
     /// Periodic executor upkeep (e.g. Schwab token refresh). Absent when
     /// the executor requires no background maintenance.
     executor_maintenance: Option<JoinHandle<()>>,
@@ -361,7 +361,7 @@ impl Conductor {
 
 enum ConductorExit {
     Supervisor(anyhow::Result<()>),
-    Monitor(Result<(), JoinError>),
+    Monitor(Result<anyhow::Result<()>, JoinError>),
     JobCleanup(Result<(), JoinError>),
 }
 
@@ -371,8 +371,9 @@ fn handle_conductor_exit(exit: ConductorExit) -> anyhow::Result<()> {
             result?;
             info!("Supervisor exited");
         }
-        ConductorExit::Monitor(result) => {
-            handle_task_exit(result, "Apalis monitor")?;
+        ConductorExit::Monitor(join_result) => {
+            let inner = join_result.map_err(|error| anyhow::anyhow!(error))?;
+            inner?;
             info!("Apalis monitor exited");
         }
         ConductorExit::JobCleanup(result) => {
@@ -1576,7 +1577,7 @@ mod tests {
 
     fn conductor_with_job_cleanup(job_cleanup: JoinHandle<()>) -> Conductor {
         let supervisor = SupervisorBuilder::default().build().run();
-        let monitor = tokio::spawn(pending::<()>());
+        let monitor = tokio::spawn(pending::<anyhow::Result<()>>());
 
         Conductor {
             supervisor,

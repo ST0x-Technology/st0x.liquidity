@@ -7,7 +7,6 @@
 
 use apalis::prelude::{Data, Status, TaskSink};
 use apalis_sqlite::SqliteStorage;
-use backon::{ExponentialBuilder, Retryable};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sqlx::SqlitePool;
@@ -15,7 +14,7 @@ use std::fmt;
 use std::sync::Arc;
 #[cfg(feature = "test-support")]
 use std::sync::atomic::{AtomicBool, Ordering};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 type Storage<Task> = SqliteStorage<
     Task,
@@ -86,6 +85,21 @@ impl fmt::Display for Label {
     }
 }
 
+/// Job execution error. Wraps the concrete `Job::Error` type at
+/// the `work()` boundary where the handler is generic over job types.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum JobError {
+    #[error("{source}")]
+    Failed {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[cfg(feature = "test-support")]
+    #[error("injected terminal job failure")]
+    Injected,
+}
+
 /// Allows e2e tests to force the next job to fail terminally.
 /// Decorates `Job::perform` — when armed, returns `Err` without
 /// calling the job. When not armed, delegates transparently.
@@ -94,9 +108,16 @@ impl fmt::Display for Label {
 pub struct FailureInjector(Arc<AtomicBool>);
 
 #[cfg(feature = "test-support")]
+impl Default for FailureInjector {
+    fn default() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+}
+
+#[cfg(feature = "test-support")]
 impl FailureInjector {
     pub fn new() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
+        Self::default()
     }
 
     pub fn arm(&self) {
@@ -106,60 +127,49 @@ impl FailureInjector {
     fn is_armed(&self) -> bool {
         self.0.swap(false, Ordering::SeqCst)
     }
+
+    async fn perform<Ctx, J: Job<Ctx> + Sync>(&self, job: &J, ctx: &Ctx) -> Result<(), JobError>
+    where
+        Ctx: Send + Sync + 'static,
+    {
+        if self.is_armed() {
+            return Err(JobError::Injected);
+        }
+
+        let label = job.label();
+        info!(%label, "Processing job");
+        job.perform(ctx).await.map_err(|source| JobError::Failed {
+            source: Box::new(source),
+        })
+    }
 }
 
 /// Generic apalis handler — test-support build.
-///
-/// Accepts a [`FailureInjector`] via apalis `Data`. When armed,
-/// the job fails without calling `perform`.
 #[cfg(feature = "test-support")]
-pub(crate) async fn work<Ctx, J>(job: J, ctx: Data<Arc<Ctx>>, injector: Data<FailureInjector>)
+pub(crate) async fn work<Ctx, J>(
+    job: J,
+    ctx: Data<Arc<Ctx>>,
+    injector: Data<FailureInjector>,
+) -> Result<(), JobError>
 where
     Ctx: Send + Sync + 'static,
     J: Job<Ctx> + Sync,
 {
-    if injector.is_armed() {
-        error!(label = %job.label(), "Injected terminal failure (test)");
-        return;
-    }
-
-    const MAX_RETRIES: usize = 3;
-    let label = job.label();
-    info!(%label, max_retries = MAX_RETRIES, "Starting job");
-
-    let result = (|| job.perform(&ctx))
-        .retry(ExponentialBuilder::default().with_max_times(MAX_RETRIES))
-        .notify(|error, duration| {
-            warn!(%label, %error, ?duration, "Retrying job after transient failure");
-        })
-        .await;
-
-    if let Err(error) = result {
-        error!(%label, %error, "Job failed after retries");
-    }
+    injector.perform(&job, &ctx).await
 }
 
 /// Generic apalis handler — production build.
 #[cfg(not(feature = "test-support"))]
-pub(crate) async fn work<Ctx, J>(job: J, ctx: Data<Arc<Ctx>>)
+pub(crate) async fn work<Ctx, J>(job: J, ctx: Data<Arc<Ctx>>) -> Result<(), JobError>
 where
     Ctx: Send + Sync + 'static,
     J: Job<Ctx> + Sync,
 {
-    const MAX_RETRIES: usize = 3;
     let label = job.label();
-    info!(%label, max_retries = MAX_RETRIES, "Starting job");
-
-    let result = (|| job.perform(&ctx))
-        .retry(ExponentialBuilder::default().with_max_times(MAX_RETRIES))
-        .notify(|error, duration| {
-            warn!(%label, %error, ?duration, "Retrying job after transient failure");
-        })
-        .await;
-
-    if let Err(error) = result {
-        error!(%label, %error, "Job failed after retries");
-    }
+    info!(%label, "Processing job");
+    job.perform(&ctx).await.map_err(|source| JobError::Failed {
+        source: Box::new(source),
+    })
 }
 
 pub(crate) async fn cleanup_finished_jobs(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
@@ -182,8 +192,14 @@ pub(crate) async fn cleanup_finished_jobs(pool: &SqlitePool) -> Result<u64, sqlx
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
+    use apalis::layers::WorkerBuilderExt;
+    use apalis::layers::retry::RetryPolicy;
     use apalis::prelude::{Monitor, WorkerBuilder};
+    use apalis_core::worker::event::Event;
+    use apalis_core::worker::ext::circuit_breaker::{CircuitBreaker, config::CircuitBreakerConfig};
+    use apalis_core::worker::ext::event_listener::EventListenerExt;
     use sqlx::SqlitePool;
 
     use super::*;
@@ -274,20 +290,38 @@ mod tests {
         let ctx_for_assert = ctx.clone();
 
         let monitor_handle = tokio::spawn({
-            let monitor = Monitor::new().register(move |index| {
-                WorkerBuilder::new(format!("test-worker-{index}"))
-                    .backend(queue.clone().into_storage())
-                    .data(ctx.clone())
-                    .data(FailureInjector::new())
-                    .build(work::<TestCtx, TestJob>)
-            });
+            let monitor = Monitor::new()
+                .should_restart(|_ctx, _error, _attempt| false)
+                .register(move |index| {
+                    let fail_stop = CircuitBreakerConfig::default()
+                        .with_failure_threshold(1)
+                        .with_recovery_timeout(Duration::from_secs(u64::MAX));
+
+                    WorkerBuilder::new(format!("test-worker-{index}"))
+                        .backend(queue.clone().into_storage())
+                        .data(ctx.clone())
+                        .data(FailureInjector::new())
+                        .concurrency(1)
+                        .retry(RetryPolicy::retries(3))
+                        .break_circuit_with(fail_stop)
+                        .on_event(|ctx, event| {
+                            if let Event::Error(_) = event {
+                                let _ = ctx.stop();
+                            }
+                        })
+                        .build(work::<TestCtx, TestJob>)
+                });
 
             async move { monitor.run().await }
         });
 
-        // backon default: 1s + 2s + 4s retries, plus time for second job
-        tokio::time::sleep(std::time::Duration::from_secs(12)).await;
-        monitor_handle.abort();
+        // RetryPolicy retries instantly, so the monitor should exit
+        // quickly once the failing job exhausts retries.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), monitor_handle).await;
+        assert!(
+            result.is_ok(),
+            "Monitor should have exited after terminal job failure"
+        );
 
         assert_eq!(
             ctx_for_assert.success_count.load(Ordering::SeqCst),

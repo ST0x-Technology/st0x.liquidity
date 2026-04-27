@@ -366,7 +366,7 @@ impl std::fmt::Debug for Ctx {
             .field("execution_threshold", &self.execution_threshold)
             .field("assets", &self.assets)
             .field("travel_rule_configured", &self.travel_rule.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

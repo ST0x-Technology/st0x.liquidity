@@ -1,7 +1,14 @@
 //! Constructs a fully-wired [`Conductor`] instance from its dependencies.
 
+use std::time::Duration;
+
 use alloy::providers::Provider;
+use apalis::layers::WorkerBuilderExt;
+use apalis::layers::retry::RetryPolicy;
 use apalis::prelude::{Monitor, WorkerBuilder};
+use apalis_core::worker::event::Event;
+use apalis_core::worker::ext::circuit_breaker::{CircuitBreaker, config::CircuitBreakerConfig};
+use apalis_core::worker::ext::event_listener::EventListenerExt;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use task_supervisor::SupervisorBuilder;
@@ -174,12 +181,14 @@ where
     #[cfg(feature = "test-support")]
     let failure_injector_for_hedge = failure_injector.clone();
 
-    let monitor = tokio::spawn(async move {
+    let fail_stop = CircuitBreakerConfig::default()
+        .with_failure_threshold(1)
+        .with_recovery_timeout(Duration::from_secs(u64::MAX));
+    let fail_stop_for_hedge = fail_stop.clone();
+
+    let monitor: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
         let apalis_monitor = Monitor::new()
-            .should_restart(|_ctx, _error, attempt| {
-                info!(attempt, "Restarting worker");
-                true
-            })
+            .should_restart(|_ctx, _error, _attempt| false)
             .register(move |index| {
                 let builder = WorkerBuilder::new(format!("order-fill-worker-{index}"))
                     .backend(job_queue.clone().into_storage())
@@ -188,7 +197,17 @@ where
                 #[cfg(feature = "test-support")]
                 let builder = builder.data(failure_injector.clone());
 
-                builder.build(work::<AccountantCtx<Prov, Exec>, _>)
+                builder
+                    .concurrency(1)
+                    .retry(RetryPolicy::retries(3))
+                    .break_circuit_with(fail_stop.clone())
+                    .on_event(|ctx, event| {
+                        if let Event::Error(err) = event {
+                            error!(%err, worker = %ctx.name(), "Job failed after retries");
+                            let _ = ctx.stop();
+                        }
+                    })
+                    .build(work::<AccountantCtx<Prov, Exec>, _>)
             })
             .register(move |index| {
                 let builder = WorkerBuilder::new(format!("hedge-worker-{index}"))
@@ -198,17 +217,25 @@ where
                 #[cfg(feature = "test-support")]
                 let builder = builder.data(failure_injector_for_hedge.clone());
 
-                builder.build(work::<HedgeCtx, _>)
+                builder
+                    .concurrency(1)
+                    .retry(RetryPolicy::retries(3))
+                    .break_circuit_with(fail_stop_for_hedge.clone())
+                    .on_event(|ctx, event| {
+                        if let Event::Error(err) = event {
+                            error!(%err, worker = %ctx.name(), "Job failed after retries");
+                            let _ = ctx.stop();
+                        }
+                    })
+                    .build(work::<HedgeCtx, _>)
             });
 
         tokio::select! {
             result = apalis_monitor.run() => {
-                if let Err(monitor_error) = result {
-                    error!(%monitor_error, "Apalis monitor exited with error");
-                }
+                result.map_err(|error| anyhow::anyhow!(error))
             }
             _ = order_poller_handle => {
-                error!("Order poller exited unexpectedly");
+                Err(anyhow::anyhow!("Order poller exited unexpectedly"))
             }
         }
     });
