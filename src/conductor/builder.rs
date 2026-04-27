@@ -1,7 +1,13 @@
 //! Constructs a fully-wired [`Conductor`] instance from its dependencies.
 
 use alloy::providers::Provider;
+use apalis::layers::WorkerBuilderExt;
+use apalis::layers::retry::RetryPolicy;
 use apalis::prelude::{Monitor, WorkerBuilder};
+use apalis_core::worker::event::Event;
+use apalis_core::worker::ext::circuit_breaker::{CircuitBreaker, config::CircuitBreakerConfig};
+use apalis_core::worker::ext::event_listener::EventListenerExt;
+use apalis_cron::CronStream;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use task_supervisor::SupervisorBuilder;
@@ -12,12 +18,12 @@ use st0x_event_sorcery::{Projection, Store};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::Executor;
 
-use super::job::work;
-#[cfg(feature = "test-support")]
+use super::job::{FAIL_STOP_RECOVERY_TIMEOUT, FixedInterval, RETRY_BACKOFF, poll_orders, work};
+#[cfg(any(test, feature = "test-support"))]
 use super::job::{FailureInjector, JobKind};
 use super::monitor::order_fills::{DexEventStreams, OrderFillMonitor};
 use super::monitor::positions::PositionMonitor;
-use super::{Conductor, spawn_inventory_poller, spawn_order_poller};
+use super::{Conductor, MonitorTaskError, build_order_poller, spawn_inventory_poller};
 use crate::config::Ctx;
 use crate::inventory::{InventoryPollingService, InventorySnapshot, WalletPollingCtx};
 use crate::offchain_order::OffchainOrder;
@@ -57,7 +63,7 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
     pub(crate) poll_notify: Arc<tokio::sync::Notify>,
     pub(crate) wallet_polling: Option<WalletPollingCtx>,
     pub(crate) tokenizer: Option<Arc<dyn Tokenizer>>,
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) failure_injector: FailureInjector,
 }
 
@@ -109,13 +115,14 @@ where
     ));
     log_optional_task_status("inventory poller", inventory_poller.is_some());
 
-    let order_poller_handle = spawn_order_poller(
+    let order_poller = Arc::new(build_order_poller(
         &context.ctx,
         context.executor.clone(),
         (*context.frameworks.offchain_order_projection).clone(),
         context.frameworks.offchain_order.clone(),
         context.frameworks.position.clone(),
-    );
+    ));
+    let order_poller_schedule = FixedInterval::new(order_poller.polling_interval());
 
     let counter_trade_submission_lock = Arc::new(tokio::sync::Mutex::new(()));
 
@@ -161,59 +168,110 @@ where
         dex_streams,
     );
 
-    // NOTE: latest versions of apalias are adding tooling for long-running tasks too,
-    // so we will be able to get rid of this task-supervisor inconsistency
     let supervisor = SupervisorBuilder::default()
         .with_task("order-fill-monitor", order_fill_monitor)
         .with_task("position-monitor", position_monitor)
         .build()
         .run();
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     let failure_injector = context.failure_injector;
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     let failure_injector_for_hedge = failure_injector.clone();
+    let failure_notify = Arc::new(tokio::sync::Notify::new());
+    let failure_notify_for_hedge = failure_notify.clone();
+    let failure_notify_for_poller = failure_notify.clone();
 
-    let monitor = tokio::spawn(async move {
+    let fail_stop = CircuitBreakerConfig::default()
+        .with_failure_threshold(1)
+        .with_recovery_timeout(FAIL_STOP_RECOVERY_TIMEOUT);
+    let fail_stop_for_hedge = fail_stop.clone();
+    let fail_stop_for_poller = fail_stop.clone();
+
+    let monitor: JoinHandle<Result<(), MonitorTaskError>> = tokio::spawn(async move {
+        let failure_notify_for_accountant = failure_notify.clone();
+        let failure_notify_for_select = failure_notify.clone();
         let apalis_monitor = Monitor::new()
-            .should_restart(|_ctx, _error, attempt| {
-                info!(attempt, "Restarting worker");
-                true
-            })
+            .should_restart(|_ctx, _error, _attempt| false)
             .register(move |index| {
                 let builder = WorkerBuilder::new(format!("order-fill-worker-{index}"))
                     .backend(job_queue.clone().into_storage())
                     .data(accountant_ctx.clone());
 
-                #[cfg(feature = "test-support")]
+                #[cfg(any(test, feature = "test-support"))]
                 let builder = builder
                     .data(failure_injector.clone())
                     .data(JobKind::OrderFill);
 
-                builder.build(work::<AccountantCtx<Prov, Exec>, _>)
+                builder
+                    .concurrency(1)
+                    .retry(RetryPolicy::retries(3).with_backoff(RETRY_BACKOFF.clone()))
+                    .break_circuit_with(fail_stop.clone())
+                    .on_event({
+                        let failure_notify = failure_notify_for_accountant.clone();
+                        move |ctx, event| {
+                            if let Event::Error(err) = event {
+                                error!(%err, worker = %ctx.name(), "Job failed after retries");
+                                failure_notify.notify_waiters();
+                                let _ = ctx.stop();
+                            }
+                        }
+                    })
+                    .build(work::<AccountantCtx<Prov, Exec>, _>)
             })
             .register(move |index| {
                 let builder = WorkerBuilder::new(format!("hedge-worker-{index}"))
                     .backend(hedge_queue.clone().into_storage())
                     .data(hedge_ctx.clone());
 
-                #[cfg(feature = "test-support")]
+                #[cfg(any(test, feature = "test-support"))]
                 let builder = builder
                     .data(failure_injector_for_hedge.clone())
                     .data(JobKind::Hedge);
 
-                builder.build(work::<HedgeCtx, _>)
+                builder
+                    .concurrency(1)
+                    .retry(RetryPolicy::retries(3).with_backoff(RETRY_BACKOFF.clone()))
+                    .break_circuit_with(fail_stop_for_hedge.clone())
+                    .on_event({
+                        let failure_notify = failure_notify_for_hedge.clone();
+                        move |ctx, event| {
+                            if let Event::Error(err) = event {
+                                error!(%err, worker = %ctx.name(), "Job failed after retries");
+                                failure_notify.notify_waiters();
+                                let _ = ctx.stop();
+                            }
+                        }
+                    })
+                    .build(work::<HedgeCtx, _>)
+            })
+            .register(move |index| {
+                WorkerBuilder::new(format!("order-poller-{index}"))
+                    .backend(CronStream::new(order_poller_schedule.clone()))
+                    .data(order_poller.clone())
+                    .concurrency(1)
+                    .retry(RetryPolicy::retries(3).with_backoff(RETRY_BACKOFF.clone()))
+                    .break_circuit_with(fail_stop_for_poller.clone())
+                    .on_event({
+                        let failure_notify = failure_notify_for_poller.clone();
+                        move |ctx, event| {
+                            if let Event::Error(err) = event {
+                                error!(%err, worker = %ctx.name(), "Order poller failed after retries");
+                                failure_notify.notify_waiters();
+                                let _ = ctx.stop();
+                            }
+                        }
+                    })
+                    .build(poll_orders::<Exec>)
             });
 
         tokio::select! {
-            result = apalis_monitor.run() => {
-                if let Err(monitor_error) = result {
-                    error!(%monitor_error, "Apalis monitor exited with error");
-                }
-            }
-            _ = order_poller_handle => {
-                error!("Order poller exited unexpectedly");
-            }
+            biased;
+            () = failure_notify_for_select.notified() => Err(MonitorTaskError::TerminalJobFailure),
+            result = apalis_monitor.run() => match result {
+                Ok(()) => Err(MonitorTaskError::UnexpectedExit { source: None }),
+                Err(source) => Err(MonitorTaskError::UnexpectedExit { source: Some(source) }),
+            },
         }
     });
 

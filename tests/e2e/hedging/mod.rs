@@ -13,7 +13,7 @@ pub(crate) mod assertions;
 use rain_math_float::Float;
 use st0x_execution::alpaca_broker_api::OrderStatus;
 use st0x_float_macro::float;
-
+#[cfg(feature = "test-support")]
 use st0x_hedge::{FailureInjector, JobKind};
 
 use self::assertions::*;
@@ -1451,7 +1451,7 @@ async fn duplicate_event_delivery() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// RAI-199: when a job fails terminally, the bot must halt — not
+/// RAI-199: when a job fails terminally, the bot must halt -- not
 /// silently continue processing subsequent events with stale state.
 ///
 /// This is a stopgap: a single worker failure brings down the whole
@@ -1459,6 +1459,7 @@ async fn duplicate_event_delivery() -> anyhow::Result<()> {
 /// invariant enforcement infrastructure and robust auto-recovery so
 /// individual worker failures are isolated and state inconsistencies
 /// are made impossible, rather than relying on a full halt.
+#[cfg(feature = "test-support")]
 #[test_log::test(tokio::test)]
 async fn job_failure_halts_bot() -> anyhow::Result<()> {
     let onchain_price = float!(155.00);
@@ -1513,11 +1514,18 @@ async fn job_failure_halts_bot() -> anyhow::Result<()> {
         .call()
         .await?;
 
-    // The bot should exit — the injected failure should halt processing
-    let bot_exited = tokio::time::timeout(Duration::from_secs(30), &mut bot).await;
-
-    let bot_join = bot_exited.expect("bot did not exit within timeout");
-    let _ = bot_join.expect("bot panicked or failed to join");
+    // The bot should exit -- the injected failure should halt processing
+    let join_result = tokio::time::timeout(Duration::from_secs(30), &mut bot)
+        .await
+        .expect("Bot should exit within 30s after terminal job failure");
+    let inner_result = join_result.expect("Bot task should fail, not panic");
+    let error = inner_result
+        .expect_err("Bot should fail after terminal job failure, not exit successfully");
+    let chain = format!("{error:#}");
+    assert!(
+        chain.contains("Apalis worker failed after retries"),
+        "Bot error chain should contain TerminalJobFailure, got: {chain}"
+    );
 
     // The second trade's onchain event should NOT have been processed
     let pool = connect_db(&infra.db_path).await?;

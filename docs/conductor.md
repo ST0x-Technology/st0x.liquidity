@@ -96,35 +96,90 @@ logging.
 ### work
 
 Generic apalis handler that bridges `Job` implementations with apalis's
-function-based worker API:
+function-based worker API. Returns `Result<(), JobError>` so apalis can
+distinguish success from failure.
 
 ```rust
-pub(crate) async fn work<Ctx, J>(job: J, ctx: Data<Arc<Ctx>>)
-where
-    Ctx: Send + Sync + 'static,
-    J: Job<Ctx>,
-{
-    // Retries with exponential backoff, then logs on final failure.
+pub(crate) async fn work<Ctx, J>(
+    job: J, ctx: Data<Arc<Ctx>>,
+) -> Result<(), JobError> {
+    let label = job.label();
+    info!(%label, "Processing job");
+    job.perform(&ctx).await.map_err(|source| JobError::Failed {
+        label,
+        source: Box::new(source),
+    })
 }
 ```
 
-### Wiring a job into apalis
+### Worker middleware stack
+
+Apalis workers use a Tower middleware stack configured on `WorkerBuilder`. The
+layers are applied in order — outermost first:
 
 ```
 WorkerBuilder::new(name)
-    .backend(job_queue)       // SqliteStorage<MyJob, ...>
-    .data(ctx)                // Arc<MyCtx>
+    .backend(job_queue)
+    .data(ctx)
+    .concurrency(1)                                          // sequential processing
+    .retry(RetryPolicy::retries(3).with_backoff(backoff))    // 1 + 3 = 4 attempts, with backoff
+    .break_circuit_with(fail_stop_config)                    // halt on terminal failure
+    .on_event(|ctx, event| { ... })                          // observability + lifecycle
     .build(work::<MyCtx, MyJob>)
 ```
 
-The apalis `Monitor` wraps workers and restarts them on failure:
+**Layer roles:**
+
+- **`.concurrency(1)`** — serializes job processing. Without it,
+  `CallAllUnordered` processes jobs in parallel and a failing job can't prevent
+  the next job from starting.
+- **`.retry(RetryPolicy::retries(3).with_backoff(RETRY_BACKOFF))`** — retries
+  failed jobs (replaces backon in the handler). `retries(3)` = 4 total attempts.
+  `RETRY_BACKOFF` is a deterministic exponential backoff (1s base, doubles each
+  attempt, capped at 30s) so transient failures (RPC blips, broker rate limits)
+  don't fast-fail into the circuit breaker. No jitter -- single-worker queues
+  don't thunder.
+- **`.break_circuit_with(config)`** — opens the circuit after
+  `failure_threshold` errors, returning `Poll::Pending` from `poll_ready` to
+  block new job pickup. Use `failure_threshold(1)` + very long
+  `recovery_timeout` for fail-stop.
+- **`.on_event()`** — fires on `Event::Error` (after retries exhaust),
+  `Event::Success`, `Event::Start`, `Event::Stop`. Use for logging AND for
+  calling `ctx.stop()` on terminal failure. The circuit breaker alone only
+  pauses the worker (`Poll::Pending`); `ctx.stop()` is needed to actually make
+  the worker exit.
+
+### Error propagation: handler failure -> bot shutdown
+
+1. `work()` returns `Err` -> retry layer retries
+2. Retries exhaust -> error reaches circuit breaker -> circuit opens
+3. Error becomes `Ok(Event::Error)` in apalis `poll_tasks`
+4. `on_event` catches `Event::Error`, fires the shared `failure_notify`
+   (`tokio::sync::Notify`), and calls `ctx.stop()`
+5. Worker exits cleanly (`Ok(())`)
+6. The spawned monitor task's biased `tokio::select!` observes the Notify and
+   returns `Err(MonitorTaskError::TerminalJobFailure)` immediately -- it does
+   not wait for `apalis_monitor.run()` to wind down. The conductor's
+   `wait_for_completion` sees the monitor task exit with that error and shuts
+   the bot down.
+
+**Critical:** the spawned monitor task must select on the shared Notify
+alongside `apalis_monitor.run()` and return the terminal error. Without the
+Notify branch, the conductor would only learn of the failure once apalis
+finished tearing down all workers; without returning the error, the conductor
+would never see the failure at all.
+
+### Monitor configuration
 
 ```
 Monitor::new()
-    .should_restart(|_ctx, _error, _attempt| true)
+    .should_restart(|_ctx, _error, _attempt| false)
     .register(|index| { /* WorkerBuilder as above */ })
     .run().await
 ```
+
+`should_restart(false)` — terminal job failure is fail-stop. The worker must not
+restart and process the next job with stale state.
 
 ### AccountForDexTrade
 
