@@ -1061,6 +1061,8 @@ mod tests {
                 cash: None,
             },
             travel_rule: None,
+            #[cfg(feature = "test-support")]
+            failure_injector: crate::conductor::job::FailureInjector::new(),
         }
     }
 

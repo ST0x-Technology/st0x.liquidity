@@ -279,6 +279,8 @@ pub struct Ctx {
     pub execution_threshold: ExecutionThreshold,
     pub(crate) assets: AssetsConfig,
     pub(crate) travel_rule: Option<TravelRuleConfig>,
+    #[cfg(feature = "test-support")]
+    pub failure_injector: crate::conductor::job::FailureInjector,
 }
 
 /// Runtime broker configuration assembled from `BrokerSecrets`.
@@ -674,6 +676,8 @@ impl Ctx {
             execution_threshold: parts.execution_threshold,
             assets: parts.assets,
             travel_rule: parts.travel_rule,
+            #[cfg(feature = "test-support")]
+            failure_injector: crate::conductor::job::FailureInjector::new(),
         })
     }
 
@@ -820,6 +824,8 @@ impl Ctx {
             execution_threshold,
             assets,
             travel_rule,
+            #[cfg(feature = "test-support")]
+            failure_injector: crate::conductor::job::FailureInjector::new(),
         })
     }
 }
@@ -1022,6 +1028,8 @@ pub(crate) mod tests {
                 cash: None,
             },
             travel_rule: None,
+            #[cfg(feature = "test-support")]
+            failure_injector: crate::conductor::job::FailureInjector::new(),
         }
     }
 

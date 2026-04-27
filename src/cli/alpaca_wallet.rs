@@ -749,6 +749,8 @@ mod tests {
                 cash: None,
             },
             travel_rule: None,
+            #[cfg(feature = "test-support")]
+            failure_injector: crate::conductor::job::FailureInjector::new(),
         }
     }
 
@@ -834,6 +836,8 @@ mod tests {
             wallet: Some(crate::wallet::OnchainWalletCtx::stub()),
             execution_threshold: ExecutionThreshold::whole_share(),
             travel_rule: None,
+            #[cfg(feature = "test-support")]
+            failure_injector: crate::conductor::job::FailureInjector::new(),
         }
     }
 
