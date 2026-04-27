@@ -218,7 +218,9 @@ pub(crate) async fn cleanup_finished_jobs(pool: &SqlitePool) -> Result<u64, sqlx
 
 #[cfg(test)]
 mod tests {
+    use apalis::prelude::{Monitor, WorkerBuilder};
     use sqlx::SqlitePool;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::conductor::setup_apalis_tables;
@@ -268,6 +270,80 @@ mod tests {
         assert!(
             !injector.is_armed(JobKind::Hedge),
             "should be disarmed after clone consumed it"
+        );
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct TestJob {
+        should_fail: bool,
+    }
+
+    struct TestCtx {
+        success_count: AtomicUsize,
+    }
+
+    impl Job<TestCtx> for TestJob {
+        type Error = TestJobError;
+
+        fn label(&self) -> Label {
+            Label::new(format!("test-job(should_fail={})", self.should_fail))
+        }
+
+        async fn perform(&self, ctx: &TestCtx) -> Result<(), Self::Error> {
+            if self.should_fail {
+                return Err(TestJobError);
+            }
+
+            ctx.success_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("test job deliberately failed")]
+    struct TestJobError;
+
+    /// RAI-199: a job that fails after all retries must halt further
+    /// processing. Currently `work()` swallows the error and the worker
+    /// picks up the next job with stale state.
+    ///
+    /// FAILS with current code — the second job runs.
+    #[tokio::test]
+    async fn job_failure_after_retries_halts_processing() {
+        let pool = setup_test_db().await;
+        setup_apalis_tables(&pool).await.unwrap();
+
+        let mut queue: JobQueue<TestJob> = JobQueue::new(&pool);
+        queue.push(TestJob { should_fail: true }).await.unwrap();
+        queue.push(TestJob { should_fail: false }).await.unwrap();
+
+        let ctx = Arc::new(TestCtx {
+            success_count: AtomicUsize::new(0),
+        });
+        let ctx_for_assert = ctx.clone();
+
+        let monitor_handle = tokio::spawn({
+            let monitor = Monitor::new().register(move |index| {
+                WorkerBuilder::new(format!("test-worker-{index}"))
+                    .backend(queue.clone().into_storage())
+                    .data(ctx.clone())
+                    .data(FailureInjector::new())
+                    .data(JobKind::OrderFill)
+                    .build(work::<TestCtx, TestJob>)
+            });
+
+            async move { monitor.run().await }
+        });
+
+        // backon default: 1s + 2s + 4s retries, plus time for second job
+        tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+        monitor_handle.abort();
+
+        assert_eq!(
+            ctx_for_assert.success_count.load(Ordering::SeqCst),
+            0,
+            "The second job should NOT have been processed after a prior \
+             job failed all retries (RAI-199)."
         );
     }
 

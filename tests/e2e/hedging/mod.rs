@@ -14,6 +14,8 @@ use rain_math_float::Float;
 use st0x_execution::alpaca_broker_api::OrderStatus;
 use st0x_float_macro::float;
 
+use st0x_hedge::{FailureInjector, JobKind};
+
 use self::assertions::*;
 use crate::poll::poll_for_all_jobs_done;
 
@@ -1446,5 +1448,86 @@ async fn duplicate_event_delivery() -> anyhow::Result<()> {
 
     pool.close().await;
     bot2.abort();
+    Ok(())
+}
+
+/// RAI-199: when a job fails terminally, the bot must halt — not
+/// silently continue processing subsequent events with stale state.
+///
+/// This is a stopgap: a single worker failure brings down the whole
+/// system. Future work (tracked in Linear) will add system-level
+/// invariant enforcement infrastructure and robust auto-recovery so
+/// individual worker failures are isolated and state inconsistencies
+/// are made impossible, rather than relying on a full halt.
+#[test_log::test(tokio::test)]
+async fn job_failure_halts_bot() -> anyhow::Result<()> {
+    let onchain_price = float!(155.00);
+    let broker_fill_price = float!(150.25);
+    let sell_amount = float!(10.75);
+
+    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
+
+    let current_block = infra.base_chain.provider.get_block_number().await?;
+    let mut ctx = build_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .assets(infra.assets_config())
+        .call()?;
+
+    let injector = FailureInjector::new();
+    ctx.failure_injector = injector.clone();
+    let mut bot = spawn_bot(ctx);
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // First trade processes normally
+    infra
+        .base_chain
+        .take_order()
+        .symbol("AAPL")
+        .amount(sell_amount)
+        .price(onchain_price)
+        .direction(TakeDirection::SellEquity)
+        .call()
+        .await?;
+
+    poll_for_events(&mut bot, &infra.db_path, "OffchainOrderEvent::Filled", 1).await;
+
+    // Snapshot event count before the injected failure
+    let pool = connect_db(&infra.db_path).await?;
+    let events_before = count_events(&pool, "OnChainTrade").await?;
+    pool.close().await;
+
+    // Arm the injector, then submit a second trade
+    injector.arm(JobKind::OrderFill);
+
+    infra
+        .base_chain
+        .take_order()
+        .symbol("AAPL")
+        .amount(sell_amount)
+        .price(onchain_price)
+        .direction(TakeDirection::SellEquity)
+        .call()
+        .await?;
+
+    // The bot should exit — the injected failure should halt processing
+    let bot_exited = tokio::time::timeout(Duration::from_secs(30), &mut bot).await;
+
+    let bot_join = bot_exited.expect("bot did not exit within timeout");
+    let _ = bot_join.expect("bot panicked or failed to join");
+
+    // The second trade's onchain event should NOT have been processed
+    let pool = connect_db(&infra.db_path).await?;
+    let events_after = count_events(&pool, "OnChainTrade").await?;
+    pool.close().await;
+
+    assert_eq!(
+        events_before, events_after,
+        "No new OnChainTrade events should be persisted after terminal failure"
+    );
+
     Ok(())
 }
