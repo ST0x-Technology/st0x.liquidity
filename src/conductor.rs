@@ -15,7 +15,7 @@ use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use task_supervisor::SupervisorHandle;
+use task_supervisor::{SupervisorError, SupervisorHandle};
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::MissedTickBehavior;
@@ -103,7 +103,7 @@ pub(crate) struct Conductor {
     /// Manages long-running tasks (order fill monitor) with automatic restart.
     supervisor: SupervisorHandle,
     /// Runs the apalis job queue workers that process trade accounting jobs.
-    monitor: JoinHandle<()>,
+    monitor: JoinHandle<Result<(), MonitorTaskError>>,
     /// Periodic executor upkeep (e.g. Schwab token refresh). Absent when
     /// the executor requires no background maintenance.
     executor_maintenance: Option<JoinHandle<()>>,
@@ -112,8 +112,41 @@ pub(crate) struct Conductor {
     /// Polls wallet balances and onchain state on a timer. Absent when
     /// rebalancing (and therefore wallet context) is not configured.
     inventory_poller: Option<JoinHandle<()>>,
+    /// Polls pending offchain orders until they reach a terminal state.
+    order_poller_handle: JoinHandle<()>,
     /// Periodically removes terminal rows from the persistent job queue.
     job_cleanup: JoinHandle<()>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum MonitorTaskError {
+    #[error("Apalis worker failed after retries")]
+    TerminalJobFailure,
+
+    #[error("Apalis monitor exited unexpectedly")]
+    UnexpectedExit,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ConductorExitError {
+    #[error(transparent)]
+    Supervisor(#[from] SupervisorError),
+
+    #[error(transparent)]
+    Join(#[from] JoinError),
+
+    #[error(transparent)]
+    Monitor(#[from] MonitorTaskError),
+
+    #[error("{task} failed")]
+    TaskFailed {
+        task: &'static str,
+        #[source]
+        source: JoinError,
+    },
+
+    #[error("{task} exited unexpectedly")]
+    UnexpectedTaskExit { task: &'static str },
 }
 
 fn base_wallet_unwrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Address> {
@@ -309,7 +342,7 @@ impl Conductor {
             poll_notify: Arc::new(tokio::sync::Notify::new()),
             wallet_polling,
             tokenizer,
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             failure_injector: ctx.failure_injector.clone(),
         };
 
@@ -333,12 +366,14 @@ impl Conductor {
 impl Conductor {
     pub(crate) async fn wait_for_completion(&mut self) -> anyhow::Result<()> {
         let exit = tokio::select! {
-            result = self.supervisor.wait() => ConductorExit::Supervisor(result.map_err(anyhow::Error::new)),
+            result = self.supervisor.wait() => ConductorExit::Supervisor(result),
             result = &mut self.monitor => ConductorExit::Monitor(result),
+            result = &mut self.order_poller_handle => ConductorExit::OrderPoller(result),
             result = &mut self.job_cleanup => ConductorExit::JobCleanup(result),
         };
 
-        handle_conductor_exit(exit)
+        handle_conductor_exit(exit)?;
+        Ok(())
     }
 
     pub(crate) fn abort_all(&self) {
@@ -354,6 +389,7 @@ impl Conductor {
         if let Some(ref handle) = self.inventory_poller {
             handle.abort();
         }
+        self.order_poller_handle.abort();
         if let Some(ref handle) = self.executor_maintenance {
             handle.abort();
         }
@@ -362,35 +398,56 @@ impl Conductor {
 }
 
 enum ConductorExit {
-    Supervisor(anyhow::Result<()>),
-    Monitor(Result<(), JoinError>),
+    Supervisor(Result<(), SupervisorError>),
+    Monitor(Result<Result<(), MonitorTaskError>, JoinError>),
+    OrderPoller(Result<(), JoinError>),
     JobCleanup(Result<(), JoinError>),
 }
 
-fn handle_conductor_exit(exit: ConductorExit) -> anyhow::Result<()> {
+fn handle_conductor_exit(exit: ConductorExit) -> Result<(), ConductorExitError> {
     match exit {
-        ConductorExit::Supervisor(result) => {
-            result?;
-            info!("Supervisor exited");
-        }
-        ConductorExit::Monitor(result) => {
-            handle_task_exit(result, "Apalis monitor")?;
-            info!("Apalis monitor exited");
-        }
-        ConductorExit::JobCleanup(result) => {
-            handle_required_background_task_exit(result, "Job cleanup")?;
-            info!("Job cleanup exited");
-        }
+        ConductorExit::Supervisor(result) => handle_supervisor_exit(result),
+        ConductorExit::Monitor(join_result) => handle_monitor_exit(join_result),
+        ConductorExit::OrderPoller(result) => handle_required_task_exit(result, "Order poller"),
+        ConductorExit::JobCleanup(result) => handle_required_task_exit(result, "Job cleanup"),
     }
+}
 
+fn handle_supervisor_exit(result: Result<(), SupervisorError>) -> Result<(), ConductorExitError> {
+    result?;
+    info!("Supervisor exited");
     Ok(())
 }
 
-fn handle_task_exit(result: Result<(), JoinError>, task: &'static str) -> anyhow::Result<()> {
+fn handle_monitor_exit(
+    join_result: Result<Result<(), MonitorTaskError>, JoinError>,
+) -> Result<(), ConductorExitError> {
+    let inner = join_result?;
+    inner?;
+    info!("Apalis monitor exited");
+    Ok(())
+}
+
+fn handle_required_task_exit(
+    result: Result<(), JoinError>,
+    task: &'static str,
+) -> Result<(), ConductorExitError> {
+    handle_required_background_task_exit(result, task)?;
+    info!("{task} exited");
+    Ok(())
+}
+
+fn handle_task_exit(
+    result: Result<(), JoinError>,
+    task: &'static str,
+) -> Result<(), ConductorExitError> {
     if let Err(join_error) = result
         && !join_error.is_cancelled()
     {
-        return Err(anyhow::Error::new(join_error).context(format!("{task} failed")));
+        return Err(ConductorExitError::TaskFailed {
+            task,
+            source: join_error,
+        });
     }
 
     Ok(())
@@ -399,9 +456,9 @@ fn handle_task_exit(result: Result<(), JoinError>, task: &'static str) -> anyhow
 fn handle_required_background_task_exit(
     result: Result<(), JoinError>,
     task: &'static str,
-) -> anyhow::Result<()> {
+) -> Result<(), ConductorExitError> {
     match result {
-        Ok(()) => Err(anyhow::anyhow!("{task} exited unexpectedly")),
+        Ok(()) => Err(ConductorExitError::UnexpectedTaskExit { task }),
         Err(join_error) => handle_task_exit(Err(join_error), task),
     }
 }
@@ -1654,7 +1711,8 @@ mod tests {
 
     fn conductor_with_job_cleanup(job_cleanup: JoinHandle<()>) -> Conductor {
         let supervisor = SupervisorBuilder::default().build().run();
-        let monitor = tokio::spawn(pending::<()>());
+        let monitor = tokio::spawn(pending::<Result<(), MonitorTaskError>>());
+        let order_poller_handle = tokio::spawn(pending::<()>());
 
         Conductor {
             supervisor,
@@ -1662,6 +1720,7 @@ mod tests {
             executor_maintenance: None,
             rebalancer: None,
             inventory_poller: None,
+            order_poller_handle,
             job_cleanup,
         }
     }

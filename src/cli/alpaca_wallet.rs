@@ -754,8 +754,12 @@ mod tests {
             redemption_wallet: None,
 =======
             #[cfg(feature = "test-support")]
+<<<<<<< HEAD
             failure_injector: crate::conductor::job::FailureInjector::new(),
 >>>>>>> 304ecf3d1 (feat: failure injector)
+=======
+            failure_injector: crate::conductor::job::FailureInjector::default(),
+>>>>>>> 0a7bd6f84 (feat: job durability)
         }
     }
 
@@ -845,8 +849,12 @@ mod tests {
             redemption_wallet: Some(Address::ZERO),
 =======
             #[cfg(feature = "test-support")]
+<<<<<<< HEAD
             failure_injector: crate::conductor::job::FailureInjector::new(),
 >>>>>>> 304ecf3d1 (feat: failure injector)
+=======
+            failure_injector: crate::conductor::job::FailureInjector::default(),
+>>>>>>> 0a7bd6f84 (feat: job durability)
         }
     }
 

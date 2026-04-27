@@ -96,35 +96,77 @@ logging.
 ### work
 
 Generic apalis handler that bridges `Job` implementations with apalis's
-function-based worker API:
+function-based worker API. Returns `Result<(), JobError>` so apalis can
+distinguish success from failure.
 
 ```rust
-pub(crate) async fn work<Ctx, J>(job: J, ctx: Data<Arc<Ctx>>)
-where
-    Ctx: Send + Sync + 'static,
-    J: Job<Ctx>,
-{
-    // Retries with exponential backoff, then logs on final failure.
+pub(crate) async fn work<Ctx, J>(
+    job: J, ctx: Data<Arc<Ctx>>,
+) -> Result<(), JobError> {
+    let label = job.label();
+    info!(%label, "Processing job");
+    job.perform(&ctx).await.map_err(|source| JobError::Failed { source: Box::new(source) })
 }
 ```
 
-### Wiring a job into apalis
+### Worker middleware stack
+
+Apalis workers use a Tower middleware stack configured on `WorkerBuilder`. The
+layers are applied in order — outermost first:
 
 ```
 WorkerBuilder::new(name)
-    .backend(job_queue)       // SqliteStorage<MyJob, ...>
-    .data(ctx)                // Arc<MyCtx>
+    .backend(job_queue)
+    .data(ctx)
+    .concurrency(1)                          // sequential processing
+    .retry(RetryPolicy::retries(3))          // 1 initial + 3 retries = 4 attempts
+    .break_circuit_with(fail_stop_config)    // halt on terminal failure
+    .on_event(|ctx, event| { ... })          // observability + lifecycle
     .build(work::<MyCtx, MyJob>)
 ```
 
-The apalis `Monitor` wraps workers and restarts them on failure:
+**Layer roles:**
+
+- **`.concurrency(1)`** — serializes job processing. Without it,
+  `CallAllUnordered` processes jobs in parallel and a failing job can't prevent
+  the next job from starting.
+- **`.retry(RetryPolicy::retries(3))`** — retries failed jobs (replaces backon
+  in the handler). `retries(3)` = 4 total attempts. Instant by default; use
+  `.with_backoff()` for delays.
+- **`.break_circuit_with(config)`** — opens the circuit after
+  `failure_threshold` errors, returning `Poll::Pending` from `poll_ready` to
+  block new job pickup. Use `failure_threshold(1)` + very long
+  `recovery_timeout` for fail-stop.
+- **`.on_event()`** — fires on `Event::Error` (after retries exhaust),
+  `Event::Success`, `Event::Start`, `Event::Stop`. Use for logging AND for
+  calling `ctx.stop()` on terminal failure. The circuit breaker alone only
+  pauses the worker (`Poll::Pending`); `ctx.stop()` is needed to actually make
+  the worker exit.
+
+### Error propagation: handler failure -> bot shutdown
+
+1. `work()` returns `Err` -> retry layer retries
+2. Retries exhaust -> error reaches circuit breaker -> circuit opens
+3. Error becomes `Ok(Event::Error)` in apalis `poll_tasks`
+4. `on_event` catches `Event::Error`, calls `ctx.stop()`
+5. Worker exits cleanly (`Ok(())`)
+6. `Monitor::should_restart` returns `false` -> monitor exits
+7. Monitor task propagates error to conductor -> bot shuts down
+
+**Critical:** the monitor `tokio::spawn` task must return `Result`, not swallow
+errors. Without this, the conductor never sees the failure.
+
+### Monitor configuration
 
 ```
 Monitor::new()
-    .should_restart(|_ctx, _error, _attempt| true)
+    .should_restart(|_ctx, _error, _attempt| false)
     .register(|index| { /* WorkerBuilder as above */ })
     .run().await
 ```
+
+`should_restart(false)` — terminal job failure is fail-stop. The worker must not
+restart and process the next job with stale state.
 
 ### AccountForDexTrade
 

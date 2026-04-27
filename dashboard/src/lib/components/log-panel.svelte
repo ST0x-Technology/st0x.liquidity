@@ -258,14 +258,14 @@
   }
 
   const getMessage = (entry: LogEntry): string => {
-    return entry.fields?.message ?? JSON.stringify(entry)
+    return entry.fields.message
   }
 
   const getTarget = (entry: LogEntry): string => {
     const spans = entry.spans?.map(span => span.name).join(' > ')
     if (spans) return `${entry.target}::${spans}`
     if (entry.span) return `${entry.target}::${entry.span.name}`
-    return entry.target ?? ''
+    return entry.target
   }
 </script>
 

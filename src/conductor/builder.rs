@@ -1,9 +1,15 @@
 //! Constructs a fully-wired [`Conductor`] instance from its dependencies.
 
 use alloy::providers::Provider;
+use apalis::layers::WorkerBuilderExt;
+use apalis::layers::retry::RetryPolicy;
 use apalis::prelude::{Monitor, WorkerBuilder};
+use apalis_core::worker::event::Event;
+use apalis_core::worker::ext::circuit_breaker::{CircuitBreaker, config::CircuitBreakerConfig};
+use apalis_core::worker::ext::event_listener::EventListenerExt;
 use sqlx::SqlitePool;
 use std::sync::Arc;
+use std::time::Duration;
 use task_supervisor::SupervisorBuilder;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
@@ -12,12 +18,12 @@ use st0x_event_sorcery::{Projection, Store};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::Executor;
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 use super::job::FailureInjector;
 use super::job::work;
 use super::monitor::order_fills::{DexEventStreams, OrderFillMonitor};
 use super::monitor::positions::PositionMonitor;
-use super::{Conductor, spawn_inventory_poller, spawn_order_poller};
+use super::{Conductor, MonitorTaskError, spawn_inventory_poller, spawn_order_poller};
 use crate::config::Ctx;
 use crate::inventory::{InventoryPollingService, InventorySnapshot, WalletPollingCtx};
 use crate::offchain_order::OffchainOrder;
@@ -57,7 +63,7 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
     pub(crate) poll_notify: Arc<tokio::sync::Notify>,
     pub(crate) wallet_polling: Option<WalletPollingCtx>,
     pub(crate) tokenizer: Option<Arc<dyn Tokenizer>>,
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) failure_injector: FailureInjector,
 }
 
@@ -169,46 +175,82 @@ where
         .build()
         .run();
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     let failure_injector = context.failure_injector;
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     let failure_injector_for_hedge = failure_injector.clone();
+    let failure_notify = Arc::new(tokio::sync::Notify::new());
+    let failure_notify_for_hedge = failure_notify.clone();
 
-    let monitor = tokio::spawn(async move {
+    let fail_stop = CircuitBreakerConfig::default()
+        .with_failure_threshold(1)
+        .with_recovery_timeout(Duration::from_secs(u64::MAX));
+    let fail_stop_for_hedge = fail_stop.clone();
+
+    let monitor: JoinHandle<Result<(), MonitorTaskError>> = tokio::spawn(async move {
+        let failure_notify_for_accountant = failure_notify.clone();
+        let failure_notify_for_select = failure_notify.clone();
         let apalis_monitor = Monitor::new()
-            .should_restart(|_ctx, _error, attempt| {
-                info!(attempt, "Restarting worker");
-                true
-            })
+            .should_restart(|_ctx, _error, _attempt| false)
             .register(move |index| {
                 let builder = WorkerBuilder::new(format!("order-fill-worker-{index}"))
                     .backend(job_queue.clone().into_storage())
                     .data(accountant_ctx.clone());
 
-                #[cfg(feature = "test-support")]
+                #[cfg(any(test, feature = "test-support"))]
                 let builder = builder.data(failure_injector.clone());
 
-                builder.build(work::<AccountantCtx<Prov, Exec>, _>)
+                builder
+                    .concurrency(1)
+                    .retry(RetryPolicy::retries(3))
+                    .break_circuit_with(fail_stop.clone())
+                    .on_event({
+                        let failure_notify = failure_notify_for_accountant.clone();
+                        move |ctx, event| {
+                            if let Event::Error(err) = event {
+                                error!(%err, worker = %ctx.name(), "Job failed after retries");
+                                failure_notify.notify_waiters();
+                                let _ = ctx.stop();
+                            }
+                        }
+                    })
+                    .build(work::<AccountantCtx<Prov, Exec>, _>)
             })
             .register(move |index| {
                 let builder = WorkerBuilder::new(format!("hedge-worker-{index}"))
                     .backend(hedge_queue.clone().into_storage())
                     .data(hedge_ctx.clone());
 
-                #[cfg(feature = "test-support")]
+                #[cfg(any(test, feature = "test-support"))]
                 let builder = builder.data(failure_injector_for_hedge.clone());
 
-                builder.build(work::<HedgeCtx, _>)
+                builder
+                    .concurrency(1)
+                    .retry(RetryPolicy::retries(3))
+                    .break_circuit_with(fail_stop_for_hedge.clone())
+                    .on_event({
+                        let failure_notify = failure_notify_for_hedge.clone();
+                        move |ctx, event| {
+                            if let Event::Error(err) = event {
+                                error!(%err, worker = %ctx.name(), "Job failed after retries");
+                                failure_notify.notify_waiters();
+                                let _ = ctx.stop();
+                            }
+                        }
+                    })
+                    .build(work::<HedgeCtx, _>)
             });
 
         tokio::select! {
+            () = failure_notify_for_select.notified() => Err(MonitorTaskError::TerminalJobFailure),
             result = apalis_monitor.run() => {
-                if let Err(monitor_error) = result {
-                    error!(%monitor_error, "Apalis monitor exited with error");
+                match result {
+                    Ok(()) => Err(MonitorTaskError::UnexpectedExit),
+                    Err(error) => {
+                        error!(?error, "Apalis monitor exited");
+                        Err(MonitorTaskError::UnexpectedExit)
+                    }
                 }
-            }
-            _ = order_poller_handle => {
-                error!("Order poller exited unexpectedly");
             }
         }
     });
@@ -219,6 +261,7 @@ where
         executor_maintenance,
         rebalancer,
         inventory_poller,
+        order_poller_handle,
         job_cleanup,
     }
 }

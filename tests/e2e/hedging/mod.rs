@@ -13,7 +13,7 @@ pub(crate) mod assertions;
 use rain_math_float::Float;
 use st0x_execution::alpaca_broker_api::OrderStatus;
 use st0x_float_macro::float;
-
+#[cfg(feature = "test-support")]
 use st0x_hedge::FailureInjector;
 
 use self::assertions::*;
@@ -1451,11 +1451,9 @@ async fn duplicate_event_delivery() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// RAI-199: when a job fails terminally, the bot must halt — not
-/// silently continue processing subsequent events with stale state.
-///
-/// FAILS with current code — the bot keeps running after the injected
-/// failure.
+/// When a job fails terminally, the bot must halt -- not silently
+/// continue processing subsequent events with stale state.
+#[cfg(feature = "test-support")]
 #[test_log::test(tokio::test)]
 async fn job_failure_halts_bot() -> anyhow::Result<()> {
     let onchain_price = float!(155.00);
@@ -1473,7 +1471,7 @@ async fn job_failure_halts_bot() -> anyhow::Result<()> {
         .assets(infra.assets_config())
         .call()?;
 
-    let injector = FailureInjector::new();
+    let injector = FailureInjector::default();
     ctx.failure_injector = injector.clone();
     let mut bot = spawn_bot(ctx);
 
@@ -1511,11 +1509,14 @@ async fn job_failure_halts_bot() -> anyhow::Result<()> {
         .await?;
 
     // The bot should exit — the injected failure should halt processing
-    let bot_exited = tokio::time::timeout(Duration::from_secs(30), &mut bot).await;
+    let join_result = tokio::time::timeout(Duration::from_secs(30), &mut bot)
+        .await
+        .unwrap();
+    let inner_result = join_result.expect("Bot task should fail, not panic");
 
     assert!(
-        bot_exited.is_ok(),
-        "Bot should have exited after terminal job failure, but it kept running"
+        inner_result.is_err(),
+        "Bot should fail after terminal job failure, not keep running or exit successfully"
     );
 
     // The second trade's onchain event should NOT have been processed

@@ -363,12 +363,16 @@ pub struct Ctx {
     pub(crate) assets: AssetsConfig,
     pub(crate) travel_rule: Option<TravelRuleConfig>,
 <<<<<<< HEAD
+<<<<<<< HEAD
     pub(crate) rest_api: Option<RestApiCtx>,
     /// Alpaca redemption wallet from `[tokenization]`.
     /// `Some` when the config includes a `[tokenization]` section.
     pub(crate) redemption_wallet: Option<Address>,
 =======
     #[cfg(feature = "test-support")]
+=======
+    #[cfg(any(test, feature = "test-support"))]
+>>>>>>> 0a7bd6f84 (feat: job durability)
     pub failure_injector: crate::conductor::job::FailureInjector,
 >>>>>>> 304ecf3d1 (feat: failure injector)
 }
@@ -456,9 +460,13 @@ impl std::fmt::Debug for Ctx {
             .field("execution_threshold", &self.execution_threshold)
             .field("assets", &self.assets)
             .field("travel_rule_configured", &self.travel_rule.is_some())
+<<<<<<< HEAD
             .field("redemption_wallet", &self.redemption_wallet)
             .field("rest_api", &self.rest_api)
             .finish()
+=======
+            .finish_non_exhaustive()
+>>>>>>> 0a7bd6f84 (feat: job durability)
     }
 }
 
@@ -793,12 +801,17 @@ impl Ctx {
             assets: parts.assets,
             travel_rule: parts.travel_rule,
 <<<<<<< HEAD
+<<<<<<< HEAD
             rest_api: parts.rest_api,
             redemption_wallet: parts.redemption_wallet,
 =======
             #[cfg(feature = "test-support")]
             failure_injector: crate::conductor::job::FailureInjector::new(),
 >>>>>>> 304ecf3d1 (feat: failure injector)
+=======
+            #[cfg(any(test, feature = "test-support"))]
+            failure_injector: crate::conductor::job::FailureInjector::default(),
+>>>>>>> 0a7bd6f84 (feat: job durability)
         })
     }
 
@@ -957,12 +970,17 @@ impl Ctx {
             assets,
             travel_rule,
 <<<<<<< HEAD
+<<<<<<< HEAD
             rest_api,
             redemption_wallet,
 =======
             #[cfg(feature = "test-support")]
             failure_injector: crate::conductor::job::FailureInjector::new(),
 >>>>>>> 304ecf3d1 (feat: failure injector)
+=======
+            #[cfg(any(test, feature = "test-support"))]
+            failure_injector: crate::conductor::job::FailureInjector::default(),
+>>>>>>> 0a7bd6f84 (feat: job durability)
         })
     }
 }
@@ -1175,12 +1193,17 @@ pub(crate) mod tests {
             },
             travel_rule: None,
 <<<<<<< HEAD
+<<<<<<< HEAD
             rest_api: None,
             redemption_wallet: None,
 =======
             #[cfg(feature = "test-support")]
             failure_injector: crate::conductor::job::FailureInjector::new(),
 >>>>>>> 304ecf3d1 (feat: failure injector)
+=======
+            #[cfg(any(test, feature = "test-support"))]
+            failure_injector: crate::conductor::job::FailureInjector::default(),
+>>>>>>> 0a7bd6f84 (feat: job durability)
         }
     }
 

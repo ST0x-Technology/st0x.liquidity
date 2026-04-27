@@ -88,7 +88,7 @@
     </button>
     <button
       class="relative whitespace-nowrap px-3 py-2 text-sm font-medium transition-colors {activeTab.current === 'logs' ? 'text-foreground after:absolute after:bottom-0 after:left-0 after:right-0 after:h-0.5 after:bg-primary' : 'text-muted-foreground hover:text-foreground'}"
-      onclick={() => activeTab.update((tab) => tab === 'logs' ? 'dashboard' : 'logs')}
+      onclick={() => { activeTab.update((tab) => tab === 'logs' ? 'dashboard' : 'logs'); }}
     >
       Logs
     </button>
@@ -98,7 +98,7 @@
   <nav class="hidden shrink-0 gap-1 border-b bg-card/50 px-4 md:flex">
     <button
       class={desktopTabClass(activeTab.current === 'dashboard')}
-      onclick={() => activeTab.update(() => 'dashboard')}
+      onclick={() => { activeTab.update(() => 'dashboard'); }}
     >
       Dashboard
     </button>
@@ -112,7 +112,7 @@
 
     <button
       class={desktopTabClass(activeTab.current === 'logs')}
-      onclick={() => activeTab.update(() => 'logs')}
+      onclick={() => { activeTab.update(() => 'logs'); }}
     >
       Logs
     </button>
