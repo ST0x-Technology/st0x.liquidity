@@ -43,6 +43,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 use std::str::FromStr;
 use tracing::warn;
 
@@ -908,6 +909,38 @@ impl TokenizedEquityMint {
         }
     }
 }
+
+/// Returns mint aggregate IDs whose latest event is non-terminal and should be
+/// resumed after restart.
+pub(crate) async fn interrupted_mint_ids(
+    pool: &SqlitePool,
+) -> Result<Vec<IssuerRequestId>, sqlx::Error> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "WITH latest AS ( \
+             SELECT aggregate_id, MAX(sequence) AS max_seq \
+             FROM events \
+             WHERE aggregate_type = 'TokenizedEquityMint' \
+             GROUP BY aggregate_id \
+         ) \
+         SELECT latest.aggregate_id \
+         FROM events last_ev \
+         INNER JOIN latest \
+             ON last_ev.aggregate_id = latest.aggregate_id \
+            AND last_ev.sequence = latest.max_seq \
+         WHERE last_ev.aggregate_type = 'TokenizedEquityMint' \
+           AND last_ev.event_type IN ( \
+               'TokenizedEquityMintEvent::MintAccepted', \
+               'TokenizedEquityMintEvent::TokensReceived', \
+               'TokenizedEquityMintEvent::TokensWrapped' \
+           ) \
+         ORDER BY latest.aggregate_id",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(IssuerRequestId::new).collect())
+}
+
 /// Our tokenized equity tokens use 18 decimals.
 pub(crate) const TOKENIZED_EQUITY_DECIMALS: u8 = 18;
 
@@ -1362,6 +1395,7 @@ impl EventSourced for TokenizedEquityMint {
 
 #[cfg(test)]
 mod tests {
+    use sqlx::SqlitePool;
     use std::sync::Arc;
 
     use st0x_event_sorcery::{AggregateError, LifecycleError, TestHarness, TestStore};
@@ -1430,6 +1464,34 @@ mod tests {
             vault_deposit_tx_hash: TxHash::random(),
             deposited_at: Utc::now(),
         }
+    }
+
+    async fn insert_event(
+        pool: &SqlitePool,
+        aggregate_id: &str,
+        sequence: i64,
+        event_type: &str,
+        payload: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+             VALUES (?, ?, ?, ?, '1.0', ?, '{}')",
+        )
+        .bind("TokenizedEquityMint")
+        .bind(aggregate_id)
+        .bind(sequence)
+        .bind(event_type)
+        .bind(payload)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn mint_requested_payload(symbol: &str) -> String {
+        format!(
+            r#"{{"MintRequested":{{"symbol":"{symbol}","quantity":"10","wallet":"0x0000000000000000000000000000000000000001","requested_at":"2026-01-01T00:00:00Z"}}}}"#
+        )
     }
 
     #[tokio::test]
@@ -1967,6 +2029,48 @@ mod tests {
             matches!(entity, TokenizedEquityMint::DepositedIntoRaindex { .. }),
             "Expected DepositedIntoRaindex, got: {entity:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn interrupted_mint_ids_returns_only_non_terminal_mints() {
+        let pool = crate::test_utils::setup_test_db().await;
+
+        insert_event(
+            &pool,
+            "mint-accepted",
+            0,
+            "TokenizedEquityMintEvent::MintRequested",
+            &mint_requested_payload("AAPL"),
+        )
+        .await;
+        insert_event(
+            &pool,
+            "mint-accepted",
+            1,
+            "TokenizedEquityMintEvent::MintAccepted",
+            r#"{"MintAccepted":{"issuer_request_id":"ISS001","tokenization_request_id":"TOK001","accepted_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .await;
+
+        insert_event(
+            &pool,
+            "mint-deposited",
+            0,
+            "TokenizedEquityMintEvent::MintRequested",
+            &mint_requested_payload("TSLA"),
+        )
+        .await;
+        insert_event(
+            &pool,
+            "mint-deposited",
+            1,
+            "TokenizedEquityMintEvent::DepositedIntoRaindex",
+            r#"{"DepositedIntoRaindex":{"vault_deposit_tx_hash":"0x0000000000000000000000000000000000000000000000000000000000000002","deposited_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .await;
+
+        let result = interrupted_mint_ids(&pool).await.unwrap();
+        assert_eq!(result, vec![IssuerRequestId::new("mint-accepted")]);
     }
 
     #[test]
