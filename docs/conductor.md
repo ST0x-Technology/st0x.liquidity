@@ -47,7 +47,7 @@ SupervisorBuilder::default()
 
 ### OrderFillMonitor
 
-Defined in `src/conductor/order_fill_monitor.rs`. Subscribes to
+Defined in `src/conductor/monitor/order_fills.rs`. Subscribes to
 ClearV3/TakeOrderV3 WebSocket streams and pushes each event into the
 `DexTradeAccountingJobQueue` as an `AccountForDexTrade` job.
 
@@ -56,12 +56,26 @@ struct OrderFillMonitor {
     ws_url: Url,
     orderbook: Address,
     job_queue: DexTradeAccountingJobQueue,
+    dex_streams: Arc<Mutex<Option<DexEventStreams>>>,
 }
 ```
 
-The WebSocket connection is created inside `run()`. On disconnect or error,
-`run()` returns `Err(...)`, the supervisor restarts the task, and a fresh
-connection is established.
+On first `run()`, the monitor consumes the pre-established `DexEventStreams`
+passed in at construction (avoiding a gap between the WS subscription used for
+`get_cutoff_block` and the monitor's first iteration). On subsequent restarts,
+it creates a fresh WebSocket connection. On disconnect or error, `run()` returns
+`Err(...)` and the supervisor restarts the task.
+
+### PositionMonitor
+
+Defined in `src/conductor/monitor/positions.rs`. A long-running supervised task
+that periodically scans all positions, filters by orchestration policy (trading
+enabled, no equity transfers in progress), and enqueues durable `PlaceHedge`
+jobs for any positions ready to hedge.
+
+The check interval is configured via `position_check_interval`. Duplicate
+enqueues are safe because the Position aggregate rejects `PlaceOffChainOrder`
+when a pending order already exists.
 
 ## One-shot jobs (apalis + Job trait)
 
@@ -143,45 +157,62 @@ hedging pipeline:
 ### AccountantCtx
 
 Defined in `src/trading/onchain/trade_accountant.rs`. Bundles all dependencies
-the job needs: config, symbol cache, EVM provider, CQRS frameworks, vault
-registry, executor. Wrapped in `Arc` and injected via apalis `Data`.
+the job needs: orderbook address, config, symbol cache, Pyth feed ID cache, EVM
+provider, CQRS frameworks, vault registry, executor. Wrapped in `Arc` and
+injected via apalis `Data`.
+
+### PlaceHedge
+
+Defined in `src/trading/offchain/hedge.rs`. Enqueued by `PositionMonitor` into
+the `HedgeJobQueue` for positions that exceed their execution threshold.
+Implements `Job<HedgeCtx>`. The `perform()` method places the offsetting
+offchain order and updates the Position aggregate.
 
 ## Conductor assembly
 
 `builder::spawn()` (`src/conductor/builder.rs`) uses `#[bon::builder]` to
 construct a running `Conductor`. Required parameters: `ConductorCtx` (shared
-dependencies), `DexTradeAccountingJobQueue`, `DexEventStreams`. Optional:
-`executor_maintenance`, `rebalancer`.
+dependencies), `DexTradeAccountingJobQueue`, `HedgeJobQueue`, `DexEventStreams`,
+`job_cleanup`. Optional: `executor_maintenance`, `rebalancer`.
 
 `ConductorCtx` bundles the shared dependencies (config, symbol cache, provider,
-executor, CQRS frameworks, execution threshold, wallet polling config).
+executor, CQRS frameworks, execution threshold, database pool, poll notifier,
+wallet polling config, tokenizer).
 
 `Conductor` lifecycle:
 
-- `run()` -- the single entry point. Sets up apalis tables, CQRS frameworks,
-  determines cutoff block, backfills historical events, then calls
-  `builder::spawn()` to start the runtime
+- `run()` -- the single entry point. Connects WebSocket, sets up apalis tables,
+  determines cutoff block, backfills historical events, sets up CQRS frameworks,
+  seeds vaults, configures rebalancing, then calls `builder::spawn()` to start
+  the runtime
 - `wait_for_completion()` -- `tokio::select!` across supervisor, apalis monitor,
-  order poller, and position checker; returns when any exits
+  and job cleanup; returns when any exits
 - `abort_all()` -- shuts down supervisor, aborts all task handles
 
 ## Startup sequencing
 
 ```
-Phase 1 (parallel):  connect_ws | setup_cqrs | setup_apalis_tables
-Phase 2 (parallel):  get_cutoff_block | seed_vaults | setup_rebalancing
+Phase 1 (sequential): connect_ws | setup_apalis_tables
+Phase 2 (sequential): get_cutoff_block
 Phase 3 (sequential): backfill checkpoint gap to job queue
-Phase 4:              builder::spawn() starts the runtime
+Phase 4 (sequential): setup_cqrs | seed_vaults | setup_rebalancing
+Phase 5:              builder::spawn() starts the runtime
 ```
 
 The trade accounting worker starts only after backfill completes. The WS
-subscription is established in phase 1, so no events are missed -- they buffer
+subscription is established in Phase 1, so no events are missed -- they buffer
 until the monitor starts.
 
 Backfill reads the last successful checkpoint from SQLite. The configured
 `deployment_block` seeds only the first run; subsequent runs start at
 `checkpoint + 1`. The checkpoint advances only after the full requested range
 has been enqueued successfully.
+
+During Phase 4, when rebalancing is configured, the conductor also queries for
+interrupted `TokenizedEquityMint` and `EquityRedemption` aggregates (those whose
+latest event is non-terminal) and resumes them from their persisted state. This
+ensures mints and redemptions that were in progress when the process crashed are
+not left stuck indefinitely.
 
 The conductor also runs periodic cleanup for terminal apalis jobs at the
 configured `apalis_finished_job_cleanup_interval_secs` cadence. Those rows are
