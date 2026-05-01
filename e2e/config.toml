@@ -12,7 +12,6 @@ tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 [raindex]
 orderbook = "0x1111111111111111111111111111111111111111"
-order_owner = "0xcccccccccccccccccccccccccccccccccccccccc"
 deployment_block = 1
 
 [rest_api]

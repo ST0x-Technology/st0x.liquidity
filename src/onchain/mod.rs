@@ -37,7 +37,6 @@ pub(crate) use trade::TradeValidationError;
 #[serde(deny_unknown_fields)]
 pub(crate) struct EvmConfig {
     pub(crate) orderbook: Address,
-    pub(crate) order_owner: Option<Address>,
     pub(crate) deployment_block: u64,
 }
 

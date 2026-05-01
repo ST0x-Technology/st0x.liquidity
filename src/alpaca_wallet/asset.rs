@@ -6,6 +6,7 @@
 use alloy::primitives::Address;
 use rain_math_float::Float;
 use serde::Deserialize;
+use tracing::trace;
 
 use super::client::{AlpacaWalletClient, AlpacaWalletError};
 use super::transfer::{Network, TokenSymbol};
@@ -70,7 +71,13 @@ impl AlpacaWalletClient {
         let response = self.get(&path).await?;
         let text = response.text().await?;
 
-        Ok(serde_json::from_str::<Vec<WalletAsset>>(&text)?)
+        let assets = serde_json::from_str::<Vec<WalletAsset>>(&text)?;
+        trace!(
+            target: "wallet",
+            asset_count = assets.len(),
+            "Listed wallet assets"
+        );
+        Ok(assets)
     }
 }
 

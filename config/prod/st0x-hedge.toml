@@ -26,9 +26,6 @@ beneficiary_entity_name = "T0 TRADE (BVI) LTD"
 orderbook = "0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D"
 # Block number to start backfilling order events from.
 deployment_block = 43259507
-# Standalone mode: the address that owns orders on the orderbook.
-# Mutually exclusive with [rebalancing].
-order_owner = "0xA9C16673F65AE808688cB18952AFE3d9658C808f"
 
 # Wallet configuration (Turnkey secure enclave signing).
 [wallet]

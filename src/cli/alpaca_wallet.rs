@@ -739,9 +739,8 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs: 3600,
             broker: BrokerCtx::DryRun,
             telemetry: None,
-            trading_mode: TradingMode::Standalone {
-                order_owner: Address::ZERO,
-            },
+            trading_mode: TradingMode::Standalone,
+            order_owner: Address::ZERO,
             wallet: None,
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: AssetsConfig {
@@ -832,6 +831,7 @@ mod tests {
                     })
                     .call(),
             )),
+            order_owner: Address::ZERO,
             wallet: Some(crate::wallet::OnchainWalletCtx::stub()),
             execution_threshold: ExecutionThreshold::whole_share(),
             travel_rule: None,

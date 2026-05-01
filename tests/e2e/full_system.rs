@@ -126,6 +126,7 @@ fn build_full_system_ctx<P: Provider + Clone>(
         .deployment_block(deployment_block)
         .broker(broker_ctx)
         .trading_mode(TradingMode::Rebalancing(Box::new(rebalancing_ctx)))
+        .order_owner(chain.owner)
         .wallet(wallet_ctx)
         .assets(AssetsConfig {
             equities: EquitiesConfig {

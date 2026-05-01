@@ -52,9 +52,8 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
         .orderbook(chain.orderbook)
         .deployment_block(deployment_block)
         .broker(broker_ctx)
-        .trading_mode(TradingMode::Standalone {
-            order_owner: chain.owner,
-        })
+        .trading_mode(TradingMode::Standalone)
+        .order_owner(chain.owner)
         .assets(assets)
         .maybe_execution_threshold_override(execution_threshold_override)
         .call()

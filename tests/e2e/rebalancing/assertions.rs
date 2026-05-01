@@ -211,6 +211,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
         .deployment_block(deployment_block)
         .broker(broker_ctx)
         .trading_mode(TradingMode::Rebalancing(Box::new(rebalancing_ctx)))
+        .order_owner(chain.owner)
         .wallet(wallet_ctx)
         .assets(assets)
         .redemption_wallet(redemption_wallet)
@@ -289,6 +290,7 @@ where
         .deployment_block(deployment_block)
         .broker(broker_ctx)
         .trading_mode(TradingMode::Rebalancing(Box::new(rebalancing_ctx)))
+        .order_owner(base_chain.owner)
         .wallet(wallet_ctx)
         .assets(AssetsConfig {
             equities: EquitiesConfig {

@@ -15,14 +15,11 @@ beneficiary_entity_name = "Acme Corp"
 [raindex]
 orderbook = "0x1111111111111111111111111111111111111111"
 deployment_block = 1
-# Required when running without [rebalancing] (Standalone mode).
-# order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 # Wallet provider — select via `kind`:
 #   "turnkey"     — Turnkey secure enclave signing   (requires --features wallet-turnkey)
 #   "private-key" — local raw private key signing     (requires --features wallet-private-key)
-# Independent of rebalancing: enables CLI commands that sign on-chain
-# transactions (vault ops, CCTP bridging, wrapping, deposits/withdrawals).
+# The wallet address is used as the order_owner for orderbook event filtering.
 [wallet]
 kind = "private-key"
 
@@ -41,9 +38,7 @@ kind = "private-key"
 redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 # Optional — only needed for automatic rebalancing.
-# Without this section (and with raindex.order_owner set above), the bot
-# runs in Standalone mode — the wallet is still available for manual CLI
-# operations.
+# Without this section the bot runs in Standalone mode (hedging only).
 [rebalancing]
 # Transfer timeout in seconds before stuck inflight state is tombstoned and cleared.
 # 1800 = 30 minutes.

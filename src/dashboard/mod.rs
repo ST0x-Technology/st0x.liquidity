@@ -169,7 +169,7 @@ pub(crate) fn settings_from_ctx(ctx: &crate::config::Ctx) -> st0x_dto::Settings 
         .collect();
 
     let trading_mode = match &ctx.trading_mode {
-        crate::config::TradingMode::Standalone { .. } => "standalone",
+        crate::config::TradingMode::Standalone => "standalone",
         crate::config::TradingMode::Rebalancing(_) => "rebalancing",
     };
 

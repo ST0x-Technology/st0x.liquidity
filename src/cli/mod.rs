@@ -1083,9 +1083,8 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs: 3600,
             broker: BrokerCtx::DryRun,
             telemetry: None,
-            trading_mode: TradingMode::Standalone {
-                order_owner: Address::ZERO,
-            },
+            trading_mode: TradingMode::Standalone,
+            order_owner: Address::ZERO,
             wallet: None,
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: AssetsConfig {
@@ -1291,7 +1290,9 @@ mod tests {
                 [raindex]
                 orderbook = "0x1111111111111111111111111111111111111111"
                 deployment_block = 1
-                order_owner = "0x2222222222222222222222222222222222222222"
+
+                [wallet]
+                kind = "private-key"
             "#,
         )
         .unwrap();
@@ -1301,9 +1302,14 @@ mod tests {
             r#"
                 [evm]
                 ws_rpc_url = "ws://localhost:8545"
+                base_rpc_url = "https://base.example.com"
+                ethereum_rpc_url = "https://mainnet.infura.io"
 
                 [broker]
                 type = "dry-run"
+
+                [wallet]
+                private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             "#,
         )
         .unwrap();

@@ -96,34 +96,31 @@ def main [env_name: string] {
   let subgraph = "https://api.goldsky.com/api/public/project_clv14x04y9kzi01saerx7bxpg/subgraphs/ob4-base/2026-02-05-c4ef/gn"
 
   # Fetch running config upfront so order_owner and other fields are available throughout.
-  # In Standalone mode, order_owner is set explicitly under [raindex].
-  # In Rebalancing mode, order_owner equals the wallet address under [rebalancing.wallet].
+  # order_owner is always derived from the [wallet].address config field.
   # For private-key wallets (no explicit address), fall back to the secrets file.
   let config_str = (ssh-run "cat /run/st0x/st0x-hedge.config 2>/dev/null")
-  let config = if ($config_str | is-not-empty) { try { $config_str | from toml } catch { null } } else { null }
+  let config = if ($config_str | is-not-empty) {
+    try { $config_str | from toml } catch { null }
+  } else {
+    null
+  }
   let order_owner = if $config != null {
-    let explicit = (try { $config.raindex.order_owner } catch { "" })
-    if ($explicit | is-not-empty) {
-      $explicit
+    let wallet_addr = (try { $config.wallet.address } catch { "" })
+    if ($wallet_addr | is-not-empty) {
+      $wallet_addr
     } else {
-      # Try config locations that hold an explicit address.
-      let wallet_addr = (try { $config.rebalancing.wallet.address } catch {
-        try { $config.wallet.address } catch {
-          try { $config.rebalancing.address } catch { "" }
-        }
-      })
-      if ($wallet_addr | is-not-empty) {
-        $wallet_addr
-      } else {
-        # Private-key wallets derive the address at runtime.
-        # Fall back to reading the key from server secrets and deriving it with `cast`.
-        let pk = (ssh-run "cat /run/agenix/st0x-hedge.toml 2>/dev/null" | lines | where ($it | str contains "private_key") | first | default "" | parse --regex 'private_key\s*=\s*"(?P<key>[^"]+)"' | get -o key.0 | default "")
-        if ($pk | is-not-empty) {
-          try { with-env { ETH_PRIVATE_KEY: $pk } { ^cast wallet address | str trim } } catch { "" }
-        } else {
-          ""
-        }
-      }
+      # Private-key wallets derive the address at runtime.
+      # Derive on the remote host so the private key never leaves the server.
+      let remote_addr = (
+        ssh-run (
+          "pk=$(grep 'private_key' /run/agenix/st0x-hedge.toml 2>/dev/null"
+          + " | sed 's/.*\"\\(.*\\)\".*/\\1/')"
+          + " && [ -n \"$pk\" ]"
+          + " && ETH_PRIVATE_KEY=$pk cast wallet address 2>/dev/null"
+          + " || echo ''"
+        ) | str trim
+      )
+      $remote_addr
     }
   } else { "" }
 
