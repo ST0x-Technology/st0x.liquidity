@@ -4,7 +4,7 @@ use rain_math_float::Float;
 use serde::Deserialize;
 use st0x_float_macro::float;
 use st0x_float_serde::{DebugFloat, DebugOptionFloat};
-use tracing::{debug, warn};
+use tracing::{debug, error};
 
 use super::AlpacaBrokerApiError;
 use super::client::AlpacaBrokerApiClient;
@@ -76,7 +76,7 @@ pub(super) async fn fetch_inventory(
         .into_iter()
         .map(|position| {
             let symbol = Symbol::new(&position.symbol).inspect_err(|_| {
-                warn!(
+                error!(
                     target: "broker",
                     symbol = %position.symbol,
                     position = ?position,

@@ -26,10 +26,6 @@ beneficiary_entity_name = "T0 TRADE (BVI) LTD"
 orderbook = "0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D"
 # Block number to start backfilling order events from.
 deployment_block = 43259507
-# Standalone mode: the address that owns orders on the orderbook.
-# Mutually exclusive with [rebalancing].
-order_owner = "0xA9C16673F65AE808688cB18952AFE3d9658C808f"
-
 # Wallet configuration (Turnkey secure enclave signing).
 [wallet]
 kind = "turnkey"
@@ -42,8 +38,13 @@ organization_id = "b100145e-7894-4c17-b3e7-160435f84803"
 # Required when [rebalancing] is configured (used for equity redemptions).
 # Also needed for CLI commands: alpaca-redeem and transfer-equity.
 # Not needed for alpaca-tokenize or alpaca-tokenization-requests.
-#[tokenization]
-#redemption_wallet = "0x0000000000000000000000000000000000000000"
+[tokenization]
+redemption_wallet = "0x1c66D6708914C40239D54919320b4C48cAE3D1A9"
+
+[rebalancing]
+transfer_timeout_secs = 1800
+equity = { target = 0.5, deviation = 0.2 }
+usdc = { mode = "disabled" }
 
 [rest_api]
 url = "https://api.st0x.io"
@@ -64,7 +65,7 @@ rebalancing = "disabled"
 
 [assets.equities.RKLB]
 trading = "enabled"
-rebalancing = "disabled"
+rebalancing = "enabled"
 # operational_limit = 1
 vault_id = "0xfab"
 tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
@@ -72,7 +73,7 @@ tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
 
 [assets.equities.SGOV]
 trading = "enabled"
-rebalancing = "disabled"
+rebalancing = "enabled"
 vault_id = "0xfab"
 tokenized_equity = "0xc941C1506B7555Ba8C506Fb6c9b9CC259902d612"
 tokenized_equity_derivative = "0x78c31580c97101694c70022c83d570150c11e935"

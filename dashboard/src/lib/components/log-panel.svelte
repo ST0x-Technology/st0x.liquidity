@@ -121,6 +121,7 @@
       entries.update(() => [])
       hasMore.update(() => false)
       total.update(() => 0)
+      error.update(() => null)
       return
     }
 
