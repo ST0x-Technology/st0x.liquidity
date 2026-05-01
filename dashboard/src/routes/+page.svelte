@@ -8,6 +8,7 @@
   import TradeHistoryPanel from '$lib/components/trade-history-panel.svelte'
   import TransferPanel from '$lib/components/transfer-panel.svelte'
   import LogPanel from '$lib/components/log-panel.svelte'
+  import OrdersPanel from '$lib/components/orders-panel.svelte'
   import { getWebSocketUrl } from '$lib/env'
   import { reactive } from '$lib/frp.svelte'
   import { createWebSocket, type WebSocketConnection } from '$lib/websocket'
@@ -43,7 +44,7 @@
     return () => { clearInterval(interval); }
   })
 
-  type Tab = 'dashboard' | 'logs'
+  type Tab = 'dashboard' | 'orders' | 'logs'
   type MobilePanel = 'inventory' | 'pending' | 'trades' | 'transfers'
 
   const activeTab = reactive<Tab>('dashboard')
@@ -80,6 +81,12 @@
       <button class={mobilePanelClass('transfers')} onclick={() => mobilePanel.update(() => 'transfers')}>Transfers</button>
     {/if}
     <button
+      class="relative whitespace-nowrap px-3 py-2 text-sm font-medium transition-colors {activeTab.current === 'orders' ? 'text-foreground after:absolute after:bottom-0 after:left-0 after:right-0 after:h-0.5 after:bg-primary' : 'text-muted-foreground hover:text-foreground'}"
+      onclick={() => activeTab.update((tab) => tab === 'orders' ? 'dashboard' : 'orders')}
+    >
+      Orders
+    </button>
+    <button
       class="relative whitespace-nowrap px-3 py-2 text-sm font-medium transition-colors {activeTab.current === 'logs' ? 'text-foreground after:absolute after:bottom-0 after:left-0 after:right-0 after:h-0.5 after:bg-primary' : 'text-muted-foreground hover:text-foreground'}"
       onclick={() => activeTab.update((tab) => tab === 'logs' ? 'dashboard' : 'logs')}
     >
@@ -94,6 +101,13 @@
       onclick={() => activeTab.update(() => 'dashboard')}
     >
       Dashboard
+    </button>
+
+    <button
+      class={desktopTabClass(activeTab.current === 'orders')}
+      onclick={() => activeTab.update(() => 'orders')}
+    >
+      Orders
     </button>
 
     <button
@@ -131,6 +145,10 @@
         <TradeHistoryPanel />
         <TransferPanel />
       </div>
+    </main>
+  {:else if activeTab.current === 'orders'}
+    <main class="flex-1 overflow-hidden p-2 md:p-4">
+      <OrdersPanel />
     </main>
   {:else}
     <main class="flex-1 overflow-hidden p-2 md:p-4">

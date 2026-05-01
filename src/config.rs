@@ -151,6 +151,75 @@ struct Config {
     wallet: Option<toml::Value>,
     broker: Option<BrokerConfig>,
     assets: AssetsConfig,
+    rest_api: Option<RestApiUrlConfig>,
+}
+
+/// Plaintext REST API settings (URL only). Credentials live in secrets.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestApiUrlConfig {
+    url: String,
+}
+
+/// Secret REST API credentials from the encrypted secrets TOML.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestApiSecrets {
+    key_id: String,
+    key_secret: String,
+}
+
+/// Combined REST API runtime context assembled from config + secrets.
+/// When absent from config, features that depend on it (e.g., the Orders
+/// dashboard tab) are gracefully disabled.
+#[derive(Clone)]
+pub struct RestApiCtx {
+    pub(crate) url: String,
+    pub(crate) key_id: Option<String>,
+    pub(crate) key_secret: Option<String>,
+    pub(crate) http_client: reqwest::Client,
+}
+
+impl std::fmt::Debug for RestApiCtx {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RestApiCtx")
+            .field("url", &self.url)
+            .field("key_id", &self.key_id.as_deref().map(|_| "<redacted>"))
+            .field(
+                "key_secret",
+                &self.key_secret.as_deref().map(|_| "<redacted>"),
+            )
+            .field("http_client", &"reqwest::Client")
+            .finish()
+    }
+}
+
+impl RestApiCtx {
+    fn new(
+        url: String,
+        key_id: Option<String>,
+        key_secret: Option<String>,
+    ) -> Result<Self, reqwest::Error> {
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
+
+        Ok(Self {
+            url,
+            key_id,
+            key_secret,
+            http_client,
+        })
+    }
+
+    /// Creates a REST API context without authentication. Used for testing
+    /// and environments where the API does not require credentials.
+    #[allow(clippy::expect_used)]
+    pub fn unauthenticated(url: String) -> Self {
+        Self::new(url, None, None)
+            .expect("reqwest client with default TLS should never fail to build")
+    }
 }
 
 /// Non-secret broker settings from the plaintext config TOML.
@@ -231,6 +300,7 @@ struct Secrets {
     #[serde(rename = "hyperdx")]
     telemetry: Option<TelemetrySecrets>,
     wallet: Option<toml::Value>,
+    rest_api: Option<RestApiSecrets>,
 }
 
 /// Broker type tag and all broker credentials.
@@ -279,6 +349,7 @@ pub struct Ctx {
     pub execution_threshold: ExecutionThreshold,
     pub(crate) assets: AssetsConfig,
     pub(crate) travel_rule: Option<TravelRuleConfig>,
+    pub(crate) rest_api: Option<RestApiCtx>,
 }
 
 /// Runtime broker configuration assembled from `BrokerSecrets`.
@@ -364,6 +435,7 @@ impl std::fmt::Debug for Ctx {
             .field("execution_threshold", &self.execution_threshold)
             .field("assets", &self.assets)
             .field("travel_rule_configured", &self.travel_rule.is_some())
+            .field("rest_api", &self.rest_api)
             .finish()
     }
 }
@@ -421,6 +493,7 @@ struct ValidatedParts {
     trading_mode: TradingMode,
     assets: AssetsConfig,
     travel_rule: Option<TravelRuleConfig>,
+    rest_api: Option<RestApiCtx>,
     /// Wallet construction inputs. `Some` when both config and secrets
     /// contain a `[wallet]` section and the required RPC URLs are present.
     /// The actual async wallet construction is deferred to `load_files`.
@@ -619,6 +692,21 @@ fn parse_and_validate(
         trading_mode,
         assets: config.assets,
         travel_rule,
+        rest_api: config
+            .rest_api
+            .map(|cfg| {
+                if secrets.rest_api.is_none() {
+                    warn!(
+                        "[rest_api] URL configured but no [rest_api] credentials in secrets -- \
+                         requests will be unauthenticated"
+                    );
+                }
+
+                let key_id = secrets.rest_api.as_ref().map(|s| s.key_id.clone());
+                let key_secret = secrets.rest_api.map(|s| s.key_secret);
+                RestApiCtx::new(cfg.url, key_id, key_secret).map_err(CtxError::RestApiClient)
+            })
+            .transpose()?,
         wallet_inputs,
     })
 }
@@ -674,6 +762,7 @@ impl Ctx {
             execution_threshold: parts.execution_threshold,
             assets: parts.assets,
             travel_rule: parts.travel_rule,
+            rest_api: parts.rest_api,
         })
     }
 
@@ -788,6 +877,7 @@ impl Ctx {
         #[builder(default = 0)] server_port: u16,
         execution_threshold_override: Option<ExecutionThreshold>,
         travel_rule: Option<TravelRuleConfig>,
+        rest_api: Option<RestApiCtx>,
     ) -> Result<Self, CtxError> {
         let execution_threshold = match execution_threshold_override {
             Some(threshold) => threshold,
@@ -820,6 +910,7 @@ impl Ctx {
             execution_threshold,
             assets,
             travel_rule,
+            rest_api,
         })
     }
 }
@@ -828,6 +919,8 @@ impl Ctx {
 pub enum CtxError {
     #[error(transparent)]
     Rebalancing(Box<RebalancingCtxError>),
+    #[error("failed to build REST API HTTP client")]
+    RestApiClient(#[source] reqwest::Error),
     #[error("ORDER_OWNER required when rebalancing is disabled")]
     MissingOrderOwner,
     #[error("failed to read config file {path}")]
@@ -952,6 +1045,7 @@ impl CtxError {
             Self::Wallet(_) => "wallet construction error",
             Self::WalletMissingRpcUrl { .. } => "wallet missing RPC URL",
             Self::WalletSecretsMissing => "wallet secrets missing",
+            Self::RestApiClient(_) => "failed to build REST API HTTP client",
         }
     }
 }
@@ -1022,6 +1116,7 @@ pub(crate) mod tests {
                 cash: None,
             },
             travel_rule: None,
+            rest_api: None,
         }
     }
 

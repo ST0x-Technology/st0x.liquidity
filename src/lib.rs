@@ -211,7 +211,7 @@ async fn run_conductor_session(
     event_sender: broadcast::Sender<Statement>,
     inventory: Arc<inventory::BroadcastingInventory>,
 ) -> anyhow::Result<()> {
-    let result = dispatch_to_executor(ctx, pool, event_sender, inventory).await;
+    let result = Box::pin(dispatch_to_executor(ctx, pool, event_sender, inventory)).await;
 
     match result {
         Ok(()) => {

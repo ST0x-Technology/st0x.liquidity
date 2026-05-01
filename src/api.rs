@@ -3,6 +3,7 @@
 use std::sync::LazyLock;
 
 use chrono::{DateTime, Utc};
+use rocket::response::content::RawJson;
 use rocket::serde::json::Json;
 use rocket::serde::{Deserialize, Serialize};
 use rocket::{Route, State, get, routes};
@@ -703,8 +704,71 @@ async fn load_transfer_summary(
         .collect()
 }
 
+fn unavailable_json(reason: &str) -> RawJson<String> {
+    RawJson(
+        serde_json::json!({
+            "unavailable": true,
+            "reason": reason,
+        })
+        .to_string(),
+    )
+}
+
+/// Proxies the bot's active Raindex orders from the st0x REST API.
+/// When `[rest_api]` is not configured, returns an unavailable indicator
+/// so the dashboard can show a friendly message instead of an error.
+#[get("/orders/raindex")]
+#[allow(clippy::cognitive_complexity)]
+async fn raindex_orders(ctx: &State<Ctx>) -> RawJson<String> {
+    let Some(rest_api) = &ctx.rest_api else {
+        return unavailable_json("REST API not configured (simulate mode)");
+    };
+
+    let owner = ctx.order_owner();
+    let url = format!(
+        "{}/v1/orders/owner/{:#x}",
+        rest_api.url.trim_end_matches('/'),
+        owner
+    );
+
+    let mut request = rest_api.http_client.get(&url);
+
+    if let (Some(key_id), Some(key_secret)) = (&rest_api.key_id, &rest_api.key_secret) {
+        request = request.basic_auth(key_id, Some(key_secret));
+    }
+
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(%error, %url, "Failed to reach st0x REST API");
+            return unavailable_json("REST API unreachable");
+        }
+    };
+
+    if !response.status().is_success() {
+        let status = response.status();
+        tracing::warn!(%status, %url, "st0x REST API returned error");
+        return unavailable_json("REST API returned an error");
+    }
+
+    match response.text().await {
+        Ok(body) => RawJson(body),
+        Err(error) => {
+            tracing::warn!(%error, "Failed to read st0x REST API response body");
+            unavailable_json("Failed to read REST API response")
+        }
+    }
+}
+
 pub(crate) fn routes() -> Vec<Route> {
-    routes![health, logs, pending_orders, trades, transfers_endpoint]
+    routes![
+        health,
+        logs,
+        pending_orders,
+        trades,
+        transfers_endpoint,
+        raindex_orders
+    ]
 }
 
 #[cfg(test)]
@@ -718,7 +782,7 @@ mod tests {
     #[test]
     fn test_num_of_routes() {
         let routes_list = routes();
-        assert_eq!(routes_list.len(), 5);
+        assert_eq!(routes_list.len(), 6);
     }
 
     #[tokio::test]
@@ -966,5 +1030,141 @@ mod tests {
         assert!(page2.has_more);
         assert_eq!(page2.entries[0]["message"], "trade 2");
         assert_eq!(page2.entries[1]["message"], "trade 1");
+    }
+
+    #[tokio::test]
+    async fn raindex_orders_returns_unavailable_when_rest_api_not_configured() {
+        let ctx = create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
+        assert!(ctx.rest_api.is_none());
+
+        let rocket = rocket::build()
+            .mount("/", routes![raindex_orders])
+            .manage(ctx);
+        let client = Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let response = client.get("/orders/raindex").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+
+        let body = response.into_string().await.expect("response body");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON response");
+
+        assert_eq!(parsed["unavailable"], true);
+        assert_eq!(parsed["reason"], "REST API not configured (simulate mode)");
+    }
+
+    #[tokio::test]
+    async fn raindex_orders_returns_unavailable_when_upstream_unreachable() {
+        let mut ctx = create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
+        ctx.rest_api = Some(crate::config::RestApiCtx::unauthenticated(
+            "http://127.0.0.1:1".to_string(),
+        ));
+
+        let rocket = rocket::build()
+            .mount("/", routes![raindex_orders])
+            .manage(ctx);
+        let client = Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let response = client.get("/orders/raindex").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+
+        let body = response.into_string().await.expect("response body");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("response must be valid JSON even on error");
+
+        assert_eq!(parsed["unavailable"], true);
+        assert!(parsed["reason"].as_str().unwrap().contains("unreachable"),);
+    }
+
+    #[tokio::test]
+    async fn raindex_orders_proxies_successful_upstream_response() {
+        let mock_server = httpmock::MockServer::start();
+        let upstream_body = serde_json::json!({
+            "orders": [{
+                "orderHash": "0xabcd",
+                "owner": "0x0000000000000000000000000000000000000000",
+                "inputToken": {"address": "0x1111", "symbol": "USDC", "decimals": 6},
+                "outputToken": {"address": "0x2222", "symbol": "wtTSLA", "decimals": 18},
+                "outputVaultBalance": "1000",
+                "ioRatio": "0.5",
+                "createdAt": 1_718_452_800,
+                "orderbookId": "0x3333"
+            }],
+            "pagination": {
+                "page": 1,
+                "pageSize": 20,
+                "totalOrders": 1,
+                "totalPages": 1,
+                "hasMore": false
+            }
+        });
+
+        let owner = alloy::primitives::Address::ZERO;
+        let expected_path = format!("/v1/orders/owner/{owner:#x}");
+
+        mock_server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path(&expected_path);
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(upstream_body.clone());
+        });
+
+        let mut ctx = create_test_ctx_with_order_owner(owner);
+        ctx.rest_api = Some(crate::config::RestApiCtx::unauthenticated(
+            mock_server.base_url(),
+        ));
+
+        let rocket = rocket::build()
+            .mount("/", routes![raindex_orders])
+            .manage(ctx);
+        let client = Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let response = client.get("/orders/raindex").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+
+        let body = response.into_string().await.expect("response body");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON response");
+
+        assert_eq!(parsed["orders"][0]["orderHash"], "0xabcd");
+        assert_eq!(parsed["pagination"]["totalOrders"], 1);
+    }
+
+    #[tokio::test]
+    async fn raindex_orders_returns_unavailable_on_upstream_500() {
+        let mock_server = httpmock::MockServer::start();
+        let owner = alloy::primitives::Address::ZERO;
+
+        mock_server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!("/v1/orders/owner/{owner:#x}"));
+            then.status(500).body("Internal Server Error");
+        });
+
+        let mut ctx = create_test_ctx_with_order_owner(owner);
+        ctx.rest_api = Some(crate::config::RestApiCtx::unauthenticated(
+            mock_server.base_url(),
+        ));
+
+        let rocket = rocket::build()
+            .mount("/", routes![raindex_orders])
+            .manage(ctx);
+        let client = Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let response = client.get("/orders/raindex").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+
+        let body = response.into_string().await.expect("response body");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("response must be valid JSON on upstream error");
+
+        assert_eq!(parsed["unavailable"], true);
+        assert!(parsed["reason"].as_str().unwrap().contains("error"));
     }
 }

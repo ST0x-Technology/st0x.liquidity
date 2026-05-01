@@ -593,6 +593,7 @@ mod tests {
                 cash: None,
             },
             travel_rule: None,
+            rest_api: None,
         }
     }
 
@@ -658,6 +659,7 @@ mod tests {
                 cash,
             },
             travel_rule: None,
+            rest_api: None,
         }
     }
 
