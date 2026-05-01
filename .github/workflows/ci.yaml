@@ -3,6 +3,8 @@ name: CI
 on:
   workflow_dispatch:
   push:
+    branches-ignore:
+      - 'graphite-base/**'
 
 permissions:
   id-token: write

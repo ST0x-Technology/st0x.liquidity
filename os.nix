@@ -4,6 +4,12 @@ let
   inherit (import ./keys.nix) roles;
   envRoles = roles.${environment};
 
+  tailscaleFqdn = {
+    prod = "st0x-liquidity-nixos.taile5cf8a.ts.net";
+    staging = "st0x-liquidity-staging.taile5cf8a.ts.net";
+  }.${environment};
+  certDir = "/var/lib/tailscale-cert";
+
   services = import ./services.nix;
   enabledServices = lib.filterAttrs (_: v: v.enabled) services;
 
@@ -124,6 +130,7 @@ in {
     tailscale = {
       enable = true;
       authKeyFile = "/run/agenix/tailscale-authkey-${environment}";
+      permitCertUid = "nginx";
     };
 
     fail2ban = {
@@ -134,8 +141,11 @@ in {
 
     nginx = {
       enable = true;
-      virtualHosts.default = {
+      virtualHosts.${tailscaleFqdn} = {
         default = true;
+        forceSSL = true;
+        sslCertificate = "${certDir}/${tailscaleFqdn}.crt";
+        sslCertificateKey = "${certDir}/${tailscaleFqdn}.key";
         root = "/nix/var/nix/profiles/per-service/dashboard";
 
         locations = let
@@ -230,6 +240,7 @@ in {
       "d /mnt/data 0755 st0x st0x -"
       "d /mnt/data/logs 0755 st0x st0x -"
       "d /mnt/data/grafana 0750 grafana grafana -"
+      "d ${certDir} 0750 nginx nginx -"
     ];
 
     services = lib.recursiveUpdate (lib.mapAttrs mkService enabledServices) {
@@ -238,6 +249,57 @@ in {
       # new unit starts, causing a crash-loop.
       tailscaled.serviceConfig.ExecStartPre =
         [ "-${pkgs.iproute2}/bin/ip link delete tailscale0" ];
+
+      # Provision a Tailscale-issued TLS certificate so the dashboard is
+      # served over HTTPS. Runs before nginx to guarantee cert files exist.
+      tailscale-cert = {
+        description =
+          "Provision Tailscale HTTPS certificate for ${tailscaleFqdn}";
+        after = [ "tailscaled.service" ];
+        wants = [ "tailscaled.service" ];
+        before = [ "nginx.service" ];
+        wantedBy = [ "multi-user.target" ];
+        path = [ pkgs.tailscale pkgs.jq ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          User = "nginx";
+          Group = "nginx";
+          # Reload nginx so it picks up renewed certs on subsequent runs
+          # triggered by the timer. || true keeps the unit green on first
+          # boot when nginx hasn't started yet.
+          ExecStartPost =
+            "+${pkgs.bash}/bin/bash -c 'systemctl is-active --quiet nginx.service && systemctl reload nginx.service || true'";
+        };
+        script = ''
+          set -euo pipefail
+          retries=0
+          until [ "$(tailscale status --json 2>/dev/null | jq -r '.BackendState' 2>/dev/null)" = "Running" ]; do
+            retries=$((retries + 1))
+            if [ "$retries" -ge 30 ]; then
+              echo "Tailscale BackendState != Running after 60s" >&2
+              exit 1
+            fi
+            sleep 2
+          done
+          tailscale cert \
+            --cert-file ${certDir}/${tailscaleFqdn}.crt \
+            --key-file ${certDir}/${tailscaleFqdn}.key \
+            ${tailscaleFqdn}
+        '';
+      };
+
+      nginx.after = [ "tailscale-cert.service" ];
+      nginx.requires = [ "tailscale-cert.service" ];
+    };
+
+    timers.tailscale-cert = {
+      description = "Renew Tailscale HTTPS certificate daily";
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnCalendar = "daily";
+        Persistent = true;
+      };
     };
   };
 
@@ -276,4 +338,5 @@ in {
   '';
 
   system.stateVersion = "24.11";
+
 }
