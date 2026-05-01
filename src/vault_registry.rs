@@ -77,7 +77,7 @@ impl EventSourced for VaultRegistry {
 
     const AGGREGATE_TYPE: &'static str = "VaultRegistry";
     const PROJECTION: Table = Table("vault_registry_view");
-    const SCHEMA_VERSION: u64 = 2;
+    const SCHEMA_VERSION: u64 = 3;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         let mut registry = Self::empty(event.timestamp());
@@ -107,17 +107,15 @@ impl EventSourced for VaultRegistry {
             VaultRegistryCommand::SeedEquityVaultFromConfig {
                 token, vault_id, ..
             } => {
-                if let Some(existing) = self.equity_vaults.get(token)
-                    && existing.vault_id == *vault_id
+                if let Some(vaults_for_token) = self.equity_vaults.get(token)
+                    && vaults_for_token.contains_key(vault_id)
                 {
                     return Ok(vec![]);
                 }
             }
 
             VaultRegistryCommand::SeedUsdcVaultFromConfig { vault_id } => {
-                if let Some(ref existing) = self.usdc_vault
-                    && existing.vault_id == *vault_id
-                {
+                if self.usdc_vaults.contains_key(vault_id) {
                     return Ok(vec![]);
                 }
             }
@@ -131,12 +129,26 @@ impl EventSourced for VaultRegistry {
 }
 
 /// Registry state tracking all discovered vaults for an orderbook/owner pair.
+///
+/// Supports multiple vaults per asset. Equity vaults are grouped by token
+/// address, with each token mapping to a set of vaults keyed by vault ID.
+/// Multiple USDC vaults are supported, keyed by vault ID.
+///
+/// Each asset also tracks a **primary** vault ID — the first vault seeded
+/// from config (or the first discovered, if none was configured). The
+/// primary vault is used for single-vault operations like deposits and
+/// withdrawals, preserving operator intent from config ordering.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct VaultRegistry {
-    /// Equity vaults, keyed by token address
-    pub(crate) equity_vaults: BTreeMap<Address, EquityVault>,
-    /// USDC vault (at most one per owner)
-    pub(crate) usdc_vault: Option<UsdcVault>,
+    /// Equity vaults, grouped by token address then keyed by vault ID.
+    pub(crate) equity_vaults: BTreeMap<Address, BTreeMap<B256, EquityVault>>,
+    /// USDC vaults, keyed by vault ID.
+    pub(crate) usdc_vaults: BTreeMap<B256, UsdcVault>,
+    /// Primary equity vault per token — the first config-seeded or discovered
+    /// vault ID for each token. Used by deposit/withdraw operations.
+    primary_equity_vault: BTreeMap<Address, B256>,
+    /// Primary USDC vault — the first config-seeded or discovered vault ID.
+    primary_usdc_vault: Option<B256>,
     pub(crate) last_updated: DateTime<Utc>,
 }
 
@@ -173,21 +185,47 @@ pub(crate) struct UsdcVault {
 impl VaultRegistry {
     pub(crate) fn token_by_symbol(&self, symbol: &Symbol) -> Option<Address> {
         self.equity_vaults
-            .values()
-            .find(|vault| vault.symbol == *symbol)
-            .map(|vault| vault.token)
+            .iter()
+            .find(|(_, vaults)| vaults.values().any(|vault| vault.symbol == *symbol))
+            .map(|(token, _)| *token)
     }
 
-    pub(crate) fn vault_id_by_token(&self, token: Address) -> Option<B256> {
-        self.equity_vaults.get(&token).map(|v| v.vault_id)
+    /// Returns the primary vault ID for a token — the first config-seeded
+    /// or discovered vault, preserving operator intent from config ordering.
+    pub(crate) fn primary_vault_id_by_token(&self, token: Address) -> Option<B256> {
+        self.primary_equity_vault.get(&token).copied()
+    }
+
+    /// Returns all vault IDs registered for a token.
+    #[cfg(test)]
+    fn all_vault_ids_by_token(&self, token: Address) -> Vec<B256> {
+        self.equity_vaults
+            .get(&token)
+            .map(|vaults| vaults.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Returns the primary USDC vault ID.
+    #[cfg(test)]
+    fn primary_usdc_vault_id(&self) -> Option<B256> {
+        self.primary_usdc_vault
     }
 
     fn empty(timestamp: DateTime<Utc>) -> Self {
         Self {
             equity_vaults: BTreeMap::new(),
-            usdc_vault: None,
+            usdc_vaults: BTreeMap::new(),
+            primary_equity_vault: BTreeMap::new(),
+            primary_usdc_vault: None,
             last_updated: timestamp,
         }
+    }
+
+    fn insert_equity_vault(&mut self, token: Address, vault_id: B256, vault: EquityVault) {
+        self.equity_vaults
+            .entry(token)
+            .or_default()
+            .insert(vault_id, vault);
     }
 
     fn apply_event(&mut self, event: &VaultRegistryEvent) {
@@ -201,8 +239,11 @@ impl VaultRegistry {
                 discovered_at,
                 symbol,
             } => {
-                self.equity_vaults.insert(
+                self.primary_equity_vault.entry(*token).or_insert(*vault_id);
+
+                self.insert_equity_vault(
                     *token,
+                    *vault_id,
                     EquityVault {
                         token: *token,
                         vault_id: *vault_id,
@@ -220,13 +261,18 @@ impl VaultRegistry {
                 discovered_in,
                 discovered_at,
             } => {
-                self.usdc_vault = Some(UsdcVault {
-                    vault_id: *vault_id,
-                    provenance: VaultProvenance::Discovered {
-                        tx_hash: *discovered_in,
-                        discovered_at: *discovered_at,
+                self.primary_usdc_vault.get_or_insert(*vault_id);
+
+                self.usdc_vaults.insert(
+                    *vault_id,
+                    UsdcVault {
+                        vault_id: *vault_id,
+                        provenance: VaultProvenance::Discovered {
+                            tx_hash: *discovered_in,
+                            discovered_at: *discovered_at,
+                        },
                     },
-                });
+                );
             }
 
             VaultRegistryEvent::EquityVaultSeededFromConfig {
@@ -235,8 +281,11 @@ impl VaultRegistry {
                 seeded_at,
                 symbol,
             } => {
-                self.equity_vaults.insert(
+                self.primary_equity_vault.entry(*token).or_insert(*vault_id);
+
+                self.insert_equity_vault(
                     *token,
+                    *vault_id,
                     EquityVault {
                         token: *token,
                         vault_id: *vault_id,
@@ -252,12 +301,17 @@ impl VaultRegistry {
                 vault_id,
                 seeded_at,
             } => {
-                self.usdc_vault = Some(UsdcVault {
-                    vault_id: *vault_id,
-                    provenance: VaultProvenance::Seeded {
-                        seeded_at: *seeded_at,
+                self.primary_usdc_vault.get_or_insert(*vault_id);
+
+                self.usdc_vaults.insert(
+                    *vault_id,
+                    UsdcVault {
+                        vault_id: *vault_id,
+                        provenance: VaultProvenance::Seeded {
+                            seeded_at: *seeded_at,
+                        },
                     },
-                });
+                );
             }
         }
     }
@@ -529,8 +583,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rediscovering_vault_updates_it() {
-        let new_vault_id =
+    async fn discovering_new_vault_id_for_same_token_adds_it() {
+        let second_vault_id =
             b256!("0x0000000000000000000000000000000000000000000000000000000000000099");
         let new_tx_hash =
             b256!("0x2222222222222222222222222222222222222222222222222222222222222222");
@@ -545,19 +599,113 @@ mod tests {
             }])
             .when(VaultRegistryCommand::DiscoverEquityVault {
                 token: TEST_TOKEN,
-                vault_id: new_vault_id,
+                vault_id: second_vault_id,
                 discovered_in: new_tx_hash,
                 symbol: test_symbol(),
             })
             .await
             .events();
 
-        assert_eq!(events.len(), 1, "Should emit event to update vault");
+        assert_eq!(events.len(), 1, "Should emit event for new vault ID");
         assert!(matches!(
             &events[0],
             VaultRegistryEvent::EquityVaultDiscovered { vault_id, .. }
-            if *vault_id == new_vault_id
+            if *vault_id == second_vault_id
         ));
+    }
+
+    #[test]
+    fn multiple_vaults_per_token_are_tracked() {
+        let vault_id_2 =
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000099");
+
+        let registry = replay::<VaultRegistry>(vec![
+            VaultRegistryEvent::EquityVaultDiscovered {
+                token: TEST_TOKEN,
+                vault_id: TEST_VAULT_ID,
+                discovered_in: TEST_TX_HASH,
+                discovered_at: Utc::now(),
+                symbol: test_symbol(),
+            },
+            VaultRegistryEvent::EquityVaultDiscovered {
+                token: TEST_TOKEN,
+                vault_id: vault_id_2,
+                discovered_in: TEST_TX_HASH,
+                discovered_at: Utc::now(),
+                symbol: test_symbol(),
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        // One token entry with two vaults
+        assert_eq!(registry.equity_vaults.len(), 1);
+        let vaults = &registry.equity_vaults[&TEST_TOKEN];
+        assert_eq!(vaults.len(), 2);
+        assert!(vaults.contains_key(&TEST_VAULT_ID));
+        assert!(vaults.contains_key(&vault_id_2));
+
+        let all_ids = registry.all_vault_ids_by_token(TEST_TOKEN);
+        assert_eq!(all_ids.len(), 2);
+    }
+
+    #[test]
+    fn primary_vault_preserves_config_order_not_btreemap_order() {
+        // The second vault has a SMALLER B256 value than the first. Without
+        // primary tracking, BTreeMap ordering would return the second one.
+        let large_vault_id =
+            b256!("0x00000000000000000000000000000000000000000000000000000000000000ff");
+        let small_vault_id =
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000001");
+
+        let registry = replay::<VaultRegistry>(vec![
+            VaultRegistryEvent::EquityVaultSeededFromConfig {
+                token: TEST_TOKEN,
+                vault_id: large_vault_id,
+                seeded_at: Utc::now(),
+                symbol: test_symbol(),
+            },
+            VaultRegistryEvent::EquityVaultSeededFromConfig {
+                token: TEST_TOKEN,
+                vault_id: small_vault_id,
+                seeded_at: Utc::now(),
+                symbol: test_symbol(),
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        // Primary should be the FIRST seeded vault (large), not the
+        // BTreeMap-ordered smallest (small).
+        assert_eq!(
+            registry.primary_vault_id_by_token(TEST_TOKEN),
+            Some(large_vault_id),
+            "Primary vault must preserve config order, not BTreeMap key order"
+        );
+    }
+
+    #[test]
+    fn multiple_usdc_vaults_are_tracked() {
+        let vault_id_2 =
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000099");
+
+        let registry = replay::<VaultRegistry>(vec![
+            VaultRegistryEvent::UsdcVaultDiscovered {
+                vault_id: TEST_VAULT_ID,
+                discovered_in: TEST_TX_HASH,
+                discovered_at: Utc::now(),
+            },
+            VaultRegistryEvent::UsdcVaultDiscovered {
+                vault_id: vault_id_2,
+                discovered_in: TEST_TX_HASH,
+                discovered_at: Utc::now(),
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(registry.usdc_vaults.len(), 2);
+        assert_eq!(registry.primary_usdc_vault_id(), Some(TEST_VAULT_ID));
     }
 
     #[test]
@@ -581,7 +729,7 @@ mod tests {
 
         assert_eq!(registry.equity_vaults.len(), 1);
         assert!(registry.equity_vaults.contains_key(&TEST_TOKEN));
-        assert!(registry.usdc_vault.is_some());
+        assert!(!registry.usdc_vaults.is_empty());
     }
 
     #[test]
@@ -598,7 +746,7 @@ mod tests {
 
         assert_eq!(registry.equity_vaults.len(), 1);
         assert!(registry.equity_vaults.contains_key(&TEST_TOKEN));
-        assert!(registry.usdc_vault.is_none());
+        assert!(registry.usdc_vaults.is_empty());
     }
 
     #[test]

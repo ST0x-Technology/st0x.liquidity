@@ -215,7 +215,7 @@ mod tests {
         EquityAssetConfig {
             tokenized_equity: Address::random(),
             tokenized_equity_derivative: Address::random(),
-            vault_id: None,
+            vault_ids: Vec::new(),
             trading: OperationMode::Enabled,
             rebalancing: OperationMode::Disabled,
             operational_limit: None,

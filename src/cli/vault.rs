@@ -178,12 +178,23 @@ pub(super) async fn vault_withdraw_usdc_command<Writer: Write>(
 ) -> anyhow::Result<()> {
     ctx.wallet()?;
 
-    let vault_id = ctx
-        .assets
-        .cash
-        .as_ref()
-        .and_then(|cash| cash.vault_id)
-        .ok_or_else(|| anyhow::anyhow!("assets.cash.vault_id is required but not configured"))?;
+    let cash =
+        ctx.assets.cash.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("assets.cash.vault_ids is required but not configured")
+        })?;
+
+    let vault_id =
+        cash.vault_ids.first().copied().ok_or_else(|| {
+            anyhow::anyhow!("assets.cash.vault_ids is required but not configured")
+        })?;
+
+    if cash.vault_ids.len() > 1 {
+        writeln!(
+            stdout,
+            "Warning: {} USDC vaults configured, using the first one: {vault_id}",
+            cash.vault_ids.len()
+        )?;
+    }
 
     let withdraw = Withdraw {
         amount: amount.into(),
@@ -525,7 +536,7 @@ mod tests {
     #[tokio::test]
     async fn withdraw_usdc_fails_when_cash_vault_id_missing() {
         let ctx = create_ctx_with_rebalancing(Some(CashAssetConfig {
-            vault_id: None,
+            vault_ids: Vec::new(),
             rebalancing: OperationMode::Enabled,
             operational_limit: None,
         }));
@@ -543,7 +554,7 @@ mod tests {
         .to_string();
 
         assert!(
-            err_msg.contains("assets.cash.vault_id is required but not configured"),
+            err_msg.contains("assets.cash.vault_ids is required but not configured"),
             "Expected vault_id missing error, got: {err_msg}"
         );
     }
@@ -586,7 +597,7 @@ mod tests {
         .to_string();
 
         assert!(
-            err_msg.contains("assets.cash.vault_id is required but not configured"),
+            err_msg.contains("assets.cash.vault_ids is required but not configured"),
             "Expected vault_id missing error, got: {err_msg}"
         );
     }
@@ -594,7 +605,7 @@ mod tests {
     #[tokio::test]
     async fn withdraw_usdc_passes_cash_vault_lookup_when_vault_id_configured() {
         let ctx = create_ctx_with_rebalancing(Some(CashAssetConfig {
-            vault_id: Some(TEST_VAULT_ID),
+            vault_ids: vec![TEST_VAULT_ID],
             rebalancing: OperationMode::Enabled,
             operational_limit: None,
         }));

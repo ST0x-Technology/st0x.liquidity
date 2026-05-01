@@ -2000,8 +2000,9 @@ The reconciliation system closes this gap by periodically fetching actual
 balances and emitting them as events the system can react to:
 
 - **VaultRegistry** (CQRS aggregate): Auto-discovers Raindex vaults from
-  ClearV3/TakeOrderV3 trade events. Tracks equity vaults (per token address) and
-  a single USDC vault per orderbook/owner pair.
+  ClearV3/TakeOrderV3 trade events. Tracks multiple equity vaults per token
+  address and multiple USDC vaults per orderbook/owner pair. Inventory polling
+  sums balances across all vaults for each asset.
 - **InventorySnapshot** (CQRS aggregate): Records point-in-time snapshots of
   actual balances fetched from onchain vaults and the offchain broker.
 - **InventoryPollingService**: Periodically polls actual balances from both

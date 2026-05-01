@@ -56,12 +56,14 @@ tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 trading = "enabled"
 rebalancing = "disabled"
-# vault_id = "0xab12"
+# Single vault: vault_ids = "0xab12"
+# Multiple vaults: vault_ids = ["0xab12", "0xcd34"]
 # operational_limit = 100.0
 
 [assets.cash]
 rebalancing = "enabled"
-# vault_id = "0xcd34"
+# Single vault: vault_ids = "0xcd34"
+# Multiple vaults: vault_ids = ["0xcd34", "0xef56"]
 # operational_limit = 10000.0
 
 # Optional — enables the Orders dashboard tab by querying the st0x REST API.

@@ -2007,7 +2007,7 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
                 EquityAssetConfig {
                     tokenized_equity: Address::ZERO,
                     tokenized_equity_derivative: Address::ZERO,
-                    vault_id: None,
+                    vault_ids: Vec::new(),
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Disabled,
                     operational_limit: Some(
@@ -2195,7 +2195,7 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
                 EquityAssetConfig {
                     tokenized_equity: Address::ZERO,
                     tokenized_equity_derivative: Address::ZERO,
-                    vault_id: None,
+                    vault_ids: Vec::new(),
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Disabled,
                     operational_limit: Some(

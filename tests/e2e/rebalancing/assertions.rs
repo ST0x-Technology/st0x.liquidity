@@ -171,7 +171,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
                 EquityAssetConfig {
                     tokenized_equity: unwrapped,
                     tokenized_equity_derivative: wrapped,
-                    vault_id: equity_vault_ids.get(symbol).copied(),
+                    vault_ids: equity_vault_ids.get(symbol).copied().into_iter().collect(),
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Enabled,
                     operational_limit: None,
@@ -198,7 +198,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
             operational_limit: None,
         },
         cash: Some(CashAssetConfig {
-            vault_id: Some(cash_vault_id),
+            vault_ids: vec![cash_vault_id],
             rebalancing: cash_rebalancing,
             operational_limit: None,
         }),
@@ -252,7 +252,7 @@ where
                 EquityAssetConfig {
                     tokenized_equity: *unwrapped,
                     tokenized_equity_derivative: *wrapped,
-                    vault_id: None,
+                    vault_ids: Vec::new(),
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Disabled,
                     operational_limit: None,
@@ -296,7 +296,7 @@ where
                 operational_limit: None,
             },
             cash: Some(CashAssetConfig {
-                vault_id: Some(usdc_vault_id),
+                vault_ids: vec![usdc_vault_id],
                 rebalancing: OperationMode::Enabled,
                 operational_limit: None,
             }),

@@ -452,10 +452,10 @@ async fn seed_vault_registry_from_config(
     vault_registry: &Store<VaultRegistry>,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    // Pre-flight validation: ensure every rebalancing-enabled equity has a
-    // vault_id before performing any writes to the vault registry.
+    // Pre-flight validation: ensure every rebalancing-enabled equity has at
+    // least one vault_id before performing any writes to the vault registry.
     for (symbol, equity_config) in &ctx.assets.equities.symbols {
-        if equity_config.vault_id.is_none() && ctx.is_rebalancing_enabled(symbol) {
+        if equity_config.vault_ids.is_empty() && ctx.is_rebalancing_enabled(symbol) {
             return Err(CtxError::MissingEquityVaultId {
                 symbol: symbol.clone(),
             }
@@ -469,40 +469,40 @@ async fn seed_vault_registry_from_config(
     };
 
     for (symbol, equity_config) in &ctx.assets.equities.symbols {
-        let Some(vault_id) = equity_config.vault_id else {
-            continue;
-        };
+        for vault_id in &equity_config.vault_ids {
+            debug!(
+                %symbol,
+                %vault_id,
+                token = %equity_config.tokenized_equity_derivative,
+                "Seeding equity vault from config"
+            );
 
-        debug!(
-            %symbol,
-            %vault_id,
-            token = %equity_config.tokenized_equity_derivative,
-            "Seeding equity vault from config"
-        );
-
-        vault_registry
-            .send(
-                &vault_registry_id,
-                VaultRegistryCommand::SeedEquityVaultFromConfig {
-                    token: equity_config.tokenized_equity_derivative,
-                    vault_id,
-                    symbol: symbol.clone(),
-                },
-            )
-            .await?;
+            vault_registry
+                .send(
+                    &vault_registry_id,
+                    VaultRegistryCommand::SeedEquityVaultFromConfig {
+                        token: equity_config.tokenized_equity_derivative,
+                        vault_id: *vault_id,
+                        symbol: symbol.clone(),
+                    },
+                )
+                .await?;
+        }
     }
 
-    if let Some(cash) = &ctx.assets.cash
-        && let Some(vault_id) = cash.vault_id
-    {
-        info!(%vault_id, "Seeding USDC vault from config");
+    if let Some(cash) = &ctx.assets.cash {
+        for vault_id in &cash.vault_ids {
+            info!(%vault_id, "Seeding USDC vault from config");
 
-        vault_registry
-            .send(
-                &vault_registry_id,
-                VaultRegistryCommand::SeedUsdcVaultFromConfig { vault_id },
-            )
-            .await?;
+            vault_registry
+                .send(
+                    &vault_registry_id,
+                    VaultRegistryCommand::SeedUsdcVaultFromConfig {
+                        vault_id: *vault_id,
+                    },
+                )
+                .await?;
+        }
     }
 
     Ok(())
@@ -640,7 +640,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             .assets
             .cash
             .as_ref()
-            .and_then(|cash| cash.vault_id)
+            .and_then(|cash| cash.vault_ids.first().copied())
             .ok_or(CtxError::MissingCashVaultId)?;
 
         let handle = services.spawn(
@@ -1788,7 +1788,7 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: aapl_token,
                 tokenized_equity_derivative: Address::random(),
-                vault_id: None,
+                vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Disabled,
                 operational_limit: None,
@@ -1799,7 +1799,7 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: tsla_token,
                 tokenized_equity_derivative: Address::random(),
-                vault_id: None,
+                vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
                 operational_limit: None,
@@ -1810,7 +1810,7 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: spym_token,
                 tokenized_equity_derivative: Address::random(),
-                vault_id: None,
+                vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Disabled,
                 operational_limit: None,
@@ -1860,7 +1860,7 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: Address::random(),
                 tokenized_equity_derivative: aapl_wrapped_token,
-                vault_id: None,
+                vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Disabled,
                 operational_limit: None,
@@ -1871,7 +1871,7 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: Address::random(),
                 tokenized_equity_derivative: tsla_wrapped_token,
-                vault_id: None,
+                vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
                 operational_limit: None,
@@ -1882,7 +1882,7 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: Address::random(),
                 tokenized_equity_derivative: spym_wrapped_token,
-                vault_id: None,
+                vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Disabled,
                 operational_limit: None,
@@ -2115,7 +2115,7 @@ mod tests {
             .expect("VaultRegistry should exist after discovery");
 
         assert!(
-            registry.usdc_vault.is_some(),
+            !registry.usdc_vaults.is_empty(),
             "Expected USDC vault to be discovered"
         );
     }
@@ -2164,7 +2164,7 @@ mod tests {
             .expect("VaultRegistry should exist after discovery");
 
         assert!(
-            registry.usdc_vault.is_some(),
+            !registry.usdc_vaults.is_empty(),
             "Expected USDC vault to be discovered from take order"
         );
         assert!(
@@ -2242,6 +2242,7 @@ mod tests {
         let has_goog_vault = registry
             .equity_vaults
             .values()
+            .flat_map(|vaults| vaults.values())
             .any(|vault| vault.symbol == goog_symbol);
 
         assert!(
@@ -2250,6 +2251,7 @@ mod tests {
             registry
                 .equity_vaults
                 .values()
+                .flat_map(|vaults| vaults.values())
                 .map(|vault| &vault.symbol)
                 .collect::<Vec<_>>()
         );
@@ -3761,9 +3763,9 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: Address::ZERO,
-                vault_id: Some(fixed_bytes!(
+                vault_ids: vec![fixed_bytes!(
                     "0x0000000000000000000000000000000000000000000000000000000000000001"
-                )),
+                )],
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
                 operational_limit: None,
@@ -3775,7 +3777,7 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: Address::ZERO,
-                vault_id: None,
+                vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
                 operational_limit: None,

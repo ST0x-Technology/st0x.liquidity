@@ -290,7 +290,7 @@ pub enum Commands {
     /// Withdraw USDC from the configured Raindex cash vault
     ///
     /// This preserves the existing USDC-specific operator flow by resolving
-    /// `assets.cash.vault_id` from config and forwarding into the generic
+    /// `assets.cash.vault_ids` from config and forwarding into the generic
     /// vault withdrawal implementation.
     VaultWithdrawUsdc {
         /// Amount of USDC to withdraw

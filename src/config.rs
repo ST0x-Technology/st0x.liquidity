@@ -62,8 +62,12 @@ pub enum OperationMode {
 pub struct EquityAssetConfig {
     pub tokenized_equity: Address,
     pub tokenized_equity_derivative: Address,
-    #[serde(default, deserialize_with = "deserialize_padded_b256")]
-    pub vault_id: Option<B256>,
+    #[serde(
+        default,
+        alias = "vault_id",
+        deserialize_with = "deserialize_vault_ids"
+    )]
+    pub vault_ids: Vec<B256>,
     pub trading: OperationMode,
     pub rebalancing: OperationMode,
     pub operational_limit: Option<Positive<FractionalShares>>,
@@ -73,8 +77,12 @@ pub struct EquityAssetConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CashAssetConfig {
-    #[serde(default, deserialize_with = "deserialize_padded_b256")]
-    pub vault_id: Option<B256>,
+    #[serde(
+        default,
+        alias = "vault_id",
+        deserialize_with = "deserialize_vault_ids"
+    )]
+    pub vault_ids: Vec<B256>,
     pub rebalancing: OperationMode,
     pub operational_limit: Option<Positive<Usdc>>,
 }
@@ -100,37 +108,55 @@ pub struct AssetsConfig {
     pub cash: Option<CashAssetConfig>,
 }
 
-/// Deserializes a hex string (possibly short, e.g. `"0xfab"`) into a
-/// left-padded `B256`. Missing values deserialize as `None`.
-fn deserialize_padded_b256<'de, D>(deserializer: D) -> Result<Option<B256>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let Some(hex_str) = Option::<String>::deserialize(deserializer)? else {
-        return Ok(None);
-    };
-
+/// Parses a hex string (possibly short, e.g. `"0xfab"`) into a
+/// left-padded `B256`.
+fn parse_padded_b256(hex_str: &str) -> Result<B256, String> {
     let stripped = hex_str
         .strip_prefix("0x")
         .or_else(|| hex_str.strip_prefix("0X"))
-        .unwrap_or(&hex_str);
+        .unwrap_or(hex_str);
 
     if stripped.len() > 64 {
-        return Err(serde::de::Error::custom(format!(
-            "hex string too long for B256: {stripped}"
-        )));
+        return Err(format!("hex string too long for B256: {stripped}"));
     }
 
     if stripped.is_empty() {
-        return Err(serde::de::Error::custom("empty hex string for B256"));
+        return Err("empty hex string for B256".to_string());
     }
 
     let padded = format!("{stripped:0>64}");
-    padded
-        .parse::<B256>()
-        .map(Some)
-        .map_err(serde::de::Error::custom)
+    padded.parse::<B256>().map_err(|err| err.to_string())
 }
+
+/// Deserializes vault IDs from either a single hex string or an array of hex
+/// strings. Each value is left-padded to a full `B256`.
+///
+/// Accepts both `vault_id = "0xfab"` (single) and
+/// `vault_ids = ["0xfab", "0xfab2"]` (multiple) in TOML.
+fn deserialize_vault_ids<'de, D>(deserializer: D) -> Result<Vec<B256>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    let raw = OneOrMany::deserialize(deserializer)?;
+
+    let hex_strings = match raw {
+        OneOrMany::One(single) => vec![single],
+        OneOrMany::Many(many) => many,
+    };
+
+    hex_strings
+        .into_iter()
+        .map(|hex_str| parse_padded_b256(&hex_str).map_err(serde::de::Error::custom))
+        .collect()
+}
+
 /// Non-secret settings deserialized from the plaintext config TOML.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1030,12 +1056,12 @@ pub enum CtxError {
     )]
     CashOperationalLimitBelowMinimumWithdrawal { configured: Usdc, minimum: Usdc },
     #[error(
-        "assets.cash.vault_id is required for rebalancing \
+        "assets.cash.vault_ids is required for rebalancing \
          but not configured"
     )]
     MissingCashVaultId,
     #[error(
-        "assets.equities.{symbol}.vault_id is required when \
+        "assets.equities.{symbol}.vault_ids is required when \
          rebalancing is enabled but not configured"
     )]
     MissingEquityVaultId { symbol: Symbol },
@@ -1080,8 +1106,8 @@ impl CtxError {
             Self::CashOperationalLimitBelowMinimumWithdrawal { .. } => {
                 "cash operational limit below minimum withdrawal"
             }
-            Self::MissingCashVaultId => "missing cash vault_id",
-            Self::MissingEquityVaultId { .. } => "missing equity vault_id",
+            Self::MissingCashVaultId => "missing cash vault_ids",
+            Self::MissingEquityVaultId { .. } => "missing equity vault_ids",
             Self::ZeroPollingInterval { .. } => "zero polling interval",
             Self::FloatComparison(_) => "float comparison failed",
             Self::InvalidTravelRule { .. } => "invalid travel rule config",
@@ -2837,12 +2863,12 @@ pub(crate) mod tests {
         );
         assert_eq!(rklb.trading, OperationMode::Disabled);
         assert_eq!(rklb.rebalancing, OperationMode::Enabled);
-        assert!(rklb.vault_id.is_some());
+        assert_eq!(rklb.vault_ids.len(), 1);
         assert!(rklb.operational_limit.is_some());
 
         let cash = config.cash.unwrap();
         assert_eq!(cash.rebalancing, OperationMode::Disabled);
-        assert!(cash.vault_id.is_some());
+        assert_eq!(cash.vault_ids.len(), 1);
     }
 
     #[test]
@@ -2861,7 +2887,32 @@ pub(crate) mod tests {
         let expected: B256 = "0000000000000000000000000000000000000000000000000000000000000fab"
             .parse()
             .unwrap();
-        assert_eq!(rklb.vault_id.unwrap(), expected);
+        assert_eq!(rklb.vault_ids[0], expected);
+    }
+
+    #[test]
+    fn vault_ids_array_parses_multiple_values() {
+        let toml_str = r#"
+            [equities.RKLB]
+            tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
+            tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
+            vault_ids = ["0xfab", "0xfab2"]
+            trading = "disabled"
+            rebalancing = "enabled"
+        "#;
+
+        let config: AssetsConfig = toml::from_str(toml_str).unwrap();
+        let rklb = &config.equities.symbols[&Symbol::new("RKLB").unwrap()];
+        assert_eq!(rklb.vault_ids.len(), 2);
+
+        let expected_1: B256 = "0000000000000000000000000000000000000000000000000000000000000fab"
+            .parse()
+            .unwrap();
+        let expected_2: B256 = "000000000000000000000000000000000000000000000000000000000000fab2"
+            .parse()
+            .unwrap();
+        assert_eq!(rklb.vault_ids[0], expected_1);
+        assert_eq!(rklb.vault_ids[1], expected_2);
     }
 
     #[test]
@@ -2934,7 +2985,7 @@ pub(crate) mod tests {
             EquityAssetConfig {
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: Address::ZERO,
-                vault_id: None,
+                vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
                 operational_limit: None,
@@ -2980,7 +3031,7 @@ pub(crate) mod tests {
             EquityAssetConfig {
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: Address::ZERO,
-                vault_id: None,
+                vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
                 operational_limit: None,
@@ -3029,7 +3080,7 @@ pub(crate) mod tests {
             EquityAssetConfig {
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: Address::ZERO,
-                vault_id: None,
+                vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Disabled,
                 operational_limit: None,
@@ -3079,49 +3130,25 @@ pub(crate) mod tests {
             /// zero-filled on the left to 64 chars.
             #[test]
             fn padded_b256_roundtrip(hex_digits in arb_hex_digits()) {
-                let toml_str = format!(
-                    r#"vault_id = "0x{hex_digits}""#,
-                );
-
-                #[derive(Deserialize)]
-                #[serde(rename_all = "snake_case")]
-                struct Wrapper {
-                    #[serde(deserialize_with = "deserialize_padded_b256")]
-                    vault_id: Option<B256>,
-                }
-
-                let wrapper: Wrapper = toml::from_str(&toml_str).unwrap();
-                let parsed = wrapper.vault_id.unwrap();
+                let hex_str = format!("0x{hex_digits}");
+                let parsed = parse_padded_b256(&hex_str).unwrap();
 
                 let expected_hex = format!("{hex_digits:0>64}");
                 let expected: B256 = expected_hex.parse().unwrap();
                 prop_assert_eq!(parsed, expected);
             }
 
-            /// Invalid hex characters must produce a deserialization error.
+            /// Invalid hex characters must produce a parse error.
             #[test]
             fn padded_b256_rejects_invalid_hex(
                 bad_char in "[g-zG-Z!@#$%^&*]",
                 prefix in arb_hex_digits(),
             ) {
-                let hex_str = format!("{prefix}{bad_char}");
-                let toml_str = format!(
-                    r#"vault_id = "0x{hex_str}""#,
-                );
-
-                #[derive(Debug, Deserialize)]
-                #[serde(rename_all = "snake_case")]
-                struct Wrapper {
-                    #[serde(deserialize_with = "deserialize_padded_b256")]
-                    vault_id: Option<B256>,
-                }
-
-                let result = toml::from_str::<Wrapper>(&toml_str);
+                let hex_str = format!("0x{prefix}{bad_char}");
+                let result = parse_padded_b256(&hex_str);
                 prop_assert!(
                     result.is_err(),
-                    "Expected error for invalid hex '{hex_str}', got {result:?}. \
-                     Parsed vault_id: {:?}",
-                    result.as_ref().ok().map(|w| w.vault_id),
+                    "Expected error for invalid hex '{hex_str}', got {result:?}",
                 );
             }
 
@@ -3222,7 +3249,7 @@ pub(crate) mod tests {
 
             let config: CashAssetConfig = toml::from_str(toml_str).unwrap();
             assert_eq!(config.rebalancing, OperationMode::Disabled);
-            assert!(config.vault_id.is_some());
+            assert_eq!(config.vault_ids.len(), 1);
         }
 
         #[test]
@@ -3253,17 +3280,7 @@ pub(crate) mod tests {
 
         #[test]
         fn padded_b256_rejects_empty_hex() {
-            let toml_str = r#"vault_id = "0x""#;
-
-            #[derive(Debug, Deserialize)]
-            #[serde(rename_all = "snake_case")]
-            struct Wrapper {
-                #[serde(deserialize_with = "deserialize_padded_b256")]
-                #[allow(dead_code)]
-                vault_id: Option<B256>,
-            }
-
-            let result = toml::from_str::<Wrapper>(toml_str);
+            let result = parse_padded_b256("0x");
             assert!(
                 result.is_err(),
                 "Expected error for empty hex string, got {result:?}"
@@ -3273,17 +3290,8 @@ pub(crate) mod tests {
         #[test]
         fn padded_b256_rejects_too_long_hex() {
             let long_hex = "a".repeat(65);
-            let toml_str = format!(r#"vault_id = "0x{long_hex}""#);
-
-            #[derive(Debug, Deserialize)]
-            #[serde(rename_all = "snake_case")]
-            struct Wrapper {
-                #[serde(deserialize_with = "deserialize_padded_b256")]
-                #[allow(dead_code)]
-                vault_id: Option<B256>,
-            }
-
-            let result = toml::from_str::<Wrapper>(&toml_str);
+            let hex_str = format!("0x{long_hex}");
+            let result = parse_padded_b256(&hex_str);
             assert!(
                 result.is_err(),
                 "Expected error for too-long hex string, got {result:?}"

@@ -61,7 +61,8 @@ rebalancing = "disabled"
 # - rebalancing: whether automatic equity rebalancing is active.
 # - tokenized_equity: unwrapped tTOKEN contract address on Base.
 # - tokenized_equity_derivative: wrapped wtTOKEN contract address on Base.
-# - vault_id: Raindex vault ID (required when rebalancing is enabled).
+# - vault_ids: Raindex vault ID(s) — single string or array of strings.
+#   (alias: vault_id for backward compat. Required when rebalancing is enabled.)
 
 [assets.equities.RKLB]
 trading = "disabled"

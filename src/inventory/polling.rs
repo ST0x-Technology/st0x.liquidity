@@ -184,18 +184,37 @@ where
 
         let expected_tokens: Vec<_> = registry.equity_vaults.keys().copied().collect();
 
-        let balance_futures = registry.equity_vaults.values().map(|vault| async {
-            self.raindex_service
-                .get_equity_balance::<OpenChainErrorRegistry>(
-                    self.order_owner,
-                    vault.token,
-                    RaindexVaultId(vault.vault_id),
-                )
-                .await
-                .map(|balance| (vault.token, vault.symbol.clone(), balance))
-        });
+        // Fetch all vault balances in parallel across all tokens and vault IDs,
+        // then sum per-token to get the total balance for each asset.
+        let per_token_futures = registry
+            .equity_vaults
+            .iter()
+            .filter_map(|(token, vaults_for_token)| {
+                let first_vault = vaults_for_token.values().next()?;
+                let symbol = first_vault.symbol.clone();
+                Some((*token, symbol, vaults_for_token))
+            })
+            .map(|(token, symbol, vaults_for_token)| async move {
+                let vault_futures = vaults_for_token.values().map(|vault| {
+                    self.raindex_service
+                        .get_equity_balance::<OpenChainErrorRegistry>(
+                            self.order_owner,
+                            vault.token,
+                            RaindexVaultId(vault.vault_id),
+                        )
+                });
 
-        let results = try_join_all(balance_futures).await?;
+                let vault_balances = try_join_all(vault_futures).await?;
+
+                let total = vault_balances[1..]
+                    .iter()
+                    .copied()
+                    .try_fold(vault_balances[0], |acc, balance| acc + balance)?;
+
+                Ok::<_, InventoryPollingError<Exe::Error>>((token, symbol, total))
+            });
+
+        let results = try_join_all(per_token_futures).await?;
 
         let balances: BTreeMap<_, _> = results
             .iter()
@@ -226,18 +245,25 @@ where
         snapshot_id: &InventorySnapshotId,
         registry: &VaultRegistry,
     ) -> Result<(), InventoryPollingError<Exe::Error>> {
-        let Some(usdc_vault) = &registry.usdc_vault else {
-            debug!(target: "inventory", "No USDC vault discovered, skipping onchain cash polling");
+        if registry.usdc_vaults.is_empty() {
+            debug!(target: "inventory", "No USDC vaults discovered, skipping onchain cash polling");
             return Ok(());
-        };
+        }
 
-        let usdc_balance = self
-            .raindex_service
-            .get_usdc_balance::<OpenChainErrorRegistry>(
-                self.order_owner,
-                RaindexVaultId(usdc_vault.vault_id),
-            )
-            .await?;
+        let balance_futures = registry.usdc_vaults.values().map(|vault| {
+            self.raindex_service
+                .get_usdc_balance::<OpenChainErrorRegistry>(
+                    self.order_owner,
+                    RaindexVaultId(vault.vault_id),
+                )
+        });
+
+        let vault_balances = try_join_all(balance_futures).await?;
+
+        let usdc_balance = vault_balances[1..]
+            .iter()
+            .copied()
+            .try_fold(vault_balances[0], |acc, balance| acc + balance)?;
 
         self.snapshot
             .send(
@@ -1233,7 +1259,7 @@ mod tests {
             "Should NOT emit OnchainUsdc when no USDC vault discovered"
         );
         assert!(
-            logs_contain("No USDC vault discovered, skipping onchain cash polling"),
+            logs_contain("No USDC vaults discovered, skipping onchain cash polling"),
             "Should log debug message explaining why cash polling was skipped"
         );
     }

@@ -1888,7 +1888,7 @@ mod tests {
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
                 cash: Some(CashAssetConfig {
-                    vault_id: None,
+                    vault_ids: Vec::new(),
                     rebalancing: OperationMode::Enabled,
                     operational_limit: None,
                 }),

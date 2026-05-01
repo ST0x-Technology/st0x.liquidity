@@ -327,7 +327,7 @@ impl<W: Wallet> Raindex for RaindexService<W> {
     async fn lookup_vault_id(&self, token: Address) -> Result<RaindexVaultId, RaindexError> {
         let registry = self.load_registry().await?;
         registry
-            .vault_id_by_token(token)
+            .primary_vault_id_by_token(token)
             .map(RaindexVaultId)
             .ok_or(RaindexError::VaultNotFound(token))
     }
@@ -341,7 +341,7 @@ impl<W: Wallet> Raindex for RaindexService<W> {
             .token_by_symbol(symbol)
             .ok_or_else(|| RaindexError::TokenNotFound(symbol.clone()))?;
         let vault_id = registry
-            .vault_id_by_token(token)
+            .primary_vault_id_by_token(token)
             .ok_or(RaindexError::VaultNotFound(token))?;
         Ok((token, RaindexVaultId(vault_id)))
     }

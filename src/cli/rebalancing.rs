@@ -171,14 +171,25 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
 
     let wallet_ctx = ctx.wallet()?;
 
-    let usdc_vault_id = ctx
-        .assets
-        .cash
-        .as_ref()
-        .and_then(|cash| cash.vault_id)
-        .ok_or_else(|| anyhow::anyhow!("assets.cash.vault_id is required but not configured"))?;
+    let cash =
+        ctx.assets.cash.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("assets.cash.vault_ids is required but not configured")
+        })?;
+
+    let usdc_vault_id =
+        cash.vault_ids.first().copied().ok_or_else(|| {
+            anyhow::anyhow!("assets.cash.vault_ids is required but not configured")
+        })?;
 
     writeln!(stdout, "   Vault ID: {usdc_vault_id}")?;
+
+    if cash.vault_ids.len() > 1 {
+        writeln!(
+            stdout,
+            "   Warning: {} USDC vaults configured, using the first one",
+            cash.vault_ids.len()
+        )?;
+    }
     let owner = wallet_ctx.base_wallet().address();
 
     let broker_mode = if alpaca_auth.is_sandbox() {
@@ -748,9 +759,9 @@ mod tests {
     async fn test_transfer_usdc_requires_wallet_config() {
         let mut ctx = create_alpaca_ctx_without_rebalancing();
         ctx.assets.cash = Some(CashAssetConfig {
-            vault_id: Some(b256!(
+            vault_ids: vec![b256!(
                 "0x00000000000000000000000000000000000000000000000000000000000000ab"
-            )),
+            )],
             rebalancing: OperationMode::Enabled,
             operational_limit: None,
         });
@@ -866,7 +877,7 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("assets.cash.vault_id is required"),
+            err_msg.contains("assets.cash.vault_ids is required"),
             "Expected vault_id error, got: {err_msg}"
         );
     }
@@ -874,7 +885,7 @@ mod tests {
     #[tokio::test]
     async fn test_transfer_usdc_requires_vault_id_when_vault_id_is_none() {
         let ctx = create_alpaca_ctx_with_rebalancing(Some(CashAssetConfig {
-            vault_id: None,
+            vault_ids: Vec::new(),
             rebalancing: OperationMode::Enabled,
             operational_limit: None,
         }));
@@ -893,7 +904,7 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("assets.cash.vault_id is required"),
+            err_msg.contains("assets.cash.vault_ids is required"),
             "Expected vault_id error, got: {err_msg}"
         );
     }
@@ -902,7 +913,7 @@ mod tests {
     async fn test_transfer_usdc_writes_vault_id_to_stdout() {
         let vault_id = b256!("0x00000000000000000000000000000000000000000000000000000000000000ab");
         let ctx = create_alpaca_ctx_with_rebalancing(Some(CashAssetConfig {
-            vault_id: Some(vault_id),
+            vault_ids: vec![vault_id],
             rebalancing: OperationMode::Enabled,
             operational_limit: None,
         }));

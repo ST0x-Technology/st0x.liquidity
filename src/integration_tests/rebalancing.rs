@@ -129,7 +129,7 @@ fn test_trigger_config() -> RebalancingTriggerConfig {
                     EquityAssetConfig {
                         tokenized_equity: Address::ZERO,
                         tokenized_equity_derivative: Address::ZERO,
-                        vault_id: None,
+                        vault_ids: Vec::new(),
                         trading: OperationMode::Disabled,
                         rebalancing: OperationMode::Enabled,
                         operational_limit: None,
@@ -137,7 +137,7 @@ fn test_trigger_config() -> RebalancingTriggerConfig {
                 )]),
             },
             cash: Some(CashAssetConfig {
-                vault_id: None,
+                vault_ids: Vec::new(),
                 rebalancing: OperationMode::Enabled,
                 operational_limit: None,
             }),
@@ -1276,7 +1276,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
     let assets = AssetsConfig {
         equities: EquitiesConfig::default(),
         cash: Some(CashAssetConfig {
-            vault_id: None,
+            vault_ids: Vec::new(),
             rebalancing: OperationMode::Enabled,
             operational_limit: Some(Positive::new(Usdc::new(float!(100))).unwrap()),
         }),
@@ -1407,7 +1407,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
     let assets = AssetsConfig {
         equities: EquitiesConfig::default(),
         cash: Some(CashAssetConfig {
-            vault_id: None,
+            vault_ids: Vec::new(),
             rebalancing: OperationMode::Enabled,
             operational_limit: Some(Positive::new(Usdc::new(float!(100))).unwrap()),
         }),
@@ -1527,7 +1527,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
                 cash: Some(CashAssetConfig {
-                    vault_id: None,
+                    vault_ids: Vec::new(),
                     rebalancing: OperationMode::Enabled,
                     operational_limit: None,
                 }),
@@ -1587,7 +1587,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
                 cash: Some(CashAssetConfig {
-                    vault_id: None,
+                    vault_ids: Vec::new(),
                     rebalancing: OperationMode::Enabled,
                     operational_limit: None,
                 }),
