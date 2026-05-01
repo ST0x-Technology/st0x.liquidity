@@ -170,7 +170,7 @@ where
             Self::Uninitialized => Entity::originate(&event).map_or_else(
                 || {
                     let err = LifecycleError::EventCantOriginate { event };
-                    error!("lifecycle failed during originate: {err}");
+                    error!(target: "cqrs", "lifecycle failed during originate: {err}");
                     Self::Failed {
                         error: err,
                         last_valid_entity: None,
@@ -186,7 +186,7 @@ where
                         entity: Box::new(entity.clone()),
                         event,
                     };
-                    error!("lifecycle failed during evolve: {err}");
+                    error!(target: "cqrs", "lifecycle failed during evolve: {err}");
                     Self::Failed {
                         error: err,
                         last_valid_entity: Some(Box::new(entity)),
@@ -194,7 +194,7 @@ where
                 }
                 Err(domain_err) => {
                     let err = LifecycleError::Apply(domain_err);
-                    error!("lifecycle failed during evolve: {err}");
+                    error!(target: "cqrs", "lifecycle failed during evolve: {err}");
                     Self::Failed {
                         error: err,
                         last_valid_entity: Some(Box::new(entity)),
@@ -210,7 +210,7 @@ where
                     failure: Box::new(error),
                     event,
                 };
-                error!("lifecycle already failed, ignoring event: {err}");
+                error!(target: "cqrs", "lifecycle already failed, ignoring event: {err}");
                 Self::Failed {
                     error: err,
                     last_valid_entity,
@@ -270,6 +270,7 @@ where
     async fn dispatch(&self, aggregate_id: &str, events: &[EventEnvelope<Lifecycle<Entity>>]) {
         let Ok(typed_id) = aggregate_id.parse::<Entity::Id>() else {
             warn!(
+                target: "cqrs",
                 aggregate_id = aggregate_id,
                 aggregate_type = Entity::AGGREGATE_TYPE,
                 "Failed to parse aggregate ID in reactor bridge"
@@ -285,6 +286,7 @@ where
 
             if let Err(error) = self.reactor.react(injected).await {
                 error!(
+                    target: "cqrs",
                     ?error,
                     aggregate_id = aggregate_id,
                     aggregate_type = Entity::AGGREGATE_TYPE,

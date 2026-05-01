@@ -596,6 +596,7 @@ fn parse_and_validate(
             // Common when sharing one secrets file across bot + CLI
             // where the bot config doesn't need a wallet.
             warn!(
+                target: "startup",
                 "[wallet] secrets present but no [wallet] config section -- \
                  wallet signing will not be available"
             );
@@ -721,6 +722,7 @@ fn parse_and_validate(
             .map(|cfg| {
                 if secrets.rest_api.is_none() {
                     warn!(
+                        target: "startup",
                         "[rest_api] URL configured but no [rest_api] credentials in secrets -- \
                          requests will be unauthenticated"
                     );

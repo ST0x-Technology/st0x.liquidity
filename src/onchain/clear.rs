@@ -21,7 +21,7 @@ use crate::symbol::cache::SymbolCache;
 
 impl OnchainTrade {
     /// Creates OnchainTrade directly from ClearV3 blockchain events
-    #[tracing::instrument(skip_all, fields(tx_hash = ?log.transaction_hash, log_index = ?log.log_index), level = tracing::Level::DEBUG)]
+    #[tracing::instrument(target = "hedge", skip_all, fields(tx_hash = ?log.transaction_hash, log_index = ?log.log_index), level = tracing::Level::DEBUG)]
     pub async fn try_from_clear_v3<E: Evm>(
         evm_ctx: &EvmCtx,
         cache: &SymbolCache,
@@ -50,12 +50,14 @@ impl OnchainTrade {
         let bob_owner_matches = bob_order.owner == order_owner;
 
         debug!(
+            target: "hedge",
             "ClearV3 owner comparison: alice.owner={:?}, bob.owner={:?}, order_owner={:?}, alice_matches={}, bob_matches={}",
             alice_order.owner, bob_order.owner, order_owner, alice_owner_matches, bob_owner_matches
         );
 
         if !(alice_owner_matches || bob_owner_matches) {
-            info!(
+            debug!(
+                target: "hedge",
                 "ClearV3 event filtered (no owner match): tx_hash={:?}, log_index={}, alice.owner={:?}, bob.owner={:?}, target={:?}",
                 log.transaction_hash,
                 log.log_index.unwrap_or(0),
@@ -99,6 +101,7 @@ impl OnchainTrade {
 
         if let Ok(Some(ref trade)) = result {
             info!(
+                target: "hedge",
                 "ClearV3 trade created successfully: tx_hash={tx_hash:?}, log_index={log_index}, symbol={symbol}, amount={amount}, direction={direction:?}",
                 tx_hash = trade.tx_hash,
                 log_index = trade.log_index,
@@ -183,6 +186,7 @@ async fn fetch_after_clear_event(
         // Found it - decode and return
         let decoded = receipt_log.log_decode::<AfterClearV2>()?;
         debug!(
+            target: "hedge",
             block_number,
             %tx_hash,
             clear_log_index,

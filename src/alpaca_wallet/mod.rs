@@ -224,6 +224,7 @@ impl AlpacaWalletService {
                 .await
                 .inspect_err(|err| {
                     error!(
+                        target: "wallet",
                         whitelist_id = %entry.id,
                         address = %entry.address,
                         ?err,

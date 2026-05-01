@@ -6,7 +6,7 @@ use sqlx::SqlitePool;
 use std::sync::Arc;
 use task_supervisor::SupervisorBuilder;
 use tokio::task::JoinHandle;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use st0x_event_sorcery::{Projection, Store};
 use st0x_evm::ReadOnlyEvm;
@@ -210,6 +210,6 @@ fn log_optional_task_status(task_name: &str, is_configured: bool) {
     if is_configured {
         info!("Started {task_name} task");
     } else {
-        info!("{task_name} not configured", task_name = task_name);
+        debug!("{task_name} not configured", task_name = task_name);
     }
 }

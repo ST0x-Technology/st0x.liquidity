@@ -173,7 +173,7 @@ impl<W: Wallet> AlpacaTokenizationService<W> {
             return Err(MintVerificationError::TransactionReverted { tx_hash });
         }
 
-        info!(%tx_hash, "Mint transaction receipt verified (status: success)");
+        info!(target: "tokenization", %tx_hash, "Mint transaction receipt verified (status: success)");
 
         // Sum all Transfer events from the token contract to the expected wallet.
         let total_transferred: U256 = receipt
@@ -207,6 +207,7 @@ impl<W: Wallet> AlpacaTokenizationService<W> {
         }
 
         info!(
+            target: "tokenization",
             %tx_hash,
             %total_transferred,
             %expected_amount,
@@ -493,6 +494,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         );
 
         debug!(
+            target: "tokenization",
             url = %url,
             symbol = %request.underlying_symbol,
             quantity = %request.quantity,
@@ -516,6 +518,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
             let tokenization_request: TokenizationRequest = serde_json::from_str(&body)
                 .inspect_err(|error| {
                     error!(
+                        target: "tokenization",
                         body_len = body.len(),
                         error = %error,
                         symbol = %request.underlying_symbol,
@@ -524,12 +527,12 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
                     );
                 })?;
 
-            debug!(request_id = %tokenization_request.id.0, "Mint request created");
+            info!(target: "tokenization", request_id = %tokenization_request.id.0, "Mint request created");
             return Ok(tokenization_request);
         }
 
         let message = response.text().await?;
-        warn!(status = %status, message = %message, "Tokenization request failed");
+        warn!(target: "tokenization", status = %status, message = %message, "Tokenization request failed");
         Err(map_mint_error(status, message, request.underlying_symbol))
     }
 
@@ -545,12 +548,14 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
     ) -> Result<Vec<TokenizationRequest>, AlpacaTokenizationError> {
         let body = self.fetch_requests_body(&params).await?;
         trace!(
+            target: "tokenization",
             body_len = body.len(),
             "List requests response body received"
         );
 
         let requests = parse_request_list(&body).inspect_err(|error| {
             error!(
+                target: "tokenization",
                 body_len = body.len(),
                 error = %error,
                 request_type = ?params.request_type,
@@ -560,7 +565,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
             );
         })?;
 
-        debug!(count = requests.len(), "Listed tokenization requests");
+        debug!(target: "tokenization", count = requests.len(), "Listed tokenization requests");
 
         Ok(requests)
     }
@@ -593,6 +598,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         })
         .inspect_err(|error| {
             error!(
+                target: "tokenization",
                 body_len = body.len(),
                 error = %error,
                 request_id = %id.0,
@@ -674,6 +680,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         })
         .inspect_err(|error| {
             error!(
+                target: "tokenization",
                 body_len = body.len(),
                 error = %error,
                 tx_hash = %expected_tx_hash,
@@ -713,9 +720,22 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
 
             match request.status {
                 TokenizationRequestStatus::Completed | TokenizationRequestStatus::Rejected => {
+                    info!(
+                        target: "tokenization",
+                        request_id = %id.0,
+                        status = %request.status,
+                        "Tokenization request reached terminal state"
+                    );
                     return Ok(request);
                 }
-                TokenizationRequestStatus::Pending => {}
+                TokenizationRequestStatus::Pending => {
+                    trace!(
+                        target: "tokenization",
+                        request_id = %id.0,
+                        elapsed = ?start.elapsed(),
+                        "Tokenization request still pending"
+                    );
+                }
             }
         }
     }
@@ -808,6 +828,7 @@ fn parse_request_list(body: &str) -> Result<Vec<TokenizationRequest>, serde_json
             Ok(parsed_request) => parsed_requests.push(parsed_request),
             Err(error) => {
                 warn!(
+                    target: "tokenization",
                     request_id,
                     error = %error,
                     "Skipping malformed tokenization request entry"

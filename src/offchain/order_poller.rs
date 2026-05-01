@@ -5,7 +5,7 @@ use rand::Rng;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{Interval, interval};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use st0x_event_sorcery::{Column, Projection, ProjectionError, SendError, Store};
 use st0x_execution::{
@@ -90,6 +90,7 @@ impl<E: Executor> OrderStatusPoller<E> {
 
     pub async fn run(mut self) -> Result<(), OrderPollingError> {
         info!(
+            target: "broker",
             polling_interval = ?self.ctx.polling_interval,
             "Starting order status poller..."
         );
@@ -98,14 +99,14 @@ impl<E: Executor> OrderStatusPoller<E> {
             self.interval.tick().await;
 
             if let Err(error) = self.poll_pending_orders().await {
-                error!("Order polling failed: {error}");
+                warn!(target: "broker", %error, "Order polling failed");
             }
         }
     }
 
-    #[tracing::instrument(skip(self), level = tracing::Level::DEBUG)]
+    #[tracing::instrument(skip(self), target = "broker", level = tracing::Level::DEBUG)]
     pub(crate) async fn poll_pending_orders(&self) -> Result<(), OrderPollingError> {
-        trace!("Starting polling cycle for submitted orders");
+        trace!(target: "broker", "Starting polling cycle for submitted orders");
 
         let executor_type = self.executor.to_supported_executor();
         let submitted_executions: Vec<_> = self
@@ -117,21 +118,22 @@ impl<E: Executor> OrderStatusPoller<E> {
             .collect();
 
         if submitted_executions.is_empty() {
-            trace!("No submitted orders to poll");
+            trace!(target: "broker", "No submitted orders to poll");
             return Ok(());
         }
 
-        info!("Polling {} submitted orders", submitted_executions.len());
+        debug!(target: "broker", "Polling {} submitted orders", submitted_executions.len());
 
         for (offchain_order_id, order) in &submitted_executions {
             if let Err(error) = self.poll_execution_status(*offchain_order_id, order).await {
-                error!("Failed to poll execution {offchain_order_id}: {error}");
+                let symbol = order.symbol();
+                warn!(target: "broker", %offchain_order_id, %symbol, %error, "Failed to poll execution status");
             }
 
             self.add_jittered_delay().await;
         }
 
-        debug!("Completed polling cycle");
+        debug!(target: "broker", "Completed polling cycle");
         Ok(())
     }
 
@@ -144,6 +146,7 @@ impl<E: Executor> OrderStatusPoller<E> {
 
         let Some(executor_order_id) = order.executor_order_id() else {
             warn!(
+                target: "broker",
                 %offchain_order_id,
                 %symbol,
                 "Missing executor_order_id for submitted execution"
@@ -186,6 +189,7 @@ impl<E: Executor> OrderStatusPoller<E> {
             }
             OrderState::Pending | OrderState::Submitted { .. } => {
                 trace!(
+                    target: "broker",
                     %offchain_order_id,
                     %symbol,
                     "Polling order..."
@@ -206,6 +210,7 @@ impl<E: Executor> OrderStatusPoller<E> {
         let symbol = order.symbol();
 
         info!(
+            target: "broker",
             %offchain_order_id,
             %price,
             %symbol,
@@ -273,6 +278,7 @@ impl<E: Executor> OrderStatusPoller<E> {
         let symbol = order.symbol();
 
         info!(
+            target: "broker",
             %offchain_order_id,
             %symbol,
             "Order failed, executing CQRS commands"

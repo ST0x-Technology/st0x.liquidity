@@ -16,7 +16,7 @@ use std::marker::PhantomData;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::time::{Duration, sleep};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::EventSourced;
 use crate::dependency::{Cons, Dependent, EntityList, Nil};
@@ -195,6 +195,8 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
     {
         let (pool, table) = self.sqlite_backing()?;
 
+        trace!(target: "cqrs", %table, "Loading all views");
+
         let query = format!(
             "SELECT view_id, payload FROM {table}
              ORDER BY view_id ASC"
@@ -228,6 +230,9 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
         <Entity::Id as FromStr>::Err: Debug,
     {
         let (pool, table) = self.sqlite_backing()?;
+
+        trace!(target: "cqrs", %table, column = %column, "Filtering views by column");
+
         validate_column(pool, table, &column).await?;
 
         let column_name = column.0;
@@ -274,6 +279,11 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
         .fetch_all(pool)
         .await?;
 
+        if stale_aggregates.is_empty() {
+            debug!(target: "cqrs", %aggregate_type, "All views up to date, nothing to replay");
+            return Ok(());
+        }
+
         for (aggregate_id, view_version, max_seq) in &stale_aggregates {
             let view_version = view_version.unwrap_or(0);
 
@@ -303,7 +313,7 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
         let (pool, table) = self.sqlite_backing()?;
         let view_id = id.to_string();
 
-        info!(%view_id, %table, "Rebuilding view from event history");
+        info!(target: "cqrs", %view_id, %table, "Rebuilding view from event history");
 
         sqlx::query(&format!("DELETE FROM {table} WHERE view_id = ?1"))
             .bind(&view_id)
@@ -321,7 +331,7 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
     {
         let (pool, table) = self.sqlite_backing()?;
 
-        info!(%table, "Rebuilding all views from event history");
+        info!(target: "cqrs", %table, "Rebuilding all views from event history");
 
         sqlx::query(&format!("DELETE FROM {table}"))
             .execute(pool)
@@ -330,6 +340,7 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
         self.catch_up().await
     }
 
+    #[allow(clippy::cognitive_complexity)]
     async fn replay_missed_events(
         &self,
         pool: &SqlitePool,
@@ -342,6 +353,7 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
         let behind = max_seq - view_version;
 
         info!(
+            target: "cqrs",
             %view_id, %view_version, %max_seq, %behind, %aggregate_type,
             "View is behind, replaying missed events"
         );
@@ -368,6 +380,12 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
         let actual = missed_payloads.len();
         // behind is always positive (SQL WHERE max_seq > version), safe to compare
         if !usize::try_from(behind).is_ok_and(|expected| actual == expected) {
+            error!(
+                target: "cqrs",
+                %view_id, %view_version, expected = %behind, %actual,
+                "Event sequence gap detected"
+            );
+
             return Err(ProjectionError::EventSequenceGap {
                 aggregate_id: view_id.to_string(),
                 view_version,
@@ -408,7 +426,7 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
         .execute(pool)
         .await?;
 
-        info!(%view_id, %behind, "View caught up successfully");
+        info!(target: "cqrs", %view_id, %behind, "View caught up successfully");
 
         Ok(())
     }
@@ -433,7 +451,7 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
                 let id: Entity::Id = match view_id.parse() {
                     Ok(id) => id,
                     Err(error) => {
-                        warn!(view_id, ?error, "Failed to parse view ID");
+                        warn!(target: "cqrs", view_id, ?error, "Failed to parse view ID");
                         return None;
                     }
                 };
@@ -441,7 +459,7 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
                 let lifecycle: Lifecycle<Entity> = match serde_json::from_str(&payload) {
                     Ok(lifecycle) => lifecycle,
                     Err(error) => {
-                        warn!(%id, ?error, "Failed to deserialize view payload");
+                        warn!(target: "cqrs", %id, ?error, "Failed to deserialize view payload");
                         return None;
                     }
                 };
@@ -449,7 +467,7 @@ impl<Entity: EventSourced<Materialized = Table>> Projection<Entity> {
                 if let Lifecycle::Live(entity) = lifecycle {
                     Some((id, entity))
                 } else {
-                    warn!(%id, "Skipping non-live aggregate in view");
+                    warn!(target: "cqrs", %id, "Skipping non-live aggregate in view");
                     None
                 }
             })
@@ -487,6 +505,8 @@ where
     /// entity doesn't exist or hasn't been initialized yet.
     pub async fn load(&self, id: &Entity::Id) -> Result<Option<Entity>, ProjectionError<Entity>> {
         let view_id = id.to_string();
+
+        trace!(target: "cqrs", %view_id, "Loading view");
 
         match self.repo.load(&view_id).await {
             Ok(Some(lifecycle)) => Ok(lifecycle.into_result()?),
@@ -546,7 +566,7 @@ where
                 Ok(Some(pair)) => pair,
                 Ok(None) => (Lifecycle::default(), ViewContext::new(view_id.clone(), 0)),
                 Err(error) => {
-                    warn!(%view_id, ?error, "Failed to load view for update");
+                    warn!(target: "cqrs", %view_id, ?error, "Failed to load view for update");
                     return Ok(());
                 }
             };
@@ -558,6 +578,7 @@ where
                 Err(PersistenceError::OptimisticLockError) if attempt < max_retries => {
                     let delay_ms = (base_delay_ms * 2u64.pow(attempt)).min(max_delay_ms);
                     warn!(
+                        target: "cqrs",
                         %view_id, attempt = attempt + 1, max_retries, delay_ms,
                         "Optimistic lock conflict, retrying view update"
                     );
@@ -565,13 +586,14 @@ where
                 }
                 Err(PersistenceError::OptimisticLockError) => {
                     error!(
+                        target: "cqrs",
                         %view_id, max_retries,
                         "View update lost: optimistic lock conflict persisted after all retries"
                     );
                     return Ok(());
                 }
                 Err(error) => {
-                    warn!(%view_id, ?error, "Failed to save view update");
+                    warn!(target: "cqrs", %view_id, ?error, "Failed to save view update");
                     return Ok(());
                 }
             }
@@ -597,6 +619,12 @@ async fn validate_column<Entity: EventSourced>(
             .await?;
 
     if !columns.iter().any(|(name,)| name == column_name) {
+        warn!(
+            target: "cqrs",
+            %column_name, %table,
+            "Column does not exist in table schema"
+        );
+
         return Err(ProjectionError::ColumnNotFound {
             column: column.clone(),
             table: table.to_string(),
@@ -616,6 +644,12 @@ async fn validate_column<Entity: EventSourced>(
         .await?;
 
         if non_null_count.0 == 0 {
+            warn!(
+                target: "cqrs",
+                %column_name, %table, row_count = %row_count.0,
+                "Generated column has all NULL values, likely stale JSON path"
+            );
+
             return Err(ProjectionError::StaleColumn {
                 column: column.clone(),
                 table: table.to_string(),

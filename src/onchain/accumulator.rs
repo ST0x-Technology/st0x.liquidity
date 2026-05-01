@@ -1,4 +1,4 @@
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use st0x_event_sorcery::Projection;
 use st0x_execution::{Direction, Executor, FractionalShares, Positive, SupportedExecutor, Symbol};
@@ -35,7 +35,7 @@ pub(crate) async fn check_execution_readiness<E: Executor>(
     }
 
     let Some(position) = position_projection.load(symbol).await? else {
-        debug!(%symbol, "Position aggregate not found, skipping");
+        debug!(target: "hedge", %symbol, "Position aggregate not found, skipping");
         return Ok(None);
     };
 
@@ -47,7 +47,7 @@ pub(crate) async fn check_execution_readiness<E: Executor>(
         .or(assets.equities.operational_limit);
 
     let Some((direction, shares)) = position.is_ready_for_execution(shares_limit)? else {
-        debug!(%symbol, net = %position.net, "Position not ready for execution");
+        debug!(target: "hedge", %symbol, net = %position.net, "Position not ready for execution");
         return Ok(None);
     };
 
@@ -56,7 +56,7 @@ pub(crate) async fn check_execution_readiness<E: Executor>(
     }
 
     let shares = Positive::new(shares)?;
-    info!(%symbol, %shares, ?direction, "Position ready for execution");
+    info!(target: "hedge", %symbol, %shares, ?direction, "Position ready for execution");
 
     Ok(Some(ExecutionCtx {
         symbol: symbol.clone(),
@@ -68,7 +68,7 @@ pub(crate) async fn check_execution_readiness<E: Executor>(
 
 fn check_asset_enabled(asset_enabled: bool, symbol: &Symbol) -> bool {
     if !asset_enabled {
-        warn!(%symbol, "asset disabled, skipping execution readiness check");
+        debug!(target: "hedge", %symbol, "asset disabled, skipping execution readiness check");
     }
 
     asset_enabled
@@ -84,7 +84,7 @@ async fn check_market_open<E: Executor>(
         .map_err(|e| OnChainError::MarketHoursCheck(Box::new(e)))?;
 
     if !is_open {
-        debug!(symbol = %symbol, "Market closed, deferring execution");
+        debug!(target: "hedge", symbol = %symbol, "Market closed, deferring execution");
     }
 
     Ok(is_open)
@@ -96,7 +96,7 @@ async fn check_market_open<E: Executor>(
 /// against its configured threshold. Skips disabled assets.
 /// Returns execution parameters for positions that are ready.
 #[cfg(test)]
-#[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
+#[tracing::instrument(target = "hedge", skip_all, level = tracing::Level::DEBUG)]
 pub(crate) async fn check_all_positions<E: Executor>(
     executor: &E,
     position_projection: &Projection<Position>,
@@ -110,7 +110,7 @@ pub(crate) async fn check_all_positions<E: Executor>(
 
     for (symbol, position) in &all_positions {
         if !is_trading_enabled(symbol) {
-            debug!(symbol = %symbol, "Asset disabled, skipping periodic check");
+            debug!(target: "hedge", symbol = %symbol, "Asset disabled, skipping periodic check");
             continue;
         }
 
@@ -129,6 +129,7 @@ pub(crate) async fn check_all_positions<E: Executor>(
             let shares = Positive::new(shares)?;
 
             info!(
+                target: "hedge",
                 symbol = %symbol,
                 shares = %shares,
                 direction = ?direction,
@@ -145,9 +146,9 @@ pub(crate) async fn check_all_positions<E: Executor>(
     }
 
     if ready.is_empty() {
-        debug!("No positions ready for execution");
+        debug!(target: "hedge", "No positions ready for execution");
     } else {
-        info!("Found {} positions ready for execution", ready.len());
+        info!(target: "hedge", count = ready.len(), "Positions ready for execution");
     }
 
     Ok(ready)

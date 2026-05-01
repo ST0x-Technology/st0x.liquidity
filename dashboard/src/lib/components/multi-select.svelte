@@ -39,9 +39,11 @@
   const activeCount = $derived(selected.size)
 
   const summary = $derived(
-    activeCount === 0 || activeCount === options.length
+    activeCount === options.length
       ? label
-      : `${label} (${String(activeCount)})`
+      : activeCount === 0
+        ? `${label} (none)`
+        : `${label} (${String(activeCount)})`
   )
 </script>
 

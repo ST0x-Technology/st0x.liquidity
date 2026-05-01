@@ -11,7 +11,7 @@ use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::debug;
 
 use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::ReadOnlyEvm;
@@ -109,7 +109,8 @@ where
         };
 
         let Some(trade) = onchain_trade else {
-            info!(
+            debug!(
+                target: "hedge",
                 event_type = trade_event.event.kind(),
                 tx_hash = ?trade_event.tx_hash,
                 log_index = trade_event.log_index,
@@ -126,6 +127,7 @@ where
         };
 
         debug!(
+            target: "hedge",
             tx_hash = ?trade_event.tx_hash,
             log_index = trade_event.log_index,
             symbol = %trade.symbol,

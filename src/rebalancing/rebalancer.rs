@@ -55,23 +55,24 @@ impl Rebalancer {
     /// Runs the rebalancer loop, receiving and executing operations.
     /// Returns when the sender channel is closed.
     pub(crate) async fn run(mut self) {
-        info!("Rebalancer started");
+        info!(target: "rebalance", "Rebalancer started");
 
         while let Some(operation) = self.receiver.recv().await {
             self.execute(operation).await;
         }
 
-        info!("Rebalancer stopped (channel closed)");
+        info!(target: "rebalance", "Rebalancer stopped (channel closed)");
     }
 
     async fn execute(&self, operation: TriggeredOperation) {
         match operation {
             TriggeredOperation::Mint { symbol, quantity } => {
+                let log_symbol = symbol.clone();
                 self.equity_to_mm
                     .transfer(Equity { symbol, quantity })
                     .await
                     .inspect_err(|error| {
-                        error!(?error, "Equity transfer to market-making venue failed");
+                        error!(target: "rebalance", ?error, symbol = %log_symbol, %quantity, "Equity transfer to market-making venue failed");
                     })
                     .ok();
             }
@@ -79,11 +80,12 @@ impl Rebalancer {
             TriggeredOperation::Redemption {
                 symbol, quantity, ..
             } => {
+                let log_symbol = symbol.clone();
                 self.equity_to_hedging
                     .transfer(Equity { symbol, quantity })
                     .await
                     .inspect_err(|error| {
-                        error!(?error, "Equity transfer to hedging venue failed");
+                        error!(target: "rebalance", ?error, symbol = %log_symbol, %quantity, "Equity transfer to hedging venue failed");
                     })
                     .ok();
             }
@@ -93,7 +95,7 @@ impl Rebalancer {
                     .transfer(amount)
                     .await
                     .inspect_err(|error| {
-                        error!(?error, "USDC transfer to market-making venue failed");
+                        error!(target: "rebalance", ?error, %amount, "USDC transfer to market-making venue failed");
                     })
                     .ok();
             }
@@ -103,7 +105,7 @@ impl Rebalancer {
                     .transfer(amount)
                     .await
                     .inspect_err(|error| {
-                        error!(?error, "USDC transfer to hedging venue failed");
+                        error!(target: "rebalance", ?error, %amount, "USDC transfer to hedging venue failed");
                     })
                     .ok();
             }

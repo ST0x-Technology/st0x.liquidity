@@ -151,7 +151,7 @@ where
         let vault_registry = self.load_vault_registry().await?;
 
         let Some(registry) = vault_registry else {
-            debug!("Vault registry not initialized, skipping onchain polling");
+            debug!(target: "inventory", "Vault registry not initialized, skipping onchain polling");
             return Ok(());
         };
 
@@ -178,7 +178,7 @@ where
         registry: &VaultRegistry,
     ) -> Result<(), InventoryPollingError<Exe::Error>> {
         if registry.equity_vaults.is_empty() {
-            debug!("No equity vaults discovered, skipping onchain equity polling");
+            debug!(target: "inventory", "No equity vaults discovered, skipping onchain equity polling");
             return Ok(());
         }
 
@@ -227,7 +227,7 @@ where
         registry: &VaultRegistry,
     ) -> Result<(), InventoryPollingError<Exe::Error>> {
         let Some(usdc_vault) = &registry.usdc_vault else {
-            debug!("No USDC vault discovered, skipping onchain cash polling");
+            debug!(target: "inventory", "No USDC vault discovered, skipping onchain cash polling");
             return Ok(());
         };
 
@@ -254,7 +254,7 @@ where
         snapshot_id: &InventorySnapshotId,
     ) -> Result<(), InventoryPollingError<Exe::Error>> {
         let Some(wallets) = &self.wallet_polling else {
-            debug!("No wallet polling configured, skipping wallet balance polling");
+            debug!(target: "inventory", "No wallet polling configured, skipping wallet balance polling");
             return Ok(());
         };
 
@@ -392,7 +392,7 @@ where
             .map_err(InventoryPollingError::Executor)?;
 
         let InventoryResult::Fetched(inventory) = inventory_result else {
-            debug!("Executor returned non-fetched inventory result, skipping offchain polling");
+            debug!(target: "inventory", "Executor returned non-fetched inventory result, skipping offchain polling");
             return Ok(());
         };
 
@@ -442,6 +442,7 @@ where
                 Some(TokenizationRequestType::Redeem) => &mut redemptions,
                 None => {
                     warn!(
+                        target: "inventory",
                         request_id = %request.id.0,
                         symbol = %request.underlying_symbol,
                         "Pending tokenization request has no type, skipping"
@@ -464,6 +465,7 @@ where
         match request.wallet {
             Some(wallet) if wallet != self.order_owner => {
                 warn!(
+                    target: "inventory",
                     request_id = %request.id.0,
                     ?wallet,
                     expected = ?self.order_owner,
@@ -480,7 +482,7 @@ where
         snapshot_id: &InventorySnapshotId,
     ) -> Result<(), InventoryPollingError<Exe::Error>> {
         let Some(tokenizer) = &self.tokenizer else {
-            debug!("No tokenizer configured, skipping inflight equity polling");
+            debug!(target: "inventory", "No tokenizer configured, skipping inflight equity polling");
             return Ok(());
         };
 
@@ -492,6 +494,7 @@ where
         )?;
 
         debug!(
+            target: "inventory",
             mint_symbols = mints.len(),
             redemption_symbols = redemptions.len(),
             "Polled inflight equity from tokenization provider"

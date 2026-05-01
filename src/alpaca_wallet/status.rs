@@ -41,6 +41,8 @@ pub(super) async fn poll_transfer_status(
     transfer_id: &AlpacaTransferId,
     config: &PollingConfig,
 ) -> Result<Transfer, AlpacaWalletError> {
+    info!(target: "wallet", %transfer_id, timeout = ?config.timeout, "Polling transfer status");
+
     let start = Instant::now();
     let mut last_status = None;
 
@@ -124,7 +126,7 @@ fn validate_and_log_status_change(
 ) -> Result<(), AlpacaWalletError> {
     let Some(prev_status) = last_status else {
         let status = transfer.status;
-        info!("Transfer {transfer_id} initial status: {status:?}");
+        info!(target: "wallet", %transfer_id, ?status, "Transfer initial status");
         return Ok(());
     };
 
@@ -139,7 +141,7 @@ fn validate_and_log_status_change(
 
     if transition.changed {
         let new_status = transition.new_status;
-        info!("Transfer {transfer_id} status: {prev_status:?} -> {new_status:?}");
+        info!(target: "wallet", %transfer_id, from = ?prev_status, to = ?new_status, "Transfer status changed");
     }
 
     Ok(())
@@ -147,9 +149,12 @@ fn validate_and_log_status_change(
 
 fn log_transfer_final_status(transfer_id: AlpacaTransferId, status: TransferStatus) {
     match status {
-        TransferStatus::Complete => info!("Transfer {transfer_id} completed successfully"),
-        TransferStatus::Failed => info!("Transfer {transfer_id} failed"),
+        TransferStatus::Complete => {
+            info!(target: "wallet", %transfer_id, "Transfer completed successfully");
+        }
+        TransferStatus::Failed => warn!(target: "wallet", %transfer_id, "Transfer failed"),
         _ => warn!(
+            target: "wallet",
             transfer_id = %transfer_id,
             status = ?status,
             "Unexpected non-final transfer status in log_transfer_final_status"
@@ -165,6 +170,8 @@ pub(super) async fn poll_deposit_by_tx_hash(
     tx_hash: &TxHash,
     config: &PollingConfig,
 ) -> Result<Transfer, AlpacaWalletError> {
+    info!(target: "wallet", %tx_hash, timeout = ?config.timeout, "Polling deposit status");
+
     let start = Instant::now();
     let mut last_status: Option<TransferStatus> = None;
 
@@ -185,7 +192,7 @@ pub(super) async fn poll_deposit_by_tx_hash(
                 .await?;
 
         let Some(transfer) = maybe_transfer else {
-            info!(%tx_hash, "Deposit not yet detected, polling...");
+            info!(target: "wallet", %tx_hash, "Deposit not yet detected, polling...");
             sleep(config.interval).await;
             continue;
         };
@@ -226,7 +233,7 @@ fn validate_and_log_deposit_status_change(
 ) -> Result<(), AlpacaWalletError> {
     let Some(prev_status) = last_status else {
         let status = transfer.status;
-        info!(%tx_hash, "Deposit detected with status: {status:?}");
+        info!(target: "wallet", %tx_hash, ?status, "Deposit detected");
         return Ok(());
     };
 
@@ -241,7 +248,7 @@ fn validate_and_log_deposit_status_change(
 
     if transition.changed {
         let new_status = transition.new_status;
-        info!(%tx_hash, "Deposit status: {prev_status:?} -> {new_status:?}");
+        info!(target: "wallet", %tx_hash, from = ?prev_status, to = ?new_status, "Deposit status changed");
     }
 
     Ok(())
@@ -249,9 +256,12 @@ fn validate_and_log_deposit_status_change(
 
 fn log_deposit_final_status(tx_hash: &TxHash, status: TransferStatus) {
     match status {
-        TransferStatus::Complete => info!(%tx_hash, "Deposit completed successfully"),
-        TransferStatus::Failed => info!(%tx_hash, "Deposit failed"),
+        TransferStatus::Complete => {
+            info!(target: "wallet", %tx_hash, "Deposit completed successfully");
+        }
+        TransferStatus::Failed => warn!(target: "wallet", %tx_hash, "Deposit failed"),
         _ => warn!(
+            target: "wallet",
             %tx_hash,
             ?status,
             "Unexpected non-final deposit status in log_deposit_final_status"

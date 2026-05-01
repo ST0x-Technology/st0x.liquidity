@@ -857,12 +857,12 @@ impl EventSourced for EquityRedemption {
                 let vault_id = match services.raindex.lookup_vault_id(token).await {
                     Ok(id) => id,
                     Err(error) => {
-                        warn!(%error, %token, "Raindex vault lookup failed");
+                        warn!(target: "rebalance", %error, %token, "Raindex vault lookup failed");
                         return Err(EquityRedemptionError::RaindexVaultNotFound(token));
                     }
                 };
 
-                info!(?vault_id, %token, %amount, "Withdrawing tokens from Raindex vault");
+                info!(target: "rebalance", ?vault_id, %token, %amount, "Withdrawing tokens from Raindex vault");
 
                 let raindex_withdraw_tx = match services
                     .raindex
@@ -871,7 +871,7 @@ impl EventSourced for EquityRedemption {
                 {
                     Ok(tx) => tx,
                     Err(error) => {
-                        warn!(%error, %token, %amount, "Raindex vault withdrawal failed");
+                        warn!(target: "rebalance", %error, %token, %amount, "Raindex vault withdrawal failed");
                         return Err(EquityRedemptionError::RaindexWithdrawFailed {
                             token,
                             amount,
@@ -923,7 +923,7 @@ impl EventSourced for EquityRedemption {
                         .wrapper
                         .lookup_underlying(symbol)
                         .inspect_err(|error| {
-                            warn!(%error, %symbol, "Underlying token lookup failed");
+                            warn!(target: "rebalance", %error, %symbol, "Underlying token lookup failed");
                         })
                         .map_err(|error| EquityRedemptionError::UnderlyingLookupFailed {
                             symbol: symbol.clone(),
@@ -936,7 +936,7 @@ impl EventSourced for EquityRedemption {
                         .to_underlying(*token, *wrapped_amount, owner, owner)
                         .await
                         .inspect_err(|error| {
-                            warn!(%error, %token, "Token unwrap failed");
+                            warn!(target: "rebalance", %error, %token, "Token unwrap failed");
                         })
                         .map_err(|error| EquityRedemptionError::UnwrapFailed {
                             token: *token,
@@ -958,6 +958,7 @@ impl EventSourced for EquityRedemption {
 
             SendTokens => match self {
                 Self::TokensUnwrapped {
+                    symbol,
                     underlying_token,
                     unwrapped_amount,
                     ..
@@ -968,14 +969,14 @@ impl EventSourced for EquityRedemption {
                     let Some(redemption_wallet) =
                         Tokenizer::redemption_wallet(services.tokenizer.as_ref())
                     else {
-                        warn!("Redemption wallet not configured");
+                        warn!(target: "rebalance", %symbol, "Redemption wallet not configured");
                         return Ok(vec![TransferFailed {
                             tx_hash: None,
                             failed_at: Utc::now(),
                         }]);
                     };
 
-                    info!(%token, %amount, "Sending unwrapped tokens for redemption");
+                    info!(target: "rebalance", %token, %amount, "Sending unwrapped tokens for redemption");
 
                     match Tokenizer::send_for_redemption(services.tokenizer.as_ref(), token, amount)
                         .await
@@ -986,7 +987,7 @@ impl EventSourced for EquityRedemption {
                             sent_at: Utc::now(),
                         }]),
                         Err(error) => {
-                            warn!(%error, %token, %amount, "Send for redemption failed");
+                            warn!(target: "rebalance", %error, %token, %amount, "Send for redemption failed");
                             Ok(vec![TransferFailed {
                                 tx_hash: None,
                                 failed_at: Utc::now(),
@@ -1108,7 +1109,7 @@ pub(crate) async fn symbols_with_stuck_redemptions(
         match *entry + quantity {
             Ok(sum) => *entry = sum,
             Err(error) => {
-                warn!(
+                warn!(target: "rebalance",
                     %error,
                     %aggregate_id,
                     "Float overflow summing stuck redemption quantities, \
@@ -1172,13 +1173,13 @@ pub(crate) async fn symbols_with_active_transfers(
         .into_iter()
         .filter_map(|(raw_symbol,)| {
             let value = raw_symbol.or_else(|| {
-                warn!("Active transfer has NULL symbol in payload, skipping");
+                warn!(target: "rebalance", "Active transfer has NULL symbol in payload, skipping");
                 None
             })?;
 
             Symbol::new(&value)
                 .inspect_err(|error| {
-                    warn!(%error, raw_symbol = %value, "Active transfer has invalid symbol, skipping");
+                    warn!(target: "rebalance", %error, raw_symbol = %value, "Active transfer has invalid symbol, skipping");
                 })
                 .ok()
         })
@@ -1219,7 +1220,7 @@ pub(crate) async fn interrupted_redemption_ids(
 
 fn parse_stuck_symbol(aggregate_id: &str, raw: Option<String>) -> Option<Symbol> {
     let value = raw.or_else(|| {
-        warn!(
+        warn!(target: "rebalance",
             %aggregate_id,
             "Stuck redemption has NULL symbol in \
              WithdrawnFromRaindex payload, skipping"
@@ -1229,7 +1230,7 @@ fn parse_stuck_symbol(aggregate_id: &str, raw: Option<String>) -> Option<Symbol>
 
     Symbol::new(&value)
         .inspect_err(|error| {
-            warn!(
+            warn!(target: "rebalance",
                 %error,
                 %aggregate_id,
                 raw_symbol = %value,
@@ -1241,7 +1242,7 @@ fn parse_stuck_symbol(aggregate_id: &str, raw: Option<String>) -> Option<Symbol>
 
 fn parse_stuck_quantity(aggregate_id: &str, raw: Option<String>) -> Option<FractionalShares> {
     let value = raw.or_else(|| {
-        warn!(
+        warn!(target: "rebalance",
             %aggregate_id,
             "Stuck redemption has NULL quantity in \
              WithdrawnFromRaindex payload, skipping"
@@ -1251,7 +1252,7 @@ fn parse_stuck_quantity(aggregate_id: &str, raw: Option<String>) -> Option<Fract
 
     Float::parse(value.clone())
         .inspect_err(|error| {
-            warn!(
+            warn!(target: "rebalance",
                 %error,
                 %aggregate_id,
                 raw_quantity = %value,

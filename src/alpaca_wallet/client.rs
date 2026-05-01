@@ -91,7 +91,7 @@ impl AlpacaWalletClient {
 
     pub(super) async fn get(&self, path: &str) -> Result<Response, AlpacaWalletError> {
         let url = format!("{}{}", self.base_url, path);
-        trace!("GET {url}");
+        trace!(target: "wallet", "GET {url}");
 
         let response = self
             .client
@@ -121,6 +121,7 @@ impl AlpacaWalletClient {
         body: &T,
     ) -> Result<Response, AlpacaWalletError> {
         let url = format!("{}{}", self.base_url, path);
+        trace!(target: "wallet", "POST {url}");
 
         // Alpaca API requires both Basic auth AND APCA headers for authentication
         let response = self
@@ -148,7 +149,7 @@ impl AlpacaWalletClient {
 
     pub(super) async fn delete(&self, path: &str) -> Result<Response, AlpacaWalletError> {
         let url = format!("{}{}", self.base_url, path);
-        trace!("DELETE {url}");
+        trace!(target: "wallet", "DELETE {url}");
 
         let response = self
             .client
@@ -178,7 +179,7 @@ impl AlpacaWalletClient {
         body: &T,
     ) -> Result<Response, AlpacaWalletError> {
         let url = format!("{}{}", self.base_url, path);
-        trace!("PATCH {url}");
+        trace!(target: "wallet", "PATCH {url}");
 
         let response = self
             .client
@@ -270,6 +271,7 @@ impl AlpacaWalletClient {
         let text = response.text().await?;
 
         trace!(
+            target: "wallet",
             response_bytes = text.len(),
             "Whitelist creation response received"
         );

@@ -146,7 +146,7 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
             operation_receiver,
         );
 
-        info!("Rebalancing infrastructure initialized");
+        info!(target: "rebalance", "Rebalancing infrastructure initialized");
         tokio::spawn(async move {
             rebalancer.run().await;
         })

@@ -14,7 +14,7 @@ use rain_math_float::Float;
 use rain_math_float::FloatError;
 #[cfg(test)]
 use st0x_float_macro::float;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, warn};
 
 use crate::bindings::IPyth::{
     getEmaPriceNoOlderThanCall, getEmaPriceUnsafeCall, getPriceNoOlderThanCall, getPriceUnsafeCall,
@@ -168,10 +168,10 @@ pub async fn extract_pyth_price<P>(
 where
     P: Provider,
 {
-    debug!("Fetching trace for tx {tx_hash}");
+    debug!(target: "hedge", %tx_hash, "Fetching transaction trace");
     let trace = fetch_transaction_trace(tx_hash, provider).await?;
 
-    debug!("Parsing trace for Pyth oracle calls");
+    debug!(target: "hedge", "Parsing trace for Pyth oracle calls");
     let pyth_calls = find_pyth_calls(&trace)?;
 
     let (first_call, rest) = parse_non_empty_pyth_calls(&pyth_calls, tx_hash)?;
@@ -186,11 +186,11 @@ fn parse_non_empty_pyth_calls(
     tx_hash: TxHash,
 ) -> Result<(&PythCall, &[PythCall]), PythError> {
     let Some((first, rest)) = pyth_calls.split_first() else {
-        warn!("No Pyth call found in transaction {tx_hash}");
+        warn!(target: "hedge", %tx_hash, "No Pyth call found in transaction");
         return Err(PythError::NoPythCall);
     };
 
-    debug!("Found {} Pyth call(s) in trace", pyth_calls.len());
+    debug!(target: "hedge", count = pyth_calls.len(), "Found Pyth call(s) in trace");
     Ok((first, rest))
 }
 
@@ -218,26 +218,28 @@ fn find_call_by_cached_feed_id<'a>(
     symbol: &str,
     tx_hash: TxHash,
 ) -> Result<&'a PythCall, PythError> {
-    debug!("Found cached feed ID for {symbol}: {feed_id}");
+    debug!(target: "hedge", symbol, %feed_id, "Found cached feed ID");
 
     std::iter::once(first_call)
         .chain(rest.iter())
         .find(|call| call.price_feed_id == feed_id)
         .ok_or_else(|| {
             warn!(
-                "No Pyth call found matching cached feed ID {feed_id} \
-                 for {symbol} in transaction {tx_hash}"
+                target: "hedge",
+                symbol, %feed_id, %tx_hash,
+                "No Pyth call found matching cached feed ID"
             );
             PythError::NoMatchingFeedId(feed_id)
         })
 }
 
 async fn cache_new_feed_id(cache: &FeedIdCache, symbol: &str, call: &PythCall) {
-    debug!("No cached feed ID for {symbol}, using first Pyth call and caching");
+    debug!(target: "hedge", symbol, "No cached feed ID, using first Pyth call and caching");
     cache.insert(symbol.to_string(), call.price_feed_id).await;
-    info!(
-        "Cached new feed ID mapping: {symbol} -> {}",
-        call.price_feed_id
+    debug!(
+        target: "hedge",
+        symbol, feed_id = %call.price_feed_id,
+        "Cached new feed ID mapping"
     );
 }
 
@@ -247,18 +249,24 @@ fn extract_and_log_price(
     tx_hash: TxHash,
 ) -> Result<Price, PythError> {
     debug!(
+        target: "hedge",
         "Using Pyth call at depth {} with feed ID {} for price extraction",
         matching_call.depth, matching_call.price_feed_id
     );
 
     let price = decode_pyth_price(&matching_call.output).map_err(|error| {
-        error!("Failed to extract Pyth price from {tx_hash}: {error}");
+        warn!(target: "hedge", %tx_hash, symbol, %error, "Failed to extract Pyth price");
         error
     })?;
 
-    info!(
-        "Extracted Pyth price for {symbol} (feed {}): {} (expo: {}, conf: {})",
-        matching_call.price_feed_id, price.price, price.expo, price.conf
+    debug!(
+        target: "hedge",
+        symbol,
+        feed_id = %matching_call.price_feed_id,
+        price = %price.price,
+        expo = price.expo,
+        conf = %price.conf,
+        "Extracted Pyth price"
     );
 
     Ok(price)

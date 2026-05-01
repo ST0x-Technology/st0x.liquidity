@@ -45,7 +45,7 @@ use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::str::FromStr;
-use tracing::warn;
+use tracing::{info, warn};
 
 use st0x_dto::{EquityMintOperation, EquityMintStatus, TransferOperation};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
@@ -1224,6 +1224,14 @@ impl EventSourced for TokenizedEquityMint {
             return Err(TokenizedEquityMintError::NegativeQuantity { value: quantity });
         }
 
+        info!(
+            target: "tokenization",
+            %symbol,
+            ?quantity,
+            %wallet,
+            "Initiating mint request"
+        );
+
         let now = Utc::now();
         let mint_requested = MintRequested {
             symbol: symbol.clone(),
@@ -1251,6 +1259,11 @@ impl EventSourced for TokenizedEquityMint {
         };
 
         if matches!(alpaca_request.status, TokenizationRequestStatus::Rejected) {
+            warn!(
+                target: "tokenization",
+                symbol = %alpaca_request.underlying_symbol,
+                "Mint request rejected by Alpaca"
+            );
             return Ok(vec![
                 mint_requested,
                 MintRejected {
@@ -1259,6 +1272,13 @@ impl EventSourced for TokenizedEquityMint {
                 },
             ]);
         }
+
+        info!(
+            target: "tokenization",
+            symbol = %alpaca_request.underlying_symbol,
+            request_id = %alpaca_request.id.0,
+            "Mint request accepted by Alpaca"
+        );
 
         Ok(vec![
             mint_requested,
@@ -1295,7 +1315,7 @@ impl EventSourced for TokenizedEquityMint {
                     {
                         Ok(req) => req,
                         Err(error) => {
-                            warn!(%error, "Polling failed");
+                            warn!(target: "tokenization", %error, %symbol, %tokenization_request_id, "Polling failed");
                             return Ok(vec![MintAcceptanceFailed {
                                 reason: format!("Polling failed: {error}"),
                                 failed_at: Utc::now(),
@@ -1329,6 +1349,13 @@ impl EventSourced for TokenizedEquityMint {
 
                             let shares_minted = quantity_to_u256_18_decimals(*quantity)?;
 
+                            info!(
+                                target: "tokenization",
+                                %symbol,
+                                %tx_hash,
+                                "Mint polling completed: tokens received"
+                            );
+
                             Ok(vec![TokensReceived {
                                 tx_hash,
                                 receipt_id: ReceiptId(U256::ZERO),
@@ -1337,14 +1364,28 @@ impl EventSourced for TokenizedEquityMint {
                                 received_at: Utc::now(),
                             }])
                         }
-                        TokenizationRequestStatus::Rejected => Ok(vec![MintAcceptanceFailed {
-                            reason: "Rejected by Alpaca after acceptance".to_string(),
-                            failed_at: Utc::now(),
-                        }]),
-                        TokenizationRequestStatus::Pending => Ok(vec![MintAcceptanceFailed {
-                            reason: "Unexpected Pending status after polling".to_string(),
-                            failed_at: Utc::now(),
-                        }]),
+                        TokenizationRequestStatus::Rejected => {
+                            warn!(
+                                target: "tokenization",
+                                %symbol,
+                                "Mint rejected by Alpaca after acceptance"
+                            );
+                            Ok(vec![MintAcceptanceFailed {
+                                reason: "Rejected by Alpaca after acceptance".to_string(),
+                                failed_at: Utc::now(),
+                            }])
+                        }
+                        TokenizationRequestStatus::Pending => {
+                            warn!(
+                                target: "tokenization",
+                                %symbol,
+                                "Unexpected pending status after polling"
+                            );
+                            Ok(vec![MintAcceptanceFailed {
+                                reason: "Unexpected Pending status after polling".to_string(),
+                                failed_at: Utc::now(),
+                            }])
+                        }
                     }
                 }
                 Self::MintRequested { .. } => Err(TokenizedEquityMintError::NotAccepted),

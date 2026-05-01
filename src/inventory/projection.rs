@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use st0x_event_sorcery::{EntityList, Reactor, deps};
 
@@ -38,11 +38,12 @@ impl InventoryProjection {
         let mut inventory = self.inventory.write().await;
         let updated = match inventory.clone().apply_snapshot_event(event, now) {
             Ok(updated) => {
-                debug!("Applied inventory snapshot event");
+                trace!(target: "inventory", "Applied inventory snapshot event");
                 updated
             }
             Err(error) => {
                 warn!(
+                    target: "inventory",
                     ?error,
                     "Inventory snapshot apply failed; force-applying to existing view",
                 );
@@ -52,7 +53,7 @@ impl InventoryProjection {
                 let forced = inventory
                     .clone()
                     .force_apply_snapshot_event(event, now, reason)?;
-                debug!("Force-applied inventory snapshot after recovery");
+                debug!(target: "inventory", "Force-applied inventory snapshot after recovery");
                 forced
             }
         };

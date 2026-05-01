@@ -178,7 +178,7 @@ impl CctpAttestationMock {
                     }
                     Ok(_) => {}
                     Err(error) => {
-                        tracing::warn!(?error, "failed to poll ethereum head");
+                        tracing::warn!(target: "bridge", ?error, "failed to poll ethereum head");
                     }
                 }
 
@@ -199,7 +199,7 @@ impl CctpAttestationMock {
                     }
                     Ok(_) => {}
                     Err(error) => {
-                        tracing::warn!(?error, "failed to poll base head");
+                        tracing::warn!(target: "bridge", ?error, "failed to poll base head");
                     }
                 }
             }
@@ -222,6 +222,7 @@ async fn scan_block_for_messages<P: Provider>(
         .await
     else {
         warn!(
+            target: "bridge",
             block_number,
             "Failed to fetch block for CCTP message scanning"
         );
@@ -238,7 +239,7 @@ async fn scan_block_for_messages<P: Provider>(
         }
 
         let Ok(Some(receipt)) = provider.get_transaction_receipt(tx_hash).await else {
-            warn!(%tx_hash, block_number, "Failed to fetch receipt for CCTP message scanning");
+            warn!(target: "bridge", %tx_hash, block_number, "Failed to fetch receipt for CCTP message scanning");
             return false;
         };
 

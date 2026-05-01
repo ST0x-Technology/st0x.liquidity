@@ -1,7 +1,7 @@
 # HTTP API port for the dashboard and health checks.
 server_port = 8001
 # Minimum log level: trace, debug, info, warn, error.
-log_level = "debug"
+log_level = "trace"
 # Directory for rotated log files (stdout if omitted).
 log_dir = "/mnt/data/logs"
 # SQLite database path for event store, projections, and job queue.

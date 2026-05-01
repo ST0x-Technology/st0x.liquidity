@@ -4,7 +4,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use super::AlpacaBrokerApiError;
@@ -218,9 +218,13 @@ impl AlpacaBrokerApiClient {
         let request =
             JournalRequest::security(self.account_id, to_account, symbol.clone(), quantity);
 
-        debug!("Creating security journal at {url}: {request:?}");
+        info!(target: "broker", %symbol, %quantity, "Creating journal transfer");
 
-        self.post(&url, &request).await
+        let response: JournalResponse = self.post(&url, &request).await?;
+
+        debug!(target: "broker", journal_id = %response.id, "Journal transfer created");
+
+        Ok(response)
     }
 
     /// Perform a GET request

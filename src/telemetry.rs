@@ -326,11 +326,33 @@ fn mk_crate_filter(level: tracing::Level) -> EnvFilter {
         "float-serde",
     ];
 
+    /// Domain-based log targets used via `target: "..."` in tracing macros.
+    /// These must be listed here so the `EnvFilter` captures them alongside
+    /// module-path-based crate targets.
+    const DOMAIN_TARGETS: [&str; 11] = [
+        "bridge",
+        "broker",
+        "cqrs",
+        "dashboard",
+        "hedge",
+        "inventory",
+        "orderbook",
+        "rebalance",
+        "startup",
+        "tokenization",
+        "wallet",
+    ];
+
     let our_crates = CRATES
         .iter()
         .map(|pkg| pkg.replace('-', "_"))
         .map(|pkg| format!("st0x_{pkg}={level}"))
         .join(",");
 
-    EnvFilter::from(format!("warn,{our_crates}"))
+    let domain_targets = DOMAIN_TARGETS
+        .iter()
+        .map(|target| format!("{target}={level}"))
+        .join(",");
+
+    EnvFilter::from(format!("warn,{our_crates},{domain_targets}"))
 }

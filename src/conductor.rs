@@ -19,7 +19,7 @@ use task_supervisor::SupervisorHandle;
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::MissedTickBehavior;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use st0x_dto::Statement;
 use st0x_event_sorcery::{Projection, Store, StoreBuilder};
@@ -473,7 +473,7 @@ async fn seed_vault_registry_from_config(
             continue;
         };
 
-        info!(
+        debug!(
             %symbol,
             %vault_id,
             token = %equity_config.tokenized_equity_derivative,
@@ -797,7 +797,7 @@ where
             return Ok(block);
         }
 
-        warn!("Event missing block number, waiting for next event");
+        debug!("Event missing block number, waiting for next event");
     }
 }
 
@@ -866,8 +866,6 @@ fn spawn_order_poller<E: Executor + Clone + Send + 'static>(
     tokio::spawn(async move {
         if let Err(error) = poller.run().await {
             error!("Order poller failed: {error}");
-        } else {
-            info!("Order poller completed successfully");
         }
     })
 }
@@ -895,9 +893,9 @@ where
                 }
             }
 
-            debug!("Running inventory poll");
+            trace!("Running inventory poll");
             if let Err(error) = service.poll_and_record().await {
-                error!(%error, "Inventory polling failed");
+                warn!(%error, "Inventory polling failed");
             }
         }
     })
@@ -955,7 +953,7 @@ pub(crate) async fn discover_vaults_for_trade(
                 symbol: base_symbol.clone(),
             }
         } else {
-            warn!(
+            debug!(
                 vault_id = %vault.vault_id,
                 token = %vault.token,
                 usdc = %USDC_BASE,
@@ -989,9 +987,11 @@ async fn execute_witness_trade(
     let price_usdc = trade.price.value();
 
     let Some(block_timestamp) = trade.block_timestamp else {
-        error!(
-            "Missing block_timestamp for OnChainTrade::Witness: tx_hash={:?}, log_index={}",
-            trade.tx_hash, trade.log_index
+        warn!(
+            tx_hash = ?trade.tx_hash,
+            log_index = trade.log_index,
+            symbol = %trade.symbol,
+            "Missing block_timestamp for OnChainTrade::Witness"
         );
         return false;
     };
@@ -1007,16 +1007,20 @@ async fn execute_witness_trade(
 
     match onchain_trade.send(&trade_id, command).await {
         Ok(()) => {
-            info!(
-                "Successfully executed OnChainTrade::Witness command: tx_hash={:?}, log_index={}",
-                trade.tx_hash, trade.log_index
+            debug!(
+                tx_hash = ?trade.tx_hash,
+                log_index = trade.log_index,
+                symbol = %trade.symbol,
+                "Successfully executed OnChainTrade::Witness command"
             );
             true
         }
         Err(error) => {
             warn!(
-                "OnChainTrade::Witness rejected: {error}, tx_hash={:?}, log_index={}, symbol={}",
-                trade.tx_hash, trade.log_index, trade.symbol
+                tx_hash = ?trade.tx_hash,
+                log_index = trade.log_index,
+                symbol = %trade.symbol,
+                "OnChainTrade::Witness rejected: {error}"
             );
             false
         }
@@ -1032,6 +1036,7 @@ async fn execute_enrich_trade(onchain_trade: &Store<OnChainTrade>, trade: &Oncha
         warn!(
             tx_hash = ?trade.tx_hash,
             log_index = trade.log_index,
+            symbol = %trade.symbol,
             gas_used = ?trade.gas_used,
             effective_gas_price = ?trade.effective_gas_price,
             pyth_price = ?trade.pyth_price,
@@ -1052,13 +1057,17 @@ async fn execute_enrich_trade(onchain_trade: &Store<OnChainTrade>, trade: &Oncha
     };
 
     match onchain_trade.send(&trade_id, command).await {
-        Ok(()) => info!(
-            "Successfully executed OnChainTrade::Enrich command: tx_hash={:?}, log_index={}",
-            trade.tx_hash, trade.log_index
+        Ok(()) => debug!(
+            tx_hash = ?trade.tx_hash,
+            log_index = trade.log_index,
+            symbol = %trade.symbol,
+            "Successfully executed OnChainTrade::Enrich command"
         ),
         Err(error) => error!(
-            "Failed to execute OnChainTrade::Enrich command: {error}, tx_hash={:?}, log_index={}",
-            trade.tx_hash, trade.log_index
+            tx_hash = ?trade.tx_hash,
+            log_index = trade.log_index,
+            symbol = %trade.symbol,
+            "Failed to execute OnChainTrade::Enrich command: {error}"
         ),
     }
 }
@@ -1074,9 +1083,11 @@ async fn execute_acknowledge_fill(
     let price_usdc = trade.price.value();
 
     let Some(block_timestamp) = trade.block_timestamp else {
-        error!(
-            "Missing block_timestamp for Position::AcknowledgeOnChainFill: tx_hash={:?}, log_index={}",
-            trade.tx_hash, trade.log_index
+        warn!(
+            tx_hash = ?trade.tx_hash,
+            log_index = trade.log_index,
+            symbol = %trade.symbol,
+            "Missing block_timestamp for Position::AcknowledgeOnChainFill"
         );
         return;
     };
@@ -1095,17 +1106,22 @@ async fn execute_acknowledge_fill(
     };
 
     match position.send(base_symbol, command).await {
-        Ok(()) => info!(
-            "Successfully executed Position::AcknowledgeOnChainFill command: tx_hash={:?}, log_index={}, symbol={}",
-            trade.tx_hash, trade.log_index, trade.symbol
+        Ok(()) => debug!(
+            tx_hash = ?trade.tx_hash,
+            log_index = trade.log_index,
+            symbol = %trade.symbol,
+            "Successfully executed Position::AcknowledgeOnChainFill command"
         ),
         Err(error) => error!(
-            "Failed to execute Position::AcknowledgeOnChainFill command: {error}, tx_hash={:?}, log_index={}, symbol={}",
-            trade.tx_hash, trade.log_index, trade.symbol
+            tx_hash = ?trade.tx_hash,
+            log_index = trade.log_index,
+            symbol = %trade.symbol,
+            "Failed to execute Position::AcknowledgeOnChainFill command: {error}"
         ),
     }
 }
 
+#[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 pub(crate) async fn process_queued_trade<E: Executor>(
     executor: &E,
     trade_event: &EmittedOnChain<RaindexTradeEvent>,
@@ -1124,6 +1140,7 @@ where
     if let Ok(Some(_)) = cqrs.onchain_trade.load(&trade_id).await {
         info!(
             ?trade_id,
+            symbol = %trade.symbol,
             "Trade already processed (duplicate event), skipping"
         );
         return Ok(None);
@@ -1394,7 +1411,7 @@ async fn execute_fail_offchain_order_position(
     };
 
     match position.send(&execution.symbol, command).await {
-        Ok(()) => info!(
+        Ok(()) => debug!(
             %offchain_order_id,
             symbol = %execution.symbol,
             "Position::FailOffChainOrder succeeded"
@@ -1409,6 +1426,7 @@ async fn execute_fail_offchain_order_position(
 
 /// Returns `true` if the Position aggregate accepted the order, `false` if it
 /// was rejected (e.g. already has a pending execution).
+#[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 async fn execute_place_offchain_order(
     execution: &ExecutionCtx,
     cqrs: &TradeProcessingCqrs,
@@ -1424,7 +1442,7 @@ async fn execute_place_offchain_order(
 
     match cqrs.position.send(&execution.symbol, command).await {
         Ok(()) => {
-            info!(
+            debug!(
                 %offchain_order_id,
                 symbol = %execution.symbol,
                 "Position::PlaceOffChainOrder succeeded"
@@ -1442,6 +1460,7 @@ async fn execute_place_offchain_order(
     }
 }
 
+#[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 async fn execute_create_offchain_order(
     execution: &ExecutionCtx,
     cqrs: &TradeProcessingCqrs,
@@ -1455,7 +1474,7 @@ async fn execute_create_offchain_order(
     };
 
     match cqrs.offchain_order.send(&offchain_order_id, command).await {
-        Ok(()) => info!(
+        Ok(()) => debug!(
             %offchain_order_id,
             symbol = %execution.symbol,
             "OffchainOrder::Place succeeded"
@@ -1505,8 +1524,8 @@ where
     }
 
     info!(
-        "Found {} accumulated positions ready for execution",
-        ready_positions.len()
+        ready_positions = ready_positions.len(),
+        "Found accumulated positions ready for execution"
     );
 
     let mut batch_budget = CounterTradeBatchBudget::default();
@@ -1522,7 +1541,7 @@ where
 
         let offchain_order_id = OffchainOrderId::new();
 
-        info!(
+        debug!(
             symbol = %execution.symbol,
             shares = %execution.shares,
             direction = ?execution.direction,
@@ -1548,7 +1567,7 @@ where
             continue;
         }
 
-        info!(
+        debug!(
             %offchain_order_id,
             symbol = %execution.symbol,
             "Position::PlaceOffChainOrder succeeded"
@@ -1564,7 +1583,7 @@ where
         let place_result = offchain_order.send(&offchain_order_id, command).await;
 
         match &place_result {
-            Ok(()) => info!(
+            Ok(()) => debug!(
                 %offchain_order_id,
                 symbol = %execution.symbol,
                 "OffchainOrder::Place succeeded"

@@ -190,6 +190,7 @@ where
     pub(super) fn apply_snapshot(self, snapshot_balance: T) -> Result<Self, FloatError> {
         if !self.inflight.is_zero()? {
             debug!(
+                target: "inventory",
                 inflight = ?self.inflight,
                 "Skipping snapshot reconciliation due to non-zero inflight"
             );
@@ -219,6 +220,7 @@ where
         recovering_from: &E,
     ) -> Self {
         warn!(
+            target: "inventory",
             ?recovering_from,
             inflight = ?self.inflight,
             "Force-applying snapshot to recover from error, clearing inflight"

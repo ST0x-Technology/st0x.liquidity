@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use rain_math_float::Float;
@@ -195,6 +195,14 @@ impl Executor for AlpacaBrokerApi {
                     .map_or(FractionalShares::ZERO, |position| position.quantity);
 
                 if available.inner().gte(order.shares.inner().inner())? {
+                    debug!(
+                        target: "broker",
+                        symbol = %order.symbol,
+                        available = %available,
+                        required = %order.shares,
+                        "Preflight passed: sufficient equity for sell"
+                    );
+
                     Ok(CounterTradePreflight::Allowed {
                         reservation: Some(CounterTradeReservation::Equity {
                             symbol: order.symbol,
@@ -225,10 +233,23 @@ impl Executor for AlpacaBrokerApi {
                     self.counter_trade_slippage_bps,
                 )?;
 
-                Ok(buying_power_counter_trade_preflight(
+                let available_buying_power_cents = account_funds.margin_safe_buying_power_cents;
+                let preflight = buying_power_counter_trade_preflight(
                     estimated_cost_cents,
-                    account_funds.margin_safe_buying_power_cents,
-                ))
+                    available_buying_power_cents,
+                );
+
+                if matches!(preflight, CounterTradePreflight::Allowed { .. }) {
+                    debug!(
+                        target: "broker",
+                        symbol = %order.symbol,
+                        estimated_cost_cents,
+                        available_buying_power_cents,
+                        "Preflight passed: sufficient buying power for buy"
+                    );
+                }
+
+                Ok(preflight)
             }
         }
     }

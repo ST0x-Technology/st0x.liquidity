@@ -428,6 +428,7 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
 
         if !response.status().is_success() {
             warn!(
+                target: "bridge",
                 url,
                 status = response.status().as_u16(),
                 "Fee endpoint failed"
@@ -445,6 +446,7 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
             .minimum_fee;
 
         debug!(
+            target: "bridge",
             ?direction,
             fast_fee = %format_float_with_fallback(&fast_fee),
             "Retrieved fast transfer fee (bps)"
@@ -481,7 +483,7 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
             direction.source_domain()
         );
 
-        info!(%url, "Polling attestation API");
+        info!(target: "bridge", %url, "Polling attestation API");
 
         let backoff = backon::ConstantBuilder::default()
             .with_delay(std::time::Duration::from_secs(RETRY_INTERVAL_SECS))
@@ -544,12 +546,12 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
             .retry(backoff)
             .notify(|err, dur| match err {
                 AttestationError::Pending { status } => {
-                    info!(%status, ?dur, "Attestation pending, retrying");
+                    debug!(target: "bridge", %status, ?dur, "Attestation pending, retrying");
                 }
                 AttestationError::NotYetAvailable { status } => {
-                    debug!(status, ?dur, "API non-success, retrying");
+                    debug!(target: "bridge", status, ?dur, "API non-success, retrying");
                 }
-                err => warn!(?err, ?dur, "Attestation error, retrying"),
+                err => warn!(target: "bridge", ?err, ?dur, "Attestation error, retrying"),
             })
             .await
             .map_err(|err| CctpError::AttestationTimeout {

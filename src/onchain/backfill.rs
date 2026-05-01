@@ -35,6 +35,7 @@ pub(crate) fn get_backfill_retry_strat() -> ExponentialBuilder {
 }
 
 #[tracing::instrument(
+    target = "orderbook",
     skip(provider, evm_ctx, pool, retry_strategy, job_queue),
     fields(end_block),
     level = tracing::Level::INFO,
@@ -51,6 +52,7 @@ pub(crate) async fn backfill_events<P: Provider + Clone, B: BackoffBuilder + Clo
 
     if start_block > end_block {
         info!(
+            target: "orderbook",
             "Already caught up to block {}, skipping backfill",
             end_block
         );
@@ -62,6 +64,7 @@ pub(crate) async fn backfill_events<P: Provider + Clone, B: BackoffBuilder + Clo
     let total_blocks = end_block - start_block + 1;
 
     info!(
+        target: "orderbook",
         "Backfilling from block {} to {} ({} blocks)",
         start_block, end_block, total_blocks
     );
@@ -90,7 +93,7 @@ pub(crate) async fn backfill_events<P: Provider + Clone, B: BackoffBuilder + Clo
         .into_iter()
         .sum::<usize>();
 
-    info!("Backfill completed: {total_enqueued} events enqueued");
+    info!(target: "orderbook", total_enqueued, "Backfill completed");
 
     save_backfill_checkpoint(pool, evm_ctx, end_block).await?;
 
@@ -147,6 +150,7 @@ async fn save_backfill_checkpoint(
 }
 
 #[tracing::instrument(
+    target = "orderbook",
     skip(provider, evm_ctx, retry_strategy, job_queue),
     fields(batch_start, batch_end),
     level = tracing::Level::DEBUG,
@@ -191,17 +195,18 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
         get_clear_logs
             .retry(retry_strategy.clone().build())
             .notify(|err, dur| {
-                trace!("Retrying clear_logs for blocks between {batch_start}-{batch_end} after error: {err} (waiting {dur:?})");
+                trace!(target: "orderbook", "Retrying clear_logs for blocks between {batch_start}-{batch_end} after error: {err} (waiting {dur:?})");
             }),
         get_take_logs
             .retry(retry_strategy.build())
             .notify(|err, dur| {
-                trace!("Retrying take_logs for blocks between {batch_start}-{batch_end} after error: {err} (waiting {dur:?})");
+                trace!(target: "orderbook", "Retrying take_logs for blocks between {batch_start}-{batch_end} after error: {err} (waiting {dur:?})");
             }),
     )
     .await?;
 
     debug!(
+        target: "orderbook",
         total_clear_logs = %clear_logs.len(),
         total_take_logs = %take_logs.len(),
         "Processed a batch of blocks from {batch_start} to {batch_end}",
@@ -225,7 +230,7 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
         .filter_map(|(event, log)| {
             EmittedOnChain::<RaindexTradeEvent>::from_log(event, &log)
                 .inspect_err(
-                    |error| warn!(%error, "Failed to extract block inclusion metadata during backfill"),
+                    |error| warn!(target: "orderbook", %error, "Failed to extract block inclusion metadata during backfill"),
                 )
                 .ok()
         })

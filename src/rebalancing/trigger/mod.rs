@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, mpsc};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 
 use rain_math_float::Float;
 use st0x_event_sorcery::{AggregateError, EntityList, LifecycleError, Reactor, Store, deps};
@@ -37,7 +37,7 @@ use crate::usdc_rebalance::{
     RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent, UsdcRebalanceId,
 };
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
-use crate::wrapper::Wrapper;
+use crate::wrapper::{Wrapper, WrapperError};
 
 /// Why the rebalancing trigger reactor failed.
 #[derive(Debug, thiserror::Error)]
@@ -568,6 +568,7 @@ impl RebalancingTrigger {
             };
 
             error!(
+                target: "rebalance",
                 aggregate_id = %id,
                 symbol = %tracking.symbol,
                 stage = %tracking.stage,
@@ -609,6 +610,7 @@ impl RebalancingTrigger {
             };
 
             error!(
+                target: "rebalance",
                 aggregate_id = %id,
                 symbol = %tracking.symbol,
                 stage = %tracking.stage,
@@ -650,6 +652,7 @@ impl RebalancingTrigger {
             };
 
             error!(
+                target: "rebalance",
                 aggregate_id = %id,
                 direction = ?tracking.direction,
                 stage = %tracking.stage,
@@ -687,6 +690,7 @@ impl RebalancingTrigger {
 
                 if !keep {
                     debug!(
+                        target: "rebalance",
                         %symbol,
                         "Ignoring inflight mint snapshot after timeout cleanup"
                     );
@@ -704,6 +708,7 @@ impl RebalancingTrigger {
 
                 if !keep {
                     debug!(
+                        target: "rebalance",
                         %symbol,
                         "Ignoring inflight redemption snapshot after timeout cleanup"
                     );
@@ -970,7 +975,7 @@ impl RebalancingTrigger {
         *inventory = updated;
         drop(inventory);
 
-        debug!("Applied inventory snapshot event");
+        trace!(target: "rebalance", "Applied inventory snapshot event");
 
         self.check_and_trigger_after_snapshot(&event).await
     }
@@ -1000,6 +1005,7 @@ impl RebalancingTrigger {
         };
 
         warn!(
+            target: "rebalance",
             ?inventory_error,
             "Resetting inventory and force-applying snapshot to recover"
         );
@@ -1111,7 +1117,7 @@ impl RebalancingTrigger {
         *inventory = updated;
         drop(inventory);
 
-        debug!("Force-applied inventory snapshot after recovery");
+        debug!(target: "rebalance", "Force-applied inventory snapshot after recovery");
 
         self.check_and_trigger_after_snapshot(&event).await
     }
@@ -1257,7 +1263,7 @@ impl Reactor for RebalancingTrigger {
 impl RebalancingTrigger {
     async fn expire_stuck_operations_with_logging(&self) {
         if let Err(error) = self.expire_stuck_operations(Utc::now()).await {
-            error!(?error, "Failed to expire stuck rebalancing operations");
+            error!(target: "rebalance", ?error, "Failed to expire stuck rebalancing operations");
         }
     }
 
@@ -1304,7 +1310,7 @@ impl RebalancingTrigger {
         match self.sender.try_send(operation.clone()) {
             Ok(()) => true,
             Err(error) => {
-                warn!(%error, context, "Failed to send triggered operation");
+                warn!(target: "rebalance", %error, ?operation, context, "Failed to send triggered operation");
                 false
             }
         }
@@ -1312,7 +1318,7 @@ impl RebalancingTrigger {
 
     async fn load_mint_tracking(&self, id: &IssuerRequestId) -> Option<MintTracking> {
         let Some(tracking) = self.mint_tracking.read().await.get(id).cloned() else {
-            warn!(id = %id, "Mint event for untracked aggregate");
+            warn!(target: "rebalance", id = %id, "Mint event for untracked aggregate");
             return None;
         };
 
@@ -1397,7 +1403,7 @@ impl RebalancingTrigger {
         id: &RedemptionAggregateId,
     ) -> Option<RedemptionTracking> {
         let Some(tracking) = self.redemption_tracking.read().await.get(id).cloned() else {
-            warn!(id = %id, "Redemption event for untracked aggregate");
+            warn!(target: "rebalance", id = %id, "Redemption event for untracked aggregate");
             return None;
         };
 
@@ -1443,19 +1449,29 @@ impl RebalancingTrigger {
         }
 
         let Some(guard) = self.try_claim_equity_guard(symbol) else {
-            debug!(%symbol, "Skipped equity trigger: already in progress");
+            debug!(target: "rebalance", %symbol, "Skipped equity trigger: already in progress");
             return Ok(());
         };
 
-        let Some(operation) = self.build_equity_operation(symbol).await? else {
-            return Ok(());
+        let operation = match self.build_equity_operation(symbol).await {
+            Ok(Some(operation)) => operation,
+            Ok(None) => return Ok(()),
+            Err(equity::EquityTriggerError::Wrapper(WrapperError::SymbolNotConfigured(symbol))) => {
+                warn!(
+                    target: "rebalance",
+                    %symbol,
+                    "Skipped equity trigger: symbol not configured"
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error),
         };
 
         if !self.try_send_operation(&operation, "equity") {
             return Ok(());
         }
 
-        debug!(%symbol, ?operation, "Triggered equity rebalancing");
+        debug!(target: "rebalance", %symbol, ?operation, "Triggered equity rebalancing");
         guard.defuse();
         Ok(())
     }
@@ -1502,14 +1518,14 @@ impl RebalancingTrigger {
         };
 
         let Some(guard) = self.try_claim_usdc_guard() else {
-            debug!("Skipped USDC trigger: already in progress");
+            debug!(target: "rebalance", "Skipped USDC trigger: already in progress");
             return;
         };
 
         let Ok(operation) =
             usdc::check_imbalance_and_build_operation(&threshold, &self.inventory, usdc_limit)
                 .await
-                .inspect_err(|skip| debug!(?skip, "Skipped USDC trigger"))
+                .inspect_err(|skip| debug!(target: "rebalance", ?skip, "Skipped USDC trigger"))
         else {
             return;
         };
@@ -1518,7 +1534,7 @@ impl RebalancingTrigger {
             return;
         }
 
-        debug!(?operation, "Triggered USDC rebalancing");
+        debug!(target: "rebalance", ?operation, "Triggered USDC rebalancing");
         guard.defuse();
     }
 
@@ -1674,7 +1690,7 @@ impl RebalancingTrigger {
         let event_sync_guard = self.mint_event_sync.lock().await;
 
         if self.mint_timed_out(&id).await {
-            warn!(id = %id, "Ignoring late mint event after timeout cleanup");
+            warn!(target: "rebalance", id = %id, "Ignoring late mint event after timeout cleanup");
             return Ok(());
         }
 
@@ -1692,7 +1708,7 @@ impl RebalancingTrigger {
         let should_check_usdc = if Self::is_terminal_mint_event(&event) {
             self.mint_tracking.write().await.remove(&id);
             self.clear_equity_in_progress(&symbol);
-            debug!(%symbol, "Cleared equity in-progress flag after mint terminal event");
+            debug!(target: "rebalance", %symbol, "Cleared equity in-progress flag after mint terminal event");
             true
         } else {
             false
@@ -1715,7 +1731,7 @@ impl RebalancingTrigger {
         let event_sync_guard = self.redemption_event_sync.lock().await;
 
         if self.redemption_timed_out(&id).await {
-            warn!(id = %id, "Ignoring late redemption event after timeout cleanup");
+            warn!(target: "rebalance", id = %id, "Ignoring late redemption event after timeout cleanup");
             return Ok(());
         }
 
@@ -1734,6 +1750,7 @@ impl RebalancingTrigger {
             self.redemption_tracking.write().await.remove(&id);
             self.clear_equity_in_progress(&symbol);
             debug!(
+                target: "rebalance",
                 %symbol,
                 "Cleared equity in-progress flag after redemption terminal event"
             );

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use st0x_event_sorcery::{Projection, Store};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use st0x_execution::{
     CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason, ExecutionError,
@@ -241,7 +241,7 @@ where
 
         let offchain_order_id = OffchainOrderId::new();
 
-        info!(
+        debug!(
             symbol = %execution.symbol,
             shares = %execution.shares,
             direction = ?execution.direction,
@@ -267,7 +267,7 @@ where
             continue;
         }
 
-        info!(
+        debug!(
             %offchain_order_id,
             symbol = %execution.symbol,
             "Position marked as pending execution"
@@ -285,7 +285,7 @@ where
             .send(&offchain_order_id, command)
             .await
         {
-            Ok(()) => info!(
+            Ok(()) => debug!(
                 %offchain_order_id,
                 symbol = %execution.symbol,
                 "Offchain order command processed for accumulated position"
@@ -315,7 +315,7 @@ where
             }
 
             Ok(Some(OffchainOrder::Submitted { .. })) => {
-                info!(
+                debug!(
                     %offchain_order_id,
                     symbol = %execution.symbol,
                     "Order submitted to broker"
@@ -323,7 +323,7 @@ where
             }
 
             Ok(Some(OffchainOrder::PartiallyFilled { .. })) => {
-                info!(
+                debug!(
                     %offchain_order_id,
                     symbol = %execution.symbol,
                     "Order partially filled by broker"
@@ -331,7 +331,7 @@ where
             }
 
             Ok(Some(OffchainOrder::Filled { .. })) => {
-                info!(
+                debug!(
                     %offchain_order_id,
                     symbol = %execution.symbol,
                     "Order filled by broker"

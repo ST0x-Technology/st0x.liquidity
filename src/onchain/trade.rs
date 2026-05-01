@@ -116,6 +116,7 @@ pub(crate) fn extract_owned_vaults(
 ) -> Vec<OwnedVaultInfo> {
     let (Ok(in_idx), Ok(out_idx)) = (input_idx.try_into(), output_idx.try_into()) else {
         warn!(
+            target: "hedge",
             owner = %order.owner,
             %input_idx,
             %output_idx,
@@ -126,6 +127,7 @@ pub(crate) fn extract_owned_vaults(
 
     let Some((input, output)) = extract_vault_info(order, in_idx, out_idx) else {
         warn!(
+            target: "hedge",
             owner = %order.owner,
             input_index = %in_idx,
             output_index = %out_idx,
@@ -234,7 +236,7 @@ impl OnchainTrade {
         {
             Ok(pyth_price) => Some(pyth_price),
             Err(error) => {
-                warn!(%tx_hash, %error, "Pyth price extraction failed");
+                warn!(target: "hedge", %tx_hash, %error, "Pyth price extraction failed");
                 None
             }
         };
@@ -292,6 +294,7 @@ impl OnchainTrade {
 
         if trades.len() > 1 {
             warn!(
+                target: "hedge",
                 "Found {} potential trades in the tx with hash {tx_hash}, returning first match",
                 trades.len()
             );

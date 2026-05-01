@@ -6,7 +6,7 @@ use rocket_ws::{Channel, Message, WebSocket};
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::{debug, info, warn};
+use tracing::{info, trace, warn};
 
 use st0x_dto::{CurrentState, Statement};
 
@@ -61,36 +61,36 @@ fn ws_endpoint<'r>(
             let json = match serde_json::to_string(&initial) {
                 Ok(serialized) => serialized,
                 Err(error) => {
-                    warn!("Failed to serialize initial state: {error}");
+                    warn!(target: "dashboard", %error, "Failed to serialize initial state");
                     return Ok(());
                 }
             };
 
             if let Err(error) = stream.send(Message::Text(json)).await {
-                warn!("Failed to send initial state: {error}");
+                warn!(target: "dashboard", %error, "Failed to send initial state");
                 return Ok(());
             }
-            info!("Sent initial state to dashboard client");
+            info!(target: "dashboard", "Sent initial state to dashboard client");
 
             loop {
                 match receiver.recv().await {
                     Ok(msg) => {
-                        debug!(?msg, "Broadcasting to dashboard client");
+                        trace!(target: "dashboard", ?msg, "Broadcasting to dashboard client");
                         let json = match serde_json::to_string(&msg) {
                             Ok(serialized) => serialized,
                             Err(error) => {
-                                warn!("Failed to serialize message: {error}");
+                                warn!(target: "dashboard", %error, "Failed to serialize message");
                                 continue;
                             }
                         };
 
                         if let Err(error) = stream.send(Message::Text(json)).await {
-                            warn!("Failed to send message to client: {error}");
+                            warn!(target: "dashboard", %error, "Failed to send message to client");
                             break;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!("Client lagged, skipped {skipped} messages");
+                        warn!(target: "dashboard", skipped, "Client lagged, skipped messages");
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         break;
@@ -203,7 +203,7 @@ fn float_to_f64(value: rain_math_float::Float, fallback: f64) -> f64 {
         .and_then(|formatted| formatted.parse::<f64>().ok());
 
     if result.is_none() {
-        warn!(%fallback, "Float conversion failed for dashboard settings, using fallback");
+        warn!(target: "dashboard", %fallback, "Float conversion failed for dashboard settings, using fallback");
     }
 
     result.unwrap_or(fallback)
@@ -218,7 +218,7 @@ async fn load_positions(pool: &SqlitePool) -> Vec<st0x_dto::Position> {
     {
         Ok(rows) => rows,
         Err(error) => {
-            warn!(%error, "Failed to load positions for dashboard");
+            warn!(target: "dashboard", %error, "Failed to load positions for dashboard");
             return Vec::new();
         }
     };
@@ -227,7 +227,7 @@ async fn load_positions(pool: &SqlitePool) -> Vec<st0x_dto::Position> {
         .filter_map(|(raw_symbol, net_str)| {
             let symbol = st0x_execution::Symbol::new(&raw_symbol)
                 .inspect_err(|error| {
-                    warn!(%error, %raw_symbol, "Invalid symbol in position view, skipping");
+                    warn!(target: "dashboard", %error, %raw_symbol, "Invalid symbol in position view, skipping");
                 })
                 .ok()?;
 
@@ -235,7 +235,7 @@ async fn load_positions(pool: &SqlitePool) -> Vec<st0x_dto::Position> {
                 .and_then(|value| match rain_math_float::Float::parse(value) {
                     Ok(float) => Some(float),
                     Err(error) => {
-                        warn!(%error, %raw_symbol, "Unparseable net_position, skipping");
+                        warn!(target: "dashboard", %error, %raw_symbol, "Unparseable net_position, skipping");
                         None
                     }
                 })

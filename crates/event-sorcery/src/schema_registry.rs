@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
 use std::collections::BTreeMap;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 use crate::{DomainEvent, EventSourced, Nil};
@@ -159,6 +159,7 @@ impl Reconciler {
     ///
     /// Returns `true` if snapshots were cleared (schema changed),
     /// `false` if versions matched.
+    #[allow(clippy::cognitive_complexity)]
     pub async fn reconcile<Entity: EventSourced>(&self) -> Result<bool, ReconcileError> {
         let name = Entity::AGGREGATE_TYPE;
         let current_version = Entity::SCHEMA_VERSION;
@@ -167,6 +168,8 @@ impl Reconciler {
             .load_registry()
             .await?
             .and_then(|registry| registry.version_of(name));
+
+        debug!(target: "cqrs", aggregate = %name, ?stored_version, "Loaded stored schema version");
 
         let needs_clear = stored_version != Some(current_version);
 
@@ -177,11 +180,14 @@ impl Reconciler {
                 .await?;
 
             info!(
+                target: "cqrs",
                 aggregate = name,
                 old_version = ?stored_version,
                 new_version = current_version,
                 "Cleared stale snapshots for schema version change"
             );
+        } else {
+            debug!(target: "cqrs", aggregate = %name, version = current_version, "Schema version unchanged");
         }
 
         self.cqrs

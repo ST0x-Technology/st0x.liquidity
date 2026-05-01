@@ -110,6 +110,7 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
 
         if current_allowance < underlying_amount {
             info!(
+                target: "orderbook",
                 %underlying_token,
                 %wrapped_token,
                 %underlying_amount,
@@ -128,7 +129,7 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
                 .await?;
         }
 
-        info!("Sending ERC4626 deposit to {wrapped_token}");
+        info!(target: "orderbook", %wrapped_token, %underlying_amount, "Sending ERC4626 deposit");
         let receipt = self
             .wallet
             .submit::<OpenChainErrorRegistry, _>(
@@ -164,7 +165,7 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
         receiver: Address,
         owner: Address,
     ) -> Result<(TxHash, U256), WrapperError> {
-        info!("Sending ERC4626 redeem to {wrapped_token}");
+        info!(target: "orderbook", %wrapped_token, %wrapped_amount, "Sending ERC4626 redeem");
         let receipt = self
             .wallet
             .submit::<OpenChainErrorRegistry, _>(

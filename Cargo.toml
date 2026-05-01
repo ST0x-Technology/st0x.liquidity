@@ -112,7 +112,10 @@ toml = "0.9.11"
 tracing = "0.1.41"
 tracing-opentelemetry = "0.31.0"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
-tracing-test = "0.2.5"
+# no-env-filter: custom `target:` strings (e.g. "hedge", "rebalance") don't
+# match the default module-path-based EnvFilter in tests. This feature makes
+# the test subscriber capture all targets regardless of RUST_LOG.
+tracing-test = { version = "0.2.5", features = ["no-env-filter"] }
 trybuild = "1.0.116"
 ts-rs = { version = "11.1.0", features = [
   "chrono",

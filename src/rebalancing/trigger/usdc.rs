@@ -243,6 +243,7 @@ pub(super) async fn check_imbalance_and_build_operation(
         let inventory = inventory.read().await;
         inventory.check_usdc_imbalance(threshold).map_err(|error| {
             warn!(
+                target: "rebalance",
                 ?error,
                 "USDC imbalance check failed due to arithmetic error"
             );
@@ -251,7 +252,7 @@ pub(super) async fn check_imbalance_and_build_operation(
     };
 
     let Some(imbalance) = imbalance else {
-        trace!("No USDC imbalance detected (balanced, partial data, or inflight)");
+        trace!(target: "rebalance", "No USDC imbalance detected (balanced, partial data, or inflight)");
         return Err(UsdcTriggerSkip::NoImbalance);
     };
 
@@ -259,6 +260,7 @@ pub(super) async fn check_imbalance_and_build_operation(
         Imbalance::TooMuchOffchain { excess } => {
             let capped = truncate_for_transfer(cap_usdc(excess, usdc_limit)).map_err(|error| {
                 warn!(
+                    target: "rebalance",
                     ?error,
                     "Failed to truncate offchain USDC imbalance for transfer"
                 );
@@ -270,6 +272,7 @@ pub(super) async fn check_imbalance_and_build_operation(
                 .map_err(|_| UsdcTriggerSkip::NoImbalance)?
             {
                 debug!(
+                    target: "rebalance",
                     excess = ?capped,
                     minimum = ?*ALPACA_MINIMUM_WITHDRAWAL,
                     "USDC imbalance below Alpaca minimum withdrawal, skipping"
@@ -282,6 +285,7 @@ pub(super) async fn check_imbalance_and_build_operation(
         Imbalance::TooMuchOnchain { excess } => {
             let amount = truncate_for_transfer(cap_usdc(excess, usdc_limit)).map_err(|error| {
                 warn!(
+                    target: "rebalance",
                     ?error,
                     "Failed to truncate onchain USDC imbalance for transfer"
                 );
@@ -294,6 +298,7 @@ pub(super) async fn check_imbalance_and_build_operation(
                 .map_err(|_| UsdcTriggerSkip::NoImbalance)?
             {
                 debug!(
+                    target: "rebalance",
                     excess = ?excess,
                     "Skipping onchain USDC rebalance because truncation collapsed the transfer to zero"
                 );
@@ -312,6 +317,7 @@ fn cap_usdc(amount: Usdc, usdc_limit: Option<Usdc>) -> Usdc {
 
     if amount.gt(&cap).unwrap_or(false) {
         warn!(
+            target: "rebalance",
             computed = %amount,
             limit = %cap,
             "USDC rebalancing amount capped by operational limit"
@@ -331,6 +337,7 @@ fn truncate_for_transfer(amount: Usdc) -> Result<Usdc, FloatError> {
 
     if truncated != amount {
         warn!(
+            target: "rebalance",
             original = ?amount,
             truncated = ?truncated,
             "Truncated USDC rebalance amount to {} decimal places for transfer",
@@ -355,7 +362,7 @@ impl RebalancingTrigger {
             .await
             .contains_key(&id)
         {
-            warn!(id = %id, "Ignoring late USDC rebalance event after timeout cleanup");
+            warn!(target: "rebalance", id = %id, "Ignoring late USDC rebalance event after timeout cleanup");
             return Ok(());
         }
 
@@ -365,7 +372,7 @@ impl RebalancingTrigger {
         if is_terminal {
             self.usdc_tracking.write().await.remove(&id);
             self.clear_usdc_in_progress();
-            debug!("Cleared USDC in-progress flag after rebalance terminal event");
+            debug!(target: "rebalance", "Cleared USDC in-progress flag after rebalance terminal event");
         }
 
         drop(event_sync_guard);
@@ -530,6 +537,7 @@ impl RebalancingTrigger {
     ) {
         let Some(stage) = UsdcRebalanceStage::from_event(event) else {
             warn!(
+                target: "rebalance",
                 id = %id,
                 ?event,
                 "Skipping conversion tracking update: event yielded no timeout stage"
@@ -538,6 +546,7 @@ impl RebalancingTrigger {
         };
         let Some(last_progress_at) = stage.timestamp(event) else {
             warn!(
+                target: "rebalance",
                 id = %id,
                 ?stage,
                 ?event,
@@ -575,7 +584,7 @@ impl RebalancingTrigger {
     ) -> Result<(), RebalancingTriggerError> {
         let mut tracking = self.usdc_tracking.write().await;
         let Some(existing) = tracking.get_mut(id) else {
-            warn!(id = %id, "Bridged event missing USDC tracking context");
+            warn!(target: "rebalance", id = %id, "Bridged event missing USDC tracking context");
             return Err(RebalancingTriggerError::MissingUsdcTrackingContext {
                 id: id.clone(),
                 event: UsdcTrackingEvent::Bridged,
@@ -593,7 +602,7 @@ impl RebalancingTrigger {
         id: &UsdcRebalanceId,
     ) -> Result<(), RebalancingTriggerError> {
         let Some(tracking) = self.usdc_tracking.read().await.get(id).cloned() else {
-            warn!(id = %id, "DepositConfirmed event missing USDC tracking context");
+            warn!(target: "rebalance", id = %id, "DepositConfirmed event missing USDC tracking context");
             return Err(RebalancingTriggerError::MissingUsdcTrackingContext {
                 id: id.clone(),
                 event: UsdcTrackingEvent::DepositConfirmed,
@@ -602,6 +611,7 @@ impl RebalancingTrigger {
 
         let Some(amount_received) = tracking.bridged_amount_received else {
             warn!(
+                target: "rebalance",
                 id = %id,
                 "DepositConfirmed event missing bridged amount for USDC rebalance"
             );
@@ -618,6 +628,7 @@ impl RebalancingTrigger {
     ) -> Result<(), RebalancingTriggerError> {
         let Some(tracking) = self.usdc_tracking.read().await.get(id).cloned() else {
             debug!(
+                target: "rebalance",
                 id = %id,
                 "Terminal failure event had no USDC tracking context to cancel"
             );
@@ -651,7 +662,7 @@ impl RebalancingTrigger {
         settled_amount: Usdc,
     ) -> Result<(), RebalancingTriggerError> {
         let Some(tracking) = self.usdc_tracking.read().await.get(id).cloned() else {
-            warn!(id = %id, "Terminal success event missing USDC tracking context");
+            warn!(target: "rebalance", id = %id, "Terminal success event missing USDC tracking context");
             return Err(RebalancingTriggerError::MissingUsdcTrackingContext {
                 id: id.clone(),
                 event,
@@ -663,6 +674,7 @@ impl RebalancingTrigger {
 
         if settled_amount.gt(&initiated_amount)? {
             warn!(
+                target: "rebalance",
                 id = %id,
                 ?event,
                 ?initiated_amount,
@@ -703,7 +715,7 @@ impl RebalancingTrigger {
         };
 
         if !tracked {
-            warn!(id = %id, "USDC progress event missing tracking context");
+            warn!(target: "rebalance", id = %id, "USDC progress event missing tracking context");
         }
     }
 }

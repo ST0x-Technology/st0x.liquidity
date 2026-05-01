@@ -15,7 +15,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use task_supervisor::{SupervisedTask, TaskResult};
 use tokio::sync::Mutex;
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
 use url::Url;
 
 use crate::bindings::IOrderBookV6::{ClearV3, IOrderBookV6Instance, TakeOrderV3};
@@ -143,12 +143,13 @@ impl OrderFillMonitor {
         let trade_event = match EmittedOnChain::<RaindexTradeEvent>::from_log(event, log) {
             Ok(trade_event) => trade_event,
             Err(err) => {
-                error!(%err, "Failed to extract block inclusion metadata from log");
+                warn!(target: "hedge", %err, "Failed to extract block inclusion metadata from log");
                 return Ok(());
             }
         };
 
         trace!(
+            target: "hedge",
             tx_hash = ?trade_event.tx_hash,
             log_index = trade_event.log_index,
             "Enqueuing trade accounting job"

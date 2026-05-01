@@ -153,11 +153,15 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
             .wallet(eth_wallet)
             .connect_provider(ctx.provider);
 
+        let required_confirmations = ctx.required_confirmations;
+
+        info!(target: "wallet", %address, required_confirmations, "Turnkey wallet initialized");
+
         Ok(Self {
             provider: base_provider,
             signing_provider,
             address,
-            required_confirmations: ctx.required_confirmations,
+            required_confirmations,
         })
     }
 
@@ -221,7 +225,7 @@ where
         calldata: Bytes,
         note: &str,
     ) -> Result<TransactionReceipt, EvmError> {
-        info!(%contract, note, "Submitting Turnkey contract call");
+        info!(target: "wallet", %contract, note, "Submitting Turnkey contract call");
 
         let tx = TransactionRequest::default()
             .to(contract)
@@ -229,14 +233,14 @@ where
 
         let pending = self.signing_provider.send_transaction(tx).await?;
 
-        info!(tx_hash = %pending.tx_hash(), note, "Transaction submitted");
+        info!(target: "wallet", tx_hash = %pending.tx_hash(), note, "Transaction submitted");
 
         let receipt = pending
             .with_required_confirmations(self.required_confirmations)
             .get_receipt()
             .await?;
 
-        info!(tx_hash = %receipt.transaction_hash, note, "Transaction confirmed");
+        info!(target: "wallet", tx_hash = %receipt.transaction_hash, note, "Transaction confirmed");
 
         Ok(receipt)
     }

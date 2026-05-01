@@ -69,7 +69,7 @@ impl<W: Wallet> CctpEndpoint<W> {
             )
             .await?;
 
-        trace!(?allowance, %amount, "Checking USDC allowance");
+        trace!(target: "bridge", ?allowance, %amount, "Checking USDC allowance");
 
         if allowance < amount {
             self.wallet
@@ -94,7 +94,7 @@ impl<W: Wallet> CctpEndpoint<W> {
         direction: BridgeDirection,
         max_fee: U256,
     ) -> Result<crate::BurnReceipt, CctpError> {
-        info!(%max_fee, %amount, "Depositing for burn with fast transfer");
+        info!(target: "bridge", %max_fee, %amount, "Depositing for burn with fast transfer");
 
         let recipient_bytes32 = FixedBytes::<32>::left_padding_from(recipient.as_slice());
 
@@ -164,6 +164,7 @@ impl<W: Wallet> CctpEndpoint<W> {
             .ok_or(CctpError::MintAndWithdrawEventNotFound)?;
 
         info!(
+            target: "bridge",
             amount = %mint_event.amount,
             fee_collected = %mint_event.feeCollected,
             "Parsed MintAndWithdraw event"

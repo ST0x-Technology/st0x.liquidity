@@ -3,7 +3,7 @@ use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
 use st0x_float_macro::float;
 use std::str::FromStr;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
 use super::client::AlpacaBrokerApiClient;
@@ -527,7 +527,8 @@ pub(crate) async fn poll_crypto_order_until_filled(
                 });
             }
             _ => {
-                debug!(
+                trace!(
+                    target: "broker",
                     order_id = %order_id,
                     status = ?order.status,
                     "Crypto order still pending, waiting..."

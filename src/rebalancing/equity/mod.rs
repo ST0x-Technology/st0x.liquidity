@@ -259,7 +259,7 @@ impl CrossVenueEquityTransfer {
             )
             .await?;
 
-        info!(%symbol, %vault_deposit_tx_hash, "Mint workflow completed");
+        info!(target: "rebalance", %symbol, %vault_deposit_tx_hash, "Mint workflow completed");
         Ok(())
     }
 
@@ -267,7 +267,7 @@ impl CrossVenueEquityTransfer {
         &self,
         tokens_received: &TokensReceivedData,
     ) -> Result<(), MintError> {
-        info!(
+        info!(target: "rebalance",
             shares_minted = %tokens_received.shares_minted,
             tx_hash = %tokens_received.tx_hash,
             "Tokens received, verifying onchain"
@@ -283,7 +283,7 @@ impl CrossVenueEquityTransfer {
             )
             .await
             .inspect_err(|error| {
-                warn!(%error, "Onchain mint verification failed");
+                warn!(target: "rebalance", %error, "Onchain mint verification failed");
             })?;
 
         Ok(())
@@ -294,7 +294,7 @@ impl CrossVenueEquityTransfer {
         issuer_request_id: &IssuerRequestId,
         tokens_received: &TokensReceivedData,
     ) -> Result<(Address, U256), MintError> {
-        info!("Onchain verification passed, wrapping into ERC-4626 shares");
+        info!(target: "rebalance", "Onchain verification passed, wrapping into ERC-4626 shares");
 
         let wrapped_token = self.wrapper.lookup_derivative(&tokens_received.symbol)?;
         let (wrap_tx_hash, wrapped_shares) = self
@@ -312,7 +312,7 @@ impl CrossVenueEquityTransfer {
             )
             .await?;
 
-        info!(%wrap_tx_hash, %wrapped_shares, "Tokens wrapped, depositing to Raindex vault");
+        info!(target: "rebalance", %wrap_tx_hash, %wrapped_shares, "Tokens wrapped, depositing to Raindex vault");
         Ok((wrapped_token, wrapped_shares))
     }
 
@@ -398,7 +398,7 @@ impl CrossVenueEquityTransfer {
             .send(aggregate_id, EquityRedemptionCommand::UnwrapTokens)
             .await?;
 
-        info!("Tokens unwrapped, sending to Alpaca");
+        info!(target: "rebalance", %aggregate_id, "Tokens unwrapped, sending to Alpaca");
 
         self.redemption_store
             .send(aggregate_id, EquityRedemptionCommand::SendTokens)
@@ -426,7 +426,7 @@ impl CrossVenueEquityTransfer {
         let detected = match self.tokenizer.poll_for_redemption(tx_hash).await {
             Ok(req) => req,
             Err(error) => {
-                warn!(%error, "Polling for redemption detection failed");
+                warn!(target: "rebalance", %error, %tx_hash, "Polling for redemption detection failed");
                 let failure = match &error {
                     TokenizerError::Alpaca(AlpacaTokenizationError::PollTimeout { .. }) => {
                         DetectionFailure::Timeout
@@ -435,8 +435,9 @@ impl CrossVenueEquityTransfer {
                         status_code: other.status_code().map(|status| status.as_u16()),
                     },
                     TokenizerError::MintVerification(verification_error) => {
-                        warn!(
+                        warn!(target: "rebalance",
                             %verification_error,
+                            %tx_hash,
                             "Unexpected MintVerification error during redemption detection"
                         );
                         DetectionFailure::ApiError { status_code: None }
@@ -479,7 +480,7 @@ impl CrossVenueEquityTransfer {
         {
             Ok(req) => req,
             Err(error) => {
-                warn!(%error, "Polling for completion failed");
+                warn!(target: "rebalance", %error, %request_id, "Polling for completion failed");
                 self.redemption_store
                     .send(
                         aggregate_id,
@@ -511,7 +512,7 @@ impl CrossVenueEquityTransfer {
                 Err(RedemptionError::Rejected)
             }
             TokenizationRequestStatus::Pending => {
-                warn!("poll_redemption_until_complete returned Pending status");
+                warn!(target: "rebalance", %request_id, "poll_redemption_until_complete returned Pending status");
                 Err(RedemptionError::UnexpectedPendingStatus)
             }
         }
@@ -645,12 +646,12 @@ impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTra
     type Asset = Equity;
     type Error = MintError;
 
-    #[instrument(skip_all, fields(symbol = %asset.symbol, quantity = %asset.quantity))]
+    #[instrument(target = "rebalance", skip_all, fields(symbol = %asset.symbol, quantity = %asset.quantity))]
     async fn transfer(&self, asset: Self::Asset) -> Result<(), Self::Error> {
         let Equity { symbol, quantity } = asset;
         let issuer_request_id = IssuerRequestId::new(Uuid::new_v4().to_string());
 
-        debug!(%issuer_request_id, wallet = %self.wallet, "Requesting mint");
+        debug!(target: "rebalance", %issuer_request_id, wallet = %self.wallet, "Requesting mint");
 
         self.mint_store
             .send(
@@ -664,7 +665,7 @@ impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTra
             )
             .await?;
 
-        info!("Mint request accepted, polling for completion");
+        info!(target: "rebalance", "Mint request accepted, polling for completion");
 
         self.mint_store
             .send(&issuer_request_id, TokenizedEquityMintCommand::Poll)
@@ -683,7 +684,7 @@ impl CrossVenueTransfer<MarketMakingVenue, HedgingVenue> for CrossVenueEquityTra
     type Asset = Equity;
     type Error = RedemptionError;
 
-    #[instrument(skip_all, fields(symbol = %asset.symbol, quantity = %asset.quantity))]
+    #[instrument(target = "rebalance", skip_all, fields(symbol = %asset.symbol, quantity = %asset.quantity))]
     async fn transfer(&self, asset: Self::Asset) -> Result<(), Self::Error> {
         let Equity { symbol, quantity } = asset;
 
@@ -691,22 +692,22 @@ impl CrossVenueTransfer<MarketMakingVenue, HedgingVenue> for CrossVenueEquityTra
         let amount = quantity.to_u256_18_decimals()?;
         let aggregate_id = RedemptionAggregateId::new(Uuid::new_v4().to_string());
 
-        info!(%token, %amount, %aggregate_id, "Starting equity transfer to hedging venue");
+        info!(target: "rebalance", %token, %amount, %aggregate_id, "Starting equity transfer to hedging venue");
 
         self.withdraw_from_raindex(&aggregate_id, &symbol, quantity, token, amount)
             .await?;
 
-        info!("Withdrawn from Raindex, unwrapping and sending to Alpaca");
+        info!(target: "rebalance", "Withdrawn from Raindex, unwrapping and sending to Alpaca");
 
         let redemption_tx = self.unwrap_and_send(&aggregate_id).await?;
 
-        info!(%redemption_tx, "Tokens sent, polling for detection");
+        info!(target: "rebalance", %redemption_tx, "Tokens sent, polling for detection");
         let request_id = self.poll_detection(&aggregate_id, &redemption_tx).await?;
 
-        info!(%request_id, "Redemption detected, awaiting completion");
+        info!(target: "rebalance", %request_id, "Redemption detected, awaiting completion");
         self.poll_completion(&aggregate_id, &request_id).await?;
 
-        info!("Equity transfer to hedging venue completed successfully");
+        info!(target: "rebalance", "Equity transfer to hedging venue completed successfully");
         Ok(())
     }
 }

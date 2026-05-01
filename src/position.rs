@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use st0x_execution::{
     Direction, ExecutorOrderId, FractionalShares, HasZero, Positive, SupportedExecutor, Symbol,
@@ -267,7 +267,8 @@ impl EventSourced for Position {
                     })
                     .inspect_err(|error| {
                         warn!(
-                            %offchain_order_id, %self.symbol,
+                            target: "hedge",
+                            %offchain_order_id, symbol = %self.symbol,
                             "Order placement rejected: {error}",
                         );
                     })?;
@@ -309,6 +310,7 @@ impl EventSourced for Position {
                 self.validate_pending_execution(offchain_order_id)?;
 
                 warn!(
+                    target: "hedge",
                     %offchain_order_id, symbol = %self.symbol, %error,
                     "Offchain venue rejected"
                 );
@@ -346,7 +348,8 @@ impl Position {
             }
             ExecutionThreshold::DollarValue(threshold_dollars) => {
                 let Some(price) = self.last_price_usdc else {
-                    warn!(
+                    debug!(
+                        target: "hedge",
                         net_position = %self.net,
                         threshold_dollars = %threshold_dollars,
                         "Cannot evaluate ExecutionThreshold::DollarValue: last_price_usdc is None"
@@ -418,7 +421,8 @@ impl Position {
                 let capped_shares = shares_limit.map_or(raw_shares, |cap| {
                     let cap = cap.inner();
                     if raw_shares > cap {
-                        warn!(
+                        debug!(
+                            target: "hedge",
                             symbol = %self.symbol,
                             computed = %raw_shares,
                             limit = %cap,

@@ -88,15 +88,17 @@ fn health() -> Json<HealthResponse> {
 /// - `offset`: skip N matching entries from the newest (default 0)
 /// - `search`: case-insensitive substring filter across the raw JSON line
 /// - `level`: comma-separated log levels to include (e.g. `ERROR,WARN`)
+/// - `target`: comma-separated domain targets to include (e.g. `hedge,rebalance`)
 /// - `since`: ISO 8601 UTC lower bound (inclusive)
 /// - `until`: ISO 8601 UTC upper bound (inclusive)
-#[get("/logs?<limit>&<offset>&<search>&<level>&<since>&<until>")]
+#[get("/logs?<limit>&<offset>&<search>&<level>&<target>&<since>&<until>")]
 fn logs(
     ctx: &State<Ctx>,
     limit: Option<usize>,
     offset: Option<usize>,
     search: Option<&str>,
     level: Option<&str>,
+    target: Option<&str>,
     since: Option<&str>,
     until: Option<&str>,
 ) -> Json<LogResponse> {
@@ -118,6 +120,11 @@ fn logs(
         levels: level.filter(|lvl| !lvl.is_empty()).map(|lvl| {
             lvl.split(',')
                 .map(|part| part.trim().to_uppercase())
+                .collect()
+        }),
+        targets: target.filter(|tgt| !tgt.is_empty()).map(|tgt| {
+            tgt.split(',')
+                .map(|part| part.trim().to_lowercase())
                 .collect()
         }),
         since: since.and_then(|val| {
@@ -144,20 +151,31 @@ fn logs(
 struct LogFilter {
     search_lower: Option<String>,
     levels: Option<Vec<String>>,
+    targets: Option<Vec<String>>,
     since: Option<DateTime<Utc>>,
     until: Option<DateTime<Utc>>,
 }
 
-/// Reads log entries from `log_dir` in newest-first order, applying
-/// filters. Iterates files in reverse (newest first) and only retains
-/// entries within the requested page window to avoid loading the entire
-/// log history into memory at once.
+/// Reads log entries from `log_dir` in newest-first order, applying filters.
+///
+/// Optimizations over a naive read-all approach:
+/// - **Date-based file skipping**: log files are named with dates
+///   (e.g. `st0x-hedge.log.2026-04-27`); files outside the `since`/`until`
+///   window are skipped entirely.
+/// - **Pre-JSON string filtering**: level and search filters are applied on
+///   the raw line before the expensive `serde_json::from_str` parse.
+/// - **Streaming line reads**: files are read line-by-line via `BufReader`
+///   instead of loading the entire file into memory.
+/// - **Early termination**: once enough entries have been collected past the
+///   requested page, remaining files are skipped.
 fn read_matching_entries(
     log_dir: &str,
     filter: &LogFilter,
     offset: usize,
     limit: usize,
 ) -> (Vec<serde_json::Value>, usize, bool) {
+    use std::io::BufRead;
+
     let Ok(dir) = std::fs::read_dir(log_dir) else {
         return (Vec::new(), 0, false);
     };
@@ -172,42 +190,101 @@ fn read_matching_entries(
         })
         .collect();
 
-    // Sort by name then reverse so newest files are read first
+    // Sort by name then reverse so newest files are read first.
     log_files.sort_by_key(std::fs::DirEntry::file_name);
     log_files.reverse();
 
-    let page_start = offset;
+    // Pre-compute level filter strings for fast raw-line matching.
+    // JSON format: `"level":"INFO"` — we match this substring directly.
+    let level_needles: Option<Vec<String>> = filter.levels.as_ref().map(|levels| {
+        levels
+            .iter()
+            .map(|lvl| format!("\"level\":\"{lvl}\""))
+            .collect()
+    });
+
+    let target_needles: Option<Vec<String>> = filter.targets.as_ref().map(|targets| {
+        targets
+            .iter()
+            .map(|tgt| format!("\"target\":\"{tgt}\""))
+            .collect()
+    });
+
     let page_end = offset + limit;
     let mut total: usize = 0;
     let mut page_entries: Vec<serde_json::Value> = Vec::new();
 
-    for file_entry in log_files {
-        let Ok(content) = std::fs::read_to_string(file_entry.path()) else {
+    for file_entry in &log_files {
+        // Date-based file skipping: the date suffix (e.g. "2026-04-27")
+        // lets us skip entire files outside the time window.
+        if let Some(since) = filter.since
+            && let Some(file_date) = extract_log_file_date(file_entry)
+        {
+            let file_end_of_day = file_date
+                .and_hms_opt(23, 59, 59)
+                .map(|ndt| DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
+
+            if let Some(eod) = file_end_of_day
+                && eod < since
+            {
+                continue;
+            }
+        }
+
+        if let Some(until) = filter.until
+            && let Some(file_date) = extract_log_file_date(file_entry)
+        {
+            let file_start_of_day = file_date
+                .and_hms_opt(0, 0, 0)
+                .map(|ndt| DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
+
+            if let Some(sod) = file_start_of_day
+                && sod > until
+            {
+                continue;
+            }
+        }
+
+        let Ok(file) = std::fs::File::open(file_entry.path()) else {
             continue;
         };
+        let reader = std::io::BufReader::new(file);
 
-        // Collect matching entries from this file, then reverse so
-        // newest lines (at the end of the file) come first.
+        // Read lines into a vec for this file so we can reverse (newest last
+        // in file -> newest first for display). We only collect lines that
+        // pass the cheap string-level filters.
         let mut file_matches: Vec<serde_json::Value> = Vec::new();
 
-        for line in content.lines() {
+        for line_result in reader.lines() {
+            let Ok(line) = line_result else {
+                continue;
+            };
+
+            // Fast string-level filtering BEFORE JSON parsing.
+            if let Some(needles) = &level_needles
+                && !needles.iter().any(|needle| line.contains(needle))
+            {
+                continue;
+            }
+
+            if let Some(needles) = &target_needles
+                && !needles.iter().any(|needle| line.contains(needle))
+            {
+                continue;
+            }
+
             if let Some(query) = &filter.search_lower
                 && !line.to_lowercase().contains(query.as_str())
             {
                 continue;
             }
 
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            // Expensive: parse JSON only for lines that passed string filters.
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
             };
 
-            if let Some(levels) = &filter.levels {
-                let entry_level = value["level"].as_str().unwrap_or("").to_uppercase();
-                if !levels.contains(&entry_level) {
-                    continue;
-                }
-            }
-
+            // Time-range filter requires parsed timestamp.
             if (filter.since.is_some() || filter.until.is_some())
                 && let Some(ts_str) = value["timestamp"].as_str()
                 && let Ok(ts) = DateTime::parse_from_rfc3339(ts_str)
@@ -233,17 +310,31 @@ fn read_matching_entries(
         file_matches.reverse();
 
         for entry in file_matches {
-            if total >= page_start && page_entries.len() < limit {
+            if total >= offset && page_entries.len() < limit {
                 page_entries.push(entry);
             }
 
             total += 1;
+        }
+
+        // Early termination: if we've filled the page and have at least one
+        // extra entry (to know has_more), skip remaining files.
+        if page_entries.len() >= limit && total > page_end {
+            break;
         }
     }
 
     let has_more = total > page_end;
 
     (page_entries, total, has_more)
+}
+
+/// Extracts the date from a log filename like `st0x-hedge.log.2026-04-27`.
+fn extract_log_file_date(entry: &std::fs::DirEntry) -> Option<chrono::NaiveDate> {
+    let name = entry.file_name();
+    let name_str = name.to_str()?;
+    let date_suffix = name_str.strip_prefix("st0x-hedge.log.")?;
+    chrono::NaiveDate::parse_from_str(date_suffix, "%Y-%m-%d").ok()
 }
 
 /// Returns non-terminal offchain orders (Pending, Submitted, PartiallyFilled).
@@ -259,7 +350,7 @@ async fn pending_orders(pool: &State<SqlitePool>) -> Json<Vec<PendingOrderRespon
     {
         Ok(rows) => rows,
         Err(error) => {
-            tracing::warn!(%error, "Failed to load pending orders");
+            tracing::warn!(target: "dashboard", %error, "Failed to load pending orders");
             return Json(Vec::new());
         }
     };
@@ -422,7 +513,7 @@ async fn load_onchain_trade_rows(pool: &SqlitePool, filter: &TradeFilter) -> Vec
     {
         Ok(rows) => rows,
         Err(error) => {
-            tracing::warn!(%error, "Failed to load onchain trades");
+            tracing::warn!(target: "dashboard", %error, "Failed to load onchain trades");
             return Vec::new();
         }
     };
@@ -467,7 +558,7 @@ async fn load_offchain_trade_rows(pool: &SqlitePool, filter: &TradeFilter) -> Ve
     {
         Ok(rows) => rows,
         Err(error) => {
-            tracing::warn!(%error, "Failed to load offchain trades");
+            tracing::warn!(target: "dashboard", %error, "Failed to load offchain trades");
             return Vec::new();
         }
     };
@@ -687,7 +778,7 @@ async fn load_transfer_summary(
     {
         Ok(rows) => rows,
         Err(error) => {
-            tracing::warn!(%error, %aggregate_type, "Failed to load transfer summary");
+            tracing::warn!(target: "dashboard", %error, %aggregate_type, "Failed to load transfer summary");
             return Vec::new();
         }
     };
@@ -740,21 +831,21 @@ async fn raindex_orders(ctx: &State<Ctx>) -> RawJson<String> {
     let response = match request.send().await {
         Ok(response) => response,
         Err(error) => {
-            tracing::warn!(%error, %url, "Failed to reach st0x REST API");
+            tracing::warn!(target: "dashboard", %error, %url, "Failed to reach st0x REST API");
             return unavailable_json("REST API unreachable");
         }
     };
 
     if !response.status().is_success() {
         let status = response.status();
-        tracing::warn!(%status, %url, "st0x REST API returned error");
+        tracing::warn!(target: "dashboard", %status, %url, "st0x REST API returned error");
         return unavailable_json("REST API returned an error");
     }
 
     match response.text().await {
         Ok(body) => RawJson(body),
         Err(error) => {
-            tracing::warn!(%error, "Failed to read st0x REST API response body");
+            tracing::warn!(target: "dashboard", %error, "Failed to read st0x REST API response body");
             unavailable_json("Failed to read REST API response")
         }
     }

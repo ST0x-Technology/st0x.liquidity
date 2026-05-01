@@ -86,7 +86,7 @@ where
         {
             return decoded.into();
         }
-        debug!("Failed to decode revert data");
+        debug!(target: "wallet", "Failed to decode revert data");
     }
 
     err.into()
@@ -126,6 +126,7 @@ pub(crate) async fn decode_reverted_receipt<Registry: IntoErrorRegistry>(
                 }
                 Ok(_) => {
                     warn!(
+                        target: "wallet",
                         tx_hash = %receipt.transaction_hash,
                         "Transaction reverted but replay succeeded -- \
                          state may have changed between blocks"

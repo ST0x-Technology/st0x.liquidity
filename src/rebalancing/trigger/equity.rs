@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use alloy::primitives::Address;
 use rain_math_float::{Float, FloatError};
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 
 use st0x_execution::{FractionalShares, Positive, Symbol};
 
@@ -112,7 +112,7 @@ pub(super) async fn check_imbalance_and_build_operation(
     };
 
     let Some(imbalance) = imbalance else {
-        trace!(%symbol, "No equity imbalance detected (balanced, partial data, or inflight)");
+        trace!(target: "rebalance", %symbol, "No equity imbalance detected (balanced, partial data, or inflight)");
         return Ok(None);
     };
 
@@ -148,7 +148,8 @@ fn cap_shares(
     let cap_value = cap.inner();
 
     if quantity > cap_value {
-        warn!(
+        debug!(
+            target: "rebalance",
             %symbol,
             computed = %quantity,
             limit = %cap_value,
@@ -176,6 +177,7 @@ fn truncate_for_alpaca(
 
     if truncated != quantity {
         warn!(
+            target: "rebalance",
             %symbol,
             original = %quantity,
             truncated = %truncated,

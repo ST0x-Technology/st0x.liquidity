@@ -13,7 +13,7 @@ use serde::de::DeserializeOwned;
 use sqlx::SqlitePool;
 use std::fmt;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, warn};
 
 type Storage<Task> = SqliteStorage<
     Task,
@@ -101,7 +101,7 @@ where
 {
     const MAX_RETRIES: usize = 3;
     let label = job.label();
-    info!(%label, max_retries = MAX_RETRIES, "Starting job");
+    debug!(%label, max_retries = MAX_RETRIES, "Starting job");
 
     let result = (|| job.perform(&ctx))
         .retry(ExponentialBuilder::default().with_max_times(MAX_RETRIES))

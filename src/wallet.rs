@@ -89,8 +89,9 @@ impl OnchainWalletCtx {
         )?;
 
         info!(
+            target: "wallet",
             wallet = %base_wallet.address(),
-            "Initialized wallet"
+            "Initialized onchain wallet (Base + Ethereum)"
         );
 
         Ok(Self {

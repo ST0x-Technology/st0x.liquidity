@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use rain_math_float::Float;
 use st0x_float_macro::float;
 use tokio::task::JoinHandle;
-use tracing::warn;
+use tracing::{debug, info};
 
 /// Hardcoded mock price returned by `MockExecutor::get_order_status`.
 static MOCK_FILL_PRICE: LazyLock<Float> = LazyLock::new(|| float!(100));
@@ -107,7 +107,7 @@ impl Executor for MockExecutor {
     type Ctx = MockExecutorCtx;
 
     async fn try_from_ctx(_ctx: Self::Ctx) -> Result<Self, Self::Error> {
-        warn!("[MOCK] Initializing mock executor - always ready in dry-run mode");
+        info!(target: "broker", "[MOCK] Initializing mock executor - always ready in dry-run mode");
         Ok(Self::new())
     }
 
@@ -115,7 +115,7 @@ impl Executor for MockExecutor {
         Ok(self.market_open)
     }
 
-    #[tracing::instrument(skip(self), fields(symbol = %order.symbol, shares = %order.shares, direction = %order.direction), level = tracing::Level::INFO)]
+    #[tracing::instrument(target = "broker", skip(self), fields(symbol = %order.symbol, shares = %order.shares, direction = %order.direction), level = tracing::Level::INFO)]
     async fn place_market_order(
         &self,
         order: MarketOrder,
@@ -128,7 +128,8 @@ impl Executor for MockExecutor {
 
         let order_id = self.generate_order_id();
 
-        warn!(
+        debug!(
+            target: "broker",
             "[TEST] Would execute order: {} {} shares of {} (order_id: {})",
             order.direction, order.shares, order.symbol, order_id
         );
@@ -150,13 +151,13 @@ impl Executor for MockExecutor {
         }
 
         if let Some(ref override_state) = self.order_status_override {
-            warn!("[TEST] Checking status for order: {}", order_id);
-            warn!("[TEST] Returning overridden status: {:?}", override_state);
+            debug!(target: "broker", "[TEST] Checking status for order: {}", order_id);
+            debug!(target: "broker", "[TEST] Returning overridden status: {:?}", override_state);
             return Ok(override_state.clone());
         }
 
-        warn!("[TEST] Checking status for order: {}", order_id);
-        warn!("[TEST] Returning mock FILLED status with test price");
+        debug!(target: "broker", "[TEST] Checking status for order: {}", order_id);
+        debug!(target: "broker", "[TEST] Returning mock FILLED status with test price");
 
         // Always return filled status in test mode with mock price
         let price = *MOCK_FILL_PRICE;

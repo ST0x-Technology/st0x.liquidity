@@ -84,7 +84,8 @@ impl Job<HedgeCtx> for PlaceHedge {
                 | PositionError::ThresholdNotMet { .. }),
             ))) => {
                 info!(
-                    %self.symbol, %error,
+                    target: "hedge",
+                    symbol = %self.symbol, %error,
                     "Position rejected hedge placement, skipping"
                 );
                 return Ok(());

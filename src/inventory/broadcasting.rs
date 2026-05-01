@@ -76,7 +76,7 @@ impl Drop for BroadcastingWriteGuard<'_> {
             .sender
             .send(Statement::InventorySnapshot(Box::new(snapshot)))
         {
-            warn!("Failed to broadcast inventory snapshot: {error}");
+            warn!(target: "inventory", %error, "Failed to broadcast inventory snapshot");
         }
     }
 }

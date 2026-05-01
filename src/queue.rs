@@ -87,6 +87,7 @@ async fn enqueue_event(
     let block_timestamp_naive = log.block_timestamp.and_then(|ts| {
         let Ok(ts_i64) = i64::try_from(ts) else {
             warn!(
+                target: "hedge",
                 "Block timestamp {ts} exceeds i64::MAX, storing NULL for tx {tx_hash:#x} log_index {log_index}"
             );
             return None;
@@ -95,6 +96,7 @@ async fn enqueue_event(
         DateTime::from_timestamp(ts_i64, 0).map_or_else(
             || {
                 warn!(
+                    target: "hedge",
                     "Invalid block timestamp {ts_i64}, storing NULL for tx {tx_hash:#x} log_index {log_index}"
                 );
                 None
@@ -123,7 +125,7 @@ async fn enqueue_event(
 
 /// Gets the next unprocessed event from the queue,
 /// ordered by block number then log index.
-#[tracing::instrument(skip(pool), level = tracing::Level::DEBUG)]
+#[tracing::instrument(target = "hedge", skip(pool), level = tracing::Level::DEBUG)]
 pub(crate) async fn get_next_unprocessed_event(
     pool: &SqlitePool,
 ) -> Result<Option<QueuedEvent>, EventQueueError> {
@@ -170,7 +172,7 @@ pub(crate) async fn get_next_unprocessed_event(
 }
 
 /// Marks an event as processed in the queue
-#[tracing::instrument(skip(pool), fields(event_id), level = tracing::Level::DEBUG)]
+#[tracing::instrument(target = "hedge", skip(pool), fields(event_id), level = tracing::Level::DEBUG)]
 pub(crate) async fn mark_event_processed(
     pool: &SqlitePool,
     event_id: i64,
@@ -194,7 +196,7 @@ pub(crate) async fn mark_event_processed(
 }
 
 /// Generic function to enqueue any event that implements Enqueueable
-#[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
+#[tracing::instrument(target = "hedge", skip_all, level = tracing::Level::DEBUG)]
 pub(crate) async fn enqueue<E: Enqueueable + Sync>(
     pool: &SqlitePool,
     event: &E,
@@ -205,12 +207,13 @@ pub(crate) async fn enqueue<E: Enqueueable + Sync>(
 }
 
 /// Enqueues buffered events that were collected during coordination phase
-#[tracing::instrument(skip(pool, event_buffer), fields(buffer_size = event_buffer.len()), level = tracing::Level::INFO)]
+#[tracing::instrument(target = "hedge", skip(pool, event_buffer), fields(buffer_size = event_buffer.len()), level = tracing::Level::INFO)]
 pub(crate) async fn enqueue_buffer(
     pool: &sqlx::SqlitePool,
     event_buffer: Vec<(TradeEvent, alloy::rpc::types::Log)>,
 ) {
     info!(
+        target: "hedge",
         "Coordination Phase: Processing {} buffered events from subscription",
         event_buffer.len()
     );
@@ -231,12 +234,14 @@ pub(crate) async fn enqueue_buffer(
                     TradeEvent::ClearV3(_) => "ClearV3",
                     TradeEvent::TakeOrderV3(_) => "TakeOrderV3",
                 };
-                error!("Failed to enqueue buffered {event_type} event: {error}");
+                error!(target: "hedge", %error, event_type, "Failed to enqueue buffered event");
             }
         })
         .buffer_unordered(CONCURRENT_ENQUEUE_LIMIT)
         .collect::<Vec<_>>()
         .await;
+
+    info!(target: "hedge", "Coordination phase: all buffered events enqueued");
 }
 
 /// Gets count of unprocessed events in the queue - test utility function

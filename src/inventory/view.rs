@@ -587,6 +587,7 @@ where
                 && fetched_at < last_rebalancing
             {
                 debug!(
+                    target: "inventory",
                     ?fetched_at,
                     ?last_rebalancing,
                     "Rejecting stale snapshot that predates last rebalancing"
@@ -953,6 +954,7 @@ impl InventoryView {
         for (symbol, &quantity) in mints {
             if view.is_stale_for_symbol(symbol, fetched_at) {
                 debug!(
+                    target: "inventory",
                     %symbol,
                     ?fetched_at,
                     "Skipping mint inflight snapshot: \
@@ -971,6 +973,7 @@ impl InventoryView {
         for (symbol, &quantity) in redemptions {
             if view.is_stale_for_symbol(symbol, fetched_at) {
                 debug!(
+                    target: "inventory",
                     %symbol,
                     ?fetched_at,
                     "Skipping redemption inflight snapshot: \
@@ -1058,6 +1061,7 @@ impl InventoryView {
                 ..
             } => {
                 debug!(
+                    target: "inventory",
                     ?margin_safe_buying_power_cents,
                     "apply_snapshot_event: OffchainMarginSafeBuyingPower"
                 );

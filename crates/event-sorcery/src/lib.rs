@@ -420,6 +420,7 @@ where
                 Ok(id) => ids.push(id),
                 Err(parse_error) => {
                     tracing::warn!(
+                        target: "cqrs",
                         aggregate_id = id_str,
                         aggregate_type = Entity::AGGREGATE_TYPE,
                         ?parse_error,
@@ -479,6 +480,7 @@ where
                 Ok(id) => ids.push(id),
                 Err(parse_error) => {
                     tracing::warn!(
+                        target: "cqrs",
                         aggregate_id = id_str,
                         aggregate_type = Entity::AGGREGATE_TYPE,
                         ?parse_error,

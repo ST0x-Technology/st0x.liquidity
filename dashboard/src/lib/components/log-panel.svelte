@@ -1,14 +1,18 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import * as Card from '$lib/components/ui/card'
+  import MultiSelect from '$lib/components/multi-select.svelte'
   import { reactive } from '$lib/frp.svelte'
   import { getApiBaseUrl } from '$lib/env'
-  import { formatUtcMs, toDatetimeLocal, TIME_PRESETS, FETCH_TIMEOUT_MS, toRfc3339 } from '$lib/time'
+  import { formatUtcMs, toDatetimeLocal, TIME_PRESETS, toRfc3339 } from '$lib/time'
+
+  /** Log queries scan files on disk and can be slow at trace level. */
+  const LOGS_TIMEOUT_MS = 15_000
 
   type LogEntry = {
     timestamp: string
     level: string
-    fields: { message: string }
+    fields: Record<string, string> & { message?: string }
     target: string
     span?: { name: string }
     spans?: Array<{ name: string }>
@@ -25,6 +29,41 @@
 
   const ALL_LEVELS = ['ERROR', 'WARN', 'INFO', 'DEBUG', 'TRACE'] as const
 
+  const ALL_CATEGORIES = [
+    'bridge',
+    'broker',
+    'cqrs',
+    'dashboard',
+    'hedge',
+    'inventory',
+    'orderbook',
+    'rebalance',
+    'startup',
+    'tokenization',
+    'wallet',
+  ] as const
+
+  const ALL_CRATES = [
+    'st0x_hedge',
+    'st0x_bridge',
+    'st0x_event_sorcery',
+    'st0x_evm',
+    'st0x_execution',
+    'apalis',
+    'rocket',
+    'sqlx',
+  ] as const
+
+  const categoryOptions = ALL_CATEGORIES.map((cat) => ({
+    value: cat,
+    label: cat,
+  }))
+
+  const crateOptions = ALL_CRATES.map((crt) => ({
+    value: crt,
+    label: crt.replace('st0x_', ''),
+  }))
+
   const entries = reactive<LogEntry[]>([])
   const loading = reactive(false)
   const loadingMore = reactive(false)
@@ -33,7 +72,12 @@
   const offset = reactive(0)
   const total = reactive(0)
   const hasMore = reactive(false)
-  const selectedLevels = reactive<Set<string>>(new Set(ALL_LEVELS))
+  const DEFAULT_LEVELS = ['ERROR', 'WARN', 'INFO', 'DEBUG'] as const
+  const OUR_CRATES = ALL_CRATES.filter((crt) => crt.startsWith('st0x_'))
+
+  const selectedLevels = reactive<Set<string>>(new Set(DEFAULT_LEVELS))
+  const selectedCategories = reactive<Set<string>>(new Set(ALL_CATEGORIES))
+  const selectedCrates = reactive<Set<string>>(new Set(OUR_CRATES))
   const since = reactive('')
   const until = reactive('')
 
@@ -46,8 +90,16 @@
     const query = search.current.trim()
     if (query) params.set('search', query)
 
-    if (selectedLevels.current.size > 0 && selectedLevels.current.size < ALL_LEVELS.length) {
+    if (selectedLevels.current.size > 0) {
       params.set('level', [...selectedLevels.current].join(','))
+    }
+
+    const targetFilters = [
+      ...selectedCategories.current,
+      ...selectedCrates.current,
+    ]
+    if (targetFilters.length > 0) {
+      params.set('target', targetFilters.join(','))
     }
 
     // datetime-local values are treated as UTC directly
@@ -58,9 +110,17 @@
   }
 
   const fetchLogs = async (mode: 'replace' | 'append') => {
-    if (selectedLevels.current.size === 0) {
+    const noFilters =
+      selectedLevels.current.size === 0 ||
+      (selectedCategories.current.size === 0 && selectedCrates.current.size === 0)
+
+    if (noFilters) {
+      error.update(() => null)
+      loading.update(() => false)
+      loadingMore.update(() => false)
       entries.update(() => [])
       hasMore.update(() => false)
+      total.update(() => 0)
       return
     }
 
@@ -78,7 +138,7 @@
 
       const response = await fetch(
         `${baseUrl}/logs?${params.toString()}`,
-        { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) }
+        { signal: AbortSignal.timeout(LOGS_TIMEOUT_MS) }
       )
 
       if (!response.ok) {
@@ -120,18 +180,25 @@
     since.update(() => '')
     until.update(() => '')
     search.update(() => '')
-    selectedLevels.update(() => new Set(ALL_LEVELS))
+    selectedLevels.update(() => new Set(DEFAULT_LEVELS))
+    selectedCategories.update(() => new Set(ALL_CATEGORIES))
+    selectedCrates.update(() => new Set(OUR_CRATES))
     offset.update(() => 0)
     if (sinceInput) sinceInput.value = ''
     if (untilInput) untilInput.value = ''
     void fetchLogs('replace')
   }
 
+  const setsEqual = (set_a: Set<string>, set_b: ReadonlyArray<string>) =>
+    set_a.size === set_b.length && set_b.every((item) => set_a.has(item))
+
   const hasFilters = $derived(
     since.current !== '' ||
     until.current !== '' ||
     search.current !== '' ||
-    selectedLevels.current.size < ALL_LEVELS.length
+    !setsEqual(selectedLevels.current, DEFAULT_LEVELS) ||
+    !setsEqual(selectedCategories.current, ALL_CATEGORIES) ||
+    !setsEqual(selectedCrates.current, OUR_CRATES)
   )
 
   onMount(() => { void fetchLogs('replace') })
@@ -149,6 +216,18 @@
       offset.update(() => 0)
       void fetchLogs('replace')
     }, DEBOUNCE_MS)
+  }
+
+  const handleCategoryChange = (selected: Set<string>) => {
+    selectedCategories.update(() => selected)
+    offset.update(() => 0)
+    void fetchLogs('replace')
+  }
+
+  const handleCrateChange = (selected: Set<string>) => {
+    selectedCrates.update(() => selected)
+    offset.update(() => 0)
+    void fetchLogs('replace')
   }
 
   const toggleLevel = (level: string) => () => {
@@ -175,38 +254,88 @@
     void fetchLogs('replace')
   }
 
-  const downloadLogs = (minutes: number | null) => async () => {
-    const baseUrl = getApiBaseUrl()
-    const params = new URLSearchParams({ limit: '5000' })
+  const downloading = reactive(false)
+  const downloadProgress = reactive('')
+
+  const buildDownloadParams = (batchOffset: number, batchSize: number, minutes: number | null): URLSearchParams => {
+    const params = new URLSearchParams({
+      limit: String(batchSize),
+      offset: String(batchOffset),
+    })
+
+    if (selectedLevels.current.size > 0) {
+      params.set('level', [...selectedLevels.current].join(','))
+    }
+
+    const targetFilters = [
+      ...selectedCategories.current,
+      ...selectedCrates.current,
+    ]
+    if (targetFilters.length > 0) {
+      params.set('target', targetFilters.join(','))
+    }
 
     if (minutes !== null) {
       const sinceDate = new Date(Date.now() - minutes * 60_000)
       params.set('since', sinceDate.toISOString())
     }
 
+    return params
+  }
+
+  const downloadLogs = (minutes: number | null) => async () => {
+    downloading.update(() => true)
+    downloadProgress.update(() => 'Fetching...')
+    const baseUrl = getApiBaseUrl()
+
     try {
-      const response = await fetch(
-        `${baseUrl}/logs?${params.toString()}`,
-        { signal: AbortSignal.timeout(15_000) }
-      )
+      const allEntries: LogEntry[] = []
+      const batchSize = 5000
+      let currentOffset = 0
+      let hasMorePages = true
 
-      if (!response.ok) return
+      while (hasMorePages) {
+        const params = buildDownloadParams(currentOffset, batchSize, minutes)
 
-      const data: LogResponse = await response.json() as LogResponse
+        downloadProgress.update(() =>
+          allEntries.length === 0
+            ? 'Fetching...'
+            : `${String(allEntries.length)} entries...`,
+        )
+
+        const response = await fetch(
+          `${baseUrl}/logs?${params.toString()}`,
+          { signal: AbortSignal.timeout(60_000) },
+        )
+
+        if (!response.ok) return
+
+        const data: LogResponse = await response.json() as LogResponse
+        allEntries.push(...data.entries)
+        hasMorePages = data.hasMore
+        currentOffset += batchSize
+      }
+
+      downloadProgress.update(() => `Writing ${String(allEntries.length)} entries...`)
+
       const blob = new Blob(
-        [data.entries.map((entry) => JSON.stringify(entry)).join('\n')],
-        { type: 'application/jsonl+json' }
+        [allEntries.map((entry) => JSON.stringify(entry)).join('\n')],
+        { type: 'application/jsonl+json' },
       )
 
-      const suffix = minutes === null ? 'all' : TIME_PRESETS.find((preset) => preset.minutes === minutes)?.label ?? `${String(minutes)}m`
+      const suffix = minutes === null
+        ? 'all'
+        : TIME_PRESETS.find((preset) => preset.minutes === minutes)?.label ?? `${String(minutes)}m`
       const anchor = document.createElement('a')
       anchor.href = URL.createObjectURL(blob)
       anchor.download = `logs-${suffix}-${new Date().toISOString().slice(0, 19).replace(/:/g, '')}.jsonl`
       anchor.click()
       URL.revokeObjectURL(anchor.href)
     } catch {
-      // Download failed silently — user can retry
+      // Download failed — user can retry
     } finally {
+      downloading.update(() => false)
+      downloadProgress.update(() => '')
       showDownloadMenu = false
     }
   }
@@ -246,8 +375,8 @@
       case 'ERROR': return 'text-red-500'
       case 'WARN': return 'text-yellow-500'
       case 'INFO': return 'text-blue-400'
-      case 'DEBUG': return 'text-muted-foreground'
-      case 'TRACE': return 'text-muted-foreground/50'
+      case 'DEBUG': return 'text-cyan-400'
+      case 'TRACE': return 'text-purple-400'
       default: return ''
     }
   }
@@ -257,8 +386,14 @@
     return levelColor(level)
   }
 
-  const getMessage = (entry: LogEntry): string => {
-    return entry.fields?.message ?? JSON.stringify(entry)
+  const getContextFields = (entry: LogEntry): string => {
+    const fields = entry.fields
+    if (!fields) return ''
+
+    return Object.entries(fields)
+      .filter(([key]) => key !== 'message')
+      .map(([key, value]) => `${key}=${String(value)}`)
+      .join(' ')
   }
 
   const getTarget = (entry: LogEntry): string => {
@@ -294,10 +429,19 @@
 
         <div class="download-menu-root relative">
           <button
-            class="rounded border bg-background px-2 py-1 text-xs hover:bg-accent"
-            onclick={() => { showDownloadMenu = !showDownloadMenu }}
+            class="inline-flex items-center gap-1.5 rounded border bg-background px-2 py-1 text-xs hover:bg-accent"
+            onclick={() => { if (!downloading.current) showDownloadMenu = !showDownloadMenu }}
+            disabled={downloading.current}
           >
-            Download
+            {#if downloading.current}
+              <svg class="h-3 w-3 animate-spin" viewBox="0 0 24 24" fill="none">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+              </svg>
+              <span>{downloadProgress.current}</span>
+            {:else}
+              Download
+            {/if}
           </button>
 
           {#if showDownloadMenu}
@@ -340,6 +484,20 @@
           </button>
         {/each}
       </div>
+
+      <MultiSelect
+        label="Category"
+        options={categoryOptions}
+        selected={selectedCategories.current}
+        onchange={handleCategoryChange}
+      />
+
+      <MultiSelect
+        label="Crate"
+        options={crateOptions}
+        selected={selectedCrates.current}
+        onchange={handleCrateChange}
+      />
 
       <div class="flex items-center gap-1">
         {#each TIME_PRESETS as preset (preset.label)}
@@ -402,7 +560,10 @@
             </span>
 
             <span class="flex-1 break-all">
-              {getMessage(entry)}
+              {entry.fields?.message ?? ''}
+              {#if getContextFields(entry)}
+                <span class="text-muted-foreground"> {getContextFields(entry)}</span>
+              {/if}
             </span>
           </div>
         {/each}

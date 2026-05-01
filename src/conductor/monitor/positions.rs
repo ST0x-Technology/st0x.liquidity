@@ -98,7 +98,7 @@ where
             .filter(|(symbol, _)| self.ctx.is_trading_enabled(symbol))
             .filter(|(symbol, _)| {
                 if active_transfers.contains(symbol) {
-                    info!(%symbol, "Skipping hedge: equity transfer in progress");
+                    debug!(%symbol, "Skipping hedge: equity transfer in progress");
                     false
                 } else {
                     true

@@ -73,13 +73,13 @@ mod integration_tests;
 #[cfg(test)]
 pub mod test_utils;
 
-#[tracing::instrument(skip_all, level = tracing::Level::INFO)]
+#[tracing::instrument(skip_all, target = "startup", level = tracing::Level::INFO)]
 pub async fn run_bot_session(ctx: Ctx) -> anyhow::Result<()> {
     let (event_sender, _) = broadcast::channel::<Statement>(256);
     run_bot_session_with_event_channel(ctx, event_sender).await
 }
 
-#[tracing::instrument(skip_all, level = tracing::Level::INFO)]
+#[tracing::instrument(skip_all, target = "startup", level = tracing::Level::INFO)]
 pub async fn run_bot_session_with_event_channel(
     ctx: Ctx,
     event_sender: broadcast::Sender<Statement>,
@@ -102,7 +102,7 @@ pub async fn run_bot_session_with_event_channel(
 
     await_shutdown(server_task, bot_task).await?;
 
-    info!("Shutdown complete");
+    info!(target: "startup", "Shutdown complete");
     Ok(())
 }
 
@@ -157,13 +157,13 @@ async fn await_shutdown(
 }
 
 fn handle_ctrl_c(server_abort: &AbortHandle, bot_abort: &AbortHandle) {
-    info!("Received shutdown signal, shutting down gracefully...");
+    info!(target: "startup", "Received shutdown signal, shutting down gracefully...");
     abort_task("server", server_abort);
     abort_task("bot", bot_abort);
 }
 
 fn abort_task(name: &str, handle: &AbortHandle) {
-    info!("Aborting {name} task");
+    info!(target: "startup", name, "Aborting task");
     handle.abort();
 }
 
@@ -172,15 +172,15 @@ fn check_server_result(
 ) -> anyhow::Result<()> {
     match result {
         Ok(Ok(_)) => {
-            info!("Server completed successfully");
+            info!(target: "startup", "Server completed successfully");
             Ok(())
         }
         Ok(Err(error)) => {
-            error!("Server failed: {error}");
+            error!(target: "startup", %error, "Server failed");
             Err(anyhow::anyhow!("Server failed: {error}"))
         }
         Err(error) => {
-            error!("Server task panicked: {error}");
+            error!(target: "startup", %error, "Server task panicked");
             Err(anyhow::anyhow!("Server task panicked: {error}"))
         }
     }
@@ -189,22 +189,22 @@ fn check_server_result(
 fn check_bot_result(result: Result<anyhow::Result<()>, JoinError>) -> anyhow::Result<()> {
     match result {
         Ok(Ok(())) => {
-            info!("Bot task completed");
+            info!(target: "startup", "Bot task completed");
             Ok(())
         }
         Ok(Err(error)) => {
-            error!("Bot failed: {error}");
+            error!(target: "startup", %error, "Bot failed");
             Err(error)
         }
         Err(error) => {
-            error!("Bot task panicked: {error}");
+            error!(target: "startup", %error, "Bot task panicked");
             Err(anyhow::anyhow!("Bot task panicked: {error}"))
         }
     }
 }
 
 /// Runs a single conductor session with the configured broker executor.
-#[tracing::instrument(skip_all, level = tracing::Level::INFO)]
+#[tracing::instrument(skip_all, target = "startup", level = tracing::Level::INFO)]
 async fn run_conductor_session(
     ctx: Ctx,
     pool: SqlitePool,
@@ -215,11 +215,11 @@ async fn run_conductor_session(
 
     match result {
         Ok(()) => {
-            info!("Bot session completed successfully");
+            info!(target: "startup", "Bot session completed successfully");
             Ok(())
         }
         Err(error) => {
-            error!("Bot session failed: {error}");
+            error!(target: "startup", %error, "Bot session failed");
             Err(error)
         }
     }
@@ -233,7 +233,7 @@ async fn dispatch_to_executor(
 ) -> anyhow::Result<()> {
     match ctx.broker.clone() {
         BrokerCtx::DryRun => {
-            info!("Initializing test executor for dry-run mode");
+            info!(target: "startup", "Initializing test executor for dry-run mode");
             let executor = MockExecutorCtx.try_into_executor().await?;
             let maintenance = executor.run_executor_maintenance().await;
 
@@ -241,7 +241,7 @@ async fn dispatch_to_executor(
                 .await
         }
         BrokerCtx::AlpacaBrokerApi(alpaca_auth) => {
-            info!("Initializing Alpaca Broker API executor");
+            info!(target: "startup", "Initializing Alpaca Broker API executor");
             let executor = alpaca_auth.try_into_executor().await?;
             let maintenance = executor.run_executor_maintenance().await;
 

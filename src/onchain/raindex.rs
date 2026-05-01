@@ -156,11 +156,11 @@ impl<W: Wallet> RaindexService<W> {
             .await?;
 
         if current_allowance >= amount {
-            debug!(%token, %amount, %current_allowance, "Sufficient allowance, skipping approve");
+            debug!(target: "orderbook", %token, %amount, %current_allowance, "Sufficient allowance, skipping approve");
             return Ok(());
         }
 
-        debug!(%token, %amount, %current_allowance, spender = %self.orderbook_address, "Sending ERC20 approve");
+        debug!(target: "orderbook", %token, %amount, %current_allowance, spender = %self.orderbook_address, "Sending ERC20 approve");
 
         let receipt = self
             .evm
@@ -174,7 +174,7 @@ impl<W: Wallet> RaindexService<W> {
             )
             .await?;
 
-        info!(tx_hash = %receipt.transaction_hash, "Approve confirmed");
+        info!(target: "orderbook", tx_hash = %receipt.transaction_hash, %token, "Approve confirmed");
         Ok(())
     }
 
@@ -187,7 +187,7 @@ impl<W: Wallet> RaindexService<W> {
     ) -> Result<TxHash, RaindexError> {
         let amount_float = Float::from_fixed_decimal(amount, decimals)?;
 
-        debug!(%token, ?vault_id, %amount, "Sending deposit4");
+        debug!(target: "orderbook", %token, ?vault_id, %amount, "Sending deposit4");
 
         let calldata = IOrderBookV6::deposit4Call {
             token,
@@ -201,7 +201,7 @@ impl<W: Wallet> RaindexService<W> {
             .submit::<Registry, _>(self.orderbook_address, calldata, "deposit4 to vault")
             .await?;
 
-        info!(tx_hash = %receipt.transaction_hash, "deposit4 confirmed");
+        info!(target: "orderbook", tx_hash = %receipt.transaction_hash, %token, %amount, "deposit4 confirmed");
         Ok(receipt.transaction_hash)
     }
 
@@ -383,7 +383,7 @@ impl<W: Wallet> Raindex for RaindexService<W> {
             )
             .await?;
 
-        info!(tx_hash = %receipt.transaction_hash, "withdraw4 confirmed");
+        info!(target: "orderbook", tx_hash = %receipt.transaction_hash, %token, %target_amount, "withdraw4 confirmed");
         Ok(receipt.transaction_hash)
     }
 }

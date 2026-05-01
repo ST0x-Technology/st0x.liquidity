@@ -4,7 +4,7 @@
 use async_trait::async_trait;
 use sqlx::SqlitePool;
 use tokio::sync::broadcast;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use st0x_dto::{Statement, Trade, TradeDirection, TradingVenue};
 use st0x_event_sorcery::{EntityList, Never, Reactor, deps, load_entity};
@@ -43,19 +43,19 @@ impl Broadcaster {
 
     fn broadcast_fill(&self, trade: Trade) {
         if let Err(error) = self.sender.send(Statement::TradeFill(trade)) {
-            warn!("Failed to broadcast trade fill (no receivers): {error}");
+            debug!(target: "dashboard", %error, "Failed to broadcast trade fill (no receivers)");
         }
     }
 
     fn broadcast_position(&self, position: st0x_dto::Position) {
         if let Err(error) = self.sender.send(Statement::PositionUpdate(position)) {
-            warn!("Failed to broadcast position update (no receivers): {error}");
+            debug!(target: "dashboard", %error, "Failed to broadcast position update (no receivers)");
         }
     }
 
     fn broadcast_transfer(&self, transfer: st0x_dto::TransferOperation) {
         if let Err(error) = self.sender.send(Statement::TransferUpdate(transfer)) {
-            warn!("Failed to broadcast transfer update (no receivers): {error}");
+            debug!(target: "dashboard", %error, "Failed to broadcast transfer update (no receivers)");
         }
     }
 }
@@ -112,8 +112,8 @@ impl Reactor for Broadcaster {
                             net: position.net.inner(),
                         });
                     }
-                    Ok(None) => warn!(%id, "Position not found after event"),
-                    Err(error) => warn!(%id, ?error, "Failed to load position for broadcast"),
+                    Ok(None) => warn!(target: "dashboard", %id, "Position not found after event"),
+                    Err(error) => warn!(target: "dashboard", %id, ?error, "Failed to load position for broadcast"),
                 }
             })
             .on(|id, event| async move {
@@ -141,12 +141,14 @@ impl Reactor for Broadcaster {
                             }
                             Ok(_) => {
                                 warn!(
+                                    target: "dashboard",
                                     %id,
                                     "OffchainOrder not in Filled state after Filled event"
                                 );
                             }
                             Err(error) => {
                                 warn!(
+                                    target: "dashboard",
                                     %id, ?error,
                                     "Failed to load OffchainOrder for fill broadcast"
                                 );
@@ -162,22 +164,22 @@ impl Reactor for Broadcaster {
             .on(|id, _event| async move {
                 match load_entity::<TokenizedEquityMint>(&self.pool, &id).await {
                     Ok(Some(entity)) => self.broadcast_transfer(entity.to_dto(&id)),
-                    Ok(None) => warn!(%id, "Mint entity not found for transfer broadcast"),
-                    Err(error) => warn!(%id, ?error, "Failed to load mint for broadcast"),
+                    Ok(None) => warn!(target: "dashboard", %id, "Mint entity not found for transfer broadcast"),
+                    Err(error) => warn!(target: "dashboard", %id, ?error, "Failed to load mint for broadcast"),
                 }
             })
             .on(|id, _event| async move {
                 match load_entity::<EquityRedemption>(&self.pool, &id).await {
                     Ok(Some(entity)) => self.broadcast_transfer(entity.to_dto(&id)),
-                    Ok(None) => warn!(%id, "Redemption entity not found for broadcast"),
-                    Err(error) => warn!(%id, ?error, "Failed to load redemption for broadcast"),
+                    Ok(None) => warn!(target: "dashboard", %id, "Redemption entity not found for broadcast"),
+                    Err(error) => warn!(target: "dashboard", %id, ?error, "Failed to load redemption for broadcast"),
                 }
             })
             .on(|id, _event| async move {
                 match load_entity::<UsdcRebalance>(&self.pool, &id).await {
                     Ok(Some(entity)) => self.broadcast_transfer(entity.to_dto(&id)),
-                    Ok(None) => warn!(%id, "USDC rebalance entity not found for broadcast"),
-                    Err(error) => warn!(%id, ?error, "Failed to load rebalance for broadcast"),
+                    Ok(None) => warn!(target: "dashboard", %id, "USDC rebalance entity not found for broadcast"),
+                    Err(error) => warn!(target: "dashboard", %id, ?error, "Failed to load rebalance for broadcast"),
                 }
             })
             .exhaustive()

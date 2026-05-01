@@ -320,6 +320,7 @@ impl AlpacaTokenizationMock {
                             }
                             None => {
                                 warn!(
+                                    target: "tokenization",
                                     symbol = %req.underlying_symbol,
                                     wallet = %req.wallet_address,
                                     idx,
@@ -348,7 +349,7 @@ impl AlpacaTokenizationMock {
                     // Convert decimal quantity to U256 with 18 decimals
                     let quantity_str = format_float_with_fallback(&quantity);
                     let Ok(amount_signed) = parse_units(&quantity_str, 18) else {
-                        warn!(%wallet, ?quantity, %token_addr, "failed to parse quantity as 18-decimal units, skipping mint");
+                        warn!(target: "tokenization", %wallet, ?quantity, %token_addr, "failed to parse quantity as 18-decimal units, skipping mint");
                         continue;
                     };
                     let amount: U256 = amount_signed.into();
@@ -356,11 +357,11 @@ impl AlpacaTokenizationMock {
                     // Execute real ERC-20 transfer on Anvil
                     let token = DeployableERC20::new(token_addr, &provider);
                     let Ok(pending_tx) = token.transfer(wallet, amount).send().await else {
-                        warn!(%wallet, %amount, %token_addr, "ERC-20 transfer send failed, skipping mint");
+                        warn!(target: "tokenization", %wallet, %amount, %token_addr, "ERC-20 transfer send failed, skipping mint");
                         continue;
                     };
                     let Ok(receipt) = pending_tx.get_receipt().await else {
-                        warn!(%token_addr, "failed to get transfer receipt, skipping mint");
+                        warn!(target: "tokenization", %token_addr, "failed to get transfer receipt, skipping mint");
                         continue;
                     };
 
@@ -379,10 +380,10 @@ impl AlpacaTokenizationMock {
                                     Float::from_raw(alloy::primitives::B256::ZERO) - quantity
                                 && let Err(error) = broker.adjust_position(&symbol, delta)
                             {
-                                warn!(%error, "failed to adjust broker position after mint");
+                                warn!(target: "tokenization", %error, "failed to adjust broker position after mint");
                             }
                         } else {
-                            warn!(%token_addr, "mint transfer reverted on-chain");
+                            warn!(target: "tokenization", %token_addr, "mint transfer reverted on-chain");
                             req.status = TokenizationStatus::Failed;
                         }
                         req.needs_mint_execution = false;
@@ -437,6 +438,7 @@ async fn scan_block_for_redemptions<P: Provider>(
             let value = U256::from_be_slice(log.data().data.as_ref());
             let Ok(shares) = FractionalShares::from_u256_18_decimals(value) else {
                 warn!(
+                    target: "tokenization",
                     %value,
                     "Failed to decode redemption quantity from Transfer event value"
                 );
@@ -664,7 +666,7 @@ fn register_tokenization_requests_with_filter_endpoint(
                                                 && let Err(error) =
                                                     broker.adjust_position(&symbol, req.quantity)
                                             {
-                                                warn!(%error, "failed to adjust broker position after redemption");
+                                                warn!(target: "tokenization", %error, "failed to adjust broker position after redemption");
                                             }
 
                                             TokenizationStatus::Completed
