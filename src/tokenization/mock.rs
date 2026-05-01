@@ -68,7 +68,7 @@ enum MockTokenSymbolBehavior {
 }
 
 pub(crate) struct MockTokenizer {
-    redemption_wallet: Address,
+    redemption_wallet: Option<Address>,
     redemption_tx: TxHash,
     mint_request_outcome: MockMintRequestOutcome,
     mint_poll_outcome: MockMintPollOutcome,
@@ -87,7 +87,7 @@ pub(crate) struct MockTokenizer {
 impl MockTokenizer {
     pub(crate) fn new() -> Self {
         Self {
-            redemption_wallet: Address::random(),
+            redemption_wallet: Some(Address::random()),
             redemption_tx: TxHash::random(),
             mint_request_outcome: MockMintRequestOutcome::Pending,
             mint_poll_outcome: MockMintPollOutcome::Completed,
@@ -144,6 +144,11 @@ impl MockTokenizer {
 
     pub(crate) fn with_no_token_symbol(mut self) -> Self {
         self.token_symbol_behavior = MockTokenSymbolBehavior::None;
+        self
+    }
+
+    pub(crate) fn with_no_redemption_wallet(mut self) -> Self {
+        self.redemption_wallet = None;
         self
     }
 
@@ -217,7 +222,7 @@ impl Tokenizer for MockTokenizer {
         }
     }
 
-    fn redemption_wallet(&self) -> Address {
+    fn redemption_wallet(&self) -> Option<Address> {
         self.redemption_wallet
     }
 

@@ -83,8 +83,9 @@ pub(crate) trait Tokenizer: Send + Sync {
         id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, TokenizerError>;
 
-    /// Returns the redemption wallet address where tokens should be sent.
-    fn redemption_wallet(&self) -> Address;
+    /// Returns the redemption wallet address where tokens should be sent,
+    /// if configured.
+    fn redemption_wallet(&self) -> Option<Address>;
 
     /// Send tokens to the redemption wallet to initiate redemption.
     async fn send_for_redemption(

@@ -61,7 +61,7 @@ impl<W: Wallet> AlpacaTokenizationService<W> {
         api_key: String,
         api_secret: String,
         wallet: W,
-        redemption_wallet: Address,
+        redemption_wallet: Option<Address>,
     ) -> Self {
         let client = AlpacaTokenizationClient::new(
             base_url,
@@ -107,8 +107,8 @@ impl<W: Wallet> AlpacaTokenizationService<W> {
             .await
     }
 
-    /// Returns the redemption wallet address.
-    pub(crate) fn redemption_wallet(&self) -> Address {
+    /// Returns the redemption wallet address, if configured.
+    pub(crate) fn redemption_wallet(&self) -> Option<Address> {
         self.client.redemption_wallet
     }
 
@@ -408,6 +408,12 @@ pub(crate) enum AlpacaTokenizationError {
 
     #[error("Poll timeout after {elapsed:?}")]
     PollTimeout { elapsed: Duration },
+
+    #[error(
+        "Redemption wallet not configured — required for \
+         redemption operations"
+    )]
+    MissingRedemptionWallet,
 }
 
 impl AlpacaTokenizationError {
@@ -445,7 +451,7 @@ struct AlpacaTokenizationClient<W: Wallet> {
     api_key: String,
     api_secret: String,
     wallet: W,
-    redemption_wallet: Address,
+    redemption_wallet: Option<Address>,
 }
 
 impl<W: Wallet> AlpacaTokenizationClient<W> {
@@ -455,7 +461,7 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         api_key: String,
         api_secret: String,
         wallet: W,
-        redemption_wallet: Address,
+        redemption_wallet: Option<Address>,
     ) -> Self {
         Self {
             http_client: Client::new(),
@@ -610,12 +616,16 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         token: Address,
         amount: U256,
     ) -> Result<TxHash, AlpacaTokenizationError> {
+        let redemption_wallet = self
+            .redemption_wallet
+            .ok_or(AlpacaTokenizationError::MissingRedemptionWallet)?;
+
         let receipt = self
             .wallet
             .submit::<Registry, _>(
                 token,
                 IERC20::transferCall {
-                    to: self.redemption_wallet,
+                    to: redemption_wallet,
                     amount,
                 },
                 "ERC20 transfer for redemption",
@@ -843,7 +853,7 @@ impl<W: Wallet> Tokenizer for AlpacaTokenizationService<W> {
         Ok(Self::poll_mint_until_complete(self, id).await?)
     }
 
-    fn redemption_wallet(&self) -> Address {
+    fn redemption_wallet(&self) -> Option<Address> {
         Self::redemption_wallet(self)
     }
 
@@ -953,7 +963,7 @@ pub(crate) mod tests {
             "test_api_key".to_string(),
             "test_api_secret".to_string(),
             wallet,
-            redemption_wallet,
+            Some(redemption_wallet),
         )
     }
 
@@ -1364,7 +1374,7 @@ pub(crate) mod tests {
             "test_api_key".to_string(),
             "test_api_secret".to_string(),
             wallet,
-            TEST_REDEMPTION_WALLET,
+            Some(TEST_REDEMPTION_WALLET),
         );
 
         let transfer_amount = U256::from(100_000u64);
@@ -1405,7 +1415,7 @@ pub(crate) mod tests {
             "test_api_key".to_string(),
             "test_api_secret".to_string(),
             wallet,
-            TEST_REDEMPTION_WALLET,
+            Some(TEST_REDEMPTION_WALLET),
         );
 
         let transfer_amount = U256::from(100_000u64);

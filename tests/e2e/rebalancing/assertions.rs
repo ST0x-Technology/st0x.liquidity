@@ -187,7 +187,6 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
     let rebalancing_ctx = st0x_hedge::RebalancingCtx::with_wallets()
         .equity(ImbalanceThreshold::new(float!(0.5), float!(0.1))?)
         .usdc(usdc_rebalancing)
-        .redemption_wallet(redemption_wallet)
         .call();
 
     let wallet_ctx =
@@ -214,6 +213,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
         .trading_mode(TradingMode::Rebalancing(Box::new(rebalancing_ctx)))
         .wallet(wallet_ctx)
         .assets(assets)
+        .redemption_wallet(redemption_wallet)
         .call()
         .map_err(Into::into)
 }
@@ -275,7 +275,6 @@ where
             target: float!(0.5),
             deviation: float!(0.1),
         })
-        .redemption_wallet(Address::random())
         .call()
         .with_circle_api_base(cctp.attestation_base_url)
         .with_cctp_addresses(cctp.token_messenger, cctp.message_transmitter);
@@ -303,6 +302,7 @@ where
             }),
         })
         .inventory_poll_interval(15)
+        .redemption_wallet(Address::random())
         .call()
         .map_err(Into::into)
 }

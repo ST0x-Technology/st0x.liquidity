@@ -6,6 +6,10 @@ on:
     branches-ignore:
       - 'graphite-base/**'
 
+concurrency:
+  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}-${{ github.ref == 'refs/heads/master' && github.sha || ''}}
+  cancel-in-progress: true
+
 permissions:
   id-token: write
   contents: read
@@ -13,9 +17,6 @@ permissions:
 jobs:
   backend-validation:
     name: backend ${{ matrix.name }}
-    concurrency:
-      group: ${{ github.ref }}-backend-${{ matrix.name }}
-      cancel-in-progress: true
     runs-on: blacksmith-8vcpu-ubuntu-2404
     strategy:
       fail-fast: false
@@ -136,9 +137,6 @@ jobs:
           fi
 
   dashboard:
-    concurrency:
-      group: ${{ github.ref }}-dashboard
-      cancel-in-progress: true
     runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
@@ -200,9 +198,6 @@ jobs:
         run: nix build --impure .#st0x-dashboard
 
   hooks:
-    concurrency:
-      group: ${{ github.ref }}-flake
-      cancel-in-progress: true
     runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4

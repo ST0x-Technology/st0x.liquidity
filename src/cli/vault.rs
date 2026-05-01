@@ -246,6 +246,7 @@ mod tests {
             },
             travel_rule: None,
             rest_api: None,
+            redemption_wallet: None,
         }
     }
 
@@ -277,7 +278,6 @@ mod tests {
                         target: float!(0.5),
                         deviation: float!(0.1),
                     })
-                    .redemption_wallet(Address::ZERO)
                     .call(),
             )),
             wallet: Some(crate::wallet::OnchainWalletCtx::stub()),
@@ -288,6 +288,7 @@ mod tests {
             },
             travel_rule: None,
             rest_api: None,
+            redemption_wallet: Some(Address::ZERO),
         }
     }
 

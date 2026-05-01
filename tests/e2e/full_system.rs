@@ -112,7 +112,6 @@ fn build_full_system_ctx<P: Provider + Clone>(
             target: float!(0.5),
             deviation: float!(0.1),
         })
-        .redemption_wallet(REDEMPTION_WALLET)
         .call()
         .with_circle_api_base(cctp.attestation_base_url)
         .with_cctp_addresses(cctp.token_messenger, cctp.message_transmitter);
@@ -145,6 +144,7 @@ fn build_full_system_ctx<P: Provider + Clone>(
             rest_api_url
                 .map(|url| st0x_hedge::config::RestApiCtx::unauthenticated(url.to_string())),
         )
+        .redemption_wallet(REDEMPTION_WALLET)
         .call()
         .map_err(Into::into)
 }

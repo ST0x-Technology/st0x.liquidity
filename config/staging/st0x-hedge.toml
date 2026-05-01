@@ -1,31 +1,63 @@
+# HTTP API port for the dashboard and health checks.
 server_port = 8001
+# Minimum log level: trace, debug, info, warn, error.
 log_level = "debug"
+# Directory for rotated log files (stdout if omitted).
 log_dir = "/mnt/data/logs"
+# SQLite database path for event store, projections, and job queue.
 database_url = "sqlite:///mnt/data/st0x-hedge.db"
+# How often (seconds) Apalis purges finished background jobs.
 apalis_finished_job_cleanup_interval_secs = 3600
+# OpenTelemetry service name sent to HyperDX.
 hyperdx.service_name = "st0x-liquidity"
 
+# Slippage tolerance (basis points) for counter-trades that hedge
+# incoming orderbook fills.
 [broker]
 counter_trade_slippage_bps = 100
 
+# Travel Rule beneficiary identity for Alpaca whitelist creation.
 [broker.travel_rule]
 beneficiary_entity_name = "T0 TRADE (BVI) LTD"
 
+# On-chain orderbook settings.
 [raindex]
+# Rain Orderbook contract on Base.
 orderbook = "0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D"
-# what block to backfill from
+# Block number to start backfilling order events from.
 deployment_block = 43259507
+# Standalone mode: the address that owns orders on the orderbook.
+# Mutually exclusive with [rebalancing].
 order_owner = "0xA9C16673F65AE808688cB18952AFE3d9658C808f"
 
+# Wallet configuration (Turnkey secure enclave signing).
 [wallet]
 kind = "turnkey"
+# On-chain address controlled by the Turnkey key.
 address = "0xA9C16673F65AE808688cB18952AFE3d9658C808f"
+# Turnkey organization that owns the signing key.
 organization_id = "b100145e-7894-4c17-b3e7-160435f84803"
 
+# Alpaca tokenization settings.
+# Required when [rebalancing] is configured (used for equity redemptions).
+# Also needed for CLI commands: alpaca-redeem and transfer-equity.
+# Not needed for alpaca-tokenize or alpaca-tokenization-requests.
+#[tokenization]
+#redemption_wallet = "0x0000000000000000000000000000000000000000"
+
+# USDC vault and rebalancing settings.
 [assets.cash]
+# Raindex vault ID for USDC deposits/withdrawals.
 vault_id = "0xfab"
+# Whether automatic USDC rebalancing between venues is active.
 rebalancing = "disabled"
 # operational_limit = 0.01
+
+# Per-equity asset configuration.
+# - trading: whether the bot hedges fills for this asset.
+# - rebalancing: whether automatic equity rebalancing is active.
+# - tokenized_equity: unwrapped tTOKEN contract address on Base.
+# - tokenized_equity_derivative: wrapped wtTOKEN contract address on Base.
 
 [assets.equities.RKLB]
 trading = "enabled"

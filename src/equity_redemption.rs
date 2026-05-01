@@ -965,21 +965,26 @@ impl EventSourced for EquityRedemption {
                     let token = *underlying_token;
                     let amount = *unwrapped_amount;
 
+                    let Some(redemption_wallet) =
+                        Tokenizer::redemption_wallet(services.tokenizer.as_ref())
+                    else {
+                        warn!("Redemption wallet not configured");
+                        return Ok(vec![TransferFailed {
+                            tx_hash: None,
+                            failed_at: Utc::now(),
+                        }]);
+                    };
+
                     info!(%token, %amount, "Sending unwrapped tokens for redemption");
 
                     match Tokenizer::send_for_redemption(services.tokenizer.as_ref(), token, amount)
                         .await
                     {
-                        Ok(redemption_tx) => {
-                            let redemption_wallet =
-                                Tokenizer::redemption_wallet(services.tokenizer.as_ref());
-
-                            Ok(vec![TokensSent {
-                                redemption_wallet,
-                                redemption_tx,
-                                sent_at: Utc::now(),
-                            }])
-                        }
+                        Ok(redemption_tx) => Ok(vec![TokensSent {
+                            redemption_wallet,
+                            redemption_tx,
+                            sent_at: Utc::now(),
+                        }]),
                         Err(error) => {
                             warn!(%error, %token, %amount, "Send for redemption failed");
                             Ok(vec![TransferFailed {
@@ -1775,6 +1780,47 @@ mod tests {
         assert!(
             matches!(entity, EquityRedemption::Failed { .. }),
             "Expected Failed state after send failure, got: {entity:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_tokens_without_redemption_wallet_emits_transfer_failed() {
+        let services = EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            tokenizer: Arc::new(MockTokenizer::new().with_no_redemption_wallet()),
+            wrapper: Arc::new(MockWrapper::new()),
+        };
+
+        let store = TestStore::<EquityRedemption>::new(services);
+        let id = RedemptionAggregateId::new("no-wallet");
+
+        store
+            .send(
+                &id,
+                EquityRedemptionCommand::Redeem {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(50.25),
+                    token: Address::random(),
+                    amount: U256::from(50_250_000_000_000_000_000_u128),
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .send(&id, EquityRedemptionCommand::UnwrapTokens)
+            .await
+            .unwrap();
+
+        store
+            .send(&id, EquityRedemptionCommand::SendTokens)
+            .await
+            .unwrap();
+
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::Failed { .. }),
+            "Expected Failed state when redemption wallet is None, got: {entity:?}"
         );
     }
 

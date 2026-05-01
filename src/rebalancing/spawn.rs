@@ -209,7 +209,6 @@ mod tests {
                 target: float!(0.6),
                 deviation: float!(0.15),
             })
-            .redemption_wallet(address!("0x1234567890123456789012345678901234567890"))
             .call()
     }
 
@@ -278,7 +277,7 @@ mod tests {
             "test_key".into(),
             "test_secret".into(),
             base_wallet.clone(),
-            rebalancing_ctx.redemption_wallet,
+            Some(address!("0x1234567890123456789012345678901234567890")),
         ));
 
         let _account_mock = server.mock(|when, then| {

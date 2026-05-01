@@ -3,6 +3,10 @@ name: Rekey Terraform Secrets
 on:
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}-${{ github.ref == 'refs/heads/master' && github.sha || ''}}
+  cancel-in-progress: true
+
 permissions:
   contents: write
   pull-requests: write
