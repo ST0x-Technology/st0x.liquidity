@@ -17,6 +17,7 @@ async-trait.workspace = true
 rain-error-decoding.workspace = true
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
+tokio = { workspace = true, features = ["time"] }
 tracing.workspace = true
 url = { workspace = true, optional = true }
 

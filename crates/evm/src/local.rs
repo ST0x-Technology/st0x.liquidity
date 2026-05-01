@@ -131,13 +131,12 @@ where
             .input(calldata.into());
 
         let pending = self.signing_provider.send_transaction(tx).await?;
+        let tx_hash = *pending.tx_hash();
 
-        info!(target: "wallet", tx_hash = %pending.tx_hash(), note, "Transaction submitted");
+        info!(target: "wallet", %tx_hash, note, "Transaction submitted");
 
-        let receipt = pending
-            .with_required_confirmations(self.required_confirmations)
-            .get_receipt()
-            .await?;
+        let receipt =
+            crate::wait_for_receipt(&self.provider, tx_hash, self.required_confirmations).await?;
 
         info!(target: "wallet", tx_hash = %receipt.transaction_hash, note, "Transaction confirmed");
 

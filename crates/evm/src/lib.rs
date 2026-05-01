@@ -24,6 +24,8 @@ use async_trait::async_trait;
 use rain_error_decoding::AbiDecodedErrorType;
 use serde::Deserialize;
 use std::sync::Arc;
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+use tokio::time::{interval, timeout};
 
 pub mod error_decoding;
 pub use error_decoding::{IntoErrorRegistry, NoOpErrorRegistry, OpenChainErrorRegistry};
@@ -145,6 +147,15 @@ pub enum EvmError {
     Reverted { tx_hash: alloy::primitives::TxHash },
     #[error("wallet config parse error: {0}")]
     WalletConfigParse(Box<dyn std::error::Error + Send + Sync>),
+    #[error(
+        "timed out waiting for transaction receipt after {}s: {tx_hash}",
+        timeout_secs
+    )]
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    ReceiptTimeout {
+        tx_hash: alloy::primitives::TxHash,
+        timeout_secs: u64,
+    },
     #[cfg(feature = "local-signer")]
     #[error("invalid private key: {0}")]
     InvalidPrivateKey(#[from] alloy::signers::k256::ecdsa::Error),
@@ -441,6 +452,99 @@ async fn execute_call<Registry: IntoErrorRegistry, Call: SolCall>(
     }
 }
 
+/// Poll interval for fallback receipt polling.
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+const RECEIPT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Maximum time to wait for a transaction receipt before giving up.
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+const RECEIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Polls for a transaction receipt with confirmation depth, bypassing alloy's
+/// heartbeat-based `get_receipt()` which can hang when the WebSocket
+/// subscription misses a block.
+///
+/// The inclusion timeout applies to the **pre-inclusion** wait (receipt not
+/// yet found). Once a receipt exists, confirmation polling continues with a
+/// generous safety timeout — a mined transaction should not be reported as
+/// failed, but a completely stalled RPC must not block the wallet forever.
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+pub(crate) async fn wait_for_receipt(
+    provider: &impl Provider,
+    tx_hash: alloy::primitives::TxHash,
+    required_confirmations: u64,
+) -> Result<TransactionReceipt, EvmError> {
+    wait_for_receipt_with_config(
+        provider,
+        tx_hash,
+        required_confirmations,
+        RECEIPT_POLL_INTERVAL,
+        RECEIPT_TIMEOUT,
+        CONFIRMATION_TIMEOUT,
+    )
+    .await
+}
+
+/// Maximum time to wait for confirmation depth after a receipt is found.
+/// Generous (30 min) because the tx is already mined — we just need blocks.
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+const CONFIRMATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Parameterized version of [`wait_for_receipt`] for testability.
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+pub(crate) async fn wait_for_receipt_with_config(
+    provider: &impl Provider,
+    tx_hash: alloy::primitives::TxHash,
+    required_confirmations: u64,
+    poll_interval: std::time::Duration,
+    inclusion_timeout: std::time::Duration,
+    confirmation_timeout: std::time::Duration,
+) -> Result<TransactionReceipt, EvmError> {
+    let mut poll = interval(poll_interval);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // Phase 1: wait for inclusion (with timeout).
+    let (receipt, receipt_block) = timeout(inclusion_timeout, async {
+        loop {
+            poll.tick().await;
+
+            let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? else {
+                continue;
+            };
+
+            let Some(block) = receipt.block_number else {
+                continue;
+            };
+
+            return Ok::<_, EvmError>((receipt, block));
+        }
+    })
+    .await
+    .map_err(|_| EvmError::ReceiptTimeout {
+        tx_hash,
+        timeout_secs: inclusion_timeout.as_secs(),
+    })??;
+
+    // Phase 2: wait for confirmation depth (generous timeout).
+    timeout(confirmation_timeout, async {
+        loop {
+            let current_block = provider.get_block_number().await?;
+            let confirmations = current_block.saturating_sub(receipt_block) + 1;
+
+            if confirmations >= required_confirmations {
+                return Ok::<_, EvmError>(receipt);
+            }
+
+            poll.tick().await;
+        }
+    })
+    .await
+    .map_err(|_| EvmError::ReceiptTimeout {
+        tx_hash,
+        timeout_secs: confirmation_timeout.as_secs(),
+    })?
+}
+
 /// Read-only EVM access wrapping a bare [`Provider`].
 ///
 /// Use this when you need an [`Evm`] implementation but don't have
@@ -718,6 +822,91 @@ mod tests {
         assert!(
             matches!(error, EvmError::WalletConfigParse(_)),
             "expected WalletConfigParse error from credentials parse, got: {error:?}"
+        );
+    }
+
+    #[cfg(feature = "local-signer")]
+    #[tokio::test]
+    async fn wait_for_receipt_returns_receipt_with_single_confirmation() {
+        let anvil = Anvil::new().spawn();
+        let signer = anvil_signer(&anvil);
+        let provider = ProviderBuilder::new()
+            .wallet(signer)
+            .connect_http(anvil.endpoint_url());
+
+        let tx = TransactionRequest::default()
+            .to(Address::ZERO)
+            .value(U256::ZERO);
+        let pending = provider.send_transaction(tx).await.unwrap();
+        let tx_hash = *pending.tx_hash();
+
+        let read_provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
+
+        let receipt = wait_for_receipt(&read_provider, tx_hash, 1).await.unwrap();
+
+        assert_eq!(receipt.transaction_hash, tx_hash);
+        assert!(receipt.status());
+    }
+
+    #[cfg(feature = "local-signer")]
+    #[tokio::test]
+    async fn wait_for_receipt_times_out_for_unknown_tx() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
+
+        let fake_hash = alloy::primitives::B256::random();
+
+        let result = wait_for_receipt_with_config(
+            &provider,
+            fake_hash,
+            1,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(200),
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(EvmError::ReceiptTimeout { tx_hash, .. }) if tx_hash == fake_hash),
+            "expected ReceiptTimeout for nonexistent tx, got: {result:?}"
+        );
+    }
+
+    #[cfg(feature = "local-signer")]
+    #[tokio::test]
+    async fn wait_for_receipt_waits_for_multiple_confirmations() {
+        // Anvil with 1-second block time auto-mines blocks.
+        let anvil = Anvil::new().block_time(1).spawn();
+        let signer = anvil_signer(&anvil);
+        let provider = ProviderBuilder::new()
+            .wallet(signer)
+            .connect_http(anvil.endpoint_url());
+
+        let tx = TransactionRequest::default()
+            .to(Address::ZERO)
+            .value(U256::ZERO);
+        let pending = provider.send_transaction(tx).await.unwrap();
+        let tx_hash = *pending.tx_hash();
+
+        let read_provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
+
+        let receipt = wait_for_receipt(&read_provider, tx_hash, 3).await.unwrap();
+
+        assert_eq!(receipt.transaction_hash, tx_hash);
+
+        let current_block = read_provider.get_block_number().await.unwrap();
+        let receipt_block = receipt.block_number.unwrap();
+        let confirmations = current_block.saturating_sub(receipt_block) + 1;
+
+        assert!(
+            confirmations >= 3,
+            "expected at least 3 confirmations, got {confirmations}"
         );
     }
 }
