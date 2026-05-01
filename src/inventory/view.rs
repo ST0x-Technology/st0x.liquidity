@@ -1073,7 +1073,6 @@ impl InventoryView {
 
             EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
-            | AlpacaWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
             | BaseWalletWrappedEquity { .. } => Ok(self),
 
@@ -1160,7 +1159,6 @@ impl InventoryView {
 
             EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
-            | AlpacaWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
             | BaseWalletWrappedEquity { .. } => Ok(self),
 

@@ -957,7 +957,6 @@ impl RebalancingTrigger {
 
             EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
-            | AlpacaWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
             | BaseWalletWrappedEquity { .. } => Ok(inventory.clone()),
 
@@ -1097,7 +1096,6 @@ impl RebalancingTrigger {
 
             EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
-            | AlpacaWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
             | BaseWalletWrappedEquity { .. } => Ok(inventory.clone()),
 
@@ -1145,7 +1143,6 @@ impl RebalancingTrigger {
             }
             EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
-            | AlpacaWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
             | BaseWalletWrappedEquity { .. }
             // Buying power is display-only and doesn't feed venue balances,

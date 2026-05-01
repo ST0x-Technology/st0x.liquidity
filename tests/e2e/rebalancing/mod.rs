@@ -697,8 +697,6 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
     let onchain_price = float!(158.39);
     let broker_fill_price = float!(155.00);
     let amount_per_trade = float!(7.5);
-    let expected_alpaca_wallet_balance = float!(1250.75);
-
     let infra = TestInfra::start(
         vec![("AAPL", broker_fill_price)],
         vec![("AAPL", float!(30))],
@@ -732,9 +730,6 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
     }
 
     let current_block = infra.base_chain.provider.get_block_number().await?;
-    infra
-        .broker_service
-        .set_wallet_usdc_balance(expected_alpaca_wallet_balance);
 
     let ctx = build_usdc_rebalancing_ctx()
         .base_chain(&infra.base_chain)
@@ -830,7 +825,6 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
 
     assert_ethereum_usdc_event_exists(&infra.db_path).await?;
     assert_base_wallet_usdc_event_exists(&infra.db_path).await?;
-    assert_alpaca_wallet_usdc_event(&infra.db_path, expected_alpaca_wallet_balance).await?;
 
     bot.abort();
     Ok(())

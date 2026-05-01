@@ -28,12 +28,11 @@ mod transfer;
 mod whitelist;
 
 use alloy::primitives::{Address, TxHash};
-use rain_math_float::Float;
 use std::sync::Arc;
 use tracing::error;
 
 use st0x_execution::{AlpacaAccountId, Positive};
-use st0x_finance::{HasZero, Usdc};
+use st0x_finance::Usdc;
 
 pub(crate) use client::{AlpacaWalletClient, AlpacaWalletError};
 pub(crate) use status::PollingConfig;
@@ -139,28 +138,6 @@ impl AlpacaWalletService {
         tx_hash: &TxHash,
     ) -> Result<Transfer, AlpacaWalletError> {
         status::poll_deposit_by_tx_hash(&self.client, tx_hash, &self.polling_config).await
-    }
-
-    /// Gets the current USDC balance held in Alpaca's crypto wallet.
-    ///
-    /// If Alpaca reports no USDC wallet entry, this returns zero.
-    pub(crate) async fn get_usdc_balance(&self) -> Result<Usdc, AlpacaWalletError> {
-        let usdc = TokenSymbol::new("USDC");
-        let wallet_assets = self.client.list_wallet_assets().await?;
-
-        let Some(balance) = wallet_assets
-            .into_iter()
-            .find(|wallet_asset| wallet_asset.asset == usdc)
-            .map(|wallet_asset| wallet_asset.balance)
-        else {
-            return Ok(Usdc::ZERO);
-        };
-
-        if balance.lt(Float::zero()?)? {
-            return Err(AlpacaWalletError::NegativeUsdcBalance { balance });
-        }
-
-        Ok(Usdc::new(balance))
     }
 
     pub(crate) async fn get_wallet_address(
@@ -445,79 +422,6 @@ mod tests {
 
         assert_eq!(result.status, transfer::TransferStatus::Complete);
         status_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_get_usdc_balance_returns_wallet_balance() {
-        let server = MockServer::start();
-        let service = create_test_service(&server);
-
-        let wallets_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([
-                    {
-                        "asset": "USDC",
-                        "balance": "1250.75"
-                    }
-                ]));
-        });
-
-        let balance = service.get_usdc_balance().await.unwrap();
-
-        assert!(balance.inner().eq(float!(1250.75)).unwrap());
-        wallets_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_get_usdc_balance_returns_zero_when_wallet_missing() {
-        let server = MockServer::start();
-        let service = create_test_service(&server);
-
-        let wallets_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([
-                    {
-                        "asset": "BTC",
-                        "balance": "0.5"
-                    }
-                ]));
-        });
-
-        let balance = service.get_usdc_balance().await.unwrap();
-
-        assert_eq!(balance, Usdc::ZERO);
-        wallets_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_get_usdc_balance_rejects_negative_balance() {
-        let server = MockServer::start();
-        let service = create_test_service(&server);
-
-        let wallets_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([
-                    {
-                        "asset": "USDC",
-                        "balance": "-10"
-                    }
-                ]));
-        });
-
-        assert!(matches!(
-            service.get_usdc_balance().await.unwrap_err(),
-            AlpacaWalletError::NegativeUsdcBalance { balance } if balance.eq(float!(-10)).unwrap_or(false)
-        ));
-        wallets_mock.assert();
     }
 
     #[tokio::test]

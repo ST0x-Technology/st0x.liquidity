@@ -20,7 +20,7 @@ use st0x_execution::{
     Executor, FractionalShares, InventoryResult, SharesBlockchain, SharesConversionError, Symbol,
 };
 
-use crate::alpaca_wallet::{AlpacaWalletError, AlpacaWalletService};
+use crate::alpaca_wallet::AlpacaWalletError;
 use crate::bindings::IERC20;
 use crate::inventory::snapshot::{
     InventorySnapshot, InventorySnapshotCommand, InventorySnapshotId,
@@ -70,7 +70,6 @@ pub(crate) enum InventoryPollingError<ExecutorError> {
 pub(crate) struct WalletPollingCtx {
     pub(crate) ethereum: Arc<dyn Wallet<Provider = RootProvider>>,
     pub(crate) base: Arc<dyn Wallet<Provider = RootProvider>>,
-    pub(crate) alpaca_wallet: Arc<AlpacaWalletService>,
     pub(crate) unwrapped_equity_token_addresses: HashMap<Symbol, Address>,
     pub(crate) wrapped_equity_token_addresses: HashMap<Symbol, Address>,
 }
@@ -319,15 +318,6 @@ where
                 .await?;
         }
 
-        let usdc_balance = wallets.alpaca_wallet.get_usdc_balance().await?;
-
-        self.snapshot
-            .send(
-                snapshot_id,
-                InventorySnapshotCommand::AlpacaWalletUsdc { usdc_balance },
-            )
-            .await?;
-
         Ok(())
     }
 
@@ -548,18 +538,12 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Utc;
     use httpmock::prelude::*;
-    use serde_json::json;
     use sqlx::{Row, SqlitePool};
-    use uuid::uuid;
-
     use st0x_event_sorcery::{StoreBuilder, test_store};
     use st0x_evm::ReadOnlyEvm;
-    use st0x_execution::{
-        AlpacaAccountId, EquityPosition, FractionalShares, Inventory, MockExecutor, Symbol,
-    };
+    use st0x_execution::{EquityPosition, FractionalShares, Inventory, MockExecutor, Symbol};
 
     use super::*;
-    use crate::alpaca_wallet::{AlpacaWalletClient, AlpacaWalletError, AlpacaWalletService};
     use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::test_utils::setup_test_db;
     use crate::tokenized_equity_mint::TokenizationRequestId;
@@ -644,17 +628,6 @@ mod tests {
         }
     }
 
-    fn create_test_alpaca_wallet(server: &MockServer) -> Arc<AlpacaWalletService> {
-        let client = AlpacaWalletClient::new(
-            server.base_url(),
-            AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
-            "test_key".to_string(),
-            "test_secret".to_string(),
-        );
-
-        Arc::new(AlpacaWalletService::new_with_client(client, None))
-    }
-
     fn zero_balance_wallet_asserter(response_count: usize) -> Asserter {
         let asserter = Asserter::new();
         let zero = alloy::hex::encode_prefixed(U256::ZERO.abi_encode());
@@ -664,29 +637,17 @@ mod tests {
         asserter
     }
 
-    fn mock_alpaca_wallets_endpoint(server: &MockServer) {
-        server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([{"asset": "USDC", "balance": "0"}]));
-        });
-    }
-
     /// Creates a fully-mocked `WalletPollingCtx` where all wallets return
     /// zero balances. The `server` must outlive the returned context. Each
     /// wallet gets enough responses for up to 5 consecutive `poll_and_record`
     /// calls.
-    fn mock_wallet_polling_ctx(server: &MockServer) -> WalletPollingCtx {
+    fn mock_wallet_polling_ctx(_server: &MockServer) -> WalletPollingCtx {
         let ethereum_asserter = zero_balance_wallet_asserter(5);
         let base_asserter = zero_balance_wallet_asserter(5);
-        mock_alpaca_wallets_endpoint(server);
 
         WalletPollingCtx {
             ethereum: MockEthereumWallet::with_asserter(&ethereum_asserter),
             base: MockBaseWallet::with_asserter(&base_asserter),
-            alpaca_wallet: create_test_alpaca_wallet(server),
             unwrapped_equity_token_addresses: HashMap::new(),
             wrapped_equity_token_addresses: HashMap::new(),
         }
@@ -1467,188 +1428,6 @@ mod tests {
         };
         let expected = u256_to_usdc(raw_usdc).unwrap();
         assert_eq!(*usdc_balance, expected, "USDC balance mismatch");
-    }
-
-    #[tokio::test]
-    async fn poll_and_record_emits_alpaca_wallet_usdc_when_wallet_provided() {
-        let pool = setup_test_db().await;
-        let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
-        let (orderbook, order_owner) = test_addresses();
-        let wallet_mock_server = MockServer::start();
-        let server = MockServer::start();
-        let alpaca_wallet = create_test_alpaca_wallet(&server);
-
-        let wallets_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([
-                    {
-                        "asset": "USDC",
-                        "balance": "1250.75"
-                    }
-                ]));
-        });
-
-        let service = InventoryPollingService::new(
-            raindex_service,
-            MockExecutor::new(),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            Some(WalletPollingCtx {
-                alpaca_wallet,
-                ..mock_wallet_polling_ctx(&wallet_mock_server)
-            }),
-            None,
-        );
-
-        service.poll_and_record().await.unwrap();
-
-        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
-        let alpaca_wallet_usdc_event = events
-            .iter()
-            .find(|event| matches!(event, InventorySnapshotEvent::AlpacaWalletUsdc { .. }))
-            .expect("Expected AlpacaWalletUsdc event to be emitted");
-
-        let InventorySnapshotEvent::AlpacaWalletUsdc { usdc_balance, .. } =
-            alpaca_wallet_usdc_event
-        else {
-            panic!("Expected AlpacaWalletUsdc event, got {alpaca_wallet_usdc_event:?}");
-        };
-        assert!(usdc_balance.inner().eq(float!(1250.75)).unwrap());
-        wallets_mock.assert();
-    }
-
-    #[tracing_test::traced_test]
-    #[tokio::test]
-    async fn poll_and_record_skips_alpaca_wallet_usdc_when_no_wallet() {
-        let pool = setup_test_db().await;
-        let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
-        let (orderbook, order_owner) = test_addresses();
-
-        let service = InventoryPollingService::new(
-            raindex_service,
-            MockExecutor::new(),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            None,
-            None,
-        );
-
-        service.poll_and_record().await.unwrap();
-
-        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
-        let has_alpaca_wallet_usdc = events
-            .iter()
-            .any(|event| matches!(event, InventorySnapshotEvent::AlpacaWalletUsdc { .. }));
-
-        assert!(
-            !has_alpaca_wallet_usdc,
-            "Should NOT emit AlpacaWalletUsdc when no Alpaca wallet configured"
-        );
-        assert!(logs_contain(
-            "No wallet polling configured, skipping wallet balance polling"
-        ));
-    }
-
-    #[tokio::test]
-    async fn poll_and_record_propagates_alpaca_wallet_api_failure() {
-        let pool = setup_test_db().await;
-        let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
-        let (orderbook, order_owner) = test_addresses();
-        let wallet_mock_server = MockServer::start();
-        let server = MockServer::start();
-        let alpaca_wallet = create_test_alpaca_wallet(&server);
-
-        let wallets_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets");
-            then.status(500).json_body(json!({
-                "message": "wallet service unavailable"
-            }));
-        });
-
-        let service = InventoryPollingService::new(
-            raindex_service,
-            MockExecutor::new(),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            Some(WalletPollingCtx {
-                alpaca_wallet,
-                ..mock_wallet_polling_ctx(&wallet_mock_server)
-            }),
-            None,
-        );
-
-        let error = service.poll_and_record().await.unwrap_err();
-        assert!(matches!(
-            error,
-            InventoryPollingError::AlpacaWallet(AlpacaWalletError::ApiError { .. })
-        ));
-        wallets_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn poll_and_record_skips_unchanged_alpaca_wallet_usdc_snapshot() {
-        let pool = setup_test_db().await;
-        let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
-        let (orderbook, order_owner) = test_addresses();
-        let wallet_mock_server = MockServer::start();
-        let server = MockServer::start();
-        let alpaca_wallet = create_test_alpaca_wallet(&server);
-
-        let wallets_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([
-                    {
-                        "asset": "USDC",
-                        "balance": "12.34"
-                    }
-                ]));
-        });
-
-        let service = InventoryPollingService::new(
-            raindex_service,
-            MockExecutor::new(),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
-            orderbook,
-            order_owner,
-            Arc::new(test_store(pool.clone(), ())),
-            Some(WalletPollingCtx {
-                alpaca_wallet,
-                ..mock_wallet_polling_ctx(&wallet_mock_server)
-            }),
-            None,
-        );
-
-        service.poll_and_record().await.unwrap();
-        service.poll_and_record().await.unwrap();
-
-        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
-        let alpaca_wallet_usdc_event_count = events
-            .iter()
-            .filter(|event| matches!(event, InventorySnapshotEvent::AlpacaWalletUsdc { .. }))
-            .count();
-
-        assert_eq!(
-            alpaca_wallet_usdc_event_count, 1,
-            "Should not emit a second AlpacaWalletUsdc event when the balance is unchanged"
-        );
-        wallets_mock.assert_calls(2);
     }
 
     #[tracing_test::traced_test]

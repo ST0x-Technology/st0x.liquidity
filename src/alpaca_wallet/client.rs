@@ -1,7 +1,6 @@
 //! Authenticated HTTP transport for Alpaca Broker API wallet modules.
 
 use alloy::primitives::{Address, TxHash, hex::FromHexError};
-use rain_math_float::{Float, FloatError};
 use reqwest::{Client, Response, StatusCode};
 use thiserror::Error;
 use tracing::trace;
@@ -56,13 +55,6 @@ pub enum AlpacaWalletError {
         previous: TransferStatus,
         next: TransferStatus,
     },
-    #[error(
-        "negative USDC balance returned from Alpaca wallet API: {}",
-        st0x_float_serde::format_float_with_fallback(balance)
-    )]
-    NegativeUsdcBalance { balance: Float },
-    #[error("Float operation failed: {0}")]
-    Float(#[from] FloatError),
 }
 
 pub struct AlpacaWalletClient {

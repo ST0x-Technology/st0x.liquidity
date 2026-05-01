@@ -1317,37 +1317,6 @@ pub(crate) async fn assert_base_wallet_usdc_event_exists(
     Ok(())
 }
 
-pub(crate) async fn assert_alpaca_wallet_usdc_event(
-    db_path: &std::path::Path,
-    expected_balance: Float,
-) -> anyhow::Result<()> {
-    let pool = connect_db(db_path).await?;
-    let events = fetch_events_by_type(&pool, "InventorySnapshot").await?;
-
-    let alpaca_wallet_usdc = events
-        .iter()
-        .rev()
-        .find(|event| event.event_type == "InventorySnapshotEvent::AlpacaWalletUsdc")
-        .ok_or_else(|| anyhow::anyhow!("Missing AlpacaWalletUsdc event"))?;
-
-    let balance_str = alpaca_wallet_usdc
-        .payload
-        .get("AlpacaWalletUsdc")
-        .and_then(|value| value.get("usdc_balance"))
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| anyhow::anyhow!("AlpacaWalletUsdc payload missing usdc_balance"))?;
-    let balance = Float::parse(balance_str.to_string())
-        .unwrap_or_else(|error| panic!("Failed to parse Alpaca wallet USDC balance: {error}"));
-
-    assert!(
-        balance.eq(expected_balance).unwrap(),
-        "Expected Alpaca wallet USDC snapshot balance {expected_balance:?}, got {balance:?}"
-    );
-
-    pool.close().await;
-    Ok(())
-}
-
 #[bon::builder]
 pub(crate) async fn assert_usdc_rebalancing_flow<P: Provider>(
     expected_positions: &[ExpectedPosition],

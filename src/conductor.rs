@@ -240,7 +240,6 @@ impl Conductor {
                 let wallet_polling = crate::inventory::WalletPollingCtx {
                     ethereum: Arc::new(ethereum_wallet),
                     base: Arc::new(base_wallet),
-                    alpaca_wallet: infra.alpaca_wallet,
                     unwrapped_equity_token_addresses: base_wallet_unwrapped_equity_token_addresses(
                         &ctx,
                     ),
@@ -429,7 +428,6 @@ struct RebalancingInfrastructure {
     position_projection: Arc<Projection<Position>>,
     snapshot: Arc<Store<InventorySnapshot>>,
     rebalancer: JoinHandle<()>,
-    alpaca_wallet: Arc<AlpacaWalletService>,
     tokenizer: Arc<dyn Tokenizer>,
 }
 
@@ -655,7 +653,6 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             position_projection: built.position_projection,
             snapshot: built.snapshot,
             rebalancer: handle,
-            alpaca_wallet,
             tokenizer,
         })
     })
