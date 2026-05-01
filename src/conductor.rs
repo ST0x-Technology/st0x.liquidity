@@ -582,6 +582,9 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             wrapper.clone(),
         ));
 
+        let equity_in_progress = Arc::clone(&rebalancing_trigger.equity_in_progress);
+        let usdc_in_progress = Arc::clone(&rebalancing_trigger.usdc_in_progress);
+
         let broadcaster = Arc::new(Broadcaster::new(deps.event_sender, deps.pool.clone()));
         let manifest = QueryManifest::new(rebalancing_trigger.clone(), broadcaster);
 
@@ -646,6 +649,8 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             RaindexVaultId(usdc_vault_id),
             operation_receiver,
             frameworks,
+            equity_in_progress,
+            usdc_in_progress,
         );
 
         Ok(RebalancingInfrastructure {

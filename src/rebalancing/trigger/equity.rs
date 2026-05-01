@@ -21,8 +21,8 @@ const ALPACA_QUANTITY_MAX_DECIMAL_PLACES: u8 = 9;
 /// Why an equity trigger failed.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum EquityTriggerError {
-    #[error("token not in vault registry")]
-    TokenNotInRegistry,
+    #[error("token not in vault registry: {0}")]
+    TokenNotInRegistry(Symbol),
     #[error(transparent)]
     Imbalance(#[from] EquityImbalanceError),
     #[error(transparent)]

@@ -1,10 +1,13 @@
 //! Operation executor that routes triggered rebalancing operations to
 //! cross-venue transfer implementations.
 
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
+use st0x_execution::{FractionalShares, Symbol};
 use st0x_finance::Usdc;
 
 use super::equity::{Equity, MintError, RedemptionError};
@@ -33,6 +36,8 @@ pub(crate) struct Rebalancer {
     usdc_to_mm: Arc<UsdcToMarketMaking>,
     usdc_to_hedging: Arc<UsdcToHedging>,
     receiver: mpsc::Receiver<TriggeredOperation>,
+    equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
+    usdc_in_progress: Arc<AtomicBool>,
 }
 
 impl Rebalancer {
@@ -42,6 +47,8 @@ impl Rebalancer {
         usdc_to_mm: Arc<UsdcToMarketMaking>,
         usdc_to_hedging: Arc<UsdcToHedging>,
         receiver: mpsc::Receiver<TriggeredOperation>,
+        equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
+        usdc_in_progress: Arc<AtomicBool>,
     ) -> Self {
         Self {
             equity_to_mm,
@@ -49,6 +56,8 @@ impl Rebalancer {
             usdc_to_mm,
             usdc_to_hedging,
             receiver,
+            equity_in_progress,
+            usdc_in_progress,
         }
     }
 
@@ -67,49 +76,80 @@ impl Rebalancer {
     async fn execute(&self, operation: TriggeredOperation) {
         match operation {
             TriggeredOperation::Mint { symbol, quantity } => {
-                let log_symbol = symbol.clone();
-                self.equity_to_mm
-                    .transfer(Equity { symbol, quantity })
-                    .await
-                    .inspect_err(|error| {
-                        error!(target: "rebalance", ?error, symbol = %log_symbol, %quantity, "Equity transfer to market-making venue failed");
-                    })
-                    .ok();
+                self.execute_mint(symbol, quantity).await;
             }
 
             TriggeredOperation::Redemption {
                 symbol, quantity, ..
             } => {
-                let log_symbol = symbol.clone();
-                self.equity_to_hedging
-                    .transfer(Equity { symbol, quantity })
-                    .await
-                    .inspect_err(|error| {
-                        error!(target: "rebalance", ?error, symbol = %log_symbol, %quantity, "Equity transfer to hedging venue failed");
-                    })
-                    .ok();
+                self.execute_redemption(symbol, quantity).await;
             }
 
             TriggeredOperation::UsdcAlpacaToBase { amount } => {
-                self.usdc_to_mm
-                    .transfer(amount)
-                    .await
-                    .inspect_err(|error| {
-                        error!(target: "rebalance", ?error, %amount, "USDC transfer to market-making venue failed");
-                    })
-                    .ok();
+                if let Err(error) = self.usdc_to_mm.transfer(amount).await {
+                    error!(target: "rebalance", ?error, %amount, "USDC transfer to market-making venue failed");
+                    self.clear_usdc_in_progress();
+                }
             }
 
             TriggeredOperation::UsdcBaseToAlpaca { amount } => {
-                self.usdc_to_hedging
-                    .transfer(amount)
-                    .await
-                    .inspect_err(|error| {
-                        error!(target: "rebalance", ?error, %amount, "USDC transfer to hedging venue failed");
-                    })
-                    .ok();
+                if let Err(error) = self.usdc_to_hedging.transfer(amount).await {
+                    error!(target: "rebalance", ?error, %amount, "USDC transfer to hedging venue failed");
+                    self.clear_usdc_in_progress();
+                }
             }
         }
+    }
+
+    async fn execute_mint(&self, symbol: Symbol, quantity: FractionalShares) {
+        let log_symbol = symbol.clone();
+
+        if let Err(error) = self
+            .equity_to_mm
+            .transfer(Equity { symbol, quantity })
+            .await
+        {
+            error!(target: "rebalance", ?error, symbol = %log_symbol, %quantity, "Equity transfer to market-making venue failed");
+            self.clear_equity_in_progress(&log_symbol);
+        }
+    }
+
+    async fn execute_redemption(&self, symbol: Symbol, quantity: FractionalShares) {
+        let log_symbol = symbol.clone();
+
+        if let Err(error) = self
+            .equity_to_hedging
+            .transfer(Equity { symbol, quantity })
+            .await
+        {
+            error!(target: "rebalance", ?error, symbol = %log_symbol, %quantity, "Equity transfer to hedging venue failed");
+            self.clear_equity_in_progress(&log_symbol);
+        }
+    }
+
+    fn clear_equity_in_progress(&self, symbol: &Symbol) {
+        {
+            let mut guard = match self.equity_in_progress.write() {
+                Ok(guard) => guard,
+                Err(poison) => poison.into_inner(),
+            };
+            guard.remove(symbol);
+        }
+
+        warn!(
+            target: "rebalance",
+            %symbol,
+            "Cleared equity in-progress flag after transfer failure"
+        );
+    }
+
+    fn clear_usdc_in_progress(&self) {
+        self.usdc_in_progress.store(false, Ordering::SeqCst);
+
+        warn!(
+            target: "rebalance",
+            "Cleared USDC in-progress flag after transfer failure"
+        );
     }
 }
 
@@ -138,6 +178,8 @@ mod tests {
             Arc::clone(&usdc) as Arc<UsdcToMarketMaking>,
             Arc::clone(&usdc) as Arc<UsdcToHedging>,
             receiver,
+            Arc::new(std::sync::RwLock::new(HashSet::new())),
+            Arc::new(AtomicBool::new(false)),
         );
 
         for operation in operations {

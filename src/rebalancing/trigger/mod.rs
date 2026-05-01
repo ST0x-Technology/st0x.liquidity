@@ -1272,10 +1272,9 @@ impl RebalancingTrigger {
         &self,
         symbol: &Symbol,
     ) -> Result<Option<TriggeredOperation>, equity::EquityTriggerError> {
-        let wrapped_token = self
-            .load_token_address(symbol)
-            .await?
-            .ok_or(equity::EquityTriggerError::TokenNotInRegistry)?;
+        let wrapped_token = self.load_token_address(symbol).await?.ok_or(
+            equity::EquityTriggerError::TokenNotInRegistry(symbol.clone()),
+        )?;
 
         let unwrapped_token = self.wrapper.lookup_underlying(symbol)?;
         let vault_ratio = self.wrapper.get_ratio_for_symbol(symbol).await?;

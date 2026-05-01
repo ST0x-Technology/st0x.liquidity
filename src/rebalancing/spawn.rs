@@ -1,8 +1,9 @@
 //! Spawns the rebalancing infrastructure.
 
 use alloy::primitives::Address;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::info;
@@ -118,6 +119,8 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
         usdc_vault_id: RaindexVaultId,
         operation_receiver: mpsc::Receiver<TriggeredOperation>,
         frameworks: RebalancingCqrsFrameworks,
+        equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
+        usdc_in_progress: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
         let equity = Arc::new(CrossVenueEquityTransfer::new(
             self.raindex.clone(),
@@ -144,6 +147,8 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
             Arc::clone(&usdc) as _,
             usdc as _,
             operation_receiver,
+            equity_in_progress,
+            usdc_in_progress,
         );
 
         info!(target: "rebalance", "Rebalancing infrastructure initialized");
@@ -416,6 +421,8 @@ mod tests {
             RaindexVaultId(B256::ZERO),
             rx,
             frameworks,
+            Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
 
         tx.send(TriggeredOperation::Mint {

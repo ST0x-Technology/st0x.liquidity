@@ -574,6 +574,8 @@ async fn equity_offchain_imbalance_triggers_mint() {
         Arc::clone(&mock_usdc) as _,
         mock_usdc as _,
         receiver,
+        Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
     );
 
     // One more onchain sell triggers the CQRS -> trigger -> Mint flow now that
@@ -775,6 +777,8 @@ async fn equity_onchain_imbalance_triggers_redemption() {
         Arc::clone(&usdc) as _,
         usdc as _,
         receiver,
+        Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
     );
 
     position_cqrs
@@ -965,6 +969,8 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
         Arc::clone(&usdc) as _,
         usdc.clone() as _,
         receiver,
+        Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
     );
 
     trigger.check_and_trigger_usdc().await;
@@ -1042,6 +1048,8 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
         Arc::clone(&usdc) as _,
         usdc.clone() as _,
         receiver,
+        Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
     );
 
     trigger.check_and_trigger_usdc().await;
@@ -1176,6 +1184,8 @@ async fn mint_api_failure_produces_rejected_event() {
         Arc::clone(&mock_usdc) as _,
         mock_usdc as _,
         receiver,
+        Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
     );
 
     // One more sell triggers the CQRS -> trigger -> Mint flow
