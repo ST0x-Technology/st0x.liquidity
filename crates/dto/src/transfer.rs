@@ -158,6 +158,16 @@ impl TransferOperation {
         }
     }
 
+    /// When this transfer was initiated.
+    #[must_use]
+    pub fn started_at(&self) -> DateTime<Utc> {
+        match self {
+            Self::EquityMint(op) => op.started_at,
+            Self::EquityRedemption(op) => op.started_at,
+            Self::UsdcBridge(op) => op.started_at,
+        }
+    }
+
     /// The last time this transfer was updated.
     #[must_use]
     pub fn updated_at(&self) -> DateTime<Utc> {

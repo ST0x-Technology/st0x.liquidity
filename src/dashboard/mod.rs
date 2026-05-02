@@ -16,7 +16,7 @@ use crate::threshold::ExecutionThreshold;
 
 mod event;
 mod trade_loader;
-mod transfer_loader;
+pub(crate) mod transfer_loader;
 pub(crate) use event::Broadcaster;
 
 pub(crate) struct Broadcast {

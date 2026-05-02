@@ -1,8 +1,12 @@
 //! HTTP API endpoints for health checks, log retrieval, and order status.
 
+use std::str::FromStr;
 use std::sync::LazyLock;
 
 use chrono::{DateTime, Utc};
+use rocket::form::{self, FromFormField, ValueField};
+use rocket::http::Status;
+use rocket::request::FromParam;
 use rocket::response::content::RawJson;
 use rocket::serde::json::Json;
 use rocket::serde::{Deserialize, Serialize};
@@ -10,6 +14,36 @@ use rocket::{Route, State, get, routes};
 use sqlx::SqlitePool;
 
 use crate::config::Ctx;
+use crate::dashboard::transfer_loader::TransferKind;
+
+impl<'a> FromParam<'a> for TransferKind {
+    type Error = String;
+
+    fn from_param(param: &'a str) -> Result<Self, Self::Error> {
+        param.parse()
+    }
+}
+
+/// Comma-separated filter for transfer kinds in query parameters.
+///
+/// Parses `"equity_mint,usdc_bridge"` into `vec![EquityMint, UsdcBridge]`.
+struct TransferKindFilter(Vec<TransferKind>);
+
+impl<'v> FromFormField<'v> for TransferKindFilter {
+    fn from_value(field: ValueField<'v>) -> form::Result<'v, Self> {
+        let kinds: Result<Vec<TransferKind>, _> = field
+            .value
+            .split(',')
+            .map(str::trim)
+            .filter(|segment| !segment.is_empty())
+            .map(TransferKind::from_str)
+            .collect();
+
+        kinds
+            .map(TransferKindFilter)
+            .map_err(|error| form::Error::validation(error).into())
+    }
+}
 
 static STARTED_AT: LazyLock<DateTime<Utc>> = LazyLock::new(Utc::now);
 
@@ -603,19 +637,19 @@ async fn load_offchain_trade_rows(pool: &SqlitePool, filter: &TradeFilter) -> Ve
         .collect()
 }
 
-/// Paginated transfer history via direct SQL on the events table.
+/// Paginated transfer history using event-sourced aggregate replay.
 ///
-/// Extracts timestamps from event payloads and status from the latest
-/// event type. No event replay needed — purely SQL-based for performance.
+/// Replays transfer aggregates to produce proper DTO statuses, then
+/// applies time-range filtering and pagination.
 #[get("/transfers?<limit>&<offset>&<kind>&<since>&<until>")]
 async fn transfers_endpoint(
     pool: &State<SqlitePool>,
     limit: Option<usize>,
     offset: Option<usize>,
-    kind: Option<&str>,
+    kind: Option<TransferKindFilter>,
     since: Option<&str>,
     until: Option<&str>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, Status> {
     let limit = limit.unwrap_or(100).min(500);
     let offset = offset.unwrap_or(0);
 
@@ -630,169 +664,180 @@ async fn transfers_endpoint(
             .map(|dt| dt.with_timezone(&Utc))
     });
 
-    let kinds: Option<Vec<String>> = kind
-        .filter(|val| !val.is_empty())
-        .map(|val| val.split(',').map(|part| part.trim().to_string()).collect());
+    let kind_filter = kind.map(|filter| filter.0);
 
-    // Each aggregate type stores its "started" timestamp in the first
-    // event payload under a type-specific JSON path.
-    let type_configs: Vec<(&str, &str, &str)> = vec![
-        (
-            "TokenizedEquityMint",
-            "equity_mint",
-            "$.MintRequested.requested_at",
-        ),
-        (
-            "EquityRedemption",
-            "equity_redemption",
-            "$.WithdrawnFromRaindex.withdrawn_at",
-        ),
-        (
-            "UsdcRebalance",
-            "usdc_bridge",
-            "$.ConversionInitiated.initiated_at",
-        ),
-    ];
+    let loaded = crate::dashboard::transfer_loader::load_all_transfer_operations(
+        pool.inner(),
+        kind_filter.as_deref(),
+    )
+    .await;
 
-    let mut all_entries: Vec<serde_json::Value> = Vec::new();
+    let mut operations = loaded.operations;
 
-    for (aggregate_type, kind_label, started_path) in &type_configs {
-        if let Some(ref kind_filter) = kinds
-            && !kind_filter.iter().any(|val| val == *kind_label)
-        {
-            continue;
-        }
-
-        let rows = load_transfer_summary(pool.inner(), aggregate_type, started_path).await;
-
-        for row in rows {
-            let started_at = row.started_at.as_deref().unwrap_or("");
+    // Filter by time range
+    if since_dt.is_some() || until_dt.is_some() {
+        operations.retain(|op| {
+            let started = op.started_at();
 
             if let Some(ref since) = since_dt
-                && let Ok(ts) = DateTime::parse_from_rfc3339(started_at)
-                && ts.with_timezone(&Utc) < *since
+                && started < *since
             {
-                continue;
+                return false;
             }
+
             if let Some(ref until) = until_dt
-                && let Ok(ts) = DateTime::parse_from_rfc3339(started_at)
-                && ts.with_timezone(&Utc) > *until
+                && started > *until
             {
-                continue;
+                return false;
             }
 
-            let status = row.latest_event.split("::").last().unwrap_or("Unknown");
-
-            all_entries.push(serde_json::json!({
-                "id": row.aggregate_id,
-                "kind": kind_label,
-                "status": { "status": status },
-                "startedAt": started_at,
-                "updatedAt": row.updated_at.as_deref().unwrap_or(started_at),
-            }));
-        }
+            true
+        });
     }
 
-    // Sort newest first by startedAt
-    all_entries.sort_by(|lhs, rhs| {
-        let lhs_ts = lhs["startedAt"].as_str().unwrap_or("");
-        let rhs_ts = rhs["startedAt"].as_str().unwrap_or("");
-        rhs_ts.cmp(lhs_ts)
-    });
+    // Sort newest first
+    operations.sort_by_key(|op| std::cmp::Reverse(op.started_at()));
 
-    let filtered_total = all_entries.len();
+    let filtered_total = operations.len();
+    let start = offset.min(filtered_total);
     let end = filtered_total.min(offset + limit);
-    let entries = &all_entries[offset.min(filtered_total)..end];
     let has_more = end < filtered_total;
 
-    Json(serde_json::json!({
+    let entries: Vec<serde_json::Value> = operations[start..end]
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<_, _>>()
+        .map_err(|error| {
+            tracing::error!(
+                target: "dashboard",
+                %error,
+                "Failed to serialize transfer operation"
+            );
+            Status::InternalServerError
+        })?;
+
+    let mut response = serde_json::json!({
         "entries": entries,
         "total": filtered_total,
         "hasMore": has_more,
-    }))
+    });
+
+    if !loaded.warnings.is_empty() {
+        response["warnings"] =
+            serde_json::to_value(&loaded.warnings).unwrap_or_else(|_| serde_json::json!([]));
+    }
+
+    Ok(Json(response))
 }
 
-struct TransferSummaryRow {
-    aggregate_id: String,
-    latest_event: String,
-    started_at: Option<String>,
-    updated_at: Option<String>,
-}
+/// Returns the full event history for a single transfer aggregate.
+///
+/// The frontend uses this to populate the detail modal with tx hashes,
+/// IDs, failure reasons, and other debugging context.
+#[get("/transfers/<kind>/<aggregate_id>/events")]
+async fn transfer_events(
+    pool: &State<SqlitePool>,
+    kind: TransferKind,
+    aggregate_id: &str,
+) -> Option<Json<serde_json::Value>> {
+    let aggregate_type = kind.aggregate_type();
 
-async fn load_transfer_summary(
-    pool: &SqlitePool,
-    aggregate_type: &str,
-    started_path: &str,
-) -> Vec<TransferSummaryRow> {
-    // Get the started_at from the first event's payload, the latest
-    // event type, and the last event's timestamp for updated_at.
-    let rows: Vec<(String, String, Option<String>, Option<String>)> =
-        match sqlx::query_as(
-            "SELECT \
-                e.aggregate_id, \
-                (SELECT e2.event_type FROM events e2 \
-                 WHERE e2.aggregate_type = ?1 \
-                   AND e2.aggregate_id = e.aggregate_id \
-                 ORDER BY e2.sequence DESC LIMIT 1) AS latest_event, \
-                (SELECT COALESCE(\
-                    json_extract(e3.payload, ?2), \
-                    json_extract(e3.payload, '$.' || SUBSTR(e3.event_type, INSTR(e3.event_type, '::') + 2) || '.initiated_at'), \
-                    json_extract(e3.payload, '$.' || SUBSTR(e3.event_type, INSTR(e3.event_type, '::') + 2) || '.requested_at'), \
-                    json_extract(e3.payload, '$.' || SUBSTR(e3.event_type, INSTR(e3.event_type, '::') + 2) || '.withdrawn_at') \
-                 ) FROM events e3 \
-                 WHERE e3.aggregate_type = ?1 \
-                   AND e3.aggregate_id = e.aggregate_id \
-                 ORDER BY e3.sequence ASC LIMIT 1) AS started_at, \
-                (SELECT COALESCE(\
-                    json_extract(e4.payload, '$.' || SUBSTR(e4.event_type, INSTR(e4.event_type, '::') + 2) || '.completed_at'), \
-                    json_extract(e4.payload, '$.' || SUBSTR(e4.event_type, INSTR(e4.event_type, '::') + 2) || '.failed_at'), \
-                    json_extract(e4.payload, '$.' || SUBSTR(e4.event_type, INSTR(e4.event_type, '::') + 2) || '.deposited_at'), \
-                    json_extract(e4.payload, '$.' || SUBSTR(e4.event_type, INSTR(e4.event_type, '::') + 2) || '.confirmed_at'), \
-                    json_extract(e4.payload, '$.' || SUBSTR(e4.event_type, INSTR(e4.event_type, '::') + 2) || '.initiated_at'), \
-                    json_extract(e4.payload, '$.' || SUBSTR(e4.event_type, INSTR(e4.event_type, '::') + 2) || '.withdrawn_at'), \
-                    json_extract(e4.payload, '$.' || SUBSTR(e4.event_type, INSTR(e4.event_type, '::') + 2) || '.requested_at'), \
-                    json_extract(e4.payload, '$.' || SUBSTR(e4.event_type, INSTR(e4.event_type, '::') + 2) || '.wrapped_at'), \
-                    json_extract(e4.payload, '$.' || SUBSTR(e4.event_type, INSTR(e4.event_type, '::') + 2) || '.unwrapped_at'), \
-                    json_extract(e4.payload, '$.' || SUBSTR(e4.event_type, INSTR(e4.event_type, '::') + 2) || '.sent_at'), \
-                    json_extract(e4.payload, '$.' || SUBSTR(e4.event_type, INSTR(e4.event_type, '::') + 2) || '.bridged_at'), \
-                    json_extract(e4.payload, '$.' || SUBSTR(e4.event_type, INSTR(e4.event_type, '::') + 2) || '.deposit_confirmed_at'), \
-                    json_extract(e4.payload, '$.' || SUBSTR(e4.event_type, INSTR(e4.event_type, '::') + 2) || '.deposit_initiated_at'), \
-                    json_extract(e4.payload, '$.' || SUBSTR(e4.event_type, INSTR(e4.event_type, '::') + 2) || '.converted_at'), \
-                    json_extract(e4.payload, '$.' || SUBSTR(e4.event_type, INSTR(e4.event_type, '::') + 2) || '.burned_at'), \
-                    json_extract(e4.payload, '$.' || SUBSTR(e4.event_type, INSTR(e4.event_type, '::') + 2) || '.attested_at'), \
-                    json_extract(e4.payload, '$.' || SUBSTR(e4.event_type, INSTR(e4.event_type, '::') + 2) || '.minted_at'), \
-                    json_extract(e4.payload, '$.' || SUBSTR(e4.event_type, INSTR(e4.event_type, '::') + 2) || '.accepted_at') \
-                 ) FROM events e4 \
-                 WHERE e4.aggregate_type = ?1 \
-                   AND e4.aggregate_id = e.aggregate_id \
-                 ORDER BY e4.sequence DESC LIMIT 1) AS updated_at \
-             FROM events e \
-             WHERE e.aggregate_type = ?1 \
-             GROUP BY e.aggregate_id \
-             ORDER BY MAX(e.rowid) DESC",
-        )
-        .bind(aggregate_type)
-        .bind(started_path)
-        .fetch_all(pool)
-        .await
+    let rows: Vec<(String, String, i64)> = match sqlx::query_as(
+        "SELECT event_type, payload, sequence \
+         FROM events \
+         WHERE aggregate_type = ?1 AND aggregate_id = ?2 \
+         ORDER BY sequence ASC",
+    )
+    .bind(aggregate_type)
+    .bind(aggregate_id)
+    .fetch_all(pool.inner())
+    .await
     {
         Ok(rows) => rows,
         Err(error) => {
-            tracing::warn!(target: "dashboard", %error, %aggregate_type, "Failed to load transfer summary");
-            return Vec::new();
+            tracing::warn!(
+                target: "dashboard",
+                %error,
+                %kind,
+                %aggregate_id,
+                "Failed to load transfer event history"
+            );
+            return None;
         }
     };
 
-    rows.into_iter()
-        .map(
-            |(aggregate_id, latest_event, started_at, updated_at)| TransferSummaryRow {
-                aggregate_id,
-                latest_event,
-                started_at,
-                updated_at,
-            },
-        )
-        .collect()
+    let events: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(event_type, payload, sequence)| {
+            let step = event_type.split("::").last().unwrap_or("Unknown");
+            let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap_or_default();
+
+            // Unwrap the variant key: {"MintRequested": {fields...}} -> {fields...}
+            let inner = parsed
+                .as_object()
+                .and_then(|obj| obj.get(step).cloned())
+                .unwrap_or(parsed);
+
+            serde_json::json!({
+                "step": step,
+                "sequence": sequence,
+                "payload": inner,
+            })
+        })
+        .collect();
+
+    Some(Json(serde_json::json!({ "events": events })))
+}
+
+/// Returns the full event history for a single trade aggregate.
+///
+/// For onchain trades (Raindex), returns Filled + optional Enriched events.
+/// For offchain trades (Alpaca), returns the full order lifecycle
+/// (Placed -> Submitted -> PartiallyFilled -> Filled/Failed).
+#[get("/trades/<venue>/<aggregate_id>/events")]
+async fn trade_events(
+    pool: &State<SqlitePool>,
+    venue: &str,
+    aggregate_id: &str,
+) -> Option<Json<serde_json::Value>> {
+    let aggregate_type = match venue {
+        "raindex" => "OnChainTrade",
+        "alpaca" | "dry_run" => "OffchainOrder",
+        _ => return None,
+    };
+
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT event_type, payload, sequence \
+         FROM events \
+         WHERE aggregate_type = ?1 AND aggregate_id = ?2 \
+         ORDER BY sequence ASC",
+    )
+    .bind(aggregate_type)
+    .bind(aggregate_id)
+    .fetch_all(pool.inner())
+    .await
+    .ok()?;
+
+    let events: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(event_type, payload, sequence)| {
+            let step = event_type.split("::").last().unwrap_or("Unknown");
+            let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap_or_default();
+
+            let inner = parsed
+                .as_object()
+                .and_then(|obj| obj.get(step).cloned())
+                .unwrap_or(parsed);
+
+            serde_json::json!({
+                "step": step,
+                "sequence": sequence,
+                "payload": inner,
+            })
+        })
+        .collect();
+
+    Some(Json(serde_json::json!({ "events": events })))
 }
 
 fn unavailable_json(reason: &str) -> RawJson<String> {
@@ -857,14 +902,15 @@ pub(crate) fn routes() -> Vec<Route> {
         logs,
         pending_orders,
         trades,
+        trade_events,
         transfers_endpoint,
+        transfer_events,
         raindex_orders
     ]
 }
 
 #[cfg(test)]
 mod tests {
-    use rocket::http::Status;
     use rocket::local::asynchronous::Client;
 
     use super::*;
@@ -873,7 +919,7 @@ mod tests {
     #[test]
     fn test_num_of_routes() {
         let routes_list = routes();
-        assert_eq!(routes_list.len(), 6);
+        assert_eq!(routes_list.len(), 8);
     }
 
     #[tokio::test]

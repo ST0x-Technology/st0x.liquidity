@@ -4,7 +4,7 @@ use chrono::{Duration, Utc};
 use sqlx::SqlitePool;
 use tracing::warn;
 
-use std::fmt::Debug;
+use std::fmt::{self, Debug, Display};
 use std::str::FromStr;
 
 use st0x_dto::{TransferOperation, TransferWarning};
@@ -14,6 +14,54 @@ use st0x_finance::Id;
 use crate::equity_redemption::EquityRedemption;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
+
+/// The three categories of cross-venue transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransferKind {
+    EquityMint,
+    EquityRedemption,
+    UsdcBridge,
+}
+
+impl TransferKind {
+    /// The cqrs-es aggregate type stored in the `events` table.
+    pub(crate) fn aggregate_type(self) -> &'static str {
+        match self {
+            Self::EquityMint => "TokenizedEquityMint",
+            Self::EquityRedemption => "EquityRedemption",
+            Self::UsdcBridge => "UsdcRebalance",
+        }
+    }
+}
+
+impl Display for TransferKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EquityMint => formatter.write_str("equity_mint"),
+            Self::EquityRedemption => formatter.write_str("equity_redemption"),
+            Self::UsdcBridge => formatter.write_str("usdc_bridge"),
+        }
+    }
+}
+
+impl FromStr for TransferKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "equity_mint" => Ok(Self::EquityMint),
+            "equity_redemption" => Ok(Self::EquityRedemption),
+            "usdc_bridge" => Ok(Self::UsdcBridge),
+            other => Err(format!("unknown transfer kind: {other}")),
+        }
+    }
+}
+
+/// Result of [`load_all_transfer_operations`] including any replay warnings.
+pub(crate) struct AllTransferOperations {
+    pub(crate) operations: Vec<TransferOperation>,
+    pub(crate) warnings: Vec<TransferWarning>,
+}
 
 /// Loaded transfers split into active (in-progress) and recent (terminal).
 pub(crate) struct LoadedTransfers {
@@ -82,6 +130,106 @@ pub(crate) async fn load_transfers(pool: &SqlitePool) -> LoadedTransfers {
         recent,
         warnings: merged.warnings,
     }
+}
+
+/// Load all transfer DTOs for the REST endpoint's paginated listing.
+///
+/// Unlike [`load_transfers`] (which partitions into active/recent with a
+/// 24h cutoff for the WebSocket), this returns every transfer without
+/// filtering.  The caller handles time-range filtering and pagination.
+pub(crate) async fn load_all_transfer_operations(
+    pool: &SqlitePool,
+    kind_filter: Option<&[TransferKind]>,
+) -> AllTransferOperations {
+    let include = |kind: TransferKind| kind_filter.is_none_or(|allowed| allowed.contains(&kind));
+
+    let mut operations = Vec::new();
+    let mut warnings = Vec::new();
+
+    if include(TransferKind::EquityMint) {
+        let (ops, warns) = replay_all::<TokenizedEquityMint>(
+            pool,
+            |id| TransferWarning::MintReplayFailed {
+                id: Id::new(id.to_string()),
+            },
+            TokenizedEquityMint::to_dto,
+        )
+        .await;
+
+        operations.extend(ops);
+        warnings.extend(warns);
+    }
+
+    if include(TransferKind::EquityRedemption) {
+        let (ops, warns) = replay_all::<EquityRedemption>(
+            pool,
+            |id| TransferWarning::RedemptionReplayFailed {
+                id: Id::new(id.to_string()),
+            },
+            EquityRedemption::to_dto,
+        )
+        .await;
+
+        operations.extend(ops);
+        warnings.extend(warns);
+    }
+
+    if include(TransferKind::UsdcBridge) {
+        let (ops, warns) = replay_all::<UsdcRebalance>(
+            pool,
+            |id| TransferWarning::BridgeReplayFailed {
+                id: Id::new(id.to_string()),
+            },
+            UsdcRebalance::to_dto,
+        )
+        .await;
+
+        operations.extend(ops);
+        warnings.extend(warns);
+    }
+
+    AllTransferOperations {
+        operations,
+        warnings,
+    }
+}
+
+/// Replay every aggregate of a given type and convert to DTOs.
+///
+/// Returns both the successfully replayed operations and any warnings for
+/// aggregates that failed to load, so the caller can surface them.
+async fn replay_all<Entity>(
+    pool: &SqlitePool,
+    make_replay_warning: impl Fn(&Entity::Id) -> TransferWarning + Send + Sync,
+    convert: impl Fn(&Entity, &Entity::Id) -> TransferOperation + Send + Sync,
+) -> (Vec<TransferOperation>, Vec<TransferWarning>)
+where
+    Entity: EventSourced,
+    Entity::Id: Debug,
+    <Entity::Id as FromStr>::Err: Debug,
+{
+    let ids = match load_all_ids::<Entity>(pool).await {
+        Ok(ids) => ids,
+        Err(error) => {
+            warn!(?error, "Failed to load aggregate IDs for REST listing");
+            return (Vec::new(), Vec::new());
+        }
+    };
+
+    let mut operations = Vec::with_capacity(ids.len());
+    let mut warnings = Vec::new();
+
+    for id in &ids {
+        match replay_aggregate::<Entity, _>(pool, id, &make_replay_warning).await {
+            Ok(entity) => operations.push(convert(&entity, id)),
+            Err(warning) => {
+                warn!(?warning, "Skipping transfer in REST listing");
+                warnings.push(warning);
+            }
+        }
+    }
+
+    (operations, warnings)
 }
 
 /// Result of loading a single transfer category.
@@ -587,6 +735,88 @@ mod tests {
             loaded.warnings.is_empty(),
             "expected no warnings, got: {:?}",
             loaded.warnings
+        );
+    }
+
+    #[test]
+    fn transfer_kind_round_trips_through_display_and_parse() {
+        for kind in [
+            TransferKind::EquityMint,
+            TransferKind::EquityRedemption,
+            TransferKind::UsdcBridge,
+        ] {
+            let text = kind.to_string();
+            let parsed: TransferKind = text.parse().unwrap();
+            assert_eq!(parsed, kind);
+        }
+    }
+
+    #[test]
+    fn transfer_kind_rejects_unknown_value() {
+        assert!("invalid".parse::<TransferKind>().is_err());
+    }
+
+    #[test]
+    fn transfer_kind_maps_to_aggregate_types() {
+        assert_eq!(
+            TransferKind::EquityMint.aggregate_type(),
+            "TokenizedEquityMint"
+        );
+        assert_eq!(
+            TransferKind::EquityRedemption.aggregate_type(),
+            "EquityRedemption"
+        );
+        assert_eq!(TransferKind::UsdcBridge.aggregate_type(), "UsdcRebalance");
+    }
+
+    #[tokio::test]
+    async fn load_all_transfer_operations_returns_warnings_for_malformed_aggregate() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+
+        insert_event(
+            &pool,
+            "TokenizedEquityMint",
+            "bad-mint-1",
+            1,
+            "TokenizedEquityMintEvent::MintRequested",
+            serde_json::json!({"malformed": true}),
+        )
+        .await;
+
+        let result = load_all_transfer_operations(&pool, None).await;
+
+        assert!(result.operations.is_empty());
+        assert_eq!(result.warnings.len(), 1, "expected one warning");
+        match result.warnings.as_slice() {
+            [TransferWarning::MintReplayFailed { id }] => {
+                assert_eq!(id, &Id::<EquityMintTag>::new("bad-mint-1".to_string()));
+            }
+            other => panic!("expected MintReplayFailed, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn load_all_transfer_operations_filters_by_kind() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        seed_transfer_events(&pool).await;
+
+        let mint_only =
+            load_all_transfer_operations(&pool, Some(&[TransferKind::EquityMint])).await;
+
+        assert!(
+            mint_only
+                .operations
+                .iter()
+                .all(|op| { matches!(op, TransferOperation::EquityMint(_)) }),
+            "expected only mint operations, got: {:?}",
+            mint_only.operations
+        );
+
+        assert!(
+            !mint_only.operations.is_empty(),
+            "expected at least one mint operation"
         );
     }
 
