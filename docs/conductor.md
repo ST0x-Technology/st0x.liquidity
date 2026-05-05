@@ -47,7 +47,7 @@ SupervisorBuilder::default()
 
 ### OrderFillMonitor
 
-Defined in `src/conductor/order_fill_monitor.rs`. Subscribes to
+Defined in `src/conductor/monitor/order_fills.rs`. Subscribes to
 ClearV3/TakeOrderV3 WebSocket streams and pushes each event into the
 `DexTradeAccountingJobQueue` as an `AccountForDexTrade` job.
 
@@ -56,6 +56,7 @@ struct OrderFillMonitor {
     ws_url: Url,
     orderbook: Address,
     job_queue: DexTradeAccountingJobQueue,
+    dex_streams: Arc<Mutex<Option<DexEventStreams>>>,
 }
 ```
 
