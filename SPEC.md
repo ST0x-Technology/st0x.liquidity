@@ -629,11 +629,13 @@ implementation. Solutions will be developed in later iterations.
 
 ## DDD/CQRS/ES Architecture
 
-The system uses Domain-Driven Design with CQRS and Event Sourcing. All state is
-derived from an immutable event log.
+The system uses Domain-Driven Design with CQRS and Event Sourcing. Audit state
+is derived from retained immutable event streams; compactable observational
+state may use snapshots as the durable source for pre-compaction history.
 
-- **Complete history**: Every state change is a fact with timestamp and sequence
-- **Reproducible state**: Replay facts to rebuild any view
+- **Complete audit history**: Every retained state change is a fact with
+  timestamp and sequence
+- **Reproducible audit state**: Replay retained facts to rebuild any audit view
 - **Temporal queries**: "What was the position at any point in time?"
 - **Zero-downtime projections**: Add new views by replaying existing events
 - **Testable business logic**: Given-When-Then tests validate rules without
@@ -642,9 +644,34 @@ derived from an immutable event log.
 
 ### Architecture
 
-- **Event Store**: Immutable append-only log (single source of truth)
+- **Event Store**: Immutable append-only log for retained event streams
 - **Snapshots**: Performance optimization for aggregate reconstruction
 - **Views**: Materialized projections optimized for queries
+
+Financial audit aggregates retain every event indefinitely. Compaction is
+allowed only by the compaction eligibility policy below.
+
+#### Compaction Eligibility Policy
+
+An aggregate may opt into event compaction only when all of these are true:
+
+- The aggregate type is explicitly allowed by this spec.
+- The aggregate records observational state fetched from external systems, not a
+  financial operation initiated by the bot.
+- Historical events older than the latest aggregate snapshot are not needed for
+  audit, regulatory review, reconciliation, or projection rebuilds.
+- The aggregate can be reconstructed from the `snapshots` table plus newer
+  events, or it has a documented external/snapshot-aware rebuild path.
+- Enabling compaction is reviewed in the PR that sets
+  `COMPACTION_POLICY = CompactAfterSnapshot` for that aggregate.
+
+Eligible aggregate types:
+
+- `InventorySnapshot`: enabled for compaction.
+- `VaultRegistry`: eligible only if a future PR also provides a snapshot-aware
+  projection rebuild path.
+
+All other aggregates retain events unless this section is updated first.
 
 **Grafana Dashboard Strategy**: Views use SQLite generated columns to expose
 JSON fields as queryable columns. Specialized views can pre-compute complex
@@ -654,9 +681,11 @@ metrics, simplifying dashboard queries.
 
 #### Event Sourcing Pattern
 
-All state changes are captured as immutable domain events. The event store is
-the single source of truth. All other data (views, snapshots) is derived and can
-be rebuilt at any time.
+All audit-relevant state changes are captured as immutable domain events. The
+event store is the immutable append-only source of truth for retained event
+streams. Views and snapshots are derived from retained event streams;
+observational aggregates may use snapshots as the durable source for compacted
+pre-snapshot history only when allowed by the compaction eligibility policy.
 
 ##### Key Flow
 

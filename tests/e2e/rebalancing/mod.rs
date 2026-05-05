@@ -61,6 +61,69 @@ fn count_tokenization_requests(
         .count()
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct StoredSnapshot {
+    last_sequence: i64,
+    payload: String,
+}
+
+async fn latest_inventory_snapshot(
+    pool: &sqlx::SqlitePool,
+) -> anyhow::Result<Option<StoredSnapshot>> {
+    let snapshot = sqlx::query_as::<_, StoredSnapshot>(
+        "SELECT last_sequence, payload \
+         FROM snapshots \
+         WHERE aggregate_type = 'InventorySnapshot' \
+         ORDER BY last_sequence DESC \
+         LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(snapshot)
+}
+
+fn snapshot_has_inflight_mint(snapshot: &StoredSnapshot, symbol: &str) -> anyhow::Result<bool> {
+    let payload: serde_json::Value = serde_json::from_str(&snapshot.payload)?;
+    let live = payload.get("Live").unwrap_or(&payload);
+    let has_symbol = live
+        .get("inflight_mints")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|mints| mints.contains_key(symbol));
+
+    Ok(has_symbol)
+}
+
+async fn poll_for_inflight_mint_snapshot(
+    bot: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+    db_path: &std::path::Path,
+    symbol: &str,
+    timeout: Duration,
+) -> anyhow::Result<StoredSnapshot> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let context = format!("InventorySnapshot snapshot with inflight mint for {symbol}");
+
+    loop {
+        sleep_or_crash(bot, &context).await;
+
+        if let Ok(pool) = connect_db(db_path).await {
+            let snapshot = latest_inventory_snapshot(&pool).await?;
+            pool.close().await;
+
+            if let Some(snapshot) = snapshot
+                && snapshot_has_inflight_mint(&snapshot, symbol)?
+            {
+                return Ok(snapshot);
+            }
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Timed out after {timeout:?} waiting for {context}",
+        );
+    }
+}
+
 /// Control test: direct high-precision sell-side Raindex prices should not
 /// break equity rebalancing. This avoids buy-side reciprocal math and verifies
 /// that direct decimal price literals do not block the mint pipeline.
@@ -1363,45 +1426,43 @@ async fn inflight_polling_emits_events_for_pending_requests() -> anyhow::Result<
 
     let mut bot = spawn_bot(ctx);
 
-    // Wait for at least one InflightEquity event to be emitted.
-    poll_for_events_with_timeout(
+    // Poll the snapshot table for inflight data instead of the events
+    // table, because compaction may delete the event before we observe
+    // it. The snapshot is the durable record.
+    poll_for_snapshot_field(
         &mut bot,
         &infra.db_path,
-        "InventorySnapshotEvent::InflightEquity",
-        1,
+        "InventorySnapshot",
+        "inflight_mints",
         Duration::from_secs(30),
     )
     .await;
 
     let pool = connect_db(&infra.db_path).await?;
 
-    // Verify InflightEquity events were emitted.
-    let snapshot_events = fetch_events_by_type(&pool, "InventorySnapshot").await?;
-    let inflight_events: Vec<_> = snapshot_events
-        .iter()
-        .filter(|event| event.event_type == "InventorySnapshotEvent::InflightEquity")
-        .collect();
-    assert!(
-        !inflight_events.is_empty(),
-        "Expected at least 1 InflightEquity event from polling"
-    );
+    // Verify the snapshot contains the injected pending mint for AAPL
+    // with the exact quantity we injected (25 shares).
+    let snapshot_payload: (String,) = sqlx::query_as(
+        "SELECT payload FROM snapshots \
+         WHERE aggregate_type = 'InventorySnapshot' LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await?;
+    let snapshot: serde_json::Value = serde_json::from_str(&snapshot_payload.0)?;
 
-    // Verify the first InflightEquity event payload contains the injected
-    // pending mint for AAPL with the exact quantity we injected (25 shares).
-    let payload = &inflight_events[0].payload;
-    let inner = payload
-        .get("InflightEquity")
-        .expect("Event payload should be wrapped in InflightEquity variant");
-    let mints = inner
-        .get("mints")
-        .expect("InflightEquity should contain mints field");
+    let live = snapshot
+        .get("Live")
+        .expect("Snapshot should be in Live state");
+    let mints = live
+        .get("inflight_mints")
+        .expect("Snapshot should contain inflight_mints");
     let aapl_quantity = mints
         .get("AAPL")
-        .expect("InflightEquity mints should contain AAPL from the injected pending request");
+        .expect("inflight_mints should contain AAPL from the injected pending request");
     assert_eq!(
         aapl_quantity.as_str().unwrap(),
         "25",
-        "InflightEquity mint quantity for AAPL should match the injected \
+        "inflight_mints quantity for AAPL should match the injected \
          pending request (25 shares), got: {aapl_quantity}"
     );
 
@@ -1808,22 +1869,18 @@ async fn interrupted_redemption_resumes_after_restart() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Inflight state survives bot restart via CQRS event replay.
+/// Inflight state survives bot restart via CQRS snapshots.
 ///
 /// When the bot restarts against the same database, the CQRS aggregate
-/// replays all previous events including `InflightEquity`. The trigger's
-/// `on_snapshot` handler processes the replayed events and restores the
-/// inflight state in the `InventoryView`.
+/// restores compacted `InventorySnapshot` state from the latest snapshot.
 ///
 /// This test:
-/// 1. Starts a bot, lets it poll and emit `InflightEquity` with a pending
+/// 1. Starts a bot, lets it poll and persist inflight state with a pending
 ///    mint
 /// 2. Stops the bot
 /// 3. Starts a new bot on the same database
-/// 4. Verifies the second bot starts successfully (CQRS replay doesn't
-///    crash) and continues emitting snapshot events (is functional)
-/// 5. Verifies dedup: the aggregate suppresses duplicate InflightEquity
-///    events when the pending request state hasn't changed
+/// 4. Verifies the second bot starts successfully and the inflight state
+///    is still present after restart
 #[test_log::test(tokio::test)]
 async fn inflight_state_survives_restart() -> anyhow::Result<()> {
     let broker_fill_price = float!("150.00");
@@ -1860,7 +1917,7 @@ async fn inflight_state_survives_restart() -> anyhow::Result<()> {
     let cash_vault_id = prepared.input_vault_id;
     let equity_vault_ids = HashMap::from([("AAPL".to_owned(), prepared.output_vault_id)]);
 
-    // --- First bot: let it poll and emit InflightEquity events ---
+    // --- First bot: let it poll and snapshot inflight equity ---
     let ctx1 = build_rebalancing_ctx()
         .chain(&infra.base_chain)
         .broker(&infra.broker_service)
@@ -1876,30 +1933,11 @@ async fn inflight_state_survives_restart() -> anyhow::Result<()> {
 
     let mut bot1 = spawn_bot(ctx1);
 
-    // Wait for at least one InflightEquity event from the first bot.
-    poll_for_events_with_timeout(
-        &mut bot1,
-        &infra.db_path,
-        "InventorySnapshotEvent::InflightEquity",
-        1,
-        Duration::from_secs(30),
-    )
-    .await;
-
-    // Record the total event count before stopping the first bot.
-    let pool = connect_db(&infra.db_path).await?;
-    let events_before_restart = fetch_events_by_type(&pool, "InventorySnapshot").await?;
-    let total_count_before = events_before_restart.len();
-    let inflight_count_before = events_before_restart
-        .iter()
-        .filter(|event| event.event_type == "InventorySnapshotEvent::InflightEquity")
-        .count();
-    pool.close().await;
-
-    assert!(
-        inflight_count_before >= 1,
-        "First bot should have emitted at least 1 InflightEquity event"
-    );
+    // Wait for the first bot to persist inflight state. InventorySnapshot
+    // events are compactable, so the durable assertion is the snapshot row.
+    let snapshot_before_restart =
+        poll_for_inflight_mint_snapshot(&mut bot1, &infra.db_path, "AAPL", Duration::from_secs(30))
+            .await?;
 
     // Stop the first bot.
     bot1.abort();
@@ -1922,9 +1960,8 @@ async fn inflight_state_survives_restart() -> anyhow::Result<()> {
 
     let bot2 = spawn_bot(ctx2);
 
-    // Wait for the second bot to start polling and emit new snapshot
-    // events. This proves the CQRS replay succeeded and the bot is
-    // functional after restart.
+    // Wait for the second bot to start polling. This proves snapshot
+    // restoration succeeded and the bot is functional after restart.
     tokio::time::sleep(Duration::from_secs(15)).await;
 
     // Verify the second bot is still alive (didn't crash on replay).
@@ -1934,33 +1971,20 @@ async fn inflight_state_survives_restart() -> anyhow::Result<()> {
     );
 
     let pool = connect_db(&infra.db_path).await?;
+    let snapshot_after_restart = latest_inventory_snapshot(&pool)
+        .await?
+        .expect("InventorySnapshot snapshot should exist after restart");
 
-    // The second bot should have emitted new snapshot events after
-    // replaying the first bot's events, proving it's functional.
-    let events_after_restart = fetch_events_by_type(&pool, "InventorySnapshot").await?;
-    let total_count_after = events_after_restart.len();
     assert!(
-        total_count_after > total_count_before,
-        "Second bot should emit new snapshot events after restart \
-         (before: {total_count_before}, after: {total_count_after})"
+        snapshot_after_restart.last_sequence >= snapshot_before_restart.last_sequence,
+        "InventorySnapshot sequence should not move backwards across restart \
+         (before: {}, after: {})",
+        snapshot_before_restart.last_sequence,
+        snapshot_after_restart.last_sequence
     );
-
-    // Verify aggregate dedup: the InflightEquity event count should not
-    // explode after restart. The aggregate replays previous events and
-    // sets its state. When the poller emits the same inflight data, the
-    // aggregate's `handle` method suppresses the duplicate. We allow a
-    // modest increase for natural state transitions (e.g., the pending
-    // request completing after polls_until_complete).
-    let inflight_count_after = events_after_restart
-        .iter()
-        .filter(|event| event.event_type == "InventorySnapshotEvent::InflightEquity")
-        .count();
-    let new_inflight_events = inflight_count_after - inflight_count_before;
     assert!(
-        new_inflight_events <= 3,
-        "Expected at most 3 new InflightEquity events after restart \
-         (dedup should suppress duplicates), got {new_inflight_events} \
-         (before: {inflight_count_before}, after: {inflight_count_after})"
+        snapshot_has_inflight_mint(&snapshot_after_restart, "AAPL")?,
+        "Inflight mint state should survive restart via the compacted snapshot"
     );
 
     pool.close().await;

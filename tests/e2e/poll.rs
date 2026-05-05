@@ -214,6 +214,77 @@ pub async fn poll_for_aggregate_events_containing(
     }
 }
 
+/// Polls the `snapshots` table until a snapshot for the given aggregate
+/// contains a non-empty value for the given JSON field.
+///
+/// Useful for compactable aggregates where events may be deleted before
+/// a test can observe them. The snapshot is the durable record.
+pub async fn poll_for_snapshot_field(
+    bot: &mut JoinHandle<anyhow::Result<()>>,
+    db_path: &std::path::Path,
+    aggregate_type: &str,
+    field_name: &str,
+    timeout: Duration,
+) {
+    let connect_opts = SqliteConnectOptions::new().filename(db_path);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let context = format!("{aggregate_type} snapshot with non-empty {field_name}");
+
+    loop {
+        sleep_or_crash(bot, &context).await;
+
+        let Ok(pool) = SqlitePool::connect_with(connect_opts.clone()).await else {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out after {timeout:?} waiting for {context} (database not ready)",
+            );
+            continue;
+        };
+
+        let query_result = sqlx::query_as::<_, (String,)>(
+            "SELECT payload FROM snapshots WHERE aggregate_type = ? LIMIT 1",
+        )
+        .bind(aggregate_type)
+        .fetch_optional(&pool)
+        .await;
+
+        pool.close().await;
+
+        match query_result {
+            Ok(Some((payload,))) => {
+                if let Ok(snapshot) = serde_json::from_str::<serde_json::Value>(&payload) {
+                    // Snapshot payload is wrapped in Lifecycle state (e.g. {"Live": {...}})
+                    let inner = snapshot.get("Live").and_then(|live| live.get(field_name));
+                    match inner {
+                        Some(value) if !value.is_null() => {
+                            let is_non_empty = match value {
+                                serde_json::Value::Object(map) => !map.is_empty(),
+                                serde_json::Value::Array(arr) => !arr.is_empty(),
+                                _ => true,
+                            };
+                            if is_non_empty {
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(query_error) => assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out after {timeout:?} waiting for {context} \
+                 (query failed: {query_error})",
+            ),
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Timed out after {timeout:?} waiting for {context}",
+        );
+    }
+}
+
 /// Polls the Position projection view until the given symbol has no
 /// pending offchain order (hedge cycle completed).
 ///

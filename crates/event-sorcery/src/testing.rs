@@ -9,6 +9,7 @@
 //! Lifecycle/Aggregate internals.
 
 use async_trait::async_trait;
+use cqrs_es::persist::PersistedEventStore;
 use cqrs_es::{Aggregate, CqrsFramework, EventStore, Query, mem_store};
 use std::fmt::Debug;
 use std::str::FromStr;
@@ -18,6 +19,7 @@ use tokio::sync::Mutex;
 use crate::dependency::HasEntity;
 use crate::lifecycle::{Lifecycle, LifecycleError, ReactorBridge};
 use crate::reactor::Reactor;
+use crate::sqlite_event_repository::SqliteEventRepository;
 use crate::{EventSourced, Store};
 
 /// Replay events through EventSourced to reconstruct entity state.
@@ -138,8 +140,14 @@ pub fn test_store<Entity: EventSourced>(
     pool: sqlx::SqlitePool,
     services: Entity::Services,
 ) -> Store<Entity> {
+    let repo = SqliteEventRepository::new(pool.clone());
+    let event_store =
+        PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_snapshot_store(
+            repo,
+            Entity::SNAPSHOT_SIZE,
+        );
     #[allow(clippy::disallowed_methods)]
-    let cqrs = sqlite_es::sqlite_cqrs(pool.clone(), vec![], services);
+    let cqrs = CqrsFramework::new(event_store, vec![], services);
     Store::new(cqrs, pool)
 }
 

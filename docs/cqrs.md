@@ -369,13 +369,15 @@ events.
 
 1. **NEVER write directly to the `events` table** -- use `Store::send()`
 2. **NEVER query the `events` table with raw SQL** -- use framework APIs
-3. **NEVER modify or delete events** -- they're immutable historical facts
-4. **NEVER implement `Aggregate` directly** -- implement `EventSourced`
-5. **NEVER construct `Lifecycle` in application code** -- it's an internal
+3. **NEVER modify events** -- they're immutable historical facts
+4. **NEVER delete retained events** -- only explicit compactable observational
+   aggregates may prune pre-snapshot events through event-sorcery compaction
+5. **NEVER implement `Aggregate` directly** -- implement `EventSourced`
+6. **NEVER construct `Lifecycle` in application code** -- it's an internal
    adapter
-6. **NEVER call `sqlite_cqrs()` or `CqrsFramework::new()` in production code**
+7. **NEVER call `sqlite_cqrs()` or `CqrsFramework::new()` in production code**
    -- use `StoreBuilder`
-7. **NEVER create multiple `Store<Entity>` for the same entity type** -- one per
+8. **NEVER create multiple `Store<Entity>` for the same entity type** -- one per
    entity, wired once at startup
 
 ## Single Framework Instance Per Entity
@@ -427,6 +429,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
     aggregate_type TEXT NOT NULL,
     aggregate_id   TEXT NOT NULL,
     last_sequence  BIGINT NOT NULL,
+    snapshot_version BIGINT NOT NULL DEFAULT 0,
     payload        JSON NOT NULL,
     timestamp      TEXT NOT NULL,
     PRIMARY KEY (aggregate_type, aggregate_id)
@@ -435,17 +438,41 @@ CREATE TABLE IF NOT EXISTS snapshots (
 
 - **payload**: Aggregate state serialized via `serde_json::to_value(&aggregate)`
 - **last_sequence**: The event sequence at the time of the snapshot
+- **snapshot_version**: The cqrs-es snapshot version used to determine the next
+  snapshot update
 - **timestamp**: ISO 8601 timestamp of when the snapshot was taken
 
-**Not currently enabled** -- all aggregates use `new_event_store`. To enable,
-replace `new_event_store(repo)` with `new_snapshot_store(repo, N)` where `N` is
-the snapshot frequency. Must reset snapshots after changing aggregate struct
-layout. Deleting snapshots is always safe (replays from events).
+Snapshots are enabled for all aggregates through `StoreBuilder`. They are used
+as a replay starting point so hot aggregates do not reload their full event
+history on every command.
+
+After changing aggregate struct layout, bump `SCHEMA_VERSION` so startup clears
+stale snapshots through the schema reconciler. Manual snapshot deletion is safe
+only for retained event streams where the full event history remains available
+for replay.
 
 ```sql
--- Reset snapshots for an aggregate after struct changes
+-- Retained streams only: reset snapshots when full event replay is available.
 DELETE FROM snapshots WHERE aggregate_type = 'Mint';
 ```
+
+Do not manually delete snapshots for aggregates using
+`CompactionPolicy::CompactAfterSnapshot`. For compacted streams, the snapshot
+may be the only durable pre-snapshot state. Those aggregates need a
+snapshot-aware rebuild path or an external source before snapshots can be
+discarded.
+
+### Event Compaction
+
+Financial audit aggregates retain every event indefinitely. Observational
+aggregates may opt into `CompactionPolicy::CompactAfterSnapshot`, which deletes
+events already represented by an aggregate snapshot. This is currently intended
+for high-frequency external-state snapshots such as `InventorySnapshot`.
+
+Only compact aggregates when historical events have no long-term audit value and
+the aggregate can be reconstructed from the `snapshots` table plus newer events.
+Do not enable compaction for projections that must support full rebuild from the
+`events` table unless the projection also has a snapshot-aware rebuild path.
 
 ### View Tables (Projections)
 
@@ -660,10 +687,12 @@ For entities that don't need services, use `type Services = ()`.
 2. **Never query the `events` table directly with raw SQL** - use `EventStore`
    trait methods or the framework's query API
 3. **Never query view tables with raw SQL** - use `GenericQuery::load()`
-4. **Never modify or delete events** - they're immutable historical facts
-5. **Never worry about changing aggregates/views** - they're just
+4. **Never modify events** - they're immutable historical facts
+5. **Never delete retained events** - only explicit compactable observational
+   aggregates may prune pre-snapshot events through event-sorcery compaction
+6. **Never worry about changing aggregates/views** - they're just
    interpretations
-6. **Never add events you don't need yet** - YAGNI applies especially to events
+7. **Never add events you don't need yet** - YAGNI applies especially to events
 
 ## Single Framework Instance Per Aggregate
 
@@ -688,8 +717,8 @@ while the application continues operating as if everything worked.
   type in the bot flow
 - **REQUIRED**: Wire all query processors via `StoreBuilder::wire()` before
   calling `build()`
-- **ALLOWED**: Direct construction in test code (via `wire::test_cqrs()`), CLI
-  code, and migration code (different execution contexts)
+- **ALLOWED**: Direct construction in test helpers, CLI code, and migration code
+  (different execution contexts)
 
 ### Adding a New Query Processor
 

@@ -51,7 +51,7 @@ use crate::base_chain::{self, TakeOrderResult};
 pub(crate) use crate::cctp::{CctpInfra, CctpOverrides, USDC_ETHEREUM};
 pub(crate) use crate::poll::{
     DEFAULT_POLL_TIMEOUT_SECS, connect_db, fetch_events_by_type, poll_for_events_with_timeout,
-    poll_for_hedge_completion, sleep_or_crash, spawn_bot,
+    poll_for_hedge_completion, poll_for_snapshot_field, sleep_or_crash, spawn_bot,
 };
 pub(crate) use crate::test_infra::TestInfra;
 use st0x_float_macro::float;
@@ -322,6 +322,11 @@ pub(crate) enum EquityRebalanceType<'a> {
     },
 }
 
+/// Asserts inventory snapshot state by reading the CQRS snapshot table.
+///
+/// Events are compacted for `InventorySnapshot`, so querying the events
+/// table is unreliable. The snapshot table always contains the latest
+/// persisted state.
 async fn assert_inventory_snapshots(
     pool: &SqlitePool,
     orderbook: Address,
@@ -329,106 +334,66 @@ async fn assert_inventory_snapshots(
     expected_symbols: &[&str],
     assert_cash: bool,
 ) -> anyhow::Result<()> {
-    let events = fetch_events_by_type(pool, "InventorySnapshot").await?;
-    assert!(
-        !events.is_empty(),
-        "Expected InventorySnapshot events, got 0"
-    );
-
     let expected_aggregate_id = format!(
         "{}:{}",
         orderbook.to_checksum(None),
         owner.to_checksum(None),
     );
-    for event in &events {
-        assert_eq!(
-            event.aggregate_id, expected_aggregate_id,
-            "InventorySnapshot aggregate_id mismatch: expected {expected_aggregate_id}, got {}",
-            event.aggregate_id
-        );
-    }
 
-    let event_types: Vec<&str> = events.iter().map(|ev| ev.event_type.as_str()).collect();
+    let snapshot_row = sqlx::query_as::<_, (String, String)>(
+        "SELECT aggregate_id, payload FROM snapshots \
+         WHERE aggregate_type = 'InventorySnapshot' AND aggregate_id = ?",
+    )
+    .bind(&expected_aggregate_id)
+    .fetch_optional(pool)
+    .await?;
 
-    assert!(
-        event_types.contains(&"InventorySnapshotEvent::OnchainEquity"),
-        "Missing OnchainEquity event, got types: {event_types:?}"
-    );
-    assert!(
-        event_types.contains(&"InventorySnapshotEvent::OffchainEquity"),
-        "Missing OffchainEquity event, got types: {event_types:?}"
+    let (aggregate_id, payload_str) =
+        snapshot_row.ok_or_else(|| anyhow::anyhow!("No InventorySnapshot snapshot found"))?;
+
+    assert_eq!(
+        aggregate_id, expected_aggregate_id,
+        "InventorySnapshot aggregate_id mismatch"
     );
 
-    if assert_cash {
-        assert!(
-            event_types.contains(&"InventorySnapshotEvent::OnchainUsdc"),
-            "Missing OnchainUsdc event, got types: {event_types:?}"
-        );
-        assert!(
-            event_types.contains(&"InventorySnapshotEvent::OffchainUsd"),
-            "Missing OffchainUsd event, got types: {event_types:?}"
-        );
-    }
+    let payload: serde_json::Value = serde_json::from_str(&payload_str)?;
+    let live = payload
+        .get("Live")
+        .ok_or_else(|| anyhow::anyhow!("Snapshot not in Live state: {payload}"))?;
 
-    let last_onchain_equity = events
-        .iter()
-        .rev()
-        .find(|ev| ev.event_type == "InventorySnapshotEvent::OnchainEquity")
-        .ok_or_else(|| anyhow::anyhow!("Missing OnchainEquity event"))?;
-    let onchain_balances = last_onchain_equity
-        .payload
-        .get("OnchainEquity")
-        .and_then(|val| val.get("balances"))
-        .ok_or_else(|| anyhow::anyhow!("OnchainEquity payload missing balances"))?;
+    let onchain_equity = live
+        .get("onchain_equity")
+        .ok_or_else(|| anyhow::anyhow!("Snapshot missing onchain_equity"))?;
+    let offchain_equity = live
+        .get("offchain_equity")
+        .ok_or_else(|| anyhow::anyhow!("Snapshot missing offchain_equity"))?;
 
     for symbol in expected_symbols {
-        let balance_str = onchain_balances
+        let balance_str = onchain_equity
             .get(*symbol)
             .and_then(|val| val.as_str())
             .unwrap_or_else(|| {
-                panic!("OnchainEquity missing symbol {symbol}, got: {onchain_balances}")
+                panic!("onchain_equity missing symbol {symbol}, got: {onchain_equity}")
             });
-        let _parsed_balance = Float::parse(balance_str.to_string())
+        let _parsed = Float::parse(balance_str.to_string())
             .unwrap_or_else(|err| panic!("Failed to parse onchain balance for {symbol}: {err:?}"));
-    }
 
-    let last_offchain_equity = events
-        .iter()
-        .rev()
-        .find(|ev| ev.event_type == "InventorySnapshotEvent::OffchainEquity")
-        .ok_or_else(|| anyhow::anyhow!("Missing OffchainEquity event"))?;
-    let offchain_positions = last_offchain_equity
-        .payload
-        .get("OffchainEquity")
-        .and_then(|val| val.get("positions"))
-        .ok_or_else(|| anyhow::anyhow!("OffchainEquity payload missing positions"))?;
-
-    for symbol in expected_symbols {
-        let position_str = offchain_positions
+        let position_str = offchain_equity
             .get(*symbol)
             .and_then(|val| val.as_str())
             .unwrap_or_else(|| {
-                panic!("OffchainEquity missing symbol {symbol}, got: {offchain_positions}")
+                panic!("offchain_equity missing symbol {symbol}, got: {offchain_equity}")
             });
-        let _position = Float::parse(position_str.to_string()).unwrap_or_else(|err| {
+        let _parsed = Float::parse(position_str.to_string()).unwrap_or_else(|err| {
             panic!("Failed to parse offchain position for {symbol}: {err:?}")
         });
     }
 
     if assert_cash {
-        let last_onchain_usdc = events
-            .iter()
-            .rev()
-            .find(|ev| ev.event_type == "InventorySnapshotEvent::OnchainUsdc")
-            .ok_or_else(|| anyhow::anyhow!("Missing OnchainUsdc event"))?;
-        let usdc_balance_str = last_onchain_usdc
-            .payload
-            .get("OnchainUsdc")
-            .and_then(|val| val.get("usdc_balance"))
+        let _usdc = live
+            .get("onchain_usdc")
             .and_then(|val| val.as_str())
-            .ok_or_else(|| anyhow::anyhow!("OnchainUsdc payload missing usdc_balance"))?;
-        let _usdc_balance = Float::parse(usdc_balance_str.to_string())
-            .unwrap_or_else(|err| panic!("Failed to parse onchain USDC balance: {err:?}"));
+            .ok_or_else(|| anyhow::anyhow!("Snapshot missing onchain_usdc"))?;
     }
 
     Ok(())

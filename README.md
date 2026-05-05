@@ -293,7 +293,8 @@ Workspace crates:
 - **`st0x-dto`** (`crates/dto/`) - Dashboard DTOs and TypeScript binding
   generation
 - **`st0x-event-sorcery`** (`crates/event-sorcery/`) - CQRS/event-sourcing
-  helpers and testing utilities
+  helpers, snapshot-backed loading, compactable observational event streams, and
+  testing utilities
 - **`st0x-execution`** (`crates/execution/`) - Standalone `Executor` trait
   abstraction with Alpaca Broker API and mock implementations
 - **`st0x-bridge`** (`crates/bridge/`) - Cross-chain bridge abstractions and

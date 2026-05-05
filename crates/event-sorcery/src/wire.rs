@@ -2,9 +2,9 @@
 //!
 //! All CQRS framework construction must go through
 //! [`StoreBuilder`], which reconciles schema versions and
-//! registers reactors. Direct calls to `sqlite_es::sqlite_cqrs`
-//! are blocked via clippy's `disallowed-methods`; `StoreBuilder`
-//! contains the single `#[allow]` escape hatch.
+//! registers reactors. Direct CQRS framework construction is
+//! blocked via clippy's `disallowed-methods`; `StoreBuilder`
+//! contains the narrow escape hatch.
 //!
 //! # Registering reactors
 //!
@@ -35,8 +35,9 @@ use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use cqrs_es::Query;
+use cqrs_es::persist::PersistedEventStore;
 use cqrs_es::persist::PersistenceError;
+use cqrs_es::{CqrsFramework, Query};
 use sqlx::SqlitePool;
 
 use crate::Nil;
@@ -45,7 +46,8 @@ use crate::lifecycle::{Lifecycle, ReactorBridge};
 use crate::projection::{Projection, ProjectionError, Table};
 use crate::reactor::Reactor;
 use crate::schema_registry::{ReconcileError, Reconciler};
-use crate::{EventSourced, Store};
+use crate::sqlite_event_repository::SqliteEventRepository;
+use crate::{CompactionPolicy, EventSourced, SqliteCqrs, Store};
 
 /// Builder for a single CQRS framework.
 ///
@@ -93,6 +95,20 @@ impl<Entity: EventSourced> StoreBuilder<Entity> {
     }
 }
 
+fn sqlite_snapshot_cqrs<Entity: EventSourced>(
+    pool: SqlitePool,
+    queries: Vec<Box<dyn Query<Lifecycle<Entity>>>>,
+    services: Entity::Services,
+) -> SqliteCqrs<Entity> {
+    let repo = SqliteEventRepository::new(pool);
+    let store = PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_snapshot_store(
+        repo,
+        Entity::SNAPSHOT_SIZE,
+    );
+    #[allow(clippy::disallowed_methods)]
+    CqrsFramework::new(store, queries, services)
+}
+
 /// Projected entities: auto-creates and wires a [`Projection`],
 /// returning `(Arc<Store>, Arc<Projection>)`.
 impl<Entity: EventSourced<Materialized = Table> + 'static> StoreBuilder<Entity, Table>
@@ -105,6 +121,19 @@ where
         mut self,
         services: Entity::Services,
     ) -> Result<(Arc<Store<Entity>>, Arc<Projection<Entity>>), ReconcileError> {
+        // Projected entities must retain all events so that
+        // `catch_up`/`rebuild_all` can replay the full history.
+        // Compacted aggregates lose events after snapshot, making
+        // projection rebuilds silently incomplete.
+        const {
+            assert!(
+                matches!(Entity::COMPACTION_POLICY, CompactionPolicy::Retain),
+                "CompactAfterSnapshot entities must not have table projections -- \
+                 rebuild_all only reads the events table and would miss \
+                 compacted snapshot-only aggregates"
+            );
+        }
+
         Reconciler::new(self.pool.clone())
             .reconcile::<Entity>()
             .await?;
@@ -127,8 +156,7 @@ where
             reactor: projection.clone(),
         }));
 
-        #[allow(clippy::disallowed_methods)]
-        let cqrs = sqlite_es::sqlite_cqrs(self.pool.clone(), self.queries, services);
+        let cqrs = sqlite_snapshot_cqrs(self.pool.clone(), self.queries, services);
         Ok((Arc::new(Store::new(cqrs, self.pool)), projection))
     }
 }
@@ -143,8 +171,7 @@ impl<Entity: EventSourced<Materialized = Nil>> StoreBuilder<Entity, Nil> {
             .reconcile::<Entity>()
             .await?;
 
-        #[allow(clippy::disallowed_methods)]
-        let cqrs = sqlite_es::sqlite_cqrs(self.pool.clone(), self.queries, services);
+        let cqrs = sqlite_snapshot_cqrs(self.pool.clone(), self.queries, services);
         Ok(Arc::new(Store::new(cqrs, self.pool)))
     }
 }

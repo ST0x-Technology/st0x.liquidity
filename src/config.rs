@@ -8,7 +8,7 @@ use alloy::primitives::{Address, B256};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
+use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode};
 use st0x_execution::{
     AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Positive,
     SupportedExecutor, Symbol, TimeInForce,
@@ -1111,10 +1111,32 @@ pub(crate) async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePo
     let options: SqliteConnectOptions = database_url
         .parse::<SqliteConnectOptions>()?
         .create_if_missing(true)
+        .auto_vacuum(SqliteAutoVacuum::Incremental)
         .journal_mode(SqliteJournalMode::Wal)
         .busy_timeout(std::time::Duration::from_secs(10));
 
-    SqlitePool::connect_with(options).await
+    let pool = SqlitePool::connect_with(options).await?;
+
+    // auto_vacuum can only be changed on a newly created database, or by
+    // running `PRAGMA auto_vacuum = INCREMENTAL` followed by a full
+    // `VACUUM` on an existing one. If the database was created before this
+    // setting was added, the pragma in SqliteConnectOptions is silently
+    // ignored and incremental_vacuum() calls will be no-ops.
+    let auto_vacuum: i32 = sqlx::query_scalar("PRAGMA auto_vacuum")
+        .fetch_one(&pool)
+        .await?;
+
+    if auto_vacuum != 2 {
+        warn!(
+            auto_vacuum,
+            "Database auto_vacuum mode is not INCREMENTAL (2). \
+             Event compaction will not reclaim disk space. \
+             Run `PRAGMA auto_vacuum = INCREMENTAL; VACUUM;` \
+             once to enable it."
+        );
+    }
+
+    Ok(pool)
 }
 
 #[cfg(test)]

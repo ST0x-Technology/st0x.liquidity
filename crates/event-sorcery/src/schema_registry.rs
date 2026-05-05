@@ -22,6 +22,7 @@ use sqlx::SqlitePool;
 use std::collections::BTreeMap;
 use tracing::{debug, info};
 
+use crate::CompactionPolicy;
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 use crate::{DomainEvent, EventSourced, Nil};
 
@@ -174,6 +175,26 @@ impl Reconciler {
         let needs_clear = stored_version != Some(current_version);
 
         if needs_clear {
+            // Compactable aggregates may have deleted their pre-snapshot
+            // events. Clearing their snapshots would permanently lose
+            // that state with no way to rebuild. Refuse and require an
+            // explicit migration instead.
+            //
+            // Skip the guard on first registration (stored_version = None):
+            // there are no snapshots to clear and no compacted events yet.
+            if stored_version.is_some()
+                && matches!(
+                    Entity::COMPACTION_POLICY,
+                    CompactionPolicy::CompactAfterSnapshot
+                )
+            {
+                return Err(ReconcileError::CompactedSnapshotClear {
+                    aggregate: name.to_string(),
+                    old_version: stored_version,
+                    new_version: current_version,
+                });
+            }
+
             sqlx::query("DELETE FROM snapshots WHERE aggregate_type = ?")
                 .bind(name)
                 .execute(&self.pool)
@@ -215,6 +236,22 @@ pub enum ReconcileError {
     Aggregate(#[from] AggregateError<LifecycleError<SchemaRegistry>>),
     #[error(transparent)]
     Persistence(#[from] PersistenceError),
+
+    /// A compactable aggregate's schema version changed but its
+    /// snapshots cannot be safely deleted because compacted events
+    /// are already gone. Requires an explicit migration.
+    #[error(
+        "Cannot clear snapshots for compactable aggregate '{aggregate}' \
+         (version {old_version:?} -> {new_version}). \
+         Compacted events have been deleted; clearing snapshots would \
+         permanently lose state. Write a migration that handles the \
+         schema change without deleting snapshots."
+    )]
+    CompactedSnapshotClear {
+        aggregate: String,
+        old_version: Option<u64>,
+        new_version: u64,
+    },
 }
 
 impl From<Never> for ReconcileError {
@@ -362,5 +399,107 @@ mod tests {
         // Should have SchemaRegistry at version 1
         let registry = reconciler.load_registry().await.unwrap().unwrap();
         assert_eq!(registry.version_of("SchemaRegistry"), Some(1));
+    }
+
+    /// Minimal compactable entity for testing the reconciliation guard.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct CompactableWidget;
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    enum CompactableEvent {
+        Created,
+    }
+
+    impl cqrs_es::DomainEvent for CompactableEvent {
+        fn event_type(&self) -> String {
+            "Created".to_string()
+        }
+        fn event_version(&self) -> String {
+            "1.0".to_string()
+        }
+    }
+
+    #[async_trait]
+    impl EventSourced for CompactableWidget {
+        type Id = String;
+        type Event = CompactableEvent;
+        type Command = ();
+        type Error = Never;
+        type Services = ();
+        type Materialized = Nil;
+
+        const AGGREGATE_TYPE: &'static str = "CompactableWidget";
+        const PROJECTION: Nil = Nil;
+        const SCHEMA_VERSION: u64 = 2;
+        const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::CompactAfterSnapshot;
+
+        fn originate(_event: &Self::Event) -> Option<Self> {
+            Some(Self)
+        }
+
+        fn evolve(_entity: &Self, _event: &Self::Event) -> Result<Option<Self>, Never> {
+            Ok(Some(Self))
+        }
+
+        async fn initialize(
+            _command: Self::Command,
+            _services: &Self::Services,
+        ) -> Result<Vec<Self::Event>, Never> {
+            Ok(vec![CompactableEvent::Created])
+        }
+
+        async fn transition(
+            &self,
+            _command: Self::Command,
+            _services: &Self::Services,
+        ) -> Result<Vec<Self::Event>, Never> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_allows_first_registration_for_compactable_aggregate() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+
+        let reconciler = Reconciler::new(pool);
+
+        // First reconcile: stored=None, current=2. No prior snapshots
+        // exist, so this should succeed even for compactable entities.
+        let cleared = reconciler.reconcile::<CompactableWidget>().await.unwrap();
+
+        assert!(cleared);
+    }
+
+    #[tokio::test]
+    async fn reconcile_errors_on_version_mismatch_for_compactable_aggregate() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+
+        let reconciler = Reconciler::new(pool.clone());
+
+        // First registration succeeds (stored=None)
+        reconciler.reconcile::<CompactableWidget>().await.unwrap();
+
+        // Manually update the stored version to simulate a version
+        // bump (we can't change the const at runtime).
+        sqlx::query(
+            "UPDATE events SET payload = \
+             '{\"VersionUpdated\":{\"name\":\"CompactableWidget\",\"version\":999}}' \
+             WHERE aggregate_type = 'SchemaRegistry' \
+             AND payload LIKE '%CompactableWidget%'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Second reconcile: stored=999, current=2. The entity is
+        // compactable, so reconcile should refuse.
+        let result = reconciler.reconcile::<CompactableWidget>().await;
+
+        assert!(
+            matches!(result, Err(ReconcileError::CompactedSnapshotClear { .. })),
+            "Expected CompactedSnapshotClear error, got {result:?}"
+        );
     }
 }

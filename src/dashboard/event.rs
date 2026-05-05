@@ -191,10 +191,12 @@ impl Reactor for Broadcaster {
 
 #[cfg(test)]
 mod tests {
-    use st0x_event_sorcery::ReactorHarness;
+    use st0x_event_sorcery::{ReactorHarness, StoreBuilder};
     use st0x_execution::Symbol;
 
     use super::*;
+    use crate::offchain_order::{OffchainOrderCommand, OffchainOrderEvent, noop_order_placer};
+    use crate::position::{PositionCommand, PositionEvent, TradeId};
     use crate::test_utils::setup_test_db;
 
     fn test_broadcaster(pool: SqlitePool) -> (Broadcaster, broadcast::Receiver<Statement>) {
@@ -255,90 +257,49 @@ mod tests {
         }
     }
 
-    async fn insert_event(
-        pool: &SqlitePool,
-        aggregate_type: &str,
-        aggregate_id: &str,
-        sequence: i64,
-        event_type: &str,
-        payload: serde_json::Value,
-    ) {
-        sqlx::query(
-            "INSERT INTO events (aggregate_type, aggregate_id, sequence,
-             event_type, event_version, payload, metadata)
-             VALUES (?1, ?2, ?3, ?4, '1.0', ?5, '{}')",
-        )
-        .bind(aggregate_type)
-        .bind(aggregate_id)
-        .bind(sequence)
-        .bind(event_type)
-        .bind(serde_json::to_string(&payload).unwrap())
-        .execute(pool)
-        .await
-        .unwrap();
-    }
-
     #[tokio::test]
     async fn offchain_order_filled_broadcasts_fill() {
-        use crate::offchain_order::OffchainOrderEvent;
-
         let pool = setup_test_db().await;
+        let (store, _projection) = StoreBuilder::<OffchainOrder>::new(pool.clone())
+            .build(noop_order_placer())
+            .await
+            .unwrap();
         let (broadcaster, mut receiver) = test_broadcaster(pool.clone());
         let harness = ReactorHarness::new(broadcaster);
 
         let now = chrono::Utc::now();
         let id = crate::offchain_order::OffchainOrderId::new();
 
-        // Seed OffchainOrder aggregate to Filled state via direct event insertion
-        let placed = OffchainOrderEvent::Placed {
-            symbol: Symbol::new("TSLA").unwrap(),
-            shares: st0x_execution::Positive::new(st0x_execution::FractionalShares::new(
-                st0x_float_macro::float!(5),
-            ))
-            .unwrap(),
-            direction: st0x_execution::Direction::Sell,
-            executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
-            placed_at: now,
-        };
-        let submitted = OffchainOrderEvent::Submitted {
-            executor_order_id: st0x_execution::ExecutorOrderId::new("test-order"),
-            submitted_at: now,
-        };
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::Place {
+                    symbol: Symbol::new("TSLA").unwrap(),
+                    shares: st0x_execution::Positive::new(st0x_execution::FractionalShares::new(
+                        st0x_float_macro::float!(5),
+                    ))
+                    .unwrap(),
+                    direction: st0x_execution::Direction::Sell,
+                    executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                OffchainOrderCommand::CompleteFill {
+                    price: st0x_finance::Usd::new(st0x_float_macro::float!(245)),
+                },
+            )
+            .await
+            .unwrap();
+
         let filled = OffchainOrderEvent::Filled {
             price: st0x_finance::Usd::new(st0x_float_macro::float!(245)),
             filled_at: now,
         };
 
-        let id_str = id.to_string();
-        insert_event(
-            &pool,
-            "OffchainOrder",
-            &id_str,
-            0,
-            "OffchainOrderEvent::Placed",
-            serde_json::to_value(&placed).unwrap(),
-        )
-        .await;
-        insert_event(
-            &pool,
-            "OffchainOrder",
-            &id_str,
-            1,
-            "OffchainOrderEvent::Submitted",
-            serde_json::to_value(&submitted).unwrap(),
-        )
-        .await;
-        insert_event(
-            &pool,
-            "OffchainOrder",
-            &id_str,
-            2,
-            "OffchainOrderEvent::Filled",
-            serde_json::to_value(&filled).unwrap(),
-        )
-        .await;
-
-        // Fire the Filled event through the reactor
         harness.receive::<OffchainOrder>(id, filled).await.unwrap();
 
         let msg = receiver.recv().await.expect("should receive fill");
@@ -355,36 +316,47 @@ mod tests {
 
     #[tokio::test]
     async fn position_update_broadcasts_net_position() {
-        use crate::position::PositionEvent;
-
         let pool = setup_test_db().await;
+        let (store, _projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
         let (broadcaster, mut receiver) = test_broadcaster(pool.clone());
         let harness = ReactorHarness::new(broadcaster);
 
         let symbol = Symbol::new("AAPL").unwrap();
         let now = chrono::Utc::now();
+        let threshold = crate::threshold::ExecutionThreshold::Shares(
+            st0x_execution::Positive::new(st0x_execution::FractionalShares::new(
+                st0x_float_macro::float!(1),
+            ))
+            .unwrap(),
+        );
 
-        // Seed a Position aggregate via direct event insertion
+        store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold,
+                    trade_id: TradeId {
+                        tx_hash: alloy::primitives::TxHash::ZERO,
+                        log_index: 0,
+                    },
+                    amount: st0x_execution::FractionalShares::new(st0x_float_macro::float!(1)),
+                    direction: st0x_execution::Direction::Buy,
+                    price_usdc: st0x_float_macro::float!(150),
+                    block_timestamp: now,
+                },
+            )
+            .await
+            .unwrap();
+
         let initialized = PositionEvent::Initialized {
             symbol: symbol.clone(),
-            threshold: crate::threshold::ExecutionThreshold::Shares(
-                st0x_execution::Positive::new(st0x_execution::FractionalShares::new(
-                    st0x_float_macro::float!(1),
-                ))
-                .unwrap(),
-            ),
+            threshold,
             initialized_at: now,
         };
-
-        insert_event(
-            &pool,
-            "Position",
-            &symbol.to_string(),
-            0,
-            "PositionEvent::Initialized",
-            serde_json::to_value(&initialized).unwrap(),
-        )
-        .await;
 
         harness
             .receive::<Position>(symbol.clone(), initialized)

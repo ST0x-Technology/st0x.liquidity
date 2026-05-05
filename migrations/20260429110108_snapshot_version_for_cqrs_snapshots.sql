@@ -1,0 +1,1 @@
+ALTER TABLE snapshots ADD COLUMN snapshot_version BIGINT NOT NULL DEFAULT 0;

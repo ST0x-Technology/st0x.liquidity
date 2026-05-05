@@ -22,7 +22,9 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, trace, warn};
 
 use st0x_dto::Statement;
-use st0x_event_sorcery::{Projection, Store, StoreBuilder};
+use st0x_event_sorcery::{
+    Projection, Store, StoreBuilder, compact_events, incremental_vacuum, load_all_ids, load_entity,
+};
 use st0x_evm::Wallet;
 use st0x_execution::{
     CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason, ExecutionError,
@@ -268,6 +270,13 @@ impl Conductor {
                 (position, position_projection, snapshot, None, None, None)
             };
 
+        // Hydrate the in-memory InventoryView from persisted snapshot
+        // state so the runtime projection has the same data as the
+        // database. Without this, the first post-restart poll may emit
+        // no events (unchanged values are deduplicated), leaving the
+        // view empty and potentially causing incorrect rebalancing.
+        hydrate_inventory_from_snapshot(&pool, &inventory).await;
+
         let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer(executor.clone()));
 
         let (offchain_order, offchain_order_projection) =
@@ -421,8 +430,76 @@ fn spawn_finished_job_cleanup(pool: SqlitePool, cleanup_interval: Duration) -> J
                     error!(%error, "Failed to clean up finished job queue rows");
                 }
             }
+
+            match compact_inventory_snapshot_events(&pool).await {
+                Ok(deleted) => {
+                    debug!(deleted, "Compacted inventory snapshot events");
+                }
+                Err(error) => {
+                    error!(%error, "Failed to compact inventory snapshot events");
+                }
+            }
         }
     })
+}
+
+async fn compact_inventory_snapshot_events(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
+    let deleted = compact_events::<InventorySnapshot>(pool).await?;
+    if deleted > 0 {
+        incremental_vacuum(pool, 100).await?;
+    }
+    Ok(deleted)
+}
+
+/// Replay persisted [`InventorySnapshot`] state into the in-memory
+/// [`BroadcastingInventory`] so the runtime view starts warm.
+async fn hydrate_inventory_from_snapshot(
+    pool: &SqlitePool,
+    inventory: &Arc<BroadcastingInventory>,
+) {
+    let ids = match load_all_ids::<InventorySnapshot>(pool).await {
+        Ok(ids) => ids,
+        Err(error) => {
+            warn!(?error, "Failed to load InventorySnapshot IDs for hydration");
+            return;
+        }
+    };
+
+    for id in &ids {
+        hydrate_single_snapshot(pool, inventory, id).await;
+    }
+}
+
+async fn hydrate_single_snapshot(
+    pool: &SqlitePool,
+    inventory: &Arc<BroadcastingInventory>,
+    id: &crate::inventory::snapshot::InventorySnapshotId,
+) {
+    let Ok(Some(snapshot)) = load_entity::<InventorySnapshot>(pool, id).await else {
+        return;
+    };
+
+    let events = snapshot.hydration_events();
+    if events.is_empty() {
+        return;
+    }
+
+    apply_hydration_events(inventory, &events).await;
+    info!(%id, event_count = events.len(), "Hydrated InventoryView from persisted snapshot");
+}
+
+async fn apply_hydration_events(
+    inventory: &Arc<BroadcastingInventory>,
+    events: &[crate::inventory::snapshot::InventorySnapshotEvent],
+) {
+    let now = chrono::Utc::now();
+    let mut view = inventory.write().await;
+
+    for event in events {
+        if let Ok(updated) = view.clone().apply_snapshot_event(event, now) {
+            *view = updated;
+        }
+    }
 }
 
 struct RebalancingInfrastructure {

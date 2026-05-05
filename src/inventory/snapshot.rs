@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use thiserror::Error;
 
-use st0x_event_sorcery::{DomainEvent, EventSourced, Never, Nil};
+use st0x_event_sorcery::{CompactionPolicy, DomainEvent, EventSourced, Never, Nil};
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_finance::Usdc;
 
@@ -104,6 +104,8 @@ impl EventSourced for InventorySnapshot {
     const AGGREGATE_TYPE: &'static str = "InventorySnapshot";
     const PROJECTION: Nil = Nil;
     const SCHEMA_VERSION: u64 = 5;
+    const COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::CompactAfterSnapshot;
+    const SNAPSHOT_SIZE: usize = 1;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         let mut snapshot = Self {
@@ -196,27 +198,48 @@ impl EventSourced for InventorySnapshot {
         let now = Utc::now();
 
         match command {
-            OnchainEquity { balances } => Ok(vec![InventorySnapshotEvent::OnchainEquity {
-                balances,
-                fetched_at: now,
-            }]),
-            OnchainUsdc { usdc_balance } => Ok(vec![InventorySnapshotEvent::OnchainUsdc {
-                usdc_balance,
-                fetched_at: now,
-            }]),
-            OffchainEquity { positions } => Ok(vec![InventorySnapshotEvent::OffchainEquity {
-                positions,
-                fetched_at: now,
-            }]),
-            OffchainUsd { usd_balance_cents } => Ok(vec![InventorySnapshotEvent::OffchainUsd {
-                usd_balance_cents,
-                fetched_at: now,
-            }]),
+            OnchainEquity { balances } => {
+                if self.onchain_equity == balances {
+                    return Ok(vec![]);
+                }
+                Ok(vec![InventorySnapshotEvent::OnchainEquity {
+                    balances,
+                    fetched_at: now,
+                }])
+            }
+            OnchainUsdc { usdc_balance } => {
+                if self.onchain_usdc == Some(usdc_balance) {
+                    return Ok(vec![]);
+                }
+                Ok(vec![InventorySnapshotEvent::OnchainUsdc {
+                    usdc_balance,
+                    fetched_at: now,
+                }])
+            }
+            OffchainEquity { positions } => {
+                if self.offchain_equity == positions {
+                    return Ok(vec![]);
+                }
+                Ok(vec![InventorySnapshotEvent::OffchainEquity {
+                    positions,
+                    fetched_at: now,
+                }])
+            }
+            OffchainUsd { usd_balance_cents } => {
+                if self.offchain_usd_cents == Some(usd_balance_cents) {
+                    return Ok(vec![]);
+                }
+                Ok(vec![InventorySnapshotEvent::OffchainUsd {
+                    usd_balance_cents,
+                    fetched_at: now,
+                }])
+            }
             OffchainMarginSafeBuyingPower {
                 margin_safe_buying_power_cents,
             } => {
-                // Always emit so the status readout reflects poll freshness,
-                // mirroring OffchainUsd.
+                if self.offchain_margin_safe_buying_power_cents == margin_safe_buying_power_cents {
+                    return Ok(vec![]);
+                }
                 Ok(vec![
                     InventorySnapshotEvent::OffchainMarginSafeBuyingPower {
                         margin_safe_buying_power_cents,
@@ -275,6 +298,90 @@ impl EventSourced for InventorySnapshot {
 }
 
 impl InventorySnapshot {
+    /// Produce events representing the full persisted state.
+    ///
+    /// Used to hydrate the in-memory [`InventoryView`] on startup so
+    /// that the runtime projection has the same state as the
+    /// persisted snapshot, even when deduplication suppresses the
+    /// first post-restart poll (unchanged values emit no events).
+    pub(crate) fn hydration_events(&self) -> Vec<InventorySnapshotEvent> {
+        let fetched_at = self.last_updated;
+        let mut events = Vec::new();
+
+        if !self.onchain_equity.is_empty() {
+            events.push(InventorySnapshotEvent::OnchainEquity {
+                balances: self.onchain_equity.clone(),
+                fetched_at,
+            });
+        }
+
+        if let Some(usdc_balance) = self.onchain_usdc {
+            events.push(InventorySnapshotEvent::OnchainUsdc {
+                usdc_balance,
+                fetched_at,
+            });
+        }
+
+        if !self.offchain_equity.is_empty() {
+            events.push(InventorySnapshotEvent::OffchainEquity {
+                positions: self.offchain_equity.clone(),
+                fetched_at,
+            });
+        }
+
+        if let Some(usd_balance_cents) = self.offchain_usd_cents {
+            events.push(InventorySnapshotEvent::OffchainUsd {
+                usd_balance_cents,
+                fetched_at,
+            });
+        }
+
+        if self.offchain_margin_safe_buying_power_cents.is_some() {
+            events.push(InventorySnapshotEvent::OffchainMarginSafeBuyingPower {
+                margin_safe_buying_power_cents: self.offchain_margin_safe_buying_power_cents,
+                fetched_at,
+            });
+        }
+
+        if let Some(usdc_balance) = self.ethereum_usdc {
+            events.push(InventorySnapshotEvent::EthereumUsdc {
+                usdc_balance,
+                fetched_at,
+            });
+        }
+
+        if let Some(usdc_balance) = self.base_wallet_usdc {
+            events.push(InventorySnapshotEvent::BaseWalletUsdc {
+                usdc_balance,
+                fetched_at,
+            });
+        }
+
+        if !self.base_wallet_unwrapped_equity.is_empty() {
+            events.push(InventorySnapshotEvent::BaseWalletUnwrappedEquity {
+                balances: self.base_wallet_unwrapped_equity.clone(),
+                fetched_at,
+            });
+        }
+
+        if !self.base_wallet_wrapped_equity.is_empty() {
+            events.push(InventorySnapshotEvent::BaseWalletWrappedEquity {
+                balances: self.base_wallet_wrapped_equity.clone(),
+                fetched_at,
+            });
+        }
+
+        if !self.inflight_mints.is_empty() || !self.inflight_redemptions.is_empty() {
+            events.push(InventorySnapshotEvent::InflightEquity {
+                mints: self.inflight_mints.clone(),
+                redemptions: self.inflight_redemptions.clone(),
+                fetched_at,
+            });
+        }
+
+        events
+    }
+
     fn apply_event(&mut self, event: &InventorySnapshotEvent) {
         self.last_updated = event.timestamp();
 
@@ -635,11 +742,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offchain_margin_safe_buying_power_emits_even_when_unchanged() {
-        // Unchanged buying power must still emit so the status readout
-        // reflects poll freshness (mirroring OffchainUsd). Without this,
-        // the BuyPwr timestamp would freeze between value changes while
-        // the USD timestamp kept ticking.
+    async fn offchain_margin_safe_buying_power_skips_unchanged_value() {
         let margin_safe_buying_power_cents = Some(3_000_000);
 
         let events = TestHarness::<InventorySnapshot>::with(())
@@ -655,19 +758,61 @@ mod tests {
             .await
             .events();
 
-        assert_eq!(
-            events.len(),
-            1,
-            "unchanged OffchainMarginSafeBuyingPower must still emit a fresh event"
+        assert!(
+            events.is_empty(),
+            "unchanged OffchainMarginSafeBuyingPower should not emit"
         );
-        match &events[0] {
-            InventorySnapshotEvent::OffchainMarginSafeBuyingPower {
-                margin_safe_buying_power_cents: event_cents,
-                ..
-            } => {
-                assert_eq!(*event_cents, margin_safe_buying_power_cents);
-            }
-            _ => panic!("Expected OffchainMarginSafeBuyingPower event"),
+    }
+
+    #[tokio::test]
+    async fn unchanged_inventory_fields_do_not_emit_events() {
+        let mut balances = BTreeMap::new();
+        balances.insert(test_symbol("AAPL"), test_shares(100));
+        let usdc_balance = Usdc::from_str("1000").unwrap();
+        let mut positions = BTreeMap::new();
+        positions.insert(test_symbol("AAPL"), test_shares(75));
+        let usd_balance_cents = 50_000_000;
+        let fetched_at = Utc::now();
+
+        let cases = vec![
+            (
+                vec![InventorySnapshotEvent::OnchainEquity {
+                    balances: balances.clone(),
+                    fetched_at,
+                }],
+                InventorySnapshotCommand::OnchainEquity { balances },
+            ),
+            (
+                vec![InventorySnapshotEvent::OnchainUsdc {
+                    usdc_balance,
+                    fetched_at,
+                }],
+                InventorySnapshotCommand::OnchainUsdc { usdc_balance },
+            ),
+            (
+                vec![InventorySnapshotEvent::OffchainEquity {
+                    positions: positions.clone(),
+                    fetched_at,
+                }],
+                InventorySnapshotCommand::OffchainEquity { positions },
+            ),
+            (
+                vec![InventorySnapshotEvent::OffchainUsd {
+                    usd_balance_cents,
+                    fetched_at,
+                }],
+                InventorySnapshotCommand::OffchainUsd { usd_balance_cents },
+            ),
+        ];
+
+        for (given, command) in cases {
+            let events = TestHarness::<InventorySnapshot>::with(())
+                .given(given)
+                .when(command)
+                .await
+                .events();
+
+            assert!(events.is_empty(), "unchanged inventory field emitted event");
         }
     }
 
@@ -1333,5 +1478,67 @@ mod tests {
             !snapshot.inflight_mints.contains_key(&test_symbol("AAPL")),
             "Previous inflight mints should be fully replaced"
         );
+    }
+
+    #[test]
+    fn hydration_events_empty_snapshot_produces_no_events() {
+        let snapshot = InventorySnapshot {
+            onchain_equity: BTreeMap::new(),
+            onchain_usdc: None,
+            offchain_equity: BTreeMap::new(),
+            offchain_usd_cents: None,
+            offchain_margin_safe_buying_power_cents: None,
+            ethereum_usdc: None,
+            base_wallet_usdc: None,
+            base_wallet_unwrapped_equity: BTreeMap::new(),
+            base_wallet_wrapped_equity: BTreeMap::new(),
+            inflight_mints: BTreeMap::new(),
+            inflight_redemptions: BTreeMap::new(),
+            last_updated: Utc::now(),
+        };
+
+        assert!(snapshot.hydration_events().is_empty());
+    }
+
+    #[test]
+    fn hydration_events_roundtrips_populated_snapshot() {
+        let now = Utc::now();
+        let mut onchain_equity = BTreeMap::new();
+        onchain_equity.insert(test_symbol("AAPL"), test_shares(100));
+        let mut inflight_mints = BTreeMap::new();
+        inflight_mints.insert(test_symbol("TSLA"), test_shares(50));
+
+        let original = InventorySnapshot {
+            onchain_equity: onchain_equity.clone(),
+            onchain_usdc: Some(Usdc::from_str("5000").unwrap()),
+            offchain_equity: BTreeMap::new(),
+            offchain_usd_cents: Some(42_00),
+            offchain_margin_safe_buying_power_cents: Some(10_000),
+            ethereum_usdc: None,
+            base_wallet_usdc: None,
+            base_wallet_unwrapped_equity: BTreeMap::new(),
+            base_wallet_wrapped_equity: BTreeMap::new(),
+            inflight_mints: inflight_mints.clone(),
+            inflight_redemptions: BTreeMap::new(),
+            last_updated: now,
+        };
+
+        let events = original.hydration_events();
+
+        // Replay those events into a fresh snapshot and verify the
+        // fields match the original.
+        let reconstructed = replay::<InventorySnapshot>(events).unwrap().unwrap();
+
+        assert_eq!(reconstructed.onchain_equity, original.onchain_equity);
+        assert_eq!(reconstructed.onchain_usdc, original.onchain_usdc);
+        assert_eq!(
+            reconstructed.offchain_usd_cents,
+            original.offchain_usd_cents
+        );
+        assert_eq!(
+            reconstructed.offchain_margin_safe_buying_power_cents,
+            original.offchain_margin_safe_buying_power_cents
+        );
+        assert_eq!(reconstructed.inflight_mints, original.inflight_mints);
     }
 }
