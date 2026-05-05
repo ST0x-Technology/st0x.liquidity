@@ -812,24 +812,50 @@ async fn recover_interrupted_tokenization_aggregates(
     }
 
     recover_stuck_redemptions(pool, inventory).await?;
+    resume_interrupted_transfers(transfer, &interrupted_mints, &interrupted_redemptions).await;
 
-    for mint_id in &interrupted_mints {
-        transfer.resume_mint(mint_id).await?;
-    }
+    Ok(())
+}
 
-    for redemption_id in &interrupted_redemptions {
-        transfer.resume_redemption(redemption_id).await?;
-    }
+async fn resume_interrupted_transfers(
+    transfer: &CrossVenueEquityTransfer,
+    interrupted_mints: &[crate::tokenized_equity_mint::IssuerRequestId],
+    interrupted_redemptions: &[crate::equity_redemption::RedemptionAggregateId],
+) {
+    let mut failed_mints = 0usize;
+    let mut failed_redemptions = 0usize;
 
-    if !interrupted_mints.is_empty() || !interrupted_redemptions.is_empty() {
-        info!(
-            mint_count = interrupted_mints.len(),
-            redemption_count = interrupted_redemptions.len(),
-            "Recovered interrupted tokenization aggregates"
+    for mint_id in interrupted_mints {
+        failed_mints += usize::from(
+            transfer
+                .resume_mint(mint_id)
+                .await
+                .inspect_err(|error| {
+                    error!(%mint_id, ?error, "Failed to resume mint -- skipping");
+                })
+                .is_err(),
         );
     }
 
-    Ok(())
+    for redemption_id in interrupted_redemptions {
+        failed_redemptions += usize::from(
+            transfer
+                .resume_redemption(redemption_id)
+                .await
+                .inspect_err(|error| {
+                    error!(%redemption_id, ?error, "Failed to resume redemption -- skipping");
+                })
+                .is_err(),
+        );
+    }
+
+    info!(
+        mint_count = interrupted_mints.len(),
+        redemption_count = interrupted_redemptions.len(),
+        failed_mints,
+        failed_redemptions,
+        "Interrupted tokenization transfer resume completed"
+    );
 }
 
 /// Constructs the position CQRS framework with its view query
