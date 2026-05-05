@@ -61,7 +61,7 @@
       {#each options as opt (opt.value)}
         <button
           class="flex w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-left text-xs hover:bg-accent"
-          onclick={() => toggle(opt.value)}
+          onclick={() => { toggle(opt.value); }}
         >
           <span class="inline-flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-sm border {selected.has(opt.value) ? 'bg-primary border-primary text-primary-foreground' : 'border-muted-foreground'}">
             {#if selected.has(opt.value)}

@@ -98,8 +98,10 @@ describe('detailFields', () => {
 
   it('preserves field order from the original object', () => {
     const result = detailFields({ z_field: '1', a_field: '2' })
-    expect(result[0][0]).toBe('z_field')
-    expect(result[1][0]).toBe('a_field')
+    expect(result).toEqual([
+      ['z_field', '1'],
+      ['a_field', '2'],
+    ])
   })
 
   it('returns empty when all fields are filtered', () => {

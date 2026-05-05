@@ -750,6 +750,8 @@ mod tests {
             travel_rule: None,
             rest_api: None,
             redemption_wallet: None,
+            #[cfg(feature = "test-support")]
+            failure_injector: crate::conductor::job::FailureInjector::new(),
         }
     }
 
@@ -837,6 +839,8 @@ mod tests {
             travel_rule: None,
             rest_api: None,
             redemption_wallet: Some(Address::ZERO),
+            #[cfg(feature = "test-support")]
+            failure_injector: crate::conductor::job::FailureInjector::new(),
         }
     }
 

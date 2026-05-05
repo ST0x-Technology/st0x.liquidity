@@ -397,6 +397,8 @@ pub struct Ctx {
     /// Alpaca redemption wallet from `[tokenization]`.
     /// `Some` when the config includes a `[tokenization]` section.
     pub(crate) redemption_wallet: Option<Address>,
+    #[cfg(feature = "test-support")]
+    pub failure_injector: crate::conductor::job::FailureInjector,
 }
 
 /// Runtime broker configuration assembled from `BrokerSecrets`.
@@ -461,7 +463,8 @@ impl std::fmt::Debug for BrokerCtx {
 
 impl std::fmt::Debug for Ctx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Ctx")
+        let mut debug_struct = f.debug_struct("Ctx");
+        debug_struct
             .field("database_url", &self.database_url)
             .field("log_level", &self.log_level)
             .field("log_dir", &self.log_dir)
@@ -484,8 +487,12 @@ impl std::fmt::Debug for Ctx {
             .field("assets", &self.assets)
             .field("travel_rule_configured", &self.travel_rule.is_some())
             .field("redemption_wallet", &self.redemption_wallet)
-            .field("rest_api", &self.rest_api)
-            .finish()
+            .field("rest_api", &self.rest_api);
+
+        #[cfg(feature = "test-support")]
+        debug_struct.field("failure_injector", &self.failure_injector);
+
+        debug_struct.finish()
     }
 }
 
@@ -803,6 +810,8 @@ impl Ctx {
             travel_rule: parts.travel_rule,
             rest_api: parts.rest_api,
             redemption_wallet: parts.redemption_wallet,
+            #[cfg(feature = "test-support")]
+            failure_injector: crate::conductor::job::FailureInjector::new(),
         })
     }
 
@@ -951,6 +960,8 @@ impl Ctx {
             travel_rule,
             rest_api,
             redemption_wallet,
+            #[cfg(feature = "test-support")]
+            failure_injector: crate::conductor::job::FailureInjector::new(),
         })
     }
 }
@@ -1154,6 +1165,8 @@ pub(crate) mod tests {
             travel_rule: None,
             rest_api: None,
             redemption_wallet: None,
+            #[cfg(feature = "test-support")]
+            failure_injector: crate::conductor::job::FailureInjector::new(),
         }
     }
 

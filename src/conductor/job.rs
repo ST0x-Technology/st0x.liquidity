@@ -13,7 +13,13 @@ use serde::de::DeserializeOwned;
 use sqlx::SqlitePool;
 use std::fmt;
 use std::sync::Arc;
-use tracing::{debug, error, warn};
+#[cfg(feature = "test-support")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(feature = "test-support"))]
+use tracing::debug;
+#[cfg(feature = "test-support")]
+use tracing::info;
+use tracing::{error, warn};
 
 type Storage<Task> = SqliteStorage<
     Task,
@@ -84,16 +90,94 @@ impl fmt::Display for Label {
     }
 }
 
-/// Generic apalis handler that bridges [`Job`] implementations
-/// with apalis's function-based worker API.
+/// Identifies which job queue a [`FailureInjector`] targets.
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum JobKind {
+    OrderFill,
+    Hedge,
+}
+
+/// Allows e2e tests to force the next job of a specific kind to
+/// fail terminally. Each [`JobKind`] has an independent flag so
+/// arming one queue cannot be consumed by the other.
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug)]
+pub struct FailureInjector {
+    order_fill: Arc<AtomicBool>,
+    hedge: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "test-support")]
+impl Default for FailureInjector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl FailureInjector {
+    pub fn new() -> Self {
+        Self {
+            order_fill: Arc::new(AtomicBool::new(false)),
+            hedge: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn arm(&self, kind: JobKind) {
+        self.flag(kind).store(true, Ordering::SeqCst);
+    }
+
+    fn is_armed(&self, kind: JobKind) -> bool {
+        self.flag(kind).swap(false, Ordering::SeqCst)
+    }
+
+    fn flag(&self, kind: JobKind) -> &AtomicBool {
+        match kind {
+            JobKind::OrderFill => &self.order_fill,
+            JobKind::Hedge => &self.hedge,
+        }
+    }
+}
+
+/// Generic apalis handler - test-support build.
 ///
-/// Register with apalis via:
-/// ```text
-/// WorkerBuilder::new(name)
-///     .backend(storage)
-///     .data(ctx)
-///     .build(work::<MyCtx, MyJob>)
-/// ```
+/// Accepts a [`FailureInjector`] and [`JobKind`] via apalis `Data`.
+/// When the injector is armed for this kind, the job fails without
+/// calling `perform`.
+#[cfg(feature = "test-support")]
+pub(crate) async fn work<Ctx, J>(
+    job: J,
+    ctx: Data<Arc<Ctx>>,
+    injector: Data<FailureInjector>,
+    kind: Data<JobKind>,
+) where
+    Ctx: Send + Sync + 'static,
+    J: Job<Ctx> + Sync,
+{
+    if injector.is_armed(*kind) {
+        error!(label = %job.label(), ?kind, "Injected terminal failure (test)");
+        return;
+    }
+
+    const MAX_RETRIES: usize = 3;
+    let label = job.label();
+    info!(%label, max_retries = MAX_RETRIES, "Starting job");
+
+    let result = (|| job.perform(&ctx))
+        .retry(ExponentialBuilder::default().with_max_times(MAX_RETRIES))
+        .notify(|error, duration| {
+            warn!(%label, %error, ?duration, "Retrying job after transient failure");
+        })
+        .await;
+
+    if let Err(error) = result {
+        error!(%label, %error, "Job failed after retries");
+    }
+}
+
+/// Generic apalis handler - production build.
+#[cfg(not(feature = "test-support"))]
 pub(crate) async fn work<Ctx, J>(job: J, ctx: Data<Arc<Ctx>>)
 where
     Ctx: Send + Sync + 'static,
@@ -139,6 +223,53 @@ mod tests {
     use super::*;
     use crate::conductor::setup_apalis_tables;
     use crate::test_utils::setup_test_db;
+
+    #[test]
+    fn failure_injector_not_armed_by_default() {
+        let injector = FailureInjector::new();
+        assert!(!injector.is_armed(JobKind::OrderFill));
+        assert!(!injector.is_armed(JobKind::Hedge));
+    }
+
+    #[test]
+    fn failure_injector_arm_then_check_auto_disarms() {
+        let injector = FailureInjector::new();
+
+        injector.arm(JobKind::OrderFill);
+        assert!(injector.is_armed(JobKind::OrderFill));
+        assert!(
+            !injector.is_armed(JobKind::OrderFill),
+            "second check should be false (auto-disarmed)"
+        );
+    }
+
+    #[test]
+    fn failure_injector_kinds_are_independent() {
+        let injector = FailureInjector::new();
+
+        injector.arm(JobKind::OrderFill);
+        assert!(
+            !injector.is_armed(JobKind::Hedge),
+            "arming OrderFill should not affect Hedge"
+        );
+        assert!(injector.is_armed(JobKind::OrderFill));
+    }
+
+    #[test]
+    fn failure_injector_shared_across_clones() {
+        let injector = FailureInjector::new();
+        let clone = injector.clone();
+
+        injector.arm(JobKind::Hedge);
+        assert!(
+            clone.is_armed(JobKind::Hedge),
+            "arming original should be visible from clone"
+        );
+        assert!(
+            !injector.is_armed(JobKind::Hedge),
+            "should be disarmed after clone consumed it"
+        );
+    }
 
     async fn insert_job(
         pool: &SqlitePool,

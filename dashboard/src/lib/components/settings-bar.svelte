@@ -67,7 +67,7 @@
   <dialog
     bind:this={dialogEl}
     class="w-full max-w-md rounded-lg border bg-card p-6 text-foreground shadow-lg backdrop:bg-black/50"
-    onclick={(event) => { if (event.target === dialogEl) dialogEl?.close() }}
+    onclick={(event) => { if (event.target === dialogEl) dialogEl.close() }}
   >
     <div class="mb-4 flex items-center justify-between">
       <h3 class="text-sm font-semibold text-foreground">Configuration</h3>

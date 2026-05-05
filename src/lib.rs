@@ -53,6 +53,8 @@ mod wrapper;
 
 pub use telemetry::{FileLogGuard, TelemetryError, TelemetryGuard, mk_env_filter, setup_tracing};
 
+#[cfg(feature = "test-support")]
+pub use conductor::job::{FailureInjector, JobKind};
 #[cfg(any(test, feature = "test-support"))]
 pub use config::TradingMode;
 #[cfg(any(test, feature = "test-support"))]

@@ -308,6 +308,8 @@ impl Conductor {
             poll_notify: Arc::new(tokio::sync::Notify::new()),
             wallet_polling,
             tokenizer,
+            #[cfg(feature = "test-support")]
+            failure_injector: ctx.failure_injector.clone(),
         };
 
         let mut conductor = builder::spawn()

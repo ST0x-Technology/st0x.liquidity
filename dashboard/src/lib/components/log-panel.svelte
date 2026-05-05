@@ -398,10 +398,11 @@
   }
 
   const getTarget = (entry: LogEntry): string => {
+    const target = entry.target ?? ''
     const spans = entry.spans?.map(span => span.name).join(' > ')
-    if (spans) return `${entry.target}::${spans}`
-    if (entry.span) return `${entry.target}::${entry.span.name}`
-    return entry.target ?? ''
+    if (spans) return `${target}::${spans}`
+    if (entry.span) return `${target}::${entry.span.name}`
+    return target
   }
 </script>
 

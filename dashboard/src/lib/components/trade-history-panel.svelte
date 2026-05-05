@@ -212,14 +212,6 @@
     void fetchTrades('replace')
   }
 
-  const explorerUrl = (trade: TradeEntry): string | null => {
-    if (trade.venue !== 'raindex') return null
-    const colonIdx = trade.id.lastIndexOf(':')
-    if (colonIdx === -1) return null
-    const txHash = trade.id.slice(0, colonIdx)
-    return getExplorerTxUrl(txHash)
-  }
-
   const directionColor = (direction: string): string =>
     direction === 'Buy' ? 'text-green-500' : 'text-red-500'
 
@@ -429,7 +421,7 @@
 <dialog
   bind:this={detailDialogEl}
   class="w-full max-w-lg rounded-lg border bg-card p-0 text-foreground shadow-lg backdrop:bg-black/50"
-  onclick={(event) => { if (event.target === detailDialogEl) detailDialogEl?.close() }}
+  onclick={(event) => { if (event.target === detailDialogEl) detailDialogEl.close() }}
 >
   {#if detailTrade.current}
     {@const trade = detailTrade.current}
@@ -491,7 +483,7 @@
 
         <!-- Event timeline -->
         <div class="relative space-y-0 border-l-2 border-muted pl-4">
-          {#each detailEvents.current as event, idx (event.sequence)}
+          {#each detailEvents.current as event (event.sequence)}
             {@const timestamp = extractTimestamp(event.payload)}
             {@const fields = Object.entries(event.payload).filter(([key]) => !isTimestampField(key))}
             <div class="relative pb-4">

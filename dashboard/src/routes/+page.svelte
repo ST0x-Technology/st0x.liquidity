@@ -75,20 +75,20 @@
   <!-- Mobile nav: panel tabs + logs -->
   <nav class="flex shrink-0 gap-1 overflow-x-auto border-b bg-card/50 px-2 md:hidden">
     {#if activeTab.current === 'dashboard'}
-      <button class={mobilePanelClass('inventory')} onclick={() => mobilePanel.update(() => 'inventory')}>Inventory</button>
-      <button class={mobilePanelClass('pending')} onclick={() => mobilePanel.update(() => 'pending')}>Pending</button>
-      <button class={mobilePanelClass('trades')} onclick={() => mobilePanel.update(() => 'trades')}>Trades</button>
-      <button class={mobilePanelClass('transfers')} onclick={() => mobilePanel.update(() => 'transfers')}>Transfers</button>
+      <button class={mobilePanelClass('inventory')} onclick={() => { mobilePanel.update(() => 'inventory'); }}>Inventory</button>
+      <button class={mobilePanelClass('pending')} onclick={() => { mobilePanel.update(() => 'pending'); }}>Pending</button>
+      <button class={mobilePanelClass('trades')} onclick={() => { mobilePanel.update(() => 'trades'); }}>Trades</button>
+      <button class={mobilePanelClass('transfers')} onclick={() => { mobilePanel.update(() => 'transfers'); }}>Transfers</button>
     {/if}
     <button
       class="relative whitespace-nowrap px-3 py-2 text-sm font-medium transition-colors {activeTab.current === 'orders' ? 'text-foreground after:absolute after:bottom-0 after:left-0 after:right-0 after:h-0.5 after:bg-primary' : 'text-muted-foreground hover:text-foreground'}"
-      onclick={() => activeTab.update((tab) => tab === 'orders' ? 'dashboard' : 'orders')}
+      onclick={() => { activeTab.update((tab) => tab === 'orders' ? 'dashboard' : 'orders'); }}
     >
       Orders
     </button>
     <button
       class="relative whitespace-nowrap px-3 py-2 text-sm font-medium transition-colors {activeTab.current === 'logs' ? 'text-foreground after:absolute after:bottom-0 after:left-0 after:right-0 after:h-0.5 after:bg-primary' : 'text-muted-foreground hover:text-foreground'}"
-      onclick={() => activeTab.update((tab) => tab === 'logs' ? 'dashboard' : 'logs')}
+      onclick={() => { activeTab.update((tab) => tab === 'logs' ? 'dashboard' : 'logs'); }}
     >
       Logs
     </button>
@@ -98,21 +98,21 @@
   <nav class="hidden shrink-0 gap-1 border-b bg-card/50 px-4 md:flex">
     <button
       class={desktopTabClass(activeTab.current === 'dashboard')}
-      onclick={() => activeTab.update(() => 'dashboard')}
+      onclick={() => { activeTab.update(() => 'dashboard'); }}
     >
       Dashboard
     </button>
 
     <button
       class={desktopTabClass(activeTab.current === 'orders')}
-      onclick={() => activeTab.update(() => 'orders')}
+      onclick={() => { activeTab.update(() => 'orders'); }}
     >
       Orders
     </button>
 
     <button
       class={desktopTabClass(activeTab.current === 'logs')}
-      onclick={() => activeTab.update(() => 'logs')}
+      onclick={() => { activeTab.update(() => 'logs'); }}
     >
       Logs
     </button>

@@ -228,8 +228,6 @@
 
       const data = (await response.json()) as { events: TransferEvent[] }
 
-      if (controller.signal.aborted) return
-
       detailEvents.update(() => data.events)
     } catch (err) {
       if (controller.signal.aborted) return
@@ -311,6 +309,7 @@
                 Status
                 <button
                   class="text-muted-foreground hover:text-foreground"
+                  aria-label="Show status legend"
                   onclick={() => { statusInfoOpen = !statusInfoOpen }}
                 >
                   <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="h-3.5 w-3.5"><path fill-rule="evenodd" d="M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Zm-7-4a1 1 0 1 1-2 0 1 1 0 0 1 2 0ZM9 9a.75.75 0 0 0 0 1.5h.253a.25.25 0 0 1 .244.304l-.459 2.066A1.75 1.75 0 0 0 10.747 15H11a.75.75 0 0 0 0-1.5h-.253a.25.25 0 0 1-.244-.304l.459-2.066A1.75 1.75 0 0 0 9.253 9H9Z" clip-rule="evenodd" /></svg>
@@ -407,7 +406,7 @@
 <dialog
   bind:this={detailDialogEl}
   class="w-full max-w-lg rounded-lg border bg-card p-0 text-foreground shadow-lg backdrop:bg-black/50"
-  onclick={(event) => { if (event.target === detailDialogEl) detailDialogEl?.close() }}
+  onclick={(event) => { if (event.target === detailDialogEl) detailDialogEl.close() }}
 >
   {#if detailTransfer.current}
     {@const transfer = detailTransfer.current}
@@ -501,7 +500,7 @@
                           </a>
                         {:else if isTransferRef(value)}
                           {#if 'OnchainTx' in value}
-                            {@const txHash = String(value['OnchainTx'])}
+                            {@const txHash = value['OnchainTx']}
                             <a
                               href={getExplorerTxUrl(txHash)}
                               target="_blank"
