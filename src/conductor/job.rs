@@ -168,6 +168,7 @@ impl fmt::Display for Label {
 pub enum JobKind {
     OrderFill,
     Hedge,
+    Backfill,
 }
 
 /// Job execution error. Wraps the concrete `Job::Error` type at
@@ -194,6 +195,7 @@ pub(crate) enum JobError {
 pub struct FailureInjector {
     order_fill: Arc<Mutex<InjectionState>>,
     hedge: Arc<Mutex<InjectionState>>,
+    backfill: Arc<Mutex<InjectionState>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -218,6 +220,7 @@ impl FailureInjector {
         Self {
             order_fill: Arc::new(Mutex::new(InjectionState::Idle)),
             hedge: Arc::new(Mutex::new(InjectionState::Idle)),
+            backfill: Arc::new(Mutex::new(InjectionState::Idle)),
         }
     }
 
@@ -254,6 +257,7 @@ impl FailureInjector {
         let mutex = match kind {
             JobKind::OrderFill => &self.order_fill,
             JobKind::Hedge => &self.hedge,
+            JobKind::Backfill => &self.backfill,
         };
 
         match mutex.lock() {

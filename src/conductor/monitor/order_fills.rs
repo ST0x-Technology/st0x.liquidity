@@ -1,24 +1,35 @@
 //! Supervised order fill monitor that subscribes to onchain events
 //! and pushes them into apalis storage for processing.
 //!
-//! The WebSocket connection is created inside [`SupervisedTask::run`],
-//! so a fresh connection is established on each restart. This provides
-//! automatic reconnection via the supervisor's restart policy.
+//! On every (re)connect — both initial startup and supervisor restarts
+//! after a WebSocket disconnect — the monitor:
+//! 1. Subscribes to fresh `ClearV3` / `TakeOrderV3` streams.
+//! 2. Determines a cutoff block via `get_cutoff_block`.
+//! 3. Enqueues a `BackfillRange` apalis job covering
+//!    `(checkpoint+1, cutoff)` to recover events emitted while the
+//!    previous subscription was unavailable.
+//! 4. Enters the live listen loop, advancing the backfill checkpoint
+//!    after every event is durably enqueued.
+//!
+//! The supervisor's restart policy provides automatic reconnection;
+//! this design keeps the disconnect-window data loss issue from
+//! recurring on every restart.
 
-use alloy::primitives::Address;
+use alloy::providers::Provider;
 use alloy::providers::ProviderBuilder;
 use alloy::providers::WsConnect;
-use alloy::rpc::types::Log;
 use alloy::sol_types;
 use futures_util::{Stream, StreamExt};
-use std::pin::Pin;
-use std::sync::Arc;
+use sqlx::SqlitePool;
 use task_supervisor::{SupervisedTask, TaskResult};
-use tokio::sync::Mutex;
 use tracing::{error, info, trace, warn};
-use url::Url;
 
 use crate::bindings::IOrderBookV6::{ClearV3, IOrderBookV6Instance, TakeOrderV3};
+use crate::conductor::monitor::cutoff::get_cutoff_block;
+use crate::onchain::EvmCtx;
+use crate::onchain::backfill::{
+    BackfillJobQueue, BackfillRange, backfill_start_block, save_backfill_checkpoint,
+};
 use crate::onchain::trade::RaindexTradeEvent;
 use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::trade_accountant::{AccountForDexTrade, DexTradeAccountingJobQueue};
@@ -26,44 +37,38 @@ use crate::trading::onchain::trade_accountant::{AccountForDexTrade, DexTradeAcco
 /// Monitors DEX WebSocket streams and pushes
 /// [`AccountForDexTrade`] jobs into apalis storage.
 ///
-/// Implements [`SupervisedTask`] so the supervisor restarts it
-/// on WebSocket disconnection or errors. On first run, it consumes
-/// pre-established streams from `Conductor::start`; on subsequent
-/// restarts it creates a fresh WS connection.
+/// Implements [`SupervisedTask`] so the supervisor restarts it on
+/// WebSocket disconnection or errors. On every invocation — first
+/// run and every restart — the monitor opens a fresh WS subscription,
+/// determines a cutoff block, enqueues a [`BackfillRange`] job for
+/// the gap since the last checkpoint, and then enters the live
+/// listen loop.
 #[derive(Clone)]
 pub(crate) struct OrderFillMonitor {
-    ws_url: Url,
-    orderbook: Address,
+    evm_ctx: EvmCtx,
     job_queue: DexTradeAccountingJobQueue,
-    dex_streams: Arc<Mutex<Option<DexEventStreams>>>,
+    backfill_queue: BackfillJobQueue,
+    pool: SqlitePool,
 }
 
 impl OrderFillMonitor {
     pub(crate) fn new(
-        ws_url: Url,
-        orderbook: Address,
+        evm_ctx: EvmCtx,
         job_queue: DexTradeAccountingJobQueue,
-        dex_streams: DexEventStreams,
+        backfill_queue: BackfillJobQueue,
+        pool: SqlitePool,
     ) -> Self {
         Self {
-            ws_url,
-            orderbook,
+            evm_ctx,
             job_queue,
-            dex_streams: Arc::new(Mutex::new(Some(dex_streams))),
+            backfill_queue,
+            pool,
         }
     }
 }
 
 impl SupervisedTask for OrderFillMonitor {
     async fn run(&mut self) -> TaskResult {
-        info!(ws_url = %self.ws_url, "Connecting to DEX WebSocket");
-        let initial = self.dex_streams.lock().await.take();
-
-        if let Some(streams) = initial {
-            info!("Order fill monitor using pre-established streams");
-            return self.listen(streams.clear, streams.take).await;
-        }
-
         self.connect_and_listen().await
     }
 }
@@ -74,45 +79,69 @@ enum OrderFillMonitorError {
     StreamClosed(&'static str),
 }
 
-type BoxedStream<T, Err = sol_types::Error> = Pin<Box<dyn Stream<Item = Result<T, Err>> + Send>>;
-
-/// DEX event streams (ClearV3 / TakeOrderV3) for monitoring order fills.
-///
-/// Passed from `Conductor::start` to avoid a gap between the WS
-/// subscription (used for `get_cutoff_block`) and the monitor's first
-/// `run()` invocation.
-pub(crate) struct DexEventStreams {
-    pub(crate) clear: BoxedStream<(ClearV3, Log)>,
-    pub(crate) take: BoxedStream<(TakeOrderV3, Log)>,
-}
-
 impl OrderFillMonitor {
     async fn connect_and_listen(&mut self) -> TaskResult {
-        info!(ws_url = %self.ws_url, "Reconnecting to DEX WebSocket");
+        info!(ws_url = %self.evm_ctx.ws_rpc_url, "Connecting to DEX WebSocket");
 
-        let ws = WsConnect::new(self.ws_url.as_str());
+        let ws = WsConnect::new(self.evm_ctx.ws_rpc_url.as_str());
         let provider = ProviderBuilder::new().connect_ws(ws).await?;
-        let orderbook = IOrderBookV6Instance::new(self.orderbook, &provider);
+        let orderbook = IOrderBookV6Instance::new(self.evm_ctx.orderbook, &provider);
 
-        let clear_stream = orderbook.ClearV3_filter().watch().await?.into_stream();
-        let take_stream = orderbook.TakeOrderV3_filter().watch().await?.into_stream();
+        let mut clear_stream = orderbook.ClearV3_filter().watch().await?.into_stream();
+        let mut take_stream = orderbook.TakeOrderV3_filter().watch().await?.into_stream();
 
-        info!("Order fill monitor connected and listening");
+        self.prepare_and_listen(&provider, &mut clear_stream, &mut take_stream)
+            .await
+    }
+
+    /// Computes the cutoff block, enqueues a `BackfillRange` job for
+    /// the gap since the last checkpoint, and enters the live listen
+    /// loop. Split out so unit tests can drive the post-subscribe
+    /// path with mocked streams and a mocked provider.
+    async fn prepare_and_listen<P, ClearEvents, TakeOrderEvents>(
+        &mut self,
+        provider: &P,
+        clear_stream: &mut ClearEvents,
+        take_stream: &mut TakeOrderEvents,
+    ) -> TaskResult
+    where
+        P: Provider + Clone,
+        ClearEvents:
+            Stream<Item = Result<(ClearV3, alloy::rpc::types::Log), sol_types::Error>> + Unpin,
+        TakeOrderEvents:
+            Stream<Item = Result<(TakeOrderV3, alloy::rpc::types::Log), sol_types::Error>> + Unpin,
+    {
+        let cutoff_block = get_cutoff_block(clear_stream, take_stream, provider).await?;
+        let from_block = backfill_start_block(&self.pool, &self.evm_ctx).await?;
+
+        info!(
+            from_block,
+            cutoff_block, "Enqueuing backfill range for missed events on (re)connect"
+        );
+
+        self.backfill_queue
+            .push(BackfillRange {
+                from_block,
+                to_block: cutoff_block,
+            })
+            .await?;
 
         self.listen(clear_stream, take_stream).await
     }
 }
 
 impl OrderFillMonitor {
-    async fn listen(
+    async fn listen<ClearEvents, TakeOrderEvents>(
         &mut self,
-        mut clear_stream: impl Stream<
-            Item = Result<(ClearV3, alloy::rpc::types::Log), sol_types::Error>,
-        > + Unpin,
-        mut take_stream: impl Stream<
-            Item = Result<(TakeOrderV3, alloy::rpc::types::Log), sol_types::Error>,
-        > + Unpin,
-    ) -> TaskResult {
+        clear_stream: &mut ClearEvents,
+        take_stream: &mut TakeOrderEvents,
+    ) -> TaskResult
+    where
+        ClearEvents:
+            Stream<Item = Result<(ClearV3, alloy::rpc::types::Log), sol_types::Error>> + Unpin,
+        TakeOrderEvents:
+            Stream<Item = Result<(TakeOrderV3, alloy::rpc::types::Log), sol_types::Error>> + Unpin,
+    {
         loop {
             let (event, log) = tokio::select! {
                 item = clear_stream.next() => {
@@ -151,6 +180,8 @@ impl OrderFillMonitor {
             }
         };
 
+        let block_number = trade_event.block_number;
+
         trace!(
             target: "hedge",
             tx_hash = ?trade_event.tx_hash,
@@ -161,6 +192,16 @@ impl OrderFillMonitor {
         self.job_queue
             .push(AccountForDexTrade { trade: trade_event })
             .await?;
+
+        // Apalis storage now durably owns this event. Advance the
+        // backfill checkpoint to `block_number - 1` so a subsequent
+        // reconnect-time backfill does not refetch already-enqueued
+        // events. The checkpoint is monotonic via `MAX(...)` upsert,
+        // so out-of-order writes from concurrent block streams cannot
+        // rewind it.
+        if let Some(advance_to) = block_number.checked_sub(1) {
+            save_backfill_checkpoint(&self.pool, &self.evm_ctx, advance_to).await?;
+        }
 
         Ok(())
     }
@@ -184,24 +225,22 @@ mod tests {
             .unwrap()
     }
 
-    async fn create_test_monitor_with_pool() -> (OrderFillMonitor, SqlitePool) {
+    async fn create_test_monitor_with_pool() -> (OrderFillMonitor, SqlitePool, EvmCtx) {
         let pool = setup_test_db().await;
         setup_apalis_tables(&pool).await.unwrap();
         let job_queue = DexTradeAccountingJobQueue::new(&pool);
+        let backfill_queue = BackfillJobQueue::new(&pool);
 
-        let dex_streams = DexEventStreams {
-            clear: Box::pin(stream::empty()),
-            take: Box::pin(stream::empty()),
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+            orderbook: Address::ZERO,
+            deployment_block: 1,
         };
 
-        let monitor = OrderFillMonitor::new(
-            Url::parse("ws://localhost:8545").unwrap(),
-            Address::ZERO,
-            job_queue,
-            dex_streams,
-        );
+        let monitor =
+            OrderFillMonitor::new(evm_ctx.clone(), job_queue, backfill_queue, pool.clone());
 
-        (monitor, pool)
+        (monitor, pool, evm_ctx)
     }
 
     fn test_clear_event() -> ClearV3 {
@@ -231,40 +270,42 @@ mod tests {
 
     #[tokio::test]
     async fn listen_enqueues_clear_event() {
-        let (mut monitor, pool) = create_test_monitor_with_pool().await;
+        let (mut monitor, pool, _evm_ctx) = create_test_monitor_with_pool().await;
         let log = create_log(0);
 
-        let clear_stream = stream::iter(vec![Ok((test_clear_event(), log))]);
-        let take_stream = stream::pending();
+        let mut clear_stream = stream::iter(vec![Ok((test_clear_event(), log))]);
+        let mut take_stream =
+            stream::pending::<Result<(TakeOrderV3, alloy::rpc::types::Log), sol_types::Error>>();
 
-        let _result = monitor.listen(clear_stream, take_stream).await;
+        let _result = monitor.listen(&mut clear_stream, &mut take_stream).await;
 
         assert_eq!(job_count(&pool).await, 1);
     }
 
     #[tokio::test]
     async fn listen_enqueues_take_event() {
-        let (mut monitor, pool) = create_test_monitor_with_pool().await;
+        let (mut monitor, pool, _evm_ctx) = create_test_monitor_with_pool().await;
         let log = create_log(1);
 
-        let clear_stream = stream::pending();
-        let take_stream = stream::iter(vec![Ok((test_take_event(), log))]);
+        let mut clear_stream =
+            stream::pending::<Result<(ClearV3, alloy::rpc::types::Log), sol_types::Error>>();
+        let mut take_stream = stream::iter(vec![Ok((test_take_event(), log))]);
 
-        let _result = monitor.listen(clear_stream, take_stream).await;
+        let _result = monitor.listen(&mut clear_stream, &mut take_stream).await;
 
         assert_eq!(job_count(&pool).await, 1);
     }
 
     #[tokio::test]
     async fn listen_returns_error_when_both_streams_empty() {
-        let (mut monitor, _pool) = create_test_monitor_with_pool().await;
+        let (mut monitor, _pool, _evm_ctx) = create_test_monitor_with_pool().await;
 
-        let clear_stream =
+        let mut clear_stream =
             stream::empty::<Result<(ClearV3, alloy::rpc::types::Log), sol_types::Error>>();
-        let take_stream =
+        let mut take_stream =
             stream::empty::<Result<(TakeOrderV3, alloy::rpc::types::Log), sol_types::Error>>();
 
-        let result = monitor.listen(clear_stream, take_stream).await;
+        let result = monitor.listen(&mut clear_stream, &mut take_stream).await;
 
         let error = result
             .unwrap_err()
@@ -275,13 +316,13 @@ mod tests {
 
     #[tokio::test]
     async fn listen_returns_error_when_clear_stream_closes() {
-        let (mut monitor, _pool) = create_test_monitor_with_pool().await;
+        let (mut monitor, _pool, _evm_ctx) = create_test_monitor_with_pool().await;
 
-        let clear_stream =
+        let mut clear_stream =
             stream::empty::<Result<(ClearV3, alloy::rpc::types::Log), sol_types::Error>>();
-        let take_stream = stream::pending();
+        let mut take_stream = stream::pending();
 
-        let result = monitor.listen(clear_stream, take_stream).await;
+        let result = monitor.listen(&mut clear_stream, &mut take_stream).await;
 
         let error = result
             .unwrap_err()
@@ -295,13 +336,13 @@ mod tests {
 
     #[tokio::test]
     async fn listen_returns_error_when_take_stream_closes() {
-        let (mut monitor, _pool) = create_test_monitor_with_pool().await;
+        let (mut monitor, _pool, _evm_ctx) = create_test_monitor_with_pool().await;
 
-        let clear_stream = stream::pending();
-        let take_stream =
+        let mut clear_stream = stream::pending();
+        let mut take_stream =
             stream::empty::<Result<(TakeOrderV3, alloy::rpc::types::Log), sol_types::Error>>();
 
-        let result = monitor.listen(clear_stream, take_stream).await;
+        let result = monitor.listen(&mut clear_stream, &mut take_stream).await;
 
         let error = result
             .unwrap_err()
@@ -315,7 +356,7 @@ mod tests {
 
     #[tokio::test]
     async fn enqueue_trade_event_persists_to_storage() {
-        let (mut monitor, pool) = create_test_monitor_with_pool().await;
+        let (mut monitor, pool, _evm_ctx) = create_test_monitor_with_pool().await;
         let log = create_log(42);
         let event = RaindexTradeEvent::ClearV3(Box::new(test_clear_event()));
 
@@ -326,7 +367,7 @@ mod tests {
 
     #[tokio::test]
     async fn enqueue_trade_event_survives_invalid_log() {
-        let (mut monitor, pool) = create_test_monitor_with_pool().await;
+        let (mut monitor, pool, _evm_ctx) = create_test_monitor_with_pool().await;
 
         let invalid_log = alloy::rpc::types::Log {
             inner: alloy::primitives::Log {
@@ -354,26 +395,185 @@ mod tests {
 
     #[tokio::test]
     async fn listen_processes_events_from_both_streams() {
-        let (mut monitor, pool) = create_test_monitor_with_pool().await;
+        let (mut monitor, pool, _evm_ctx) = create_test_monitor_with_pool().await;
 
         let clear_log = create_log(0);
         let take_log = create_log(1);
 
-        // Chain with stream::pending() so streams don't close after yielding
-        // their item — avoids a tokio::select! race where the exhausted stream
-        // is polled before the other stream's item is consumed.
-        let clear_stream =
+        let mut clear_stream =
             stream::iter(vec![Ok((test_clear_event(), clear_log))]).chain(stream::pending());
-        let take_stream =
+        let mut take_stream =
             stream::iter(vec![Ok((test_take_event(), take_log))]).chain(stream::pending());
 
-        // listen blocks on the now-pending streams after processing both events
         let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            monitor.listen(clear_stream, take_stream),
+            std::time::Duration::from_millis(50),
+            monitor.listen(&mut clear_stream, &mut take_stream),
         )
         .await;
 
         assert_eq!(job_count(&pool).await, 2);
+    }
+
+    #[tokio::test]
+    async fn enqueue_trade_event_advances_checkpoint_to_block_minus_one() {
+        let (mut monitor, pool, evm_ctx) = create_test_monitor_with_pool().await;
+        // create_log uses block_number = 12345 by default.
+        let log = create_log(7);
+        let event = RaindexTradeEvent::ClearV3(Box::new(test_clear_event()));
+
+        monitor.enqueue_trade_event(event, &log).await.unwrap();
+
+        let checkpoint = crate::onchain::backfill::load_backfill_checkpoint(&pool, &evm_ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            checkpoint,
+            Some(12344),
+            "checkpoint must advance to block_number - 1 once an event is durably enqueued"
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_trade_event_checkpoint_is_monotonic() {
+        let (mut monitor, pool, evm_ctx) = create_test_monitor_with_pool().await;
+
+        let high_block_log = alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: Address::ZERO,
+                data: alloy::primitives::LogData::empty(),
+            },
+            block_hash: None,
+            block_number: Some(200),
+            block_timestamp: None,
+            transaction_hash: Some(alloy::primitives::B256::ZERO),
+            transaction_index: None,
+            log_index: Some(0),
+            removed: false,
+        };
+
+        let low_block_log = alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: Address::ZERO,
+                data: alloy::primitives::LogData::empty(),
+            },
+            block_hash: None,
+            block_number: Some(50),
+            block_timestamp: None,
+            transaction_hash: Some(alloy::primitives::B256::ZERO),
+            transaction_index: None,
+            log_index: Some(0),
+            removed: false,
+        };
+
+        let event_high = RaindexTradeEvent::ClearV3(Box::new(test_clear_event()));
+        let event_low = RaindexTradeEvent::ClearV3(Box::new(test_clear_event()));
+
+        monitor
+            .enqueue_trade_event(event_high, &high_block_log)
+            .await
+            .unwrap();
+        monitor
+            .enqueue_trade_event(event_low, &low_block_log)
+            .await
+            .unwrap();
+
+        let checkpoint = crate::onchain::backfill::load_backfill_checkpoint(&pool, &evm_ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            checkpoint,
+            Some(199),
+            "checkpoint must never rewind when an out-of-order event is observed"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_and_listen_enqueues_backfill_for_disconnect_window() {
+        // RAI-198 repro: when the monitor (re)connects, it must
+        // enqueue a BackfillRange covering (checkpoint+1, cutoff)
+        // so events emitted during the WS disconnect window are
+        // recovered. Pre-fix: no BackfillRange is enqueued and
+        // those events are silently dropped.
+        let (mut monitor, pool, evm_ctx) = create_test_monitor_with_pool().await;
+
+        // Simulate prior progress: live monitor processed events up
+        // through block 99 before the disconnect.
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 99)
+            .await
+            .unwrap();
+
+        // Mock provider returns block 105 from `eth_blockNumber`,
+        // which the monitor will use as the cutoff after the cutoff
+        // helper times out waiting for live events.
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_success(&serde_json::Value::from(105_u64));
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let mut clear_stream =
+            stream::empty::<Result<(ClearV3, alloy::rpc::types::Log), sol_types::Error>>();
+        let mut take_stream =
+            stream::empty::<Result<(TakeOrderV3, alloy::rpc::types::Log), sol_types::Error>>();
+
+        // prepare_and_listen returns Err(StreamsClosed) once it falls
+        // through to the listen loop with empty streams; we don't
+        // care about that — we only care that the backfill job was
+        // enqueued before the listen loop starts.
+        let _ = monitor
+            .prepare_and_listen(&provider, &mut clear_stream, &mut take_stream)
+            .await;
+
+        let job_count = job_count(&pool).await;
+        assert_eq!(
+            job_count, 1,
+            "exactly one job (the BackfillRange) must be enqueued on reconnect"
+        );
+
+        let job_payload = sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT job FROM Jobs WHERE job_type LIKE '%BackfillRange%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let job: BackfillRange = serde_json::from_slice(&job_payload).unwrap();
+        assert_eq!(job.from_block, 100, "backfill must resume after checkpoint");
+        assert_eq!(job.to_block, 105, "backfill must extend up to the cutoff");
+    }
+
+    #[tokio::test]
+    async fn enqueue_trade_event_does_not_advance_on_invalid_log() {
+        let (mut monitor, pool, evm_ctx) = create_test_monitor_with_pool().await;
+
+        let invalid_log = alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: Address::ZERO,
+                data: alloy::primitives::LogData::empty(),
+            },
+            block_hash: None,
+            block_number: None,
+            block_timestamp: None,
+            transaction_hash: None,
+            transaction_index: None,
+            log_index: None,
+            removed: false,
+        };
+
+        let event = RaindexTradeEvent::ClearV3(Box::new(test_clear_event()));
+
+        monitor
+            .enqueue_trade_event(event, &invalid_log)
+            .await
+            .unwrap();
+
+        let checkpoint = crate::onchain::backfill::load_backfill_checkpoint(&pool, &evm_ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            checkpoint, None,
+            "checkpoint must not advance when the log lacks block metadata"
+        );
     }
 }

@@ -21,12 +21,13 @@ use st0x_execution::Executor;
 use super::job::{FAIL_STOP_RECOVERY_TIMEOUT, FixedInterval, RETRY_BACKOFF, poll_orders, work};
 #[cfg(any(test, feature = "test-support"))]
 use super::job::{FailureInjector, JobKind};
-use super::monitor::order_fills::{DexEventStreams, OrderFillMonitor};
+use super::monitor::order_fills::OrderFillMonitor;
 use super::monitor::positions::PositionMonitor;
 use super::{Conductor, MonitorTaskError, build_order_poller, spawn_inventory_poller};
 use crate::config::Ctx;
 use crate::inventory::{InventoryPollingService, InventorySnapshot, WalletPollingCtx};
 use crate::offchain_order::OffchainOrder;
+use crate::onchain::backfill::BackfillJobQueue;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::raindex::RaindexService;
 use crate::onchain_trade::OnChainTrade;
@@ -69,11 +70,13 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
 
 /// Wires all runtime components and returns a running [`Conductor`].
 #[bon::builder]
+// Main spawn function, long to keep together
+#[allow(clippy::too_many_lines)]
 pub(crate) fn spawn<Prov, Exec>(
     context: ConductorCtx<Prov, Exec>,
     job_queue: DexTradeAccountingJobQueue,
+    backfill_queue: BackfillJobQueue,
     hedge_queue: HedgeJobQueue,
-    dex_streams: DexEventStreams,
     job_cleanup: JoinHandle<()>,
     executor_maintenance: Option<JoinHandle<()>>,
     rebalancer: Option<JoinHandle<()>>,
@@ -137,7 +140,7 @@ where
         hedge_queue.clone(),
         std::time::Duration::from_secs(context.ctx.position_check_interval),
         context.ctx.clone(),
-        context.pool,
+        context.pool.clone(),
     );
 
     let trade_cqrs = super::TradeProcessingCqrs {
@@ -159,13 +162,15 @@ where
         cqrs: trade_cqrs,
         vault_registry: context.frameworks.vault_registry,
         executor: context.executor,
+        pool: context.pool.clone(),
+        job_queue: job_queue.clone(),
     });
 
     let order_fill_monitor = OrderFillMonitor::new(
-        context.ctx.evm.ws_rpc_url.clone(),
-        context.ctx.evm.orderbook,
+        context.ctx.evm.clone(),
         job_queue.clone(),
-        dex_streams,
+        backfill_queue.clone(),
+        context.pool,
     );
 
     let supervisor = SupervisorBuilder::default()
@@ -178,6 +183,8 @@ where
     let failure_injector = context.failure_injector;
     #[cfg(any(test, feature = "test-support"))]
     let failure_injector_for_hedge = failure_injector.clone();
+    #[cfg(any(test, feature = "test-support"))]
+    let failure_injector_for_backfill = failure_injector.clone();
     let failure_notify = Arc::new(tokio::sync::Notify::new());
     let failure_notify_for_hedge = failure_notify.clone();
     let failure_notify_for_poller = failure_notify.clone();
@@ -187,6 +194,10 @@ where
         .with_recovery_timeout(FAIL_STOP_RECOVERY_TIMEOUT);
     let fail_stop_for_hedge = fail_stop.clone();
     let fail_stop_for_poller = fail_stop.clone();
+    let fail_stop_for_backfill = fail_stop.clone();
+
+    let accountant_ctx_for_backfill = accountant_ctx.clone();
+    let failure_notify_for_backfill = failure_notify.clone();
 
     let monitor: JoinHandle<Result<(), MonitorTaskError>> = tokio::spawn(async move {
         let failure_notify_for_accountant = failure_notify.clone();
@@ -244,6 +255,32 @@ where
                         }
                     })
                     .build(work::<HedgeCtx, _>)
+            })
+            .register(move |index| {
+                let builder = WorkerBuilder::new(format!("backfill-worker-{index}"))
+                    .backend(backfill_queue.clone().into_storage())
+                    .data(accountant_ctx_for_backfill.clone());
+
+                #[cfg(any(test, feature = "test-support"))]
+                let builder = builder
+                    .data(failure_injector_for_backfill.clone())
+                    .data(JobKind::Backfill);
+
+                builder
+                    .concurrency(1)
+                    .retry(RetryPolicy::retries(3).with_backoff(RETRY_BACKOFF.clone()))
+                    .break_circuit_with(fail_stop_for_backfill.clone())
+                    .on_event({
+                        let failure_notify = failure_notify_for_backfill.clone();
+                        move |ctx, event| {
+                            if let Event::Error(err) = event {
+                                error!(%err, worker = %ctx.name(), "Job failed after retries");
+                                failure_notify.notify_waiters();
+                                let _ = ctx.stop();
+                            }
+                        }
+                    })
+                    .build(work::<AccountantCtx<Prov, Exec>, _>)
             })
             .register(move |index| {
                 WorkerBuilder::new(format!("order-poller-{index}"))

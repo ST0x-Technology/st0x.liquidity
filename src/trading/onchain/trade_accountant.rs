@@ -10,6 +10,7 @@ use alloy::primitives::{Address, IntoLogData};
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 use std::sync::Arc;
 use tracing::debug;
 
@@ -53,6 +54,8 @@ pub(crate) struct AccountantCtx<Node, Exec> {
     pub(crate) cqrs: TradeProcessingCqrs,
     pub(crate) vault_registry: Arc<Store<VaultRegistry>>,
     pub(crate) executor: Exec,
+    pub(crate) pool: SqlitePool,
+    pub(crate) job_queue: DexTradeAccountingJobQueue,
 }
 
 impl<Node, Exec> Job<AccountantCtx<Node, Exec>> for AccountForDexTrade
@@ -293,6 +296,8 @@ mod tests {
             counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
 
+        let job_queue = DexTradeAccountingJobQueue::new(&pool);
+
         let accountant_ctx = AccountantCtx {
             orderbook: ctx.evm.orderbook,
             ctx,
@@ -302,6 +307,8 @@ mod tests {
             cqrs,
             vault_registry,
             executor,
+            pool: pool.clone(),
+            job_queue,
         };
 
         let job = test_job();
