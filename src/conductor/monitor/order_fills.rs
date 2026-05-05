@@ -70,8 +70,8 @@ impl SupervisedTask for OrderFillMonitor {
 
 #[derive(Debug, thiserror::Error)]
 enum OrderFillMonitorError {
-    #[error("DEX event streams closed unexpectedly")]
-    StreamsClosed,
+    #[error("{0} event stream closed unexpectedly")]
+    StreamClosed(&'static str),
 }
 
 type BoxedStream<T, Err = sol_types::Error> = Pin<Box<dyn Stream<Item = Result<T, Err>> + Send>>;
@@ -114,21 +114,24 @@ impl OrderFillMonitor {
         > + Unpin,
     ) -> TaskResult {
         loop {
-            let trade_event = tokio::select! {
-                Some(result) = clear_stream.next() => {
+            let (event, log) = tokio::select! {
+                item = clear_stream.next() => {
+                    let Some(result) = item else {
+                        error!("ClearV3 event stream closed unexpectedly");
+                        return Err(OrderFillMonitorError::StreamClosed("ClearV3").into());
+                    };
                     let (event, log) = result?;
-                    Some((RaindexTradeEvent::ClearV3(Box::new(event)), log))
+                    (RaindexTradeEvent::ClearV3(Box::new(event)), log)
                 }
-                Some(result) = take_stream.next() => {
-                    let (event, log) = result?;
-                    Some((RaindexTradeEvent::TakeOrderV3(Box::new(event)), log))
-                }
-                else => None,
-            };
 
-            let Some((event, log)) = trade_event else {
-                error!("Both DEX event streams ended unexpectedly");
-                return Err(OrderFillMonitorError::StreamsClosed.into());
+                item = take_stream.next() => {
+                    let Some(result) = item else {
+                        error!("TakeOrderV3 event stream closed unexpectedly");
+                        return Err(OrderFillMonitorError::StreamClosed("TakeOrderV3").into());
+                    };
+                    let (event, log) = result?;
+                    (RaindexTradeEvent::TakeOrderV3(Box::new(event)), log)
+                }
             };
 
             self.enqueue_trade_event(event, &log).await?;
@@ -232,7 +235,7 @@ mod tests {
         let log = create_log(0);
 
         let clear_stream = stream::iter(vec![Ok((test_clear_event(), log))]);
-        let take_stream = stream::empty();
+        let take_stream = stream::pending();
 
         let _result = monitor.listen(clear_stream, take_stream).await;
 
@@ -244,7 +247,7 @@ mod tests {
         let (mut monitor, pool) = create_test_monitor_with_pool().await;
         let log = create_log(1);
 
-        let clear_stream = stream::empty();
+        let clear_stream = stream::pending();
         let take_stream = stream::iter(vec![Ok((test_take_event(), log))]);
 
         let _result = monitor.listen(clear_stream, take_stream).await;
@@ -267,7 +270,47 @@ mod tests {
             .unwrap_err()
             .downcast::<OrderFillMonitorError>()
             .expect("expected OrderFillMonitorError");
-        assert!(matches!(*error, OrderFillMonitorError::StreamsClosed));
+        assert!(matches!(*error, OrderFillMonitorError::StreamClosed(_)));
+    }
+
+    #[tokio::test]
+    async fn listen_returns_error_when_clear_stream_closes() {
+        let (mut monitor, _pool) = create_test_monitor_with_pool().await;
+
+        let clear_stream =
+            stream::empty::<Result<(ClearV3, alloy::rpc::types::Log), sol_types::Error>>();
+        let take_stream = stream::pending();
+
+        let result = monitor.listen(clear_stream, take_stream).await;
+
+        let error = result
+            .unwrap_err()
+            .downcast::<OrderFillMonitorError>()
+            .expect("expected OrderFillMonitorError");
+        assert!(matches!(
+            *error,
+            OrderFillMonitorError::StreamClosed("ClearV3")
+        ));
+    }
+
+    #[tokio::test]
+    async fn listen_returns_error_when_take_stream_closes() {
+        let (mut monitor, _pool) = create_test_monitor_with_pool().await;
+
+        let clear_stream = stream::pending();
+        let take_stream =
+            stream::empty::<Result<(TakeOrderV3, alloy::rpc::types::Log), sol_types::Error>>();
+
+        let result = monitor.listen(clear_stream, take_stream).await;
+
+        let error = result
+            .unwrap_err()
+            .downcast::<OrderFillMonitorError>()
+            .expect("expected OrderFillMonitorError");
+        assert!(matches!(
+            *error,
+            OrderFillMonitorError::StreamClosed("TakeOrderV3")
+        ));
     }
 
     #[tokio::test]
@@ -316,10 +359,20 @@ mod tests {
         let clear_log = create_log(0);
         let take_log = create_log(1);
 
-        let clear_stream = stream::iter(vec![Ok((test_clear_event(), clear_log))]);
-        let take_stream = stream::iter(vec![Ok((test_take_event(), take_log))]);
+        // Chain with stream::pending() so streams don't close after yielding
+        // their item — avoids a tokio::select! race where the exhausted stream
+        // is polled before the other stream's item is consumed.
+        let clear_stream =
+            stream::iter(vec![Ok((test_clear_event(), clear_log))]).chain(stream::pending());
+        let take_stream =
+            stream::iter(vec![Ok((test_take_event(), take_log))]).chain(stream::pending());
 
-        let _result = monitor.listen(clear_stream, take_stream).await;
+        // listen blocks on the now-pending streams after processing both events
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            monitor.listen(clear_stream, take_stream),
+        )
+        .await;
 
         assert_eq!(job_count(&pool).await, 2);
     }
