@@ -38,6 +38,10 @@ impl ExecutionThreshold {
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "test helper constructing a known-positive literal"
+    )]
     pub fn whole_share() -> Self {
         // float!(1) is a compile-time positive constant, so Positive::new
         // cannot fail at runtime here.

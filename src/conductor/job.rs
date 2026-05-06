@@ -312,6 +312,7 @@ pub enum JobKind {
     SeedVaultRegistry,
     WrappedEquityRecovery,
     CheckPositions,
+    MockBroker,
 }
 
 /// Job execution error. Wraps the concrete `Job::Error` type at
@@ -347,6 +348,7 @@ pub struct FailureInjector {
     seed_vault_registry: Arc<Mutex<InjectionState>>,
     wrapped_equity_recovery: Arc<Mutex<InjectionState>>,
     check_positions: Arc<Mutex<InjectionState>>,
+    mock_broker: Arc<Mutex<InjectionState>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -380,6 +382,7 @@ impl FailureInjector {
             seed_vault_registry: Arc::new(Mutex::new(InjectionState::Idle)),
             wrapped_equity_recovery: Arc::new(Mutex::new(InjectionState::Idle)),
             check_positions: Arc::new(Mutex::new(InjectionState::Idle)),
+            mock_broker: Arc::new(Mutex::new(InjectionState::Idle)),
         }
     }
 
@@ -425,6 +428,7 @@ impl FailureInjector {
             JobKind::SeedVaultRegistry => &self.seed_vault_registry,
             JobKind::WrappedEquityRecovery => &self.wrapped_equity_recovery,
             JobKind::CheckPositions => &self.check_positions,
+            JobKind::MockBroker => &self.mock_broker,
         };
 
         match mutex.lock() {

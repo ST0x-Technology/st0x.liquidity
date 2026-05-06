@@ -1177,6 +1177,10 @@ pub async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePool, sql
 }
 
 #[cfg(any(test, feature = "test-support"))]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test helper parsing a static, known-valid URL"
+)]
 pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
     Ctx {
         database_url: ":memory:".to_owned(),
