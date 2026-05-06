@@ -1,54 +1,41 @@
-//! HTTP API endpoints for health checks, log retrieval, order status,
-//! and transfer recovery.
+//! HTTP API endpoints for health checks, log retrieval, and order status.
 
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::LazyLock;
 
+use axum::Json;
+use axum::Router;
+use axum::extract::{Path, Query, State};
+use axum::http::{StatusCode, header};
+use axum::response::IntoResponse;
+use axum::routing::get;
 use chrono::{DateTime, Utc};
-use rocket::form::{self, FromFormField, ValueField};
-use rocket::http::Status;
-use rocket::request::FromParam;
-use rocket::response::content::RawJson;
-use rocket::serde::json::Json;
-use rocket::serde::{Deserialize, Serialize};
-use rocket::{Route, State, get, post, routes};
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use tokio::sync::Mutex;
-use tracing::{error, info};
 
-use st0x_config::Ctx;
-
+use crate::AppState;
 use crate::dashboard::transfer_loader::TransferKind;
-use crate::rebalancing::equity::CrossVenueEquityTransfer;
 
-impl<'a> FromParam<'a> for TransferKind {
-    type Error = String;
+/// Wraps a JSON-formatted string for response without re-serialization.
+struct RawJson(String);
 
-    fn from_param(param: &'a str) -> Result<Self, Self::Error> {
-        param.parse()
+impl IntoResponse for RawJson {
+    fn into_response(self) -> axum::response::Response {
+        let Self(body) = self;
+        ([(header::CONTENT_TYPE, "application/json")], body).into_response()
     }
 }
 
 /// Comma-separated filter for transfer kinds in query parameters.
 ///
 /// Parses `"equity_mint,usdc_bridge"` into `vec![EquityMint, UsdcBridge]`.
-struct TransferKindFilter(Vec<TransferKind>);
-
-impl<'v> FromFormField<'v> for TransferKindFilter {
-    fn from_value(field: ValueField<'v>) -> form::Result<'v, Self> {
-        let kinds: Result<Vec<TransferKind>, _> = field
-            .value
-            .split(',')
-            .map(str::trim)
-            .filter(|segment| !segment.is_empty())
-            .map(TransferKind::from_str)
-            .collect();
-
-        kinds
-            .map(TransferKindFilter)
-            .map_err(|error| form::Error::validation(error).into())
-    }
+fn parse_transfer_kind_filter(value: &str) -> Result<Vec<TransferKind>, String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(TransferKind::from_str)
+        .collect()
 }
 
 static STARTED_AT: LazyLock<DateTime<Utc>> = LazyLock::new(Utc::now);
@@ -109,8 +96,7 @@ struct TradeResponse {
     has_more: bool,
 }
 
-#[get("/health")]
-fn health() -> Json<HealthResponse> {
+async fn health() -> Json<HealthResponse> {
     let uptime = Utc::now() - *STARTED_AT;
 
     Json(HealthResponse {
@@ -119,6 +105,17 @@ fn health() -> Json<HealthResponse> {
         git_commit: GIT_COMMIT.to_string(),
         uptime_seconds: uptime.num_seconds(),
     })
+}
+
+#[derive(Deserialize, Default)]
+struct LogsQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+    search: Option<String>,
+    level: Option<String>,
+    target: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
 }
 
 /// Returns log entries with pagination, search, level, and time range
@@ -131,21 +128,11 @@ fn health() -> Json<HealthResponse> {
 /// - `target`: comma-separated domain targets to include (e.g. `hedge,rebalance`)
 /// - `since`: ISO 8601 UTC lower bound (inclusive)
 /// - `until`: ISO 8601 UTC upper bound (inclusive)
-#[get("/logs?<limit>&<offset>&<search>&<level>&<target>&<since>&<until>")]
-fn logs(
-    ctx: &State<Ctx>,
-    limit: Option<usize>,
-    offset: Option<usize>,
-    search: Option<&str>,
-    level: Option<&str>,
-    target: Option<&str>,
-    since: Option<&str>,
-    until: Option<&str>,
-) -> Json<LogResponse> {
-    let limit = limit.unwrap_or(100).min(5000);
-    let offset = offset.unwrap_or(0);
+async fn logs(State(state): State<AppState>, Query(query): Query<LogsQuery>) -> Json<LogResponse> {
+    let limit = query.limit.unwrap_or(100).min(5000);
+    let offset = query.offset.unwrap_or(0);
 
-    let Some(ref log_dir) = ctx.log_dir else {
+    let Some(ref log_dir) = state.ctx.log_dir else {
         return Json(LogResponse {
             entries: Vec::new(),
             total: 0,
@@ -154,25 +141,35 @@ fn logs(
     };
 
     let filter = LogFilter {
-        search_lower: search
-            .filter(|query| !query.is_empty())
+        search_lower: query
+            .search
+            .as_deref()
+            .filter(|val| !val.is_empty())
             .map(str::to_lowercase),
-        levels: level.filter(|lvl| !lvl.is_empty()).map(|lvl| {
-            lvl.split(',')
-                .map(|part| part.trim().to_uppercase())
-                .collect()
-        }),
-        targets: target.filter(|tgt| !tgt.is_empty()).map(|tgt| {
-            tgt.split(',')
-                .map(|part| part.trim().to_lowercase())
-                .collect()
-        }),
-        since: since.and_then(|val| {
+        levels: query
+            .level
+            .as_deref()
+            .filter(|val| !val.is_empty())
+            .map(|val| {
+                val.split(',')
+                    .map(|part| part.trim().to_uppercase())
+                    .collect()
+            }),
+        targets: query
+            .target
+            .as_deref()
+            .filter(|val| !val.is_empty())
+            .map(|val| {
+                val.split(',')
+                    .map(|part| part.trim().to_lowercase())
+                    .collect()
+            }),
+        since: query.since.as_deref().and_then(|val| {
             DateTime::parse_from_rfc3339(val)
                 .ok()
                 .map(|dt| dt.with_timezone(&Utc))
         }),
-        until: until.and_then(|val| {
+        until: query.until.as_deref().and_then(|val| {
             DateTime::parse_from_rfc3339(val)
                 .ok()
                 .map(|dt| dt.with_timezone(&Utc))
@@ -378,14 +375,13 @@ fn extract_log_file_date(entry: &std::fs::DirEntry) -> Option<chrono::NaiveDate>
 }
 
 /// Returns non-terminal offchain orders (Pending, Submitted, PartiallyFilled).
-#[get("/orders/pending")]
-async fn pending_orders(pool: &State<SqlitePool>) -> Json<Vec<PendingOrderResponse>> {
+async fn pending_orders(State(state): State<AppState>) -> Json<Vec<PendingOrderResponse>> {
     let rows: Vec<(String, String, String)> = match sqlx::query_as(
         "SELECT view_id, status, payload FROM offchain_order_view \
          WHERE status IN ('Pending', 'Submitted', 'PartiallyFilled') \
          ORDER BY rowid DESC LIMIT 100",
     )
-    .fetch_all(pool.inner())
+    .fetch_all(&state.pool)
     .await
     {
         Ok(rows) => rows,
@@ -427,44 +423,56 @@ fn parse_pending_order(
     })
 }
 
+#[derive(Deserialize, Default)]
+struct TradesQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+    symbol: Option<String>,
+    venue: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+}
+
 /// Paginated trade history from both onchain and offchain fills.
 ///
 /// Returns newest-first. Supports filtering by symbol, venue, and time range.
-#[get("/trades?<limit>&<offset>&<symbol>&<venue>&<since>&<until>")]
 async fn trades(
-    pool: &State<SqlitePool>,
-    limit: Option<usize>,
-    offset: Option<usize>,
-    symbol: Option<&str>,
-    venue: Option<&str>,
-    since: Option<&str>,
-    until: Option<&str>,
+    State(state): State<AppState>,
+    Query(query): Query<TradesQuery>,
 ) -> Json<TradeResponse> {
-    let limit = limit.unwrap_or(100).min(500);
-    let offset = offset.unwrap_or(0);
+    let limit = query.limit.unwrap_or(100).min(500);
+    let offset = query.offset.unwrap_or(0);
 
-    let since_dt = since.and_then(|val| {
+    let since_dt = query.since.as_deref().and_then(|val| {
         DateTime::parse_from_rfc3339(val)
             .ok()
             .map(|dt| dt.with_timezone(&Utc))
     });
-    let until_dt = until.and_then(|val| {
+    let until_dt = query.until.as_deref().and_then(|val| {
         DateTime::parse_from_rfc3339(val)
             .ok()
             .map(|dt| dt.with_timezone(&Utc))
     });
 
-    let venues = venue.filter(|val| !val.is_empty()).map(|val| {
-        val.split(',')
-            .map(|part| part.trim().to_string())
-            .collect::<Vec<_>>()
-    });
+    let venues = query
+        .venue
+        .as_deref()
+        .filter(|val| !val.is_empty())
+        .map(|val| {
+            val.split(',')
+                .map(|part| part.trim().to_string())
+                .collect::<Vec<_>>()
+        });
 
-    let symbols = symbol.filter(|val| !val.is_empty()).map(|val| {
-        val.split(',')
-            .map(|part| part.trim().to_string())
-            .collect::<Vec<_>>()
-    });
+    let symbols = query
+        .symbol
+        .as_deref()
+        .filter(|val| !val.is_empty())
+        .map(|val| {
+            val.split(',')
+                .map(|part| part.trim().to_string())
+                .collect::<Vec<_>>()
+        });
 
     let trade_filter = TradeFilter {
         symbols,
@@ -473,7 +481,7 @@ async fn trades(
         until: until_dt,
     };
 
-    let mut all_trades = load_trade_rows(pool.inner(), &trade_filter).await;
+    let mut all_trades = load_trade_rows(&state.pool, &trade_filter).await;
     all_trades.sort_by(|lhs, rhs| rhs.filled_at.cmp(&lhs.filled_at));
 
     let total = all_trades.len();
@@ -643,37 +651,47 @@ async fn load_offchain_trade_rows(pool: &SqlitePool, filter: &TradeFilter) -> Ve
         .collect()
 }
 
+#[derive(Deserialize, Default)]
+struct TransfersQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+    kind: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+}
+
 /// Paginated transfer history using event-sourced aggregate replay.
 ///
 /// Replays transfer aggregates to produce proper DTO statuses, then
 /// applies time-range filtering and pagination.
-#[get("/transfers?<limit>&<offset>&<kind>&<since>&<until>")]
 async fn transfers_endpoint(
-    pool: &State<SqlitePool>,
-    limit: Option<usize>,
-    offset: Option<usize>,
-    kind: Option<TransferKindFilter>,
-    since: Option<&str>,
-    until: Option<&str>,
-) -> Result<Json<serde_json::Value>, Status> {
-    let limit = limit.unwrap_or(100).min(500);
-    let offset = offset.unwrap_or(0);
+    State(state): State<AppState>,
+    Query(query): Query<TransfersQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let limit = query.limit.unwrap_or(100).min(500);
+    let offset = query.offset.unwrap_or(0);
 
-    let since_dt = since.and_then(|val| {
+    let since_dt = query.since.as_deref().and_then(|val| {
         DateTime::parse_from_rfc3339(val)
             .ok()
             .map(|dt| dt.with_timezone(&Utc))
     });
-    let until_dt = until.and_then(|val| {
+    let until_dt = query.until.as_deref().and_then(|val| {
         DateTime::parse_from_rfc3339(val)
             .ok()
             .map(|dt| dt.with_timezone(&Utc))
     });
 
-    let kind_filter = kind.map(|filter| filter.0);
+    let kind_filter = match query.kind.as_deref().filter(|val| !val.is_empty()) {
+        Some(value) => Some(parse_transfer_kind_filter(value).map_err(|error| {
+            tracing::warn!(target: "dashboard", %error, "Invalid transfer kind filter");
+            StatusCode::BAD_REQUEST
+        })?),
+        None => None,
+    };
 
     let loaded = crate::dashboard::transfer_loader::load_all_transfer_operations(
-        pool.inner(),
+        &state.pool,
         kind_filter.as_deref(),
     )
     .await;
@@ -719,7 +737,7 @@ async fn transfers_endpoint(
                 %error,
                 "Failed to serialize transfer operation"
             );
-            Status::InternalServerError
+            StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
     let mut response = serde_json::json!({
@@ -740,12 +758,11 @@ async fn transfers_endpoint(
 ///
 /// The frontend uses this to populate the detail modal with tx hashes,
 /// IDs, failure reasons, and other debugging context.
-#[get("/transfers/<kind>/<aggregate_id>/events")]
 async fn transfer_events(
-    pool: &State<SqlitePool>,
-    kind: TransferKind,
-    aggregate_id: &str,
-) -> Option<Json<serde_json::Value>> {
+    State(state): State<AppState>,
+    Path((kind_str, aggregate_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let kind = TransferKind::from_str(&kind_str).map_err(|_| StatusCode::NOT_FOUND)?;
     let aggregate_type = kind.aggregate_type();
 
     let rows: Vec<(String, String, i64)> = match sqlx::query_as(
@@ -755,8 +772,8 @@ async fn transfer_events(
          ORDER BY sequence ASC",
     )
     .bind(aggregate_type)
-    .bind(aggregate_id)
-    .fetch_all(pool.inner())
+    .bind(&aggregate_id)
+    .fetch_all(&state.pool)
     .await
     {
         Ok(rows) => rows,
@@ -768,7 +785,7 @@ async fn transfer_events(
                 %aggregate_id,
                 "Failed to load transfer event history"
             );
-            return None;
+            return Err(StatusCode::NOT_FOUND);
         }
     };
 
@@ -792,7 +809,7 @@ async fn transfer_events(
         })
         .collect();
 
-    Some(Json(serde_json::json!({ "events": events })))
+    Ok(Json(serde_json::json!({ "events": events })))
 }
 
 /// Returns the full event history for a single trade aggregate.
@@ -800,16 +817,14 @@ async fn transfer_events(
 /// For onchain trades (Raindex), returns Filled + optional Enriched events.
 /// For offchain trades (Alpaca), returns the full order lifecycle
 /// (Placed -> Submitted -> PartiallyFilled -> Filled/Failed).
-#[get("/trades/<venue>/<aggregate_id>/events")]
 async fn trade_events(
-    pool: &State<SqlitePool>,
-    venue: &str,
-    aggregate_id: &str,
-) -> Option<Json<serde_json::Value>> {
-    let aggregate_type = match venue {
+    State(state): State<AppState>,
+    Path((venue, aggregate_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let aggregate_type = match venue.as_str() {
         "raindex" => "OnChainTrade",
         "alpaca" | "dry_run" => "OffchainOrder",
-        _ => return None,
+        _ => return Err(StatusCode::NOT_FOUND),
     };
 
     let rows: Vec<(String, String, i64)> = sqlx::query_as(
@@ -819,10 +834,10 @@ async fn trade_events(
          ORDER BY sequence ASC",
     )
     .bind(aggregate_type)
-    .bind(aggregate_id)
-    .fetch_all(pool.inner())
+    .bind(&aggregate_id)
+    .fetch_all(&state.pool)
     .await
-    .ok()?;
+    .map_err(|_| StatusCode::NOT_FOUND)?;
 
     let events: Vec<serde_json::Value> = rows
         .into_iter()
@@ -843,10 +858,10 @@ async fn trade_events(
         })
         .collect();
 
-    Some(Json(serde_json::json!({ "events": events })))
+    Ok(Json(serde_json::json!({ "events": events })))
 }
 
-fn unavailable_json(reason: &str) -> RawJson<String> {
+fn unavailable_json(reason: &str) -> RawJson {
     RawJson(
         serde_json::json!({
             "unavailable": true,
@@ -859,14 +874,13 @@ fn unavailable_json(reason: &str) -> RawJson<String> {
 /// Proxies the bot's active Raindex orders from the st0x REST API.
 /// When `[rest_api]` is not configured, returns an unavailable indicator
 /// so the dashboard can show a friendly message instead of an error.
-#[get("/orders/raindex")]
 #[allow(clippy::cognitive_complexity)]
-async fn raindex_orders(ctx: &State<Ctx>) -> RawJson<String> {
-    let Some(rest_api) = &ctx.rest_api else {
+async fn raindex_orders(State(state): State<AppState>) -> RawJson {
+    let Some(rest_api) = &state.ctx.rest_api else {
         return unavailable_json("REST API not configured (simulate mode)");
     };
 
-    let owner = ctx.order_owner();
+    let owner = state.ctx.order_owner();
     let url = format!(
         "{}/v1/orders/owner/{:#x}",
         rest_api.url.trim_end_matches('/'),
@@ -902,215 +916,70 @@ async fn raindex_orders(ctx: &State<Ctx>) -> RawJson<String> {
     }
 }
 
-#[derive(Serialize)]
-struct ErrorResponse {
-    error: String,
-}
-
-/// Shared handle for resuming interrupted tokenization transfers at
-/// runtime, set by the conductor after startup completes.
-pub(crate) struct RecoveryHandle {
-    pub(crate) transfer: Arc<CrossVenueEquityTransfer>,
-}
-
-/// Prevents concurrent `/transfers/resume` requests from racing through
-/// duplicate mint/redemption recovery flows.
-pub(crate) struct ResumeLock(pub(crate) Mutex<()>);
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct InterruptedTransfersResponse {
-    interrupted_mints: Vec<String>,
-    interrupted_redemptions: Vec<String>,
-}
-
-#[get("/transfers/interrupted")]
-async fn interrupted_transfers(
-    pool: &State<SqlitePool>,
-) -> Result<Json<InterruptedTransfersResponse>, (Status, Json<ErrorResponse>)> {
-    let mints = crate::tokenized_equity_mint::interrupted_mint_ids(pool.inner())
-        .await
-        .map_err(|error| {
-            error!(?error, "Failed to query interrupted mints");
-            (
-                Status::InternalServerError,
-                Json(ErrorResponse {
-                    error: "Failed to query interrupted mints".to_string(),
-                }),
-            )
-        })?;
-
-    let redemptions = crate::equity_redemption::interrupted_redemption_ids(pool.inner())
-        .await
-        .map_err(|error| {
-            error!(?error, "Failed to query interrupted redemptions");
-            (
-                Status::InternalServerError,
-                Json(ErrorResponse {
-                    error: "Failed to query interrupted redemptions".to_string(),
-                }),
-            )
-        })?;
-
-    Ok(Json(InterruptedTransfersResponse {
-        interrupted_mints: mints.into_iter().map(|id| id.to_string()).collect(),
-        interrupted_redemptions: redemptions.into_iter().map(|id| id.to_string()).collect(),
-    }))
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ResumeResponse {
-    mints_attempted: usize,
-    mints_failed: usize,
-    redemptions_attempted: usize,
-    redemptions_failed: usize,
-}
-
-#[post("/transfers/resume")]
-async fn resume_transfers(
-    pool: &State<SqlitePool>,
-    recovery: &State<Arc<tokio::sync::OnceCell<RecoveryHandle>>>,
-    resume_lock: &State<ResumeLock>,
-) -> Result<Json<ResumeResponse>, (Status, Json<ErrorResponse>)> {
-    let _guard = resume_lock.0.try_lock().map_err(|_| {
-        (
-            Status::Conflict,
-            Json(ErrorResponse {
-                error: "A resume operation is already in progress".to_string(),
-            }),
+pub(crate) fn routes() -> Router<AppState> {
+    Router::new()
+        .route("/health", get(health))
+        .route("/logs", get(logs))
+        .route("/orders/pending", get(pending_orders))
+        .route("/trades", get(trades))
+        .route("/trades/{venue}/{aggregate_id}/events", get(trade_events))
+        .route("/transfers", get(transfers_endpoint))
+        .route(
+            "/transfers/{kind}/{aggregate_id}/events",
+            get(transfer_events),
         )
-    })?;
-
-    let handle = recovery.get().ok_or_else(|| {
-        (
-            Status::ServiceUnavailable,
-            Json(ErrorResponse {
-                error: "Recovery not ready yet (conductor still starting)".to_string(),
-            }),
-        )
-    })?;
-
-    let mints = crate::tokenized_equity_mint::interrupted_mint_ids(pool.inner())
-        .await
-        .map_err(|error| {
-            error!(?error, "Failed to query interrupted mints");
-            (
-                Status::InternalServerError,
-                Json(ErrorResponse {
-                    error: "Failed to query interrupted mints".to_string(),
-                }),
-            )
-        })?;
-
-    let redemptions = crate::equity_redemption::interrupted_redemption_ids(pool.inner())
-        .await
-        .map_err(|error| {
-            error!(?error, "Failed to query interrupted redemptions");
-            (
-                Status::InternalServerError,
-                Json(ErrorResponse {
-                    error: "Failed to query interrupted redemptions".to_string(),
-                }),
-            )
-        })?;
-
-    let mints_attempted = mints.len();
-    let redemptions_attempted = redemptions.len();
-    let mut mints_failed = 0usize;
-    let mut redemptions_failed = 0usize;
-
-    for mint_id in &mints {
-        if let Err(error) = handle.transfer.resume_mint(mint_id).await {
-            error!(%mint_id, ?error, "Failed to resume mint");
-            mints_failed += 1;
-        }
-    }
-
-    for redemption_id in &redemptions {
-        if let Err(error) = handle.transfer.resume_redemption(redemption_id).await {
-            error!(%redemption_id, ?error, "Failed to resume redemption");
-            redemptions_failed += 1;
-        }
-    }
-
-    info!(
-        mints_attempted,
-        mints_failed,
-        redemptions_attempted,
-        redemptions_failed,
-        "Transfer recovery completed via API"
-    );
-
-    Ok(Json(ResumeResponse {
-        mints_attempted,
-        mints_failed,
-        redemptions_attempted,
-        redemptions_failed,
-    }))
-}
-
-pub(crate) fn routes() -> Vec<Route> {
-    routes![
-        health,
-        logs,
-        pending_orders,
-        trades,
-        trade_events,
-        transfers_endpoint,
-        transfer_events,
-        raindex_orders,
-        interrupted_transfers,
-        resume_transfers
-    ]
+        .route("/orders/raindex", get(raindex_orders))
 }
 
 #[cfg(test)]
 mod tests {
-    use rocket::local::asynchronous::Client;
+    use std::sync::Arc;
+
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use sqlx::SqlitePool;
+    use tokio::sync::broadcast;
+    use tower::ServiceExt;
 
     use super::*;
-    use st0x_config::create_test_ctx_with_order_owner;
+    use crate::dashboard;
+    use crate::inventory::{self, BroadcastingInventory};
+    use st0x_config::{Ctx, create_test_ctx_with_order_owner};
 
-    #[test]
-    fn test_num_of_routes() {
-        let routes_list = routes();
-        assert_eq!(routes_list.len(), 10);
+    async fn empty_app_state(ctx: Ctx) -> AppState {
+        let (sender, _) = broadcast::channel(16);
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+
+        AppState {
+            settings: dashboard::settings_from_ctx(&ctx),
+            ctx,
+            pool,
+            event_sender: sender.clone(),
+            inventory: Arc::new(BroadcastingInventory::new(
+                inventory::InventoryView::default(),
+                sender,
+            )),
+        }
     }
 
-    #[tokio::test]
-    async fn test_health_endpoint() {
-        let ctx = create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
-        let rocket = rocket::build()
-            .mount("/", routes![health, logs])
-            .manage(ctx);
-        let client = Client::tracked(rocket)
+    fn build_app(state: AppState) -> Router {
+        routes().with_state(state)
+    }
+
+    async fn body_to_string(response: axum::response::Response) -> String {
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    async fn get_log_response(app: &Router, uri: &str) -> LogResponse {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
-            .expect("valid rocket instance");
-
-        let response = client.get("/health").dispatch().await;
-        assert_eq!(response.status(), Status::Ok);
-
-        let body = response.into_string().await.expect("response body");
-        let health_response: HealthResponse =
-            serde_json::from_str(&body).expect("valid JSON response");
-
-        assert_eq!(health_response.status, "healthy");
-        assert!(health_response.timestamp <= chrono::Utc::now());
-        assert!(!health_response.git_commit.is_empty());
-        assert!(health_response.uptime_seconds >= 0);
-    }
-
-    fn make_test_rocket(ctx: Ctx) -> rocket::Rocket<rocket::Build> {
-        rocket::build()
-            .mount("/", routes![health, logs])
-            .manage(ctx)
-    }
-
-    async fn get_log_response(client: &Client, uri: &str) -> LogResponse {
-        let response = client.get(uri).dispatch().await;
-        assert_eq!(response.status(), Status::Ok);
-        let body = response.into_string().await.expect("response body");
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_to_string(response).await;
         serde_json::from_str(&body).expect("valid LogResponse JSON")
     }
 
@@ -1122,14 +991,44 @@ mod tests {
 {"timestamp":"2026-04-20T10:00:01Z","level":"DEBUG","target":"st0x_hedge","message":"Polling"}
 {"timestamp":"2026-04-20T10:00:02Z","level":"WARN","target":"st0x_hedge","message":"Slow response"}"#;
 
+    #[test]
+    fn test_num_of_routes() {
+        // Smoke check the router constructs without panic.
+        let _: Router<AppState> = routes();
+    }
+
+    #[tokio::test]
+    async fn test_health_endpoint() {
+        let ctx = create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response).await;
+        let health_response: HealthResponse =
+            serde_json::from_str(&body).expect("valid JSON response");
+
+        assert_eq!(health_response.status, "healthy");
+        assert!(health_response.timestamp <= chrono::Utc::now());
+        assert!(!health_response.git_commit.is_empty());
+        assert!(health_response.uptime_seconds >= 0);
+    }
+
     #[tokio::test]
     async fn logs_returns_empty_when_no_log_dir() {
         let ctx = create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
-        let client = Client::tracked(make_test_rocket(ctx))
-            .await
-            .expect("valid rocket instance");
+        let app = build_app(empty_app_state(ctx).await);
 
-        let result = get_log_response(&client, "/logs").await;
+        let result = get_log_response(&app, "/logs").await;
         assert!(result.entries.is_empty());
         assert_eq!(result.total, 0);
         assert!(!result.has_more);
@@ -1147,11 +1046,9 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
         ctx.log_dir = Some(temp_dir.path().to_str().unwrap().to_string());
 
-        let client = Client::tracked(make_test_rocket(ctx))
-            .await
-            .expect("valid rocket instance");
+        let app = build_app(empty_app_state(ctx).await);
 
-        let result = get_log_response(&client, "/logs").await;
+        let result = get_log_response(&app, "/logs").await;
         assert_eq!(result.entries.len(), 3);
         assert_eq!(result.total, 3);
         assert!(!result.has_more);
@@ -1172,11 +1069,9 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
         ctx.log_dir = Some(temp_dir.path().to_str().unwrap().to_string());
 
-        let client = Client::tracked(make_test_rocket(ctx))
-            .await
-            .expect("valid rocket instance");
+        let app = build_app(empty_app_state(ctx).await);
 
-        let result = get_log_response(&client, "/logs?limit=2").await;
+        let result = get_log_response(&app, "/logs?limit=2").await;
         assert_eq!(result.entries.len(), 2);
         assert_eq!(result.total, 3);
         assert!(result.has_more);
@@ -1197,18 +1092,16 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
         ctx.log_dir = Some(temp_dir.path().to_str().unwrap().to_string());
 
-        let client = Client::tracked(make_test_rocket(ctx))
-            .await
-            .expect("valid rocket instance");
+        let app = build_app(empty_app_state(ctx).await);
 
         // Page 1: newest 2
-        let page1 = get_log_response(&client, "/logs?limit=2&offset=0").await;
+        let page1 = get_log_response(&app, "/logs?limit=2&offset=0").await;
         assert_eq!(page1.entries.len(), 2);
         assert!(page1.has_more);
         assert_eq!(page1.entries[0]["message"], "Slow response");
 
         // Page 2: older entries
-        let page2 = get_log_response(&client, "/logs?limit=2&offset=2").await;
+        let page2 = get_log_response(&app, "/logs?limit=2&offset=2").await;
         assert_eq!(page2.entries.len(), 1);
         assert!(!page2.has_more);
         assert_eq!(page2.entries[0]["message"], "Bot started");
@@ -1226,11 +1119,9 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
         ctx.log_dir = Some(temp_dir.path().to_str().unwrap().to_string());
 
-        let client = Client::tracked(make_test_rocket(ctx))
-            .await
-            .expect("valid rocket instance");
+        let app = build_app(empty_app_state(ctx).await);
 
-        let result = get_log_response(&client, "/logs?search=slow").await;
+        let result = get_log_response(&app, "/logs?search=slow").await;
         assert_eq!(result.entries.len(), 1);
         assert_eq!(result.total, 1);
         assert!(!result.has_more);
@@ -1249,11 +1140,9 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
         ctx.log_dir = Some(temp_dir.path().to_str().unwrap().to_string());
 
-        let client = Client::tracked(make_test_rocket(ctx))
-            .await
-            .expect("valid rocket instance");
+        let app = build_app(empty_app_state(ctx).await);
 
-        let result = get_log_response(&client, "/logs?level=INFO,WARN").await;
+        let result = get_log_response(&app, "/logs?level=INFO,WARN").await;
         assert_eq!(result.entries.len(), 2);
         assert_eq!(result.total, 2);
         // Newest first: WARN before INFO
@@ -1273,13 +1162,11 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
         ctx.log_dir = Some(temp_dir.path().to_str().unwrap().to_string());
 
-        let client = Client::tracked(make_test_rocket(ctx))
-            .await
-            .expect("valid rocket instance");
+        let app = build_app(empty_app_state(ctx).await);
 
         // Only entries between 10:00:00 and 10:00:01 inclusive
         let result = get_log_response(
-            &client,
+            &app,
             "/logs?since=2026-04-20T10:00:00Z&until=2026-04-20T10:00:01Z",
         )
         .await;
@@ -1306,19 +1193,17 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
         ctx.log_dir = Some(temp_dir.path().to_str().unwrap().to_string());
 
-        let client = Client::tracked(make_test_rocket(ctx))
-            .await
-            .expect("valid rocket instance");
+        let app = build_app(empty_app_state(ctx).await);
 
         // Newest first: trade 4, trade 3, trade 2, trade 1, trade 0
-        let page1 = get_log_response(&client, "/logs?search=trade&limit=2").await;
+        let page1 = get_log_response(&app, "/logs?search=trade&limit=2").await;
         assert_eq!(page1.entries.len(), 2);
         assert_eq!(page1.total, 5);
         assert!(page1.has_more);
         assert_eq!(page1.entries[0]["message"], "trade 4");
         assert_eq!(page1.entries[1]["message"], "trade 3");
 
-        let page2 = get_log_response(&client, "/logs?search=trade&limit=2&offset=2").await;
+        let page2 = get_log_response(&app, "/logs?search=trade&limit=2&offset=2").await;
         assert_eq!(page2.entries.len(), 2);
         assert!(page2.has_more);
         assert_eq!(page2.entries[0]["message"], "trade 2");
@@ -1330,17 +1215,20 @@ mod tests {
         let ctx = create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
         assert!(ctx.rest_api.is_none());
 
-        let rocket = rocket::build()
-            .mount("/", routes![raindex_orders])
-            .manage(ctx);
-        let client = Client::tracked(rocket)
+        let app = build_app(empty_app_state(ctx).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/orders/raindex")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
-            .expect("valid rocket instance");
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
 
-        let response = client.get("/orders/raindex").dispatch().await;
-        assert_eq!(response.status(), Status::Ok);
-
-        let body = response.into_string().await.expect("response body");
+        let body = body_to_string(response).await;
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON response");
 
         assert_eq!(parsed["unavailable"], true);
@@ -1354,17 +1242,20 @@ mod tests {
             "http://127.0.0.1:1".to_string(),
         ));
 
-        let rocket = rocket::build()
-            .mount("/", routes![raindex_orders])
-            .manage(ctx);
-        let client = Client::tracked(rocket)
+        let app = build_app(empty_app_state(ctx).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/orders/raindex")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
-            .expect("valid rocket instance");
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
 
-        let response = client.get("/orders/raindex").dispatch().await;
-        assert_eq!(response.status(), Status::Ok);
-
-        let body = response.into_string().await.expect("response body");
+        let body = body_to_string(response).await;
         let parsed: serde_json::Value =
             serde_json::from_str(&body).expect("response must be valid JSON even on error");
 
@@ -1410,17 +1301,20 @@ mod tests {
             mock_server.base_url(),
         ));
 
-        let rocket = rocket::build()
-            .mount("/", routes![raindex_orders])
-            .manage(ctx);
-        let client = Client::tracked(rocket)
+        let app = build_app(empty_app_state(ctx).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/orders/raindex")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
-            .expect("valid rocket instance");
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
 
-        let response = client.get("/orders/raindex").dispatch().await;
-        assert_eq!(response.status(), Status::Ok);
-
-        let body = response.into_string().await.expect("response body");
+        let body = body_to_string(response).await;
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON response");
 
         assert_eq!(parsed["orders"][0]["orderHash"], "0xabcd");
@@ -1443,68 +1337,24 @@ mod tests {
             mock_server.base_url(),
         ));
 
-        let rocket = rocket::build()
-            .mount("/", routes![raindex_orders])
-            .manage(ctx);
-        let client = Client::tracked(rocket)
+        let app = build_app(empty_app_state(ctx).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/orders/raindex")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
-            .expect("valid rocket instance");
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
 
-        let response = client.get("/orders/raindex").dispatch().await;
-        assert_eq!(response.status(), Status::Ok);
-
-        let body = response.into_string().await.expect("response body");
+        let body = body_to_string(response).await;
         let parsed: serde_json::Value =
             serde_json::from_str(&body).expect("response must be valid JSON on upstream error");
 
         assert_eq!(parsed["unavailable"], true);
         assert!(parsed["reason"].as_str().unwrap().contains("error"));
-    }
-
-    async fn create_test_pool() -> SqlitePool {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
-        pool
-    }
-
-    #[tokio::test]
-    async fn interrupted_transfers_returns_empty_on_fresh_db() {
-        let pool = create_test_pool().await;
-        let rocket = rocket::build()
-            .mount("/", routes![interrupted_transfers])
-            .manage(pool);
-        let client = Client::tracked(rocket).await.unwrap();
-
-        let response = client.get("/transfers/interrupted").dispatch().await;
-        assert_eq!(response.status(), Status::Ok);
-
-        let body: serde_json::Value =
-            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
-
-        assert_eq!(body["interruptedMints"], serde_json::json!([]));
-        assert_eq!(body["interruptedRedemptions"], serde_json::json!([]));
-    }
-
-    #[tokio::test]
-    async fn resume_transfers_returns_503_before_conductor_ready() {
-        let pool = create_test_pool().await;
-        let recovery = Arc::new(tokio::sync::OnceCell::<RecoveryHandle>::new());
-        let rocket = rocket::build()
-            .mount("/", routes![resume_transfers])
-            .manage(pool)
-            .manage(recovery)
-            .manage(ResumeLock(Mutex::new(())));
-        let client = Client::tracked(rocket).await.unwrap();
-
-        let response = client.post("/transfers/resume").dispatch().await;
-        assert_eq!(response.status(), Status::ServiceUnavailable);
-
-        let body: serde_json::Value =
-            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
-
-        assert_eq!(
-            body["error"],
-            "Recovery not ready yet (conductor still starting)"
-        );
     }
 }
