@@ -4,7 +4,7 @@ use rain_math_float::Float;
 use serde::Deserialize;
 use st0x_float_macro::float;
 use st0x_float_serde::{DebugFloat, DebugOptionFloat};
-use tracing::{debug, error};
+use tracing::{debug, error, trace};
 
 use super::AlpacaBrokerApiError;
 use super::client::AlpacaBrokerApiClient;
@@ -74,6 +74,22 @@ pub(super) async fn fetch_inventory(
 
     let broker_positions = positions
         .into_iter()
+        .filter(|position| {
+            // USDCUSD is Alpaca's crypto pair for USDC/USD conversion during
+            // rebalancing. It's not an equity position and has no vault in the
+            // registry -- filtering it here prevents downstream
+            // TokenNotInRegistry errors.
+            if position.symbol == "USDCUSD" {
+                trace!(
+                    target: "broker",
+                    quantity = ?position.quantity,
+                    "Skipping USDCUSD crypto position from inventory"
+                );
+                return false;
+            }
+
+            true
+        })
         .map(|position| {
             let symbol = Symbol::new(&position.symbol).inspect_err(|_| {
                 error!(
@@ -545,5 +561,58 @@ mod tests {
         let error = fetch_inventory(&client).await.unwrap_err();
 
         assert!(matches!(error, AlpacaBrokerApiError::HttpClient(_)));
+    }
+
+    #[tokio::test]
+    async fn fetch_inventory_filters_usdcusd_crypto_position() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "symbol": "AAPL",
+                        "qty_available": "10.0",
+                        "market_value": "1500.00"
+                    },
+                    {
+                        "symbol": "USDCUSD",
+                        "qty_available": "5000.0",
+                        "market_value": "5000.00"
+                    },
+                    {
+                        "symbol": "RKLB",
+                        "qty_available": "3.0",
+                        "market_value": "240.00"
+                    }
+                ]));
+        });
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "cash": "10000.00",
+                    "non_marginable_buying_power": "10000.00"
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let inventory = fetch_inventory(&client).await.unwrap();
+
+        let symbols: Vec<String> = inventory
+            .positions
+            .iter()
+            .map(|position| position.symbol.to_string())
+            .collect();
+
+        assert_eq!(symbols, vec!["AAPL", "RKLB"]);
+        assert_eq!(inventory.positions.len(), 2);
     }
 }
