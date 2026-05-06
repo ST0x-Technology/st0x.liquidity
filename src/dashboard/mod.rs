@@ -219,8 +219,10 @@ fn float_to_f64(value: rain_math_float::Float, fallback: f64) -> f64 {
 }
 
 async fn load_positions(pool: &SqlitePool) -> Vec<st0x_dto::Position> {
-    let rows: Vec<(String, Option<String>)> = match sqlx::query_as(
-        "SELECT symbol, net_position FROM position_view WHERE symbol IS NOT NULL",
+    let rows: Vec<(String, Option<String>, Option<String>)> = match sqlx::query_as(
+        "SELECT symbol, net_position, \
+         json_extract(payload, '$.Live.last_price_usdc') \
+         FROM position_view WHERE symbol IS NOT NULL",
     )
     .fetch_all(pool)
     .await
@@ -233,7 +235,7 @@ async fn load_positions(pool: &SqlitePool) -> Vec<st0x_dto::Position> {
     };
 
     rows.into_iter()
-        .filter_map(|(raw_symbol, net_str)| {
+        .filter_map(|(raw_symbol, net_str, price_str)| {
             let symbol = st0x_execution::Symbol::new(&raw_symbol)
                 .inspect_err(|error| {
                     warn!(target: "dashboard", %error, %raw_symbol, "Invalid symbol in position view, skipping");
@@ -250,7 +252,19 @@ async fn load_positions(pool: &SqlitePool) -> Vec<st0x_dto::Position> {
                 })
                 .unwrap_or_else(|| st0x_float_macro::float!(0));
 
-            Some(st0x_dto::Position { symbol, net })
+            let last_price_usdc = price_str.and_then(|value| {
+                rain_math_float::Float::parse(value)
+                    .inspect_err(|error| {
+                        warn!(target: "dashboard", %error, %raw_symbol, "Unparseable last_price_usdc, ignoring");
+                    })
+                    .ok()
+            });
+
+            Some(st0x_dto::Position {
+                symbol,
+                net,
+                last_price_usdc,
+            })
         })
         .collect()
 }

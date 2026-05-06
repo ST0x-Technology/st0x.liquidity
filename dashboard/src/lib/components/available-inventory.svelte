@@ -46,7 +46,7 @@
   }
 
   type SortDir = 'asc' | 'desc'
-  type Col = 'asset' | 'alpaca' | 'inflight' | 'raindex' | 'total' | 'ratio' | 'dislocation'
+  type Col = 'asset' | 'alpaca' | 'inflight' | 'raindex' | 'total' | 'ratio' | 'exposure'
   type SortState = { column: Col; dir: SortDir } | null
 
   const sort = reactive<SortState>(null)
@@ -83,8 +83,16 @@
   const formatRatio = (ratio: number): string =>
     `${(ratio * 100).toFixed(1)}%`
 
+  type PositionInfo = { net: number; priceUsdc: number }
+
   const positionMap = $derived(
-    new Map(positions.map((position) => [position.symbol, parseFloat(position.net)]))
+    new Map(positions.map((position) => [
+      position.symbol,
+      {
+        net: parseFloat(position.net),
+        priceUsdc: position.last_price_usdc ? parseFloat(position.last_price_usdc) : 0,
+      } satisfies PositionInfo,
+    ]))
   )
 
   type Row = {
@@ -94,7 +102,7 @@
     raindex: Formatted
     total: Formatted
     ratio: number
-    dislocation: number
+    exposure: number
     isCash: boolean
     trading: boolean
   }
@@ -118,7 +126,11 @@
         raindex: fmt(item.onchainAvailable),
         total: fmtValue(totalVal),
         ratio: computeRatio(item.onchainAvailable, item.offchainAvailable),
-        dislocation: positionMap.get(stripped) ?? 0,
+        exposure: (() => {
+          const pos = positionMap.get(stripped)
+          if (!pos) return 0
+          return pos.net * pos.priceUsdc
+        })(),
         isCash: false,
         trading: tradingSet.has(stripped),
       }
@@ -141,7 +153,7 @@
       raindex: fmt(usdc.onchainAvailable),
       total: fmtValue(total),
       ratio: computeRatio(usdc.onchainAvailable, usdc.offchainAvailable),
-      dislocation: 0,
+      exposure: 0,
       isCash: true,
       trading: true,
     }
@@ -154,7 +166,7 @@
     raindex: (lhs, rhs) => decimalCompare(lhs.raindex.full, rhs.raindex.full),
     total: (lhs, rhs) => decimalCompare(lhs.total.full, rhs.total.full),
     ratio: (lhs, rhs) => lhs.ratio - rhs.ratio,
-    dislocation: (lhs, rhs) => lhs.dislocation - rhs.dislocation,
+    exposure: (lhs, rhs) => lhs.exposure - rhs.exposure,
   }
 
   const sortedEquities = $derived.by(() => {
@@ -204,15 +216,14 @@
     return 'text-muted-foreground'
   }
 
-  const isNegligible = (value: number): boolean => Math.abs(value) < 0.001
+  const isNegligible = (value: number): boolean => Math.abs(value) < 0.01
 
-  const fmtDislocation = (value: number): string => {
-    if (value === 0) return '0'
-    if (isNegligible(value)) return '~0'
+  const fmtExposure = (value: number): string => {
+    if (value === 0) return '$0'
+    if (isNegligible(value)) return '~$0'
     const sign = value > 0 ? '+' : '-'
     const abs = Math.abs(value)
-    if (abs < 0.01) return `${sign}${abs.toPrecision(2)}`
-    return `${sign}${abs.toFixed(2)}`
+    return `${sign}$${abs.toFixed(2)}`
   }
 
 </script>
@@ -260,13 +271,13 @@
         </button>
       </Table.Head>
 
-      <Table.Head aria-sort={ariaSort(sort.current, 'dislocation')}>
+      <Table.Head aria-sort={ariaSort(sort.current, 'exposure')}>
         <button
           class="{sortBtnClass} text-left"
-          onclick={toggleSort('dislocation')}
+          onclick={toggleSort('exposure')}
           title="Net directional exposure from counterparty fills"
         >
-          Dislocation{sortIndicator(sort.current, 'dislocation')}
+          Exposure{sortIndicator(sort.current, 'exposure')}
         </button>
       </Table.Head>
     </Table.Row>
@@ -351,11 +362,11 @@
         </Table.Cell>
         <Table.Cell>
           <div class="flex items-center gap-1.5 font-mono text-xs">
-            {#if !isNegligible(row.dislocation) && row.dislocation !== 0}
-              <span class="text-base leading-none {row.dislocation > 0 ? 'text-green-500' : 'text-red-500'}">{row.dislocation > 0 ? '\u25B2' : '\u25BC'}</span>
+            {#if !isNegligible(row.exposure) && row.exposure !== 0}
+              <span class="text-base leading-none {row.exposure > 0 ? 'text-green-500' : 'text-red-500'}">{row.exposure > 0 ? '\u25B2' : '\u25BC'}</span>
             {/if}
-            <span class={row.dislocation === 0 || isNegligible(row.dislocation) ? 'text-muted-foreground' : row.dislocation > 0 ? 'text-green-500' : 'text-red-500'}>
-              {fmtDislocation(row.dislocation)}
+            <span class={row.exposure === 0 || isNegligible(row.exposure) ? 'text-muted-foreground' : row.exposure > 0 ? 'text-green-500' : 'text-red-500'}>
+              {fmtExposure(row.exposure)}
             </span>
           </div>
         </Table.Cell>

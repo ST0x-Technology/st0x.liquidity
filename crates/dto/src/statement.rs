@@ -178,6 +178,7 @@ mod tests {
         let msg = Statement::PositionUpdate(Position {
             symbol: Symbol::new("AAPL").unwrap(),
             net: rain_math_float::Float::parse("5.5".to_string()).unwrap(),
+            last_price_usdc: None,
         });
         let json = serde_json::to_value(&msg).expect("serialization should succeed");
         assert_eq!(json["type"], json!("position_update"));

@@ -110,6 +110,7 @@ impl Reactor for Broadcaster {
                         self.broadcast_position(st0x_dto::Position {
                             symbol: position.symbol,
                             net: position.net.inner(),
+                            last_price_usdc: position.last_price_usdc,
                         });
                     }
                     Ok(None) => warn!(target: "dashboard", %id, "Position not found after event"),

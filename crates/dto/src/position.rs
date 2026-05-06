@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use st0x_finance::Symbol;
-use st0x_float_serde::float_string_serde;
+use st0x_float_serde::{float_string_serde, option_float_string_serde};
 
 /// Per-symbol net position.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -15,4 +15,9 @@ pub struct Position {
     #[serde(with = "float_string_serde")]
     #[ts(type = "string")]
     pub net: Float,
+    /// Last traded price in USDC, used to convert share dislocation to dollar
+    /// values for display alongside USD-denominated hedge thresholds.
+    #[serde(default, with = "option_float_string_serde")]
+    #[ts(type = "string | null")]
+    pub last_price_usdc: Option<Float>,
 }
