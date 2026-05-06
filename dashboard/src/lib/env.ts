@@ -24,9 +24,7 @@ export const getWebSocketUrl = (): string => {
   return val !== undefined && val !== '' ? val : getDefaultWsUrl()
 }
 
-export const getApiBaseUrl = (): string => {
-  return window.location.origin
-}
+export const getApiBaseUrl = (): string => window.location.origin
 
 export const getExplorerTxUrl = (txHash: string): string => {
   const envKey = 'PUBLIC_EXPLORER_URL'

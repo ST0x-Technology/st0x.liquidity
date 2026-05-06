@@ -543,6 +543,7 @@ mod tests {
             vault_ids: Vec::new(),
             rebalancing: OperationMode::Enabled,
             operational_limit: None,
+            reserved: None,
         }));
         let amount = Usdc::new(float!(100));
 
@@ -612,6 +613,7 @@ mod tests {
             vault_ids: vec![TEST_VAULT_ID],
             rebalancing: OperationMode::Enabled,
             operational_limit: None,
+            reserved: None,
         }));
         let amount = Usdc::new(float!(100));
 

@@ -35,6 +35,8 @@ the limit:
   contracts
 - [docs/feature-flags.md](docs/feature-flags.md) - Cargo feature flags,
   `test-support` vs `cfg(test)`, common pitfalls with dead code warnings
+- [docs/ttdd.md](docs/ttdd.md) - Type-driven TDD workflow: scientific method
+  applied to software, failing tests before implementation
 
 **Update at the end:**
 

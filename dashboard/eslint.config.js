@@ -60,7 +60,12 @@ export default [
       eqeqeq: ['error', 'always'],
       'prefer-const': 'error',
       'no-var': 'error',
-      'func-style': ['error', 'expression']
+      'func-style': ['error', 'expression'],
+      'arrow-body-style': ['error', 'as-needed'],
+      '@typescript-eslint/no-confusing-void-expression': [
+        'error',
+        { ignoreArrowShorthand: true }
+      ]
     }
   },
   {
@@ -99,7 +104,12 @@ export default [
       'svelte/no-unused-class-name': 'off',
       'svelte/require-optimized-style-attribute': 'error',
       'svelte/require-stores-init': 'error',
-      'func-style': ['error', 'expression']
+      'func-style': ['error', 'expression'],
+      'arrow-body-style': ['error', 'as-needed'],
+      '@typescript-eslint/no-confusing-void-expression': [
+        'error',
+        { ignoreArrowShorthand: true }
+      ]
     }
   },
   {

@@ -638,6 +638,9 @@ pub(crate) struct InventoryView {
     /// Margin-safe buying power in cents from the offchain broker.
     #[serde(default)]
     buying_power_cents: Option<i64>,
+    /// Gross offchain USD balance in cents (before cash reserve subtraction).
+    #[serde(default)]
+    offchain_gross_usd_cents: Option<i64>,
 }
 
 impl InventoryView {
@@ -712,6 +715,8 @@ impl InventoryView {
             format!("{sign}${whole}.{frac:02}")
         });
 
+        let offchain_gross = self.offchain_gross_usd_cents.and_then(Usdc::from_cents);
+
         st0x_dto::Inventory {
             per_symbol,
             usdc: UsdcInventory {
@@ -719,6 +724,7 @@ impl InventoryView {
                 onchain_inflight: usdc_onchain_inflight,
                 offchain_available: usdc_offchain_available,
                 offchain_inflight: usdc_offchain_inflight,
+                offchain_gross,
                 buying_power,
             },
         }
@@ -745,6 +751,7 @@ impl Default for InventoryView {
             equities: HashMap::new(),
             last_updated: Utc::now(),
             buying_power_cents: None,
+            offchain_gross_usd_cents: None,
         }
     }
 }
@@ -846,6 +853,7 @@ impl InventoryView {
             last_updated: now,
             usdc: self.usdc,
             buying_power_cents: self.buying_power_cents,
+            offchain_gross_usd_cents: self.offchain_gross_usd_cents,
         })
     }
 
@@ -861,6 +869,7 @@ impl InventoryView {
             last_updated: now,
             equities: self.equities,
             buying_power_cents: self.buying_power_cents,
+            offchain_gross_usd_cents: self.offchain_gross_usd_cents,
         })
     }
 
@@ -885,6 +894,7 @@ impl InventoryView {
             last_updated: now,
             usdc: self.usdc,
             buying_power_cents: self.buying_power_cents,
+            offchain_gross_usd_cents: self.offchain_gross_usd_cents,
         })
     }
 
@@ -901,6 +911,7 @@ impl InventoryView {
             last_updated: now,
             equities: self.equities,
             buying_power_cents: self.buying_power_cents,
+            offchain_gross_usd_cents: self.offchain_gross_usd_cents,
         })
     }
 
@@ -1046,14 +1057,20 @@ impl InventoryView {
             }
 
             OffchainUsd {
-                usd_balance_cents, ..
+                usd_balance_cents,
+                gross_usd_cents,
+                ..
             } => {
                 let usdc = Usdc::from_cents(*usd_balance_cents)
                     .ok_or(InventoryViewError::UsdBalanceConversion(*usd_balance_cents))?;
-                self.update_usdc(
+                let updated = self.update_usdc(
                     Inventory::on_snapshot(Venue::Hedging, usdc, fetched_at),
                     now,
-                )
+                )?;
+                Ok(Self {
+                    offchain_gross_usd_cents: *gross_usd_cents,
+                    ..updated
+                })
             }
 
             OffchainMarginSafeBuyingPower {
@@ -1139,14 +1156,20 @@ impl InventoryView {
             }
 
             OffchainUsd {
-                usd_balance_cents, ..
+                usd_balance_cents,
+                gross_usd_cents,
+                ..
             } => {
                 let usdc = Usdc::from_cents(*usd_balance_cents)
                     .ok_or(InventoryViewError::UsdBalanceConversion(*usd_balance_cents))?;
-                self.update_usdc(
+                let updated = self.update_usdc(
                     Inventory::force_on_snapshot(Venue::Hedging, usdc, reason),
                     now,
-                )
+                )?;
+                Ok(Self {
+                    offchain_gross_usd_cents: *gross_usd_cents,
+                    ..updated
+                })
             }
 
             OffchainMarginSafeBuyingPower {
@@ -1425,6 +1448,7 @@ mod tests {
             equities: equities.into_iter().collect(),
             last_updated: Utc::now(),
             buying_power_cents: None,
+            offchain_gross_usd_cents: None,
         }
     }
 
@@ -1444,6 +1468,7 @@ mod tests {
             equities: HashMap::new(),
             last_updated: Utc::now(),
             buying_power_cents: None,
+            offchain_gross_usd_cents: None,
         }
     }
 
@@ -2012,6 +2037,7 @@ mod tests {
             usdc: usdc_make_inventory(5000, 1000, 3000, 500),
             last_updated: Utc::now(),
             buying_power_cents: None,
+            offchain_gross_usd_cents: None,
         };
 
         let dto = view.to_dto();
@@ -2053,6 +2079,7 @@ mod tests {
             usdc: Inventory::default(),
             last_updated: Utc::now(),
             buying_power_cents: None,
+            offchain_gross_usd_cents: None,
         };
 
         let dto = view.to_dto();

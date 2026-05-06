@@ -387,22 +387,17 @@
     return levelColor(level)
   }
 
-  const getContextFields = (entry: LogEntry): string => {
-    const fields = entry.fields
-    if (!fields) return ''
-
-    return Object.entries(fields)
+  const getContextFields = (entry: LogEntry): string =>
+    Object.entries(entry.fields)
       .filter(([key]) => key !== 'message')
-      .map(([key, value]) => `${key}=${String(value)}`)
+      .map(([key, value]) => `${key}=${value}`)
       .join(' ')
-  }
 
   const getTarget = (entry: LogEntry): string => {
-    const target = entry.target ?? ''
     const spans = entry.spans?.map(span => span.name).join(' > ')
-    if (spans) return `${target}::${spans}`
-    if (entry.span) return `${target}::${entry.span.name}`
-    return target
+    if (spans) return `${entry.target}::${spans}`
+    if (entry.span) return `${entry.target}::${entry.span.name}`
+    return entry.target
   }
 </script>
 
@@ -562,7 +557,7 @@
             </span>
 
             <span class="flex-1 break-all">
-              {entry.fields?.message ?? ''}
+              {entry.fields.message ?? ''}
               {#if getContextFields(entry)}
                 <span class="text-muted-foreground"> {getContextFields(entry)}</span>
               {/if}

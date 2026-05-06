@@ -13,7 +13,7 @@ use st0x_execution::{
     AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Positive,
     SupportedExecutor, Symbol, TimeInForce,
 };
-use st0x_finance::Usdc;
+use st0x_finance::{Usd, Usdc};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -85,6 +85,9 @@ pub struct CashAssetConfig {
     pub vault_ids: Vec<B256>,
     pub rebalancing: OperationMode,
     pub operational_limit: Option<Positive<Usdc>>,
+    /// USD amount subtracted from offchain cash to compute available balance.
+    /// Prevents the system from rebalancing funds that should remain untouched.
+    pub reserved: Option<Positive<Usd>>,
 }
 
 /// Equity assets configuration with an optional global operational limit.
@@ -3140,13 +3143,13 @@ pub(crate) mod tests {
                         value != "enabled" && value != "disabled"
                     })
             ) {
-                let toml_str = format!(r#"mode = "{invalid}""#);
-
                 #[derive(Debug, Deserialize)]
                 struct Wrapper {
                     #[allow(dead_code)]
                     mode: OperationMode,
                 }
+
+                let toml_str = format!(r#"mode = "{invalid}""#);
 
                 let result = toml::from_str::<Wrapper>(&toml_str);
                 prop_assert!(
@@ -3208,6 +3211,59 @@ pub(crate) mod tests {
             let config: CashAssetConfig = toml::from_str(toml_str).unwrap();
             assert_eq!(config.rebalancing, OperationMode::Disabled);
             assert_eq!(config.vault_ids.len(), 1);
+        }
+
+        #[test]
+        fn cash_reserved_parses_positive_usd() {
+            let toml_str = r#"
+                rebalancing = "enabled"
+                reserved = 5000.00
+            "#;
+
+            let config: CashAssetConfig = toml::from_str(toml_str).unwrap();
+            let reserved = config.reserved.unwrap();
+            assert!(
+                reserved.inner().eq(&Usd::new(float!(5000))).unwrap(),
+                "Expected $5000 reserved, got {reserved}"
+            );
+        }
+
+        #[test]
+        fn cash_reserved_absent_is_none() {
+            let toml_str = r#"
+                rebalancing = "enabled"
+            "#;
+
+            let config: CashAssetConfig = toml::from_str(toml_str).unwrap();
+            assert!(config.reserved.is_none());
+        }
+
+        #[test]
+        fn cash_reserved_rejects_zero() {
+            let toml_str = r#"
+                rebalancing = "enabled"
+                reserved = 0
+            "#;
+
+            let result = toml::from_str::<CashAssetConfig>(toml_str);
+            assert!(
+                result.is_err(),
+                "Expected error for zero reserved, got {result:?}"
+            );
+        }
+
+        #[test]
+        fn cash_reserved_rejects_negative() {
+            let toml_str = r#"
+                rebalancing = "enabled"
+                reserved = -100
+            "#;
+
+            let result = toml::from_str::<CashAssetConfig>(toml_str);
+            assert!(
+                result.is_err(),
+                "Expected error for negative reserved, got {result:?}"
+            );
         }
 
         #[test]

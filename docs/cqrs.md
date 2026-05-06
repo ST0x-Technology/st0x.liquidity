@@ -276,6 +276,33 @@ Bump `SCHEMA_VERSION` when the entity's state, event, or projection schema
 changes. On startup, the wiring infrastructure (via `StoreBuilder::build()`)
 detects version mismatches and automatically clears stale snapshots.
 
+### Adding Optional Fields to Events
+
+When adding a new field to an existing event variant that has a sensible default
+(zero, `None`, etc.), use `#[serde(default)]` on the field instead of writing an
+upcaster. Old persisted events that lack the field will deserialize with the
+default value.
+
+```rust
+#[derive(Serialize, Deserialize)]
+enum MyEvent {
+    Snapshot {
+        existing_field: i64,
+        #[serde(default)]
+        new_optional_field: i64,  // old events -> 0
+    },
+}
+```
+
+**Pitfall**: `#[serde(default)]` only works when the default is semantically
+correct for old events. If old events _must_ be distinguished from "field not
+present" (e.g., `None` vs `Some(0)`), use `Option<T>` with `#[serde(default)]`
+instead. For fields where the default would be misleading, use an upcaster (see
+below).
+
+Always bump `SCHEMA_VERSION` after adding the field so view projections are
+rebuilt with the new field populated from the first event that carries it.
+
 ## Testing
 
 ### replay -- reconstruct state from events

@@ -161,6 +161,7 @@ mod tests {
 
         let event = InventorySnapshotEvent::OffchainUsd {
             usd_balance_cents: 12345,
+            gross_usd_cents: None,
             fetched_at: Utc::now(),
         };
 
@@ -204,6 +205,7 @@ mod tests {
             .apply_snapshot_event(
                 &InventorySnapshotEvent::OffchainUsd {
                     usd_balance_cents: 500_000,
+                    gross_usd_cents: None,
                     fetched_at: Utc::now(),
                 },
                 Utc::now(),
@@ -243,6 +245,7 @@ mod tests {
         projection
             .apply(&InventorySnapshotEvent::OffchainUsd {
                 usd_balance_cents: 500_000,
+                gross_usd_cents: None,
                 fetched_at: Utc::now(),
             })
             .await

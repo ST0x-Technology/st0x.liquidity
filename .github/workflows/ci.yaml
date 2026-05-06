@@ -194,6 +194,15 @@ jobs:
           nix fmt -- dashboard/bun.nix
           git diff --exit-code dashboard/bun.nix
 
+      - name: Generate dashboard API bindings
+        run: nix run --impure .#st0x-dto -- dashboard/src/lib/api
+
+      - name: Dashboard lint
+        run: |
+          cd dashboard
+          nix develop -c bun install
+          nix develop -c bun run lint
+
       - name: Dashboard
         run: nix build --impure .#st0x-dashboard
 

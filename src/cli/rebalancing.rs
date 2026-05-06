@@ -768,6 +768,7 @@ mod tests {
             )],
             rebalancing: OperationMode::Enabled,
             operational_limit: None,
+            reserved: None,
         });
         let pool = setup_test_db().await;
         let amount = Usdc::new(Float::parse("100".to_string()).unwrap());
@@ -892,6 +893,7 @@ mod tests {
             vault_ids: Vec::new(),
             rebalancing: OperationMode::Enabled,
             operational_limit: None,
+            reserved: None,
         }));
         let pool = setup_test_db().await;
         let amount = Usdc::new(Float::parse("100".to_string()).unwrap());
@@ -920,6 +922,7 @@ mod tests {
             vault_ids: vec![vault_id],
             rebalancing: OperationMode::Enabled,
             operational_limit: None,
+            reserved: None,
         }));
         let pool = setup_test_db().await;
         let amount = Usdc::new(Float::parse("100".to_string()).unwrap());

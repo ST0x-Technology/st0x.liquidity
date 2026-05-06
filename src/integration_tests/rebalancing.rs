@@ -17,6 +17,7 @@ use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{broadcast, mpsc};
 
 use rain_math_float::Float;
@@ -140,6 +141,7 @@ fn test_trigger_config() -> RebalancingTriggerConfig {
                 vault_ids: Vec::new(),
                 rebalancing: OperationMode::Enabled,
                 operational_limit: None,
+                reserved: None,
             }),
         },
         disabled_assets: HashSet::new(),
@@ -1080,7 +1082,222 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
     );
 }
 
-/// Verifies that setting `usdc: None` in RebalancingTriggerConfig
+/// Verifies that cash reserve shifts the effective offchain balance by
+/// wiring up the actual `InventoryPollingService` with `reserved_cash`.
+///
+/// The broker reports $500, reserve is $300, so polling's
+/// `compute_available_cash` subtracts the reserve -> effective offchain = $200.
+///
+/// Without reserve: 500 onchain / 500 offchain = 50% ratio -> balanced.
+/// With $300 reserve: effective offchain = 200, ratio = 500/700 = 71.4%
+/// -> above 70% upper bound -> TooMuchOnchain -> base_to_alpaca.
+/// Excess = 500 - 350 (target = 0.5 * 700) = $150.
+#[tokio::test]
+async fn cash_reserve_shifts_offchain_balance_triggering_base_to_alpaca() {
+    use alloy::providers::{ProviderBuilder, mock::Asserter};
+
+    use st0x_event_sorcery::StoreBuilder;
+    use st0x_evm::ReadOnlyEvm;
+    use st0x_execution::{Inventory as ExecutorInventory, MockExecutor};
+    use st0x_finance::Usd;
+
+    use crate::inventory::InventoryPollingService;
+    use crate::inventory::snapshot::{InventorySnapshotCommand, InventorySnapshotId};
+    use crate::onchain::raindex::RaindexService;
+
+    let pool = setup_test_db().await;
+
+    let (event_sender, _) = broadcast::channel::<Statement>(16);
+    let inventory = Arc::new(BroadcastingInventory::new(
+        InventoryView::default(),
+        event_sender,
+    ));
+
+    let (sender, receiver) = mpsc::channel(10);
+
+    let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
+    let wrapper = Arc::new(MockWrapper::new());
+
+    let trigger = Arc::new(RebalancingTrigger::new(
+        test_trigger_config(),
+        Arc::clone(&vault_registry),
+        TEST_ORDERBOOK,
+        TEST_ORDER_OWNER,
+        Arc::clone(&inventory),
+        sender,
+        wrapper,
+    ));
+
+    // Build snapshot store with trigger as reactor — mirrors production wiring
+    // in QueryManifest::build. Snapshot events from polling flow through the
+    // trigger's on_snapshot, updating the BroadcastingInventory.
+    let (_, vault_registry_projection) = StoreBuilder::<VaultRegistry>::new(pool.clone())
+        .build(())
+        .await
+        .unwrap();
+
+    let snapshot_id = InventorySnapshotId {
+        orderbook: TEST_ORDERBOOK,
+        owner: TEST_ORDER_OWNER,
+    };
+
+    let snapshot_store =
+        StoreBuilder::<crate::inventory::snapshot::InventorySnapshot>::new(pool.clone())
+            .with(Arc::clone(&trigger))
+            .build(())
+            .await
+            .unwrap();
+
+    // Set onchain $500 directly via snapshot command (onchain polling is
+    // skipped because vault registry is empty — no vaults registered).
+    snapshot_store
+        .send(
+            &snapshot_id,
+            InventorySnapshotCommand::OnchainUsdc {
+                usdc_balance: Usdc::new(float!(500)),
+            },
+        )
+        .await
+        .unwrap();
+
+    // Broker reports $500 gross, reserve = $300 -> available = $200.
+    let executor = MockExecutor::new().with_inventory(ExecutorInventory {
+        positions: vec![],
+        usd_balance_cents: 50_000,
+        margin_safe_buying_power_cents: Some(50_000),
+    });
+
+    let asserter = Asserter::new();
+    let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+    let raindex_service = Arc::new(RaindexService::new(
+        ReadOnlyEvm::new(provider),
+        TEST_ORDERBOOK,
+        vault_registry_projection,
+        TEST_ORDER_OWNER,
+    ));
+
+    let reserved_cash = Usd::new(float!(300));
+
+    let polling_service = InventoryPollingService::new(
+        raindex_service,
+        executor,
+        vault_registry,
+        snapshot_id,
+        snapshot_store.clone(),
+        None,
+        None,
+        reserved_cash,
+    );
+
+    // Poll offchain balances — compute_available_cash subtracts $300 reserve
+    // from the $500 broker balance, emitting OffchainUsd with $200 available
+    // and gross_usd_cents = Some(50000). The trigger reactor applies the
+    // event to the BroadcastingInventory.
+    polling_service.poll_and_record().await.unwrap();
+
+    // Verify the reserve subtraction landed in the inventory view.
+    let view = inventory.read().await;
+    assert_eq!(
+        view.usdc_available(Venue::Hedging),
+        Some(Usdc::new(float!(200))),
+        "Offchain available should be $500 gross - $300 reserved = $200"
+    );
+    drop(view);
+
+    // Trigger checks thresholds against the reserve-shifted inventory.
+    trigger.check_and_trigger_usdc().await;
+
+    let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
+    let usdc = Arc::new(MockUsdcRebalance::new());
+
+    let rebalancer = Rebalancer::new(
+        Arc::clone(&mock_equity) as _,
+        mock_equity as _,
+        Arc::clone(&usdc) as _,
+        usdc.clone() as _,
+        receiver,
+        Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+
+    // Drop all Arc clones holding the trigger so the mpsc channel closes
+    // and rebalancer.run() terminates after processing queued operations.
+    // The snapshot store (held by polling_service and locally) keeps the
+    // trigger alive via its reactor list.
+    drop(trigger);
+    drop(snapshot_store);
+    drop(polling_service);
+
+    rebalancer.run().await;
+
+    assert_eq!(
+        usdc.base_to_alpaca_calls(),
+        1,
+        "Reserve-shifted imbalance should trigger base_to_alpaca"
+    );
+
+    let call = usdc
+        .last_base_to_alpaca_call()
+        .expect("Expected a captured call");
+    assert_eq!(
+        call.amount,
+        Usdc::new(float!(150)),
+        "Expected excess of $150 (actual $500 - target $350)"
+    );
+
+    assert_eq!(
+        usdc.alpaca_to_base_calls(),
+        0,
+        "alpaca_to_base should not have been called"
+    );
+}
+
+/// Verifies that without reserve, the same 500/500 split is balanced
+/// and no rebalancing triggers. This is the counterpart to
+/// `cash_reserve_shifts_offchain_balance_triggering_base_to_alpaca`.
+#[tokio::test]
+async fn balanced_usdc_without_reserve_triggers_no_rebalancing() {
+    let pool = setup_test_db().await;
+
+    let (event_sender, _) = broadcast::channel::<Statement>(16);
+    let inventory = Arc::new(BroadcastingInventory::new(
+        InventoryView::default(),
+        event_sender,
+    ));
+
+    build_imbalanced_inventory(Imbalance::Usdc {
+        inventory: &inventory,
+        onchain: Usdc::new(float!(500)),
+        offchain: Usdc::new(float!(500)),
+    })
+    .await;
+
+    let (sender, mut receiver) = mpsc::channel(10);
+
+    let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
+    let wrapper = Arc::new(MockWrapper::new());
+
+    let trigger = RebalancingTrigger::new(
+        test_trigger_config(),
+        vault_registry,
+        TEST_ORDERBOOK,
+        TEST_ORDER_OWNER,
+        Arc::clone(&inventory),
+        sender,
+        wrapper,
+    );
+
+    trigger.check_and_trigger_usdc().await;
+
+    drop(trigger);
+
+    assert!(
+        matches!(receiver.try_recv(), Err(TryRecvError::Disconnected)),
+        "Balanced 500/500 split should not trigger any USDC rebalancing"
+    );
+}
+
+/// Verifies that setting `usdc: None` in `RebalancingTriggerConfig`
 /// disables USDC rebalancing entirely: even with a severe imbalance,
 /// `check_and_trigger_usdc` dispatches no operations.
 #[tokio::test]
@@ -1289,6 +1506,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
             vault_ids: Vec::new(),
             rebalancing: OperationMode::Enabled,
             operational_limit: Some(Positive::new(Usdc::new(float!(100))).unwrap()),
+            reserved: None,
         }),
     };
 
@@ -1420,6 +1638,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
             vault_ids: Vec::new(),
             rebalancing: OperationMode::Enabled,
             operational_limit: Some(Positive::new(Usdc::new(float!(100))).unwrap()),
+            reserved: None,
         }),
     };
     let config = RebalancingTriggerConfig {
@@ -1540,6 +1759,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
                     vault_ids: Vec::new(),
                     rebalancing: OperationMode::Enabled,
                     operational_limit: None,
+                    reserved: None,
                 }),
             },
             disabled_assets: HashSet::new(),
@@ -1600,6 +1820,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
                     vault_ids: Vec::new(),
                     rebalancing: OperationMode::Enabled,
                     operational_limit: None,
+                    reserved: None,
                 }),
             },
             disabled_assets: HashSet::new(),

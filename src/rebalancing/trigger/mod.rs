@@ -940,18 +940,7 @@ impl RebalancingTrigger {
                     })
             }
 
-            OffchainUsd {
-                usd_balance_cents, ..
-            } => {
-                let usdc = Usdc::from_cents(*usd_balance_cents)
-                    .ok_or(InventoryViewError::UsdBalanceConversion(*usd_balance_cents))?;
-                inventory.clone().update_usdc(
-                    Inventory::on_snapshot(Venue::Hedging, usdc, fetched_at),
-                    now,
-                )
-            }
-
-            OffchainMarginSafeBuyingPower { .. } => {
+            OffchainUsd { .. } | OffchainMarginSafeBuyingPower { .. } => {
                 inventory.clone().apply_snapshot_event(&event, now)
             }
 
@@ -1077,22 +1066,9 @@ impl RebalancingTrigger {
                     })
             }
 
-            OffchainUsd {
-                usd_balance_cents, ..
-            } => {
-                let usdc = Usdc::from_cents(*usd_balance_cents)
-                    .ok_or(InventoryViewError::UsdBalanceConversion(*usd_balance_cents))?;
-                inventory.clone().update_usdc(
-                    Inventory::force_on_snapshot(Venue::Hedging, usdc, recovery_reason),
-                    now,
-                )
-            }
-
-            OffchainMarginSafeBuyingPower { .. } => {
-                inventory
-                    .clone()
-                    .force_apply_snapshot_event(&event, now, recovery_reason)
-            }
+            OffchainUsd { .. } | OffchainMarginSafeBuyingPower { .. } => inventory
+                .clone()
+                .force_apply_snapshot_event(&event, now, recovery_reason),
 
             EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
@@ -1887,6 +1863,7 @@ mod tests {
                     vault_ids: Vec::new(),
                     rebalancing: OperationMode::Enabled,
                     operational_limit: None,
+                    reserved: None,
                 }),
             },
             disabled_assets: HashSet::new(),
@@ -4396,6 +4373,7 @@ mod tests {
             id.clone(),
             InventorySnapshotEvent::OffchainUsd {
                 usd_balance_cents: 90000,
+                gross_usd_cents: None,
                 fetched_at: Utc::now(),
             },
         )

@@ -22,6 +22,7 @@ deployment_block = 1
 # The wallet address is used as the order_owner for orderbook event filtering.
 [wallet]
 kind = "private-key"
+address = "0xfcad0b19bb29d4674531d6f115237e16afce377c"
 
 # For kind = "turnkey", use instead:
 # [wallet]

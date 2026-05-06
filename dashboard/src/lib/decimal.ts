@@ -3,6 +3,9 @@ import Decimal from 'decimal.js'
 export const decimalAdd = (left: string, right: string): string =>
   new Decimal(left).plus(new Decimal(right)).toString()
 
+export const decimalSub = (left: string, right: string): string =>
+  new Decimal(left).minus(new Decimal(right)).toString()
+
 export const decimalCompare = (left: string, right: string): number =>
   new Decimal(left).cmp(new Decimal(right))
 

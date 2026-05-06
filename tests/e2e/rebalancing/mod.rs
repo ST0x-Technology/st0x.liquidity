@@ -28,7 +28,8 @@ pub(crate) mod assertions;
 
 use std::collections::HashMap;
 
-use st0x_execution::{FractionalShares, SharesBlockchain};
+use st0x_execution::SharesBlockchain;
+use st0x_finance::{FractionalShares, Positive, Usd};
 use st0x_hedge::OperationMode;
 
 use self::assertions::*;
@@ -959,6 +960,7 @@ async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
         .await?;
 
     let current_block = infra.base_chain.provider.get_block_number().await?;
+    let reserved = Positive::new(Usd::new(float!(3000)))?;
     let ctx = build_usdc_rebalancing_ctx()
         .base_chain(&infra.base_chain)
         .ethereum_endpoint(&cctp.ethereum_endpoint)
@@ -968,6 +970,7 @@ async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
         .equity_tokens(&infra.equity_addresses)
         .usdc_vault_id(usdc_vault_id)
         .cctp(cctp.cctp_overrides())
+        .reserved(reserved)
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -1049,6 +1052,9 @@ async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
         .ethereum_usdc_balance_after_rebalance(ethereum_usdc_balance_after_rebalance)
         .rebalance_type(UsdcRebalanceType::BaseToAlpaca)
         .call()
+        .await?;
+
+    assert_offchain_usd_reflects_reserve(&mut bot, &infra.db_path, &infra.broker_service, reserved)
         .await?;
 
     bot.abort();

@@ -71,8 +71,11 @@ pub(crate) struct InventorySnapshot {
     pub(crate) onchain_usdc: Option<Usdc>,
     /// Latest offchain equity positions by symbol
     pub(crate) offchain_equity: BTreeMap<Symbol, FractionalShares>,
-    /// Latest offchain USD balance in cents
+    /// Latest offchain USD balance in cents (post-reserve, available for trading)
     pub(crate) offchain_usd_cents: Option<i64>,
+    /// Latest offchain gross USD balance in cents (before reserve subtraction)
+    #[serde(default)]
+    pub(crate) offchain_gross_usd_cents: Option<i64>,
     /// Latest offchain margin-safe buying power in cents (`non_marginable_buying_power`
     /// capped at cash balance -- the same value used for counter-trade preflight checks)
     pub(crate) offchain_margin_safe_buying_power_cents: Option<i64>,
@@ -113,6 +116,7 @@ impl EventSourced for InventorySnapshot {
             onchain_usdc: None,
             offchain_equity: BTreeMap::new(),
             offchain_usd_cents: None,
+            offchain_gross_usd_cents: None,
             offchain_margin_safe_buying_power_cents: None,
             ethereum_usdc: None,
             base_wallet_usdc: None,
@@ -151,8 +155,12 @@ impl EventSourced for InventorySnapshot {
                 positions,
                 fetched_at: now,
             },
-            OffchainUsd { usd_balance_cents } => InventorySnapshotEvent::OffchainUsd {
+            OffchainUsd {
                 usd_balance_cents,
+                gross_usd_cents,
+            } => InventorySnapshotEvent::OffchainUsd {
+                usd_balance_cents,
+                gross_usd_cents,
                 fetched_at: now,
             },
             OffchainMarginSafeBuyingPower {
@@ -225,12 +233,18 @@ impl EventSourced for InventorySnapshot {
                     fetched_at: now,
                 }])
             }
-            OffchainUsd { usd_balance_cents } => {
-                if self.offchain_usd_cents == Some(usd_balance_cents) {
+            OffchainUsd {
+                usd_balance_cents,
+                gross_usd_cents,
+            } => {
+                if self.offchain_usd_cents == Some(usd_balance_cents)
+                    && self.offchain_gross_usd_cents == gross_usd_cents
+                {
                     return Ok(vec![]);
                 }
                 Ok(vec![InventorySnapshotEvent::OffchainUsd {
                     usd_balance_cents,
+                    gross_usd_cents,
                     fetched_at: now,
                 }])
             }
@@ -332,6 +346,7 @@ impl InventorySnapshot {
         if let Some(usd_balance_cents) = self.offchain_usd_cents {
             events.push(InventorySnapshotEvent::OffchainUsd {
                 usd_balance_cents,
+                gross_usd_cents: self.offchain_gross_usd_cents,
                 fetched_at,
             });
         }
@@ -396,9 +411,12 @@ impl InventorySnapshot {
                 self.offchain_equity = positions.clone();
             }
             InventorySnapshotEvent::OffchainUsd {
-                usd_balance_cents, ..
+                usd_balance_cents,
+                gross_usd_cents,
+                ..
             } => {
                 self.offchain_usd_cents = Some(*usd_balance_cents);
+                self.offchain_gross_usd_cents = *gross_usd_cents;
             }
             InventorySnapshotEvent::OffchainMarginSafeBuyingPower {
                 margin_safe_buying_power_cents,
@@ -441,6 +459,9 @@ pub(crate) enum InventorySnapshotCommand {
     },
     OffchainUsd {
         usd_balance_cents: i64,
+        /// Gross USD balance before reserve subtraction. `None` when no
+        /// cash reserve is configured, so the dashboard hides the row.
+        gross_usd_cents: Option<i64>,
     },
     OffchainMarginSafeBuyingPower {
         margin_safe_buying_power_cents: Option<i64>,
@@ -486,6 +507,8 @@ pub(crate) enum InventorySnapshotEvent {
     OffchainUsd {
         #[serde(alias = "cash_balance_cents")]
         usd_balance_cents: i64,
+        #[serde(default)]
+        gross_usd_cents: Option<i64>,
         fetched_at: DateTime<Utc>,
     },
     OffchainMarginSafeBuyingPower {
@@ -725,7 +748,10 @@ mod tests {
 
         let events = TestHarness::<InventorySnapshot>::with(())
             .given_no_previous_events()
-            .when(InventorySnapshotCommand::OffchainUsd { usd_balance_cents })
+            .when(InventorySnapshotCommand::OffchainUsd {
+                usd_balance_cents,
+                gross_usd_cents: None,
+            })
             .await
             .events();
 
@@ -799,9 +825,13 @@ mod tests {
             (
                 vec![InventorySnapshotEvent::OffchainUsd {
                     usd_balance_cents,
+                    gross_usd_cents: None,
                     fetched_at,
                 }],
-                InventorySnapshotCommand::OffchainUsd { usd_balance_cents },
+                InventorySnapshotCommand::OffchainUsd {
+                    usd_balance_cents,
+                    gross_usd_cents: None,
+                },
             ),
         ];
 
@@ -1487,6 +1517,7 @@ mod tests {
             onchain_usdc: None,
             offchain_equity: BTreeMap::new(),
             offchain_usd_cents: None,
+            offchain_gross_usd_cents: None,
             offchain_margin_safe_buying_power_cents: None,
             ethereum_usdc: None,
             base_wallet_usdc: None,
@@ -1513,6 +1544,7 @@ mod tests {
             onchain_usdc: Some(Usdc::from_str("5000").unwrap()),
             offchain_equity: BTreeMap::new(),
             offchain_usd_cents: Some(42_00),
+            offchain_gross_usd_cents: Some(50_00),
             offchain_margin_safe_buying_power_cents: Some(10_000),
             ethereum_usdc: None,
             base_wallet_usdc: None,

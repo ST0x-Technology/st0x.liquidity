@@ -200,6 +200,7 @@
     detailAbortController?.abort()
     const controller = new AbortController()
     detailAbortController = controller
+    const isAborted = () => controller.signal.aborted
 
     detailTransfer.update(() => transfer)
     detailLoading.update(() => true)
@@ -219,7 +220,7 @@
         },
       )
 
-      if (controller.signal.aborted) return
+      if (isAborted()) return
 
       if (!response.ok) {
         detailError.update(() => `HTTP ${String(response.status)}`)
@@ -228,12 +229,14 @@
 
       const data = (await response.json()) as { events: TransferEvent[] }
 
+      if (isAborted()) return
+
       detailEvents.update(() => data.events)
     } catch (err) {
-      if (controller.signal.aborted) return
+      if (isAborted()) return
       detailError.update(() => err instanceof Error ? err.message : 'Unknown error')
     } finally {
-      if (!controller.signal.aborted) {
+      if (!isAborted()) {
         detailLoading.update(() => false)
       }
     }

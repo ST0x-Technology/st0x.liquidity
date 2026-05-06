@@ -252,8 +252,10 @@
             name = "secret";
             additionalBuildInputs = [ ragenix.packages.${system}.default ];
             body = ''
+              set -euo pipefail
               ${infraPkgs.parseIdentity}
-              exec ragenix --rules ./secret/secrets.nix -i "$identity" -e "$@"
+              ragenix --rules ./secret/secrets.nix -i "$identity" -e "$@"
+              exec ${rekeySecrets}
             '';
           };
 

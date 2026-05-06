@@ -190,13 +190,32 @@ describe('createWebSocket', () => {
         type: 'current_state',
         data: {
           trades: [trade],
-          inventory: { perSymbol: [], usdc: { onchainAvailable: '0', onchainInflight: '0', offchainAvailable: '0', offchainInflight: '0', buyingPower: null } },
+          inventory: {
+            perSymbol: [], usdc: {
+              onchainAvailable: '0',
+              onchainInflight: '0',
+              offchainAvailable: '0',
+              offchainInflight: '0',
+              offchainGross: null,
+              buyingPower: null
+            }
+          },
           positions: [],
           settings: {
-            equityTarget: 0.5, equityDeviation: 0.2, usdcTarget: null, usdcDeviation: null,
+            equityTarget: 0.5,
+            equityDeviation: 0.2,
+            usdcTarget: null,
+            usdcDeviation: null,
+            cashReserved: null,
             executionThreshold: '$2', assets: [],
-            logLevel: 'Debug', serverPort: 8001, orderbook: '0x0', deploymentBlock: 0,
-            tradingMode: 'standalone', broker: 'dry_run', orderPollingInterval: 5, inventoryPollInterval: 15
+            logLevel: 'Debug',
+            serverPort: 8001,
+            orderbook: '0x0',
+            deploymentBlock: 0,
+            tradingMode: 'standalone',
+            broker: 'dry_run',
+            orderPollingInterval: 5,
+            inventoryPollInterval: 15
           },
           activeTransfers: [activeTransfer],
           recentTransfers: [recentTransfer],
@@ -271,8 +290,21 @@ describe('createWebSocket', () => {
       getInstance(0).simulateOpen()
 
       const inventory = {
-        perSymbol: [{ symbol: 'AAPL', onchainAvailable: '10', onchainInflight: '0', offchainAvailable: '5', offchainInflight: '0' }],
-        usdc: { onchainAvailable: '1000', onchainInflight: '0', offchainAvailable: '500', offchainInflight: '0', buyingPower: null }
+        perSymbol: [{
+          symbol: 'AAPL',
+          onchainAvailable: '10',
+          onchainInflight: '0',
+          offchainAvailable: '5',
+          offchainInflight: '0'
+        }],
+        usdc: {
+          onchainAvailable: '1000',
+          onchainInflight: '0',
+          offchainAvailable: '500',
+          offchainInflight: '0',
+          offchainGross: null,
+          buyingPower: null
+        }
       }
 
       const message: Statement = {

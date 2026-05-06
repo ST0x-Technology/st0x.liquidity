@@ -1,0 +1,7 @@
+error: float_result!(99999999999999999999999999999999999999999999999999999999999999999999999) failed: Decimal Float error selector: Err(0x32b8b8be)
+ --> tests/compile_fail/float_result_overflow.rs:6:13
+  |
+6 |     let _ = float_result!(99999999999999999999999999999999999999999999999999999999999999999999999);
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the macro `float_result` (in Nightly builds, run with -Z macro-backtrace for more info)

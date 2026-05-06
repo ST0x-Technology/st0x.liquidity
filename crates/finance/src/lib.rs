@@ -2,7 +2,7 @@
 //!
 //! This is a leaf crate with zero workspace dependencies, providing
 //! domain types that multiple crates need: `Symbol`, `FractionalShares`,
-//! `Usdc`, `Usd`, `Positive`, `HasZero`, and `Id<Tag>`.
+//! `Usdc`, `Usd`, `Positive`, `NonNegative`, `HasZero`, and `Id<Tag>`.
 
 use rain_math_float::{Float, FloatError};
 use serde::Deserialize;
@@ -17,7 +17,7 @@ mod usdc;
 pub use id::{BlankIdError, Id};
 pub use shares::FractionalShares;
 pub use symbol::{EmptySymbolError, Symbol};
-pub use usd::Usd;
+pub use usd::{Usd, UsdToCentsError};
 pub use usdc::{Usdc, UsdcConversionError};
 
 /// Trait for types that have a zero value and can be compared to it.
@@ -93,6 +93,61 @@ where
 }
 
 impl<T: std::fmt::Display> std::fmt::Display for Positive<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Value must be non-negative (zero or greater).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("value must be non-negative, got {value:?}")]
+pub struct NotNonNegative<T> {
+    pub value: T,
+}
+
+/// Wrapper that guarantees the inner value is non-negative (zero or greater).
+///
+/// Use this when an API requires values that cannot be negative, such as
+/// available cash after subtracting a reserve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Hash, serde::Serialize)]
+#[serde(transparent)]
+pub struct NonNegative<T>(T);
+
+impl<T> NonNegative<T>
+where
+    T: HasZero + Into<Float>,
+{
+    /// # Errors
+    ///
+    /// Returns [`NotNonNegative`] if `value` is negative.
+    pub fn new(value: T) -> Result<Self, NotNonNegative<T>> {
+        let negative = value.is_negative().unwrap_or(false);
+
+        if negative {
+            return Err(NotNonNegative { value });
+        }
+        Ok(Self(value))
+    }
+
+    pub const fn inner(self) -> T {
+        self.0
+    }
+}
+
+impl<'de, T> Deserialize<'de> for NonNegative<T>
+where
+    T: Deserialize<'de> + HasZero + Into<Float> + Debug,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = T::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl<T: std::fmt::Display> std::fmt::Display for NonNegative<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
@@ -202,6 +257,55 @@ mod tests {
         let positive = Positive::new(FractionalShares::new(float!(1.5))).unwrap();
         let error = positive.to_whole_shares().unwrap_err();
         assert!(matches!(error, ToWholeSharesError::Fractional(_)));
+    }
+
+    #[test]
+    fn non_negative_accepts_zero() {
+        let non_neg = NonNegative::new(FractionalShares::ZERO).unwrap();
+        assert_eq!(non_neg.inner(), FractionalShares::ZERO);
+    }
+
+    #[test]
+    fn non_negative_accepts_positive_value() {
+        let value = FractionalShares::new(float!(5));
+        let non_neg = NonNegative::new(value).unwrap();
+        assert_eq!(non_neg.inner(), value);
+    }
+
+    #[test]
+    fn non_negative_rejects_negative() {
+        let negative = FractionalShares::new(float!(-1));
+        let error = NonNegative::new(negative).unwrap_err();
+        assert_eq!(error.value, negative);
+    }
+
+    #[test]
+    fn non_negative_deserialize_accepts_zero() {
+        let non_neg: NonNegative<FractionalShares> = serde_json::from_str("\"0\"").unwrap();
+        assert!(non_neg.inner().is_zero().unwrap());
+    }
+
+    #[test]
+    fn non_negative_deserialize_rejects_negative() {
+        let result: Result<NonNegative<FractionalShares>, _> = serde_json::from_str("\"-1\"");
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().to_lowercase().contains("non-negative"),
+            "expected 'non-negative' in error message, got: {error}"
+        );
+    }
+
+    #[test]
+    fn non_negative_usd_accepts_zero() {
+        let non_neg = NonNegative::new(Usd::ZERO).unwrap();
+        assert!(non_neg.inner().is_zero().unwrap());
+    }
+
+    #[test]
+    fn non_negative_usd_rejects_negative() {
+        let negative = Usd::new(float!(-50));
+        let error = NonNegative::new(negative).unwrap_err();
+        assert_eq!(error.value, negative);
     }
 
     #[test]

@@ -4,7 +4,7 @@
   import type { UsdcInventory } from '$lib/api/UsdcInventory'
   import type { Position } from '$lib/api/Position'
   import type { Settings } from '$lib/api/Settings'
-  import { decimalAdd, decimalCompare, decimalIsZero, formatDecimal } from '$lib/decimal'
+  import { decimalAdd, decimalCompare, decimalIsZero, decimalSub, formatDecimal } from '$lib/decimal'
   import { reactive } from '$lib/frp.svelte'
 
   interface Props {
@@ -278,6 +278,14 @@
         <Table.Cell class="font-mono font-medium">Cash</Table.Cell>
         <Table.Cell class="text-right font-mono opacity-90">
           <span class={approxClass(cashRow.alpaca)} title={cashRow.alpaca.truncated ? cashRow.alpaca.full : undefined}>{cashRow.alpaca.display}</span>
+          {#if usdc?.offchainGross}
+            {@const gross = fmt(usdc.offchainGross)}
+            {@const reserved = fmt(decimalSub(usdc.offchainGross, usdc.offchainAvailable))}
+            <div class="text-xs text-muted-foreground">
+              Gross: <span class={approxClass(gross)} title={gross.truncated ? gross.full : undefined}>{gross.display}</span>
+              · Rsv: <span class={approxClass(reserved)} title={reserved.truncated ? reserved.full : undefined}>{reserved.display}</span>
+            </div>
+          {/if}
           {#if usdc?.buyingPower}
             {@const bp = fmt(usdc.buyingPower.replace(/^\$/, ''))}
             <div class="text-xs text-muted-foreground">BP: <span class={approxClass(bp)} title={bp.truncated ? bp.full : undefined}>{bp.display}</span></div>
