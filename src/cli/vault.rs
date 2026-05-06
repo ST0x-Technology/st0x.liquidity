@@ -13,10 +13,10 @@ use st0x_float_macro::float;
 use st0x_float_serde::format_float_with_fallback;
 
 use crate::bindings::IERC20;
-use crate::config::Ctx;
 use crate::onchain::USDC_BASE;
 use crate::onchain::raindex::{Raindex, RaindexService, RaindexVaultId};
 use crate::vault_registry::VaultRegistry;
+use st0x_config::Ctx;
 
 pub(super) struct Deposit {
     pub(super) amount: Float,
@@ -218,14 +218,14 @@ mod tests {
 
     use super::*;
     use crate::bindings::IERC20::decimalsCall;
-    use crate::config::{
+    use crate::inventory::ImbalanceThreshold;
+    use st0x_config::EvmCtx;
+    use st0x_config::ExecutionThreshold;
+    use st0x_config::RebalancingCtx;
+    use st0x_config::{
         AssetsConfig, BrokerCtx, CashAssetConfig, EquitiesConfig, LogLevel, OperationMode,
         TradingMode,
     };
-    use crate::inventory::ImbalanceThreshold;
-    use crate::onchain::EvmCtx;
-    use crate::rebalancing::RebalancingCtx;
-    use crate::threshold::ExecutionThreshold;
     use st0x_float_macro::float;
 
     fn create_ctx_without_rebalancing() -> Ctx {
@@ -260,7 +260,7 @@ mod tests {
             rest_api: None,
             redemption_wallet: None,
             #[cfg(feature = "test-support")]
-            failure_injector: crate::conductor::job::FailureInjector::new(),
+            failure_injector: st0x_config::FailureInjector::new(),
         }
     }
 
@@ -296,7 +296,7 @@ mod tests {
                     .call(),
             )),
             order_owner: Address::ZERO,
-            wallet: Some(crate::wallet::OnchainWalletCtx::stub()),
+            wallet: Some(st0x_config::OnchainWalletCtx::stub()),
             wallet_meta: None,
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: AssetsConfig {
@@ -307,7 +307,7 @@ mod tests {
             rest_api: None,
             redemption_wallet: Some(Address::ZERO),
             #[cfg(feature = "test-support")]
-            failure_injector: crate::conductor::job::FailureInjector::new(),
+            failure_injector: st0x_config::FailureInjector::new(),
         }
     }
 

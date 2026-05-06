@@ -18,7 +18,6 @@ use st0x_finance::Usdc;
 use super::{TransferDirection, TransferType};
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::bindings::IERC20;
-use crate::config::{BrokerCtx, Ctx};
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId};
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
@@ -34,6 +33,7 @@ use crate::tokenized_equity_mint::{
 use crate::usdc_rebalance::UsdcRebalance;
 use crate::vault_registry::VaultRegistry;
 use crate::wrapper::{Wrapper, WrapperService};
+use st0x_config::{BrokerCtx, Ctx};
 
 /// Resolves the redemption wallet address from CLI flag or config.
 ///
@@ -676,14 +676,14 @@ mod tests {
     use st0x_float_macro::float;
 
     use super::*;
-    use crate::config::{
+    use crate::inventory::ImbalanceThreshold;
+    use crate::test_utils::setup_test_db;
+    use st0x_config::EvmCtx;
+    use st0x_config::ExecutionThreshold;
+    use st0x_config::RebalancingCtx;
+    use st0x_config::{
         AssetsConfig, CashAssetConfig, EquitiesConfig, LogLevel, OperationMode, TradingMode,
     };
-    use crate::inventory::ImbalanceThreshold;
-    use crate::onchain::EvmCtx;
-    use crate::rebalancing::RebalancingCtx;
-    use crate::test_utils::setup_test_db;
-    use crate::threshold::ExecutionThreshold;
 
     fn create_ctx_without_rebalancing() -> Ctx {
         Ctx {
@@ -717,7 +717,7 @@ mod tests {
             rest_api: None,
             redemption_wallet: None,
             #[cfg(feature = "test-support")]
-            failure_injector: crate::conductor::job::FailureInjector::new(),
+            failure_injector: st0x_config::FailureInjector::new(),
         }
     }
 
@@ -777,7 +777,7 @@ mod tests {
                     .call(),
             )),
             order_owner: Address::ZERO,
-            wallet: Some(crate::wallet::OnchainWalletCtx::stub()),
+            wallet: Some(st0x_config::OnchainWalletCtx::stub()),
             wallet_meta: None,
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: AssetsConfig {
@@ -788,7 +788,7 @@ mod tests {
             rest_api: None,
             redemption_wallet: Some(Address::ZERO),
             #[cfg(feature = "test-support")]
-            failure_injector: crate::conductor::job::FailureInjector::new(),
+            failure_injector: st0x_config::FailureInjector::new(),
         }
     }
 

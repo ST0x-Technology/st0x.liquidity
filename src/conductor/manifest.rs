@@ -125,7 +125,6 @@ mod tests {
     use st0x_float_macro::float;
 
     use super::*;
-    use crate::config::{AssetsConfig, EquitiesConfig};
     use crate::inventory::snapshot::{InventorySnapshotCommand, InventorySnapshotId};
     use crate::inventory::{BroadcastingInventory, ImbalanceThreshold, InventoryView, Venue};
     use crate::onchain::mock::MockRaindex;
@@ -133,6 +132,7 @@ mod tests {
     use crate::test_utils::setup_test_db;
     use crate::tokenization::mock::MockTokenizer;
     use crate::wrapper::mock::MockWrapper;
+    use st0x_config::{AssetsConfig, EquitiesConfig};
 
     fn test_trigger_config() -> RebalancingServiceConfig {
         RebalancingServiceConfig {

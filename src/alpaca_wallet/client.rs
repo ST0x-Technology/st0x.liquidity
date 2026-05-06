@@ -316,7 +316,7 @@ mod tests {
     use serde_json::json;
     use uuid::uuid;
 
-    use crate::config::TravelRuleConfig;
+    use st0x_config::TravelRuleConfig;
 
     use super::*;
 

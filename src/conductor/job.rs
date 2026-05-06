@@ -17,10 +17,11 @@ use serde::de::DeserializeOwned;
 use sqlx::SqlitePool;
 use std::fmt;
 use std::sync::Arc;
-#[cfg(any(test, feature = "test-support"))]
-use std::sync::Mutex;
 use std::time::Duration;
 use tracing::{debug, error, warn};
+
+#[cfg(any(test, feature = "test-support"))]
+pub use st0x_config::{FailureInjector, JobKind};
 
 /// Recovery timeout for the fail-stop circuit breaker. Effectively
 /// infinite for any plausible bot uptime; chosen to be finite so
@@ -297,20 +298,6 @@ impl fmt::Display for Label {
     }
 }
 
-/// Identifies which job queue a [`FailureInjector`] targets.
-#[cfg(any(test, feature = "test-support"))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum JobKind {
-    OrderFill,
-    Hedge,
-    Backfill,
-    PollOrderStatus,
-    ReconcileOrderFill,
-    HandleOrderRejection,
-    EquityRebalancingCheck,
-    UsdcRebalancingCheck,
-}
-
 /// Job execution error. Wraps the concrete `Job::Error` type at
 /// the `work()` boundary where the handler is generic over job types.
 #[derive(Debug, thiserror::Error)]
@@ -327,122 +314,28 @@ pub(crate) enum JobError {
     Injected,
 }
 
-/// Allows e2e tests to force the next job of a specific kind to
-/// fail terminally. Each [`JobKind`] has an independent injection
-/// state so arming one queue cannot be consumed by the other.
 #[cfg(any(test, feature = "test-support"))]
-#[derive(Clone, Debug)]
-pub struct FailureInjector {
-    order_fill: Arc<Mutex<InjectionState>>,
-    hedge: Arc<Mutex<InjectionState>>,
-    backfill: Arc<Mutex<InjectionState>>,
-    poll_order_status: Arc<Mutex<InjectionState>>,
-    reconcile_order_fill: Arc<Mutex<InjectionState>>,
-    handle_order_rejection: Arc<Mutex<InjectionState>>,
-    equity_rebalancing_check: Arc<Mutex<InjectionState>>,
-    usdc_rebalancing_check: Arc<Mutex<InjectionState>>,
-}
+async fn perform_with_injection<Ctx, J: Job<Ctx> + Sync>(
+    injector: &FailureInjector,
+    kind: JobKind,
+    job: &J,
+    ctx: &Ctx,
+    attempt: usize,
+) -> Result<J::Output, JobError>
+where
+    Ctx: Send + Sync + 'static,
+{
+    let label = job.label();
 
-#[cfg(any(test, feature = "test-support"))]
-#[derive(Debug, Default)]
-enum InjectionState {
-    #[default]
-    Idle,
-    Armed,
-    Targeted(String),
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl Default for FailureInjector {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl FailureInjector {
-    pub fn new() -> Self {
-        Self {
-            order_fill: Arc::new(Mutex::new(InjectionState::Idle)),
-            hedge: Arc::new(Mutex::new(InjectionState::Idle)),
-            backfill: Arc::new(Mutex::new(InjectionState::Idle)),
-            poll_order_status: Arc::new(Mutex::new(InjectionState::Idle)),
-            reconcile_order_fill: Arc::new(Mutex::new(InjectionState::Idle)),
-            handle_order_rejection: Arc::new(Mutex::new(InjectionState::Idle)),
-            equity_rebalancing_check: Arc::new(Mutex::new(InjectionState::Idle)),
-            usdc_rebalancing_check: Arc::new(Mutex::new(InjectionState::Idle)),
-        }
+    if injector.should_inject(kind, label.as_str()) {
+        return Err(JobError::Injected);
     }
 
-    pub fn arm(&self, kind: JobKind) {
-        *self.lock_state(kind) = InjectionState::Armed;
-    }
-
-    #[cfg(test)]
-    fn is_armed(&self, kind: JobKind) -> bool {
-        let state = &mut *self.lock_state(kind);
-        let was_armed = matches!(state, InjectionState::Armed);
-
-        if was_armed {
-            *state = InjectionState::Idle;
-        }
-
-        was_armed
-    }
-
-    fn should_inject(&self, kind: JobKind, label: &Label) -> bool {
-        let state = &mut *self.lock_state(kind);
-
-        match state {
-            InjectionState::Idle => false,
-            InjectionState::Armed => {
-                *state = InjectionState::Targeted(label.as_str().to_owned());
-                true
-            }
-            InjectionState::Targeted(target_label) => target_label == label.as_str(),
-        }
-    }
-
-    fn lock_state(&self, kind: JobKind) -> std::sync::MutexGuard<'_, InjectionState> {
-        let mutex = match kind {
-            JobKind::OrderFill => &self.order_fill,
-            JobKind::Hedge => &self.hedge,
-            JobKind::Backfill => &self.backfill,
-            JobKind::PollOrderStatus => &self.poll_order_status,
-            JobKind::ReconcileOrderFill => &self.reconcile_order_fill,
-            JobKind::HandleOrderRejection => &self.handle_order_rejection,
-            JobKind::EquityRebalancingCheck => &self.equity_rebalancing_check,
-            JobKind::UsdcRebalancingCheck => &self.usdc_rebalancing_check,
-        };
-
-        match mutex.lock() {
-            Ok(state) => state,
-            Err(poisoned) => poisoned.into_inner(),
-        }
-    }
-
-    async fn perform<Ctx, J: Job<Ctx> + Sync>(
-        &self,
-        kind: JobKind,
-        job: &J,
-        ctx: &Ctx,
-        attempt: usize,
-    ) -> Result<J::Output, JobError>
-    where
-        Ctx: Send + Sync + 'static,
-    {
-        let label = job.label();
-
-        if self.should_inject(kind, &label) {
-            return Err(JobError::Injected);
-        }
-
-        log_processing(&label, attempt);
-        job.perform(ctx).await.map_err(|source| JobError::Failed {
-            label,
-            source: Box::new(source),
-        })
-    }
+    log_processing(&label, attempt);
+    job.perform(ctx).await.map_err(|source| JobError::Failed {
+        label,
+        source: Box::new(source),
+    })
 }
 
 fn log_processing(label: &Label, attempt: usize) {
@@ -466,7 +359,7 @@ where
     Ctx: Send + Sync + 'static,
     J: Job<Ctx> + Sync,
 {
-    injector.perform(*kind, &job, &ctx, attempt.current()).await
+    perform_with_injection(&injector, *kind, &job, &ctx, attempt.current()).await
 }
 
 /// Generic apalis handler -- production build.
@@ -519,83 +412,6 @@ mod tests {
     use super::*;
     use crate::conductor::setup_apalis_tables;
     use crate::test_utils::setup_test_db;
-
-    #[test]
-    fn failure_injector_not_armed_by_default() {
-        let injector = FailureInjector::new();
-        assert!(!injector.is_armed(JobKind::OrderFill));
-        assert!(!injector.is_armed(JobKind::Hedge));
-    }
-
-    #[test]
-    fn failure_injector_arm_then_check_auto_disarms() {
-        let injector = FailureInjector::new();
-
-        injector.arm(JobKind::OrderFill);
-        assert!(injector.is_armed(JobKind::OrderFill));
-        assert!(
-            !injector.is_armed(JobKind::OrderFill),
-            "second check should be false (auto-disarmed)"
-        );
-    }
-
-    #[test]
-    fn failure_injector_kinds_are_independent() {
-        let injector = FailureInjector::new();
-
-        injector.arm(JobKind::OrderFill);
-        assert!(
-            !injector.is_armed(JobKind::Hedge),
-            "arming OrderFill should not affect Hedge"
-        );
-        assert!(injector.is_armed(JobKind::OrderFill));
-    }
-
-    #[test]
-    fn failure_injector_targeted_label_latches_across_retries() {
-        let injector = FailureInjector::new();
-        let first = Label::new("job-a");
-        let same = Label::new("job-a");
-        let different = Label::new("job-b");
-
-        injector.arm(JobKind::OrderFill);
-
-        assert!(
-            injector.should_inject(JobKind::OrderFill, &first),
-            "Armed state should inject for the first label"
-        );
-        assert!(
-            matches!(
-                &*injector.lock_state(JobKind::OrderFill),
-                InjectionState::Targeted(target) if target == "job-a"
-            ),
-            "state should latch to Targeted with the first label"
-        );
-        assert!(
-            injector.should_inject(JobKind::OrderFill, &same),
-            "Targeted state should keep injecting for the same label across retries"
-        );
-        assert!(
-            !injector.should_inject(JobKind::OrderFill, &different),
-            "Targeted state should not inject for a different label"
-        );
-    }
-
-    #[test]
-    fn failure_injector_shared_across_clones() {
-        let injector = FailureInjector::new();
-        let clone = injector.clone();
-
-        injector.arm(JobKind::Hedge);
-        assert!(
-            clone.is_armed(JobKind::Hedge),
-            "arming original should be visible from clone"
-        );
-        assert!(
-            !injector.is_armed(JobKind::Hedge),
-            "should be disarmed after clone consumed it"
-        );
-    }
 
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     struct TestJob {

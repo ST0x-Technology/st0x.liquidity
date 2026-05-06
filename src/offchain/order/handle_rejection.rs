@@ -138,7 +138,7 @@ mod tests {
     use crate::offchain::order::noop_order_placer;
     use crate::position::TradeId;
     use crate::test_utils::{OnchainTradeBuilder, setup_test_db};
-    use crate::threshold::ExecutionThreshold;
+    use st0x_config::ExecutionThreshold;
 
     struct TestInfra {
         ctx: HandleOrderRejectionCtx,

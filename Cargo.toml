@@ -1,6 +1,7 @@
 [workspace]
 members = [
   ".",
+  "crates/config",
   "crates/dto",
   "crates/event-sorcery",
   "crates/execution",
@@ -94,6 +95,7 @@ sqlx = { version = "0.8.6", features = [
   "runtime-tokio-rustls",
 ] }
 st0x-bridge = { path = "crates/bridge" }
+st0x-config = { path = "crates/config" }
 st0x-dto = { path = "crates/dto" }
 st0x-event-sorcery = { path = "crates/event-sorcery" }
 st0x-evm = { path = "crates/evm" }
@@ -110,6 +112,7 @@ tokio = { version = "1.46.0", features = ["full"] }
 tokio-tungstenite = "0.28.0"
 toml = "0.9.11"
 tracing = "0.1.41"
+tracing-appender = "0.2.5"
 tracing-opentelemetry = "0.31.0"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 # no-env-filter: custom `target:` strings (e.g. "hedge", "rebalance") don't
@@ -137,10 +140,14 @@ rust-version = "1.89"
 [features]
 default = ["all-wallets"]
 all-wallets = ["wallet-private-key", "wallet-turnkey"]
-wallet-turnkey = ["st0x-evm/turnkey"]
-wallet-private-key = ["st0x-evm/local-signer"]
+wallet-turnkey = ["st0x-evm/turnkey", "st0x-config/wallet-turnkey"]
+wallet-private-key = ["st0x-evm/local-signer", "st0x-config/wallet-private-key"]
 
-test-support = ["st0x-bridge/test-support", "wallet-private-key"]
+test-support = [
+  "st0x-bridge/test-support",
+  "st0x-config/test-support",
+  "wallet-private-key",
+]
 mock = [
   "st0x-execution/mock",
   "st0x-evm/mock",
@@ -187,6 +194,7 @@ serde_json.workspace = true
 sqlite-es.workspace = true
 sqlx.workspace = true
 st0x-bridge = { workspace = true, features = ["cctp"] }
+st0x-config.workspace = true
 st0x-dto.workspace = true
 st0x-event-sorcery.workspace = true
 st0x-evm.workspace = true
@@ -206,8 +214,9 @@ urlencoding.workspace = true
 uuid.workspace = true
 # Force transitive wasm-bindgen to match rain.wasm's expected version
 wasm-bindgen.workspace = true
-tracing-appender = "0.2.5"
+tracing-appender.workspace = true
 tokio-util = { version = "0.7.18", features = ["rt"] }
+apalis-workflow = "0.1.0-rc.7"
 
 [dev-dependencies]
 approx.workspace = true
@@ -220,7 +229,7 @@ rsa.workspace = true
 serial_test.workspace = true
 st0x-bridge = { workspace = true, features = ["mock"] }
 st0x-event-sorcery = { workspace = true, features = ["test-support"] }
-st0x-evm = { workspace = true, features = ["mock"] }
+st0x-evm = { workspace = true, features = ["mock", "test-support"] }
 st0x-execution = { workspace = true, features = ["mock", "test-support"] }
 st0x-hedge = { workspace = true, features = ["test-support", "mock"] }
 temp-env.workspace = true

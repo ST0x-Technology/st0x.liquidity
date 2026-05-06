@@ -1,14 +1,10 @@
 //! USDC-specific trigger types and logic.
 
 use std::sync::Arc;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
 use rain_math_float::{Float, FloatError};
-use serde::{Deserialize, Serialize};
-
-use st0x_float_macro::float;
 use tracing::{debug, trace, warn};
 
 use st0x_finance::Usdc;
@@ -173,11 +169,7 @@ impl UsdcRebalanceStage {
     }
 }
 
-/// Minimum USDC amount for Alpaca withdrawals.
-/// Alpaca requires $50 USD minimum, but due to USDC/USD spread (~17bps observed in live tests),
-/// we use $51 to ensure we always meet the minimum after conversion slippage.
-pub(crate) static ALPACA_MINIMUM_WITHDRAWAL: LazyLock<Usdc> =
-    LazyLock::new(|| Usdc::new(float!(51)));
+pub(crate) use st0x_config::ALPACA_MINIMUM_WITHDRAWAL;
 
 /// Maximum decimal places for rebalanceable USDC token amounts.
 const USDC_TRANSFER_MAX_DECIMAL_PLACES: u8 = 6;

@@ -19,7 +19,8 @@ use st0x_execution::{Direction, FractionalShares, HasZero};
 
 use super::pyth::{extract_pyth_price, raw_price_to_pyth_price};
 use crate::bindings::IOrderBookV6::{ClearV3, OrderV4, TakeOrderV3};
-use crate::onchain::EvmCtx;
+use st0x_config::EvmCtx;
+
 use crate::onchain::OnChainError;
 use crate::onchain::io::{TokenizedSymbol, TradeDetails, Usdc, WrappedTokenizedShares};
 use crate::onchain::pyth::FeedIdCache;
@@ -433,8 +434,8 @@ mod tests {
 
     use super::*;
     use crate::bindings::IOrderBookV6;
-    use crate::onchain::EvmCtx;
     use crate::symbol::cache::SymbolCache;
+    use st0x_config::EvmCtx;
     use st0x_float_macro::float;
 
     #[test]

@@ -40,7 +40,6 @@ use crate::conductor::{
     AccumulatedPositionExecutionCtx, TradeProcessingCqrs, VaultDiscoveryCtx,
     check_and_execute_accumulated_positions, discover_vaults_for_trade, process_queued_trade,
 };
-use crate::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
 use crate::offchain::order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderId,
 };
@@ -51,11 +50,12 @@ use crate::onchain::trade::RaindexTradeEvent;
 use crate::position::{Position, PositionCommand};
 use crate::symbol::cache::SymbolCache;
 use crate::test_utils::setup_test_db;
-use crate::threshold::ExecutionThreshold;
 use crate::tokenization::alpaca::tests::setup_anvil;
 use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::trade_accountant::TradeAccountingError;
 use crate::vault_registry::VaultRegistryId;
+use st0x_config::ExecutionThreshold;
+use st0x_config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
 
 const TEST_AAPL: &str = "AAPL";
 const TEST_MSFT: &str = "MSFT";

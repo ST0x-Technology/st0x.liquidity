@@ -10,10 +10,10 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
+use st0x_config::Ctx;
 use st0x_dto::Statement;
 use st0x_execution::FractionalShares;
 use st0x_execution::alpaca_broker_api::OrderStatus;
-use st0x_hedge::config::Ctx;
 use st0x_hedge::{run_bot_session, run_bot_session_with_event_channel};
 
 /// Spawns the full bot as a background task.

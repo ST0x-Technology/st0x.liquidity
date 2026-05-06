@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use st0x_evm::Wallet;
 
-use crate::config::Ctx;
+use st0x_config::Ctx;
 
 #[derive(Debug, Error)]
 pub(crate) enum SubmitError {

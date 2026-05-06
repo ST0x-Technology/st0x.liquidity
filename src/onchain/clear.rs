@@ -9,14 +9,13 @@ use tracing::debug;
 
 use st0x_evm::Evm;
 
+use st0x_config::EvmCtx;
+
 use super::OnChainError;
 use crate::bindings::IOrderBookV6::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
+use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::TradeValidationError;
-use crate::onchain::{
-    EvmCtx,
-    pyth::FeedIdCache,
-    trade::{OnchainTrade, OrderFill},
-};
+use crate::onchain::trade::{OnchainTrade, OrderFill};
 use crate::symbol::cache::SymbolCache;
 
 impl OnchainTrade {

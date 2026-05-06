@@ -10,6 +10,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
+use st0x_config::{Ctx, ExecutionThreshold};
 use st0x_event_sorcery::{Projection, Store};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::Executor;
@@ -22,7 +23,6 @@ use super::job::FailureInjector;
 use super::job::{FAIL_STOP_RECOVERY_TIMEOUT, build_supervised_worker};
 use super::monitor::inventory::InventoryMonitor;
 use super::monitor::order_fills::OrderFillMonitor;
-use crate::config::Ctx;
 use crate::inventory::{
     InventoryPollingService, InventorySnapshot, InventorySnapshotId, WalletPollingCtx,
 };
@@ -43,7 +43,6 @@ use crate::rebalancing::{
     UsdcRebalancingCheck, UsdcRebalancingCheckScheduler,
 };
 use crate::symbol::cache::SymbolCache;
-use crate::threshold::ExecutionThreshold;
 use crate::tokenization::Tokenizer;
 use crate::trading::offchain::hedge::{HedgeCtx, HedgeJobQueue, PlaceHedge};
 use crate::trading::onchain::trade_accountant::{

@@ -3,33 +3,9 @@
 mod equity;
 mod usdc;
 
-pub(crate) use equity::{EquityRebalancingCheck, EquityRebalancingCheckScheduler};
-pub(crate) use usdc::{
-    ALPACA_MINIMUM_WITHDRAWAL, UsdcRebalancingCheck, UsdcRebalancingCheckScheduler,
-};
-
-/// Bundle of the equity + USDC schedulers so constructors and plumbing
-/// functions can pass them as a single argument instead of two.
-#[derive(Clone)]
-pub(crate) struct RebalancingSchedulers {
-    pub(crate) equity: EquityRebalancingCheckScheduler,
-    pub(crate) usdc: UsdcRebalancingCheckScheduler,
-}
-
-impl RebalancingSchedulers {
-    pub(crate) fn new(pool: &SqlitePool) -> Self {
-        Self {
-            equity: EquityRebalancingCheckScheduler::new(pool),
-            usdc: UsdcRebalancingCheckScheduler::new(pool),
-        }
-    }
-}
-
 use alloy::primitives::Address;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
-use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,7 +18,6 @@ use st0x_event_sorcery::{AggregateError, EntityList, LifecycleError, Reactor, St
 use st0x_execution::{FractionalShares, Positive, Symbol};
 use st0x_finance::Usdc;
 
-use crate::config::AssetsConfig;
 use crate::equity_redemption::{
     EquityRedemption, EquityRedemptionCommand, EquityRedemptionEvent, RedemptionAggregateId,
 };
@@ -61,6 +36,7 @@ use crate::usdc_rebalance::{
 };
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 use crate::wrapper::{Wrapper, WrapperError};
+use st0x_config::AssetsConfig;
 
 /// Why the rebalancing trigger reactor failed.
 #[derive(Debug, thiserror::Error)]
@@ -99,183 +75,6 @@ pub(crate) enum TokenAddressError {
     Uninitialized,
     #[error(transparent)]
     Persistence(#[from] AggregateError<LifecycleError<VaultRegistry>>),
-}
-
-/// Error type for rebalancing configuration validation.
-#[derive(Debug, thiserror::Error)]
-pub enum RebalancingCtxError {
-    #[error("rebalancing requires alpaca-broker-api broker type")]
-    NotAlpacaBroker,
-    #[error("rebalancing transfer_timeout_secs must be non-zero")]
-    ZeroTransferTimeout,
-    #[error("invalid wallet config: {0}")]
-    WalletConfig(#[from] toml::de::Error),
-    #[error(transparent)]
-    Evm(#[from] st0x_evm::EvmError),
-}
-
-/// USDC rebalancing configuration with explicit enable/disable.
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(tag = "mode", rename_all = "lowercase")]
-pub enum UsdcRebalancing {
-    Enabled {
-        #[serde(deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string")]
-        target: Float,
-        #[serde(deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string")]
-        deviation: Float,
-    },
-    Disabled,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RebalancingConfig {
-    pub(crate) equity: ImbalanceThreshold,
-    pub(crate) usdc: UsdcRebalancing,
-    pub(crate) transfer_timeout_secs: u64,
-}
-
-/// Runtime configuration for rebalancing operations.
-///
-/// Constructed asynchronously from `RebalancingConfig`,
-/// `RebalancingSecrets`, and broker auth. During construction, wallets
-/// are pre-built for both chains. After construction, all fields are
-/// immutable.
-///
-/// Read-only provider access for either chain is available via
-/// `base_wallet().provider()` and `ethereum_wallet().provider()`.
-#[derive(Clone)]
-pub struct RebalancingCtx {
-    pub(crate) equity: ImbalanceThreshold,
-    pub(crate) usdc: Option<ImbalanceThreshold>,
-    pub(crate) transfer_timeout: Duration,
-    /// Circle attestation/fee API base URL (test-only override).
-    #[cfg(feature = "test-support")]
-    pub circle_api_base: String,
-    /// `TokenMessengerV2` contract address (test-only override).
-    #[cfg(feature = "test-support")]
-    pub token_messenger: Address,
-    /// `MessageTransmitterV2` contract address (test-only override).
-    #[cfg(feature = "test-support")]
-    pub message_transmitter: Address,
-}
-
-impl RebalancingCtx {
-    /// Construct from config and secrets.
-    ///
-    /// Wallets are now built separately via [`OnchainWalletCtx`] —
-    /// this constructor only validates and stores rebalancing-specific
-    /// trigger thresholds.
-    pub(crate) fn new(config: &RebalancingConfig) -> Result<Self, RebalancingCtxError> {
-        if config.transfer_timeout_secs == 0 {
-            return Err(RebalancingCtxError::ZeroTransferTimeout);
-        }
-
-        let usdc = match config.usdc {
-            UsdcRebalancing::Enabled { target, deviation } => {
-                Some(ImbalanceThreshold { target, deviation })
-            }
-            UsdcRebalancing::Disabled => None,
-        };
-
-        Ok(Self {
-            equity: config.equity,
-            usdc,
-            transfer_timeout: Duration::from_secs(config.transfer_timeout_secs),
-            #[cfg(feature = "test-support")]
-            circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
-            #[cfg(feature = "test-support")]
-            token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
-            #[cfg(feature = "test-support")]
-            message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
-        })
-    }
-}
-
-#[cfg(test)]
-#[bon::bon]
-impl RebalancingCtx {
-    /// Test constructor that creates a `RebalancingCtx` with stub wallets.
-    ///
-    /// The wallets panic on `send` -- use only in tests that don't submit
-    /// transactions through the rebalancing wallet.
-    #[builder]
-    pub(crate) fn stub(
-        equity: ImbalanceThreshold,
-        usdc: Option<ImbalanceThreshold>,
-        #[builder(default = Duration::from_secs(30 * 60))] transfer_timeout: Duration,
-    ) -> Self {
-        Self {
-            equity,
-            usdc,
-            transfer_timeout,
-            #[cfg(feature = "test-support")]
-            circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
-            #[cfg(feature = "test-support")]
-            token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
-            #[cfg(feature = "test-support")]
-            message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
-        }
-    }
-}
-
-#[cfg(feature = "test-support")]
-#[bon::bon]
-impl RebalancingCtx {
-    /// Test constructor that accepts pre-built wallets for e2e tests
-    /// that need real onchain interaction (e.g. with Anvil forks).
-    #[builder]
-    pub fn with_wallets(
-        equity: ImbalanceThreshold,
-        usdc: UsdcRebalancing,
-        #[builder(default = Duration::from_secs(30 * 60))] transfer_timeout: Duration,
-    ) -> Self {
-        let usdc = match usdc {
-            UsdcRebalancing::Enabled { target, deviation } => {
-                Some(ImbalanceThreshold { target, deviation })
-            }
-            UsdcRebalancing::Disabled => None,
-        };
-
-        Self {
-            equity,
-            usdc,
-            transfer_timeout,
-            circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
-            token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
-            message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
-        }
-    }
-
-    /// Sets the Circle API base URL override (for e2e tests with local
-    /// CCTP contracts and a mock attestation server).
-    #[must_use]
-    pub fn with_circle_api_base(mut self, base_url: String) -> Self {
-        self.circle_api_base = base_url;
-        self
-    }
-
-    /// Sets the CCTP contract address overrides (for e2e tests with
-    /// locally deployed CCTP contracts).
-    #[must_use]
-    pub fn with_cctp_addresses(
-        mut self,
-        token_messenger: Address,
-        message_transmitter: Address,
-    ) -> Self {
-        self.token_messenger = token_messenger;
-        self.message_transmitter = message_transmitter;
-        self
-    }
-}
-
-impl std::fmt::Debug for RebalancingCtx {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RebalancingCtx")
-            .field("equity", &self.equity)
-            .field("usdc", &self.usdc)
-            .finish_non_exhaustive()
-    }
 }
 
 /// Configuration for the rebalancing trigger (runtime).
@@ -2183,8 +1982,6 @@ mod tests {
     use super::*;
 
     use crate::alpaca_wallet::AlpacaTransferId;
-    use crate::conductor::job::Job;
-    use crate::config::{CashAssetConfig, EquitiesConfig, OperationMode};
     use crate::equity_redemption::DetectionFailure;
     use crate::inventory::snapshot::{
         InventorySnapshot, InventorySnapshotEvent, InventorySnapshotId,
@@ -2192,14 +1989,15 @@ mod tests {
     use crate::inventory::view::Operator;
     use crate::inventory::{InventoryError, InventoryView, TransferOp, Venue};
     use crate::offchain::order::OffchainOrderId;
-    use crate::position::{Position, PositionEvent, TradeId};
-    use crate::threshold::ExecutionThreshold;
+    use crate::position::{PositionEvent, TradeId};
     use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
     use crate::usdc_rebalance::{
         TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
     };
     use crate::vault_registry::VaultRegistryCommand;
     use crate::wrapper::mock::MockWrapper;
+    use st0x_config::ExecutionThreshold;
+    use st0x_config::{CashAssetConfig, EquitiesConfig, OperationMode};
     use st0x_execution::HasZero;
     use st0x_float_macro::float;
 
@@ -5695,103 +5493,6 @@ mod tests {
         ));
     }
 
-    fn valid_rebalancing_config_toml() -> &'static str {
-        r#"
-            transfer_timeout_secs = 1800
-
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
-
-            [usdc]
-            mode = "enabled"
-            target = "0.5"
-            deviation = "0.3"
-        "#
-    }
-
-    #[test]
-    fn deserialize_config_succeeds() {
-        let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
-
-        assert!(config.equity.target.eq(float!(0.5)).unwrap());
-        assert!(config.equity.deviation.eq(float!(0.2)).unwrap());
-
-        let UsdcRebalancing::Enabled { target, deviation } = config.usdc else {
-            panic!("expected UsdcRebalancing::Enabled");
-        };
-        assert!(target.eq(float!(0.5)).unwrap());
-        assert!(deviation.eq(float!(0.3)).unwrap());
-        assert_eq!(config.transfer_timeout_secs, 1800);
-    }
-
-    #[test]
-    fn deserialize_with_custom_thresholds() {
-        let config: RebalancingConfig = toml::from_str(
-            r#"
-            transfer_timeout_secs = 1800
-
-            [equity]
-            target = "0.6"
-            deviation = "0.1"
-
-            [usdc]
-            mode = "enabled"
-            target = "0.4"
-            deviation = "0.15"
-        "#,
-        )
-        .unwrap();
-
-        assert!(config.equity.target.eq(float!(0.6)).unwrap());
-        assert!(config.equity.deviation.eq(float!(0.1)).unwrap());
-
-        let UsdcRebalancing::Enabled { target, deviation } = config.usdc else {
-            panic!("expected UsdcRebalancing::Enabled");
-        };
-        assert!(target.eq(float!(0.4)).unwrap());
-        assert!(deviation.eq(float!(0.15)).unwrap());
-    }
-
-    #[test]
-    fn deserialize_missing_transfer_timeout_secs_fails() {
-        let toml_str = r#"
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
-
-            [usdc]
-            mode = "enabled"
-            target = "0.5"
-            deviation = "0.3"
-        "#;
-
-        let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
-        assert!(
-            error.message().contains("transfer_timeout_secs"),
-            "Expected missing transfer_timeout_secs error, got: {error}"
-        );
-    }
-
-    #[test]
-    fn deserialize_missing_equity_fails() {
-        let toml_str = r#"
-            redemption_wallet = "0x1234567890123456789012345678901234567890"
-            transfer_timeout_secs = 1800
-
-            [usdc]
-            mode = "enabled"
-            target = "0.5"
-            deviation = "0.3"
-        "#;
-
-        let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
-        assert!(
-            error.message().contains("equity"),
-            "Expected missing equity error, got: {error}"
-        );
-    }
-
     #[tokio::test]
     async fn usdc_rebalancing_disabled_when_cash_ratio_absent() {
         // Regression: when usdc is None, startup must not require assets.cash.vault_id.
@@ -5833,24 +5534,6 @@ mod tests {
         assert!(
             trigger.usdc_rebalancing_params().is_none(),
             "Expected usdc_rebalancing_params to be None when cash ratio is absent"
-        );
-    }
-
-    #[test]
-    fn deserialize_missing_usdc_fails() {
-        let toml_str = r#"
-            redemption_wallet = "0x1234567890123456789012345678901234567890"
-            transfer_timeout_secs = 1800
-
-            [equity]
-            target = "0.5"
-            deviation = "0.2"
-        "#;
-
-        let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
-        assert!(
-            error.message().contains("usdc"),
-            "Expected missing usdc error, got: {error}"
         );
     }
 
@@ -6750,7 +6433,7 @@ mod tests {
             private_key = private_key_str
         };
 
-        let wallet = crate::wallet::build_wallet(
+        let wallet = st0x_config::build_wallet(
             &st0x_evm::WalletKind::PrivateKey,
             wallet_config.into(),
             wallet_secrets.into(),
