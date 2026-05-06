@@ -27,7 +27,7 @@ use st0x_event_sorcery::{
 use st0x_evm::Wallet;
 use st0x_execution::{
     CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason, ExecutionError,
-    Executor, FractionalShares, MarketOrder, Symbol,
+    Executor, FractionalShares, MarketOrder, Symbol, TryIntoExecutor,
 };
 
 use crate::alpaca_wallet::AlpacaWalletService;
@@ -183,10 +183,9 @@ pub(crate) struct AccumulatedPositionExecutionCtx<'a> {
 
 impl Conductor {
     pub(crate) async fn run<E>(
-        executor: E,
+        executor_ctx: impl TryIntoExecutor<Executor = E>,
         ctx: Ctx,
         pool: SqlitePool,
-        executor_maintenance: Option<JoinHandle<()>>,
         event_sender: broadcast::Sender<Statement>,
         inventory: Arc<BroadcastingInventory>,
     ) -> anyhow::Result<()>
@@ -194,6 +193,9 @@ impl Conductor {
         E: Executor + Clone + Send + 'static,
         TradeAccountingError: From<E::Error>,
     {
+        let executor = executor_ctx.try_into_executor().await?;
+        let executor_maintenance = executor.run_executor_maintenance().await;
+
         // Connect WS and set up apalis tables. The cutoff/backfill
         // step that used to live here has moved into
         // `OrderFillMonitor::run` so that every reconnect — not just
