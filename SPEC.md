@@ -472,14 +472,33 @@ The system provides two top-level capabilities:
 │                                                                         │
 │  st0x-execution      st0x-tokenization  st0x-bridge    st0x-raindex     │
 │  ├─ Executor trait   ├─ Tokenizer trait ├─ Bridge trait├─ Raindex trait │
+│  ├─ Alpaca wallet    │                  │              │                │
+│  ├─ Pyth feeds       │                  │              │                │
 │  │                   │                  │              │                │
 │  │ features:         │ features:        │ features:    │ features:      │
 │  │ ├─ alpaca-broker  │ └─ alpaca        │ └─ cctp      │ └─ rain        │
 │  │ └─ mock           │                  │              │                │
 │                                                                         │
-└───────┬──────────────────┬──────────────────┬──────────────┬────────────┘
-        │                  │                  │              │
-        ▼                  ▼                  ▼              ▼
+│  st0x-evm                              st0x-wrapper                     │
+│  ├─ Wallet trait                       └─ Wrap/unwrap (ERC-4626)        │
+│  ├─ Provider/signer                                                     │
+│  ├─ ABI bindings (IERC20, ...)                                          │
+│  └─ Chain constants (USDC_*)                                            │
+│                                                                         │
+└─────────────────────────────────┬───────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        SHARED METADATA                                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  st0x-registry                                                          │
+│  ├─ SymbolCache                                                         │
+│  └─ VaultRegistry                                                       │
+│                                                                         │
+└─────────────────────────────────┬───────────────────────────────────────┘
+                                  │
+                                  ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                          DOMAIN LOGIC                                   │
 │                    (business rules, uses traits)                        │
@@ -491,7 +510,8 @@ The system provides two top-level capabilities:
 │  └─ CQRS aggregates                    ├─ Mint/Redeem managers          │
 │                                         └─ CQRS aggregates              │
 │  depends on: execution                 depends on: tokenization,        │
-│                                                    bridge, raindex      │
+│                                                    bridge, raindex,     │
+│                                                    wrapper              │
 │                                                                         │
 └──────────────────────────────────┬──────────────────────────────────────┘
                                    │
@@ -503,55 +523,76 @@ The system provides two top-level capabilities:
 │  st0x-baton (orchestration toolkit, wraps apalis)                       │
 │  ├─ Job trait, worker patterns, apalis helpers                          │
 │                                                                         │
-│  st0x-server                           st0x-dashboard                   │
-│  ├─ Conductor (uses Baton)             ├─ Websocket events              │
-│  ├─ Startup, Monitor, job wiring       ├─ Admin UI backend              │
-│  └─ API endpoints                      └─ Own conductor (future)        │
+│  st0x-config (RESTRICTED: only st0x-server and st0x-cli may depend)     │
+│  ├─ Ctx, BrokerCtx, Env (TOML loading and assembly)                     │
+│  └─ setup_tracing                                                       │
+│                                                                         │
+│  st0x-server          st0x-dashboard         st0x-cli                   │
+│  ├─ Bot binary        ├─ Admin UI backend    ├─ Operator binary         │
+│  ├─ Conductor         ├─ Websocket events    ├─ Manual operations       │
+│  ├─ Startup, Monitor  └─ Manual operations   └─ View rebuilds           │
+│  └─ API endpoints                                                       │
+│                                                                         │
+│  All three are thin wrappers; domain logic lives in the layers above.   │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
-
-                · · · · · · · · · · · · · · · · · · · · ·
-                ·                                       ·
-                ·  st0x-cli (temporary utility)         ·
-                ·  ├─ Debug commands                    ·
-                ·  └─ To be deprecated                  ·
-                ·                                       ·
-                · · · · · · · · · · · · · · · · · · · · ·
 ```
 
 ### Crate Descriptions
 
 **Integration Layer** (external API wrappers):
 
-| Crate               | Purpose                                              | Feature Flags                     |
-| ------------------- | ---------------------------------------------------- | --------------------------------- |
-| `st0x-execution`    | Brokerage API integration for trade execution        | `mock`                            |
-| `st0x-tokenization` | Tokenization API for minting/redeeming equity tokens | `alpaca`                          |
-| `st0x-bridge`       | Cross-chain asset transfers                          | `cctp`                            |
-| `st0x-raindex`      | Rain orderbook vault deposit/withdraw operations     | `rain`                            |
-| `st0x-evm`          | EVM chain interaction and wallet abstraction         | `turnkey`, `local-signer`, `mock` |
+| Crate               | Purpose                                                                        | Feature Flags                     |
+| ------------------- | ------------------------------------------------------------------------------ | --------------------------------- |
+| `st0x-execution`    | Brokerage API integration for trade execution; Alpaca wallet ops; Pyth feeds   | `alpaca-broker`, `mock`           |
+| `st0x-tokenization` | Tokenization API for minting/redeeming equity tokens                           | `alpaca`                          |
+| `st0x-bridge`       | Cross-chain asset transfers                                                    | `cctp`                            |
+| `st0x-raindex`      | Rain orderbook vault deposit/withdraw operations                               | `rain`                            |
+| `st0x-evm`          | EVM chain interaction, wallet abstraction, ABI bindings, chain/token constants | `turnkey`, `local-signer`, `mock` |
+| `st0x-wrapper`      | ERC-4626 wrap/unwrap operations and ratio math                                 |                                   |
 
 Each integration crate defines a trait (e.g., `Executor`, `Tokenizer`, `Bridge`,
-`Raindex`, `Wallet`) with one or more implementations selectable via feature
-flags. This allows swapping implementations without changing domain logic.
+`Raindex`, `Wallet`, `Wrapper`) with one or more implementations selectable via
+feature flags. This allows swapping implementations without changing domain
+logic.
+
+**Shared Metadata Layer** (caches consumed by domain and application crates):
+
+| Crate           | Purpose                                                               |
+| --------------- | --------------------------------------------------------------------- |
+| `st0x-registry` | Symbol metadata cache and vault registry, sourced from chain + config |
+
+`st0x-registry` is the only crate that both domain and application crates may
+consume to resolve symbols and vault addresses. It does not contain business
+rules; it caches reference data.
 
 **Domain Logic Layer** (business rules):
 
-| Crate            | Purpose                                                  | Dependencies                                       |
-| ---------------- | -------------------------------------------------------- | -------------------------------------------------- |
-| `st0x-hedge`     | Hedging logic: accumulator, position tracking, queue     | `st0x-execution`                                   |
-| `st0x-rebalance` | Balance maintenance: triggers, managers, CQRS aggregates | `st0x-tokenization`, `st0x-bridge`, `st0x-raindex` |
+| Crate            | Purpose                                                  | Dependencies                                                       |
+| ---------------- | -------------------------------------------------------- | ------------------------------------------------------------------ |
+| `st0x-hedge`     | Hedging logic: accumulator, position tracking, queue     | `st0x-execution`, `st0x-registry`                                  |
+| `st0x-rebalance` | Balance maintenance: triggers, managers, CQRS aggregates | `st0x-tokenization`, `st0x-bridge`, `st0x-raindex`, `st0x-wrapper` |
 
 Domain crates depend on integration traits, not concrete implementations. This
-enables testing with mocks and future implementation swaps.
+enables testing with mocks and future implementation swaps. **Domain crates must
+be config-agnostic**: they accept narrow constructor arguments (`&dyn Wallet`,
+`&dyn Executor`, vault addresses, RPC URLs, threshold values), never `Ctx` or
+`BrokerCtx` from `st0x-config`.
 
 **Application Layer** (binaries and wiring):
 
-| Crate            | Purpose                                                                |
-| ---------------- | ---------------------------------------------------------------------- |
-| `st0x-server`    | Main bot binary, conductor, wires hedging + rebalancing, API endpoints |
-| `st0x-dashboard` | Admin dashboard backend, websocket events, manual operations           |
-| `st0x-cli`       | Temporary utility for manual trading and debug operations              |
+| Crate            | Purpose                                                                                                                                                                                                               |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `st0x-config`    | TOML/secrets loading, `Ctx`/`BrokerCtx`/`Env` assembly, `setup_tracing`. **Restricted visibility: only `st0x-server` and `st0x-cli` may depend on it. No integration, shared, or domain crate may import it.**        |
+| `st0x-server`    | Main bot binary, conductor, wires hedging + rebalancing, API endpoints                                                                                                                                                |
+| `st0x-dashboard` | Admin dashboard backend, websocket events, manual operations                                                                                                                                                          |
+| `st0x-cli`       | Operator binary; thin wrapper exposing manual operations (orders, equity/USDC transfers, vault deposit/withdraw, CCTP bridging, wrap/unwrap, Alpaca wallet ops, view rebuilds) over the integration and domain crates |
+
+The binary crates wire the layers above into a runnable artifact: `st0x-server`
+runs the bot, `st0x-dashboard` exposes the admin UI, `st0x-cli` exposes the same
+domain capabilities to a human operator. A command added to the CLI corresponds
+to a feature already implemented in an integration or domain crate -- the CLI
+does not contain business rules.
 
 ### Feature Flag Strategy
 
@@ -587,14 +628,36 @@ Fix coupling issues before extraction:
   CCTP-specific contracts, so vault doesn't depend on cctp
 - Move ID types: `IssuerRequestId`/`TokenizationRequestId` move from aggregate
   to tokenization module, reversing the dependency direction
+- Delete `src/shares.rs`: it is a four-line re-export of `FractionalShares`,
+  `SharesBlockchain`, and `SharesConversionError` from `st0x-finance` /
+  `st0x-execution`. Its sole consumer (`src/wrapper/ratio.rs`) imports directly
+  from `st0x_execution`
+- Decouple integration and domain modules from `Ctx`/`BrokerCtx`/`Env`. Every
+  `&Ctx` or `&BrokerCtx` parameter on a function destined for an integration,
+  shared, or domain crate must be replaced with the narrow set of values it
+  actually uses (`&dyn Wallet`, `&dyn Executor`, RPC URL, vault address,
+  threshold, etc.). After this refactor, only `src/bin/server.rs`,
+  `src/bin/cli.rs`, and the conductor wiring should reference `Ctx`
 
-### Phase 2: Integration Layer Extraction
+### Phase 2: Integration & Shared-Metadata Extraction
 
-Extract external API wrappers (no CQRS/ES dependencies):
+Extract external API wrappers and shared reference data (no CQRS/ES
+dependencies):
 
 - `st0x-tokenization`: Alpaca tokenization API, defines `Tokenizer` trait
 - `st0x-bridge`: CCTP cross-chain transfers, defines `Bridge` trait
 - `st0x-raindex`: Rain orderbook vault operations, defines `Raindex` trait
+- `st0x-wrapper`: ERC-4626 wrap/unwrap operations, defines `Wrapper` trait;
+  consumed by `st0x-rebalance` and `st0x-cli`
+- `st0x-registry`: extract `SymbolCache` (`src/symbol/cache.rs`) and
+  `VaultRegistry` (`src/vault_registry.rs`) into a single shared crate consumed
+  by domain and application crates
+- Fold `IERC20` (and other shared `sol!` ABI bindings) and chain/token constants
+  (`USDC_BASE`, `USDC_ETHEREUM`, `USDC_ETHEREUM_SEPOLIA`) from `src/onchain/`
+  and `src/bindings/` into `st0x-evm`
+- Fold `AlpacaWalletService` (`src/alpaca_wallet/`) and `FeedIdCache`
+  (`src/onchain/pyth/`) into `st0x-execution`, since both are Alpaca/price-feed
+  integrations
 
 ### Phase 3: Rebalancing Domain Extraction
 
@@ -608,10 +671,48 @@ Extract rebalancing logic (already clean CQRS, no legacy persistence):
 Extract hedging logic and create application binary (must happen atomically):
 
 - `st0x-hedge`: Pure library with accumulator, position tracking, queue
+- `st0x-config`: extract TOML/secrets loading, `Ctx`/`BrokerCtx`/`Env` assembly,
+  and `setup_tracing` into a binary-only crate. Workspace-level enforcement:
+  only `st0x-server` and `st0x-cli` may add `st0x-config` as a dependency. The
+  Phase 1 `Ctx` decoupling is a precondition -- if any integration/shared/domain
+  crate still imports `Ctx`, this extraction blocks
 - `st0x-server`: Application binary with conductor, wires hedging + rebalancing
   together
 - Dashboard stays as feature-gated module in server
-- CLI remains temporary utility
+
+### Phase 5: CLI Extraction
+
+Extract the operator binary into its own crate, last because it consumes
+everything below:
+
+- Move `src/cli/`, `src/cli.rs` (currently `src/cli/mod.rs`), and
+  `src/bin/cli.rs` to `crates/cli/`
+- `st0x-cli` depends on:
+  - integration crates: `st0x-execution`, `st0x-tokenization`, `st0x-bridge`,
+    `st0x-raindex`, `st0x-evm`, `st0x-wrapper`
+  - shared metadata: `st0x-registry`
+  - domain crates: `st0x-hedge`, `st0x-rebalance`
+  - application: `st0x-config` (the only non-binary crate it shares with
+    `st0x-server`), `st0x-event-sorcery` for view rebuilds
+  - No dependency on `st0x-server` or `st0x-dashboard`
+- Common third-party dependencies (alloy, sqlx, tokio, clap, tracing, serde,
+  etc.) must be pulled from `[workspace.dependencies]` with the same feature
+  selections used by `st0x-server`, so the CLI cannot drift in version or
+  feature flags from the main crate
+- The CLI must not introduce any new domain logic. Each command resolves to an
+  existing service or aggregate command on a domain crate. If a CLI command
+  cannot be expressed as a thin wrapper, the missing capability belongs in a
+  domain crate first
+
+**Transitional state**: until Phases 2-4 land, `st0x-cli` is permitted to depend
+on the existing root crate (`st0x-hedge`, later renamed to `st0x-server`) for
+the modules that have not yet been extracted (bindings, chain constants,
+`SymbolCache`, `VaultRegistry`, `Wrapper`, `AlpacaWalletService`, Pyth feeds,
+etc.). This dependency must shrink and ultimately disappear as Phases 2-4 land;
+the end-state dependency list above is the target. Any new CLI feature added
+during the transitional period should still flow through a service or aggregate
+-- the transitional dependency is a packaging concession, not a license to add
+business logic in the CLI.
 
 ## System Risks
 
