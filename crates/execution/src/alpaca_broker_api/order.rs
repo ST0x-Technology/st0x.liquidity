@@ -3,7 +3,7 @@ use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
 use st0x_float_macro::float;
 use std::str::FromStr;
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 use uuid::Uuid;
 
 use super::client::AlpacaBrokerApiClient;
@@ -439,7 +439,7 @@ fn truncate_shares_to_alpaca_precision(
         )?;
 
     if !truncated_float.eq(original)? {
-        warn!(
+        debug!(
             original = %shares,
             truncated = %FractionalShares::new(truncated_float),
             "Truncated order quantity to {} decimal places for Alpaca",

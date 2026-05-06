@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use alloy::primitives::Address;
 use rain_math_float::{Float, FloatError};
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 use st0x_execution::{FractionalShares, Positive, Symbol};
 
@@ -176,7 +176,7 @@ fn truncate_for_alpaca(
     let truncated = FractionalShares::new(truncated_value);
 
     if truncated != quantity {
-        warn!(
+        debug!(
             target: "rebalance",
             %symbol,
             original = %quantity,

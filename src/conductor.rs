@@ -312,6 +312,9 @@ impl Conductor {
                 .build(order_placer)
                 .await?;
 
+        recover_orphaned_pending_offchain_orders(&position, &position_projection, &offchain_order)
+            .await?;
+
         let frameworks = CqrsFrameworks {
             onchain_trade,
             position,
@@ -907,6 +910,102 @@ async fn resume_interrupted_transfers(
         failed_redemptions,
         "Interrupted tokenization transfer resume completed"
     );
+}
+
+/// Recovers positions whose `pending_offchain_order_id` references an
+/// offchain order that has already reached a terminal state (Filled or
+/// Failed) but whose completion was never propagated back to the position
+/// aggregate.
+///
+/// This can happen when `complete_offchain_order_fill` succeeds but the
+/// subsequent `complete_position_order` call fails -- the two operations
+/// are not atomic. Since the order poller only polls `Submitted` orders,
+/// it will never retry the failed position update, leaving the position
+/// permanently stuck.
+async fn recover_orphaned_pending_offchain_orders(
+    position: &Arc<Store<Position>>,
+    position_projection: &Arc<Projection<Position>>,
+    offchain_order: &Arc<Store<OffchainOrder>>,
+) -> anyhow::Result<()> {
+    let positions = position_projection.load_all().await?;
+
+    let orphaned: Vec<_> = positions
+        .into_iter()
+        .filter_map(|(symbol, pos)| {
+            pos.pending_offchain_order_id
+                .map(|order_id| (symbol, order_id))
+        })
+        .collect();
+
+    if orphaned.is_empty() {
+        return Ok(());
+    }
+
+    info!(
+        count = orphaned.len(),
+        "Found positions with pending offchain orders, checking for orphans"
+    );
+
+    for (symbol, order_id) in orphaned {
+        recover_single_orphaned_order(position, offchain_order, &symbol, order_id).await?;
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::cognitive_complexity)]
+async fn recover_single_orphaned_order(
+    position: &Arc<Store<Position>>,
+    offchain_order: &Arc<Store<OffchainOrder>>,
+    symbol: &Symbol,
+    order_id: OffchainOrderId,
+) -> anyhow::Result<()> {
+    let Some(order) = offchain_order.load(&order_id).await? else {
+        warn!(%symbol, %order_id, "Pending offchain order not found in store -- skipping");
+        return Ok(());
+    };
+
+    let command = match order {
+        OffchainOrder::Filled {
+            ref executor_order_id,
+            price,
+            filled_at,
+            ..
+        } => {
+            info!(%symbol, %order_id, "Orphaned order already Filled -- recovering");
+            PositionCommand::CompleteOffChainOrder {
+                offchain_order_id: order_id,
+                shares_filled: order.shares(),
+                direction: order.direction(),
+                executor_order_id: executor_order_id.clone(),
+                price,
+                broker_timestamp: filled_at,
+            }
+        }
+
+        OffchainOrder::Failed { .. } => {
+            info!(%symbol, %order_id, "Orphaned order already Failed -- recovering");
+            PositionCommand::FailOffChainOrder {
+                offchain_order_id: order_id,
+                error: "recovered from orphaned state on startup".to_string(),
+            }
+        }
+
+        OffchainOrder::Submitted { .. } | OffchainOrder::PartiallyFilled { .. } => {
+            debug!(%symbol, %order_id, "Pending offchain order still in progress");
+            return Ok(());
+        }
+
+        OffchainOrder::Pending { .. } => {
+            warn!(%symbol, %order_id, "Offchain order still Pending -- may not have been submitted");
+            return Ok(());
+        }
+    };
+
+    position.send(symbol, command).await?;
+    info!(%symbol, %order_id, "Orphaned pending order recovered");
+
+    Ok(())
 }
 
 /// Constructs the position CQRS framework with its view query
@@ -3966,6 +4065,318 @@ mod tests {
         assert!(
             registry.is_none(),
             "Vault registry should have no state after validation failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_orphaned_pending_clears_filled_order() {
+        let pool = setup_test_db().await;
+        let order_placer = crate::offchain_order::noop_order_placer();
+
+        let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let (offchain_order, _offchain_order_projection) =
+            StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(order_placer)
+                .await
+                .unwrap();
+
+        let symbol = Symbol::new("RKLB").unwrap();
+        let threshold = ExecutionThreshold::whole_share();
+        let offchain_order_id = OffchainOrderId::new();
+        let shares = Positive::new(st0x_execution::FractionalShares::new(float!(0.5))).unwrap();
+
+        // Step 1: Initialize position via an onchain fill
+        position
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold,
+                    trade_id: TradeId {
+                        tx_hash: fixed_bytes!(
+                            "0000000000000000000000000000000000000000000000000000000000000001"
+                        ),
+                        log_index: 0,
+                    },
+                    amount: st0x_execution::FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(78),
+                    block_timestamp: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Step 2: Place an offchain order on the position (sets pending)
+        position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id,
+                    shares,
+                    direction: Direction::Sell,
+                    executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                    threshold,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Step 3: Create the offchain order aggregate (Place -> Submitted -> Filled)
+        offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::Place {
+                    symbol: symbol.clone(),
+                    shares,
+                    direction: Direction::Sell,
+                    executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                },
+            )
+            .await
+            .unwrap();
+
+        offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::CompleteFill {
+                    price: Usd::new(float!(78)),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Verify position is stuck: pending_offchain_order_id is set
+        let pos = position_projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(pos.pending_offchain_order_id, Some(offchain_order_id));
+
+        // Step 4: Run recovery
+        recover_orphaned_pending_offchain_orders(&position, &position_projection, &offchain_order)
+            .await
+            .unwrap();
+
+        // Verify recovery cleared the pending order
+        let pos = position_projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(
+            pos.pending_offchain_order_id, None,
+            "Recovery should clear pending_offchain_order_id for filled orders"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_orphaned_pending_skips_submitted_order() {
+        let pool = setup_test_db().await;
+
+        struct BlockingPlacer;
+
+        #[async_trait::async_trait]
+        impl crate::offchain_order::OrderPlacer for BlockingPlacer {
+            async fn place_market_order(
+                &self,
+                _order: MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("test-submitted"),
+                    placed_shares: Positive::new(st0x_execution::FractionalShares::new(float!(
+                        0.5
+                    )))
+                    .unwrap(),
+                })
+            }
+        }
+
+        let order_placer: Arc<dyn crate::offchain_order::OrderPlacer> = Arc::new(BlockingPlacer);
+
+        let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let (offchain_order, _offchain_order_projection) =
+            StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(order_placer)
+                .await
+                .unwrap();
+
+        let symbol = Symbol::new("SGOV").unwrap();
+        let threshold = ExecutionThreshold::whole_share();
+        let offchain_order_id = OffchainOrderId::new();
+        let shares = Positive::new(st0x_execution::FractionalShares::new(float!(0.5))).unwrap();
+
+        // Initialize position
+        position
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold,
+                    trade_id: TradeId {
+                        tx_hash: fixed_bytes!(
+                            "0000000000000000000000000000000000000000000000000000000000000002"
+                        ),
+                        log_index: 0,
+                    },
+                    amount: st0x_execution::FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(100),
+                    block_timestamp: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Place offchain order on position
+        position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id,
+                    shares,
+                    direction: Direction::Sell,
+                    executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                    threshold,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Create offchain order in Submitted state (Place triggers submission)
+        offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::Place {
+                    symbol: symbol.clone(),
+                    shares,
+                    direction: Direction::Sell,
+                    executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Verify: order is Submitted, position has pending
+        let order = offchain_order
+            .load(&offchain_order_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(order, OffchainOrder::Submitted { .. }));
+
+        // Run recovery
+        recover_orphaned_pending_offchain_orders(&position, &position_projection, &offchain_order)
+            .await
+            .unwrap();
+
+        // Verify: pending_offchain_order_id is NOT cleared
+        let pos = position_projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(
+            pos.pending_offchain_order_id,
+            Some(offchain_order_id),
+            "Recovery must not clear pending order that is still Submitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_orphaned_pending_clears_failed_order() {
+        let pool = setup_test_db().await;
+        let order_placer = crate::offchain_order::noop_order_placer();
+
+        let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let (offchain_order, _offchain_order_projection) =
+            StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(order_placer)
+                .await
+                .unwrap();
+
+        let symbol = Symbol::new("TSLA").unwrap();
+        let threshold = ExecutionThreshold::whole_share();
+        let offchain_order_id = OffchainOrderId::new();
+        let shares = Positive::new(st0x_execution::FractionalShares::new(float!(0.5))).unwrap();
+
+        // Initialize position
+        position
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold,
+                    trade_id: TradeId {
+                        tx_hash: fixed_bytes!(
+                            "0000000000000000000000000000000000000000000000000000000000000003"
+                        ),
+                        log_index: 0,
+                    },
+                    amount: st0x_execution::FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(400),
+                    block_timestamp: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Place offchain order on position
+        position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id,
+                    shares,
+                    direction: Direction::Sell,
+                    executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                    threshold,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Create offchain order that transitions to Failed
+        offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::Place {
+                    symbol: symbol.clone(),
+                    shares,
+                    direction: Direction::Sell,
+                    executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                },
+            )
+            .await
+            .unwrap();
+
+        offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::MarkFailed {
+                    error: "insufficient qty".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Verify position is stuck
+        let pos = position_projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(pos.pending_offchain_order_id, Some(offchain_order_id));
+
+        // Run recovery
+        recover_orphaned_pending_offchain_orders(&position, &position_projection, &offchain_order)
+            .await
+            .unwrap();
+
+        // Verify recovery cleared the pending order
+        let pos = position_projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(
+            pos.pending_offchain_order_id, None,
+            "Recovery should clear pending_offchain_order_id for failed orders"
         );
     }
 }
