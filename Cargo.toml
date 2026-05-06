@@ -49,9 +49,12 @@ alloy = { version = "1.0.38", features = ["full", "rand", "node-bindings"] }
 alloy-primitives = "1.4"
 alloy-signer-turnkey = "=1.0.41"
 anyhow = "1.0.102"
+apalis-board = { version = "1.0.0-rc.8", features = ["axum", "ui"] }
+apalis-workflow = "0.1.0-rc.7"
 apca = "0.30.0"
 approx = "0.5.1"
 async-trait = "0.1.81"
+axum = { version = "0.8.9", features = ["ws", "json"] }
 backon = { version = "1.5.1", features = ["tokio"] }
 base64 = "0.22"
 bon = "3.9.0"
@@ -81,8 +84,6 @@ reqwest = { version = "0.12.4", features = [
   "gzip",
   "blocking",
 ] }
-rocket = { version = "0.5.1", features = ["json"] }
-rocket_ws = "0.1.1"
 rsa = { version = "0.9.10", features = ["pem"] }
 serde = { version = "1.0.197", features = ["derive"] }
 serde_json = "1.0.140"
@@ -107,6 +108,7 @@ test-log = { version = "0.2.19", features = ["trace"] }
 thiserror = "2.0.12"
 tokio = { version = "1.46.0", features = ["full"] }
 tokio-tungstenite = "0.28.0"
+tokio-util = { version = "0.7.18", features = ["rt"] }
 toml = "0.9.11"
 tracing = "0.1.41"
 tracing-appender = "0.2.5"
@@ -194,8 +196,6 @@ rain-error-decoding.workspace = true
 rain-math-float.workspace = true
 rand.workspace = true
 reqwest.workspace = true
-rocket.workspace = true
-rocket_ws.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
@@ -221,8 +221,10 @@ uuid.workspace = true
 # Force transitive wasm-bindgen to match rain.wasm's expected version
 wasm-bindgen.workspace = true
 tracing-appender.workspace = true
-tokio-util = { version = "0.7.18", features = ["rt"] }
-apalis-workflow = "0.1.0-rc.7"
+tokio-util.workspace = true
+apalis-workflow.workspace = true
+axum.workspace = true
+apalis-board.workspace = true
 
 [dev-dependencies]
 approx.workspace = true
@@ -243,6 +245,7 @@ tempfile.workspace = true
 test-log.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite.workspace = true
+tower = { version = "0.5.3", features = ["util"] }
 tracing-subscriber.workspace = true
 tracing-test.workspace = true
 url.workspace = true

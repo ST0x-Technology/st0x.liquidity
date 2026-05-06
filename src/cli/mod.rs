@@ -1298,6 +1298,7 @@ mod tests {
             log_level: LogLevel::Debug,
             log_dir: None,
             server_port: 8080,
+            board_port: 8081,
             evm: EvmCtx {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
@@ -1632,6 +1633,7 @@ mod tests {
             &config_path,
             r#"
                 database_url = ":memory:"
+                board_port = 8081
                 apalis_finished_job_cleanup_interval_secs = 3600
 
                 [assets.equities]

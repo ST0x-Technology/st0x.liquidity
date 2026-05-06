@@ -4,26 +4,27 @@
 //! directional exposure by executing offsetting trades on
 //! traditional brokerages.
 
-use anyhow::Context;
-use rocket::{Ignite, Rocket};
+use apalis_board::axum::framework::{ApiBuilder, RegisterRoute};
+use apalis_board::axum::sse::TracingBroadcaster;
+use apalis_board::axum::ui::ServeUI;
+use axum::{Extension, Router};
 use sqlx::SqlitePool;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use task_supervisor::{
+    SupervisedTask, SupervisorBuilder, SupervisorError, SupervisorHandle, TaskResult,
+};
+use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio::task::{AbortHandle, JoinError, JoinHandle};
-use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use st0x_dto::Statement;
 use st0x_execution::MockExecutorCtx;
 
 use st0x_config::{BrokerCtx, Ctx};
 
-/// How long to wait for in-flight work to drain before force-aborting.
-/// Outer timeout for the entire graceful shutdown sequence. Must exceed
-/// the rebalancer drain timeout (60s) plus margin for supervisor
-/// shutdown and apalis drain.
-const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(90);
+use crate::trading::offchain::hedge::HedgeJobQueue;
+use crate::trading::onchain::trade_accountant::DexTradeAccountingJobQueue;
 
 mod alpaca_wallet;
 pub mod api;
@@ -87,6 +88,28 @@ mod integration_tests;
 #[cfg(test)]
 pub mod test_utils;
 
+/// Returns the global apalis-board log broadcaster, creating it on first access.
+///
+/// The same instance must be wired into the tracing subscriber (so log
+/// events are pushed into it) and into the board router as an `Extension`
+/// (so the `/api/v1/events` SSE handler can read them out).
+pub fn apalis_broadcaster() -> &'static Arc<Mutex<TracingBroadcaster>> {
+    static BROADCASTER: OnceLock<Arc<Mutex<TracingBroadcaster>>> = OnceLock::new();
+    BROADCASTER.get_or_init(TracingBroadcaster::create)
+}
+
+/// Shared application state passed to all axum handlers.
+#[derive(Clone)]
+pub(crate) struct AppState {
+    pub(crate) ctx: Ctx,
+    pub(crate) pool: SqlitePool,
+    pub(crate) event_sender: broadcast::Sender<Statement>,
+    pub(crate) inventory: Arc<inventory::BroadcastingInventory>,
+    pub(crate) settings: st0x_dto::Settings,
+    pub(crate) recovery: Arc<tokio::sync::OnceCell<api::RecoveryHandle>>,
+    pub(crate) resume_lock: Arc<api::ResumeLock>,
+}
+
 #[tracing::instrument(skip_all, target = "startup", level = tracing::Level::INFO)]
 pub async fn run_bot_session(ctx: Ctx) -> anyhow::Result<()> {
     let (event_sender, _) = broadcast::channel::<Statement>(256);
@@ -126,208 +149,167 @@ async fn run_bot_session_inner(
 ) -> anyhow::Result<()> {
     let pool = ctx.get_sqlite_pool().await?;
     sqlx::migrate!().set_ignore_missing(true).run(&pool).await?;
+    conductor::setup_apalis_tables(&pool).await?;
 
     let inventory = Arc::new(inventory::BroadcastingInventory::new(
         inventory::InventoryView::default(),
         event_sender.clone(),
     ));
 
-    let shutdown_token = CancellationToken::new();
+    let shutdown_token = tokio_util::sync::CancellationToken::new();
     let recovery_cell = Arc::new(tokio::sync::OnceCell::new());
+    let resume_lock = Arc::new(api::ResumeLock(tokio::sync::Mutex::new(())));
 
-    let server_task = spawn_server_task(
+    let server_supervisor = spawn_server_supervisor(
         &ctx,
         &pool,
         event_sender.clone(),
         inventory.clone(),
         recovery_cell.clone(),
+        resume_lock,
     );
     let bot_task = tokio::spawn(Box::pin(run_conductor_session(
         ctx,
         pool,
         event_sender,
         inventory,
-        shutdown_token.clone(),
+        shutdown_token,
         recovery_cell,
         #[cfg(any(test, feature = "test-support"))]
         failure_injector,
     )));
 
-    await_shutdown(server_task, bot_task, shutdown_token).await?;
+    await_shutdown(server_supervisor, bot_task).await?;
 
     info!(target: "startup", "Shutdown complete");
     Ok(())
 }
 
-fn spawn_server_task(
+/// Long-running axum HTTP server, supervised so a bind/serve failure
+/// doesn't silently take the API and dashboard down for the rest of
+/// the bot's lifetime.
+#[derive(Clone)]
+struct ServerTask {
+    router: Router,
+    port: u16,
+}
+
+impl SupervisedTask for ServerTask {
+    async fn run(&mut self) -> TaskResult {
+        let listener = TcpListener::bind(("0.0.0.0", self.port)).await?;
+        info!(target: "startup", port = self.port, "Server listening");
+        axum::serve(listener, self.router.clone()).await?;
+        Err("axum server exited unexpectedly".into())
+    }
+}
+
+fn spawn_server_supervisor(
     ctx: &Ctx,
     pool: &SqlitePool,
     event_sender: broadcast::Sender<Statement>,
     inventory: Arc<inventory::BroadcastingInventory>,
-    recovery_cell: Arc<tokio::sync::OnceCell<api::RecoveryHandle>>,
-) -> JoinHandle<Result<Rocket<Ignite>, rocket::Error>> {
-    let rocket_config = rocket::Config::figment()
-        .merge(("port", ctx.server_port))
-        .merge(("address", "0.0.0.0"));
+    recovery: Arc<tokio::sync::OnceCell<api::RecoveryHandle>>,
+    resume_lock: Arc<api::ResumeLock>,
+) -> SupervisorHandle {
+    let state = AppState {
+        ctx: ctx.clone(),
+        pool: pool.clone(),
+        event_sender,
+        inventory,
+        settings: dashboard::settings_from_ctx(ctx),
+        recovery,
+        resume_lock,
+    };
 
-    let rocket = rocket::custom(rocket_config)
-        .mount("/", api::routes())
-        .mount("/api", dashboard::routes())
-        .manage(pool.clone())
-        .manage(ctx.clone())
-        .manage(dashboard::Broadcast {
-            sender: event_sender,
-        })
-        .manage(dashboard::DashboardState {
-            inventory,
-            pool: pool.clone(),
-            settings: dashboard::settings_from_ctx(ctx),
-        })
-        .manage(recovery_cell)
-        .manage(api::ResumeLock(tokio::sync::Mutex::new(())));
+    let main_router = Router::new()
+        .merge(api::routes())
+        .nest("/api", dashboard::routes())
+        .with_state(state);
 
-    tokio::spawn(rocket.launch())
+    // apalis-board's embedded UI is built with hardcoded absolute paths
+    // (`/apalis-board-web-*`) and the wasm calls `/api/v1/*` directly,
+    // so it must own its origin. Run it on its own port instead of
+    // nesting under the main router.
+    let dex_storage = DexTradeAccountingJobQueue::new(pool).into_storage();
+    let hedge_storage = HedgeJobQueue::new(pool).into_storage();
+    let board_api = ApiBuilder::new(Router::new())
+        .register(dex_storage)
+        .register(hedge_storage)
+        .build();
+    let board_router = Router::new()
+        .nest("/api/v1", board_api)
+        .fallback_service(ServeUI::new())
+        .layer(Extension(apalis_broadcaster().clone()));
+
+    SupervisorBuilder::default()
+        .with_task(
+            "axum-server",
+            ServerTask {
+                router: main_router,
+                port: ctx.server_port,
+            },
+        )
+        .with_task(
+            "apalis-board",
+            ServerTask {
+                router: board_router,
+                port: ctx.board_port,
+            },
+        )
+        .build()
+        .run()
 }
 
 async fn await_shutdown(
-    mut server_task: JoinHandle<Result<Rocket<Ignite>, rocket::Error>>,
-    mut bot_task: JoinHandle<anyhow::Result<()>>,
-    shutdown_token: CancellationToken,
+    server_supervisor: SupervisorHandle,
+    bot_task: JoinHandle<anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
-    let server_abort = server_task.abort_handle();
     let bot_abort = bot_task.abort_handle();
 
-    let trigger = await_shutdown_trigger(&mut server_task, &mut bot_task).await?;
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            info!(
+                target: "startup",
+                "Received shutdown signal, shutting down gracefully..."
+            );
 
-    match trigger {
-        ShutdownTrigger::Signal(early_exit) => {
-            info!(target: "shutdown", "Initiating graceful shutdown");
-            shutdown_token.cancel();
-            abort_task("server", &server_abort);
-            drain_bot_with_timeout(bot_task, bot_abort, early_exit, GRACEFUL_SHUTDOWN_TIMEOUT).await
+            shutdown_supervisor(&server_supervisor);
+            abort_task("bot", &bot_abort);
+
+            Ok(())
         }
-        ShutdownTrigger::BotExited(result) => {
-            abort_task("server", &server_abort);
+        result = server_supervisor.wait() => {
+            abort_task("bot", &bot_abort);
+            check_server_result(result)
+        }
+        result = bot_task => {
+            shutdown_supervisor(&server_supervisor);
             check_bot_result(result)
         }
     }
 }
 
-enum ShutdownTrigger {
-    /// An OS signal (or server exit) triggered shutdown; includes any
-    /// server error to propagate after the bot drains.
-    Signal(Option<anyhow::Result<()>>),
-    /// The bot task exited on its own before any signal.
-    BotExited(Result<anyhow::Result<()>, JoinError>),
-}
-
-/// Waits for the first shutdown trigger: SIGINT, SIGTERM, or task exit.
-async fn await_shutdown_trigger(
-    server_task: &mut JoinHandle<Result<Rocket<Ignite>, rocket::Error>>,
-    bot_task: &mut JoinHandle<anyhow::Result<()>>,
-) -> anyhow::Result<ShutdownTrigger> {
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .context("failed to register SIGTERM handler")?;
-
-    let trigger = tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            info!(target: "shutdown", "Received SIGINT");
-            ShutdownTrigger::Signal(None)
-        }
-        _ = sigterm.recv() => {
-            info!(target: "shutdown", "Received SIGTERM");
-            ShutdownTrigger::Signal(None)
-        }
-        result = server_task => {
-            ShutdownTrigger::Signal(Some(check_server_result(result)))
-        }
-        result = bot_task => {
-            ShutdownTrigger::BotExited(result)
-        }
-    };
-
-    Ok(trigger)
-}
-
-async fn drain_bot_with_timeout(
-    bot_task: JoinHandle<anyhow::Result<()>>,
-    bot_abort: AbortHandle,
-    early_exit: Option<anyhow::Result<()>>,
-    timeout: Duration,
-) -> anyhow::Result<()> {
-    info!(
-        target: "shutdown",
-        "Waiting up to {}s for in-flight work to drain (send signal again to force quit)",
-        timeout.as_secs()
-    );
-
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .context("failed to register SIGTERM handler for drain")?;
-
-    let drain_result = tokio::select! {
-        result = tokio::time::timeout(timeout, bot_task) => result,
-        _ = tokio::signal::ctrl_c() => {
-            warn!(target: "shutdown", "Received second signal, force-aborting immediately");
-            abort_task("bot", &bot_abort);
-            if let Some(server_result) = early_exit {
-                return server_result;
-            }
-            return Ok(());
-        }
-        _ = sigterm.recv() => {
-            warn!(target: "shutdown", "Received second SIGTERM, force-aborting immediately");
-            abort_task("bot", &bot_abort);
-            if let Some(server_result) = early_exit {
-                return server_result;
-            }
-            return Ok(());
-        }
-    };
-
-    match drain_result {
-        Ok(result) => {
-            info!(target: "shutdown", "Bot drained gracefully");
-            let bot_outcome = check_bot_result(result);
-            if let Some(server_result) = early_exit {
-                server_result?;
-            }
-            bot_outcome
-        }
-        Err(_elapsed) => {
-            warn!(
-                target: "shutdown",
-                "Drain timeout expired after {}s, force-aborting bot",
-                timeout.as_secs()
-            );
-            abort_task("bot", &bot_abort);
-            if let Some(server_result) = early_exit {
-                server_result?;
-            }
-            Ok(())
-        }
+fn shutdown_supervisor(handle: &SupervisorHandle) {
+    info!(target: "startup", name = "server", "Shutting down supervisor");
+    if let Err(error) = handle.shutdown() {
+        error!(target: "startup", %error, "Failed to shutdown server supervisor");
     }
 }
 
 fn abort_task(name: &str, handle: &AbortHandle) {
-    info!(target: "shutdown", name, "Aborting task");
+    info!(target: "startup", name, "Aborting task");
     handle.abort();
 }
 
-fn check_server_result(
-    result: Result<Result<Rocket<Ignite>, rocket::Error>, JoinError>,
-) -> anyhow::Result<()> {
+fn check_server_result(result: Result<(), SupervisorError>) -> anyhow::Result<()> {
     match result {
-        Ok(Ok(_)) => {
-            info!(target: "startup", "Server completed successfully");
+        Ok(()) => {
+            info!(target: "startup", "Server supervisor completed successfully");
             Ok(())
         }
-        Ok(Err(error)) => {
-            error!(target: "startup", %error, "Server failed");
-            Err(anyhow::anyhow!("Server failed: {error}"))
-        }
         Err(error) => {
-            error!(target: "startup", %error, "Server task panicked");
-            Err(anyhow::anyhow!("Server task panicked: {error}"))
+            error!(target: "startup", %error, "Server supervisor failed");
+            Err(anyhow::anyhow!("Server supervisor failed: {error}"))
         }
     }
 }
@@ -356,7 +338,7 @@ async fn run_conductor_session(
     pool: SqlitePool,
     event_sender: broadcast::Sender<Statement>,
     inventory: Arc<inventory::BroadcastingInventory>,
-    shutdown_token: CancellationToken,
+    shutdown_token: tokio_util::sync::CancellationToken,
     recovery_cell: Arc<tokio::sync::OnceCell<api::RecoveryHandle>>,
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> anyhow::Result<()> {
@@ -447,7 +429,7 @@ mod tests {
             pool,
             create_test_event_sender(),
             create_test_inventory(),
-            CancellationToken::new(),
+            tokio_util::sync::CancellationToken::new(),
             Arc::new(tokio::sync::OnceCell::new()),
             FailureInjector::new(),
         ))
@@ -463,72 +445,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_bot_with_timeout_succeeds_when_bot_drains() {
-        let bot_task = tokio::spawn(async { Ok(()) });
-        let bot_abort = bot_task.abort_handle();
-        drain_bot_with_timeout(bot_task, bot_abort, None, GRACEFUL_SHUTDOWN_TIMEOUT)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn drain_bot_with_timeout_propagates_bot_error() {
-        let bot_task = tokio::spawn(async { Err(anyhow::anyhow!("bot failed")) });
-        let bot_abort = bot_task.abort_handle();
-        let result =
-            drain_bot_with_timeout(bot_task, bot_abort, None, GRACEFUL_SHUTDOWN_TIMEOUT).await;
-        let error = result.unwrap_err();
-        assert!(
-            error.to_string().contains("bot failed"),
-            "should propagate bot error, got: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn drain_bot_with_timeout_propagates_server_error_on_success() {
-        let bot_task = tokio::spawn(async { Ok(()) });
-        let bot_abort = bot_task.abort_handle();
-        let early_exit = Some(Err(anyhow::anyhow!("server crashed")));
-        let result =
-            drain_bot_with_timeout(bot_task, bot_abort, early_exit, GRACEFUL_SHUTDOWN_TIMEOUT)
-                .await;
-        let error = result.unwrap_err();
-        assert!(
-            error.to_string().contains("server crashed"),
-            "should propagate server error, got: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn drain_bot_with_timeout_force_aborts_on_timeout() {
-        // Bot that never completes, forcing the timeout path
-        let bot_task = tokio::spawn(async { std::future::pending::<anyhow::Result<()>>().await });
-        let bot_abort = bot_task.abort_handle();
-
-        let result =
-            drain_bot_with_timeout(bot_task, bot_abort, None, Duration::from_millis(10)).await;
-
-        result.unwrap();
-    }
-
-    #[tokio::test]
-    async fn drain_bot_with_timeout_force_abort_propagates_server_error() {
-        let bot_task = tokio::spawn(async { std::future::pending::<anyhow::Result<()>>().await });
-        let bot_abort = bot_task.abort_handle();
-        let early_exit = Some(Err(anyhow::anyhow!("server crashed")));
-
-        let result =
-            drain_bot_with_timeout(bot_task, bot_abort, early_exit, Duration::from_millis(10))
-                .await;
-
-        let error = result.unwrap_err();
-        assert!(
-            error.to_string().contains("server crashed"),
-            "should propagate server error on force-abort, got: {error}"
-        );
-    }
-
-    #[tokio::test]
     async fn test_run_function_error_propagation() {
         let mut ctx = create_test_ctx_with_order_owner(address!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -540,7 +456,7 @@ mod tests {
             pool,
             create_test_event_sender(),
             create_test_inventory(),
-            CancellationToken::new(),
+            tokio_util::sync::CancellationToken::new(),
             Arc::new(tokio::sync::OnceCell::new()),
             FailureInjector::new(),
         ))

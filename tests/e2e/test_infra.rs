@@ -76,9 +76,16 @@ pub fn init_tracing_with_log_dir(log_dir: &Path) -> tracing_appender::non_blocki
         .with_writer(std::io::stderr)
         .with_filter(console_filter);
 
+    let board_filter = mk_env_filter(tracing::Level::DEBUG);
+    let board_layer =
+        apalis_board::axum::sse::TracingSubscriber::new(st0x_hedge::apalis_broadcaster())
+            .layer()
+            .with_filter(board_filter);
+
     tracing_subscriber::registry()
         .with(console_layer)
         .with(file_layer)
+        .with(board_layer)
         .try_init()
         .expect("Failed to initialize tracing subscriber with log dir");
 

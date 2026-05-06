@@ -155,6 +155,7 @@ fn build_full_system_ctx<P: Provider + Clone>(
         })
         .inventory_poll_interval(15)
         .server_port(server_port)
+        .board_port(8002)
         .maybe_rest_api(
             rest_api_url.map(|url| st0x_config::RestApiCtx::unauthenticated(url.to_string())),
         )
