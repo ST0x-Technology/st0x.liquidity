@@ -4,7 +4,6 @@ use num_traits::ToPrimitive;
 use rand::Rng;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::{Interval, interval};
 use tracing::{debug, info, trace, warn};
 
 use st0x_event_sorcery::{Column, Projection, ProjectionError, SendError, Store};
@@ -59,16 +58,16 @@ impl Default for OrderPollerCtx {
     }
 }
 
-pub struct OrderStatusPoller<E: Executor> {
+#[derive(Clone)]
+pub struct OrderStatusPoller<E: Executor + Clone> {
     ctx: OrderPollerCtx,
-    interval: Interval,
     executor: E,
     offchain_order_projection: Projection<OffchainOrder>,
     offchain_order: Arc<Store<OffchainOrder>>,
     position: Arc<Store<Position>>,
 }
 
-impl<E: Executor> OrderStatusPoller<E> {
+impl<E: Executor + Clone> OrderStatusPoller<E> {
     pub fn new(
         ctx: OrderPollerCtx,
         executor: E,
@@ -76,11 +75,8 @@ impl<E: Executor> OrderStatusPoller<E> {
         offchain_order: Arc<Store<OffchainOrder>>,
         position: Arc<Store<Position>>,
     ) -> Self {
-        let interval = interval(ctx.polling_interval);
-
         Self {
             ctx,
-            interval,
             executor,
             offchain_order_projection,
             offchain_order,
@@ -88,20 +84,8 @@ impl<E: Executor> OrderStatusPoller<E> {
         }
     }
 
-    pub async fn run(mut self) -> Result<(), OrderPollingError> {
-        info!(
-            target: "broker",
-            polling_interval = ?self.ctx.polling_interval,
-            "Starting order status poller..."
-        );
-
-        loop {
-            self.interval.tick().await;
-
-            if let Err(error) = self.poll_pending_orders().await {
-                warn!(target: "broker", %error, "Order polling failed");
-            }
-        }
+    pub(crate) fn polling_interval(&self) -> Duration {
+        self.ctx.polling_interval
     }
 
     #[tracing::instrument(skip(self), target = "broker", level = tracing::Level::DEBUG)]
