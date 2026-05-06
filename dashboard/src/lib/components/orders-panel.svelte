@@ -5,7 +5,8 @@
   import { getApiBaseUrl } from '$lib/env'
   /** The REST API proxies an on-chain query that can be slow. */
   const ORDERS_TIMEOUT_MS = 30_000
-  import { formatDecimal, formatTimestamp } from '$lib/format'
+  import { formatDecimal } from '$lib/decimal'
+  import { formatTimestamp } from '$lib/format'
 
   type TokenRef = {
     address: string
@@ -198,11 +199,11 @@
                 <td class="py-2 pr-4 font-medium">{order.inputToken.symbol}</td>
 
                 <td class="py-2 pr-4 text-right font-mono">
-                  {formatDecimal(order.outputVaultBalance)}
+                  {formatDecimal(order.outputVaultBalance, 3)}
                 </td>
 
                 <td class="py-2 pr-4 text-right font-mono">
-                  {formatDecimal(order.ioRatio)}
+                  {formatDecimal(order.ioRatio, 3)}
                 </td>
 
                 <td class="py-2 pr-4">

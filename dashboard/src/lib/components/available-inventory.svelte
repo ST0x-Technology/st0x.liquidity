@@ -24,7 +24,7 @@
   type Formatted = { display: string; full: string; truncated: boolean }
 
   const fmtValue = (value: string): Formatted => {
-    const display = trimTrailingZeros(formatDecimal(value, 2))
+    const display = trimTrailingZeros(formatDecimal(value, 3))
     const lossless = trimTrailingZeros(formatDecimal(value, 18))
     const truncated = display !== lossless
     return {

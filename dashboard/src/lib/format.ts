@@ -13,32 +13,6 @@ export const formatBalance = (raw: string, decimals: number): string => {
   return trimmed ? `${intPart}.${trimmed}` : intPart
 }
 
-/// Formats a decimal string for display by rounding to a sensible number
-/// of significant digits. Handles values the upstream API returns as
-/// pre-formatted decimals (e.g. "10.996", "1993.824…").
-///
-/// Rules:
-///  - Values >= 1: show up to 6 decimal places, trim trailing zeros.
-///  - Values < 1: preserve up to 6 significant digits after the leading zeros.
-///  - Non-numeric / empty: returned as-is.
-export const formatDecimal = (value: string): string => {
-  if (!value || value === '0') return '0'
-
-  const num = Number(value)
-  if (Number.isNaN(num)) return value
-
-  if (num === 0) return '0'
-
-  // For values >= 1, fixed 6 decimal places is plenty.
-  if (Math.abs(num) >= 1) {
-    return parseFloat(num.toFixed(6)).toString()
-  }
-
-  // For tiny values (< 1), toFixed(6) would round to "0.000000".
-  // Use toPrecision to keep 6 significant digits instead.
-  return parseFloat(num.toPrecision(6)).toString()
-}
-
 /// Formats a Unix epoch timestamp (seconds) to a UTC datetime string.
 export const formatTimestamp = (epoch: number): string => {
   if (epoch === 0) return '-'

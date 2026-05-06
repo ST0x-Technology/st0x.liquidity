@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { formatBalance, formatDecimal, formatTimestamp } from './format'
+import { formatBalance, formatTimestamp } from './format'
 
 describe('formatBalance', () => {
   it('returns "0" for empty string', () => {
@@ -36,42 +36,6 @@ describe('formatBalance', () => {
 
   it('handles large values', () => {
     expect(formatBalance('100000000000000000000000', 18)).toBe('100000')
-  })
-})
-
-describe('formatDecimal', () => {
-  it('returns "0" for empty or zero', () => {
-    expect(formatDecimal('')).toBe('0')
-    expect(formatDecimal('0')).toBe('0')
-  })
-
-  it('returns non-numeric strings as-is', () => {
-    expect(formatDecimal('abc')).toBe('abc')
-  })
-
-  it('trims excessive decimals on values >= 1', () => {
-    expect(formatDecimal('1993.82413955615987854')).toBe('1993.82414')
-  })
-
-  it('trims trailing zeros', () => {
-    expect(formatDecimal('100.500000')).toBe('100.5')
-  })
-
-  it('handles integers', () => {
-    expect(formatDecimal('42')).toBe('42')
-  })
-
-  it('preserves significant digits for tiny values', () => {
-    expect(formatDecimal('0.00000000000010996')).toBe('1.0996e-13')
-  })
-
-  it('formats normal small values', () => {
-    expect(formatDecimal('0.123456789')).toBe('0.123457')
-  })
-
-  it('handles IO ratio style values', () => {
-    expect(formatDecimal('180.79830445')).toBe('180.798304')
-    expect(formatDecimal('0.5')).toBe('0.5')
   })
 })
 

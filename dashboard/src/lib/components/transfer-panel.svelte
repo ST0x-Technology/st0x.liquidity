@@ -19,6 +19,9 @@
     detailFields,
   } from '$lib/transfer'
 
+  const isNumeric = (value: unknown): boolean =>
+    typeof value === 'string' && value !== '' && !Number.isNaN(Number(value))
+
   type TransferEntry = {
     kind: string
     id: string
@@ -348,7 +351,7 @@
                 {transfer.kind === 'usdc_bridge' ? 'USDC' : transfer.symbol ?? ''}
               </Table.Cell>
               <Table.Cell class="text-right font-mono text-xs">
-                {#if transfer.quantity}{formatDecimal(transfer.quantity, 2)}{:else if transfer.amount}{formatDecimal(transfer.amount, 2)}{/if}
+                {#if transfer.quantity}{formatDecimal(transfer.quantity, 3)}{:else if transfer.amount}{formatDecimal(transfer.amount, 3)}{/if}
               </Table.Cell>
               <Table.Cell class="text-right text-xs {style.text}">
                 <span class="inline-flex items-center gap-1.5">
@@ -421,11 +424,11 @@
         </span>
         {#if transfer.quantity}
           <span class="font-mono text-xs font-normal text-muted-foreground">
-            {formatDecimal(transfer.quantity, 2)}
+            {formatDecimal(transfer.quantity, 3)}
           </span>
         {:else if transfer.amount}
           <span class="font-mono text-xs font-normal text-muted-foreground">
-            {formatDecimal(transfer.amount, 2)}
+            {formatDecimal(transfer.amount, 3)}
           </span>
         {/if}
       </div>
@@ -484,6 +487,8 @@
                               {:else}
                                 {JSON.stringify(value)}
                               {/if}
+                            {:else if isNumeric(value)}
+                              {formatDecimal(String(value), 3)}
                             {:else}
                               {String(value)}
                             {/if}
@@ -523,6 +528,8 @@
                           {/if}
                         {:else if typeof value === 'object' && value !== null}
                           {JSON.stringify(value)}
+                        {:else if isNumeric(value)}
+                          {formatDecimal(String(value), 3)}
                         {:else}
                           {String(value)}
                         {/if}

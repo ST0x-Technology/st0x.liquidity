@@ -215,12 +215,10 @@
   const directionColor = (direction: string): string =>
     direction === 'Buy' ? 'text-green-500' : 'text-red-500'
 
-  const fmtSize = (value: string): string => {
-    const num = parseFloat(value)
-    if (num === 0) return '0'
-    if (Math.abs(num) < 0.01) return num.toPrecision(2)
-    return num.toFixed(2)
-  }
+  const fmtSize = (value: string): string => formatDecimal(value, 3)
+
+  const isNumeric = (value: unknown): boolean =>
+    typeof value === 'string' && value !== '' && !Number.isNaN(Number(value))
 
   // -- Detail modal state --
 
@@ -525,9 +523,11 @@
                           <span class="text-muted-foreground">{JSON.stringify(value)}</span>
                         {:else if key === 'pyth_price' && typeof value === 'object' && value !== null}
                           {@const pyth = value as Record<string, unknown>}
-                          <span>${formatDecimal(String(pyth['value']), 2)} (conf: {pyth['conf']}, expo: {pyth['expo']})</span>
+                          <span>${formatDecimal(String(pyth['value']), 3)} (conf: {pyth['conf']}, expo: {pyth['expo']})</span>
                         {:else if typeof value === 'object' && value !== null}
                           {JSON.stringify(value)}
+                        {:else if isNumeric(value)}
+                          {formatDecimal(String(value), 3)}
                         {:else}
                           {String(value)}
                         {/if}
