@@ -17,7 +17,7 @@ let
     name = "stox";
     runtimeInputs = [ st0x-cli ];
     text = ''
-      exec cli \
+      exec st0x-cli \
         --config "''${STOX_CONFIG:-/run/st0x/st0x-hedge.config}" \
         --secrets "''${STOX_SECRETS:-/run/agenix/st0x-hedge.toml}" \
         "$@"

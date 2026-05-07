@@ -26,16 +26,16 @@ use super::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
 use crate::equity_redemption::{
     DetectionFailure, EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId,
 };
-use crate::onchain::raindex::{Raindex, RaindexError};
+use crate::onchain::raindex::{Raindex, RaindexError, RaindexVaultId};
 use crate::tokenization::{
-    AlpacaTokenizationError, MintVerificationError, TokenizationRequestStatus, Tokenizer,
-    TokenizerError,
+    AlpacaTokenizationError, MintVerificationError, TokenizationRequest, TokenizationRequestStatus,
+    Tokenizer, TokenizerError,
 };
 use crate::tokenized_equity_mint::{
     IssuerRequestId, TOKENIZED_EQUITY_DECIMALS, TokenizationRequestId, TokenizedEquityMint,
     TokenizedEquityMintCommand,
 };
-use crate::wrapper::{Wrapper, WrapperError};
+use crate::wrapper::{UnderlyingPerWrapped, Wrapper, WrapperError};
 
 /// A quantity of equity in a specific symbol.
 #[derive(Debug)]
@@ -69,6 +69,156 @@ pub(crate) struct EquityTransferServices {
     pub(crate) raindex: Arc<dyn Raindex>,
     pub(crate) tokenizer: Arc<dyn Tokenizer>,
     pub(crate) wrapper: Arc<dyn Wrapper>,
+}
+
+impl EquityTransferServices {
+    /// Constructs a services instance whose methods all panic.
+    ///
+    /// Safe for sending commands that never invoke services (e.g., the
+    /// `FailWrapping`, `FailAcceptance`, `FailRaindexDeposit`, and
+    /// `FailTransfer` commands). Used by the CLI `fail-transfer`
+    /// subcommand where no real broker/RPC connection exists.
+    pub(crate) fn panicking() -> Self {
+        Self {
+            raindex: Arc::new(PanickingRaindex),
+            tokenizer: Arc::new(PanickingTokenizer),
+            wrapper: Arc::new(PanickingWrapper),
+        }
+    }
+}
+
+/// Panicking Raindex stub for CLI-only use. All methods panic.
+struct PanickingRaindex;
+
+#[async_trait]
+impl Raindex for PanickingRaindex {
+    async fn lookup_vault_id(&self, _: Address) -> Result<RaindexVaultId, RaindexError> {
+        unimplemented!("PanickingRaindex: not available in CLI context")
+    }
+
+    async fn lookup_vault_info(
+        &self,
+        _: &Symbol,
+    ) -> Result<(Address, RaindexVaultId), RaindexError> {
+        unimplemented!("PanickingRaindex: not available in CLI context")
+    }
+
+    async fn deposit(
+        &self,
+        _: Address,
+        _: RaindexVaultId,
+        _: U256,
+        _: u8,
+    ) -> Result<TxHash, RaindexError> {
+        unimplemented!("PanickingRaindex: not available in CLI context")
+    }
+
+    async fn withdraw(
+        &self,
+        _: Address,
+        _: RaindexVaultId,
+        _: U256,
+        _: u8,
+    ) -> Result<TxHash, RaindexError> {
+        unimplemented!("PanickingRaindex: not available in CLI context")
+    }
+}
+
+/// Panicking Tokenizer stub for CLI-only use. All methods panic.
+struct PanickingTokenizer;
+
+#[async_trait]
+impl Tokenizer for PanickingTokenizer {
+    async fn request_mint(
+        &self,
+        _: Symbol,
+        _: FractionalShares,
+        _: Address,
+        _: IssuerRequestId,
+    ) -> Result<TokenizationRequest, TokenizerError> {
+        unimplemented!("PanickingTokenizer: not available in CLI context")
+    }
+
+    async fn poll_mint_until_complete(
+        &self,
+        _: &TokenizationRequestId,
+    ) -> Result<TokenizationRequest, TokenizerError> {
+        unimplemented!("PanickingTokenizer: not available in CLI context")
+    }
+
+    fn redemption_wallet(&self) -> Option<Address> {
+        unimplemented!("PanickingTokenizer: not available in CLI context")
+    }
+
+    async fn send_for_redemption(&self, _: Address, _: U256) -> Result<TxHash, TokenizerError> {
+        unimplemented!("PanickingTokenizer: not available in CLI context")
+    }
+
+    async fn poll_for_redemption(&self, _: &TxHash) -> Result<TokenizationRequest, TokenizerError> {
+        unimplemented!("PanickingTokenizer: not available in CLI context")
+    }
+
+    async fn poll_redemption_until_complete(
+        &self,
+        _: &TokenizationRequestId,
+    ) -> Result<TokenizationRequest, TokenizerError> {
+        unimplemented!("PanickingTokenizer: not available in CLI context")
+    }
+
+    async fn verify_mint_tx(
+        &self,
+        _: TxHash,
+        _: Address,
+        _: Address,
+        _: U256,
+    ) -> Result<(), MintVerificationError> {
+        unimplemented!("PanickingTokenizer: not available in CLI context")
+    }
+
+    async fn list_pending_requests(&self) -> Result<Vec<TokenizationRequest>, TokenizerError> {
+        unimplemented!("PanickingTokenizer: not available in CLI context")
+    }
+}
+
+/// Panicking Wrapper stub for CLI-only use. All methods panic.
+struct PanickingWrapper;
+
+#[async_trait]
+impl Wrapper for PanickingWrapper {
+    async fn get_ratio_for_symbol(&self, _: &Symbol) -> Result<UnderlyingPerWrapped, WrapperError> {
+        unimplemented!("PanickingWrapper: not available in CLI context")
+    }
+
+    fn lookup_underlying(&self, _: &Symbol) -> Result<Address, WrapperError> {
+        unimplemented!("PanickingWrapper: not available in CLI context")
+    }
+
+    fn lookup_derivative(&self, _: &Symbol) -> Result<Address, WrapperError> {
+        unimplemented!("PanickingWrapper: not available in CLI context")
+    }
+
+    async fn to_wrapped(
+        &self,
+        _: Address,
+        _: U256,
+        _: Address,
+    ) -> Result<(TxHash, U256), WrapperError> {
+        unimplemented!("PanickingWrapper: not available in CLI context")
+    }
+
+    async fn to_underlying(
+        &self,
+        _: Address,
+        _: U256,
+        _: Address,
+        _: Address,
+    ) -> Result<(TxHash, U256), WrapperError> {
+        unimplemented!("PanickingWrapper: not available in CLI context")
+    }
+
+    fn owner(&self) -> Address {
+        unimplemented!("PanickingWrapper: not available in CLI context")
+    }
 }
 
 #[derive(Debug, Error)]

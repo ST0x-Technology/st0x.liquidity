@@ -725,6 +725,10 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             .build(deps.pool.clone(), equity_transfer_services)
             .await?;
 
+        rebalancing_trigger
+            .set_stores(built.mint.clone(), built.redemption.clone())
+            .await;
+
         let recovery_transfer = CrossVenueEquityTransfer::new(
             raindex_service.clone(),
             tokenizer.clone(),

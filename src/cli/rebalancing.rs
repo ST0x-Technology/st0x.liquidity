@@ -15,11 +15,11 @@ use st0x_execution::{
 };
 use st0x_finance::Usdc;
 
-use super::TransferDirection;
+use super::{TransferDirection, TransferType};
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::bindings::IERC20;
 use crate::config::{BrokerCtx, Ctx};
-use crate::equity_redemption::EquityRedemption;
+use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId};
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, Equity, EquityTransferServices};
@@ -28,7 +28,9 @@ use crate::rebalancing::usdc::CrossVenueCashTransfer;
 use crate::tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus, Tokenizer,
 };
-use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMint};
+use crate::tokenized_equity_mint::{
+    IssuerRequestId, TokenizedEquityMint, TokenizedEquityMintCommand,
+};
 use crate::usdc_rebalance::UsdcRebalance;
 use crate::vault_registry::VaultRegistry;
 use crate::wrapper::{Wrapper, WrapperService};
@@ -555,6 +557,106 @@ fn format_tokenization_request<Writer: Write>(
 
     if let Some(ref issuer_id) = request.issuer_request_id {
         writeln!(stdout, "   Issuer ID: {}", issuer_id.0)?;
+    }
+
+    Ok(())
+}
+
+/// Manually fail a stuck mint or redemption transfer aggregate.
+///
+/// Loads the aggregate from the event store, determines its current state,
+/// and sends the appropriate failure command. Rejects if the aggregate is
+/// already in a terminal state.
+pub(crate) async fn fail_transfer_command<W: Write>(
+    stdout: &mut W,
+    pool: &SqlitePool,
+    transfer_type: TransferType,
+    id: &str,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let services = EquityTransferServices::panicking();
+
+    match transfer_type {
+        TransferType::Mint => {
+            let mint_id = IssuerRequestId::new(id);
+
+            let entity = st0x_event_sorcery::load_entity::<TokenizedEquityMint>(pool, &mint_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Mint aggregate not found: {id}"))?;
+
+            let command = match entity {
+                TokenizedEquityMint::MintAccepted { .. } => {
+                    TokenizedEquityMintCommand::FailAcceptance {
+                        reason: reason.to_string(),
+                    }
+                }
+                TokenizedEquityMint::TokensReceived { .. } => {
+                    TokenizedEquityMintCommand::FailWrapping {
+                        reason: reason.to_string(),
+                    }
+                }
+                TokenizedEquityMint::TokensWrapped { .. } => {
+                    TokenizedEquityMintCommand::FailRaindexDeposit {
+                        reason: reason.to_string(),
+                    }
+                }
+                TokenizedEquityMint::MintRequested { .. } => {
+                    anyhow::bail!("Mint {id} is at MintRequested -- cannot fail before acceptance");
+                }
+                TokenizedEquityMint::DepositedIntoRaindex { .. } => {
+                    anyhow::bail!("Mint {id} already completed (DepositedIntoRaindex)");
+                }
+                TokenizedEquityMint::Failed { .. } => {
+                    anyhow::bail!("Mint {id} already failed");
+                }
+            };
+
+            st0x_event_sorcery::send_command::<TokenizedEquityMint>(
+                pool, &mint_id, command, services,
+            )
+            .await?;
+
+            writeln!(stdout, "Mint {id} marked as failed")?;
+        }
+
+        TransferType::Redemption => {
+            let redemption_id: RedemptionAggregateId = id
+                .parse()
+                .map_err(|error| anyhow::anyhow!("Invalid redemption ID: {error}"))?;
+
+            let entity = st0x_event_sorcery::load_entity::<EquityRedemption>(pool, &redemption_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Redemption aggregate not found: {id}"))?;
+
+            match entity {
+                EquityRedemption::WithdrawnFromRaindex { .. }
+                | EquityRedemption::TokensUnwrapped { .. } => {}
+                EquityRedemption::TokensSent { .. } | EquityRedemption::Pending { .. } => {
+                    anyhow::bail!(
+                        "Redemption {id} is past the transfer stage -- \
+                         use FailDetection or RejectRedemption instead"
+                    );
+                }
+                EquityRedemption::Completed { .. } => {
+                    anyhow::bail!("Redemption {id} already completed");
+                }
+                EquityRedemption::Failed { .. } => {
+                    anyhow::bail!("Redemption {id} already failed");
+                }
+            }
+
+            st0x_event_sorcery::send_command::<EquityRedemption>(
+                pool,
+                &redemption_id,
+                EquityRedemptionCommand::FailTransfer {
+                    reason: reason.to_string(),
+                },
+                services,
+            )
+            .await?;
+
+            writeln!(stdout, "Redemption {id} marked as failed")?;
+        }
     }
 
     Ok(())

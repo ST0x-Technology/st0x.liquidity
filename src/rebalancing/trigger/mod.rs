@@ -22,7 +22,9 @@ use st0x_execution::{FractionalShares, Positive, Symbol};
 use st0x_finance::Usdc;
 
 use crate::config::AssetsConfig;
-use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent, RedemptionAggregateId};
+use crate::equity_redemption::{
+    EquityRedemption, EquityRedemptionCommand, EquityRedemptionEvent, RedemptionAggregateId,
+};
 use crate::inventory::projection::InventoryProjectionError;
 use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::{
@@ -31,7 +33,7 @@ use crate::inventory::{
 };
 use crate::position::{Position, PositionEvent};
 use crate::tokenized_equity_mint::{
-    IssuerRequestId, TokenizedEquityMint, TokenizedEquityMintEvent,
+    IssuerRequestId, TokenizedEquityMint, TokenizedEquityMintCommand, TokenizedEquityMintEvent,
 };
 use crate::usdc_rebalance::{
     RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent, UsdcRebalanceId,
@@ -456,6 +458,12 @@ pub(crate) struct RebalancingTrigger {
     mint_event_sync: Arc<Mutex<()>>,
     redemption_event_sync: Arc<Mutex<()>>,
     usdc_event_sync: Arc<Mutex<()>>,
+    /// CQRS stores for emitting failure events on timeout.
+    /// Set after construction via `set_stores` because the stores
+    /// are built after the trigger (the trigger is a Reactor dependency
+    /// of the stores' query manifest).
+    mint_store: RwLock<Option<Arc<Store<TokenizedEquityMint>>>>,
+    redemption_store: RwLock<Option<Arc<Store<EquityRedemption>>>>,
 }
 
 type EquityInventoryUpdate = Box<
@@ -499,7 +507,22 @@ impl RebalancingTrigger {
             mint_event_sync: Arc::new(Mutex::new(())),
             redemption_event_sync: Arc::new(Mutex::new(())),
             usdc_event_sync: Arc::new(Mutex::new(())),
+            mint_store: RwLock::new(None),
+            redemption_store: RwLock::new(None),
         }
+    }
+
+    /// Attach CQRS stores so the trigger can emit failure events on timeout.
+    ///
+    /// Called after construction because the stores are built by the query
+    /// manifest, which depends on the trigger as a reactor.
+    pub(crate) async fn set_stores(
+        &self,
+        mint_store: Arc<Store<TokenizedEquityMint>>,
+        redemption_store: Arc<Store<EquityRedemption>>,
+    ) {
+        *self.mint_store.write().await = Some(mint_store);
+        *self.redemption_store.write().await = Some(redemption_store);
     }
 
     async fn expire_stuck_operations(
@@ -567,16 +590,46 @@ impl RebalancingTrigger {
                 continue;
             };
 
+            let elapsed_secs = elapsed.as_secs();
             error!(
                 target: "rebalance",
                 aggregate_id = %id,
                 symbol = %tracking.symbol,
                 stage = %tracking.stage,
-                ?elapsed,
+                elapsed_secs,
+                outcome = "timeout",
                 "Mint transfer timed out; clearing trigger guard and inventory inflight"
             );
 
             self.clear_equity_in_progress(&tracking.symbol);
+
+            if let Some(store) = self.mint_store.read().await.as_ref() {
+                let reason = format!(
+                    "Transfer timed out after {elapsed_secs}s at stage {}",
+                    tracking.stage
+                );
+
+                let command = match tracking.stage {
+                    MintTrackingStage::Accepted => {
+                        TokenizedEquityMintCommand::FailAcceptance { reason }
+                    }
+                    MintTrackingStage::TokensReceived => {
+                        TokenizedEquityMintCommand::FailWrapping { reason }
+                    }
+                    MintTrackingStage::TokensWrapped => {
+                        TokenizedEquityMintCommand::FailRaindexDeposit { reason }
+                    }
+                    MintTrackingStage::Requested => continue,
+                };
+
+                if let Err(error) = store.send(&id, command).await {
+                    warn!(
+                        target: "rebalance",
+                        %id, %error,
+                        "Failed to emit timeout failure event for mint"
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -609,16 +662,50 @@ impl RebalancingTrigger {
                 continue;
             };
 
+            let elapsed_secs = elapsed.as_secs();
             error!(
                 target: "rebalance",
                 aggregate_id = %id,
                 symbol = %tracking.symbol,
                 stage = %tracking.stage,
-                ?elapsed,
+                elapsed_secs,
+                outcome = "timeout",
                 "Redemption transfer timed out; clearing trigger guard and inventory inflight"
             );
 
             self.clear_equity_in_progress(&tracking.symbol);
+
+            if let Some(store) = self.redemption_store.read().await.as_ref() {
+                let reason = format!(
+                    "Transfer timed out after {elapsed_secs}s at stage {}",
+                    tracking.stage
+                );
+
+                let command = match tracking.stage {
+                    RedemptionTrackingStage::WithdrawnFromRaindex
+                    | RedemptionTrackingStage::TokensUnwrapped => {
+                        Some(EquityRedemptionCommand::FailTransfer { reason })
+                    }
+                    RedemptionTrackingStage::TokensSent => {
+                        Some(EquityRedemptionCommand::FailDetection {
+                            failure: crate::equity_redemption::DetectionFailure::Timeout,
+                        })
+                    }
+                    RedemptionTrackingStage::Detected => {
+                        Some(EquityRedemptionCommand::RejectRedemption { reason })
+                    }
+                };
+
+                if let Some(command) = command
+                    && let Err(error) = store.send(&id, command).await
+                {
+                    warn!(
+                        target: "rebalance",
+                        %id, %error,
+                        "Failed to emit timeout failure event for redemption"
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -2623,6 +2710,7 @@ mod tests {
         TokenizedEquityMintEvent::WrappingFailed {
             symbol: symbol.clone(),
             quantity,
+            reason: None,
             failed_at: Utc::now(),
         }
     }
@@ -2637,6 +2725,7 @@ mod tests {
     fn make_transfer_failed() -> EquityRedemptionEvent {
         EquityRedemptionEvent::TransferFailed {
             tx_hash: Some(TxHash::random()),
+            reason: None,
             failed_at: Utc::now(),
         }
     }

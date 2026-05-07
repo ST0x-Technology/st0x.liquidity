@@ -419,6 +419,35 @@ pub async fn load_entity<Entity: EventSourced>(
     Ok(context.aggregate.into_result()?)
 }
 
+/// Execute a single command against an aggregate without a pre-built
+/// [`Store`].
+///
+/// Creates a temporary CQRS framework with no query processors,
+/// executes the command, and discards the framework. Useful in CLI
+/// contexts where you need to send a command but don't have (or need)
+/// a full server-lifetime Store.
+///
+/// The caller must provide `services` matching the aggregate's
+/// `Services` type. For commands that never invoke services (e.g.,
+/// failure commands), a panicking stub is safe.
+pub async fn send_command<Entity: EventSourced>(
+    pool: &SqlitePool,
+    id: &Entity::Id,
+    command: Entity::Command,
+    services: Entity::Services,
+) -> Result<(), SendError<Entity>> {
+    let repo = SqliteEventRepository::new(pool.clone());
+    let store = PersistedEventStore::<SqliteEventRepository, Lifecycle<Entity>>::new_snapshot_store(
+        repo,
+        Entity::SNAPSHOT_SIZE,
+    );
+
+    #[allow(clippy::disallowed_methods)]
+    let cqrs = CqrsFramework::new(store, vec![], services);
+
+    cqrs.execute(&id.to_string(), command).await
+}
+
 /// Delete compactable events that are already represented by snapshots.
 ///
 /// This is a no-op for entities with [`CompactionPolicy::Retain`]. For

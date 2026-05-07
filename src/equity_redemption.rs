@@ -205,6 +205,9 @@ pub(crate) enum EquityRedemptionCommand {
     Complete,
     /// Alpaca rejected the redemption.
     RejectRedemption { reason: String },
+    /// Operator or timeout-driven failure from `WithdrawnFromRaindex` or
+    /// `TokensUnwrapped` states.
+    FailTransfer { reason: String },
 }
 
 /// Reason for detection failure when polling Alpaca for redemption detection.
@@ -239,6 +242,10 @@ pub(crate) enum EquityRedemptionEvent {
     /// Raindex withdraw succeeded but transfer to redemption wallet failed.
     TransferFailed {
         tx_hash: Option<TxHash>,
+        /// Reason for failure (timeout, EVM revert, operator action).
+        /// Absent in events emitted before this field was added.
+        #[serde(default)]
+        reason: Option<String>,
         failed_at: DateTime<Utc>,
     },
 
@@ -317,13 +324,15 @@ impl PartialEq for EquityRedemptionEvent {
             (
                 Self::TransferFailed {
                     tx_hash: h1,
+                    reason: r1,
                     failed_at: f1,
                 },
                 Self::TransferFailed {
                     tx_hash: h2,
+                    reason: r2,
                     failed_at: f2,
                 },
-            ) => h1 == h2 && f1 == f2,
+            ) => h1 == h2 && r1 == r2 && f1 == f2,
             (
                 Self::TokensSent {
                     redemption_wallet: w1,
@@ -496,6 +505,10 @@ pub(crate) enum EquityRedemption {
         raindex_withdraw_tx: Option<TxHash>,
         redemption_tx: Option<TxHash>,
         tokenization_request_id: Option<TokenizationRequestId>,
+        /// Reason for failure (timeout, operator action, etc.).
+        /// Absent for aggregates that failed before this field was added.
+        #[serde(default)]
+        reason: Option<String>,
         /// When the redemption process started (withdrawn_at or sent_at from prior state)
         started_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
@@ -641,7 +654,11 @@ impl EventSourced for EquityRedemption {
         Ok(match event {
             WithdrawnFromRaindex { .. } => None,
 
-            TransferFailed { tx_hash, failed_at } => match entity {
+            TransferFailed {
+                tx_hash,
+                reason,
+                failed_at,
+            } => match entity {
                 Self::WithdrawnFromRaindex {
                     symbol,
                     quantity,
@@ -661,6 +678,7 @@ impl EventSourced for EquityRedemption {
                     raindex_withdraw_tx: Some(*raindex_withdraw_tx),
                     redemption_tx: *tx_hash,
                     tokenization_request_id: None,
+                    reason: reason.clone(),
                     started_at: *withdrawn_at,
                     failed_at: *failed_at,
                 }),
@@ -787,6 +805,7 @@ impl EventSourced for EquityRedemption {
                     raindex_withdraw_tx: Some(*raindex_withdraw_tx),
                     redemption_tx: Some(*redemption_tx),
                     tokenization_request_id: None,
+                    reason: None,
                     started_at: *sent_at,
                     failed_at: *failed_at,
                 })
@@ -834,6 +853,7 @@ impl EventSourced for EquityRedemption {
                     raindex_withdraw_tx: None,
                     redemption_tx: Some(*redemption_tx),
                     tokenization_request_id: Some(tokenization_request_id.clone()),
+                    reason: None,
                     started_at: *sent_at,
                     failed_at: *rejected_at,
                 })
@@ -894,7 +914,8 @@ impl EventSourced for EquityRedemption {
             | Detect { .. }
             | FailDetection { .. }
             | Complete
-            | RejectRedemption { .. } => Err(EquityRedemptionError::NotStarted),
+            | RejectRedemption { .. }
+            | FailTransfer { .. } => Err(EquityRedemptionError::NotStarted),
         }
     }
 
@@ -972,6 +993,7 @@ impl EventSourced for EquityRedemption {
                         warn!(target: "rebalance", %symbol, "Redemption wallet not configured");
                         return Ok(vec![TransferFailed {
                             tx_hash: None,
+                            reason: None,
                             failed_at: Utc::now(),
                         }]);
                     };
@@ -990,6 +1012,7 @@ impl EventSourced for EquityRedemption {
                             warn!(target: "rebalance", %error, %token, %amount, "Send for redemption failed");
                             Ok(vec![TransferFailed {
                                 tx_hash: None,
+                                reason: None,
                                 failed_at: Utc::now(),
                             }])
                         }
@@ -1049,6 +1072,25 @@ impl EventSourced for EquityRedemption {
                 }]),
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+            },
+
+            FailTransfer { reason } => match self {
+                Self::WithdrawnFromRaindex { symbol, .. }
+                | Self::TokensUnwrapped { symbol, .. } => {
+                    warn!(
+                        target: "rebalance",
+                        %symbol, %reason,
+                        "Marking redemption as transfer-failed"
+                    );
+                    Ok(vec![TransferFailed {
+                        tx_hash: None,
+                        reason: Some(reason),
+                        failed_at: Utc::now(),
+                    }])
+                }
+                Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
+                Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                _ => Err(EquityRedemptionError::AlreadyStarted),
             },
         }
     }
@@ -1300,6 +1342,15 @@ mod tests {
             redemption_wallet: Address::random(),
             redemption_tx: TxHash::random(),
             sent_at: Utc::now(),
+        }
+    }
+
+    fn tokens_unwrapped_event() -> EquityRedemptionEvent {
+        EquityRedemptionEvent::TokensUnwrapped {
+            underlying_token: Address::random(),
+            unwrap_tx_hash: TxHash::random(),
+            unwrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
+            unwrapped_at: Utc::now(),
         }
     }
 
@@ -2529,6 +2580,7 @@ mod tests {
             raindex_withdraw_tx: Some(TxHash::random()),
             redemption_tx: Some(TxHash::random()),
             tokenization_request_id: Some(TokenizationRequestId("TOK001".to_string())),
+            reason: None,
             started_at: now,
             failed_at: later,
         };
@@ -2541,5 +2593,74 @@ mod tests {
         assert_eq!(failed_at, later);
         assert_eq!(op.started_at, now);
         assert_eq!(op.updated_at, later);
+    }
+
+    #[tokio::test]
+    async fn fail_transfer_from_withdrawn_transitions_to_failed() {
+        let events = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(vec![withdrawn_from_raindex_event()])
+            .when(EquityRedemptionCommand::FailTransfer {
+                reason: "Transfer timed out".to_string(),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            EquityRedemptionEvent::TransferFailed { tx_hash: None, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn fail_transfer_from_unwrapped_transitions_to_failed() {
+        let events = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(vec![
+                withdrawn_from_raindex_event(),
+                tokens_unwrapped_event(),
+            ])
+            .when(EquityRedemptionCommand::FailTransfer {
+                reason: "Transfer timed out".to_string(),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            EquityRedemptionEvent::TransferFailed { tx_hash: None, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn fail_transfer_rejected_from_tokens_sent() {
+        let error = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(vec![withdrawn_from_raindex_event(), tokens_sent_event()])
+            .when(EquityRedemptionCommand::FailTransfer {
+                reason: "should not work".to_string(),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(EquityRedemptionError::AlreadyStarted)
+        ));
+    }
+
+    #[tokio::test]
+    async fn fail_transfer_rejected_before_start() {
+        let error = TestHarness::<EquityRedemption>::with(mock_services())
+            .given_no_previous_events()
+            .when(EquityRedemptionCommand::FailTransfer {
+                reason: "should not work".to_string(),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(EquityRedemptionError::NotStarted)
+        ));
     }
 }

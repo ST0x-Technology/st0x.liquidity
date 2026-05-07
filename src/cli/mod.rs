@@ -47,6 +47,15 @@ pub enum ConvertDirection {
     ToUsdc,
 }
 
+/// Transfer type for the fail-transfer command.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum TransferType {
+    /// Tokenized equity mint (Alpaca -> onchain)
+    Mint,
+    /// Equity redemption (onchain -> Alpaca)
+    Redemption,
+}
+
 /// Aggregate types that have materialized views.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum AggregateView {
@@ -439,6 +448,27 @@ pub enum Commands {
         yes: bool,
     },
 
+    /// Manually fail a stuck mint or redemption transfer
+    ///
+    /// Marks a transfer aggregate as failed, transitioning it to a terminal
+    /// state. Use when a transfer is permanently stuck (e.g., timed out,
+    /// unrecoverable error) and needs operator intervention.
+    FailTransfer {
+        /// Transfer type: "mint" or "redemption"
+        #[arg(short = 't', long = "type")]
+        transfer_type: TransferType,
+        /// Aggregate ID (issuer_request_id for mint, redemption ID for redemption)
+        #[arg(short = 'i', long = "id")]
+        id: String,
+        /// Reason for failure
+        #[arg(
+            short = 'r',
+            long = "reason",
+            default_value = "Manually failed via CLI"
+        )]
+        reason: String,
+    },
+
     /// Rebuild a materialized view by replaying all events from scratch
     ///
     /// Use as an escape hatch when a view becomes corrupted (e.g., due to
@@ -589,6 +619,11 @@ enum SimpleCommand {
         aggregate: AggregateView,
         id: Option<String>,
         all: bool,
+    },
+    FailTransfer {
+        transfer_type: TransferType,
+        id: String,
+        reason: String,
     },
 }
 
@@ -776,6 +811,15 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
         Commands::RebuildView { aggregate, id, all } => {
             Ok(SimpleCommand::RebuildView { aggregate, id, all })
         }
+        Commands::FailTransfer {
+            transfer_type,
+            id,
+            reason,
+        } => Ok(SimpleCommand::FailTransfer {
+            transfer_type,
+            id,
+            reason,
+        }),
     }
 }
 
@@ -928,6 +972,11 @@ async fn run_simple_command<W: Write>(
         SimpleCommand::RebuildView { aggregate, id, all } => {
             rebuild_view(stdout, pool, aggregate, id, all).await
         }
+        SimpleCommand::FailTransfer {
+            transfer_type,
+            id,
+            reason,
+        } => rebalancing::fail_transfer_command(stdout, pool, transfer_type, &id, &reason).await,
     }
 }
 

@@ -123,6 +123,10 @@ in {
     cargoExtraArgs = "--bin cli --features wallet-turnkey";
     doCheck = false;
 
+    postInstall = ''
+      mv $out/bin/cli $out/bin/st0x-cli
+    '';
+
     meta = {
       description = "st0x liquidity CLI";
       homepage = "https://github.com/ST0x-Technology/st0x.liquidity";

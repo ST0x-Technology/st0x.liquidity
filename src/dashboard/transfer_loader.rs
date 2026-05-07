@@ -527,6 +527,7 @@ mod tests {
             "EquityRedemptionEvent::TransferFailed",
             serde_json::to_value(EquityRedemptionEvent::TransferFailed {
                 tx_hash: None,
+                reason: None,
                 failed_at: two_days_ago,
             })
             .unwrap(),

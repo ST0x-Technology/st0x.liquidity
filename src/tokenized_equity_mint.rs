@@ -246,6 +246,18 @@ pub(crate) enum TokenizedEquityMintCommand {
     DepositToVault {
         vault_deposit_tx_hash: TxHash,
     },
+    /// Operator or timeout-driven failure from `MintAccepted` state.
+    FailAcceptance {
+        reason: String,
+    },
+    /// Operator or timeout-driven failure from `TokensReceived` state.
+    FailWrapping {
+        reason: String,
+    },
+    /// Operator or timeout-driven failure from `TokensWrapped` state.
+    FailRaindexDeposit {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -307,6 +319,10 @@ pub(crate) enum TokenizedEquityMintEvent {
             deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
         )]
         quantity: Float,
+        /// Reason for the wrapping failure (timeout, EVM revert, operator action).
+        /// Absent in events emitted before this field was added.
+        #[serde(default)]
+        reason: Option<String>,
         failed_at: DateTime<Utc>,
     },
 
@@ -429,14 +445,21 @@ impl PartialEq for TokenizedEquityMintEvent {
                 Self::WrappingFailed {
                     symbol: sym_a,
                     quantity: qty_a,
+                    reason: reason_a,
                     failed_at: time_a,
                 },
                 Self::WrappingFailed {
                     symbol: sym_b,
                     quantity: qty_b,
+                    reason: reason_b,
                     failed_at: time_b,
                 },
-            ) => sym_a == sym_b && qty_a.eq(*qty_b).unwrap_or(false) && time_a == time_b,
+            ) => {
+                sym_a == sym_b
+                    && qty_a.eq(*qty_b).unwrap_or(false)
+                    && reason_a == reason_b
+                    && time_a == time_b
+            }
             (
                 Self::DepositedIntoRaindex {
                     vault_deposit_tx_hash: hash_a,
@@ -993,6 +1016,7 @@ impl EventSourced for TokenizedEquityMint {
             WrappingFailed {
                 symbol,
                 quantity,
+                reason,
                 failed_at,
             } => {
                 let Self::TokensReceived { requested_at, .. } = entity else {
@@ -1001,7 +1025,9 @@ impl EventSourced for TokenizedEquityMint {
                 Some(Self::Failed {
                     symbol: symbol.clone(),
                     quantity: *quantity,
-                    reason: "ERC-4626 wrapping failed".to_string(),
+                    reason: reason
+                        .clone()
+                        .unwrap_or_else(|| "ERC-4626 wrapping failed".to_string()),
                     requested_at: *requested_at,
                     failed_at: *failed_at,
                 })
@@ -1429,6 +1455,53 @@ impl EventSourced for TokenizedEquityMint {
                     Err(TokenizedEquityMintError::AlreadyCompleted)
                 }
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
+            },
+
+            TokenizedEquityMintCommand::FailAcceptance { reason } => match self {
+                Self::MintAccepted { .. } => Ok(vec![MintAcceptanceFailed {
+                    reason,
+                    failed_at: Utc::now(),
+                }]),
+                Self::DepositedIntoRaindex { .. } => {
+                    Err(TokenizedEquityMintError::AlreadyCompleted)
+                }
+                Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
+                _ => Err(TokenizedEquityMintError::AlreadyInProgress),
+            },
+
+            TokenizedEquityMintCommand::FailWrapping { reason } => match self {
+                Self::TokensReceived {
+                    symbol, quantity, ..
+                } => {
+                    warn!(
+                        target: "rebalance",
+                        %symbol, %reason,
+                        "Marking mint as wrapping-failed"
+                    );
+                    Ok(vec![WrappingFailed {
+                        symbol: symbol.clone(),
+                        quantity: *quantity,
+                        reason: Some(reason),
+                        failed_at: Utc::now(),
+                    }])
+                }
+                Self::DepositedIntoRaindex { .. } => {
+                    Err(TokenizedEquityMintError::AlreadyCompleted)
+                }
+                Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
+                _ => Err(TokenizedEquityMintError::AlreadyInProgress),
+            },
+
+            TokenizedEquityMintCommand::FailRaindexDeposit { reason } => match self {
+                Self::TokensWrapped { .. } => Ok(vec![RaindexDepositFailed {
+                    reason,
+                    failed_at: Utc::now(),
+                }]),
+                Self::DepositedIntoRaindex { .. } => {
+                    Err(TokenizedEquityMintError::AlreadyCompleted)
+                }
+                Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
+                _ => Err(TokenizedEquityMintError::AlreadyInProgress),
             },
         }
     }
@@ -1995,6 +2068,7 @@ mod tests {
         let event = TokenizedEquityMintEvent::WrappingFailed {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(10),
+            reason: None,
             failed_at: Utc::now(),
         };
 
@@ -2291,5 +2365,149 @@ mod tests {
         }
         assert_eq!(op.started_at, now);
         assert_eq!(op.updated_at, later);
+    }
+
+    #[tokio::test]
+    async fn fail_acceptance_from_accepted_transitions_to_failed() {
+        let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
+        let id = IssuerRequestId::new("ISS001");
+
+        store.send(&id, mint_command()).await.unwrap();
+
+        store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::FailAcceptance {
+                    reason: "Timed out".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::Failed { .. }),
+            "Expected Failed state, got: {entity:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_wrapping_from_tokens_received_transitions_to_failed() {
+        let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
+        let id = IssuerRequestId::new("ISS001");
+
+        store.send(&id, mint_command()).await.unwrap();
+        store
+            .send(&id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+
+        store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::FailWrapping {
+                    reason: "RPC timeout".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::Failed { .. }),
+            "Expected Failed state, got: {entity:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_raindex_deposit_from_tokens_wrapped_transitions_to_failed() {
+        let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
+        let id = IssuerRequestId::new("ISS001");
+
+        store.send(&id, mint_command()).await.unwrap();
+        store
+            .send(&id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::WrapTokens {
+                    wrap_tx_hash: TxHash::random(),
+                    wrapped_shares: U256::from(100u64),
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::FailRaindexDeposit {
+                    reason: "Vault deposit timeout".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let entity = store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::Failed { .. }),
+            "Expected Failed state, got: {entity:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_wrapping_rejected_from_wrong_state() {
+        let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
+        let id = IssuerRequestId::new("ISS001");
+
+        // MintAccepted state -- FailWrapping requires TokensReceived
+        store.send(&id, mint_command()).await.unwrap();
+
+        let result = store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::FailWrapping {
+                    reason: "should not work".to_string(),
+                },
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "FailWrapping should fail from MintAccepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_acceptance_rejected_from_terminal_state() {
+        let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
+        let id = IssuerRequestId::new("ISS001");
+
+        store.send(&id, mint_command()).await.unwrap();
+        store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::FailAcceptance {
+                    reason: "first fail".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let result = store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::FailAcceptance {
+                    reason: "second fail".to_string(),
+                },
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "FailAcceptance should fail from Failed state"
+        );
     }
 }
