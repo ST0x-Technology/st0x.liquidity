@@ -11,7 +11,7 @@ use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, info};
 
 use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::ReadOnlyEvm;
@@ -25,7 +25,7 @@ use crate::conductor::{
 };
 use crate::config::Ctx;
 use crate::onchain::pyth::FeedIdCache;
-use crate::onchain::trade::RaindexTradeEvent;
+use crate::onchain::trade::{RaindexTradeEvent, TradeValidationError};
 use crate::onchain::{OnChainError, OnchainTrade};
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
@@ -74,6 +74,7 @@ where
         Label::new(format!("{}:{block_number}:{log_index}", event.kind()))
     }
 
+    #[allow(clippy::cognitive_complexity)]
     async fn perform(&self, ctx: &AccountantCtx<Node, Exec>) -> Result<(), Self::Error> {
         use RaindexTradeEvent::{ClearV3, TakeOrderV3};
 
@@ -81,7 +82,7 @@ where
         let order_owner = ctx.ctx.order_owner();
         let reconstructed_log = reconstruct_log(ctx.orderbook, trade_event);
 
-        let onchain_trade = match &trade_event.event {
+        let trade_result = match &trade_event.event {
             ClearV3(clear_event) => {
                 OnchainTrade::try_from_clear_v3(
                     &ctx.ctx.evm,
@@ -92,7 +93,7 @@ where
                     &ctx.feed_id_cache,
                     order_owner,
                 )
-                .await?
+                .await
             }
 
             TakeOrderV3(take_event) => {
@@ -104,8 +105,28 @@ where
                     order_owner,
                     &ctx.feed_id_cache,
                 )
-                .await?
+                .await
             }
+        };
+
+        let onchain_trade = match trade_result {
+            Ok(trade) => trade,
+            Err(OnChainError::Validation(TradeValidationError::InvalidSymbolConfiguration(
+                input,
+                output,
+            ))) => {
+                info!(
+                    target: "hedge",
+                    event_type = trade_event.event.kind(),
+                    tx_hash = ?trade_event.tx_hash,
+                    log_index = trade_event.log_index,
+                    input,
+                    output,
+                    "Skipping event with non-hedgeable token pair"
+                );
+                return Ok(());
+            }
+            Err(err) => return Err(err.into()),
         };
 
         let Some(trade) = onchain_trade else {
@@ -206,13 +227,18 @@ mod tests {
     use alloy::primitives::{Address, B256, U256, address};
     use alloy::providers::mock::Asserter;
     use alloy::providers::{ProviderBuilder, RootProvider};
+    use alloy::sol_types::SolCall;
+    use rain_math_float::Float;
 
     use st0x_event_sorcery::StoreBuilder;
     use st0x_execution::{MockExecutor, MockExecutorCtx, TryIntoExecutor};
 
     use super::*;
+    use crate::bindings::IERC20::{decimalsCall, symbolCall};
     use crate::bindings::IOrderBookV6;
-    use crate::bindings::IOrderBookV6::ClearConfigV2;
+    use crate::bindings::IOrderBookV6::{
+        ClearConfigV2, SignedContextV1, TakeOrderConfigV4, TakeOrderV3 as TakeOrderV3Event,
+    };
     use crate::config::tests::create_test_ctx_with_order_owner;
     use crate::offchain_order::OffchainOrder;
     use crate::onchain_trade::OnChainTrade;
@@ -305,6 +331,128 @@ mod tests {
         };
 
         let job = test_job();
+        job.perform(&accountant_ctx).await.unwrap();
+    }
+
+    /// A TakeOrderV3 event with a non-hedgeable token pair (e.g. tNVDA/wtNVDA)
+    /// should be skipped gracefully instead of causing a fatal error.
+    #[tokio::test]
+    async fn perform_skips_take_order_with_non_hedgeable_pair() {
+        let pool = setup_test_db().await;
+        let asserter = Asserter::new();
+
+        // The order owner matches so the event passes the owner filter.
+        let order = get_test_order();
+        let order_owner = order.owner;
+
+        let take_event = TakeOrderV3Event {
+            sender: address!("0x1111111111111111111111111111111111111111"),
+            config: TakeOrderConfigV4 {
+                order,
+                inputIOIndex: U256::from(0),
+                outputIOIndex: U256::from(1),
+                signedContext: vec![SignedContextV1 {
+                    signer: Address::ZERO,
+                    signature: vec![].into(),
+                    context: vec![],
+                }],
+            },
+            input: Float::from_fixed_decimal_lossy(alloy::primitives::uint!(9_U256), 0)
+                .unwrap()
+                .0
+                .get_inner(),
+            output: Float::from_fixed_decimal_lossy(alloy::primitives::uint!(100_U256), 0)
+                .unwrap()
+                .0
+                .get_inner(),
+        };
+
+        let log = get_test_log();
+        let event = RaindexTradeEvent::TakeOrderV3(Box::new(take_event));
+        let job = AccountForDexTrade {
+            trade: EmittedOnChain::from_log(event, &log).unwrap(),
+        };
+
+        // Mock EVM responses: receipt first, then decimals()+symbol() for each token.
+        let tx_hash = alloy::primitives::fixed_bytes!(
+            "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        );
+        asserter.push_success(&serde_json::json!({
+            "transactionHash": tx_hash,
+            "transactionIndex": "0x1",
+            "blockHash": "0x1234567890123456789012345678901234567890123456789012345678901234",
+            "blockNumber": "0x1",
+            "from": "0x1234567890123456789012345678901234567890",
+            "to": "0x5678901234567890123456789012345678901234",
+            "gasUsed": "0x5208",
+            "effectiveGasPrice": "0x77359400",
+            "cumulativeGasUsed": "0x5208",
+            "status": "0x1",
+            "type": "0x2",
+            "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "logs": []
+        }));
+
+        // Input token (order's output due to TakeOrder perspective swap)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
+        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
+            &"tNVDA".to_string(),
+        ));
+
+        // Output token (order's input)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
+        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
+            &"wtNVDA".to_string(),
+        ));
+
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
+        let ctx = create_test_ctx_with_order_owner(order_owner);
+
+        let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let (offchain_order, _offchain_order_projection) =
+            StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(crate::offchain_order::noop_order_placer())
+                .await
+                .unwrap();
+
+        let (vault_registry, _vault_registry_projection) =
+            StoreBuilder::<VaultRegistry>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+
+        let cqrs = TradeProcessingCqrs {
+            onchain_trade,
+            position,
+            position_projection,
+            offchain_order,
+            execution_threshold: ExecutionThreshold::whole_share(),
+            assets: ctx.assets.clone(),
+            counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
+        };
+
+        let accountant_ctx = AccountantCtx {
+            orderbook: ctx.evm.orderbook,
+            ctx,
+            cache: SymbolCache::default(),
+            feed_id_cache: FeedIdCache::default(),
+            evm: st0x_evm::ReadOnlyEvm::new(provider),
+            cqrs,
+            vault_registry,
+            executor,
+        };
+
+        // Should succeed (skip) rather than error.
         job.perform(&accountant_ctx).await.unwrap();
     }
 }
