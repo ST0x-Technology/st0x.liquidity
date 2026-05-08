@@ -380,13 +380,20 @@ pub async fn poll_for_all_jobs_done(
             continue;
         };
 
-        let total = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM Jobs")
-            .fetch_one(&pool)
-            .await;
+        // PollInventory self-reschedules forever, so a row is always pending
+        // -- exclude it from "all jobs done" queries.
+        let total = sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM Jobs WHERE job_type NOT LIKE '%::PollInventory'",
+        )
+        .fetch_one(&pool)
+        .await;
 
-        let done = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM Jobs WHERE status = 'Done'")
-            .fetch_one(&pool)
-            .await;
+        let done = sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM Jobs \
+             WHERE status = 'Done' AND job_type NOT LIKE '%::PollInventory'",
+        )
+        .fetch_one(&pool)
+        .await;
 
         pool.close().await;
 
@@ -423,20 +430,30 @@ pub async fn count_events(pool: &SqlitePool, aggregate_type: &str) -> anyhow::Re
     Ok(row.0)
 }
 
-/// Counts total apalis jobs enqueued.
+/// Counts total apalis jobs enqueued in the trade-processing pipeline.
+///
+/// Excludes self-rescheduling housekeeping queues (`PollInventory`) whose
+/// row count varies non-deterministically with wall-clock time and would
+/// otherwise dominate the totals these assertions are reasoning about.
 pub async fn count_jobs(pool: &SqlitePool) -> anyhow::Result<i64> {
-    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM Jobs")
-        .fetch_one(pool)
-        .await?;
+    let row: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type NOT LIKE '%::PollInventory'")
+            .fetch_one(pool)
+            .await?;
 
     Ok(row.0)
 }
 
-/// Counts apalis jobs that have been processed (status = 'Done').
+/// Counts trade-processing apalis jobs that have been processed
+/// (status = 'Done'). Excludes `PollInventory` for the same reason as
+/// [`count_jobs`].
 pub async fn count_done_jobs(pool: &SqlitePool) -> anyhow::Result<i64> {
-    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM Jobs WHERE status = 'Done'")
-        .fetch_one(pool)
-        .await?;
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM Jobs \
+         WHERE status = 'Done' AND job_type NOT LIKE '%::PollInventory'",
+    )
+    .fetch_one(pool)
+    .await?;
 
     Ok(row.0)
 }

@@ -8,7 +8,10 @@ mod venue_balance;
 pub(crate) mod view;
 
 pub(crate) use broadcasting::BroadcastingInventory;
-pub(crate) use polling::{InventoryPollingService, WalletPollingCtx};
+pub(crate) use polling::{
+    InventoryPollingService, PollInventory, PollInventoryCtx, PollInventoryJobQueue,
+    WalletPollingCtx,
+};
 pub(crate) use projection::InventoryProjection;
 pub(crate) use snapshot::{InventorySnapshot, InventorySnapshotId};
 pub(crate) use venue_balance::InventoryError;

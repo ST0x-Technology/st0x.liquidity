@@ -14,16 +14,17 @@ use st0x_evm::ReadOnlyEvm;
 use st0x_execution::Executor;
 use st0x_finance::{HasZero, Positive, Usd};
 
+use super::Conductor;
 use super::exit::MonitorTaskError;
 #[cfg(any(test, feature = "test-support"))]
 use super::job::FailureInjector;
 use super::job::{FAIL_STOP_RECOVERY_TIMEOUT, build_supervised_worker};
 use super::monitor::order_fills::OrderFillMonitor;
 use super::monitor::positions::PositionMonitor;
-use super::{Conductor, spawn_inventory_poller};
 use crate::config::Ctx;
 use crate::inventory::{
-    InventoryPollingService, InventorySnapshot, InventorySnapshotId, WalletPollingCtx,
+    InventoryPollingService, InventorySnapshot, InventorySnapshotId, PollInventory,
+    PollInventoryCtx, PollInventoryJobQueue, WalletPollingCtx,
 };
 use crate::offchain::order::handle_rejection::HandleOrderRejectionCtx;
 use crate::offchain::order::poll_status::PollOrderStatusCtx;
@@ -66,7 +67,6 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
     pub(crate) execution_threshold: ExecutionThreshold,
     pub(crate) frameworks: CqrsFrameworks,
     pub(crate) pool: SqlitePool,
-    pub(crate) poll_notify: Arc<tokio::sync::Notify>,
     pub(crate) wallet_polling: Option<WalletPollingCtx>,
     pub(crate) tokenizer: Option<Arc<dyn Tokenizer>>,
     #[cfg(any(test, feature = "test-support"))]
@@ -83,6 +83,7 @@ pub(crate) fn spawn<Prov, Exec>(
     poll_status_queue: PollOrderStatusJobQueue,
     reconcile_queue: ReconcileOrderFillJobQueue,
     rejection_queue: HandleOrderRejectionJobQueue,
+    poll_inventory_queue: PollInventoryJobQueue,
     job_cleanup: JoinHandle<()>,
     executor_maintenance: Option<JoinHandle<()>>,
     rebalancer: Option<JoinHandle<()>>,
@@ -120,7 +121,7 @@ where
         owner: order_owner,
     };
 
-    let polling_service = InventoryPollingService::new(
+    let polling_service = Arc::new(InventoryPollingService::new(
         raindex_service,
         context.executor.clone(),
         context.frameworks.vault_registry.clone(),
@@ -129,14 +130,30 @@ where
         context.wallet_polling,
         context.tokenizer,
         reserved_cash,
-    );
-
-    let inventory_poller = Some(spawn_inventory_poller(
-        polling_service,
-        std::time::Duration::from_secs(context.ctx.inventory_poll_interval),
-        context.poll_notify.clone(),
     ));
-    log_optional_task_status("inventory poller", inventory_poller.is_some());
+
+    let poll_inventory_ctx = Arc::new(PollInventoryCtx::new(
+        polling_service,
+        poll_inventory_queue.clone(),
+        std::time::Duration::from_secs(context.ctx.inventory_poll_interval),
+    ));
+
+    // Cold-start bootstrap: ensure at least one PollInventory is queued so
+    // the worker has something to process on startup. Idempotent -- if a
+    // PollInventory row survived the previous shutdown, the worker simply
+    // picks the older row up first; the duplicate runs back-to-back at
+    // worst, since the worker is single-concurrency. Fire-and-forget: the
+    // queue is durable, the apalis worker we register below will pick up
+    // whichever row lands first.
+    {
+        let mut bootstrap_queue = poll_inventory_queue.clone();
+        tokio::spawn(async move {
+            if let Err(error) = bootstrap_queue.push(PollInventory).await {
+                tracing::warn!(%error, "Failed to enqueue cold-start PollInventory job");
+            }
+        });
+    }
+    info!("Started inventory poller worker");
 
     let poll_interval = context.ctx.order_polling_interval();
     info!("Constructing order-job context with poll interval: {poll_interval:?}");
@@ -220,12 +237,14 @@ where
         poll_status_ctx,
         reconcile_ctx,
         rejection_ctx,
+        poll_inventory_ctx,
         job_queue,
         hedge_queue,
         backfill_queue,
         poll_status_queue,
         reconcile_queue,
         rejection_queue,
+        poll_inventory_queue,
         #[cfg(any(test, feature = "test-support"))]
         failure_injector: context.failure_injector,
     });
@@ -235,7 +254,6 @@ where
         monitor,
         executor_maintenance,
         rebalancer,
-        inventory_poller,
         job_cleanup,
     }
 }
@@ -255,12 +273,14 @@ where
     poll_status_ctx: Arc<PollOrderStatusCtx<Exec>>,
     reconcile_ctx: Arc<ReconcileOrderFillCtx>,
     rejection_ctx: Arc<HandleOrderRejectionCtx>,
+    poll_inventory_ctx: Arc<PollInventoryCtx>,
     job_queue: DexTradeAccountingJobQueue,
     hedge_queue: HedgeJobQueue,
     backfill_queue: BackfillJobQueue,
     poll_status_queue: PollOrderStatusJobQueue,
     reconcile_queue: ReconcileOrderFillJobQueue,
     rejection_queue: HandleOrderRejectionJobQueue,
+    poll_inventory_queue: PollInventoryJobQueue,
     #[cfg(any(test, feature = "test-support"))]
     failure_injector: FailureInjector,
 }
@@ -280,12 +300,14 @@ where
         poll_status_ctx,
         reconcile_ctx,
         rejection_ctx,
+        poll_inventory_ctx,
         job_queue,
         hedge_queue,
         backfill_queue,
         poll_status_queue,
         reconcile_queue,
         rejection_queue,
+        poll_inventory_queue,
         #[cfg(any(test, feature = "test-support"))]
         failure_injector,
     } = wiring;
@@ -300,12 +322,15 @@ where
     let failure_injector_for_reconcile = failure_injector.clone();
     #[cfg(any(test, feature = "test-support"))]
     let failure_injector_for_rejection = failure_injector.clone();
+    #[cfg(any(test, feature = "test-support"))]
+    let failure_injector_for_poll_inventory = failure_injector.clone();
     let failure_notify = Arc::new(tokio::sync::Notify::new());
     let failure_notify_for_hedge = failure_notify.clone();
     let failure_notify_for_backfill = failure_notify.clone();
     let failure_notify_for_poll = failure_notify.clone();
     let failure_notify_for_reconcile = failure_notify.clone();
     let failure_notify_for_rejection = failure_notify.clone();
+    let failure_notify_for_poll_inventory = failure_notify.clone();
     let failure_notify_for_select = failure_notify.clone();
 
     let fail_stop = CircuitBreakerConfig::default()
@@ -316,6 +341,7 @@ where
     let fail_stop_for_poll = fail_stop.clone();
     let fail_stop_for_reconcile = fail_stop.clone();
     let fail_stop_for_rejection = fail_stop.clone();
+    let fail_stop_for_poll_inventory = fail_stop.clone();
 
     let accountant_ctx_for_backfill = accountant_ctx.clone();
 
@@ -392,6 +418,18 @@ where
                     failure_notify_for_rejection.clone(),
                     #[cfg(any(test, feature = "test-support"))]
                     failure_injector_for_rejection.clone(),
+                )
+            })
+            .register(move |index| {
+                build_supervised_worker!(
+                    ::<PollInventoryCtx, PollInventory>,
+                    index,
+                    poll_inventory_queue.clone(),
+                    poll_inventory_ctx.clone(),
+                    fail_stop_for_poll_inventory.clone(),
+                    failure_notify_for_poll_inventory.clone(),
+                    #[cfg(any(test, feature = "test-support"))]
+                    failure_injector_for_poll_inventory.clone(),
                 )
             });
 

@@ -9,6 +9,7 @@ use apalis::layers::retry::backoff::Backoff;
 use apalis::prelude::{Attempt, Data, TaskBuilder, TaskSink};
 use apalis_core::backend::TaskSinkError;
 use apalis_core::backend::poll_strategy::{BackoffConfig, IntervalStrategy, StrategyBuilder};
+use apalis_core::task::Task as ApalisTask;
 use apalis_core::worker::context::WorkerContext;
 use apalis_core::worker::event::Event;
 use apalis_sqlite::{Config, SqliteContext, SqliteStorage};
@@ -136,6 +137,23 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
             .run_after(delay)
             .build();
         Ok(TaskSink::push_task(&mut self.0, scheduled).await?)
+    }
+
+    /// Push a task that should not be picked up until `delay` has elapsed.
+    ///
+    /// Used by self-rescheduling jobs (e.g. `PollInventory`) to maintain
+    /// a periodic cadence: each invocation re-enqueues itself with a
+    /// `run_at` set in the future. Apalis honours the timestamp via the
+    /// `Pending` row's `run_at` column.
+    pub(crate) async fn push_after(
+        &mut self,
+        task: Task,
+        delay: Duration,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let scheduled = ApalisTask::builder(task).run_after(delay).build();
+        TaskSink::push_task(&mut self.0, scheduled)
+            .await
+            .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)
     }
 
     pub(crate) fn into_storage(self) -> Storage<Task> {
@@ -278,6 +296,7 @@ pub enum JobKind {
     PollOrderStatus,
     ReconcileOrderFill,
     HandleOrderRejection,
+    PollInventory,
 }
 
 /// Job execution error. Wraps the concrete `Job::Error` type at
@@ -308,6 +327,7 @@ pub struct FailureInjector {
     poll_order_status: Arc<Mutex<InjectionState>>,
     reconcile_order_fill: Arc<Mutex<InjectionState>>,
     handle_order_rejection: Arc<Mutex<InjectionState>>,
+    poll_inventory: Arc<Mutex<InjectionState>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -336,6 +356,7 @@ impl FailureInjector {
             poll_order_status: Arc::new(Mutex::new(InjectionState::Idle)),
             reconcile_order_fill: Arc::new(Mutex::new(InjectionState::Idle)),
             handle_order_rejection: Arc::new(Mutex::new(InjectionState::Idle)),
+            poll_inventory: Arc::new(Mutex::new(InjectionState::Idle)),
         }
     }
 
@@ -376,6 +397,7 @@ impl FailureInjector {
             JobKind::PollOrderStatus => &self.poll_order_status,
             JobKind::ReconcileOrderFill => &self.reconcile_order_fill,
             JobKind::HandleOrderRejection => &self.handle_order_rejection,
+            JobKind::PollInventory => &self.poll_inventory,
         };
 
         match mutex.lock() {

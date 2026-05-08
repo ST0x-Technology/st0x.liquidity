@@ -8,10 +8,13 @@
 
 use alloy::primitives::Address;
 use alloy::providers::RootProvider;
+use async_trait::async_trait;
 use futures_util::future::try_join_all;
 use rain_math_float::FloatError;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, warn};
 
 use st0x_event_sorcery::{SendError, Store};
@@ -23,6 +26,9 @@ use st0x_finance::{HasZero, NotNonNegative, Usd, UsdToCentsError};
 
 use crate::alpaca_wallet::AlpacaWalletError;
 use crate::bindings::IERC20;
+#[cfg(any(test, feature = "test-support"))]
+use crate::conductor::job::JobKind;
+use crate::conductor::job::{Job, JobQueue, Label};
 use crate::inventory::snapshot::{
     InventorySnapshot, InventorySnapshotCommand, InventorySnapshotId,
 };
@@ -569,6 +575,103 @@ fn compute_available_cash(
     let available_usd_cents = available.inner().to_cents()?;
 
     Ok((gross_usd_cents, available_usd_cents))
+}
+
+/// Erases the `Chain` and `Exe` parameters of [`InventoryPollingService`]
+/// so the apalis [`Job`] context isn't generic over them.
+#[async_trait]
+pub(crate) trait Poller: Send + Sync {
+    async fn poll(&self) -> Result<(), PollerError>;
+}
+
+/// Boxed source error from a [`Poller`] implementation. Polling errors are
+/// always logged and swallowed by [`PollInventory::perform`]; this wrapper
+/// only erases the underlying executor-specific error type.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub(crate) struct PollerError(Box<dyn std::error::Error + Send + Sync>);
+
+#[async_trait]
+impl<Chain, Exe> Poller for InventoryPollingService<Chain, Exe>
+where
+    Chain: Evm + Send + Sync + 'static,
+    Exe: Executor + Send + Sync + 'static,
+    Exe::Error: std::error::Error + Send + Sync + 'static,
+{
+    async fn poll(&self) -> Result<(), PollerError> {
+        Self::poll_and_record(self)
+            .await
+            .map_err(|error| PollerError(Box::new(error)))
+    }
+}
+
+/// Persistent self-rescheduling job that drives [`InventoryPollingService`].
+///
+/// Carries no payload: the snapshot id, polling service, and re-schedule
+/// interval all live in [`PollInventoryCtx`]. Each successful or failed
+/// poll re-enqueues a follow-up `PollInventory` with `run_at = now + interval`.
+/// External callers can wake polling by pushing a fresh `PollInventory`
+/// with the default `run_at = now`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct PollInventory;
+
+pub(crate) type PollInventoryJobQueue = JobQueue<PollInventory>;
+
+/// Bundled dependencies for [`PollInventory`].
+pub(crate) struct PollInventoryCtx {
+    poller: Arc<dyn Poller>,
+    job_queue: PollInventoryJobQueue,
+    interval: Duration,
+}
+
+impl PollInventoryCtx {
+    pub(crate) fn new(
+        poller: Arc<dyn Poller>,
+        job_queue: PollInventoryJobQueue,
+        interval: Duration,
+    ) -> Self {
+        Self {
+            poller,
+            job_queue,
+            interval,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PollInventoryJobError {
+    #[error("failed to reschedule PollInventory job")]
+    Reschedule(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl Job<PollInventoryCtx> for PollInventory {
+    type Output = ();
+    type Error = PollInventoryJobError;
+
+    const WORKER_NAME: &'static str = "poll-inventory-worker";
+    #[cfg(any(test, feature = "test-support"))]
+    const JOB_KIND: JobKind = JobKind::PollInventory;
+
+    fn label(&self) -> Label {
+        Label::new("PollInventory")
+    }
+
+    async fn perform(&self, ctx: &PollInventoryCtx) -> Result<Self::Output, Self::Error> {
+        // Polling failures are transient (RPC blips, vault contention) -- log
+        // and continue rescheduling so a hiccup never escalates into a halted
+        // poller.
+        if let Err(error) = ctx.poller.poll().await {
+            warn!(target: "inventory", %error, "Inventory polling failed; rescheduling");
+        }
+
+        let mut queue = ctx.job_queue.clone();
+        queue
+            .push_after(Self, ctx.interval)
+            .await
+            .map_err(PollInventoryJobError::Reschedule)?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -2737,5 +2840,123 @@ mod tests {
 
         assert_eq!(mints.len(), 1);
         assert_eq!(redemptions.len(), 1);
+    }
+
+    mod poll_inventory_job {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use sqlx::Row;
+
+        use super::*;
+        use crate::conductor::job::Job;
+        use crate::conductor::setup_apalis_tables;
+
+        #[derive(Debug, Default)]
+        struct CountingPoller {
+            calls: AtomicUsize,
+            fail: bool,
+        }
+
+        impl CountingPoller {
+            fn new() -> Arc<Self> {
+                Arc::new(Self::default())
+            }
+
+            fn failing() -> Arc<Self> {
+                Arc::new(Self {
+                    calls: AtomicUsize::new(0),
+                    fail: true,
+                })
+            }
+
+            fn calls(&self) -> usize {
+                self.calls.load(Ordering::SeqCst)
+            }
+        }
+
+        #[derive(Debug, thiserror::Error)]
+        #[error("counting poller forced failure")]
+        struct CountingPollerFailure;
+
+        #[async_trait]
+        impl Poller for CountingPoller {
+            async fn poll(&self) -> Result<(), PollerError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.fail {
+                    Err(PollerError(Box::new(CountingPollerFailure)))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        async fn pending_poll_inventory_run_ats(pool: &SqlitePool) -> Vec<i64> {
+            let queue_name = std::any::type_name::<PollInventory>();
+            sqlx::query("SELECT run_at FROM Jobs WHERE job_type = ? ORDER BY run_at")
+                .bind(queue_name)
+                .fetch_all(pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.get::<i64, _>("run_at"))
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn perform_invokes_poller_and_reschedules_after_interval() {
+            let pool = setup_test_db().await;
+            setup_apalis_tables(&pool).await.unwrap();
+
+            let poller = CountingPoller::new();
+            let queue = PollInventoryJobQueue::new(&pool);
+            let interval = Duration::from_secs(60);
+            let ctx = PollInventoryCtx::new(poller.clone(), queue, interval);
+
+            let now_secs = chrono::Utc::now().timestamp();
+            PollInventory.perform(&ctx).await.unwrap();
+
+            assert_eq!(poller.calls(), 1, "Poller should be invoked exactly once");
+
+            let run_ats = pending_poll_inventory_run_ats(&pool).await;
+            assert_eq!(
+                run_ats.len(),
+                1,
+                "perform should enqueue exactly one follow-up PollInventory"
+            );
+            let follow_up_run_at = run_ats[0];
+            let interval_secs = i64::try_from(interval.as_secs()).unwrap();
+            assert!(
+                follow_up_run_at >= now_secs + interval_secs - 5
+                    && follow_up_run_at <= now_secs + interval_secs + 5,
+                "follow-up run_at {follow_up_run_at} should be ~{interval_secs}s in the future from {now_secs}"
+            );
+        }
+
+        #[tokio::test]
+        async fn perform_swallows_poller_error_and_still_reschedules() {
+            let pool = setup_test_db().await;
+            setup_apalis_tables(&pool).await.unwrap();
+
+            let poller = CountingPoller::failing();
+            let queue = PollInventoryJobQueue::new(&pool);
+            let ctx = PollInventoryCtx::new(poller.clone(), queue, Duration::from_secs(30));
+
+            // A polling failure must NOT propagate as a job error -- otherwise
+            // a transient RPC blip would burn through the retry budget and
+            // halt the bot at the fail-stop circuit breaker.
+            PollInventory.perform(&ctx).await.unwrap();
+
+            assert_eq!(
+                poller.calls(),
+                1,
+                "Poller should be invoked even on failure"
+            );
+            let run_ats = pending_poll_inventory_run_ats(&pool).await;
+            assert_eq!(
+                run_ats.len(),
+                1,
+                "Failed poll must still reschedule a follow-up"
+            );
+        }
     }
 }
