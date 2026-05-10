@@ -86,7 +86,6 @@ Current broker support is limited to `alpaca-broker-api` and `dry-run`.
 
 ```bash
 cargo run --bin server -- --config path/to/config.toml --secrets path/to/secrets.toml
-cargo run --bin reporter -- --config path/to/config.toml
 ```
 
 Manual wrap of tokenized equity into wrapped vault shares (requires rebalancing
@@ -130,7 +129,6 @@ GitHub Actions (CI/CD)
   v
 NixOS host (DigitalOcean droplet)
   ├── server           (systemd, hedging bot)
-  ├── reporter         (systemd, P&L reporter)
   ├── nginx            (dashboard + WebSocket proxy)
   └── grafana          (metrics visualization)
 ```
@@ -162,7 +160,6 @@ nix run .#deployNixos
 
 # Deploy a specific service profile
 nix run .#deployService server
-nix run .#deployService reporter
 ```
 
 ### SSH Access
@@ -189,9 +186,6 @@ SSH into the host and run:
 nix-env --profile /nix/var/nix/profiles/per-service/server --rollback
 systemctl restart server
 
-# Roll back the reporter profile
-nix-env --profile /nix/var/nix/profiles/per-service/reporter --rollback
-systemctl restart reporter
 ```
 
 ### Secrets Management
@@ -278,9 +272,7 @@ Open `http://localhost:5173` to watch the dashboard. Press `Ctrl-C` to stop.
 
 ## P&L Tracking
 
-The P&L reporter (`cargo run --bin reporter`) calculates realized profit/loss
-using FIFO accounting and writes metrics to the `metrics_pnl` table for Grafana
-visualization. This subsystem is currently being reworked.
+P&L tracking via FIFO accounting is not yet implemented.
 
 ## Project Structure
 
@@ -289,7 +281,7 @@ visualization. This subsystem is currently being reworked.
 Workspace crates:
 
 - **`st0x-hedge`** (root) - Main arbitrage bot: event loop, CQRS/ES aggregates,
-  conductor, reporter, dashboard backend, and CLI
+  conductor, dashboard backend, and CLI
 - **`st0x-dto`** (`crates/dto/`) - Dashboard DTOs and TypeScript binding
   generation
 - **`st0x-event-sorcery`** (`crates/event-sorcery/`) - CQRS/event-sourcing
@@ -297,9 +289,13 @@ Workspace crates:
   testing utilities
 - **`st0x-execution`** (`crates/execution/`) - Standalone `Executor` trait
   abstraction with Alpaca Broker API and mock implementations
+- **`st0x-finance`** (`crates/finance/`) - Shared financial primitives: `Symbol`,
+  `FractionalShares`, `Usdc`, `Usd`, and numeric domain types
 - **`st0x-bridge`** (`crates/bridge/`) - Cross-chain bridge abstractions and
   CCTP implementation
 - **`st0x-evm`** (`crates/evm/`) - EVM wallet, provider, and test-chain support
+- **`st0x-float-macro`** (`crates/float-macro/`) - Proc macro for compile-time
+  `Float` literal parsing
 - **`st0x-float-serde`** (`crates/float-serde/`) - Shared Rain Float formatting
   and serde helpers for workspace wire formats
 
@@ -366,7 +362,7 @@ decryption):
 | --------------- | ----------------------------------- | ---------------------------------------------- |
 | `deployAll`     | `nix run .#deployAll`               | Deploy system config + all services            |
 | `deployNixos`   | `nix run .#deployNixos`             | Deploy NixOS system config only                |
-| `deployService` | `nix run .#deployService <profile>` | Deploy a single service (`server`, `reporter`) |
+| `deployService` | `nix run .#deployService <profile>` | Deploy a single service (e.g. `server`) |
 | `remote`        | `nix run .#remote [-- <cmd>]`       | SSH into production host                       |
 | `secret`        | `nix run .#secret <file.age>`       | Edit an encrypted config, then re-encrypt all  |
 | `bootstrap`     | `nix run .#bootstrap`               | One-time NixOS install on a new host           |
