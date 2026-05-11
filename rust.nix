@@ -1,24 +1,41 @@
-{ pkgs, craneLib }:
+{ pkgs, craneLib, abiEnv, rainMathFloatSrc }:
 
 let
-  # Requires --impure. Submodules must be checked out and prepSolArtifacts
-  # must have been run before building.
-  libDir = builtins.path {
-    path = builtins.getEnv "PWD" + "/lib";
-    name = "lib";
+  # Cargo `rain-math-float` is a path-dep at `.tmp/rain-math-float/crates/float`.
+  # Both the dev shell and crane builds materialise that path inside the
+  # source tree, keeping nix and cargo on a single pinned source. Crane's
+  # `mkDummySrc` walks the tree to find Cargo.toml files but strips
+  # symlinks during cleaning, so we copy the source as a real directory
+  # rather than symlinking it. Living under `.tmp/` keeps generated paths
+  # off the repo root (see `Generated paths` in AGENTS.md).
+  rainMathFloatPath = ".tmp/rain-math-float";
+
+  withRainMathFloat = name: src:
+    pkgs.runCommand name { } ''
+      cp -rL --no-preserve=mode ${src} $out
+      chmod -R u+w $out
+      # Drop any .tmp/ from the source (e.g. a dev-shell symlink to
+      # rain-math-float) so the second copy below doesn't nest into
+      # $out/.tmp/rain-math-float/rain-math-float-patched/ and break the
+      # cargo path-dep at .tmp/rain-math-float/crates/float.
+      rm -rf $out/.tmp
+      mkdir -p $(dirname $out/${rainMathFloatPath})
+      cp -rL --no-preserve=mode ${rainMathFloatSrc} $out/${rainMathFloatPath}
+    '';
+
+  # Filter `.tmp/` out of the workspace source so dev-shell-materialised
+  # paths (e.g. `.tmp/rain-math-float` symlink) don't get baked into the
+  # nix build inputs.
+  cleanedSrc = pkgs.lib.cleanSourceWith {
+    src = pkgs.lib.cleanSource ./.;
+    filter = path: _type: !(pkgs.lib.hasInfix "/.tmp" path);
   };
 
-  # Cargo manifests only -- deps derivation hash changes only when dependencies change
-  depsSrc = pkgs.lib.cleanSourceWith {
-    src = ./.;
-    filter = path: type:
-      let base = builtins.baseNameOf path;
-      in type == "directory" || base == "Cargo.toml" || base == "Cargo.lock";
-  };
+  fullSrc = withRainMathFloat "st0x-src" cleanedSrc;
 
   # Vendor cargo deps with git dependency hashes
   baseVendorDir = craneLib.vendorCargoDeps {
-    src = ./.;
+    src = fullSrc;
     cargoLock = ./Cargo.lock;
     outputHashes = {
       "sqlite-es-0.1.0" = "sha256-Pf9nBYz2glSuEvBXnH0+5yqs+ZAOhd7xVTByWt6FMm0=";
@@ -59,11 +76,13 @@ let
     ${pkgs.gnused}/bin/sed -i "s|${baseVendorDir}|$out|g" $out/config.toml
   '';
 
-  # Common arguments shared between deps and final build
-  commonArgs = {
+  # Build args without ABI env vars. Used for the deps-only derivation so an
+  # ABI change doesn't bust the cached dependency artifacts -- third-party
+  # deps don't reference any ST0X_*_ABI variable.
+  depsArgs = {
     pname = "st0x-liquidity";
     version = "0.1.0";
-    src = ./.;
+    src = fullSrc;
 
     inherit cargoVendorDir;
 
@@ -77,21 +96,24 @@ let
     # Each crate (ours + apalis-sqlite) ships its own .sqlx/ with prepared data.
     # Run `cargo sqlx prepare` after changing sqlx macros to regenerate.
     SQLX_OFFLINE = "true";
-
-    # Submodules with path dependencies need lib/ symlinked early
-    postUnpack = ''
-      rm -rf $sourceRoot/lib
-      ln -s ${libDir} $sourceRoot/lib
-    '';
   };
 
-  # Build only dependencies (cached separately from source changes)
-  cargoArtifacts = craneLib.buildDepsOnly (commonArgs // { src = depsSrc; });
+  # Full build args for our crates: deps args plus ABI env vars consumed by
+  # our build.rs / sol! macros.
+  commonArgs = depsArgs // abiEnv;
+
+  # Build only dependencies (cached separately from source changes).
+  # Crane's mkDummySrc internally strips to manifests + dummy crate roots,
+  # so we feed it fullSrc rather than pre-stripping ourselves -- our prior
+  # manifest-only filter dropped src/lib.rs files for crates with implicit
+  # `[lib]` detection, which broke the deps build.
+  cargoArtifacts = craneLib.buildDepsOnly depsArgs;
 
 in {
-  # DTO crate for TypeScript codegen - no sqlx deps needed
+  # DTO crate for TypeScript codegen
   dto = craneLib.buildPackage (commonArgs // {
     pname = "st0x-dto";
+    inherit cargoArtifacts;
     cargoExtraArgs = "-p st0x-dto";
     doCheck = false;
 

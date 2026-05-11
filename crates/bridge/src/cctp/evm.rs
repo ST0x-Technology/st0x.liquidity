@@ -17,7 +17,7 @@ use crate::BridgeDirection;
 sol!(
     #![sol(all_derives = true, rpc)]
     #[derive(serde::Serialize, serde::Deserialize)]
-    IERC20, "../../lib/forge-std/out/IERC20.sol/IERC20.json"
+    IERC20, env!("ST0X_IERC20_ABI")
 );
 
 /// Single-chain CCTP endpoint with contract instances for cross-chain operations.

@@ -324,27 +324,20 @@ mod tests {
     }
 
     #[test]
-    fn serialize_float_with_extreme_exponent_uses_scientific_fallback() {
-        // Construct a Float with exponent -77, which exceeds the
-        // non-scientific formatter's -76 limit. This reproduces the
-        // crash from RAI-218: accumulated Float arithmetic can produce
-        // such exponents through catastrophic cancellation.
+    fn format_float_roundtrips_at_extreme_exponent() {
+        // Regression: accumulated Float arithmetic could produce exponents
+        // the non-scientific formatter rejected, crashing serialization.
+        // `format_float` must produce a roundtrippable string for such
+        // values regardless of whether the direct or the scientific path
+        // is taken.
         let float = pack_raw(9_999_999_910_959_448, -77);
 
-        // Non-scientific formatting should fail for this exponent.
-        assert!(
-            float.format_with_scientific(false).is_err(),
-            "Expected non-scientific format to fail for exponent -77"
-        );
-
-        // But our format_float should succeed via scientific fallback.
         let formatted = format_float(&float).unwrap();
         assert!(
             !formatted.is_empty(),
             "format_float should produce output for exponent -77"
         );
 
-        // The formatted string should roundtrip through parse.
         let roundtripped = Float::parse(formatted.clone()).unwrap();
         assert!(
             roundtripped.eq(float).unwrap(),
@@ -371,51 +364,25 @@ mod tests {
         );
     }
 
-    /// Proves the upstream Rain Float bug: adding two values whose
-    /// magnitudes nearly cancel produces a Float that the non-scientific
-    /// formatter cannot handle (UnformatableExponent).
-    ///
-    /// These are the exact values from the production crash (staging
-    /// logs, event 605 applied to position view version 604):
+    /// Regression coverage for a production serialization crash. The
+    /// exact values come from staging logs (event 605 against position
+    /// view 604):
     ///   net position = -0.09999999910959448  (17 decimal places)
     ///   hedge fill   =  0.099999999          (9 decimal places)
     ///   sum          = -0.00000000010959448  (~-1.1e-10)
     ///
-    /// Both inputs format fine individually. Their sum is a valid tiny
-    /// number, but its internal Float representation has exponent -77
-    /// because `add` inflates both inputs via `maximizeFull` (adding
-    /// trailing zeros), and after cancellation `packLossy` doesn't
-    /// strip them.
+    /// Their sum used to land on a Float exponent that the non-scientific
+    /// formatter rejected, panicking serialization. `format_float` must
+    /// produce a roundtrippable string for this case.
     #[test]
-    fn addition_of_near_cancelling_values_produces_unformattable_float() {
+    fn format_float_roundtrips_near_cancellation_residual() {
         let net_position = Float::parse("-0.09999999910959448".to_string()).unwrap();
         let hedge_fill = Float::parse("0.099999999".to_string()).unwrap();
-
-        // Both inputs format fine individually.
-        net_position.format_with_scientific(false).unwrap();
-        hedge_fill.format_with_scientific(false).unwrap();
-
-        // Their sum is a valid, tiny number (~-1.1e-10).
         let result = (net_position + hedge_fill).unwrap();
 
-        // Scientific notation works — the value is real and finite.
-        let scientific = result.format_with_scientific(true).unwrap();
-        assert!(
-            !scientific.is_empty(),
-            "Scientific format should work for the sum"
-        );
-
-        // But non-scientific formatting crashes — this is the upstream bug.
-        assert!(
-            result.format_with_scientific(false).is_err(),
-            "Expected non-scientific format to fail for near-cancellation \
-             result. Rain Float's add produces exponent -77 from \
-             maximizeFull trailing zeros that packLossy doesn't strip. \
-             Scientific result: {scientific}"
-        );
-
-        // Our format_float works around this via scientific fallback.
         let formatted = format_float(&result).unwrap();
+        assert!(!formatted.is_empty(), "format_float produced empty output");
+
         let roundtripped = Float::parse(formatted.clone()).unwrap();
         assert!(
             roundtripped.eq(result).unwrap(),
@@ -423,40 +390,26 @@ mod tests {
         );
     }
 
-    /// Verify that smaller numbers produce even worse exponents after
-    /// near-cancellation. If 0.0999... → exponent -77, then 0.00999...
-    /// should → -78 and 0.000999... → -79, since maximizeFull inflates
-    /// by more powers of 10 for smaller starting coefficients.
+    /// Same scenario as `format_float_roundtrips_near_cancellation_residual`
+    /// at smaller magnitudes -- previously these produced progressively
+    /// worse exponents from cancellation; we still want to roundtrip cleanly.
     #[test]
-    fn smaller_magnitudes_produce_worse_exponents() {
-        // Each pair: a negative value and a slightly smaller positive value,
-        // so their sum is a tiny residual that triggers the formatter bug.
-
-        // ~0.01 magnitude: expect exponent -78
+    fn format_float_roundtrips_tiny_cancellation_residuals() {
         let hundredths = (Float::parse("-0.0099999991".to_string()).unwrap()
             + Float::parse("0.009999999".to_string()).unwrap())
         .unwrap();
-        assert!(
-            hundredths.format_with_scientific(false).is_err(),
-            "Expected exponent -78 to fail non-scientific format. \
-             Scientific: {}",
-            hundredths.format_with_scientific(true).unwrap()
-        );
-
-        // ~0.001 magnitude: expect exponent -79
         let thousandths = (Float::parse("-0.00099999991".to_string()).unwrap()
             + Float::parse("0.0009999999".to_string()).unwrap())
         .unwrap();
-        assert!(
-            thousandths.format_with_scientific(false).is_err(),
-            "Expected exponent -79 to fail non-scientific format. \
-             Scientific: {}",
-            thousandths.format_with_scientific(true).unwrap()
-        );
 
-        // All should work with our format_float fallback.
-        format_float(&hundredths).unwrap();
-        format_float(&thousandths).unwrap();
+        for value in [hundredths, thousandths] {
+            let formatted = format_float(&value).unwrap();
+            let roundtripped = Float::parse(formatted.clone()).unwrap();
+            assert!(
+                roundtripped.eq(value).unwrap(),
+                "Roundtrip failed: '{formatted}'"
+            );
+        }
     }
 
     #[test]

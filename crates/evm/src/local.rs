@@ -174,13 +174,13 @@ mod tests {
     sol!(
         #![sol(all_derives = true, rpc)]
         TestERC20,
-        "../../lib/rain.orderbook/out/ArbTest.sol/Token.json"
+        env!("ST0X_TEST_ERC20_ABI")
     );
 
     sol!(
         #![sol(all_derives = true, rpc)]
         IERC20,
-        "../../lib/forge-std/out/IERC20.sol/IERC20.json"
+        env!("ST0X_IERC20_ABI")
     );
 
     async fn setup_anvil_with_token() -> (
