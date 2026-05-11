@@ -658,9 +658,9 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
 
     // Crash recovery may produce slightly more or fewer jobs than the
     // reference run. More jobs come from re-running backfill on restart
-    // and the PositionMonitor enqueueing extra PlaceHedge jobs during
-    // recovery (idempotent — the aggregate rejects duplicates via
-    // PendingExecution). Fewer jobs come from the duplicate-trade
+    // and the CheckPositions scan enqueueing extra PlaceHedge jobs
+    // during recovery (idempotent — the aggregate rejects duplicates
+    // via PendingExecution). Fewer jobs come from the duplicate-trade
     // shortcut in `process_queued_trade`: a trade already processed
     // before the crash skips PollOrderStatus / ReconcileOrderFill
     // enqueuing on the second pass. Bound the delta in both directions

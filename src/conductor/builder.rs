@@ -22,7 +22,6 @@ use super::job::FailureInjector;
 use super::job::{FAIL_STOP_RECOVERY_TIMEOUT, build_supervised_worker};
 use super::monitor::inventory::InventoryMonitor;
 use super::monitor::order_fills::OrderFillMonitor;
-use super::monitor::positions::PositionMonitor;
 use crate::config::Ctx;
 use crate::inventory::{
     InventoryPollingService, InventorySnapshot, InventorySnapshotId, WalletPollingCtx,
@@ -176,14 +175,15 @@ where
         poll_status_queue: poll_status_queue.clone(),
     });
 
-    let position_monitor = PositionMonitor::new(
-        context.executor.clone(),
-        context.frameworks.position_projection.clone(),
-        hedge_queue.clone(),
-        std::time::Duration::from_secs(context.ctx.position_check_interval),
-        context.ctx.clone(),
-        context.pool.clone(),
-    );
+    let check_positions_ctx = Arc::new(CheckPositionsCtx {
+        executor: context.executor.clone(),
+        position_projection: context.frameworks.position_projection.clone(),
+        hedge_queue: hedge_queue.clone(),
+        check_positions_queue: check_positions_queue.clone(),
+        ctx: context.ctx.clone(),
+        pool: context.pool.clone(),
+        check_interval: std::time::Duration::from_secs(context.ctx.position_check_interval),
+    });
 
     let trade_cqrs = super::TradeProcessingCqrs {
         onchain_trade: context.frameworks.onchain_trade,
@@ -229,7 +229,6 @@ where
         .with_base_restart_delay(std::time::Duration::from_secs(1))
         .with_dead_tasks_threshold(Some(0.0))
         .with_task("order-fill-monitor", order_fill_monitor)
-        .with_task("position-monitor", position_monitor)
         .with_task("inventory-monitor", inventory_monitor)
         .build()
         .run();

@@ -217,7 +217,7 @@ executor, CQRS frameworks, execution threshold, wallet polling config).
   determines cutoff block, backfills historical events, then calls
   `builder::spawn()` to start the runtime
 - `wait_for_completion()` -- `tokio::select!` across supervisor, apalis monitor,
-  order poller, and position checker; returns when any exits
+  and periodic job cleanup (see periodic cleanup below); returns when any exits
 - `abort_all()` -- shuts down supervisor, aborts all task handles
 
 ## Startup sequencing

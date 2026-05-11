@@ -2,4 +2,3 @@
 
 pub(crate) mod inventory;
 pub(crate) mod order_fills;
-pub(crate) mod positions;

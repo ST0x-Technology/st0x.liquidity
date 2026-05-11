@@ -1045,7 +1045,7 @@ async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
 
     let total_amount = (amount_per_trade * float!(3)).unwrap();
 
-    // The PositionMonitor batches hedges across scan cycles. The
+    // CheckPositions batches hedges across scan cycles. The
     // last onchain fill may arrive during the USDC rebalance, so
     // its hedge completes after the rebalance event. Wait for all
     // hedges to fill by polling until the position net reaches zero.
