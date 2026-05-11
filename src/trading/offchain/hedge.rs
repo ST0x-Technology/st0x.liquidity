@@ -45,7 +45,12 @@ pub(crate) struct PlaceHedge {
 }
 
 impl Job<HedgeCtx> for PlaceHedge {
+    type Output = ();
     type Error = TradeAccountingError;
+
+    const WORKER_NAME: &'static str = "hedge-worker";
+    #[cfg(any(test, feature = "test-support"))]
+    const JOB_KIND: crate::conductor::job::JobKind = crate::conductor::job::JobKind::Hedge;
 
     fn label(&self) -> Label {
         Label::new(format!(
@@ -54,7 +59,7 @@ impl Job<HedgeCtx> for PlaceHedge {
         ))
     }
 
-    async fn perform(&self, ctx: &HedgeCtx) -> Result<(), Self::Error> {
+    async fn perform(&self, ctx: &HedgeCtx) -> Result<Self::Output, Self::Error> {
         // Only specific business rejections are safe to swallow:
         // - PendingExecution: another hedge already claimed this
         //   position — idempotent, no action needed.

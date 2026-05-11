@@ -575,6 +575,12 @@ async fn equity_redemption_buy_inv_repeating_reciprocal_regression() -> anyhow::
     )
     .await;
 
+    // Redemption is driven by the inventory poller observing the
+    // post-take vault balance, so it can complete before the bot has
+    // processed the TakeOrderV3 event and placed its hedge. Wait for
+    // the position to settle so broker assertions are deterministic.
+    poll_for_hedge_completion(&mut bot, &infra.db_path, "AAPL", Duration::from_secs(30)).await;
+
     let expected_positions = [ExpectedPosition::builder()
         .symbol("AAPL")
         .amount(trade_amount)
@@ -959,6 +965,17 @@ async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
         .start_deposit_watcher(eth_deposit_provider, USDC_ETHEREUM, infra.base_chain.owner)
         .await?;
 
+    // Capture the Ethereum USDC balance before spawning the bot, so the
+    // baseline cannot include CCTP mints from a rebalance that fires
+    // shortly after startup. The bot is the only thing that triggers
+    // the CCTP receiveMessage on Ethereum, so its absence here pins the
+    // baseline to the pristine pre-test state.
+    let ethereum_usdc_balance_before_rebalance =
+        crate::base_chain::IERC20::new(USDC_ETHEREUM, &eth_balance_provider)
+            .balanceOf(infra.base_chain.owner)
+            .call()
+            .await?;
+
     let current_block = infra.base_chain.provider.get_block_number().await?;
     let reserved = Positive::new(Usd::new(float!(3000)))?;
     let ctx = build_usdc_rebalancing_ctx()
@@ -997,12 +1014,6 @@ async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
         })
         .expect("at least one take should touch the USDC input vault")
         .input_vault_balance_before_take;
-
-    let ethereum_usdc_balance_before_rebalance =
-        crate::base_chain::IERC20::new(USDC_ETHEREUM, &eth_balance_provider)
-            .balanceOf(infra.base_chain.owner)
-            .call()
-            .await?;
 
     poll_for_events_with_timeout(
         &mut bot,

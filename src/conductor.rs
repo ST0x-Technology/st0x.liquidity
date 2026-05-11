@@ -7,10 +7,9 @@ mod manifest;
 pub(crate) mod monitor;
 
 use alloy::primitives::Address;
-use alloy::providers::{Provider, ProviderBuilder, WsConnect};
+use alloy::providers::{ProviderBuilder, WsConnect};
 use anyhow::Context;
 use chrono::Utc;
-use futures_util::StreamExt;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,11 +27,10 @@ use st0x_event_sorcery::{
 use st0x_evm::Wallet;
 use st0x_execution::{
     CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason, ExecutionError,
-    Executor, FractionalShares, MarketOrder, Symbol,
+    Executor, FractionalShares, MarketOrder, Symbol, TryIntoExecutor,
 };
 
 use crate::alpaca_wallet::AlpacaWalletService;
-use crate::bindings::IOrderBookV6::{self, IOrderBookV6Instance};
 use crate::conductor::job::cleanup_finished_jobs;
 use crate::config::{AssetsConfig, BrokerCtx, Ctx, CtxError};
 use crate::dashboard::Broadcaster;
@@ -52,7 +50,7 @@ use crate::onchain::USDC_BASE;
 #[cfg(test)]
 use crate::onchain::accumulator::check_all_positions;
 use crate::onchain::accumulator::{ExecutionCtx, check_execution_readiness};
-use crate::onchain::backfill::{backfill_events, get_backfill_retry_strat};
+use crate::onchain::backfill::BackfillJobQueue;
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::onchain::trade::{RaindexTradeEvent, extract_owned_vaults, extract_vaults_from_clear};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
@@ -185,10 +183,9 @@ pub(crate) struct AccumulatedPositionExecutionCtx<'a> {
 
 impl Conductor {
     pub(crate) async fn run<E>(
-        executor: E,
+        executor_ctx: impl TryIntoExecutor<Executor = E>,
         ctx: Ctx,
         pool: SqlitePool,
-        executor_maintenance: Option<JoinHandle<()>>,
         event_sender: broadcast::Sender<Statement>,
         inventory: Arc<BroadcastingInventory>,
     ) -> anyhow::Result<()>
@@ -196,38 +193,19 @@ impl Conductor {
         E: Executor + Clone + Send + 'static,
         TradeAccountingError: From<E::Error>,
     {
-        // Phase 1: connect WS and set up apalis tables (parallel)
+        let executor = executor_ctx.try_into_executor().await?;
+        let executor_maintenance = executor.run_executor_maintenance().await;
+
         let ws = WsConnect::new(ctx.evm.ws_rpc_url.as_str());
         let provider = ProviderBuilder::new()
             .connect_ws(ws)
             .await
             .context("failed to connect websocket provider")?;
         let cache = SymbolCache::default();
-        let orderbook = IOrderBookV6Instance::new(ctx.evm.orderbook, &provider);
 
         setup_apalis_tables(&pool).await?;
         let job_queue = DexTradeAccountingJobQueue::new(&pool);
-
-        let mut clear_stream = orderbook.ClearV3_filter().watch().await?.into_stream();
-        let mut take_stream = orderbook.TakeOrderV3_filter().watch().await?.into_stream();
-
-        // Phase 2: determine cutoff block from WS subscription
-        let cutoff_block = get_cutoff_block(&mut clear_stream, &mut take_stream, &provider).await?;
-
-        // Phase 3: backfill historical events to the job queue.
-        // Backfill includes the cutoff block because `get_cutoff_block`
-        // consumed one stream item to learn the block number — that event
-        // would otherwise be lost. Duplicate events from the overlap are
-        // harmless: OnChainTrade aggregates deduplicate by (tx_hash, log_index).
-        backfill_events(
-            &provider,
-            &ctx.evm,
-            &pool,
-            cutoff_block,
-            get_backfill_retry_strat(),
-            job_queue.clone(),
-        )
-        .await?;
+        let backfill_queue = BackfillJobQueue::new(&pool);
 
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
             .build(())
@@ -326,11 +304,6 @@ impl Conductor {
             snapshot,
         };
 
-        let dex_streams = monitor::order_fills::DexEventStreams {
-            clear: Box::pin(clear_stream),
-            take: Box::pin(take_stream),
-        };
-
         let hedge_queue = crate::conductor::job::JobQueue::new(&pool);
         let job_cleanup = spawn_finished_job_cleanup(
             pool.clone(),
@@ -355,8 +328,8 @@ impl Conductor {
         let mut conductor = builder::spawn()
             .context(conductor_ctx)
             .job_queue(job_queue)
+            .backfill_queue(backfill_queue)
             .hedge_queue(hedge_queue)
-            .dex_streams(dex_streams)
             .maybe_executor_maintenance(executor_maintenance)
             .maybe_rebalancer(rebalancer)
             .job_cleanup(job_cleanup)
@@ -1020,88 +993,6 @@ async fn build_position_cqrs(
     Ok(StoreBuilder::<Position>::new(pool.clone())
         .build(())
         .await?)
-}
-
-/// Determines the block number at which the WS subscription starts.
-///
-/// Waits up to 5 seconds for the first event on either stream. If an event
-/// arrives, its block number is the cutoff. If no events arrive within the
-/// timeout, falls back to the provider's current block number.
-async fn get_cutoff_block<ClearEvents, TakeOrderEvents, P>(
-    clear_stream: &mut ClearEvents,
-    take_stream: &mut TakeOrderEvents,
-    provider: &P,
-) -> anyhow::Result<u64>
-where
-    ClearEvents: futures_util::Stream<
-            Item = Result<(IOrderBookV6::ClearV3, alloy::rpc::types::Log), alloy::sol_types::Error>,
-        > + Unpin,
-    TakeOrderEvents: futures_util::Stream<
-            Item = Result<
-                (IOrderBookV6::TakeOrderV3, alloy::rpc::types::Log),
-                alloy::sol_types::Error,
-            >,
-        > + Unpin,
-    P: Provider + Clone,
-{
-    info!("Waiting for first WebSocket event to determine cutoff block...");
-
-    let timeout = tokio::time::sleep(Duration::from_secs(5));
-    tokio::pin!(timeout);
-
-    loop {
-        let block_number =
-            await_next_block(clear_stream, take_stream, &mut timeout, provider).await?;
-
-        if let Some(block) = block_number {
-            info!("First event at block {block}, using as cutoff");
-            return Ok(block);
-        }
-
-        debug!("Event missing block number, waiting for next event");
-    }
-}
-
-async fn await_next_block<ClearEvents, TakeOrderEvents, P>(
-    clear_stream: &mut ClearEvents,
-    take_stream: &mut TakeOrderEvents,
-    timeout: &mut std::pin::Pin<&mut tokio::time::Sleep>,
-    provider: &P,
-) -> anyhow::Result<Option<u64>>
-where
-    ClearEvents: futures_util::Stream<
-            Item = Result<
-                (
-                    crate::bindings::IOrderBookV6::ClearV3,
-                    alloy::rpc::types::Log,
-                ),
-                alloy::sol_types::Error,
-            >,
-        > + Unpin,
-    TakeOrderEvents: futures_util::Stream<
-            Item = Result<
-                (
-                    crate::bindings::IOrderBookV6::TakeOrderV3,
-                    alloy::rpc::types::Log,
-                ),
-                alloy::sol_types::Error,
-            >,
-        > + Unpin,
-    P: Provider + Clone,
-{
-    tokio::select! {
-        Some(result) = clear_stream.next() => {
-            Ok(result?.1.block_number)
-        }
-        Some(result) = take_stream.next() => {
-            Ok(result?.1.block_number)
-        }
-        () = &mut *timeout => {
-            let current_block = provider.get_block_number().await?;
-            info!("No events within timeout, using current block {current_block} as cutoff");
-            Ok(Some(current_block))
-        }
-    }
 }
 
 fn build_order_poller<E: Executor + Clone + Send + 'static>(
@@ -1882,8 +1773,6 @@ where
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, B256, TxHash, U256, address, bytes, fixed_bytes};
-    use alloy::providers::ProviderBuilder;
-    use alloy::providers::mock::Asserter;
     use apalis::prelude::Status;
     use rain_math_float::Float;
     use sqlx::SqlitePool;
@@ -2171,23 +2060,6 @@ mod tests {
             !actual.contains_key(&spym),
             "Disabled assets should be excluded from Base-wallet wrapped equity polling"
         );
-    }
-
-    #[tokio::test]
-    async fn test_get_cutoff_block_with_timeout() {
-        let asserter = Asserter::new();
-
-        asserter.push_success(&serde_json::Value::from(12345u64));
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-
-        let mut clear_stream = futures_util::stream::empty();
-        let mut take_stream = futures_util::stream::empty();
-
-        let cutoff_block = get_cutoff_block(&mut clear_stream, &mut take_stream, &provider)
-            .await
-            .unwrap();
-
-        assert_eq!(cutoff_block, 12345);
     }
 
     const TEST_ORDERBOOK: Address = address!("0x1234567890123456789012345678901234567890");

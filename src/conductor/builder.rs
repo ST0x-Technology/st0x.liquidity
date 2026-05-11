@@ -1,35 +1,32 @@
 //! Constructs a fully-wired [`Conductor`] instance from its dependencies.
 
 use alloy::providers::Provider;
-use apalis::layers::WorkerBuilderExt;
-use apalis::layers::retry::RetryPolicy;
-use apalis::prelude::{Monitor, WorkerBuilder};
-use apalis_core::worker::event::Event;
-use apalis_core::worker::ext::circuit_breaker::{CircuitBreaker, config::CircuitBreakerConfig};
-use apalis_core::worker::ext::event_listener::EventListenerExt;
-use apalis_cron::CronStream;
+use apalis::prelude::Monitor;
+use apalis_core::worker::ext::circuit_breaker::config::CircuitBreakerConfig;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use task_supervisor::SupervisorBuilder;
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 
 use st0x_event_sorcery::{Projection, Store};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::Executor;
 use st0x_finance::{HasZero, Positive, Usd};
 
-use super::job::{FAIL_STOP_RECOVERY_TIMEOUT, FixedInterval, RETRY_BACKOFF, poll_orders, work};
 #[cfg(any(test, feature = "test-support"))]
-use super::job::{FailureInjector, JobKind};
-use super::monitor::order_fills::{DexEventStreams, OrderFillMonitor};
+use super::job::FailureInjector;
+use super::job::{FAIL_STOP_RECOVERY_TIMEOUT, FixedInterval, build_supervised_worker};
+use super::monitor::order_fills::OrderFillMonitor;
 use super::monitor::positions::PositionMonitor;
 use super::{Conductor, MonitorTaskError, build_order_poller, spawn_inventory_poller};
 use crate::config::Ctx;
 use crate::inventory::{
     InventoryPollingService, InventorySnapshot, InventorySnapshotId, WalletPollingCtx,
 };
+use crate::offchain::order_poller::build_order_poller_worker;
 use crate::offchain_order::OffchainOrder;
+use crate::onchain::backfill::{BackfillJobQueue, BackfillRange};
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::raindex::RaindexService;
 use crate::onchain_trade::OnChainTrade;
@@ -37,9 +34,9 @@ use crate::position::Position;
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::ExecutionThreshold;
 use crate::tokenization::Tokenizer;
-use crate::trading::offchain::hedge::{HedgeCtx, HedgeJobQueue};
+use crate::trading::offchain::hedge::{HedgeCtx, HedgeJobQueue, PlaceHedge};
 use crate::trading::onchain::trade_accountant::{
-    AccountantCtx, DexTradeAccountingJobQueue, TradeAccountingError,
+    AccountForDexTrade, AccountantCtx, DexTradeAccountingJobQueue, TradeAccountingError,
 };
 use crate::vault_registry::VaultRegistry;
 
@@ -75,8 +72,8 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
 pub(crate) fn spawn<Prov, Exec>(
     context: ConductorCtx<Prov, Exec>,
     job_queue: DexTradeAccountingJobQueue,
+    backfill_queue: BackfillJobQueue,
     hedge_queue: HedgeJobQueue,
-    dex_streams: DexEventStreams,
     job_cleanup: JoinHandle<()>,
     executor_maintenance: Option<JoinHandle<()>>,
     rebalancer: Option<JoinHandle<()>>,
@@ -153,7 +150,7 @@ where
         hedge_queue.clone(),
         std::time::Duration::from_secs(context.ctx.position_check_interval),
         context.ctx.clone(),
-        context.pool,
+        context.pool.clone(),
     );
 
     let trade_cqrs = super::TradeProcessingCqrs {
@@ -175,13 +172,15 @@ where
         cqrs: trade_cqrs,
         vault_registry: context.frameworks.vault_registry,
         executor: context.executor,
+        pool: context.pool.clone(),
+        job_queue: job_queue.clone(),
     });
 
     let order_fill_monitor = OrderFillMonitor::new(
-        context.ctx.evm.ws_rpc_url.clone(),
-        context.ctx.evm.orderbook,
+        context.ctx.evm.clone(),
         job_queue.clone(),
-        dex_streams,
+        backfill_queue.clone(),
+        context.pool,
     );
 
     let supervisor = SupervisorBuilder::default()
@@ -194,91 +193,71 @@ where
     let failure_injector = context.failure_injector;
     #[cfg(any(test, feature = "test-support"))]
     let failure_injector_for_hedge = failure_injector.clone();
+    #[cfg(any(test, feature = "test-support"))]
+    let failure_injector_for_backfill = failure_injector.clone();
     let failure_notify = Arc::new(tokio::sync::Notify::new());
     let failure_notify_for_hedge = failure_notify.clone();
+    let failure_notify_for_backfill = failure_notify.clone();
     let failure_notify_for_poller = failure_notify.clone();
+    let failure_notify_for_select = failure_notify.clone();
 
     let fail_stop = CircuitBreakerConfig::default()
         .with_failure_threshold(1)
         .with_recovery_timeout(FAIL_STOP_RECOVERY_TIMEOUT);
     let fail_stop_for_hedge = fail_stop.clone();
+    let fail_stop_for_backfill = fail_stop.clone();
     let fail_stop_for_poller = fail_stop.clone();
 
+    let accountant_ctx_for_backfill = accountant_ctx.clone();
+
     let monitor: JoinHandle<Result<(), MonitorTaskError>> = tokio::spawn(async move {
-        let failure_notify_for_accountant = failure_notify.clone();
-        let failure_notify_for_select = failure_notify.clone();
         let apalis_monitor = Monitor::new()
             .should_restart(|_ctx, _error, _attempt| false)
             .register(move |index| {
-                let builder = WorkerBuilder::new(format!("order-fill-worker-{index}"))
-                    .backend(job_queue.clone().into_storage())
-                    .data(accountant_ctx.clone());
-
-                #[cfg(any(test, feature = "test-support"))]
-                let builder = builder
-                    .data(failure_injector.clone())
-                    .data(JobKind::OrderFill);
-
-                builder
-                    .concurrency(1)
-                    .retry(RetryPolicy::retries(3).with_backoff(RETRY_BACKOFF.clone()))
-                    .break_circuit_with(fail_stop.clone())
-                    .on_event({
-                        let failure_notify = failure_notify_for_accountant.clone();
-                        move |ctx, event| {
-                            if let Event::Error(err) = event {
-                                error!(%err, worker = %ctx.name(), "Job failed after retries");
-                                failure_notify.notify_waiters();
-                                let _ = ctx.stop();
-                            }
-                        }
-                    })
-                    .build(work::<AccountantCtx<Prov, Exec>, _>)
+                build_supervised_worker!(
+                    ::<AccountantCtx<Prov, Exec>, AccountForDexTrade>,
+                    index,
+                    job_queue.clone(),
+                    accountant_ctx.clone(),
+                    fail_stop.clone(),
+                    failure_notify.clone(),
+                    #[cfg(any(test, feature = "test-support"))]
+                    failure_injector.clone(),
+                )
             })
             .register(move |index| {
-                let builder = WorkerBuilder::new(format!("hedge-worker-{index}"))
-                    .backend(hedge_queue.clone().into_storage())
-                    .data(hedge_ctx.clone());
-
-                #[cfg(any(test, feature = "test-support"))]
-                let builder = builder
-                    .data(failure_injector_for_hedge.clone())
-                    .data(JobKind::Hedge);
-
-                builder
-                    .concurrency(1)
-                    .retry(RetryPolicy::retries(3).with_backoff(RETRY_BACKOFF.clone()))
-                    .break_circuit_with(fail_stop_for_hedge.clone())
-                    .on_event({
-                        let failure_notify = failure_notify_for_hedge.clone();
-                        move |ctx, event| {
-                            if let Event::Error(err) = event {
-                                error!(%err, worker = %ctx.name(), "Job failed after retries");
-                                failure_notify.notify_waiters();
-                                let _ = ctx.stop();
-                            }
-                        }
-                    })
-                    .build(work::<HedgeCtx, _>)
+                build_supervised_worker!(
+                    ::<HedgeCtx, PlaceHedge>,
+                    index,
+                    hedge_queue.clone(),
+                    hedge_ctx.clone(),
+                    fail_stop_for_hedge.clone(),
+                    failure_notify_for_hedge.clone(),
+                    #[cfg(any(test, feature = "test-support"))]
+                    failure_injector_for_hedge.clone(),
+                )
             })
             .register(move |index| {
-                WorkerBuilder::new(format!("order-poller-{index}"))
-                    .backend(CronStream::new(order_poller_schedule.clone()))
-                    .data(order_poller.clone())
-                    .concurrency(1)
-                    .retry(RetryPolicy::retries(3).with_backoff(RETRY_BACKOFF.clone()))
-                    .break_circuit_with(fail_stop_for_poller.clone())
-                    .on_event({
-                        let failure_notify = failure_notify_for_poller.clone();
-                        move |ctx, event| {
-                            if let Event::Error(err) = event {
-                                error!(%err, worker = %ctx.name(), "Order poller failed after retries");
-                                failure_notify.notify_waiters();
-                                let _ = ctx.stop();
-                            }
-                        }
-                    })
-                    .build(poll_orders::<Exec>)
+                build_supervised_worker!(
+                    ::<AccountantCtx<Prov, Exec>, BackfillRange>,
+                    index,
+                    backfill_queue.clone(),
+                    accountant_ctx_for_backfill.clone(),
+                    fail_stop_for_backfill.clone(),
+                    failure_notify_for_backfill.clone(),
+                    #[cfg(any(test, feature = "test-support"))]
+                    failure_injector_for_backfill.clone(),
+                )
+            })
+            .register(move |index| {
+                build_order_poller_worker!(
+                    index,
+                    order_poller.clone(),
+                    order_poller_schedule.clone(),
+                    fail_stop_for_poller.clone(),
+                    failure_notify_for_poller.clone(),
+                    Exec,
+                )
             });
 
         tokio::select! {
