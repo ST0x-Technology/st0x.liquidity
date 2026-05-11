@@ -584,29 +584,25 @@ pub(crate) async fn fail_transfer_command<W: Write>(
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("Mint aggregate not found: {id}"))?;
 
+            use TokenizedEquityMint::*;
+            use TokenizedEquityMintCommand::*;
             let command = match entity {
-                TokenizedEquityMint::MintAccepted { .. } => {
-                    TokenizedEquityMintCommand::FailAcceptance {
-                        reason: reason.to_string(),
-                    }
-                }
-                TokenizedEquityMint::TokensReceived { .. } => {
-                    TokenizedEquityMintCommand::FailWrapping {
-                        reason: reason.to_string(),
-                    }
-                }
-                TokenizedEquityMint::TokensWrapped { .. } => {
-                    TokenizedEquityMintCommand::FailRaindexDeposit {
-                        reason: reason.to_string(),
-                    }
-                }
-                TokenizedEquityMint::MintRequested { .. } => {
+                MintAccepted { .. } => FailAcceptance {
+                    reason: reason.to_string(),
+                },
+                TokensReceived { .. } => FailWrapping {
+                    reason: reason.to_string(),
+                },
+                TokensWrapped { .. } => FailRaindexDeposit {
+                    reason: reason.to_string(),
+                },
+                MintRequested { .. } => {
                     anyhow::bail!("Mint {id} is at MintRequested -- cannot fail before acceptance");
                 }
-                TokenizedEquityMint::DepositedIntoRaindex { .. } => {
+                DepositedIntoRaindex { .. } => {
                     anyhow::bail!("Mint {id} already completed (DepositedIntoRaindex)");
                 }
-                TokenizedEquityMint::Failed { .. } => {
+                Failed { .. } => {
                     anyhow::bail!("Mint {id} already failed");
                 }
             };
@@ -628,19 +624,19 @@ pub(crate) async fn fail_transfer_command<W: Write>(
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("Redemption aggregate not found: {id}"))?;
 
+            use EquityRedemption::*;
             match entity {
-                EquityRedemption::WithdrawnFromRaindex { .. }
-                | EquityRedemption::TokensUnwrapped { .. } => {}
-                EquityRedemption::TokensSent { .. } | EquityRedemption::Pending { .. } => {
+                WithdrawnFromRaindex { .. } | TokensUnwrapped { .. } => {}
+                TokensSent { .. } | Pending { .. } => {
                     anyhow::bail!(
                         "Redemption {id} is past the transfer stage -- \
                          use FailDetection or RejectRedemption instead"
                     );
                 }
-                EquityRedemption::Completed { .. } => {
+                Completed { .. } => {
                     anyhow::bail!("Redemption {id} already completed");
                 }
-                EquityRedemption::Failed { .. } => {
+                Failed { .. } => {
                     anyhow::bail!("Redemption {id} already failed");
                 }
             }

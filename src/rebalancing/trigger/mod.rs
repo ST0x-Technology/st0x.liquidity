@@ -1028,14 +1028,14 @@ impl RebalancingTrigger {
                     })
             }
 
-            OffchainUsd { .. } | OffchainMarginSafeBuyingPower { .. } => {
-                inventory.clone().apply_snapshot_event(&event, now)
-            }
+            OffchainUsd { .. }
+            | OffchainMarginSafeBuyingPower { .. }
+            | EthereumUsdc { .. }
+            | BaseWalletUsdc { .. } => inventory.clone().apply_snapshot_event(&event, now),
 
-            EthereumUsdc { .. }
-            | BaseWalletUsdc { .. }
-            | BaseWalletUnwrappedEquity { .. }
-            | BaseWalletWrappedEquity { .. } => Ok(inventory.clone()),
+            BaseWalletUnwrappedEquity { .. } | BaseWalletWrappedEquity { .. } => {
+                Ok(inventory.clone())
+            }
 
             InflightEquity { .. } => {
                 if let Some((mints, redemptions)) = &filtered_inflight {
@@ -1154,14 +1154,18 @@ impl RebalancingTrigger {
                     })
             }
 
-            OffchainUsd { .. } | OffchainMarginSafeBuyingPower { .. } => inventory
-                .clone()
-                .force_apply_snapshot_event(&event, now, recovery_reason),
+            OffchainUsd { .. }
+            | OffchainMarginSafeBuyingPower { .. }
+            | EthereumUsdc { .. }
+            | BaseWalletUsdc { .. } => {
+                inventory
+                    .clone()
+                    .force_apply_snapshot_event(&event, now, recovery_reason)
+            }
 
-            EthereumUsdc { .. }
-            | BaseWalletUsdc { .. }
-            | BaseWalletUnwrappedEquity { .. }
-            | BaseWalletWrappedEquity { .. } => Ok(inventory.clone()),
+            BaseWalletUnwrappedEquity { .. } | BaseWalletWrappedEquity { .. } => {
+                Ok(inventory.clone())
+            }
 
             // Recovery for inflight snapshots: forward the original fetched_at
             // so is_stale_for_symbol still rejects pre-rebalancing polls.
@@ -1205,6 +1209,10 @@ impl RebalancingTrigger {
             OnchainUsdc { .. } | OffchainUsd { .. } => {
                 self.check_and_trigger_usdc().await;
             }
+            // Wallet-read USDC events update `inflight_cash` for visibility
+            // but don't drive triggers here. Suppression-aware
+            // re-triggering will be added once orphan-vs-baseline
+            // detection is in place.
             EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }

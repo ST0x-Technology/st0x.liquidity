@@ -197,7 +197,8 @@ describe('createWebSocket', () => {
               offchainAvailable: '0',
               offchainInflight: '0',
               offchainGross: null,
-              buyingPower: null
+              buyingPower: null,
+              inflightCash: { ethereumWallet: null, baseWallet: null }
             }
           },
           positions: [],
@@ -303,7 +304,8 @@ describe('createWebSocket', () => {
           offchainAvailable: '500',
           offchainInflight: '0',
           offchainGross: null,
-          buyingPower: null
+          buyingPower: null,
+          inflightCash: { ethereumWallet: null, baseWallet: null }
         }
       }
 
