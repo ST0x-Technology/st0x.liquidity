@@ -12,7 +12,7 @@ use tokio::task::{AbortHandle, JoinError, JoinHandle};
 use tracing::{error, info};
 
 use st0x_dto::Statement;
-use st0x_execution::{Executor, MockExecutorCtx, TryIntoExecutor};
+use st0x_execution::MockExecutorCtx;
 
 use crate::config::{BrokerCtx, Ctx};
 
@@ -144,7 +144,14 @@ async fn await_shutdown(
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
-            handle_ctrl_c(&server_abort, &bot_abort);
+            info!(
+                target: "startup",
+                "Received shutdown signal, shutting down gracefully..."
+            );
+
+            abort_task("server", &server_abort);
+            abort_task("bot", &bot_abort);
+
             Ok(())
         }
         result = server_task => {
@@ -156,12 +163,6 @@ async fn await_shutdown(
             check_bot_result(result)
         }
     }
-}
-
-fn handle_ctrl_c(server_abort: &AbortHandle, bot_abort: &AbortHandle) {
-    info!(target: "startup", "Received shutdown signal, shutting down gracefully...");
-    abort_task("server", server_abort);
-    abort_task("bot", bot_abort);
 }
 
 fn abort_task(name: &str, handle: &AbortHandle) {
@@ -213,7 +214,30 @@ async fn run_conductor_session(
     event_sender: broadcast::Sender<Statement>,
     inventory: Arc<inventory::BroadcastingInventory>,
 ) -> anyhow::Result<()> {
-    let result = Box::pin(dispatch_to_executor(ctx, pool, event_sender, inventory)).await;
+    let result = match ctx.broker.clone() {
+        BrokerCtx::DryRun => {
+            info!(target: "startup", "Initializing test executor for dry-run mode");
+            Box::pin(conductor::Conductor::run(
+                MockExecutorCtx,
+                ctx,
+                pool,
+                event_sender,
+                inventory,
+            ))
+            .await
+        }
+        BrokerCtx::AlpacaBrokerApi(alpaca_auth) => {
+            info!(target: "startup", "Initializing Alpaca Broker API executor");
+            Box::pin(conductor::Conductor::run(
+                alpaca_auth,
+                ctx,
+                pool,
+                event_sender,
+                inventory,
+            ))
+            .await
+        }
+    };
 
     match result {
         Ok(()) => {
@@ -223,32 +247,6 @@ async fn run_conductor_session(
         Err(error) => {
             error!(target: "startup", %error, "Bot session failed");
             Err(error)
-        }
-    }
-}
-
-async fn dispatch_to_executor(
-    ctx: Ctx,
-    pool: SqlitePool,
-    event_sender: broadcast::Sender<Statement>,
-    inventory: Arc<inventory::BroadcastingInventory>,
-) -> anyhow::Result<()> {
-    match ctx.broker.clone() {
-        BrokerCtx::DryRun => {
-            info!(target: "startup", "Initializing test executor for dry-run mode");
-            let executor = MockExecutorCtx.try_into_executor().await?;
-            let maintenance = executor.run_executor_maintenance().await;
-
-            conductor::Conductor::run(executor, ctx, pool, maintenance, event_sender, inventory)
-                .await
-        }
-        BrokerCtx::AlpacaBrokerApi(alpaca_auth) => {
-            info!(target: "startup", "Initializing Alpaca Broker API executor");
-            let executor = alpaca_auth.try_into_executor().await?;
-            let maintenance = executor.run_executor_maintenance().await;
-
-            conductor::Conductor::run(executor, ctx, pool, maintenance, event_sender, inventory)
-                .await
         }
     }
 }

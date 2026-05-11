@@ -7,8 +7,11 @@
 
 use apalis::layers::retry::backoff::Backoff;
 use apalis::prelude::{Attempt, Data, Status, TaskSink};
+use apalis_core::backend::poll_strategy::{BackoffConfig, IntervalStrategy, StrategyBuilder};
+use apalis_core::worker::context::WorkerContext;
+use apalis_core::worker::event::Event;
 use apalis_cron::Schedule;
-use apalis_sqlite::SqliteStorage;
+use apalis_sqlite::{Config, SqliteStorage};
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -102,9 +105,36 @@ impl<Task> Clone for JobQueue<Task> {
     }
 }
 
+/// Pickup latency SLO for queued jobs.
+///
+/// Hedge placement (and the upstream trade-processing pipeline) needs
+/// to react to events on the order of a single second: a missed window
+/// here translates directly into directional exposure that the hedger
+/// is supposed to be neutralising. Apalis defaults to exponential
+/// poll backoff capped at 60s, which is sensible for long-running
+/// systems that idle for hours but violates the SLO this service
+/// operates under -- after even a brief idle period a worker can be
+/// sleeping for tens of seconds when a new job lands.
+///
+/// We cap the polling interval at 1s end-to-end so the worst-case
+/// pickup latency matches the SLO regardless of prior queue state.
+fn build_poll_config<T: 'static>() -> Config {
+    let strategy = StrategyBuilder::new()
+        .apply(
+            IntervalStrategy::new(Duration::from_millis(100))
+                .with_backoff(BackoffConfig::new(Duration::from_secs(1))),
+        )
+        .build();
+
+    Config::new(std::any::type_name::<T>()).with_poll_interval(strategy)
+}
+
 impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueue<Task> {
     pub(crate) fn new(pool: &SqlitePool) -> Self {
-        Self(SqliteStorage::new(pool))
+        Self(SqliteStorage::new_with_config(
+            pool,
+            &build_poll_config::<Task>(),
+        ))
     }
 
     pub(crate) async fn push(
@@ -127,19 +157,103 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
 /// needed to process a single job. The `Ctx` type parameter
 /// bundles all runtime dependencies (executor, CQRS frameworks,
 /// config, etc.) into one struct injected via apalis `Data`.
+///
+/// The `Output` associated type is what downstream apalis-workflow
+/// stages receive when this job is composed into a DAG. Leaf jobs
+/// that don't feed anything use `type Output = ();`.
+///
+/// `WORKER_NAME`, `TERMINAL_FAILURE_MSG`, and `JOB_KIND` are read
+/// by the shared [`build_supervised_worker!`] macro so each Job
+/// impl carries everything `Monitor::register` needs.
 pub(crate) trait Job<Ctx>: Serialize + DeserializeOwned + Send + 'static
 where
     Ctx: Send + Sync + 'static,
 {
+    /// Value produced on successful completion. Becomes the input
+    /// of the next stage in apalis-workflow DAGs.
+    type Output: Send + 'static;
+
     /// Error type returned by [`perform`](Job::perform).
     type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Worker name prefix; the registered worker name is
+    /// `format!("{WORKER_NAME}-{index}")`.
+    const WORKER_NAME: &'static str;
+
+    /// Logged when retries are exhausted and the supervisor receives
+    /// a terminal failure for this job.
+    const TERMINAL_FAILURE_MSG: &'static str = "Job failed after retries";
+
+    /// Identifier for this job type in the e2e [`FailureInjector`].
+    #[cfg(any(test, feature = "test-support"))]
+    const JOB_KIND: JobKind;
 
     /// Human-readable label for structured logging.
     fn label(&self) -> Label;
 
     /// Process this job using the provided context.
-    async fn perform(&self, ctx: &Ctx) -> Result<(), Self::Error>;
+    async fn perform(&self, ctx: &Ctx) -> Result<Self::Output, Self::Error>;
 }
+
+/// Builds a `Worker` for a `Job<Ctx>` impl.
+///
+/// Mirrors the `work::<Ctx, Job>` turbofish style: pass the same two
+/// types and the macro expands to a fully-wired worker (queue backend,
+/// retry policy, fail-stop circuit breaker, terminal-failure notifier,
+/// `.build(work::<Ctx, Job>)`).
+///
+/// A macro because `.build()` returns a deeply-nested
+/// `Worker<Args, Ctx, Backend, Svc, Middleware>` whose `Svc` and
+/// `Middleware` types accumulate from the layer stack and have no
+/// public alias or `impl Trait` shorthand. Macro expansion lets the
+/// compiler infer the type at the call site.
+macro_rules! build_supervised_worker {
+    (
+        ::<$ctx_type:ty, $job:ty>,
+        $index:expr,
+        $queue:expr,
+        $ctx:expr,
+        $fail_stop:expr,
+        $failure_notify:expr
+        $(, $failure_injector:expr)? $(,)?
+    ) => {{
+        use ::apalis::layers::WorkerBuilderExt;
+        use ::apalis::layers::retry::RetryPolicy;
+        use ::apalis::prelude::WorkerBuilder;
+        use ::apalis_core::worker::ext::circuit_breaker::CircuitBreaker;
+        use ::apalis_core::worker::ext::event_listener::EventListenerExt;
+
+        let builder = WorkerBuilder::new(format!(
+            "{}-{}",
+            <$job as $crate::conductor::job::Job<$ctx_type>>::WORKER_NAME,
+            $index,
+        ))
+        .backend($queue.into_storage())
+        .data($ctx);
+
+        $(
+            #[cfg(any(test, feature = "test-support"))]
+            let builder = builder.data($failure_injector).data(
+                <$job as $crate::conductor::job::Job<$ctx_type>>::JOB_KIND,
+            );
+        )?
+
+        builder
+            .concurrency(1)
+            .retry(
+                RetryPolicy::retries(3)
+                    .with_backoff($crate::conductor::job::RETRY_BACKOFF.clone()),
+            )
+            .break_circuit_with($fail_stop)
+            .on_event($crate::conductor::job::on_terminal_failure(
+                $failure_notify,
+                <$job as $crate::conductor::job::Job<$ctx_type>>::TERMINAL_FAILURE_MSG,
+            ))
+            .build($crate::conductor::job::work::<$ctx_type, $job>)
+    }};
+}
+
+pub(crate) use build_supervised_worker;
 
 /// Human-readable identifier for an enqueued job, used in structured logging.
 #[derive(Debug)]
@@ -168,6 +282,7 @@ impl fmt::Display for Label {
 pub enum JobKind {
     OrderFill,
     Hedge,
+    Backfill,
 }
 
 /// Job execution error. Wraps the concrete `Job::Error` type at
@@ -194,6 +309,7 @@ pub(crate) enum JobError {
 pub struct FailureInjector {
     order_fill: Arc<Mutex<InjectionState>>,
     hedge: Arc<Mutex<InjectionState>>,
+    backfill: Arc<Mutex<InjectionState>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -218,6 +334,7 @@ impl FailureInjector {
         Self {
             order_fill: Arc::new(Mutex::new(InjectionState::Idle)),
             hedge: Arc::new(Mutex::new(InjectionState::Idle)),
+            backfill: Arc::new(Mutex::new(InjectionState::Idle)),
         }
     }
 
@@ -254,6 +371,7 @@ impl FailureInjector {
         let mutex = match kind {
             JobKind::OrderFill => &self.order_fill,
             JobKind::Hedge => &self.hedge,
+            JobKind::Backfill => &self.backfill,
         };
 
         match mutex.lock() {
@@ -268,7 +386,7 @@ impl FailureInjector {
         job: &J,
         ctx: &Ctx,
         attempt: usize,
-    ) -> Result<(), JobError>
+    ) -> Result<J::Output, JobError>
     where
         Ctx: Send + Sync + 'static,
     {
@@ -302,7 +420,7 @@ pub(crate) async fn work<Ctx, J>(
     injector: Data<FailureInjector>,
     kind: Data<JobKind>,
     attempt: Attempt,
-) -> Result<(), JobError>
+) -> Result<J::Output, JobError>
 where
     Ctx: Send + Sync + 'static,
     J: Job<Ctx> + Sync,
@@ -316,7 +434,7 @@ pub(crate) async fn work<Ctx, J>(
     job: J,
     ctx: Data<Arc<Ctx>>,
     attempt: Attempt,
-) -> Result<(), JobError>
+) -> Result<J::Output, JobError>
 where
     Ctx: Send + Sync + 'static,
     J: Job<Ctx> + Sync,
@@ -342,6 +460,22 @@ where
     E: Executor + Clone + Send + Sync + 'static,
 {
     poller.poll_pending_orders().await
+}
+
+/// On-event handler shared by every supervised worker: when apalis
+/// reports a terminal job failure (retries exhausted), notify the
+/// monitor task and stop the worker.
+pub(crate) fn on_terminal_failure(
+    failure_notify: Arc<tokio::sync::Notify>,
+    error_msg: &'static str,
+) -> impl Fn(&WorkerContext, &Event) + Send + Sync + 'static {
+    move |ctx, event| {
+        if let Event::Error(err) = event {
+            error!(%err, worker = %ctx.name(), "{error_msg}");
+            failure_notify.notify_waiters();
+            let _ = ctx.stop();
+        }
+    }
 }
 
 pub(crate) async fn cleanup_finished_jobs(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
@@ -464,13 +598,17 @@ mod tests {
     }
 
     impl Job<TestCtx> for TestJob {
+        type Output = ();
         type Error = TestJobError;
+
+        const WORKER_NAME: &'static str = "test-worker";
+        const JOB_KIND: JobKind = JobKind::OrderFill;
 
         fn label(&self) -> Label {
             Label::new(format!("test-job(should_fail={})", self.should_fail))
         }
 
-        async fn perform(&self, ctx: &TestCtx) -> Result<(), Self::Error> {
+        async fn perform(&self, ctx: &TestCtx) -> Result<Self::Output, Self::Error> {
             if self.should_fail {
                 return Err(TestJobError);
             }

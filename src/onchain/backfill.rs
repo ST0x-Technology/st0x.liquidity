@@ -11,16 +11,23 @@ use alloy::sol_types::SolEvent;
 use backon::{BackoffBuilder, ExponentialBuilder, Retryable};
 use futures_util::future;
 use itertools::Itertools;
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::time::Duration;
 use tracing::{debug, info, trace, warn};
 
+use st0x_evm::Evm;
+use st0x_execution::Executor;
+
 use super::EvmCtx;
 use super::OnChainError;
 use crate::bindings::IOrderBookV6::{ClearV3, TakeOrderV3};
+use crate::conductor::job::{Job, Label};
 use crate::onchain::trade::RaindexTradeEvent;
 use crate::trading::onchain::inclusion::EmittedOnChain;
-use crate::trading::onchain::trade_accountant::{AccountForDexTrade, DexTradeAccountingJobQueue};
+use crate::trading::onchain::trade_accountant::{
+    AccountForDexTrade, AccountantCtx, DexTradeAccountingJobQueue, TradeAccountingError,
+};
 
 pub(crate) fn get_backfill_retry_strat() -> ExponentialBuilder {
     const BACKFILL_MAX_RETRIES: usize = 15;
@@ -34,6 +41,12 @@ pub(crate) fn get_backfill_retry_strat() -> ExponentialBuilder {
         .with_jitter()
 }
 
+/// Loads the checkpoint and backfills up to `end_block`. Retained
+/// for tests that exercise the "resume from checkpoint" branch
+/// alongside the batched fetch logic. Production code uses
+/// [`BackfillRange`] (and thus [`backfill_range`]) directly via the
+/// monitor.
+#[cfg(test)]
 #[tracing::instrument(
     target = "orderbook",
     skip(provider, evm_ctx, pool, retry_strategy, job_queue),
@@ -50,57 +63,142 @@ pub(crate) async fn backfill_events<P: Provider + Clone, B: BackoffBuilder + Clo
 ) -> Result<(), OnChainError> {
     let start_block = backfill_start_block(pool, evm_ctx).await?;
 
-    if start_block > end_block {
+    backfill_range(
+        provider,
+        evm_ctx,
+        pool,
+        start_block,
+        end_block,
+        retry_strategy,
+        job_queue,
+    )
+    .await
+}
+
+/// Fetches `ClearV3` / `TakeOrderV3` logs in `[from_block, to_block]`,
+/// pushes an `AccountForDexTrade` job for each, and advances the
+/// backfill checkpoint to `to_block` on success.
+///
+/// Skips RPC calls when `from_block > to_block` (already caught up),
+/// but still moves the checkpoint forward so a stale row does not
+/// cause repeated no-op fetches.
+#[tracing::instrument(
+    target = "orderbook",
+    skip(provider, evm_ctx, pool, retry_strategy, job_queue),
+    fields(from_block, to_block),
+    level = tracing::Level::INFO,
+)]
+pub(crate) async fn backfill_range<P: Provider + Clone, B: BackoffBuilder + Clone>(
+    provider: &P,
+    evm_ctx: &EvmCtx,
+    pool: &SqlitePool,
+    from_block: u64,
+    to_block: u64,
+    retry_strategy: B,
+    job_queue: DexTradeAccountingJobQueue,
+) -> Result<(), OnChainError> {
+    if from_block > to_block {
         info!(
             target: "orderbook",
             "Already caught up to block {}, skipping backfill",
-            end_block
+            to_block
         );
 
-        save_backfill_checkpoint(pool, evm_ctx, end_block).await?;
+        save_backfill_checkpoint(pool, evm_ctx, to_block).await?;
         return Ok(());
     }
 
-    let total_blocks = end_block - start_block + 1;
+    let total_blocks = to_block - from_block + 1;
 
     info!(
         target: "orderbook",
         "Backfilling from block {} to {} ({} blocks)",
-        start_block, end_block, total_blocks
+        from_block, to_block, total_blocks
     );
 
-    let batch_ranges = generate_batch_ranges(start_block, end_block);
+    let batch_ranges = generate_batch_ranges(from_block, to_block);
 
-    let batch_tasks = batch_ranges
-        .into_iter()
-        .map(|(batch_start, batch_end)| {
-            enqueue_batch_events(
-                provider,
-                evm_ctx,
-                batch_start,
-                batch_end,
-                retry_strategy.clone(),
-                job_queue.clone(),
-            )
-        })
-        .collect::<Vec<_>>();
-
-    let batch_results = future::join_all(batch_tasks).await;
-
-    let total_enqueued = batch_results
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .sum::<usize>();
+    let mut total_enqueued: usize = 0;
+    for (batch_start, batch_end) in batch_ranges {
+        let enqueued = enqueue_batch_events(
+            provider,
+            evm_ctx,
+            batch_start,
+            batch_end,
+            retry_strategy.clone(),
+            job_queue.clone(),
+        )
+        .await?;
+        total_enqueued += enqueued;
+    }
 
     info!(target: "orderbook", total_enqueued, "Backfill completed");
 
-    save_backfill_checkpoint(pool, evm_ctx, end_block).await?;
+    save_backfill_checkpoint(pool, evm_ctx, to_block).await?;
 
     Ok(())
 }
 
-async fn backfill_start_block(pool: &SqlitePool, evm_ctx: &EvmCtx) -> Result<u64, OnChainError> {
+/// Persistent job queue for backfill jobs.
+pub(crate) type BackfillJobQueue = crate::conductor::job::JobQueue<BackfillRange>;
+
+/// Apalis job that backfills missed `ClearV3` / `TakeOrderV3` events
+/// between `from_block` and `to_block` (inclusive).
+///
+/// Enqueued by `OrderFillMonitor::run` on every (re)connect to cover
+/// the gap between the previously checkpointed block and the cutoff
+/// of the new WebSocket subscription. Job durability via apalis
+/// storage means a crash mid-backfill is retried automatically.
+///
+/// Assumes the startup WS provider from `Conductor::run` (used here
+/// via `ctx.evm.provider()`) stays usable for `eth_getLogs` — backfill
+/// does not pick up the fresh provider that `OrderFillMonitor` opens
+/// on reconnect. Apalis retries plus the conductor restart loop
+/// provide defense in depth if that assumption breaks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct BackfillRange {
+    pub(crate) from_block: u64,
+    pub(crate) to_block: u64,
+}
+
+impl<Node, Exec> Job<AccountantCtx<Node, Exec>> for BackfillRange
+where
+    Node: Provider + Clone + Send + Sync + 'static,
+    Exec: Executor + Clone + Send + Sync + 'static,
+    TradeAccountingError: From<Exec::Error>,
+{
+    type Output = ();
+    type Error = OnChainError;
+
+    const WORKER_NAME: &'static str = "backfill-worker";
+    #[cfg(any(test, feature = "test-support"))]
+    const JOB_KIND: crate::conductor::job::JobKind = crate::conductor::job::JobKind::Backfill;
+
+    fn label(&self) -> Label {
+        Label::new(format!(
+            "BackfillRange:{}:{}",
+            self.from_block, self.to_block
+        ))
+    }
+
+    async fn perform(&self, ctx: &AccountantCtx<Node, Exec>) -> Result<Self::Output, Self::Error> {
+        backfill_range(
+            ctx.evm.provider(),
+            &ctx.ctx.evm,
+            &ctx.pool,
+            self.from_block,
+            self.to_block,
+            get_backfill_retry_strat(),
+            ctx.job_queue.clone(),
+        )
+        .await
+    }
+}
+
+pub(crate) async fn backfill_start_block(
+    pool: &SqlitePool,
+    evm_ctx: &EvmCtx,
+) -> Result<u64, OnChainError> {
     load_backfill_checkpoint(pool, evm_ctx)
         .await?
         .map_or(Ok(evm_ctx.deployment_block), |last_processed_block| {
@@ -108,7 +206,7 @@ async fn backfill_start_block(pool: &SqlitePool, evm_ctx: &EvmCtx) -> Result<u64
         })
 }
 
-async fn load_backfill_checkpoint(
+pub(crate) async fn load_backfill_checkpoint(
     pool: &SqlitePool,
     evm_ctx: &EvmCtx,
 ) -> Result<Option<u64>, OnChainError> {
@@ -124,7 +222,7 @@ async fn load_backfill_checkpoint(
         .map_err(OnChainError::IntConversion)
 }
 
-async fn save_backfill_checkpoint(
+pub(crate) async fn save_backfill_checkpoint(
     pool: &SqlitePool,
     evm_ctx: &EvmCtx,
     last_processed_block: u64,

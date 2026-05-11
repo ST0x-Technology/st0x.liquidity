@@ -58,6 +58,43 @@ impl Default for OrderPollerCtx {
     }
 }
 
+/// Builds the cron-driven order-status poller worker. See
+/// `build_order_fill_worker!` in `trade_accountant` for the rationale
+/// behind the macro form.
+macro_rules! build_order_poller_worker {
+    (
+        $index:expr,
+        $poller:expr,
+        $schedule:expr,
+        $fail_stop:expr,
+        $failure_notify:expr,
+        $exec:ty $(,)?
+    ) => {{
+        use ::apalis::layers::WorkerBuilderExt;
+        use ::apalis::layers::retry::RetryPolicy;
+        use ::apalis::prelude::WorkerBuilder;
+        use ::apalis_core::worker::ext::circuit_breaker::CircuitBreaker;
+        use ::apalis_core::worker::ext::event_listener::EventListenerExt;
+        use ::apalis_cron::CronStream;
+
+        WorkerBuilder::new(format!("order-poller-{}", $index))
+            .backend(CronStream::new($schedule))
+            .data($poller)
+            .concurrency(1)
+            .retry(
+                RetryPolicy::retries(3).with_backoff($crate::conductor::job::RETRY_BACKOFF.clone()),
+            )
+            .break_circuit_with($fail_stop)
+            .on_event($crate::conductor::job::on_terminal_failure(
+                $failure_notify,
+                "Order poller failed after retries",
+            ))
+            .build($crate::conductor::job::poll_orders::<$exec>)
+    }};
+}
+
+pub(crate) use build_order_poller_worker;
+
 #[derive(Clone)]
 pub struct OrderStatusPoller<E: Executor + Clone> {
     ctx: OrderPollerCtx,
