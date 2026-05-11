@@ -24,7 +24,6 @@ use super::job::{FAIL_STOP_RECOVERY_TIMEOUT, build_supervised_worker};
 use super::monitor::executor_maintenance::ExecutorMaintenance;
 use super::monitor::inventory::InventoryMonitor;
 use super::monitor::order_fills::OrderFillMonitor;
-use super::monitor::positions::PositionMonitor;
 use crate::config::Ctx;
 use crate::inventory::{
     InventoryPollingService, InventorySnapshot, InventorySnapshotId, WalletPollingCtx,
@@ -41,6 +40,7 @@ use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::raindex::RaindexService;
 use crate::onchain_trade::OnChainTrade;
 use crate::position::Position;
+use crate::position_check::{CheckPositions, CheckPositionsCtx, CheckPositionsJobQueue};
 use crate::rebalancing::{
     EquityRebalancingCheck, EquityRebalancingCheckScheduler, RebalancingService,
     UsdcRebalancingCheck, UsdcRebalancingCheckScheduler,
@@ -96,6 +96,7 @@ pub(crate) fn spawn<Prov, Exec>(
     poll_status_queue: PollOrderStatusJobQueue,
     reconcile_queue: ReconcileOrderFillJobQueue,
     rejection_queue: HandleOrderRejectionJobQueue,
+    check_positions_queue: CheckPositionsJobQueue,
     wrapped_equity_recovery_queue: WrappedEquityRecoveryJobQueue,
     wrapped_equity_recovery_ctx: Option<Arc<WrappedEquityRecoveryCtx>>,
     equity_check_scheduler: EquityRebalancingCheckScheduler,
@@ -208,14 +209,15 @@ where
         poll_status_queue: poll_status_queue.clone(),
     });
 
-    let position_monitor = PositionMonitor::new(
-        context.executor.clone(),
-        context.frameworks.position_projection.clone(),
-        hedge_queue.clone(),
-        std::time::Duration::from_secs(context.ctx.position_check_interval),
-        context.ctx.clone(),
-        context.pool.clone(),
-    );
+    let check_positions_ctx = Arc::new(CheckPositionsCtx {
+        executor: context.executor.clone(),
+        position_projection: context.frameworks.position_projection.clone(),
+        hedge_queue: hedge_queue.clone(),
+        check_positions_queue: check_positions_queue.clone(),
+        ctx: context.ctx.clone(),
+        pool: context.pool.clone(),
+        check_interval: std::time::Duration::from_secs(context.ctx.position_check_interval),
+    });
 
     let trade_cqrs = super::TradeProcessingCqrs {
         onchain_trade: context.frameworks.onchain_trade,
@@ -263,7 +265,6 @@ where
         .with_base_restart_delay(std::time::Duration::from_secs(1))
         .with_dead_tasks_threshold(Some(0.0))
         .with_task("order-fill-monitor", order_fill_monitor)
-        .with_task("position-monitor", position_monitor)
         .with_task("inventory-monitor", inventory_monitor);
 
     log_optional_task_status("executor maintenance", maintenance_interval.is_some());
@@ -283,6 +284,7 @@ where
         poll_status_ctx,
         reconcile_ctx,
         rejection_ctx,
+        check_positions_ctx,
         rebalancing_check_ctx: rebalancing_service,
         seed_vault_registry_ctx,
         job_queue,
@@ -291,6 +293,7 @@ where
         poll_status_queue,
         reconcile_queue,
         rejection_queue,
+        check_positions_queue,
         wrapped_equity_recovery_queue,
         wrapped_equity_recovery_ctx,
         equity_check_scheduler,
@@ -329,6 +332,7 @@ where
     poll_status_ctx: Arc<PollOrderStatusCtx<Exec>>,
     reconcile_ctx: Arc<ReconcileOrderFillCtx>,
     rejection_ctx: Arc<HandleOrderRejectionCtx>,
+    check_positions_ctx: Arc<CheckPositionsCtx<Exec>>,
     rebalancing_check_ctx: Option<Arc<RebalancingService>>,
     seed_vault_registry_ctx: Arc<SeedVaultRegistryCtx>,
     job_queue: DexTradeAccountingJobQueue,
@@ -337,6 +341,7 @@ where
     poll_status_queue: PollOrderStatusJobQueue,
     reconcile_queue: ReconcileOrderFillJobQueue,
     rejection_queue: HandleOrderRejectionJobQueue,
+    check_positions_queue: CheckPositionsJobQueue,
     wrapped_equity_recovery_queue: WrappedEquityRecoveryJobQueue,
     wrapped_equity_recovery_ctx: Option<Arc<WrappedEquityRecoveryCtx>>,
     equity_check_scheduler: EquityRebalancingCheckScheduler,
@@ -362,6 +367,7 @@ where
             poll_status_ctx,
             reconcile_ctx,
             rejection_ctx,
+            check_positions_ctx,
             rebalancing_check_ctx,
             seed_vault_registry_ctx,
             job_queue,
@@ -370,6 +376,7 @@ where
             poll_status_queue,
             reconcile_queue,
             rejection_queue,
+            check_positions_queue,
             wrapped_equity_recovery_queue,
             wrapped_equity_recovery_ctx,
             equity_check_scheduler,
@@ -398,6 +405,8 @@ where
         let failure_injector_for_seed_vault_registry = failure_injector.clone();
         #[cfg(any(test, feature = "test-support"))]
         let failure_injector_for_wrapped_equity_recovery = failure_injector.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let failure_injector_for_check_positions = failure_injector.clone();
         let failure_notify = Arc::new(tokio::sync::Notify::new());
         let failure_notify_for_hedge = failure_notify.clone();
         let failure_notify_for_backfill = failure_notify.clone();
@@ -408,6 +417,7 @@ where
         let failure_notify_for_usdc_rebalancing_check = failure_notify.clone();
         let failure_notify_for_seed_vault_registry = failure_notify.clone();
         let failure_notify_for_wrapped_equity_recovery = failure_notify.clone();
+        let failure_notify_for_check_positions = failure_notify.clone();
         let failure_notify_for_select = failure_notify.clone();
 
         let fail_stop = CircuitBreakerConfig::default()
@@ -422,6 +432,7 @@ where
         let fail_stop_for_usdc_rebalancing_check = fail_stop.clone();
         let fail_stop_for_seed_vault_registry = fail_stop.clone();
         let fail_stop_for_wrapped_equity_recovery = fail_stop.clone();
+        let fail_stop_for_check_positions = fail_stop.clone();
 
         let accountant_ctx_for_backfill = accountant_ctx.clone();
 
@@ -510,6 +521,18 @@ where
                         failure_notify_for_seed_vault_registry.clone(),
                         #[cfg(any(test, feature = "test-support"))]
                         failure_injector_for_seed_vault_registry.clone(),
+                    )
+                })
+                .register(move |index| {
+                    build_supervised_worker!(
+                        ::<CheckPositionsCtx<Exec>, CheckPositions>,
+                        index,
+                        check_positions_queue.clone(),
+                        check_positions_ctx.clone(),
+                        fail_stop_for_check_positions.clone(),
+                        failure_notify_for_check_positions.clone(),
+                        #[cfg(any(test, feature = "test-support"))]
+                        failure_injector_for_check_positions.clone(),
                     )
                 });
 
