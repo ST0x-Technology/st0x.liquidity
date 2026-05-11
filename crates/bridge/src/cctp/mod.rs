@@ -214,7 +214,7 @@ impl crate::Attestation for AttestationResponse {
     }
 }
 
-// CCTP V2 message layout (see lib/evm-cctp-contracts/src/messages/v2/MessageV2.sol):
+// CCTP V2 message layout (see Circle's evm-cctp-contracts: src/messages/v2/MessageV2.sol):
 // - Bytes 0-3: version (4 bytes)
 // - Bytes 4-7: source domain (4 bytes)
 // - Bytes 8-11: destination domain (4 bytes)
