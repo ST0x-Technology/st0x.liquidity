@@ -17,6 +17,9 @@ use st0x_float_macro::float;
 
 use super::snapshot::InventorySnapshotEvent;
 use super::venue_balance::{InventoryError, VenueBalance};
+use crate::equity_redemption::RedemptionAggregateId;
+use crate::tokenized_equity_mint::IssuerRequestId;
+use crate::usdc_rebalance::UsdcRebalanceId;
 use crate::wrapper::{RatioError, UnderlyingPerWrapped};
 
 static EXACT_ONE: LazyLock<Float> = LazyLock::new(|| float!(1));
@@ -641,6 +644,24 @@ pub(crate) struct InventoryView {
     /// Gross offchain USD balance in cents (before cash reserve subtraction).
     #[serde(default)]
     offchain_gross_usd_cents: Option<i64>,
+    /// Aggregate ID of the in-flight USDC rebalance, if any.
+    ///
+    /// Populated when a transfer initiates and cleared on terminal events.
+    /// Recovery uses this to load the stalled aggregate from its store.
+    #[serde(default)]
+    active_usdc_rebalance: Option<UsdcRebalanceId>,
+    /// Aggregate IDs of in-flight equity mints, keyed by symbol.
+    ///
+    /// Populated when a non-terminal mint event is processed, cleared on
+    /// terminal mint events.
+    #[serde(default)]
+    active_mints: HashMap<Symbol, IssuerRequestId>,
+    /// Aggregate IDs of in-flight equity redemptions, keyed by symbol.
+    ///
+    /// Populated when a non-terminal redemption event is processed, cleared
+    /// on terminal redemption events.
+    #[serde(default)]
+    active_redemptions: HashMap<Symbol, RedemptionAggregateId>,
 }
 
 impl InventoryView {
@@ -752,6 +773,9 @@ impl Default for InventoryView {
             last_updated: Utc::now(),
             buying_power_cents: None,
             offchain_gross_usd_cents: None,
+            active_usdc_rebalance: None,
+            active_mints: HashMap::new(),
+            active_redemptions: HashMap::new(),
         }
     }
 }
@@ -851,9 +875,7 @@ impl InventoryView {
         Ok(Self {
             equities,
             last_updated: now,
-            usdc: self.usdc,
-            buying_power_cents: self.buying_power_cents,
-            offchain_gross_usd_cents: self.offchain_gross_usd_cents,
+            ..self
         })
     }
 
@@ -867,9 +889,7 @@ impl InventoryView {
         Ok(Self {
             usdc: updated,
             last_updated: now,
-            equities: self.equities,
-            buying_power_cents: self.buying_power_cents,
-            offchain_gross_usd_cents: self.offchain_gross_usd_cents,
+            ..self
         })
     }
 
@@ -892,9 +912,7 @@ impl InventoryView {
         Ok(Self {
             equities,
             last_updated: now,
-            usdc: self.usdc,
-            buying_power_cents: self.buying_power_cents,
-            offchain_gross_usd_cents: self.offchain_gross_usd_cents,
+            ..self
         })
     }
 
@@ -909,10 +927,82 @@ impl InventoryView {
         Ok(Self {
             usdc: cleared,
             last_updated: now,
-            equities: self.equities,
-            buying_power_cents: self.buying_power_cents,
-            offchain_gross_usd_cents: self.offchain_gross_usd_cents,
+            ..self
         })
+    }
+
+    /// Returns the aggregate ID of the in-flight USDC rebalance, if any.
+    #[cfg(test)]
+    pub(crate) fn active_usdc_rebalance(&self) -> Option<&UsdcRebalanceId> {
+        self.active_usdc_rebalance.as_ref()
+    }
+
+    /// Returns the aggregate ID of the in-flight mint for `symbol`, if any.
+    #[cfg(test)]
+    pub(crate) fn active_mint(&self, symbol: &Symbol) -> Option<&IssuerRequestId> {
+        self.active_mints.get(symbol)
+    }
+
+    /// Returns the aggregate ID of the in-flight redemption for `symbol`, if any.
+    #[cfg(test)]
+    pub(crate) fn active_redemption(&self, symbol: &Symbol) -> Option<&RedemptionAggregateId> {
+        self.active_redemptions.get(symbol)
+    }
+
+    /// Records `id` as the in-flight USDC rebalance.
+    pub(crate) fn set_active_usdc_rebalance(self, id: UsdcRebalanceId) -> Self {
+        Self {
+            active_usdc_rebalance: Some(id),
+            ..self
+        }
+    }
+
+    /// Clears the in-flight USDC rebalance ID (no-op if already empty).
+    pub(crate) fn clear_active_usdc_rebalance(self) -> Self {
+        Self {
+            active_usdc_rebalance: None,
+            ..self
+        }
+    }
+
+    /// Records `id` as the in-flight mint for `symbol`.
+    pub(crate) fn set_active_mint(self, symbol: Symbol, id: IssuerRequestId) -> Self {
+        let mut active_mints = self.active_mints;
+        active_mints.insert(symbol, id);
+        Self {
+            active_mints,
+            ..self
+        }
+    }
+
+    /// Clears the in-flight mint ID for `symbol` (no-op if absent).
+    pub(crate) fn clear_active_mint(self, symbol: &Symbol) -> Self {
+        let mut active_mints = self.active_mints;
+        active_mints.remove(symbol);
+        Self {
+            active_mints,
+            ..self
+        }
+    }
+
+    /// Records `id` as the in-flight redemption for `symbol`.
+    pub(crate) fn set_active_redemption(self, symbol: Symbol, id: RedemptionAggregateId) -> Self {
+        let mut active_redemptions = self.active_redemptions;
+        active_redemptions.insert(symbol, id);
+        Self {
+            active_redemptions,
+            ..self
+        }
+    }
+
+    /// Clears the in-flight redemption ID for `symbol` (no-op if absent).
+    pub(crate) fn clear_active_redemption(self, symbol: &Symbol) -> Self {
+        let mut active_redemptions = self.active_redemptions;
+        active_redemptions.remove(symbol);
+        Self {
+            active_redemptions,
+            ..self
+        }
     }
 
     /// Returns the set of symbols that currently have inflight balances
@@ -1199,7 +1289,6 @@ mod tests {
     use alloy::primitives::U256;
     use chrono::{Duration, Utc};
     use rain_math_float::Float;
-    use std::collections::HashMap;
 
     use st0x_finance::Usdc;
 
@@ -1446,9 +1535,7 @@ mod tests {
         InventoryView {
             usdc: usdc_make_inventory(1000, 0, 1000, 0),
             equities: equities.into_iter().collect(),
-            last_updated: Utc::now(),
-            buying_power_cents: None,
-            offchain_gross_usd_cents: None,
+            ..InventoryView::default()
         }
     }
 
@@ -1465,10 +1552,7 @@ mod tests {
                 offchain_available,
                 offchain_inflight,
             ),
-            equities: HashMap::new(),
-            last_updated: Utc::now(),
-            buying_power_cents: None,
-            offchain_gross_usd_cents: None,
+            ..InventoryView::default()
         }
     }
 
@@ -2035,9 +2119,7 @@ mod tests {
         let view = InventoryView {
             equities: std::iter::once((tsla, make_inventory(80, 20, 40, 10))).collect(),
             usdc: usdc_make_inventory(5000, 1000, 3000, 500),
-            last_updated: Utc::now(),
-            buying_power_cents: None,
-            offchain_gross_usd_cents: None,
+            ..InventoryView::default()
         };
 
         let dto = view.to_dto();
@@ -2077,9 +2159,7 @@ mod tests {
             ))
             .collect(),
             usdc: Inventory::default(),
-            last_updated: Utc::now(),
-            buying_power_cents: None,
-            offchain_gross_usd_cents: None,
+            ..InventoryView::default()
         };
 
         let dto = view.to_dto();
