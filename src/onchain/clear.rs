@@ -5,7 +5,7 @@ use alloy::primitives::Address;
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
-use tracing::{debug, info};
+use tracing::debug;
 
 use st0x_evm::Evm;
 
@@ -100,7 +100,7 @@ impl OnchainTrade {
                 .await;
 
         if let Ok(Some(ref trade)) = result {
-            info!(
+            debug!(
                 target: "hedge",
                 "ClearV3 trade created successfully: tx_hash={tx_hash:?}, log_index={log_index}, symbol={symbol}, amount={amount}, direction={direction:?}",
                 tx_hash = trade.tx_hash,

@@ -18,7 +18,7 @@ use std::sync::Arc;
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::Mutex;
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{debug, error, warn};
 
 use st0x_execution::Executor;
 
@@ -288,7 +288,7 @@ impl FailureInjector {
 
 fn log_processing(label: &Label, attempt: usize) {
     if attempt <= 1 {
-        info!(%label, "Processing job");
+        debug!(%label, "Processing job");
     } else {
         warn!(%label, attempt, "Retrying job after transient failure");
     }
