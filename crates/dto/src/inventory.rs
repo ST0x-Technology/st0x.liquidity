@@ -42,6 +42,34 @@ pub struct UsdcInventory {
     pub offchain_gross: Option<Usdc>,
     /// Margin-safe buying power from the offchain broker, formatted as USD string.
     pub buying_power: Option<String>,
+    /// USDC observed at intermediate wallet locations between venues.
+    pub inflight_cash: InFlightCash,
+}
+
+/// USDC sitting in wallets between venues, observed by polling.
+///
+/// `None` means the wallet has not been observed yet; `Some(ZERO)` means
+/// it was observed empty. The values are tracked separately from venue
+/// inventory and never feed into imbalance math.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct InFlightCash {
+    /// USDC parked on the Ethereum wallet between Alpaca and CCTP.
+    #[ts(type = "string | null")]
+    pub ethereum_wallet: Option<Usdc>,
+    /// USDC parked on the Base wallet between CCTP and the Raindex vaults.
+    #[ts(type = "string | null")]
+    pub base_wallet: Option<Usdc>,
+}
+
+impl InFlightCash {
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            ethereum_wallet: None,
+            base_wallet: None,
+        }
+    }
 }
 
 /// Full inventory snapshot across all symbols and USDC.
@@ -64,6 +92,7 @@ impl Inventory {
                 offchain_inflight: Usdc::ZERO,
                 offchain_gross: None,
                 buying_power: None,
+                inflight_cash: InFlightCash::empty(),
             },
         }
     }
@@ -101,6 +130,10 @@ mod tests {
                 offchain_inflight: Usdc::new(float!(500)),
                 offchain_gross: Some(Usdc::new(float!(6000))),
                 buying_power: Some("$4,500.00".to_string()),
+                inflight_cash: InFlightCash {
+                    ethereum_wallet: Some(Usdc::new(float!(250))),
+                    base_wallet: Some(Usdc::ZERO),
+                },
             },
         };
 
@@ -120,5 +153,7 @@ mod tests {
         assert_eq!(usdc["offchainInflight"], json!("500"));
         assert_eq!(usdc["offchainGross"], json!("6000"));
         assert_eq!(usdc["buyingPower"], json!("$4,500.00"));
+        assert_eq!(usdc["inflightCash"]["ethereumWallet"], json!("250"));
+        assert_eq!(usdc["inflightCash"]["baseWallet"], json!("0"));
     }
 }

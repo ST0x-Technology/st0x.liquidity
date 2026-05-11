@@ -304,6 +304,19 @@
         </Table.Cell>
         <Table.Cell class="text-right font-mono opacity-50">
           <span class={approxClass(cashRow.inflight)} title={cashRow.inflight.truncated ? cashRow.inflight.full : undefined}>{cashRow.inflight.display}</span>
+          {#if usdc?.inflightCash && (usdc.inflightCash.ethereumWallet !== null || usdc.inflightCash.baseWallet !== null)}
+            {@const eth = usdc.inflightCash.ethereumWallet === null ? null : fmt(usdc.inflightCash.ethereumWallet)}
+            {@const base = usdc.inflightCash.baseWallet === null ? null : fmt(usdc.inflightCash.baseWallet)}
+            <div class="text-xs text-muted-foreground" title="Wallet-observed USDC sitting between venues. Not part of imbalance math.">
+              {#if eth}
+                Eth: <span class={approxClass(eth)} title={eth.truncated ? eth.full : undefined}>{eth.display}</span>
+              {/if}
+              {#if eth && base} · {/if}
+              {#if base}
+                Base: <span class={approxClass(base)} title={base.truncated ? base.full : undefined}>{base.display}</span>
+              {/if}
+            </div>
+          {/if}
         </Table.Cell>
         <Table.Cell class="text-right font-mono opacity-90">
           <span class={approxClass(cashRow.raindex)} title={cashRow.raindex.truncated ? cashRow.raindex.full : undefined}>{cashRow.raindex.display}</span>

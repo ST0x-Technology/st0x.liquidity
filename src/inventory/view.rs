@@ -8,9 +8,9 @@ use chrono::{DateTime, Utc};
 use itertools::Itertools;
 use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, warn};
 
-use st0x_dto::{SymbolInventory, UsdcInventory};
+use st0x_dto::{InFlightCash, SymbolInventory, UsdcInventory};
 use st0x_execution::{Direction, FractionalShares, HasZero, Symbol};
 use st0x_finance::Usdc;
 use st0x_float_macro::float;
@@ -632,6 +632,36 @@ where
     }
 }
 
+/// Locations where USDC may sit in transit between venues.
+///
+/// These slots track wallet balances observed by polling rather than
+/// venue inventory. The underlying imbalance math
+/// ([`InventoryView::check_usdc_imbalance`]) operates strictly on venue
+/// totals so wallet readings can never compensate a real venue
+/// imbalance. Wallet-residue-driven suppression is deferred to a broader
+/// orphan-state detection mechanism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) enum InFlightCashLocation {
+    /// USDC parked on the Ethereum wallet between Alpaca withdrawal and
+    /// CCTP burn (or between CCTP mint and Alpaca deposit, depending on
+    /// direction).
+    EthereumWallet,
+    /// USDC parked on the Base wallet outside the Raindex vaults
+    /// (between vault withdrawal and CCTP burn, or between CCTP mint
+    /// and vault deposit).
+    BaseWallet,
+}
+
+/// A wallet-read USDC observation paired with the time it was fetched.
+///
+/// `fetched_at` discriminates concurrent or out-of-order snapshots so the
+/// view ignores readings older than the one it currently holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct InFlightCashEntry {
+    pub(crate) amount: Usdc,
+    pub(crate) fetched_at: DateTime<Utc>,
+}
+
 /// Cross-aggregate projection tracking inventory across venues.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct InventoryView {
@@ -644,6 +674,14 @@ pub(crate) struct InventoryView {
     /// Gross offchain USD balance in cents (before cash reserve subtraction).
     #[serde(default)]
     offchain_gross_usd_cents: Option<i64>,
+    /// USDC observed at intermediate locations between the two venues.
+    /// Populated from wallet-read snapshots and exposed for visibility
+    /// into in-flight transit. Does not feed the imbalance math.
+    ///
+    /// Each entry carries the snapshot's `fetched_at` so out-of-order
+    /// wallet polls cannot overwrite a fresher reading with a stale one.
+    #[serde(default)]
+    inflight_cash: HashMap<InFlightCashLocation, InFlightCashEntry>,
     /// Aggregate ID of the in-flight USDC rebalance, if any.
     ///
     /// Populated when a transfer initiates and cleared on terminal events.
@@ -696,6 +734,12 @@ impl InventoryView {
 
     /// Checks USDC inventory for imbalance against the threshold.
     /// Returns the imbalance if one exists.
+    ///
+    /// Wallet readings (`inflight_cash`) never enter the imbalance math:
+    /// the design explicitly keeps `check_usdc_imbalance` venue-only so
+    /// wallet observations cannot mask or compensate a real venue
+    /// imbalance. Suppression-based on wallet residue is tracked
+    /// separately by a broader orphan-state detection mechanism.
     pub(crate) fn check_usdc_imbalance(
         &self,
         threshold: &ImbalanceThreshold,
@@ -738,6 +782,17 @@ impl InventoryView {
 
         let offchain_gross = self.offchain_gross_usd_cents.and_then(Usdc::from_cents);
 
+        let inflight_cash = InFlightCash {
+            ethereum_wallet: self
+                .inflight_cash
+                .get(&InFlightCashLocation::EthereumWallet)
+                .map(|entry| entry.amount),
+            base_wallet: self
+                .inflight_cash
+                .get(&InFlightCashLocation::BaseWallet)
+                .map(|entry| entry.amount),
+        };
+
         st0x_dto::Inventory {
             per_symbol,
             usdc: UsdcInventory {
@@ -747,6 +802,7 @@ impl InventoryView {
                 offchain_inflight: usdc_offchain_inflight,
                 offchain_gross,
                 buying_power,
+                inflight_cash,
             },
         }
     }
@@ -773,6 +829,7 @@ impl Default for InventoryView {
             last_updated: Utc::now(),
             buying_power_cents: None,
             offchain_gross_usd_cents: None,
+            inflight_cash: HashMap::new(),
             active_usdc_rebalance: None,
             active_mints: HashMap::new(),
             active_redemptions: HashMap::new(),
@@ -856,6 +913,21 @@ impl InventoryView {
         }
     }
 
+    /// Returns the in-flight USDC observed at the given intermediate location.
+    #[cfg(test)]
+    pub(crate) fn inflight_cash_at(&self, location: InFlightCashLocation) -> Option<Usdc> {
+        self.inflight_cash.get(&location).map(|entry| entry.amount)
+    }
+
+    /// Returns a clone of the full in-flight cash map for use in tests
+    /// that need to assert no-op semantics across multiple events.
+    #[cfg(test)]
+    pub(crate) fn inflight_cash_snapshot(
+        &self,
+    ) -> HashMap<InFlightCashLocation, InFlightCashEntry> {
+        self.inflight_cash.clone()
+    }
+
     pub(crate) fn update_equity(
         self,
         symbol: &Symbol,
@@ -875,7 +947,13 @@ impl InventoryView {
         Ok(Self {
             equities,
             last_updated: now,
-            ..self
+            usdc: self.usdc,
+            buying_power_cents: self.buying_power_cents,
+            offchain_gross_usd_cents: self.offchain_gross_usd_cents,
+            inflight_cash: self.inflight_cash,
+            active_usdc_rebalance: self.active_usdc_rebalance,
+            active_mints: self.active_mints,
+            active_redemptions: self.active_redemptions,
         })
     }
 
@@ -889,8 +967,47 @@ impl InventoryView {
         Ok(Self {
             usdc: updated,
             last_updated: now,
-            ..self
+            equities: self.equities,
+            buying_power_cents: self.buying_power_cents,
+            offchain_gross_usd_cents: self.offchain_gross_usd_cents,
+            inflight_cash: self.inflight_cash,
+            active_usdc_rebalance: self.active_usdc_rebalance,
+            active_mints: self.active_mints,
+            active_redemptions: self.active_redemptions,
         })
+    }
+
+    /// Record the latest wallet-read USDC balance at an intermediate location.
+    ///
+    /// Wallet readings replace any prior value at the same location only when
+    /// the incoming `fetched_at` is at least as recent as the existing entry's.
+    /// Polls running concurrently against different RPC nodes can land out of
+    /// order, so dropping older snapshots prevents a stale reading from
+    /// overwriting a fresher one.
+    pub(crate) fn set_inflight_cash(
+        mut self,
+        location: InFlightCashLocation,
+        amount: Usdc,
+        fetched_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Self {
+        if let Some(existing) = self.inflight_cash.get(&location)
+            && existing.fetched_at > fetched_at
+        {
+            warn!(
+                target: "inventory",
+                ?location,
+                existing_fetched_at = ?existing.fetched_at,
+                incoming_fetched_at = ?fetched_at,
+                "ignoring stale inflight_cash snapshot",
+            );
+            return self;
+        }
+
+        self.inflight_cash
+            .insert(location, InFlightCashEntry { amount, fetched_at });
+        self.last_updated = now;
+        self
     }
 
     pub(crate) fn clear_equity_inflight(
@@ -912,7 +1029,13 @@ impl InventoryView {
         Ok(Self {
             equities,
             last_updated: now,
-            ..self
+            usdc: self.usdc,
+            buying_power_cents: self.buying_power_cents,
+            offchain_gross_usd_cents: self.offchain_gross_usd_cents,
+            inflight_cash: self.inflight_cash,
+            active_usdc_rebalance: self.active_usdc_rebalance,
+            active_mints: self.active_mints,
+            active_redemptions: self.active_redemptions,
         })
     }
 
@@ -927,7 +1050,13 @@ impl InventoryView {
         Ok(Self {
             usdc: cleared,
             last_updated: now,
-            ..self
+            equities: self.equities,
+            buying_power_cents: self.buying_power_cents,
+            offchain_gross_usd_cents: self.offchain_gross_usd_cents,
+            inflight_cash: self.inflight_cash,
+            active_usdc_rebalance: self.active_usdc_rebalance,
+            active_mints: self.active_mints,
+            active_redemptions: self.active_redemptions,
         })
     }
 
@@ -1178,10 +1307,27 @@ impl InventoryView {
                 })
             }
 
-            EthereumUsdc { .. }
-            | BaseWalletUsdc { .. }
-            | BaseWalletUnwrappedEquity { .. }
-            | BaseWalletWrappedEquity { .. } => Ok(self),
+            EthereumUsdc {
+                usdc_balance,
+                fetched_at,
+            } => Ok(self.set_inflight_cash(
+                InFlightCashLocation::EthereumWallet,
+                *usdc_balance,
+                *fetched_at,
+                now,
+            )),
+
+            BaseWalletUsdc {
+                usdc_balance,
+                fetched_at,
+            } => Ok(self.set_inflight_cash(
+                InFlightCashLocation::BaseWallet,
+                *usdc_balance,
+                *fetched_at,
+                now,
+            )),
+
+            BaseWalletUnwrappedEquity { .. } | BaseWalletWrappedEquity { .. } => Ok(self),
 
             InflightEquity {
                 mints, redemptions, ..
@@ -1270,10 +1416,27 @@ impl InventoryView {
                 ..self
             }),
 
-            EthereumUsdc { .. }
-            | BaseWalletUsdc { .. }
-            | BaseWalletUnwrappedEquity { .. }
-            | BaseWalletWrappedEquity { .. } => Ok(self),
+            EthereumUsdc {
+                usdc_balance,
+                fetched_at,
+            } => Ok(self.set_inflight_cash(
+                InFlightCashLocation::EthereumWallet,
+                *usdc_balance,
+                *fetched_at,
+                now,
+            )),
+
+            BaseWalletUsdc {
+                usdc_balance,
+                fetched_at,
+            } => Ok(self.set_inflight_cash(
+                InFlightCashLocation::BaseWallet,
+                *usdc_balance,
+                *fetched_at,
+                now,
+            )),
+
+            BaseWalletUnwrappedEquity { .. } | BaseWalletWrappedEquity { .. } => Ok(self),
 
             InflightEquity {
                 mints,
@@ -1287,7 +1450,8 @@ impl InventoryView {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::U256;
-    use chrono::{Duration, Utc};
+    use chrono::{Duration, TimeZone, Utc};
+    use proptest::prelude::*;
     use rain_math_float::Float;
 
     use st0x_finance::Usdc;
@@ -1535,7 +1699,13 @@ mod tests {
         InventoryView {
             usdc: usdc_make_inventory(1000, 0, 1000, 0),
             equities: equities.into_iter().collect(),
-            ..InventoryView::default()
+            last_updated: Utc::now(),
+            buying_power_cents: None,
+            offchain_gross_usd_cents: None,
+            inflight_cash: HashMap::new(),
+            active_usdc_rebalance: None,
+            active_mints: HashMap::new(),
+            active_redemptions: HashMap::new(),
         }
     }
 
@@ -1552,7 +1722,14 @@ mod tests {
                 offchain_available,
                 offchain_inflight,
             ),
-            ..InventoryView::default()
+            equities: HashMap::new(),
+            last_updated: Utc::now(),
+            buying_power_cents: None,
+            offchain_gross_usd_cents: None,
+            inflight_cash: HashMap::new(),
+            active_usdc_rebalance: None,
+            active_mints: HashMap::new(),
+            active_redemptions: HashMap::new(),
         }
     }
 
@@ -1793,6 +1970,240 @@ mod tests {
         assert_eq!(
             view.check_usdc_imbalance(&threshold("0.5", "0.3")).unwrap(),
             None
+        );
+    }
+
+    /// Wallet-read events must populate `inflight_cash` rather than the
+    /// venue inventory slots. The venue snapshot semantics ("wallet
+    /// balances are a transfer-in-progress signal, not part of the
+    /// imbalance math") depend on this separation.
+    #[test]
+    fn apply_snapshot_event_populates_inflight_cash_for_ethereum_usdc() {
+        let view = InventoryView::default();
+        let now = Utc::now();
+        let balance = Usdc::new(float!(123));
+
+        let updated = view
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::EthereumUsdc {
+                    usdc_balance: balance,
+                    fetched_at: now,
+                },
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(
+            updated.inflight_cash_at(InFlightCashLocation::EthereumWallet),
+            Some(balance),
+            "EthereumUsdc must populate the Ethereum inflight cash slot",
+        );
+        assert_eq!(
+            updated.inflight_cash_at(InFlightCashLocation::BaseWallet),
+            None,
+            "Ethereum event must not touch the BaseWallet slot",
+        );
+        assert_eq!(
+            updated.usdc_available(Venue::MarketMaking),
+            None,
+            "EthereumUsdc must not initialize venue inventory",
+        );
+        assert_eq!(updated.usdc_available(Venue::Hedging), None);
+    }
+
+    #[test]
+    fn apply_snapshot_event_populates_inflight_cash_for_base_wallet_usdc() {
+        let view = InventoryView::default();
+        let now = Utc::now();
+        let balance = Usdc::new(float!(45));
+
+        let updated = view
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::BaseWalletUsdc {
+                    usdc_balance: balance,
+                    fetched_at: now,
+                },
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(
+            updated.inflight_cash_at(InFlightCashLocation::BaseWallet),
+            Some(balance),
+            "BaseWalletUsdc must populate the BaseWallet inflight cash slot",
+        );
+        assert_eq!(
+            updated.inflight_cash_at(InFlightCashLocation::EthereumWallet),
+            None,
+            "BaseWallet event must not touch the Ethereum slot",
+        );
+    }
+
+    /// The two inflight tracking systems must remain independent: the
+    /// per-venue `Inventory<Usdc>::inflight` (managed by transfer
+    /// lifecycle events) and the location-keyed `inflight_cash` map
+    /// (populated by wallet polls) describe different things and can
+    /// legitimately coexist mid-transfer.
+    #[test]
+    fn venue_inflight_and_inflight_cash_are_tracked_independently() {
+        let now = Utc::now();
+        let view = make_usdc_view(700, 200, 100, 0)
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::EthereumUsdc {
+                    usdc_balance: Usdc::new(float!(50)),
+                    fetched_at: now,
+                },
+                now,
+            )
+            .unwrap();
+
+        // Venue-level inflight remains exactly as constructed
+        assert_eq!(
+            view.usdc_inflight(Venue::MarketMaking),
+            Some(Usdc::new(float!(200))),
+        );
+        // Wallet-level inflight is captured separately
+        assert_eq!(
+            view.inflight_cash_at(InFlightCashLocation::EthereumWallet),
+            Some(Usdc::new(float!(50))),
+        );
+    }
+
+    /// Wallet balances must NOT enter the imbalance math. The design
+    /// explicitly keeps `check_usdc_imbalance` operating on venue totals
+    /// only, so wallet readings can never mask or compensate a real venue
+    /// imbalance. Wallet-residue-driven suppression is deferred to a
+    /// broader orphan-state detection mechanism, where distinguishing
+    /// "in-flight" from "settled-with-baseline" requires transfer history.
+    #[test]
+    fn wallet_balances_do_not_enter_imbalance_math() {
+        let now = Utc::now();
+        let imbalance_without_wallet = make_usdc_view(900, 0, 100, 0)
+            .check_usdc_imbalance(&threshold("0.5", "0.3"))
+            .unwrap();
+        assert!(
+            matches!(
+                imbalance_without_wallet,
+                Some(Imbalance::TooMuchOnchain { .. })
+            ),
+            "venue imbalance is detected without wallet noise, got {imbalance_without_wallet:?}",
+        );
+
+        let with_huge_wallet = make_usdc_view(900, 0, 100, 0)
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::BaseWalletUsdc {
+                    usdc_balance: Usdc::new(float!(10000)),
+                    fetched_at: now,
+                },
+                now,
+            )
+            .unwrap();
+        let imbalance_with_wallet = with_huge_wallet
+            .check_usdc_imbalance(&threshold("0.5", "0.3"))
+            .unwrap();
+        assert_eq!(
+            imbalance_without_wallet, imbalance_with_wallet,
+            "wallet readings must not alter the imbalance answer",
+        );
+    }
+
+    /// `force_apply_snapshot_event` must wire the same wallet-read events
+    /// so recovery paths produce identical inflight_cash bookkeeping.
+    #[test]
+    fn force_apply_snapshot_event_also_populates_inflight_cash() {
+        let now = Utc::now();
+        let reason = std::sync::Arc::new(InventoryViewError::UsdBalanceConversion(-1));
+        let view = InventoryView::default()
+            .force_apply_snapshot_event(
+                &InventorySnapshotEvent::EthereumUsdc {
+                    usdc_balance: Usdc::new(float!(7)),
+                    fetched_at: now,
+                },
+                now,
+                reason.clone(),
+            )
+            .unwrap()
+            .force_apply_snapshot_event(
+                &InventorySnapshotEvent::BaseWalletUsdc {
+                    usdc_balance: Usdc::new(float!(8)),
+                    fetched_at: now,
+                },
+                now,
+                reason,
+            )
+            .unwrap();
+
+        assert_eq!(
+            view.inflight_cash_at(InFlightCashLocation::EthereumWallet),
+            Some(Usdc::new(float!(7))),
+        );
+        assert_eq!(
+            view.inflight_cash_at(InFlightCashLocation::BaseWallet),
+            Some(Usdc::new(float!(8))),
+        );
+    }
+
+    /// A wallet poll whose `fetched_at` predates the entry already on file
+    /// must not overwrite it. Polls running concurrently against different
+    /// RPC nodes can land out of order; honouring the older one would let
+    /// stale balances replace fresher ones.
+    #[test]
+    fn set_inflight_cash_ignores_stale_fetched_at() {
+        let earlier = Utc::now();
+        let later = earlier + Duration::seconds(30);
+        let fresh_fetched_at = earlier;
+        let stale_fetched_at = earlier - Duration::seconds(10);
+
+        let view = InventoryView::default()
+            .set_inflight_cash(
+                InFlightCashLocation::EthereumWallet,
+                Usdc::new(float!(100)),
+                fresh_fetched_at,
+                earlier,
+            )
+            .set_inflight_cash(
+                InFlightCashLocation::EthereumWallet,
+                Usdc::new(float!(7)),
+                stale_fetched_at,
+                later,
+            );
+
+        assert_eq!(
+            view.inflight_cash_at(InFlightCashLocation::EthereumWallet),
+            Some(Usdc::new(float!(100))),
+            "stale snapshot must not overwrite fresher entry",
+        );
+        assert_eq!(
+            view.last_updated, earlier,
+            "dropping a stale snapshot must not advance last_updated",
+        );
+    }
+
+    /// A snapshot whose `fetched_at` matches the existing entry must
+    /// still replace it. Equal timestamps from the same poll cycle should
+    /// not be treated as stale.
+    #[test]
+    fn set_inflight_cash_replaces_when_fetched_at_equals_existing() {
+        let fetched_at = Utc::now();
+        let now = fetched_at;
+
+        let view = InventoryView::default()
+            .set_inflight_cash(
+                InFlightCashLocation::BaseWallet,
+                Usdc::new(float!(50)),
+                fetched_at,
+                now,
+            )
+            .set_inflight_cash(
+                InFlightCashLocation::BaseWallet,
+                Usdc::new(float!(75)),
+                fetched_at,
+                now,
+            );
+
+        assert_eq!(
+            view.inflight_cash_at(InFlightCashLocation::BaseWallet),
+            Some(Usdc::new(float!(75))),
         );
     }
 
@@ -2119,7 +2530,13 @@ mod tests {
         let view = InventoryView {
             equities: std::iter::once((tsla, make_inventory(80, 20, 40, 10))).collect(),
             usdc: usdc_make_inventory(5000, 1000, 3000, 500),
-            ..InventoryView::default()
+            last_updated: Utc::now(),
+            buying_power_cents: None,
+            offchain_gross_usd_cents: None,
+            inflight_cash: HashMap::new(),
+            active_usdc_rebalance: None,
+            active_mints: HashMap::new(),
+            active_redemptions: HashMap::new(),
         };
 
         let dto = view.to_dto();
@@ -2159,7 +2576,13 @@ mod tests {
             ))
             .collect(),
             usdc: Inventory::default(),
-            ..InventoryView::default()
+            last_updated: Utc::now(),
+            buying_power_cents: None,
+            offchain_gross_usd_cents: None,
+            inflight_cash: HashMap::new(),
+            active_usdc_rebalance: None,
+            active_mints: HashMap::new(),
+            active_redemptions: HashMap::new(),
         };
 
         let dto = view.to_dto();
@@ -2171,6 +2594,46 @@ mod tests {
 
         assert_eq!(dto.usdc.onchain_available, Usdc::ZERO);
         assert_eq!(dto.usdc.offchain_available, Usdc::ZERO);
+    }
+
+    /// `to_dto` must expose `inflight_cash` so the dashboard can see USDC
+    /// observed in transit between venues. Locations that have not yet
+    /// been polled remain `None`; observed locations expose their amount.
+    #[test]
+    fn to_dto_includes_inflight_cash() {
+        let fetched_at = Utc::now();
+        let view = InventoryView::default()
+            .set_inflight_cash(
+                InFlightCashLocation::EthereumWallet,
+                Usdc::new(float!(250)),
+                fetched_at,
+                fetched_at,
+            )
+            .set_inflight_cash(
+                InFlightCashLocation::BaseWallet,
+                Usdc::ZERO,
+                fetched_at,
+                fetched_at,
+            );
+
+        let dto = view.to_dto();
+
+        assert_eq!(
+            dto.usdc.inflight_cash.ethereum_wallet,
+            Some(Usdc::new(float!(250)))
+        );
+        assert_eq!(dto.usdc.inflight_cash.base_wallet, Some(Usdc::ZERO));
+    }
+
+    /// Locations that have never been observed must surface as `None` in
+    /// the DTO so the dashboard can distinguish "not polled yet" from
+    /// "observed as zero".
+    #[test]
+    fn to_dto_inflight_cash_is_none_for_unobserved_locations() {
+        let dto = InventoryView::default().to_dto();
+
+        assert_eq!(dto.usdc.inflight_cash.ethereum_wallet, None);
+        assert_eq!(dto.usdc.inflight_cash.base_wallet, None);
     }
 
     #[test]
@@ -2252,5 +2715,141 @@ mod tests {
             shares(40),
             "Available should reflect the transfer (50 - 10 moved to inflight)"
         );
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct SetInflightCashCall {
+        location: InFlightCashLocation,
+        amount: Usdc,
+        fetched_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    }
+
+    fn arb_location() -> impl Strategy<Value = InFlightCashLocation> {
+        use InFlightCashLocation::{BaseWallet, EthereumWallet};
+        prop_oneof![Just(EthereumWallet), Just(BaseWallet)]
+    }
+
+    fn arb_usdc() -> impl Strategy<Value = Usdc> {
+        (0i64..1_000_000_000)
+            .prop_map(|cents| Usdc::from_cents(cents).expect("in-range cents are valid Usdc"))
+    }
+
+    /// Bounded so `Utc.timestamp_millis_opt` is always representable.
+    fn arb_timestamp() -> impl Strategy<Value = DateTime<Utc>> {
+        (0i64..i64::from(u32::MAX)).prop_map(|millis| {
+            Utc.timestamp_millis_opt(millis)
+                .single()
+                .expect("bounded millis are representable")
+        })
+    }
+
+    fn arb_call() -> impl Strategy<Value = SetInflightCashCall> {
+        (arb_location(), arb_usdc(), arb_timestamp(), arb_timestamp()).prop_map(
+            |(location, amount, fetched_at, now)| SetInflightCashCall {
+                location,
+                amount,
+                fetched_at,
+                now,
+            },
+        )
+    }
+
+    fn apply_calls(calls: &[SetInflightCashCall]) -> InventoryView {
+        calls.iter().fold(InventoryView::default(), |view, call| {
+            view.set_inflight_cash(call.location, call.amount, call.fetched_at, call.now)
+        })
+    }
+
+    fn dto_slot(dto: &st0x_dto::Inventory, location: InFlightCashLocation) -> Option<Usdc> {
+        use InFlightCashLocation::{BaseWallet, EthereumWallet};
+        match location {
+            EthereumWallet => dto.usdc.inflight_cash.ethereum_wallet,
+            BaseWallet => dto.usdc.inflight_cash.base_wallet,
+        }
+    }
+
+    const LOCATIONS: [InFlightCashLocation; 2] = [
+        InFlightCashLocation::EthereumWallet,
+        InFlightCashLocation::BaseWallet,
+    ];
+
+    proptest! {
+        /// Each slot must equal the amount from the call with the maximum
+        /// `fetched_at` for that location. `max_by_key` keeps the latest
+        /// tie, matching the "equal timestamps replace" semantics.
+        #[test]
+        fn set_inflight_cash_keeps_freshest_per_location(
+            calls in prop::collection::vec(arb_call(), 0..16),
+        ) {
+            let dto = apply_calls(&calls).to_dto();
+
+            for location in LOCATIONS {
+                let expected = calls
+                    .iter()
+                    .filter(|call| call.location == location)
+                    .max_by_key(|call| call.fetched_at)
+                    .map(|call| call.amount);
+
+                prop_assert_eq!(dto_slot(&dto, location), expected);
+            }
+        }
+
+        /// Writes targeting one location must never mutate the other slot.
+        #[test]
+        fn set_inflight_cash_does_not_touch_other_location(
+            mut calls in prop::collection::vec(arb_call(), 1..16),
+            untouched in arb_location(),
+        ) {
+            use InFlightCashLocation::{BaseWallet, EthereumWallet};
+
+            let target = match untouched {
+                EthereumWallet => BaseWallet,
+                BaseWallet => EthereumWallet,
+            };
+            for call in &mut calls {
+                call.location = target;
+            }
+
+            let dto = apply_calls(&calls).to_dto();
+            prop_assert_eq!(dto_slot(&dto, untouched), None);
+        }
+
+        /// `last_updated` must equal the `now` of the most recent accepted
+        /// call. Stale calls (fetched_at strictly older than the entry on
+        /// file) must not advance the clock.
+        #[test]
+        fn set_inflight_cash_last_updated_advances_only_on_accept(
+            calls in prop::collection::vec(arb_call(), 1..16),
+        ) {
+            let mut stored: HashMap<InFlightCashLocation, DateTime<Utc>> = HashMap::new();
+            let mut expected: Option<DateTime<Utc>> = None;
+
+            for call in &calls {
+                if stored.get(&call.location).is_none_or(|seen| *seen <= call.fetched_at) {
+                    stored.insert(call.location, call.fetched_at);
+                    expected = Some(call.now);
+                }
+            }
+
+            prop_assert_eq!(
+                apply_calls(&calls).last_updated,
+                expected.expect("first call always accepts against an empty map"),
+            );
+        }
+
+        /// The DTO slot must equal the view's stored amount at every
+        /// location for any sequence of writes.
+        #[test]
+        fn to_dto_round_trips_inflight_cash(
+            calls in prop::collection::vec(arb_call(), 0..16),
+        ) {
+            let view = apply_calls(&calls);
+            let dto = view.to_dto();
+
+            for location in LOCATIONS {
+                prop_assert_eq!(dto_slot(&dto, location), view.inflight_cash_at(location));
+            }
+        }
     }
 }
