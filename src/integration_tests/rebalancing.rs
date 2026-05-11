@@ -30,6 +30,7 @@ use st0x_finance::{Usd, Usdc};
 
 use super::{ExpectedEvent, assert_events, fetch_events};
 use crate::bindings::{IERC20, TestERC20};
+use crate::conductor::setup_apalis_tables;
 use crate::config::{
     AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, OperationMode,
 };
@@ -42,6 +43,7 @@ use crate::position::{Position, PositionCommand, TradeId};
 use crate::rebalancing::equity::mock::MockCrossVenueEquityTransfer;
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, Equity, EquityTransferServices};
 use crate::rebalancing::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
+use crate::rebalancing::usdc::TransferUsdcToHedgingJobQueue;
 use crate::rebalancing::usdc::mock::MockUsdcRebalance;
 use crate::rebalancing::{
     Rebalancer, RebalancingTrigger, RebalancingTriggerConfig, TriggeredOperation,
@@ -109,6 +111,32 @@ async fn discover_deterministic_tx_hash(
     provider.anvil_revert(snapshot_id).await.unwrap();
 
     tx_hash
+}
+
+/// Reads the single enqueued `TransferUsdcToHedging` payload from the
+/// apalis Jobs table and asserts its `amount` field equals
+/// `expected_amount` (encoded the same way `Usdc` serialises -- as a
+/// decimal string).
+async fn assert_enqueued_transfer_amount(
+    pool: &SqlitePool,
+    expected_amount: &str,
+    context: &'static str,
+) {
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(
+            &sqlx::query_scalar::<_, Vec<u8>>("SELECT job FROM Jobs LIMIT 1")
+                .fetch_one(pool)
+                .await
+                .unwrap_or_else(|error| panic!("{context}: {error}")),
+        )
+        .unwrap()
+        .get("amount")
+        .expect("Job payload should carry the requested amount")
+        .as_str()
+        .expect("amount serialises as string"),
+        expected_amount,
+        "{context}",
+    );
 }
 
 fn test_trigger_config() -> RebalancingTriggerConfig {
@@ -571,11 +599,13 @@ async fn equity_offchain_imbalance_triggers_mint() {
     let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
     let mock_usdc = Arc::new(MockUsdcRebalance::new());
 
+    setup_apalis_tables(&pool).await.unwrap();
+
     let rebalancer = Rebalancer::new(
         equity_transfer as _,
         mock_equity as _,
         Arc::clone(&mock_usdc) as _,
-        mock_usdc as _,
+        TransferUsdcToHedgingJobQueue::new(&pool),
         receiver,
         Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -785,11 +815,12 @@ async fn equity_onchain_imbalance_triggers_redemption() {
 
     let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
     let usdc = Arc::new(MockUsdcRebalance::new());
+    setup_apalis_tables(&pool).await.unwrap();
     let rebalancer = Rebalancer::new(
         Arc::clone(&mock_equity) as _,
         equity_transfer as _,
         Arc::clone(&usdc) as _,
-        usdc as _,
+        TransferUsdcToHedgingJobQueue::new(&pool),
         receiver,
         Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1002,11 +1033,13 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
     let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
     let usdc = Arc::new(MockUsdcRebalance::new());
 
+    setup_apalis_tables(&pool).await.unwrap();
+
     let rebalancer = Rebalancer::new(
         Arc::clone(&mock_equity) as _,
         mock_equity as _,
         Arc::clone(&usdc) as _,
-        usdc.clone() as _,
+        TransferUsdcToHedgingJobQueue::new(&pool),
         receiver,
         Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1081,11 +1114,13 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
     let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
     let usdc = Arc::new(MockUsdcRebalance::new());
 
+    setup_apalis_tables(&pool).await.unwrap();
+
     let rebalancer = Rebalancer::new(
         Arc::clone(&mock_equity) as _,
         mock_equity as _,
         Arc::clone(&usdc) as _,
-        usdc.clone() as _,
+        TransferUsdcToHedgingJobQueue::new(&pool),
         receiver,
         Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1097,21 +1132,18 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
 
     rebalancer.run().await;
 
+    assert_enqueued_transfer_amount(
+        &pool,
+        "400",
+        "Expected excess of $400 (actual $900 - target $500)",
+    )
+    .await;
+
     assert_eq!(
         usdc.base_to_alpaca_calls(),
-        1,
-        "Expected USDC manager to be called once for base_to_alpaca"
+        0,
+        "Base-to-Alpaca trait impl should no longer be called directly"
     );
-
-    let call = usdc
-        .last_base_to_alpaca_call()
-        .expect("Expected a captured call");
-    assert_eq!(
-        call.amount,
-        Usdc::new(float!(400)),
-        "Expected excess of $400 (actual $900 - target $500)"
-    );
-
     assert_eq!(
         usdc.alpaca_to_base_calls(),
         0,
@@ -1247,11 +1279,13 @@ async fn cash_reserve_shifts_offchain_balance_triggering_base_to_alpaca() {
     let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
     let usdc = Arc::new(MockUsdcRebalance::new());
 
+    setup_apalis_tables(&pool).await.unwrap();
+
     let rebalancer = Rebalancer::new(
         Arc::clone(&mock_equity) as _,
         mock_equity as _,
         Arc::clone(&usdc) as _,
-        usdc.clone() as _,
+        TransferUsdcToHedgingJobQueue::new(&pool),
         receiver,
         Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1267,21 +1301,18 @@ async fn cash_reserve_shifts_offchain_balance_triggering_base_to_alpaca() {
 
     rebalancer.run().await;
 
+    assert_enqueued_transfer_amount(
+        &pool,
+        "150",
+        "Expected excess of $150 (actual $500 - target $350)",
+    )
+    .await;
+
     assert_eq!(
         usdc.base_to_alpaca_calls(),
-        1,
-        "Reserve-shifted imbalance should trigger base_to_alpaca"
+        0,
+        "Base-to-Alpaca trait impl should no longer be called directly"
     );
-
-    let call = usdc
-        .last_base_to_alpaca_call()
-        .expect("Expected a captured call");
-    assert_eq!(
-        call.amount,
-        Usdc::new(float!(150)),
-        "Expected excess of $150 (actual $500 - target $350)"
-    );
-
     assert_eq!(
         usdc.alpaca_to_base_calls(),
         0,
@@ -1432,11 +1463,13 @@ async fn mint_api_failure_produces_rejected_event() {
     let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
     let mock_usdc = Arc::new(MockUsdcRebalance::new());
 
+    setup_apalis_tables(&pool).await.unwrap();
+
     let rebalancer = Rebalancer::new(
         equity_transfer as _,
         mock_equity as _,
         Arc::clone(&mock_usdc) as _,
-        mock_usdc as _,
+        TransferUsdcToHedgingJobQueue::new(&pool),
         receiver,
         Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),

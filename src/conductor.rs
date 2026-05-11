@@ -58,6 +58,7 @@ use crate::onchain::trade::{RaindexTradeEvent, extract_owned_vaults, extract_vau
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
+use crate::rebalancing::usdc::{BaseToAlpacaTransfer, TransferUsdcToHedgingJobQueue};
 use crate::rebalancing::{
     RebalancerServices, RebalancingCqrsFrameworks, RebalancingCtx, RebalancingTrigger,
     RebalancingTriggerConfig,
@@ -184,6 +185,7 @@ impl Conductor {
         setup_apalis_tables(&pool).await?;
         let job_queue = DexTradeAccountingJobQueue::new(&pool);
         let backfill_queue = BackfillJobQueue::new(&pool);
+        let transfer_usdc_to_hedging_queue = TransferUsdcToHedgingJobQueue::new(&pool);
 
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
             .build(())
@@ -209,6 +211,7 @@ impl Conductor {
             rebalancer,
             wallet_polling,
             tokenizer,
+            transfer_usdc_to_hedging,
         } = PositionAndRebalancing::setup(
             rebalancing,
             &ctx,
@@ -217,6 +220,7 @@ impl Conductor {
             event_sender,
             vault_registry.clone(),
             vault_registry_projection.clone(),
+            transfer_usdc_to_hedging_queue.clone(),
         )
         .await?;
 
@@ -276,6 +280,7 @@ impl Conductor {
             pool,
             wallet_polling,
             tokenizer,
+            transfer_usdc_to_hedging,
             #[cfg(any(test, feature = "test-support"))]
             failure_injector: ctx.failure_injector.clone(),
         };
@@ -289,6 +294,7 @@ impl Conductor {
             .reconcile_queue(reconcile_queue)
             .rejection_queue(rejection_queue)
             .poll_inventory_queue(poll_inventory_queue)
+            .transfer_usdc_to_hedging_queue(transfer_usdc_to_hedging_queue)
             .maybe_executor_maintenance(executor_maintenance)
             .maybe_rebalancer(rebalancer)
             .job_cleanup(job_cleanup)
@@ -437,6 +443,7 @@ struct RebalancingInfrastructure {
     snapshot: Arc<Store<InventorySnapshot>>,
     rebalancer: JoinHandle<()>,
     tokenizer: Arc<dyn Tokenizer>,
+    transfer_usdc_to_hedging: Arc<dyn BaseToAlpacaTransfer>,
 }
 
 /// Shared infrastructure dependencies needed to spawn rebalancing.
@@ -447,6 +454,7 @@ struct RebalancingDeps {
     event_sender: broadcast::Sender<Statement>,
     vault_registry: Arc<Store<VaultRegistry>>,
     vault_registry_projection: Arc<Projection<VaultRegistry>>,
+    transfer_usdc_to_hedging_queue: TransferUsdcToHedgingJobQueue,
 }
 
 /// Position + rebalancing-adjacent infrastructure produced during conductor
@@ -461,6 +469,7 @@ struct PositionAndRebalancing {
     rebalancer: Option<JoinHandle<()>>,
     wallet_polling: Option<crate::inventory::WalletPollingCtx>,
     tokenizer: Option<Arc<dyn Tokenizer>>,
+    transfer_usdc_to_hedging: Option<Arc<dyn BaseToAlpacaTransfer>>,
 }
 
 impl PositionAndRebalancing {
@@ -472,6 +481,7 @@ impl PositionAndRebalancing {
         event_sender: broadcast::Sender<Statement>,
         vault_registry: Arc<Store<VaultRegistry>>,
         vault_registry_projection: Arc<Projection<VaultRegistry>>,
+        transfer_usdc_to_hedging_queue: TransferUsdcToHedgingJobQueue,
     ) -> anyhow::Result<Self> {
         if let Some(rebalancing_ctx) = rebalancing {
             let wallet_ctx = ctx.wallet()?;
@@ -490,6 +500,7 @@ impl PositionAndRebalancing {
                     event_sender,
                     vault_registry,
                     vault_registry_projection,
+                    transfer_usdc_to_hedging_queue,
                 },
             )
             .await?;
@@ -508,6 +519,7 @@ impl PositionAndRebalancing {
                 rebalancer: Some(infra.rebalancer),
                 wallet_polling: Some(wallet_polling),
                 tokenizer: Some(infra.tokenizer),
+                transfer_usdc_to_hedging: Some(infra.transfer_usdc_to_hedging),
             })
         } else {
             let (position, position_projection) = build_position_cqrs(pool).await?;
@@ -527,6 +539,7 @@ impl PositionAndRebalancing {
                 rebalancer: None,
                 wallet_polling: None,
                 tokenizer: None,
+                transfer_usdc_to_hedging: None,
             })
         }
     }
@@ -739,13 +752,14 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             .and_then(|cash| cash.vault_ids.first().copied())
             .ok_or(CtxError::MissingCashVaultId)?;
 
-        let handle = services.spawn(
+        let (handle, transfer_usdc_to_hedging) = services.spawn(
             market_maker_wallet,
             RaindexVaultId(usdc_vault_id),
             operation_receiver,
             frameworks,
             equity_in_progress,
             usdc_in_progress,
+            deps.transfer_usdc_to_hedging_queue,
         );
 
         Ok(RebalancingInfrastructure {
@@ -754,6 +768,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             snapshot: built.snapshot,
             rebalancer: handle,
             tokenizer,
+            transfer_usdc_to_hedging,
         })
     })
 }

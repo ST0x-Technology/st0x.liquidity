@@ -38,6 +38,10 @@ use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::raindex::RaindexService;
 use crate::onchain_trade::OnChainTrade;
 use crate::position::Position;
+use crate::rebalancing::usdc::{
+    BaseToAlpacaTransfer, TransferUsdcToHedging, TransferUsdcToHedgingCtx,
+    TransferUsdcToHedgingJobQueue,
+};
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::ExecutionThreshold;
 use crate::tokenization::Tokenizer;
@@ -69,6 +73,10 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
     pub(crate) pool: SqlitePool,
     pub(crate) wallet_polling: Option<WalletPollingCtx>,
     pub(crate) tokenizer: Option<Arc<dyn Tokenizer>>,
+    /// `Some` whenever the rebalancer is configured. The
+    /// [`TransferUsdcToHedging`] worker is only registered when this is
+    /// present.
+    pub(crate) transfer_usdc_to_hedging: Option<Arc<dyn BaseToAlpacaTransfer>>,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) failure_injector: FailureInjector,
 }
@@ -84,6 +92,7 @@ pub(crate) fn spawn<Prov, Exec>(
     reconcile_queue: ReconcileOrderFillJobQueue,
     rejection_queue: HandleOrderRejectionJobQueue,
     poll_inventory_queue: PollInventoryJobQueue,
+    transfer_usdc_to_hedging_queue: TransferUsdcToHedgingJobQueue,
     job_cleanup: JoinHandle<()>,
     executor_maintenance: Option<JoinHandle<()>>,
     rebalancer: Option<JoinHandle<()>>,
@@ -245,6 +254,10 @@ where
         reconcile_queue,
         rejection_queue,
         poll_inventory_queue,
+        transfer_usdc_to_hedging_queue,
+        transfer_usdc_to_hedging_ctx: context
+            .transfer_usdc_to_hedging
+            .map(|transfer| Arc::new(TransferUsdcToHedgingCtx { transfer })),
         #[cfg(any(test, feature = "test-support"))]
         failure_injector: context.failure_injector,
     });
@@ -281,6 +294,10 @@ where
     reconcile_queue: ReconcileOrderFillJobQueue,
     rejection_queue: HandleOrderRejectionJobQueue,
     poll_inventory_queue: PollInventoryJobQueue,
+    transfer_usdc_to_hedging_queue: TransferUsdcToHedgingJobQueue,
+    /// `Some` only when the rebalancer is configured; otherwise no
+    /// worker is registered to drain the queue.
+    transfer_usdc_to_hedging_ctx: Option<Arc<TransferUsdcToHedgingCtx>>,
     #[cfg(any(test, feature = "test-support"))]
     failure_injector: FailureInjector,
 }
@@ -308,6 +325,8 @@ where
         reconcile_queue,
         rejection_queue,
         poll_inventory_queue,
+        transfer_usdc_to_hedging_queue,
+        transfer_usdc_to_hedging_ctx,
         #[cfg(any(test, feature = "test-support"))]
         failure_injector,
     } = wiring;
@@ -324,6 +343,8 @@ where
     let failure_injector_for_rejection = failure_injector.clone();
     #[cfg(any(test, feature = "test-support"))]
     let failure_injector_for_poll_inventory = failure_injector.clone();
+    #[cfg(any(test, feature = "test-support"))]
+    let failure_injector_for_transfer = failure_injector.clone();
     let failure_notify = Arc::new(tokio::sync::Notify::new());
     let failure_notify_for_hedge = failure_notify.clone();
     let failure_notify_for_backfill = failure_notify.clone();
@@ -331,6 +352,7 @@ where
     let failure_notify_for_reconcile = failure_notify.clone();
     let failure_notify_for_rejection = failure_notify.clone();
     let failure_notify_for_poll_inventory = failure_notify.clone();
+    let failure_notify_for_transfer = failure_notify.clone();
     let failure_notify_for_select = failure_notify.clone();
 
     let fail_stop = CircuitBreakerConfig::default()
@@ -342,6 +364,7 @@ where
     let fail_stop_for_reconcile = fail_stop.clone();
     let fail_stop_for_rejection = fail_stop.clone();
     let fail_stop_for_poll_inventory = fail_stop.clone();
+    let fail_stop_for_transfer = fail_stop.clone();
 
     let accountant_ctx_for_backfill = accountant_ctx.clone();
 
@@ -359,7 +382,24 @@ where
                     #[cfg(any(test, feature = "test-support"))]
                     failure_injector.clone(),
                 )
+            });
+        let apalis_monitor = if let Some(transfer_ctx) = transfer_usdc_to_hedging_ctx {
+            apalis_monitor.register(move |index| {
+                build_supervised_worker!(
+                    ::<TransferUsdcToHedgingCtx, TransferUsdcToHedging>,
+                    index,
+                    transfer_usdc_to_hedging_queue.clone(),
+                    transfer_ctx.clone(),
+                    fail_stop_for_transfer.clone(),
+                    failure_notify_for_transfer.clone(),
+                    #[cfg(any(test, feature = "test-support"))]
+                    failure_injector_for_transfer.clone(),
+                )
             })
+        } else {
+            apalis_monitor
+        };
+        let apalis_monitor = apalis_monitor
             .register(move |index| {
                 build_supervised_worker!(
                     ::<HedgeCtx, PlaceHedge>,

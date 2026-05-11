@@ -16,7 +16,7 @@ use st0x_execution::{
 };
 
 use super::equity::CrossVenueEquityTransfer;
-use super::usdc::CrossVenueCashTransfer;
+use super::usdc::{BaseToAlpacaTransfer, CrossVenueCashTransfer, TransferUsdcToHedgingJobQueue};
 use super::{Rebalancer, RebalancingCtx, TriggeredOperation};
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::config::EquityAssetConfig;
@@ -121,7 +121,8 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
         frameworks: RebalancingCqrsFrameworks,
         equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
         usdc_in_progress: Arc<AtomicBool>,
-    ) -> JoinHandle<()> {
+        transfer_usdc_to_hedging_queue: TransferUsdcToHedgingJobQueue,
+    ) -> (JoinHandle<()>, Arc<dyn BaseToAlpacaTransfer>) {
         let equity = Arc::new(CrossVenueEquityTransfer::new(
             self.raindex.clone(),
             self.tokenizer,
@@ -145,16 +146,19 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
             Arc::clone(&equity) as _,
             equity as _,
             Arc::clone(&usdc) as _,
-            usdc as _,
+            transfer_usdc_to_hedging_queue,
             operation_receiver,
             equity_in_progress,
             usdc_in_progress,
         );
 
         info!(target: "rebalance", "Rebalancing infrastructure initialized");
-        tokio::spawn(async move {
-            rebalancer.run().await;
-        })
+        (
+            tokio::spawn(async move {
+                rebalancer.run().await;
+            }),
+            usdc as Arc<dyn BaseToAlpacaTransfer>,
+        )
     }
 }
 
@@ -398,6 +402,7 @@ mod tests {
         let (services, _ctx) = make_services_with_mock_wallet(&server).await;
 
         let pool = crate::test_utils::setup_test_db().await;
+        crate::conductor::setup_apalis_tables(&pool).await.unwrap();
         let mock_services = EquityTransferServices {
             tokenizer: Arc::new(MockTokenizer::new()),
             raindex: Arc::new(MockRaindex::new()),
@@ -416,13 +421,14 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(10);
 
-        let handle = services.spawn(
+        let (handle, _transfer) = services.spawn(
             Address::random(),
             RaindexVaultId(B256::ZERO),
             rx,
             frameworks,
             Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            TransferUsdcToHedgingJobQueue::new(&pool),
         );
 
         tx.send(TriggeredOperation::Mint {

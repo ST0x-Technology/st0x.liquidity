@@ -297,6 +297,7 @@ pub enum JobKind {
     ReconcileOrderFill,
     HandleOrderRejection,
     PollInventory,
+    TransferUsdcToHedging,
 }
 
 /// Job execution error. Wraps the concrete `Job::Error` type at
@@ -328,6 +329,7 @@ pub struct FailureInjector {
     reconcile_order_fill: Arc<Mutex<InjectionState>>,
     handle_order_rejection: Arc<Mutex<InjectionState>>,
     poll_inventory: Arc<Mutex<InjectionState>>,
+    transfer_usdc_to_hedging: Arc<Mutex<InjectionState>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -357,6 +359,7 @@ impl FailureInjector {
             reconcile_order_fill: Arc::new(Mutex::new(InjectionState::Idle)),
             handle_order_rejection: Arc::new(Mutex::new(InjectionState::Idle)),
             poll_inventory: Arc::new(Mutex::new(InjectionState::Idle)),
+            transfer_usdc_to_hedging: Arc::new(Mutex::new(InjectionState::Idle)),
         }
     }
 
@@ -398,6 +401,7 @@ impl FailureInjector {
             JobKind::ReconcileOrderFill => &self.reconcile_order_fill,
             JobKind::HandleOrderRejection => &self.handle_order_rejection,
             JobKind::PollInventory => &self.poll_inventory,
+            JobKind::TransferUsdcToHedging => &self.transfer_usdc_to_hedging,
         };
 
         match mutex.lock() {

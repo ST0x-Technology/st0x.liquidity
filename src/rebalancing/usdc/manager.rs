@@ -771,7 +771,6 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
         id: &UsdcRebalanceId,
         mint_tx: TxHash,
     ) -> Result<(), UsdcTransferError> {
-        // Record the deposit initiation with the mint tx
         self.cqrs
             .send(
                 id,
@@ -781,6 +780,18 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
             )
             .await?;
 
+        self.poll_and_finalize_alpaca_deposit(id, mint_tx).await
+    }
+
+    /// Polls Alpaca for the deposit then emits `ConfirmDeposit` or
+    /// `FailDeposit`. Assumes the aggregate is already in `DepositInitiated`;
+    /// callers that haven't yet sent `InitiateDeposit` must do so first.
+    #[instrument(target = "rebalance", skip(self), fields(%id, %mint_tx), level = tracing::Level::DEBUG)]
+    async fn poll_and_finalize_alpaca_deposit(
+        &self,
+        id: &UsdcRebalanceId,
+        mint_tx: TxHash,
+    ) -> Result<(), UsdcTransferError> {
         info!(target: "rebalance", %mint_tx, "Polling Alpaca for deposit detection");
 
         let transfer = match self.alpaca_wallet.poll_deposit_by_tx_hash(&mint_tx).await {
@@ -818,6 +829,203 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
 
         info!(target: "rebalance", "Alpaca deposit confirmed");
         Ok(())
+    }
+
+    /// Loads the `UsdcRebalance` aggregate for `id` and resumes the
+    /// Base-to-Alpaca workflow from the persisted state. If the aggregate
+    /// has no prior state, starts the workflow from scratch with
+    /// `initial_amount`. For an aggregate in mid-flight (e.g. `Bridging`,
+    /// `Attested`, `DepositInitiated`), continues from the next pending
+    /// step without re-emitting commands already recorded.
+    #[instrument(target = "rebalance", skip(self), fields(%id, %initial_amount), level = tracing::Level::DEBUG)]
+    pub(crate) async fn resume_base_to_alpaca(
+        &self,
+        id: &UsdcRebalanceId,
+        initial_amount: Usdc,
+    ) -> Result<(), UsdcTransferError> {
+        let Some(state) = self.cqrs.load(id).await? else {
+            return self.execute_base_to_alpaca(id, initial_amount).await;
+        };
+
+        if *state_direction(&state) != RebalanceDirection::BaseToAlpaca {
+            return Err(UsdcTransferError::WrongDirectionForResume {
+                id: id.clone(),
+                direction: state_direction(&state).clone(),
+            });
+        }
+
+        use UsdcRebalance::*;
+        match state {
+            Withdrawing { amount, .. } => {
+                info!(target: "rebalance", %id, %amount, "Resuming base-to-alpaca from Withdrawing");
+                self.cqrs
+                    .send(id, UsdcRebalanceCommand::ConfirmWithdrawal)
+                    .await?;
+                self.continue_from_withdrawal_complete(id, amount).await
+            }
+            WithdrawalComplete { amount, .. } => {
+                info!(target: "rebalance", %id, %amount, "Resuming base-to-alpaca from WithdrawalComplete");
+                self.continue_from_withdrawal_complete(id, amount).await
+            }
+            Bridging {
+                amount,
+                burn_tx_hash,
+                ..
+            } => {
+                info!(target: "rebalance", %id, %burn_tx_hash, "Resuming base-to-alpaca from Bridging");
+                self.continue_from_bridging(id, amount, burn_tx_hash).await
+            }
+            Attested {
+                amount,
+                burn_tx_hash,
+                ..
+            } => {
+                info!(target: "rebalance", %id, %burn_tx_hash, "Resuming base-to-alpaca from Attested");
+                self.continue_from_attested(id, amount, burn_tx_hash).await
+            }
+            Bridged {
+                amount_received,
+                mint_tx_hash,
+                ..
+            } => {
+                info!(target: "rebalance", %id, %mint_tx_hash, %amount_received, "Resuming base-to-alpaca from Bridged");
+                self.continue_from_bridged(id, mint_tx_hash, amount_received)
+                    .await
+            }
+            DepositInitiated {
+                amount,
+                mint_tx_hash,
+                ..
+            } => {
+                info!(target: "rebalance", %id, %mint_tx_hash, "Resuming base-to-alpaca from DepositInitiated");
+                self.continue_from_deposit_initiated(id, amount, mint_tx_hash)
+                    .await
+            }
+            DepositConfirmed { amount, .. } => {
+                info!(target: "rebalance", %id, %amount, "Resuming base-to-alpaca from DepositConfirmed");
+                self.execute_usdc_to_usd_conversion(id, amount).await?;
+                Ok(())
+            }
+            Converting { .. } => Err(UsdcTransferError::ResumeUnsafeConverting { id: id.clone() }),
+            ConversionComplete { .. }
+            | ConversionFailed { .. }
+            | WithdrawalFailed { .. }
+            | BridgingFailed { .. }
+            | DepositFailed { .. } => Ok(()),
+        }
+    }
+
+    async fn continue_from_withdrawal_complete(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+    ) -> Result<(), UsdcTransferError> {
+        let burn = self
+            .execute_cctp_burn_on_base(id, usdc_to_u256(amount)?)
+            .await?;
+        self.continue_from_bridging(id, amount, burn.tx).await
+    }
+
+    async fn continue_from_bridging(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        burn_tx: TxHash,
+    ) -> Result<(), UsdcTransferError> {
+        let attestation = self
+            .poll_attestation_for_base_burn(
+                id,
+                &BurnReceipt {
+                    tx: burn_tx,
+                    amount: usdc_to_u256(amount)?,
+                },
+            )
+            .await?;
+        let mint = self.execute_cctp_mint_on_ethereum(id, attestation).await?;
+        self.continue_from_bridged(id, mint.tx, u256_to_usdc(mint.amount)?)
+            .await
+    }
+
+    async fn continue_from_attested(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        burn_tx: TxHash,
+    ) -> Result<(), UsdcTransferError> {
+        let attestation = self
+            .cctp_bridge
+            .poll_attestation(BridgeDirection::BaseToEthereum, burn_tx)
+            .await
+            .map_err(|error| UsdcTransferError::Cctp(Box::new(error)))?;
+        let mint = self
+            .cctp_bridge
+            .mint(BridgeDirection::BaseToEthereum, &attestation)
+            .await
+            .map_err(|error| UsdcTransferError::Cctp(Box::new(error)))?;
+        let amount_received = u256_to_usdc(mint.amount)?;
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::ConfirmBridging {
+                    mint_tx: mint.tx,
+                    amount_received,
+                    fee_collected: u256_to_usdc(mint.fee)?,
+                },
+            )
+            .await?;
+        info!(target: "rebalance",
+            mint_tx = %mint.tx,
+            requested = %amount,
+            received = %amount_received,
+            "CCTP mint on Ethereum executed during resume"
+        );
+        self.continue_from_bridged(id, mint.tx, amount_received)
+            .await
+    }
+
+    async fn continue_from_bridged(
+        &self,
+        id: &UsdcRebalanceId,
+        mint_tx: TxHash,
+        amount_received: Usdc,
+    ) -> Result<(), UsdcTransferError> {
+        self.poll_and_confirm_alpaca_deposit(id, mint_tx).await?;
+        self.execute_usdc_to_usd_conversion(id, amount_received)
+            .await?;
+        Ok(())
+    }
+
+    async fn continue_from_deposit_initiated(
+        &self,
+        id: &UsdcRebalanceId,
+        amount_received: Usdc,
+        mint_tx: TxHash,
+    ) -> Result<(), UsdcTransferError> {
+        self.poll_and_finalize_alpaca_deposit(id, mint_tx).await?;
+        self.execute_usdc_to_usd_conversion(id, amount_received)
+            .await?;
+        Ok(())
+    }
+}
+
+/// Returns the rebalance direction stored on any non-initial aggregate
+/// state. Every persisted state carries a direction, so this is total.
+fn state_direction(state: &UsdcRebalance) -> &RebalanceDirection {
+    use UsdcRebalance::*;
+    match state {
+        Converting { direction, .. }
+        | ConversionComplete { direction, .. }
+        | ConversionFailed { direction, .. }
+        | Withdrawing { direction, .. }
+        | WithdrawalComplete { direction, .. }
+        | WithdrawalFailed { direction, .. }
+        | Bridging { direction, .. }
+        | Attested { direction, .. }
+        | Bridged { direction, .. }
+        | BridgingFailed { direction, .. }
+        | DepositInitiated { direction, .. }
+        | DepositConfirmed { direction, .. }
+        | DepositFailed { direction, .. } => direction,
     }
 }
 
@@ -2358,6 +2566,289 @@ mod tests {
             withdrawal_result.is_ok(),
             "Initiate should succeed from ConversionComplete state, \
              got: {withdrawal_result:?}"
+        );
+    }
+
+    /// Resuming an aggregate that has not been initiated falls back to
+    /// the from-scratch [`execute_base_to_alpaca`] path. Verified
+    /// indirectly via the aggregate state after the call advances past
+    /// the initial `Initiate` command.
+    #[tokio::test]
+    async fn resume_from_empty_aggregate_starts_fresh() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, private_key) = setup_anvil();
+
+        let _account_mock = create_broker_account_mock(&server);
+        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet).await;
+        let cqrs = create_test_store_instance().await;
+
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            Arc::clone(&cqrs),
+            market_maker_wallet,
+            TEST_VAULT_ID,
+        );
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+
+        // execute_base_to_alpaca starts with the vault withdrawal then
+        // the CCTP bridge calls; those fail without a real onchain
+        // setup. We just need to confirm an error occurs (rather than
+        // e.g. a silent no-op suggesting resume short-circuited).
+        manager.resume_base_to_alpaca(&id, amount).await.expect_err(
+            "Resume from empty state should start fresh and fail at \
+                 the first onchain operation",
+        );
+
+        // The aggregate transitioned to a BaseToAlpaca direction state,
+        // proving the from-scratch path was taken rather than a no-op.
+        let state = cqrs
+            .load(&id)
+            .await
+            .unwrap()
+            .expect("Resume should have written at least one event");
+        assert_eq!(
+            *state_direction(&state),
+            RebalanceDirection::BaseToAlpaca,
+            "Resume from empty state should drive the BaseToAlpaca direction, \
+             got state {state:?}",
+        );
+    }
+
+    /// Calling `resume_base_to_alpaca` on a `BaseToAlpaca`-direction
+    /// aggregate already at `DepositConfirmed` runs only the final
+    /// USDC->USD conversion step.
+    #[tokio::test]
+    async fn resume_from_deposit_confirmed_runs_only_conversion() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, private_key) = setup_anvil();
+
+        let _account_mock = create_broker_account_mock(&server);
+        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet).await;
+        let cqrs = create_test_store_instance().await;
+
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            Arc::clone(&cqrs),
+            market_maker_wallet,
+            TEST_VAULT_ID,
+        );
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        advance_to_deposit_confirmed_base_to_alpaca(&cqrs, &id, amount).await;
+
+        // `advance_to_deposit_confirmed_base_to_alpaca` records 99.99 as
+        // the actual amount received; the resume must convert that
+        // amount (not the original 100) to USD.
+        let conversion_mock = create_conversion_order_mock(&server, "99.99");
+        let _poll_mock = create_get_order_mock(
+            &server,
+            "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "filled",
+            "99.99",
+        );
+
+        manager
+            .resume_base_to_alpaca(&id, amount)
+            .await
+            .expect("Resume from DepositConfirmed should complete the conversion");
+
+        conversion_mock.assert();
+
+        let final_state = cqrs.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(final_state, UsdcRebalance::ConversionComplete { .. }),
+            "Aggregate should reach ConversionComplete after resume, got: \
+             {final_state:?}",
+        );
+    }
+
+    /// Resuming from a terminal state is a no-op: no commands are sent,
+    /// no API calls are made.
+    #[tokio::test]
+    async fn resume_from_terminal_conversion_complete_is_noop() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, private_key) = setup_anvil();
+
+        let _account_mock = create_broker_account_mock(&server);
+        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet).await;
+        let cqrs = create_test_store_instance().await;
+
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            Arc::clone(&cqrs),
+            market_maker_wallet,
+            TEST_VAULT_ID,
+        );
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        advance_to_deposit_confirmed_base_to_alpaca(&cqrs, &id, amount).await;
+
+        // Drive to ConversionComplete via the existing conversion path.
+        // `advance_to_deposit_confirmed_base_to_alpaca` records 99.99 as
+        // the actual amount received, so the conversion must use that.
+        let _conversion_mock = create_conversion_order_mock(&server, "99.99");
+        let _poll_mock = create_get_order_mock(
+            &server,
+            "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "filled",
+            "99.99",
+        );
+        manager
+            .execute_usdc_to_usd_conversion(&id, usdc("99.99"))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            cqrs.load(&id).await.unwrap().unwrap(),
+            UsdcRebalance::ConversionComplete { .. }
+        ));
+
+        // Mounting a strict mock that fails the test if hit ensures no
+        // additional Alpaca calls happen during the noop resume.
+        let bad_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(500).body("should not be called");
+        });
+
+        manager
+            .resume_base_to_alpaca(&id, amount)
+            .await
+            .expect("Resume from ConversionComplete should be a no-op");
+
+        assert_eq!(
+            bad_mock.calls(),
+            0,
+            "Resume from terminal state must not make any Alpaca calls"
+        );
+    }
+
+    /// Resuming a `Converting` aggregate is unsafe: the broker order may
+    /// or may not have been placed, and we cannot reconcile without
+    /// manual intervention.
+    #[tokio::test]
+    async fn resume_from_converting_state_returns_unsafe_error() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, private_key) = setup_anvil();
+
+        let _account_mock = create_broker_account_mock(&server);
+        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet).await;
+        let cqrs = create_test_store_instance().await;
+
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            Arc::clone(&cqrs),
+            market_maker_wallet,
+            TEST_VAULT_ID,
+        );
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        advance_to_deposit_confirmed_base_to_alpaca(&cqrs, &id, amount).await;
+
+        // Move into Converting state without confirming (simulating
+        // crash mid-conversion). `advance_to_deposit_confirmed_base_to_alpaca`
+        // recorded 99.99 as the amount received after CCTP fees, so the
+        // post-deposit conversion command must use that exact figure.
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::InitiatePostDepositConversion {
+                order_id: Uuid::new_v4(),
+                amount: usdc("99.99"),
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = manager
+            .resume_base_to_alpaca(&id, amount)
+            .await
+            .expect_err("Converting state must not auto-resume");
+        assert!(
+            matches!(err, UsdcTransferError::ResumeUnsafeConverting { .. }),
+            "Expected ResumeUnsafeConverting, got: {err:?}",
+        );
+    }
+
+    /// Resuming with an aggregate that belongs to the opposite direction
+    /// must return an error rather than silently driving the wrong flow.
+    #[tokio::test]
+    async fn resume_with_wrong_direction_returns_error() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, private_key) = setup_anvil();
+
+        let _account_mock = create_broker_account_mock(&server);
+        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet).await;
+        let cqrs = create_test_store_instance().await;
+
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            Arc::clone(&cqrs),
+            market_maker_wallet,
+            TEST_VAULT_ID,
+        );
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+
+        // Seed aggregate in AlpacaToBase direction
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::InitiateConversion {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                order_id: Uuid::new_v4(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = manager
+            .resume_base_to_alpaca(&id, amount)
+            .await
+            .expect_err("Mismatched direction must be rejected");
+        assert!(
+            matches!(err, UsdcTransferError::WrongDirectionForResume { .. }),
+            "Expected WrongDirectionForResume, got: {err:?}",
         );
     }
 
