@@ -369,6 +369,14 @@ impl RebalancingTrigger {
         self.apply_usdc_rebalance_event(&id, &event).await?;
 
         let is_terminal = Self::is_terminal_usdc_rebalance_event(&event);
+        {
+            let mut inventory = self.inventory.write().await;
+            *inventory = if is_terminal {
+                inventory.clone().clear_active_usdc_rebalance()
+            } else {
+                inventory.clone().set_active_usdc_rebalance(id.clone())
+            };
+        }
         if is_terminal {
             self.usdc_tracking.write().await.remove(&id);
             self.clear_usdc_in_progress();
