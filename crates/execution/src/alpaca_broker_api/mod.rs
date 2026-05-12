@@ -36,7 +36,7 @@ mod mock_api;
 pub use mock_api::{
     AlpacaBrokerMock, MockMode, MockOrderSnapshot, MockPosition, MockPositionSnapshot,
     MockWalletTransferSnapshot, OrderSide, OrderStatus, TEST_ACCOUNT_ID, TEST_API_KEY,
-    TEST_API_SECRET, TransferDirection, TransferStatus, WhitelistStatus,
+    TEST_API_SECRET, TransferDirection, TransferFlow, TransferStatus, WhitelistStatus,
 };
 mod order;
 mod positions;

@@ -366,6 +366,17 @@ impl<P: Provider + Clone> BaseChain<P> {
         Ok(vault_id)
     }
 
+    /// Sets the owner's USDC wallet balance directly (via Anvil storage
+    /// override). Used by tests to model production-like flows where the
+    /// bot's wallet is empty except mid-transfer.
+    pub async fn set_owner_usdc_balance(&self, amount: U256) -> anyhow::Result<()> {
+        let balance_slot = evm_mapping_slot(self.owner, USDC_BALANCES_SLOT);
+        self.provider
+            .anvil_set_storage_at(USDC_BASE, balance_slot, amount.into())
+            .await?;
+        Ok(())
+    }
+
     /// Deposits tokens into an existing Raindex vault.
     ///
     /// `amount` is in raw units (e.g. 18-decimal for equity tokens).

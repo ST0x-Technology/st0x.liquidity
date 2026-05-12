@@ -799,6 +799,13 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
         );
     }
 
+    // Drain residual owner-wallet USDC after vault + order setup so wallet
+    // polling sees the production-like baseline (0). Without this, the
+    // `BaseWalletUsdc` snapshot would carry the leftover from
+    // `deploy_usdc_at`'s 1B-USDC seeding and trip the wallet-inflight
+    // suppression even though no transfer is in flight.
+    infra.base_chain.set_owner_usdc_balance(U256::ZERO).await?;
+
     let current_block = infra.base_chain.provider.get_block_number().await?;
 
     let ctx = build_usdc_rebalancing_ctx()
@@ -928,6 +935,13 @@ async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
     // add ~3.6k USDC (148.6k / 245k = 0.61 > 0.6 threshold).
     let usdc_amount: U256 = parse_units("145000", 6)?.into();
     let usdc_vault_id = infra.base_chain.create_usdc_vault(usdc_amount).await?;
+
+    // Drain residual owner-wallet USDC so wallet polling sees the
+    // production-like baseline (0). Without this, `BaseWalletUsdc`
+    // snapshots would carry the leftover from `deploy_usdc_at`'s
+    // 1B-USDC seeding and trip the wallet-inflight suppression even
+    // though no transfer is in flight.
+    infra.base_chain.set_owner_usdc_balance(U256::ZERO).await?;
 
     // Set up SellEquity orders BEFORE bot starts.
     // All orders share the same USDC input vault as the pre-funded vault

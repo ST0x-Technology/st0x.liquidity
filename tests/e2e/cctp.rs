@@ -2,20 +2,35 @@
 //!
 //! Deploys CCTP V2 contracts on a second (Ethereum) Anvil chain and on the
 //! existing Base chain from [`TestInfra`], links them, replaces USDC bytecode
-//! with mint/burn tokens, mints USDC on both chains, and starts the
-//! attestation watcher.
+//! with mint/burn tokens, and starts the attestation watcher.
+//!
+//! The bot's wallets start with zero USDC. Inbound USDC arrives only through
+//! the rebalance flow itself: CCTP mints (BaseToAlpaca) or the Alpaca
+//! withdrawal executor that mints on Ethereum when the broker mock records
+//! an OUTGOING transfer (AlpacaToBase). This mirrors production semantics
+//! where wallet balances are non-zero only mid-transfer.
+
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::Duration;
 
 use alloy::node_bindings::{Anvil, AnvilInstance};
 use alloy::primitives::{Address, B256, U256, utils::parse_units};
 use alloy::providers::Provider;
 use alloy::providers::ext::AnvilApi as _;
 use alloy::signers::local::PrivateKeySigner;
+use futures_util::{StreamExt, stream};
+use rain_math_float::Float;
+use task_supervisor::{SupervisedTask, SupervisorBuilder, SupervisorHandle, TaskResult};
 use tokio::task::JoinHandle;
+use tracing::warn;
 
 use st0x_bridge::cctp::{
     TestMintBurnToken, deploy_cctp_on_chain, link_chains, mint_usdc, set_max_burn_amount,
 };
 use st0x_execution::Symbol;
+use st0x_execution::alpaca_broker_api::{AlpacaBrokerMock, TransferFlow};
+use st0x_finance::Usdc;
 
 use crate::base_chain::USDC_BASE;
 use crate::test_infra::TestInfra;
@@ -36,8 +51,14 @@ pub struct CctpOverrides {
 ///
 /// Deploys CCTP V2 contracts on a second (Ethereum) Anvil chain and on
 /// the existing Base chain from `TestInfra`, links them, replaces Base
-/// USDC with a mint/burn token, mints USDC on both chains, registers
-/// broker wallet endpoints, and starts the attestation watcher.
+/// USDC with a mint/burn token, registers broker wallet endpoints, starts
+/// the attestation watcher, and starts the Alpaca-withdrawal executor that
+/// mints USDC on Ethereum when the broker mock records an OUTGOING wallet
+/// transfer (simulating Alpaca actually sending USDC on completion).
+///
+/// The bot's wallets begin with zero USDC; balances arise only mid-transfer
+/// (Alpaca withdrawal -> Ethereum -> CCTP burn / CCTP mint -> Base wallet
+/// or Ethereum wallet -> Alpaca deposit), matching production semantics.
 pub struct CctpInfra {
     pub ethereum_endpoint: String,
     attestation_base_url: String,
@@ -47,6 +68,7 @@ pub struct CctpInfra {
     // Kept alive so resources aren't dropped while the test runs.
     _ethereum_anvil: AnvilInstance,
     _attestation_watcher: JoinHandle<()>,
+    _supervisor: SupervisorHandle,
 }
 
 impl CctpInfra {
@@ -145,30 +167,25 @@ impl CctpInfra {
         )
         .await?;
 
-        // MockMintBurnToken.mint() has no access control, so any key works.
-        let mint_amount = U256::from(1_000_000_000_000u64); // 1M USDC
-
-        mint_usdc(
-            &infra.base_chain.endpoint(),
-            &cctp_deployer_key,
-            USDC_BASE,
-            infra.base_chain.owner,
-            mint_amount,
-        )
-        .await?;
-
-        mint_usdc(
-            &ethereum_endpoint,
-            &cctp_deployer_key,
-            USDC_ETHEREUM,
-            infra.base_chain.owner,
-            mint_amount,
-        )
-        .await?;
-
         infra
             .broker_service
             .register_wallet_endpoints(infra.base_chain.owner);
+
+        // Simulate Alpaca's withdrawal-side leg: when the broker mock
+        // records an OUTGOING wallet transfer, mint USDC on Ethereum to
+        // the recipient. Without this, AlpacaToBase tests would have
+        // nothing to burn during the CCTP step.
+        let supervisor = SupervisorBuilder::default()
+            .with_task(
+                "alpaca-withdrawal-executor",
+                AlpacaWithdrawalExecutor {
+                    broker: Arc::clone(&infra.broker_service),
+                    ethereum_endpoint: ethereum_endpoint.clone(),
+                    deployer_key: cctp_deployer_key,
+                },
+            )
+            .build()
+            .run();
 
         // USDC/USD conversion is a 1:1 stablecoin pair on Alpaca
         infra
@@ -193,6 +210,7 @@ impl CctpInfra {
             message_transmitter: base_cctp.message_transmitter,
             _ethereum_anvil: ethereum_anvil,
             _attestation_watcher: attestation_watcher,
+            _supervisor: supervisor,
         })
     }
 
@@ -201,6 +219,103 @@ impl CctpInfra {
             attestation_base_url: self.attestation_base_url.clone(),
             token_messenger: self.token_messenger,
             message_transmitter: self.message_transmitter,
+        }
+    }
+}
+
+/// Simulates Alpaca's withdrawal-side leg by polling the broker mock for
+/// OUTGOING wallet transfers and minting USDC on Ethereum to the recipient.
+///
+/// Mints on first observation so the bot's CCTP burn finds USDC available
+/// before the mock flips the transfer's status to `Complete`. The
+/// per-transfer dedupe set is task-local; if `task-supervisor` restarts the
+/// task after a panic, we re-walk all transfers but the on-chain mint
+/// behaves idempotently per `transfer_id` only within a single run -- a
+/// restart could double-mint, which is acceptable for tests.
+#[derive(Clone)]
+struct AlpacaWithdrawalExecutor {
+    broker: Arc<AlpacaBrokerMock>,
+    ethereum_endpoint: String,
+    deployer_key: B256,
+}
+
+/// Outcome of a single mint attempt for an outgoing transfer.
+enum MintAttempt {
+    /// Terminal outcome (success or permanent validation failure). The
+    /// transfer_id should be recorded so we don't re-attempt next tick.
+    Done,
+    /// Transient failure -- leave the transfer_id off the handled set so
+    /// the outer loop re-attempts on the next tick.
+    Retry,
+}
+
+impl AlpacaWithdrawalExecutor {
+    async fn try_mint(&self, transfer_id: &str, recipient: Address, amount: Float) -> MintAttempt {
+        let raw_amount = match Usdc::new(amount).to_u256_6_decimals() {
+            Ok(raw) => raw,
+            Err(error) => {
+                warn!(
+                    %transfer_id,
+                    ?error,
+                    "withdrawal executor: invalid USDC amount, skipping"
+                );
+                return MintAttempt::Done;
+            }
+        };
+
+        match mint_usdc(
+            &self.ethereum_endpoint,
+            &self.deployer_key,
+            USDC_ETHEREUM,
+            recipient,
+            raw_amount,
+        )
+        .await
+        {
+            Ok(()) => MintAttempt::Done,
+            Err(error) => {
+                warn!(
+                    %transfer_id,
+                    ?error,
+                    "withdrawal executor: mint_usdc failed, will retry"
+                );
+                MintAttempt::Retry
+            }
+        }
+    }
+}
+
+impl SupervisedTask for AlpacaWithdrawalExecutor {
+    async fn run(&mut self) -> TaskResult {
+        let this = &*self;
+        let mut minted: HashSet<String> = HashSet::new();
+
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            let seen = &minted;
+            let newly_handled: HashSet<String> = stream::iter(this.broker.wallet_transfers())
+                .filter_map(|transfer| async move {
+                    let TransferFlow::Outgoing { recipient } = transfer.flow else {
+                        return None;
+                    };
+
+                    (!seen.contains(&transfer.transfer_id)).then_some((
+                        transfer.transfer_id,
+                        recipient,
+                        transfer.amount,
+                    ))
+                })
+                .filter_map(|(transfer_id, recipient, amount)| async move {
+                    match this.try_mint(&transfer_id, recipient, amount).await {
+                        MintAttempt::Done => Some(transfer_id),
+                        MintAttempt::Retry => None,
+                    }
+                })
+                .collect()
+                .await;
+
+            minted.extend(newly_handled);
         }
     }
 }
