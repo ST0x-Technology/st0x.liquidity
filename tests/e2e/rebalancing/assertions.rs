@@ -117,12 +117,12 @@ impl Wallet for TestWallet {
         self.address
     }
 
-    async fn send(
+    async fn send_pending(
         &self,
         contract: Address,
         calldata: alloy::primitives::Bytes,
         note: &str,
-    ) -> Result<TransactionReceipt, EvmError> {
+    ) -> Result<alloy::primitives::TxHash, EvmError> {
         tracing::info!(%contract, note, "Submitting local test wallet call");
 
         let tx = TransactionRequest::default()
@@ -130,12 +130,68 @@ impl Wallet for TestWallet {
             .input(calldata.into());
 
         let pending = self.signing_provider.send_transaction(tx).await?;
-        let receipt = pending
-            .with_required_confirmations(self.required_confirmations)
-            .get_receipt()
-            .await?;
+        Ok(*pending.tx_hash())
+    }
+
+    async fn await_receipt(
+        &self,
+        tx_hash: alloy::primitives::TxHash,
+    ) -> Result<TransactionReceipt, EvmError> {
+        let timeout = Duration::from_secs(60);
+        let poll_interval = Duration::from_secs(1);
+        let start = tokio::time::Instant::now();
+
+        let mut poll = tokio::time::interval(poll_interval);
+
+        let (receipt, receipt_block) = loop {
+            poll.tick().await;
+
+            if start.elapsed() > timeout {
+                return Err(EvmError::ReceiptTimeout {
+                    tx_hash,
+                    timeout_secs: 60,
+                });
+            }
+
+            let Some(receipt) = self.read_provider.get_transaction_receipt(tx_hash).await? else {
+                continue;
+            };
+
+            let Some(block) = receipt.block_number else {
+                continue;
+            };
+
+            break (receipt, block);
+        };
+
+        // Wait for required confirmation depth.
+        loop {
+            let current_block = self.read_provider.get_block_number().await?;
+            if current_block >= receipt_block + self.required_confirmations - 1 {
+                break;
+            }
+
+            poll.tick().await;
+
+            if start.elapsed() > timeout {
+                return Err(EvmError::ReceiptTimeout {
+                    tx_hash,
+                    timeout_secs: 60,
+                });
+            }
+        }
 
         Ok(receipt)
+    }
+
+    async fn send(
+        &self,
+        contract: Address,
+        calldata: alloy::primitives::Bytes,
+        note: &str,
+    ) -> Result<TransactionReceipt, EvmError> {
+        let tx_hash = self.send_pending(contract, calldata, note).await?;
+        self.await_receipt(tx_hash).await
     }
 }
 
@@ -431,8 +487,8 @@ async fn assert_equity_mint_rebalancing<P: Provider>(
 
     assert_eq!(
         mint_events.len(),
-        5,
-        "Expected exactly 5 TokenizedEquityMint events in the completed aggregate, \
+        7,
+        "Expected exactly 7 TokenizedEquityMint events in the completed aggregate, \
          got {} (total across all aggregates: {})",
         mint_events.len(),
         all_mint_events.len(),
@@ -443,7 +499,9 @@ async fn assert_equity_mint_rebalancing<P: Provider>(
             "TokenizedEquityMintEvent::MintRequested",
             "TokenizedEquityMintEvent::MintAccepted",
             "TokenizedEquityMintEvent::TokensReceived",
+            "TokenizedEquityMintEvent::WrapSubmitted",
             "TokenizedEquityMintEvent::TokensWrapped",
+            "TokenizedEquityMintEvent::VaultDepositSubmitted",
             "TokenizedEquityMintEvent::DepositedIntoRaindex",
         ],
     );
@@ -584,14 +642,19 @@ async fn assert_equity_redeem_rebalancing<P: Provider>(
     let redeem_events = fetch_events_by_type(pool, "EquityRedemption").await?;
     assert_eq!(
         redeem_events.len(),
-        5,
-        "Expected exactly 5 EquityRedemption success events",
+        10,
+        "Expected exactly 10 EquityRedemption success events",
     );
     assert_event_subsequence(
         &redeem_events,
         &[
+            "EquityRedemptionEvent::VaultWithdrawPending",
+            "EquityRedemptionEvent::VaultWithdrawSubmitted",
             "EquityRedemptionEvent::WithdrawnFromRaindex",
+            "EquityRedemptionEvent::UnwrapPending",
+            "EquityRedemptionEvent::UnwrapSubmitted",
             "EquityRedemptionEvent::TokensUnwrapped",
+            "EquityRedemptionEvent::SendPending",
             "EquityRedemptionEvent::TokensSent",
             "EquityRedemptionEvent::Detected",
             "EquityRedemptionEvent::Completed",
@@ -747,22 +810,21 @@ async fn assert_equity_redeem_rebalancing<P: Provider>(
         last_event.event_type,
     );
 
-    // Verify the symbol from the first event (WithdrawnFromRaindex carries
-    // it; the terminal Completed event only has a timestamp).
-    let first_event = &redeem_events[0];
-    let withdrawn = first_event
+    // Verify the symbol from the VaultWithdrawPending event (the terminal
+    // Completed event only has a timestamp). Find by payload key rather
+    // than assuming a fixed index.
+    let pending_event = redeem_events
+        .iter()
+        .find(|event| event.payload.get("VaultWithdrawPending").is_some())
+        .ok_or_else(|| anyhow::anyhow!("No redemption event contains VaultWithdrawPending"))?;
+    let submitted = pending_event
         .payload
-        .get("WithdrawnFromRaindex")
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "First redemption event payload missing WithdrawnFromRaindex, got: {:?}",
-                first_event.payload
-            )
-        })?;
+        .get("VaultWithdrawPending")
+        .expect("checked in find");
     assert_eq!(
-        withdrawn.get("symbol").and_then(|val| val.as_str()),
+        submitted.get("symbol").and_then(|val| val.as_str()),
         Some(symbol),
-        "Redemption should be for {symbol}, got: {withdrawn}"
+        "Redemption should be for {symbol}, got: {submitted:?}"
     );
 
     Ok(())

@@ -64,7 +64,17 @@ impl Raindex for MockRaindex {
         Ok((self.token, self.vault_id))
     }
 
-    async fn deposit(
+    async fn withdraw(
+        &self,
+        _token: Address,
+        _vault_id: RaindexVaultId,
+        _target_amount: U256,
+        _decimals: u8,
+    ) -> Result<TxHash, RaindexError> {
+        Ok(self.withdraw_tx)
+    }
+
+    async fn submit_deposit(
         &self,
         token: Address,
         _vault_id: RaindexVaultId,
@@ -78,7 +88,7 @@ impl Raindex for MockRaindex {
         Ok(self.deposit_tx)
     }
 
-    async fn withdraw(
+    async fn submit_withdraw(
         &self,
         _token: Address,
         _vault_id: RaindexVaultId,
@@ -86,5 +96,9 @@ impl Raindex for MockRaindex {
         _decimals: u8,
     ) -> Result<TxHash, RaindexError> {
         Ok(self.withdraw_tx)
+    }
+
+    async fn confirm_tx(&self, _tx_hash: TxHash) -> Result<(), RaindexError> {
+        Ok(())
     }
 }

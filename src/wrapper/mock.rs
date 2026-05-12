@@ -2,6 +2,8 @@
 
 use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 use st0x_execution::Symbol;
 
@@ -26,6 +28,8 @@ pub(crate) struct MockWrapper {
     wrapped_token: Address,
     ratio: U256,
     failure: MockFailure,
+    /// Maps tx hashes to their submitted amounts for confirm methods.
+    submitted_amounts: Mutex<HashMap<TxHash, U256>>,
 }
 
 impl MockWrapper {
@@ -37,6 +41,7 @@ impl MockWrapper {
             wrapped_token: Address::random(),
             ratio: RATIO_ONE,
             failure: MockFailure::None,
+            submitted_amounts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -49,6 +54,7 @@ impl MockWrapper {
             wrapped_token: Address::random(),
             ratio,
             failure: MockFailure::None,
+            submitted_amounts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -67,35 +73,31 @@ impl MockWrapper {
 
     /// Creates a mock wrapper that fails on wrap operations.
     pub(crate) fn failing() -> Self {
-        Self {
-            failure: MockFailure::Wrap,
-            ..Self::new()
-        }
+        let mut mock = Self::new();
+        mock.failure = MockFailure::Wrap;
+        mock
     }
 
     /// Creates a mock wrapper that fails on unwrap operations.
     pub(crate) fn failing_unwrap() -> Self {
-        Self {
-            failure: MockFailure::Unwrap,
-            ..Self::new()
-        }
+        let mut mock = Self::new();
+        mock.failure = MockFailure::Unwrap;
+        mock
     }
 
     /// Creates a mock wrapper that fails on underlying token lookup.
     pub(crate) fn failing_lookup() -> Self {
-        Self {
-            failure: MockFailure::Lookup,
-            ..Self::new()
-        }
+        let mut mock = Self::new();
+        mock.failure = MockFailure::Lookup;
+        mock
     }
 
     /// Creates a mock wrapper that succeeds on underlying token lookup but
     /// fails on derivative token lookup.
     pub(crate) fn failing_derivative_lookup() -> Self {
-        Self {
-            failure: MockFailure::DerivativeLookup,
-            ..Self::new()
-        }
+        let mut mock = Self::new();
+        mock.failure = MockFailure::DerivativeLookup;
+        mock
     }
 }
 
@@ -147,6 +149,70 @@ impl Wrapper for MockWrapper {
         }
         // 1:1 ratio for mock - underlying amount equals wrapped amount
         Ok((self.unwrap_tx, wrapped_amount))
+    }
+
+    async fn submit_wrap(
+        &self,
+        _wrapped_token: Address,
+        underlying_amount: U256,
+        _receiver: Address,
+    ) -> Result<TxHash, WrapperError> {
+        if self.failure == MockFailure::Wrap {
+            return Err(WrapperError::MissingDepositEvent);
+        }
+        let tx_hash = TxHash::random();
+        self.submitted_amounts
+            .lock()
+            .unwrap()
+            .insert(tx_hash, underlying_amount);
+        Ok(tx_hash)
+    }
+
+    async fn confirm_wrap(
+        &self,
+        _wrapped_token: Address,
+        tx_hash: TxHash,
+    ) -> Result<U256, WrapperError> {
+        // 1:1 ratio — return the amount that was submitted for this tx
+        let amount = self
+            .submitted_amounts
+            .lock()
+            .unwrap()
+            .remove(&tx_hash)
+            .expect("confirm called with tx hash that was never submitted");
+        Ok(amount)
+    }
+
+    async fn submit_unwrap(
+        &self,
+        _wrapped_token: Address,
+        wrapped_amount: U256,
+        _receiver: Address,
+        _owner: Address,
+    ) -> Result<TxHash, WrapperError> {
+        if self.failure == MockFailure::Unwrap {
+            return Err(WrapperError::MissingWithdrawEvent);
+        }
+        self.submitted_amounts
+            .lock()
+            .unwrap()
+            .insert(self.unwrap_tx, wrapped_amount);
+        Ok(self.unwrap_tx)
+    }
+
+    async fn confirm_unwrap(
+        &self,
+        _wrapped_token: Address,
+        tx_hash: TxHash,
+    ) -> Result<U256, WrapperError> {
+        // 1:1 ratio — return the amount that was submitted for this tx
+        let amount = self
+            .submitted_amounts
+            .lock()
+            .unwrap()
+            .remove(&tx_hash)
+            .expect("confirm called with tx hash that was never submitted");
+        Ok(amount)
     }
 
     fn owner(&self) -> Address {

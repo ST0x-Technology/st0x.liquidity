@@ -461,6 +461,20 @@ mod tests {
             self.address
         }
 
+        async fn send_pending(
+            &self,
+            contract: Address,
+            calldata: Bytes,
+            _note: &str,
+        ) -> Result<TxHash, EvmError> {
+            self.calls.lock().unwrap().push((contract, calldata));
+            Ok(TxHash::random())
+        }
+
+        async fn await_receipt(&self, _tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
+            self.receipts.lock().unwrap().remove(0)
+        }
+
         async fn send(
             &self,
             contract: Address,

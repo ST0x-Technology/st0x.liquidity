@@ -5,7 +5,7 @@
 //! directly.
 
 use alloy::network::{Ethereum, EthereumWallet};
-use alloy::primitives::{Address, B256, Bytes};
+use alloy::primitives::{Address, B256, Bytes, TxHash};
 use alloy::providers::fillers::{
     BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
 };
@@ -118,12 +118,12 @@ where
         self.signing_provider.default_signer_address()
     }
 
-    async fn send(
+    async fn send_pending(
         &self,
         contract: Address,
         calldata: Bytes,
         note: &str,
-    ) -> Result<TransactionReceipt, EvmError> {
+    ) -> Result<TxHash, EvmError> {
         info!(target: "wallet", %contract, note, "Submitting local contract call");
 
         let tx = TransactionRequest::default()
@@ -135,12 +135,26 @@ where
 
         info!(target: "wallet", %tx_hash, note, "Transaction submitted");
 
+        Ok(tx_hash)
+    }
+
+    async fn await_receipt(&self, tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
         let receipt =
             crate::wait_for_receipt(&self.provider, tx_hash, self.required_confirmations).await?;
 
-        info!(target: "wallet", tx_hash = %receipt.transaction_hash, note, "Transaction confirmed");
+        info!(target: "wallet", tx_hash = %receipt.transaction_hash, "Transaction confirmed");
 
         Ok(receipt)
+    }
+
+    async fn send(
+        &self,
+        contract: Address,
+        calldata: Bytes,
+        note: &str,
+    ) -> Result<TransactionReceipt, EvmError> {
+        let tx_hash = self.send_pending(contract, calldata, note).await?;
+        self.await_receipt(tx_hash).await
     }
 }
 
