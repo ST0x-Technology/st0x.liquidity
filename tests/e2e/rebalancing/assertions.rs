@@ -945,8 +945,6 @@ struct UsdcRebalanceExpectations<'a> {
 struct UsdcRebalanceEventAmounts {
     initiated_amount: U256,
     bridged_amount_received: U256,
-    /// Full amount burned on source chain = amount_received + fee_collected
-    bridged_amount_burned: U256,
 }
 
 fn usdc_rebalance_expectations(
@@ -1041,20 +1039,10 @@ async fn assert_usdc_rebalancing_db_state(
         .get("amount_received")
         .and_then(|val| val.as_str())
         .ok_or_else(|| anyhow::anyhow!("Bridged event missing amount_received"))?;
-    let fee_collected = bridged_payload
-        .get("fee_collected")
-        .and_then(|val| val.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Bridged event missing fee_collected"))?;
-
-    let received_units: U256 = parse_units(amount_received, 6)?.into();
-    let fee_units: U256 = parse_units(fee_collected, 6)?.into();
 
     Ok(UsdcRebalanceEventAmounts {
         initiated_amount: parse_units(initiated_amount_str, 6)?.into(),
-        bridged_amount_received: received_units,
-        bridged_amount_burned: received_units
-            .checked_add(fee_units)
-            .ok_or_else(|| anyhow::anyhow!("burned amount overflow"))?,
+        bridged_amount_received: parse_units(amount_received, 6)?.into(),
     })
 }
 
@@ -1089,7 +1077,7 @@ fn assert_usdc_rebalancing_broker_state(
     let transfers: Vec<_> = broker
         .wallet_transfers()
         .into_iter()
-        .filter(|transfer| transfer.direction == expectations.expected_transfer_direction)
+        .filter(|transfer| transfer.flow.direction() == expectations.expected_transfer_direction)
         .collect();
     assert_eq!(
         transfers.len(),
@@ -1227,15 +1215,15 @@ async fn assert_usdc_rebalancing_onchain_state<P: Provider>(
 
     let expected_ethereum_post_units = match rebalance_type {
         UsdcRebalanceType::AlpacaToBase => {
-            // In production, the Alpaca withdrawal deposits USDC on
-            // Ethereum and the CCTP burn removes the same amount (net
-            // zero). The mock broker records the transfer but does NOT
-            // mint USDC on-chain, so only the burn is reflected. The
-            // burn amount is the full source-chain amount (received +
-            // fee), not just the amount received on the destination.
-            ethereum_usdc_balance_before_rebalance
-                .checked_sub(event_amounts.bridged_amount_burned)
-                .ok_or_else(|| anyhow::anyhow!("Ethereum USDC underflow on AlpacaToBase burn"))?
+            // The Alpaca withdrawal mints USDC to the bot's Ethereum wallet
+            // (via the test fixture's withdrawal executor) and the CCTP
+            // burn removes the same amount, so the wallet returns to its
+            // pre-test baseline of zero. We can't compare against
+            // `ethereum_usdc_balance_before_rebalance` because the test
+            // captures it after the bot starts -- if the watcher has
+            // already minted by that point, the "before" reading reflects
+            // mid-flight state, not baseline.
+            U256::ZERO
         }
         UsdcRebalanceType::BaseToAlpaca => ethereum_usdc_balance_before_rebalance
             .checked_add(event_amounts.bridged_amount_received)

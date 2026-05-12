@@ -225,12 +225,36 @@ impl std::fmt::Display for TransferStatus {
 
 /// Snapshot of a wallet transfer, returned by
 /// [`AlpacaBrokerMock::wallet_transfers`].
+///
+/// Direction-specific counterparty data lives in [`TransferFlow`]; common
+/// metadata stays on the snapshot so consumers don't pay a match cost for
+/// status / amount / id checks. The `flow` discriminant subsumes any
+/// separate "direction" tag, so neither the meaning of an address nor the
+/// invariant linking address-to-direction needs to be reasoned about.
 pub struct MockWalletTransferSnapshot {
     pub transfer_id: String,
-    pub direction: TransferDirection,
     pub amount: Float,
     pub asset: String,
     pub status: TransferStatus,
+    pub flow: TransferFlow,
+}
+
+/// Direction-specific counterparty data attached to a wallet transfer.
+pub enum TransferFlow {
+    /// USDC moving from Alpaca to an on-chain `recipient`.
+    Outgoing { recipient: Address },
+    /// USDC arriving at Alpaca from an on-chain `sender`.
+    Incoming { sender: Address },
+}
+
+impl TransferFlow {
+    #[must_use]
+    pub fn direction(&self) -> TransferDirection {
+        match self {
+            Self::Outgoing { .. } => TransferDirection::Outgoing,
+            Self::Incoming { .. } => TransferDirection::Incoming,
+        }
+    }
 }
 
 /// Owns the `MockServer` and shared state. All endpoints respond dynamically
@@ -407,10 +431,17 @@ impl AlpacaBrokerMock {
             .iter()
             .map(|transfer| MockWalletTransferSnapshot {
                 transfer_id: transfer.transfer_id.clone(),
-                direction: transfer.direction,
                 amount: transfer.amount,
                 asset: transfer.asset.clone(),
                 status: transfer.status,
+                flow: match transfer.direction {
+                    TransferDirection::Outgoing => TransferFlow::Outgoing {
+                        recipient: transfer.to_address,
+                    },
+                    TransferDirection::Incoming => TransferFlow::Incoming {
+                        sender: transfer.from_address,
+                    },
+                },
             })
             .collect()
     }
