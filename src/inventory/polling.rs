@@ -637,6 +637,19 @@ mod tests {
             self.address
         }
 
+        async fn send_pending(
+            &self,
+            _contract: Address,
+            _calldata: Bytes,
+            _note: &str,
+        ) -> Result<TxHash, EvmError> {
+            panic!("MockEthereumWallet::send_pending should not be called in polling tests")
+        }
+
+        async fn await_receipt(&self, _tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
+            panic!("MockEthereumWallet::await_receipt should not be called in polling tests")
+        }
+
         async fn send(
             &self,
             _contract: Address,
@@ -660,6 +673,19 @@ mod tests {
     impl Wallet for MockBaseWallet {
         fn address(&self) -> Address {
             self.address
+        }
+
+        async fn send_pending(
+            &self,
+            _contract: Address,
+            _calldata: Bytes,
+            _note: &str,
+        ) -> Result<TxHash, EvmError> {
+            panic!("MockBaseWallet::send_pending should not be called in polling tests")
+        }
+
+        async fn await_receipt(&self, _tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
+            panic!("MockBaseWallet::await_receipt should not be called in polling tests")
         }
 
         async fn send(

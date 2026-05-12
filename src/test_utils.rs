@@ -1,7 +1,7 @@
 //! Shared test fixtures: database setup, stub orders/logs,
 //! and builders for onchain trades and offchain executions.
 
-use alloy::primitives::{Address, B256, Bytes, LogData, address, bytes, fixed_bytes};
+use alloy::primitives::{Address, B256, Bytes, LogData, TxHash, address, bytes, fixed_bytes};
 use alloy::providers::RootProvider;
 use alloy::rpc::client::RpcClient;
 use alloy::rpc::types::{Log, TransactionReceipt};
@@ -51,6 +51,23 @@ impl Evm for StubWallet {
 impl Wallet for StubWallet {
     fn address(&self) -> Address {
         self.address
+    }
+
+    async fn send_pending(
+        &self,
+        _contract: Address,
+        _calldata: Bytes,
+        _note: &str,
+    ) -> Result<TxHash, EvmError> {
+        panic!(
+            "StubWallet::send_pending called - use a real wallet in tests that need transactions"
+        )
+    }
+
+    async fn await_receipt(&self, _tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
+        panic!(
+            "StubWallet::await_receipt called - use a real wallet in tests that need transactions"
+        )
     }
 
     async fn send(

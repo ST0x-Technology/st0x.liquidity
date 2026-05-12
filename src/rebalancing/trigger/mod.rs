@@ -272,7 +272,9 @@ enum MintTrackingStage {
     Requested,
     Accepted,
     TokensReceived,
+    WrapSubmitted,
     TokensWrapped,
+    VaultDepositSubmitted,
 }
 
 impl std::fmt::Display for MintTrackingStage {
@@ -281,7 +283,9 @@ impl std::fmt::Display for MintTrackingStage {
             Self::Requested => write!(formatter, "MintRequested"),
             Self::Accepted => write!(formatter, "MintAccepted"),
             Self::TokensReceived => write!(formatter, "TokensReceived"),
+            Self::WrapSubmitted => write!(formatter, "WrapSubmitted"),
             Self::TokensWrapped => write!(formatter, "TokensWrapped"),
+            Self::VaultDepositSubmitted => write!(formatter, "VaultDepositSubmitted"),
         }
     }
 }
@@ -324,9 +328,17 @@ impl MintTracking {
                 self.stage = MintTrackingStage::TokensReceived;
                 self.last_progress_at = *received_at;
             }
+            TokenizedEquityMintEvent::WrapSubmitted { submitted_at, .. } => {
+                self.stage = MintTrackingStage::WrapSubmitted;
+                self.last_progress_at = *submitted_at;
+            }
             TokenizedEquityMintEvent::TokensWrapped { wrapped_at, .. } => {
                 self.stage = MintTrackingStage::TokensWrapped;
                 self.last_progress_at = *wrapped_at;
+            }
+            TokenizedEquityMintEvent::VaultDepositSubmitted { submitted_at, .. } => {
+                self.stage = MintTrackingStage::VaultDepositSubmitted;
+                self.last_progress_at = *submitted_at;
             }
             TokenizedEquityMintEvent::MintRequested { .. }
             | TokenizedEquityMintEvent::MintRejected { .. }
@@ -340,8 +352,13 @@ impl MintTracking {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RedemptionTrackingStage {
+    VaultWithdrawPending,
+    VaultWithdrawSubmitted,
     WithdrawnFromRaindex,
+    UnwrapPending,
+    UnwrapSubmitted,
     TokensUnwrapped,
+    SendPending,
     TokensSent,
     Detected,
 }
@@ -349,8 +366,13 @@ enum RedemptionTrackingStage {
 impl std::fmt::Display for RedemptionTrackingStage {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::VaultWithdrawPending => write!(formatter, "VaultWithdrawPending"),
+            Self::VaultWithdrawSubmitted => write!(formatter, "VaultWithdrawSubmitted"),
             Self::WithdrawnFromRaindex => write!(formatter, "WithdrawnFromRaindex"),
+            Self::UnwrapPending => write!(formatter, "UnwrapPending"),
+            Self::UnwrapSubmitted => write!(formatter, "UnwrapSubmitted"),
             Self::TokensUnwrapped => write!(formatter, "TokensUnwrapped"),
+            Self::SendPending => write!(formatter, "SendPending"),
             Self::TokensSent => write!(formatter, "TokensSent"),
             Self::Detected => write!(formatter, "Detected"),
         }
@@ -366,30 +388,70 @@ struct RedemptionTracking {
 }
 
 impl RedemptionTracking {
-    fn from_withdrawn_event(event: &EquityRedemptionEvent) -> Option<Self> {
-        let EquityRedemptionEvent::WithdrawnFromRaindex {
-            symbol,
-            quantity,
-            withdrawn_at,
-            ..
-        } = event
-        else {
-            return None;
-        };
-
-        Some(Self {
-            symbol: symbol.clone(),
-            quantity: FractionalShares::new(*quantity),
-            stage: RedemptionTrackingStage::WithdrawnFromRaindex,
-            last_progress_at: *withdrawn_at,
-        })
+    fn from_genesis_event(event: &EquityRedemptionEvent) -> Option<Self> {
+        match event {
+            EquityRedemptionEvent::VaultWithdrawPending {
+                symbol,
+                quantity,
+                pending_at,
+                ..
+            } => Some(Self {
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(*quantity),
+                stage: RedemptionTrackingStage::VaultWithdrawPending,
+                last_progress_at: *pending_at,
+            }),
+            EquityRedemptionEvent::VaultWithdrawSubmitted {
+                symbol,
+                quantity,
+                submitted_at,
+                ..
+            } => Some(Self {
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(*quantity),
+                stage: RedemptionTrackingStage::VaultWithdrawSubmitted,
+                last_progress_at: *submitted_at,
+            }),
+            EquityRedemptionEvent::WithdrawnFromRaindex {
+                symbol,
+                quantity,
+                withdrawn_at,
+                ..
+            } => Some(Self {
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(*quantity),
+                stage: RedemptionTrackingStage::WithdrawnFromRaindex,
+                last_progress_at: *withdrawn_at,
+            }),
+            _ => None,
+        }
     }
 
     fn track_progress(&mut self, event: &EquityRedemptionEvent) {
         match event {
+            EquityRedemptionEvent::VaultWithdrawSubmitted { submitted_at, .. } => {
+                self.stage = RedemptionTrackingStage::VaultWithdrawSubmitted;
+                self.last_progress_at = *submitted_at;
+            }
+            EquityRedemptionEvent::WithdrawnFromRaindex { withdrawn_at, .. } => {
+                self.stage = RedemptionTrackingStage::WithdrawnFromRaindex;
+                self.last_progress_at = *withdrawn_at;
+            }
+            EquityRedemptionEvent::UnwrapPending { pending_at, .. } => {
+                self.stage = RedemptionTrackingStage::UnwrapPending;
+                self.last_progress_at = *pending_at;
+            }
+            EquityRedemptionEvent::UnwrapSubmitted { submitted_at, .. } => {
+                self.stage = RedemptionTrackingStage::UnwrapSubmitted;
+                self.last_progress_at = *submitted_at;
+            }
             EquityRedemptionEvent::TokensUnwrapped { unwrapped_at, .. } => {
                 self.stage = RedemptionTrackingStage::TokensUnwrapped;
                 self.last_progress_at = *unwrapped_at;
+            }
+            EquityRedemptionEvent::SendPending { pending_at, .. } => {
+                self.stage = RedemptionTrackingStage::SendPending;
+                self.last_progress_at = *pending_at;
             }
             EquityRedemptionEvent::TokensSent { sent_at, .. } => {
                 self.stage = RedemptionTrackingStage::TokensSent;
@@ -399,7 +461,7 @@ impl RedemptionTracking {
                 self.stage = RedemptionTrackingStage::Detected;
                 self.last_progress_at = *detected_at;
             }
-            EquityRedemptionEvent::WithdrawnFromRaindex { .. }
+            EquityRedemptionEvent::VaultWithdrawPending { .. }
             | EquityRedemptionEvent::TransferFailed { .. }
             | EquityRedemptionEvent::DetectionFailed { .. }
             | EquityRedemptionEvent::RedemptionRejected { .. }
@@ -613,10 +675,10 @@ impl RebalancingTrigger {
                     MintTrackingStage::Accepted => {
                         TokenizedEquityMintCommand::FailAcceptance { reason }
                     }
-                    MintTrackingStage::TokensReceived => {
+                    MintTrackingStage::TokensReceived | MintTrackingStage::WrapSubmitted => {
                         TokenizedEquityMintCommand::FailWrapping { reason }
                     }
-                    MintTrackingStage::TokensWrapped => {
+                    MintTrackingStage::TokensWrapped | MintTrackingStage::VaultDepositSubmitted => {
                         TokenizedEquityMintCommand::FailRaindexDeposit { reason }
                     }
                     MintTrackingStage::Requested => continue,
@@ -682,8 +744,13 @@ impl RebalancingTrigger {
                 );
 
                 let command = match tracking.stage {
-                    RedemptionTrackingStage::WithdrawnFromRaindex
-                    | RedemptionTrackingStage::TokensUnwrapped => {
+                    RedemptionTrackingStage::VaultWithdrawPending
+                    | RedemptionTrackingStage::VaultWithdrawSubmitted
+                    | RedemptionTrackingStage::WithdrawnFromRaindex
+                    | RedemptionTrackingStage::UnwrapPending
+                    | RedemptionTrackingStage::UnwrapSubmitted
+                    | RedemptionTrackingStage::TokensUnwrapped
+                    | RedemptionTrackingStage::SendPending => {
                         Some(EquityRedemptionCommand::FailTransfer { reason })
                     }
                     RedemptionTrackingStage::TokensSent => {
@@ -958,7 +1025,7 @@ impl RebalancingTrigger {
             return;
         }
 
-        if let Some(created) = RedemptionTracking::from_withdrawn_event(event) {
+        if let Some(created) = RedemptionTracking::from_genesis_event(event) {
             tracking.insert(id.clone(), created);
         }
     }
@@ -1444,7 +1511,9 @@ impl RebalancingTrigger {
             DepositedIntoRaindex { .. } => Some(Self::last_rebalancing_update()),
             MintRequested { .. }
             | MintRejected { .. }
+            | WrapSubmitted { .. }
             | TokensWrapped { .. }
+            | VaultDepositSubmitted { .. }
             | WrappingFailed { .. }
             | RaindexDepositFailed { .. } => None,
         }
@@ -1519,7 +1588,7 @@ impl RebalancingTrigger {
         use EquityRedemptionEvent::*;
 
         match event {
-            WithdrawnFromRaindex { .. } => Some(Self::start_equity_transfer_update(
+            VaultWithdrawPending { .. } => Some(Self::start_equity_transfer_update(
                 Venue::MarketMaking,
                 quantity,
             )),
@@ -1531,7 +1600,12 @@ impl RebalancingTrigger {
                 Venue::MarketMaking,
                 quantity,
             )),
-            TokensUnwrapped { .. }
+            VaultWithdrawSubmitted { .. }
+            | WithdrawnFromRaindex { .. }
+            | UnwrapPending { .. }
+            | UnwrapSubmitted { .. }
+            | TokensUnwrapped { .. }
+            | SendPending { .. }
             | TokensSent { .. }
             | DetectionFailed { .. }
             | Detected { .. }
@@ -1679,7 +1753,13 @@ impl RebalancingTrigger {
             | TokensReceived {
                 symbol, quantity, ..
             }
+            | WrapSubmitted {
+                symbol, quantity, ..
+            }
             | TokensWrapped {
+                symbol, quantity, ..
+            }
+            | VaultDepositSubmitted {
                 symbol, quantity, ..
             } => {
                 let quantity = FractionalShares::new(*quantity);
@@ -1692,8 +1772,14 @@ impl RebalancingTrigger {
                     TokensReceived { received_at, .. } => {
                         (MintTrackingStage::TokensReceived, *received_at)
                     }
+                    WrapSubmitted { received_at, .. } => {
+                        (MintTrackingStage::WrapSubmitted, *received_at)
+                    }
                     TokensWrapped { wrapped_at, .. } => {
                         (MintTrackingStage::TokensWrapped, *wrapped_at)
+                    }
+                    VaultDepositSubmitted { wrapped_at, .. } => {
+                        (MintTrackingStage::VaultDepositSubmitted, *wrapped_at)
                     }
                     _ => unreachable!(),
                 };
@@ -1734,10 +1820,25 @@ impl RebalancingTrigger {
         use EquityRedemption::*;
 
         match entity {
-            WithdrawnFromRaindex {
+            VaultWithdrawPending {
+                symbol, quantity, ..
+            }
+            | VaultWithdrawSubmitted {
+                symbol, quantity, ..
+            }
+            | WithdrawnFromRaindex {
+                symbol, quantity, ..
+            }
+            | UnwrapPending {
+                symbol, quantity, ..
+            }
+            | UnwrapSubmitted {
                 symbol, quantity, ..
             }
             | TokensUnwrapped {
+                symbol, quantity, ..
+            }
+            | SendPending {
                 symbol, quantity, ..
             }
             | TokensSent {
@@ -1749,11 +1850,27 @@ impl RebalancingTrigger {
                 let quantity = FractionalShares::new(*quantity);
 
                 let (stage, last_progress_at) = match entity {
+                    VaultWithdrawPending { pending_at, .. } => {
+                        (RedemptionTrackingStage::VaultWithdrawPending, *pending_at)
+                    }
+                    VaultWithdrawSubmitted { submitted_at, .. } => (
+                        RedemptionTrackingStage::VaultWithdrawSubmitted,
+                        *submitted_at,
+                    ),
                     WithdrawnFromRaindex { withdrawn_at, .. } => {
                         (RedemptionTrackingStage::WithdrawnFromRaindex, *withdrawn_at)
                     }
+                    UnwrapPending { withdrawn_at, .. } => {
+                        (RedemptionTrackingStage::UnwrapPending, *withdrawn_at)
+                    }
+                    UnwrapSubmitted { withdrawn_at, .. } => {
+                        (RedemptionTrackingStage::UnwrapSubmitted, *withdrawn_at)
+                    }
                     TokensUnwrapped { unwrapped_at, .. } => {
                         (RedemptionTrackingStage::TokensUnwrapped, *unwrapped_at)
+                    }
+                    SendPending { unwrapped_at, .. } => {
+                        (RedemptionTrackingStage::SendPending, *unwrapped_at)
                     }
                     TokensSent { sent_at, .. } => (RedemptionTrackingStage::TokensSent, *sent_at),
                     Pending { detected_at, .. } => {
@@ -1896,7 +2013,9 @@ impl RebalancingTrigger {
             MintRequested { .. }
             | MintAccepted { .. }
             | TokensReceived { .. }
-            | TokensWrapped { .. } => false,
+            | WrapSubmitted { .. }
+            | TokensWrapped { .. }
+            | VaultDepositSubmitted { .. } => false,
         }
     }
 
@@ -1904,7 +2023,7 @@ impl RebalancingTrigger {
     fn extract_redemption_info(
         event: &EquityRedemptionEvent,
     ) -> Option<(Symbol, FractionalShares)> {
-        RedemptionTracking::from_withdrawn_event(event)
+        RedemptionTracking::from_genesis_event(event)
             .map(|tracking| (tracking.symbol, tracking.quantity))
     }
 
@@ -1917,8 +2036,13 @@ impl RebalancingTrigger {
             | DetectionFailed { .. }
             | RedemptionRejected { .. } => true,
 
-            WithdrawnFromRaindex { .. }
+            VaultWithdrawPending { .. }
+            | VaultWithdrawSubmitted { .. }
+            | WithdrawnFromRaindex { .. }
+            | UnwrapPending { .. }
+            | UnwrapSubmitted { .. }
             | TokensUnwrapped { .. }
+            | SendPending { .. }
             | TokensSent { .. }
             | Detected { .. } => false,
         }
@@ -4537,13 +4661,12 @@ mod tests {
     }
 
     fn make_withdrawn_from_raindex(symbol: &Symbol, quantity: Float) -> EquityRedemptionEvent {
-        EquityRedemptionEvent::WithdrawnFromRaindex {
+        EquityRedemptionEvent::VaultWithdrawPending {
             symbol: symbol.clone(),
             quantity,
             token: Address::random(),
             wrapped_amount: U256::from(50_250_000_000_000_000_000_u128),
-            raindex_withdraw_tx: TxHash::random(),
-            withdrawn_at: Utc::now(),
+            pending_at: Utc::now(),
         }
     }
 

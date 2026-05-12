@@ -16,7 +16,8 @@
 //! `Wallet::submit` (write transactions), so consumers get
 //! human-readable revert reasons without manual wiring.
 
-use alloy::primitives::{Address, Bytes};
+use alloy::consensus::Transaction;
+use alloy::primitives::{Address, Bytes, TxHash};
 use alloy::providers::Provider;
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use alloy::sol_types::SolCall;
@@ -229,6 +230,25 @@ pub trait Wallet: Evm {
     /// Returns the address this wallet signs transactions from.
     fn address(&self) -> Address;
 
+    /// Submit a signed transaction and return the tx hash immediately,
+    /// without waiting for confirmation.
+    ///
+    /// Implementations handle signing and submission to the mempool.
+    /// The returned hash can be passed to [`await_receipt`](Wallet::await_receipt)
+    /// to wait for confirmation separately.
+    async fn send_pending(
+        &self,
+        contract: Address,
+        calldata: Bytes,
+        note: &str,
+    ) -> Result<TxHash, EvmError>;
+
+    /// Wait for a previously submitted transaction to be confirmed.
+    ///
+    /// Polls for the receipt and waits for the configured confirmation
+    /// depth before returning.
+    async fn await_receipt(&self, tx_hash: TxHash) -> Result<TransactionReceipt, EvmError>;
+
     /// Send raw calldata as a signed transaction.
     ///
     /// Implementations handle signing, submission, and waiting for the
@@ -284,6 +304,65 @@ pub trait Wallet: Evm {
     {
         let calldata = Bytes::from(call.abi_encode());
         let receipt = self.send(contract, calldata.clone(), note).await?;
+        decode_reverted_receipt::<Registry>(
+            self.provider(),
+            self.address(),
+            contract,
+            calldata,
+            receipt,
+        )
+        .await
+    }
+
+    /// Submit a typed contract call without waiting for confirmation.
+    ///
+    /// Like [`submit`](Wallet::submit), but returns the tx hash
+    /// immediately instead of waiting for the receipt. Use
+    /// [`confirm`](Wallet::confirm) to wait and decode reverts later.
+    async fn submit_pending<Call: SolCall + Send>(
+        &self,
+        contract: Address,
+        call: Call,
+        note: &str,
+    ) -> Result<TxHash, EvmError>
+    where
+        Self: Sized,
+    {
+        let calldata = Bytes::from(call.abi_encode());
+        self.send_pending(contract, calldata, note).await
+    }
+
+    /// Wait for a previously submitted transaction and decode reverts.
+    ///
+    /// Counterpart to [`submit_pending`](Wallet::submit_pending).
+    /// Awaits the receipt, then if the transaction reverted, fetches
+    /// the original transaction from chain to recover `from`,
+    /// `to`, and `input`, and replays as `eth_call` to decode the
+    /// Solidity error via `Registry`.
+    async fn confirm<Registry: IntoErrorRegistry>(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<TransactionReceipt, EvmError>
+    where
+        Self: Sized,
+    {
+        let receipt = self.await_receipt(tx_hash).await?;
+
+        if receipt.status() {
+            return Ok(receipt);
+        }
+
+        // Recover the original calldata from chain so we can replay
+        // the failed call and decode the Solidity revert reason.
+        let original_tx = self
+            .provider()
+            .get_transaction_by_hash(tx_hash)
+            .await?
+            .ok_or(EvmError::Reverted { tx_hash })?;
+
+        let contract = original_tx.to().unwrap_or_default();
+        let calldata = original_tx.input().clone();
+
         decode_reverted_receipt::<Registry>(
             self.provider(),
             self.address(),
@@ -378,6 +457,19 @@ impl<Inner: Evm + ?Sized> Evm for Arc<Inner> {
 impl<Inner: Wallet + ?Sized> Wallet for Arc<Inner> {
     fn address(&self) -> Address {
         (**self).address()
+    }
+
+    async fn send_pending(
+        &self,
+        contract: Address,
+        calldata: Bytes,
+        note: &str,
+    ) -> Result<TxHash, EvmError> {
+        (**self).send_pending(contract, calldata, note).await
+    }
+
+    async fn await_receipt(&self, tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
+        (**self).await_receipt(tx_hash).await
     }
 
     async fn send(

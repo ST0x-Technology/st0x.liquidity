@@ -90,6 +90,37 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
         underlying_amount: U256,
         receiver: Address,
     ) -> Result<(TxHash, U256), WrapperError> {
+        let tx_hash = self
+            .submit_wrap(wrapped_token, underlying_amount, receiver)
+            .await?;
+
+        let actual_shares = self.confirm_wrap(wrapped_token, tx_hash).await?;
+
+        Ok((tx_hash, actual_shares))
+    }
+
+    async fn to_underlying(
+        &self,
+        wrapped_token: Address,
+        wrapped_amount: U256,
+        receiver: Address,
+        owner: Address,
+    ) -> Result<(TxHash, U256), WrapperError> {
+        let tx_hash = self
+            .submit_unwrap(wrapped_token, wrapped_amount, receiver, owner)
+            .await?;
+
+        let actual_assets = self.confirm_unwrap(wrapped_token, tx_hash).await?;
+
+        Ok((tx_hash, actual_assets))
+    }
+
+    async fn submit_wrap(
+        &self,
+        wrapped_token: Address,
+        underlying_amount: U256,
+        receiver: Address,
+    ) -> Result<TxHash, WrapperError> {
         let underlying_token: Address = self
             .wallet
             .call::<OpenChainErrorRegistry, _>(wrapped_token, IERC4626::assetCall {})
@@ -130,9 +161,9 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
         }
 
         info!(target: "orderbook", %wrapped_token, %underlying_amount, "Sending ERC4626 deposit");
-        let receipt = self
+        let tx_hash = self
             .wallet
-            .submit::<OpenChainErrorRegistry, _>(
+            .submit_pending(
                 wrapped_token,
                 IERC4626::depositCall {
                     assets: underlying_amount,
@@ -141,7 +172,21 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
                 "ERC4626 deposit",
             )
             .await?;
-        let tx_hash = receipt.transaction_hash;
+
+        info!(target: "orderbook", %tx_hash, "ERC4626 deposit submitted");
+
+        Ok(tx_hash)
+    }
+
+    async fn confirm_wrap(
+        &self,
+        wrapped_token: Address,
+        tx_hash: TxHash,
+    ) -> Result<U256, WrapperError> {
+        let receipt = self
+            .wallet
+            .confirm::<OpenChainErrorRegistry>(tx_hash)
+            .await?;
 
         let actual_shares = receipt
             .inner
@@ -155,20 +200,20 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
             })
             .ok_or(WrapperError::MissingDepositEvent)?;
 
-        Ok((tx_hash, actual_shares))
+        Ok(actual_shares)
     }
 
-    async fn to_underlying(
+    async fn submit_unwrap(
         &self,
         wrapped_token: Address,
         wrapped_amount: U256,
         receiver: Address,
         owner: Address,
-    ) -> Result<(TxHash, U256), WrapperError> {
+    ) -> Result<TxHash, WrapperError> {
         info!(target: "orderbook", %wrapped_token, %wrapped_amount, "Sending ERC4626 redeem");
-        let receipt = self
+        let tx_hash = self
             .wallet
-            .submit::<OpenChainErrorRegistry, _>(
+            .submit_pending(
                 wrapped_token,
                 IERC4626::redeemCall {
                     shares: wrapped_amount,
@@ -178,7 +223,21 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
                 "ERC4626 redeem",
             )
             .await?;
-        let tx_hash = receipt.transaction_hash;
+
+        info!(target: "orderbook", %tx_hash, "ERC4626 redeem submitted");
+
+        Ok(tx_hash)
+    }
+
+    async fn confirm_unwrap(
+        &self,
+        wrapped_token: Address,
+        tx_hash: TxHash,
+    ) -> Result<U256, WrapperError> {
+        let receipt = self
+            .wallet
+            .confirm::<OpenChainErrorRegistry>(tx_hash)
+            .await?;
 
         let actual_assets = receipt
             .inner
@@ -192,7 +251,7 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
             })
             .ok_or(WrapperError::MissingWithdrawEvent)?;
 
-        Ok((tx_hash, actual_assets))
+        Ok(actual_assets)
     }
 
     fn owner(&self) -> Address {

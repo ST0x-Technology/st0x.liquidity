@@ -979,11 +979,11 @@ async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
         .start_deposit_watcher(eth_deposit_provider, USDC_ETHEREUM, infra.base_chain.owner)
         .await?;
 
-    // Capture the Ethereum USDC balance before spawning the bot, so the
-    // baseline cannot include CCTP mints from a rebalance that fires
-    // shortly after startup. The bot is the only thing that triggers
-    // the CCTP receiveMessage on Ethereum, so its absence here pins the
-    // baseline to the pristine pre-test state.
+    // Snapshot Ethereum USDC balance before the bot starts. Once the
+    // bot detects the USDC surplus from takes it may start the CCTP
+    // bridge immediately, minting USDC on Ethereum. Querying after
+    // takes is racey — the "before" snapshot would capture a
+    // partially-bridged state and double-count the mint.
     let ethereum_usdc_balance_before_rebalance =
         crate::base_chain::IERC20::new(USDC_ETHEREUM, &eth_balance_provider)
             .balanceOf(infra.base_chain.owner)
@@ -1189,7 +1189,10 @@ async fn redemption_rejected_preserves_inflight_via_sticky() -> anyhow::Result<(
         &redeem_events,
         &[
             "EquityRedemptionEvent::WithdrawnFromRaindex",
+            "EquityRedemptionEvent::UnwrapPending",
+            "EquityRedemptionEvent::UnwrapSubmitted",
             "EquityRedemptionEvent::TokensUnwrapped",
+            "EquityRedemptionEvent::SendPending",
             "EquityRedemptionEvent::TokensSent",
             "EquityRedemptionEvent::Detected",
             "EquityRedemptionEvent::RedemptionRejected",
@@ -1323,7 +1326,9 @@ async fn pending_requests_filtered_by_wallet() -> anyhow::Result<()> {
             "TokenizedEquityMintEvent::MintRequested",
             "TokenizedEquityMintEvent::MintAccepted",
             "TokenizedEquityMintEvent::TokensReceived",
+            "TokenizedEquityMintEvent::WrapSubmitted",
             "TokenizedEquityMintEvent::TokensWrapped",
+            "TokenizedEquityMintEvent::VaultDepositSubmitted",
             "TokenizedEquityMintEvent::DepositedIntoRaindex",
         ],
     );
@@ -1645,7 +1650,9 @@ async fn interrupted_mint_resumes_after_restart() -> anyhow::Result<()> {
             "TokenizedEquityMintEvent::MintRequested",
             "TokenizedEquityMintEvent::MintAccepted",
             "TokenizedEquityMintEvent::TokensReceived",
+            "TokenizedEquityMintEvent::WrapSubmitted",
             "TokenizedEquityMintEvent::TokensWrapped",
+            "TokenizedEquityMintEvent::VaultDepositSubmitted",
             "TokenizedEquityMintEvent::DepositedIntoRaindex",
         ],
     );
@@ -1825,7 +1832,10 @@ async fn interrupted_redemption_resumes_after_restart() -> anyhow::Result<()> {
         &redemption_events_after_restart,
         &[
             "EquityRedemptionEvent::WithdrawnFromRaindex",
+            "EquityRedemptionEvent::UnwrapPending",
+            "EquityRedemptionEvent::UnwrapSubmitted",
             "EquityRedemptionEvent::TokensUnwrapped",
+            "EquityRedemptionEvent::SendPending",
             "EquityRedemptionEvent::TokensSent",
             "EquityRedemptionEvent::Detected",
             "EquityRedemptionEvent::Completed",

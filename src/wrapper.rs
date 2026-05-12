@@ -77,6 +77,47 @@ pub(crate) trait Wrapper: Send + Sync {
         owner: Address,
     ) -> Result<(TxHash, U256), WrapperError>;
 
+    /// Submit an ERC-4626 deposit without waiting for confirmation.
+    ///
+    /// Handles approval if needed, submits the deposit transaction, and
+    /// returns the tx hash immediately. Use [`confirm_wrap`](Wrapper::confirm_wrap)
+    /// to wait for confirmation and extract the actual shares minted.
+    async fn submit_wrap(
+        &self,
+        wrapped_token: Address,
+        underlying_amount: U256,
+        receiver: Address,
+    ) -> Result<TxHash, WrapperError>;
+
+    /// Wait for a previously submitted wrap transaction to confirm
+    /// and extract the shares minted from the receipt.
+    async fn confirm_wrap(
+        &self,
+        wrapped_token: Address,
+        tx_hash: TxHash,
+    ) -> Result<U256, WrapperError>;
+
+    /// Submit an ERC-4626 redeem without waiting for confirmation.
+    ///
+    /// Returns the tx hash immediately. Use
+    /// [`confirm_unwrap`](Wrapper::confirm_unwrap) to wait for
+    /// confirmation and extract the actual underlying amount received.
+    async fn submit_unwrap(
+        &self,
+        wrapped_token: Address,
+        wrapped_amount: U256,
+        receiver: Address,
+        owner: Address,
+    ) -> Result<TxHash, WrapperError>;
+
+    /// Wait for a previously submitted unwrap transaction to confirm
+    /// and extract the underlying amount received from the receipt.
+    async fn confirm_unwrap(
+        &self,
+        wrapped_token: Address,
+        tx_hash: TxHash,
+    ) -> Result<U256, WrapperError>;
+
     /// Returns the market maker wallet address that owns the wrapped tokens.
     fn owner(&self) -> Address;
 }

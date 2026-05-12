@@ -103,7 +103,7 @@ impl Raindex for PanickingRaindex {
         unimplemented!("PanickingRaindex: not available in CLI context")
     }
 
-    async fn deposit(
+    async fn withdraw(
         &self,
         _: Address,
         _: RaindexVaultId,
@@ -113,13 +113,27 @@ impl Raindex for PanickingRaindex {
         unimplemented!("PanickingRaindex: not available in CLI context")
     }
 
-    async fn withdraw(
+    async fn submit_deposit(
         &self,
         _: Address,
         _: RaindexVaultId,
         _: U256,
         _: u8,
     ) -> Result<TxHash, RaindexError> {
+        unimplemented!("PanickingRaindex: not available in CLI context")
+    }
+
+    async fn submit_withdraw(
+        &self,
+        _: Address,
+        _: RaindexVaultId,
+        _: U256,
+        _: u8,
+    ) -> Result<TxHash, RaindexError> {
+        unimplemented!("PanickingRaindex: not available in CLI context")
+    }
+
+    async fn confirm_tx(&self, _: TxHash) -> Result<(), RaindexError> {
         unimplemented!("PanickingRaindex: not available in CLI context")
     }
 }
@@ -213,6 +227,28 @@ impl Wrapper for PanickingWrapper {
         _: Address,
         _: Address,
     ) -> Result<(TxHash, U256), WrapperError> {
+        unimplemented!("PanickingWrapper: not available in CLI context")
+    }
+
+    async fn submit_wrap(&self, _: Address, _: U256, _: Address) -> Result<TxHash, WrapperError> {
+        unimplemented!("PanickingWrapper: not available in CLI context")
+    }
+
+    async fn confirm_wrap(&self, _: Address, _: TxHash) -> Result<U256, WrapperError> {
+        unimplemented!("PanickingWrapper: not available in CLI context")
+    }
+
+    async fn submit_unwrap(
+        &self,
+        _: Address,
+        _: U256,
+        _: Address,
+        _: Address,
+    ) -> Result<TxHash, WrapperError> {
+        unimplemented!("PanickingWrapper: not available in CLI context")
+    }
+
+    async fn confirm_unwrap(&self, _: Address, _: TxHash) -> Result<U256, WrapperError> {
         unimplemented!("PanickingWrapper: not available in CLI context")
     }
 
@@ -390,15 +426,27 @@ impl CrossVenueEquityTransfer {
         wrapped_shares: U256,
     ) -> Result<(), MintError> {
         let vault_id = self.raindex.lookup_vault_id(wrapped_token).await?;
+
         let vault_deposit_tx_hash = self
             .raindex
-            .deposit(
+            .submit_deposit(
                 wrapped_token,
                 vault_id,
                 wrapped_shares,
                 TOKENIZED_EQUITY_DECIMALS,
             )
             .await?;
+
+        self.mint_store
+            .send(
+                issuer_request_id,
+                TokenizedEquityMintCommand::SubmitVaultDeposit {
+                    vault_deposit_tx_hash,
+                },
+            )
+            .await?;
+
+        self.raindex.confirm_tx(vault_deposit_tx_hash).await?;
 
         self.mint_store
             .send(
@@ -447,9 +495,22 @@ impl CrossVenueEquityTransfer {
         info!(target: "rebalance", "Onchain verification passed, wrapping into ERC-4626 shares");
 
         let wrapped_token = self.wrapper.lookup_derivative(&tokens_received.symbol)?;
-        let (wrap_tx_hash, wrapped_shares) = self
+
+        let wrap_tx_hash = self
             .wrapper
-            .to_wrapped(wrapped_token, tokens_received.shares_minted, self.wallet)
+            .submit_wrap(wrapped_token, tokens_received.shares_minted, self.wallet)
+            .await?;
+
+        self.mint_store
+            .send(
+                issuer_request_id,
+                TokenizedEquityMintCommand::SubmitWrap { wrap_tx_hash },
+            )
+            .await?;
+
+        let wrapped_shares = self
+            .wrapper
+            .confirm_wrap(wrapped_token, wrap_tx_hash)
             .await?;
 
         self.mint_store
@@ -466,6 +527,7 @@ impl CrossVenueEquityTransfer {
         Ok((wrapped_token, wrapped_shares))
     }
 
+    #[allow(clippy::cognitive_complexity)]
     pub(crate) async fn resume_mint(
         &self,
         issuer_request_id: &IssuerRequestId,
@@ -485,6 +547,38 @@ impl CrossVenueEquityTransfer {
                         .finalize_received_mint(issuer_request_id, tokens_received)
                         .await;
                 }
+                TokenizedEquityMint::WrapSubmitted {
+                    wrap_tx_hash,
+                    symbol,
+                    ..
+                } => {
+                    info!(%issuer_request_id, %wrap_tx_hash, "Resuming submitted wrap");
+                    let wrapped_token = self.wrapper.lookup_derivative(&symbol)?;
+                    let wrapped_shares = self
+                        .wrapper
+                        .confirm_wrap(wrapped_token, wrap_tx_hash)
+                        .await?;
+
+                    self.mint_store
+                        .send(
+                            issuer_request_id,
+                            TokenizedEquityMintCommand::WrapTokens {
+                                wrap_tx_hash,
+                                wrapped_shares,
+                            },
+                        )
+                        .await?;
+
+                    info!(target: "rebalance", %wrap_tx_hash, %wrapped_shares, "Wrap confirmed on resume, depositing to Raindex vault");
+                    return self
+                        .deposit_wrapped_mint(
+                            issuer_request_id,
+                            &symbol,
+                            wrapped_token,
+                            wrapped_shares,
+                        )
+                        .await;
+                }
                 TokenizedEquityMint::TokensWrapped {
                     symbol,
                     wrapped_shares,
@@ -501,6 +595,26 @@ impl CrossVenueEquityTransfer {
                         )
                         .await;
                 }
+                TokenizedEquityMint::VaultDepositSubmitted {
+                    vault_deposit_tx_hash,
+                    symbol,
+                    ..
+                } => {
+                    info!(%issuer_request_id, %vault_deposit_tx_hash, "Resuming submitted vault deposit");
+                    self.raindex.confirm_tx(vault_deposit_tx_hash).await?;
+
+                    self.mint_store
+                        .send(
+                            issuer_request_id,
+                            TokenizedEquityMintCommand::DepositToVault {
+                                vault_deposit_tx_hash,
+                            },
+                        )
+                        .await?;
+
+                    info!(target: "rebalance", %symbol, %vault_deposit_tx_hash, "Vault deposit confirmed on resume");
+                    return Ok(());
+                }
                 TokenizedEquityMint::DepositedIntoRaindex { .. }
                 | TokenizedEquityMint::Failed { .. } => return Ok(()),
                 entity @ TokenizedEquityMint::MintRequested { .. } => {
@@ -514,7 +628,8 @@ impl CrossVenueEquityTransfer {
         }
     }
 
-    /// Sends the Redeem command to withdraw from Raindex vault.
+    /// Sends the Redeem command to submit vault withdrawal, then
+    /// ConfirmWithdraw to wait for confirmation.
     async fn withdraw_from_raindex(
         &self,
         aggregate_id: &RedemptionAggregateId,
@@ -535,6 +650,14 @@ impl CrossVenueEquityTransfer {
             )
             .await?;
 
+        self.redemption_store
+            .send(aggregate_id, EquityRedemptionCommand::SubmitWithdraw)
+            .await?;
+
+        self.redemption_store
+            .send(aggregate_id, EquityRedemptionCommand::ConfirmWithdraw)
+            .await?;
+
         Ok(())
     }
 
@@ -548,7 +671,19 @@ impl CrossVenueEquityTransfer {
             .send(aggregate_id, EquityRedemptionCommand::UnwrapTokens)
             .await?;
 
+        self.redemption_store
+            .send(aggregate_id, EquityRedemptionCommand::SubmitUnwrap)
+            .await?;
+
+        self.redemption_store
+            .send(aggregate_id, EquityRedemptionCommand::ConfirmUnwrap)
+            .await?;
+
         info!(target: "rebalance", %aggregate_id, "Tokens unwrapped, sending to Alpaca");
+
+        self.redemption_store
+            .send(aggregate_id, EquityRedemptionCommand::PrepareSend)
+            .await?;
 
         self.redemption_store
             .send(aggregate_id, EquityRedemptionCommand::SendTokens)
@@ -680,17 +815,48 @@ impl CrossVenueEquityTransfer {
             })
     }
 
+    #[allow(clippy::cognitive_complexity)]
     pub(crate) async fn resume_redemption(
         &self,
         aggregate_id: &RedemptionAggregateId,
     ) -> Result<(), RedemptionError> {
         loop {
             match self.load_redemption_entity(aggregate_id).await? {
+                EquityRedemption::VaultWithdrawPending { .. } => {
+                    info!(%aggregate_id, "Resuming pending vault withdrawal");
+                    self.redemption_store
+                        .send(aggregate_id, EquityRedemptionCommand::SubmitWithdraw)
+                        .await?;
+                }
+                EquityRedemption::VaultWithdrawSubmitted { .. } => {
+                    info!(%aggregate_id, "Resuming submitted vault withdrawal");
+                    self.redemption_store
+                        .send(aggregate_id, EquityRedemptionCommand::ConfirmWithdraw)
+                        .await?;
+                }
                 EquityRedemption::WithdrawnFromRaindex { .. } => {
                     self.resume_withdrawn_redemption(aggregate_id).await?;
                 }
+                EquityRedemption::UnwrapPending { .. } => {
+                    info!(%aggregate_id, "Resuming pending unwrap");
+                    self.redemption_store
+                        .send(aggregate_id, EquityRedemptionCommand::SubmitUnwrap)
+                        .await?;
+                }
+                EquityRedemption::UnwrapSubmitted { .. } => {
+                    info!(%aggregate_id, "Resuming submitted unwrap");
+                    self.redemption_store
+                        .send(aggregate_id, EquityRedemptionCommand::ConfirmUnwrap)
+                        .await?;
+                }
                 EquityRedemption::TokensUnwrapped { .. } => {
                     self.resume_unwrapped_redemption(aggregate_id).await?;
+                }
+                EquityRedemption::SendPending { .. } => {
+                    info!(%aggregate_id, "Resuming pending send");
+                    self.redemption_store
+                        .send(aggregate_id, EquityRedemptionCommand::SendTokens)
+                        .await?;
                 }
                 EquityRedemption::TokensSent { redemption_tx, .. } => {
                     self.resume_sent_redemption(aggregate_id, &redemption_tx)
@@ -728,7 +894,7 @@ impl CrossVenueEquityTransfer {
     ) -> Result<(), RedemptionError> {
         info!(%aggregate_id, "Resuming unwrapped redemption");
         self.redemption_store
-            .send(aggregate_id, EquityRedemptionCommand::SendTokens)
+            .send(aggregate_id, EquityRedemptionCommand::PrepareSend)
             .await?;
         Ok(())
     }

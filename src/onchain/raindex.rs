@@ -205,6 +205,34 @@ impl<W: Wallet> RaindexService<W> {
         Ok(receipt.transaction_hash)
     }
 
+    /// Submit a deposit4 transaction without waiting for confirmation.
+    async fn submit_deposit4_to_vault(
+        &self,
+        token: Address,
+        vault_id: RaindexVaultId,
+        amount: U256,
+        decimals: u8,
+    ) -> Result<TxHash, RaindexError> {
+        let amount_float = Float::from_fixed_decimal(amount, decimals)?;
+
+        debug!(target: "orderbook", %token, ?vault_id, %amount, "Sending deposit4");
+
+        let calldata = IOrderBookV6::deposit4Call {
+            token,
+            vaultId: vault_id.0,
+            depositAmount: amount_float.get_inner(),
+            tasks: Vec::new(),
+        };
+
+        let tx_hash = self
+            .evm
+            .submit_pending(self.orderbook_address, calldata, "deposit4 to vault")
+            .await?;
+
+        info!(target: "orderbook", %tx_hash, %token, %amount, "deposit4 submitted");
+        Ok(tx_hash)
+    }
+
     /// Deposits USDC to a Rain OrderBook vault on Base.
     ///
     /// Convenience method that calls `deposit` with the Base USDC address and decimals.
@@ -303,16 +331,7 @@ pub(crate) trait Raindex: Send + Sync {
         symbol: &Symbol,
     ) -> Result<(Address, RaindexVaultId), RaindexError>;
 
-    /// Deposits tokens to a Rain OrderBook vault.
-    async fn deposit(
-        &self,
-        token: Address,
-        vault_id: RaindexVaultId,
-        amount: U256,
-        decimals: u8,
-    ) -> Result<TxHash, RaindexError>;
-
-    /// Withdraws tokens from a Rain OrderBook vault.
+    /// Withdraws tokens from a Rain OrderBook vault (atomic submit + confirm).
     async fn withdraw(
         &self,
         token: Address,
@@ -320,6 +339,34 @@ pub(crate) trait Raindex: Send + Sync {
         target_amount: U256,
         decimals: u8,
     ) -> Result<TxHash, RaindexError>;
+
+    /// Submit a vault deposit without waiting for confirmation.
+    ///
+    /// Handles approval if needed, submits the deposit4 transaction,
+    /// and returns the tx hash immediately. Use
+    /// [`confirm_tx`](Raindex::confirm_tx) to wait for confirmation.
+    async fn submit_deposit(
+        &self,
+        token: Address,
+        vault_id: RaindexVaultId,
+        amount: U256,
+        decimals: u8,
+    ) -> Result<TxHash, RaindexError>;
+
+    /// Submit a vault withdrawal without waiting for confirmation.
+    ///
+    /// Returns the tx hash immediately. Use
+    /// [`confirm_tx`](Raindex::confirm_tx) to wait for confirmation.
+    async fn submit_withdraw(
+        &self,
+        token: Address,
+        vault_id: RaindexVaultId,
+        target_amount: U256,
+        decimals: u8,
+    ) -> Result<TxHash, RaindexError>;
+
+    /// Wait for a previously submitted transaction to be confirmed.
+    async fn confirm_tx(&self, tx_hash: TxHash) -> Result<(), RaindexError>;
 }
 
 #[async_trait]
@@ -344,16 +391,6 @@ impl<W: Wallet> Raindex for RaindexService<W> {
             .primary_vault_id_by_token(token)
             .ok_or(RaindexError::VaultNotFound(token))?;
         Ok((token, RaindexVaultId(vault_id)))
-    }
-
-    async fn deposit(
-        &self,
-        token: Address,
-        vault_id: RaindexVaultId,
-        amount: U256,
-        decimals: u8,
-    ) -> Result<TxHash, RaindexError> {
-        Self::deposit::<OpenChainErrorRegistry>(self, token, vault_id, amount, decimals).await
     }
 
     async fn withdraw(
@@ -385,6 +422,62 @@ impl<W: Wallet> Raindex for RaindexService<W> {
 
         info!(target: "orderbook", tx_hash = %receipt.transaction_hash, %token, %target_amount, "withdraw4 confirmed");
         Ok(receipt.transaction_hash)
+    }
+
+    async fn submit_deposit(
+        &self,
+        token: Address,
+        vault_id: RaindexVaultId,
+        amount: U256,
+        decimals: u8,
+    ) -> Result<TxHash, RaindexError> {
+        if amount.is_zero() {
+            return Err(RaindexError::ZeroAmount);
+        }
+
+        self.approve_for_orderbook::<OpenChainErrorRegistry>(token, amount)
+            .await?;
+
+        self.submit_deposit4_to_vault(token, vault_id, amount, decimals)
+            .await
+    }
+
+    async fn submit_withdraw(
+        &self,
+        token: Address,
+        vault_id: RaindexVaultId,
+        target_amount: U256,
+        decimals: u8,
+    ) -> Result<TxHash, RaindexError> {
+        if target_amount.is_zero() {
+            return Err(RaindexError::ZeroAmount);
+        }
+
+        let amount_float = Float::from_fixed_decimal(target_amount, decimals)?;
+
+        let tx_hash = self
+            .evm
+            .submit_pending(
+                self.orderbook_address,
+                IOrderBookV6::withdraw4Call {
+                    token,
+                    vaultId: vault_id.0,
+                    targetAmount: amount_float.get_inner(),
+                    tasks: Vec::new(),
+                },
+                "withdraw4 from vault",
+            )
+            .await?;
+
+        info!(target: "orderbook", %tx_hash, %token, %target_amount, "withdraw4 submitted");
+        Ok(tx_hash)
+    }
+
+    async fn confirm_tx(&self, tx_hash: TxHash) -> Result<(), RaindexError> {
+        let receipt = self.evm.confirm::<OpenChainErrorRegistry>(tx_hash).await?;
+
+        info!(target: "orderbook", tx_hash = %receipt.transaction_hash, "Transaction confirmed");
+        Ok(())
     }
 }
 

@@ -464,6 +464,7 @@ async fn build_equity_transfer_with_trigger(
 /// drives the TokenizedEquityMint aggregate to completion via the Alpaca
 /// tokenization API.
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn equity_offchain_imbalance_triggers_mint() {
     let EquityTriggerFixture {
         pool,
@@ -672,7 +673,17 @@ async fn equity_offchain_imbalance_triggers_mint() {
             ExpectedEvent::new(
                 "TokenizedEquityMint",
                 &mint_agg_id,
+                "TokenizedEquityMintEvent::WrapSubmitted",
+            ),
+            ExpectedEvent::new(
+                "TokenizedEquityMint",
+                &mint_agg_id,
                 "TokenizedEquityMintEvent::TokensWrapped",
+            ),
+            ExpectedEvent::new(
+                "TokenizedEquityMint",
+                &mint_agg_id,
+                "TokenizedEquityMintEvent::VaultDepositSubmitted",
             ),
             ExpectedEvent::new(
                 "TokenizedEquityMint",
@@ -709,6 +720,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
 /// setting up httpmock responses, so the mock detection endpoint can match
 /// the exact hash produced by the real onchain transfer.
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn equity_onchain_imbalance_triggers_redemption() {
     let EquityTriggerFixture {
         pool,
@@ -870,12 +882,37 @@ async fn equity_onchain_imbalance_triggers_redemption() {
             ExpectedEvent::new(
                 "EquityRedemption",
                 &redemption_agg_id,
+                "EquityRedemptionEvent::VaultWithdrawPending",
+            ),
+            ExpectedEvent::new(
+                "EquityRedemption",
+                &redemption_agg_id,
+                "EquityRedemptionEvent::VaultWithdrawSubmitted",
+            ),
+            ExpectedEvent::new(
+                "EquityRedemption",
+                &redemption_agg_id,
                 "EquityRedemptionEvent::WithdrawnFromRaindex",
             ),
             ExpectedEvent::new(
                 "EquityRedemption",
                 &redemption_agg_id,
+                "EquityRedemptionEvent::UnwrapPending",
+            ),
+            ExpectedEvent::new(
+                "EquityRedemption",
+                &redemption_agg_id,
+                "EquityRedemptionEvent::UnwrapSubmitted",
+            ),
+            ExpectedEvent::new(
+                "EquityRedemption",
+                &redemption_agg_id,
                 "EquityRedemptionEvent::TokensUnwrapped",
+            ),
+            ExpectedEvent::new(
+                "EquityRedemption",
+                &redemption_agg_id,
+                "EquityRedemptionEvent::SendPending",
             ),
             ExpectedEvent::new(
                 "EquityRedemption",
@@ -897,21 +934,21 @@ async fn equity_onchain_imbalance_triggers_redemption() {
     .await;
 
     assert_eq!(
-        events[6].payload["WithdrawnFromRaindex"]["symbol"]
+        events[6].payload["VaultWithdrawPending"]["symbol"]
             .as_str()
             .unwrap(),
         "AAPL",
-        "WithdrawnFromRaindex should target the correct symbol"
+        "VaultWithdrawPending should target the correct symbol"
     );
     assert_eq!(
-        events[8].payload["TokensSent"]["redemption_tx"]
+        events[13].payload["TokensSent"]["redemption_tx"]
             .as_str()
             .unwrap(),
         format!("{expected_tx_hash:#x}"),
         "TokensSent redemption_tx should match the deterministic Anvil hash"
     );
     assert_eq!(
-        events[9].payload["Detected"]["tokenization_request_id"]
+        events[14].payload["Detected"]["tokenization_request_id"]
             .as_str()
             .unwrap(),
         "redeem_int_test",
@@ -2275,7 +2312,7 @@ async fn transfer_failed_cancels_redemption_inflight() {
 
     let redemption_id = RedemptionAggregateId::new("redemption-transfer-failed");
 
-    // Redeem: withdraws tokens from Raindex vault -> WithdrawnFromRaindex
+    // Redeem: creates VaultWithdrawPending
     redemption_store
         .send(
             &redemption_id,
@@ -2289,7 +2326,7 @@ async fn transfer_failed_cancels_redemption_inflight() {
         .await
         .unwrap();
 
-    // After WithdrawnFromRaindex, inflight should be set at MarketMaking
+    // After VaultWithdrawPending, inflight should be set at MarketMaking
     let inflight_after_withdraw = inventory
         .read()
         .await
@@ -2297,12 +2334,39 @@ async fn transfer_failed_cancels_redemption_inflight() {
         .unwrap();
     assert!(
         !inflight_after_withdraw.inner().is_zero().unwrap(),
-        "Inflight should be non-zero after WithdrawnFromRaindex, got {inflight_after_withdraw:?}"
+        "Inflight should be non-zero after VaultWithdrawPending, got {inflight_after_withdraw:?}"
     );
 
-    // UnwrapTokens -> TokensUnwrapped (no inventory change)
+    redemption_store
+        .send(&redemption_id, EquityRedemptionCommand::SubmitWithdraw)
+        .await
+        .unwrap();
+
+    redemption_store
+        .send(&redemption_id, EquityRedemptionCommand::ConfirmWithdraw)
+        .await
+        .unwrap();
+
+    // UnwrapTokens -> UnwrapPending, SubmitUnwrap -> UnwrapSubmitted,
+    // ConfirmUnwrap -> TokensUnwrapped
     redemption_store
         .send(&redemption_id, EquityRedemptionCommand::UnwrapTokens)
+        .await
+        .unwrap();
+
+    redemption_store
+        .send(&redemption_id, EquityRedemptionCommand::SubmitUnwrap)
+        .await
+        .unwrap();
+
+    redemption_store
+        .send(&redemption_id, EquityRedemptionCommand::ConfirmUnwrap)
+        .await
+        .unwrap();
+
+    // PrepareSend -> SendPending
+    redemption_store
+        .send(&redemption_id, EquityRedemptionCommand::PrepareSend)
         .await
         .unwrap();
 

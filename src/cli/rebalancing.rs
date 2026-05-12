@@ -590,10 +590,10 @@ pub(crate) async fn fail_transfer_command<W: Write>(
                 MintAccepted { .. } => FailAcceptance {
                     reason: reason.to_string(),
                 },
-                TokensReceived { .. } => FailWrapping {
+                TokensReceived { .. } | WrapSubmitted { .. } => FailWrapping {
                     reason: reason.to_string(),
                 },
-                TokensWrapped { .. } => FailRaindexDeposit {
+                TokensWrapped { .. } | VaultDepositSubmitted { .. } => FailRaindexDeposit {
                     reason: reason.to_string(),
                 },
                 MintRequested { .. } => {
@@ -626,7 +626,13 @@ pub(crate) async fn fail_transfer_command<W: Write>(
 
             use EquityRedemption::*;
             match entity {
-                WithdrawnFromRaindex { .. } | TokensUnwrapped { .. } => {}
+                VaultWithdrawPending { .. }
+                | VaultWithdrawSubmitted { .. }
+                | WithdrawnFromRaindex { .. }
+                | UnwrapPending { .. }
+                | UnwrapSubmitted { .. }
+                | TokensUnwrapped { .. }
+                | SendPending { .. } => {}
                 TokensSent { .. } | Pending { .. } => {
                     anyhow::bail!(
                         "Redemption {id} is past the transfer stage -- \
