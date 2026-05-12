@@ -1,4 +1,6 @@
-use tracing::{debug, info};
+use tracing::debug;
+#[cfg(test)]
+use tracing::info;
 
 use st0x_event_sorcery::Projection;
 use st0x_execution::{Direction, Executor, FractionalShares, Positive, SupportedExecutor, Symbol};
@@ -56,7 +58,7 @@ pub(crate) async fn check_execution_readiness<E: Executor>(
     }
 
     let shares = Positive::new(shares)?;
-    info!(target: "hedge", %symbol, %shares, ?direction, "Position ready for execution");
+    debug!(target: "hedge", %symbol, %shares, ?direction, "Position ready for execution");
 
     Ok(Some(ExecutionCtx {
         symbol: symbol.clone(),
@@ -128,7 +130,7 @@ pub(crate) async fn check_all_positions<E: Executor>(
 
             let shares = Positive::new(shares)?;
 
-            info!(
+            debug!(
                 target: "hedge",
                 symbol = %symbol,
                 shares = %shares,

@@ -1,18 +1,21 @@
 import Decimal from 'decimal.js'
 
+const toDecimal = (value: string): Decimal =>
+  new Decimal(value !== '' ? value : '0')
+
 export const decimalAdd = (left: string, right: string): string =>
-  new Decimal(left).plus(new Decimal(right)).toString()
+  toDecimal(left).plus(toDecimal(right)).toString()
 
 export const decimalSub = (left: string, right: string): string =>
-  new Decimal(left).minus(new Decimal(right)).toString()
+  toDecimal(left).minus(toDecimal(right)).toString()
 
 export const decimalCompare = (left: string, right: string): number =>
-  new Decimal(left).cmp(new Decimal(right))
+  toDecimal(left).cmp(toDecimal(right))
 
-export const decimalIsZero = (value: string): boolean => new Decimal(value).isZero()
+export const decimalIsZero = (value: string): boolean => toDecimal(value).isZero()
 
 export const formatDecimal = (value: string, decimals: number): string => {
-  const fixed = new Decimal(value).toFixed(decimals)
+  const fixed = toDecimal(value).toFixed(decimals)
   const [intPart = '0', fracPart] = fixed.split('.')
   const withCommas = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ',')
   return fracPart !== undefined ? `${withCommas}.${fracPart}` : withCommas

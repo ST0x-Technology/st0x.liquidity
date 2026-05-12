@@ -1254,7 +1254,7 @@ where
     };
 
     if let Ok(Some(_)) = cqrs.onchain_trade.load(&trade_id).await {
-        info!(
+        debug!(
             ?trade_id,
             symbol = %trade.symbol,
             "Trade already processed (duplicate event), skipping"
