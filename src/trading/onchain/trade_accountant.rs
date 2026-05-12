@@ -222,12 +222,14 @@ pub(crate) enum TradeAccountingError {
     #[error("Position command failed: {0}")]
     PositionCommand(#[from] SendError<crate::position::Position>),
     #[error("Offchain order command failed: {0}")]
-    OffchainOrderCommand(#[from] SendError<crate::offchain_order::OffchainOrder>),
+    OffchainOrderCommand(#[from] SendError<crate::offchain::order::OffchainOrder>),
     #[error("Execution error: {0}")]
     Execution(#[from] ExecutionError),
     // TODO: TradeAccountingError should not be coupled to a concrete executor error type.
     #[error("Alpaca broker API error: {0}")]
     AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
+    #[error("Failed to enqueue PollOrderStatus job: {0}")]
+    EnqueuePollJob(#[from] crate::conductor::job::QueuePushError),
 }
 
 #[cfg(test)]
@@ -248,7 +250,7 @@ mod tests {
         ClearConfigV2, SignedContextV1, TakeOrderConfigV4, TakeOrderV3 as TakeOrderV3Event,
     };
     use crate::config::tests::create_test_ctx_with_order_owner;
-    use crate::offchain_order::OffchainOrder;
+    use crate::offchain::order::OffchainOrder;
     use crate::onchain_trade::OnChainTrade;
     use crate::position::Position;
     use crate::test_utils::{get_test_log, get_test_order, setup_test_db};
@@ -307,7 +309,7 @@ mod tests {
 
         let (offchain_order, _offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(crate::offchain_order::noop_order_placer())
+                .build(crate::offchain::order::noop_order_placer())
                 .await
                 .unwrap();
 
@@ -325,6 +327,7 @@ mod tests {
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: ctx.assets.clone(),
             counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
+            poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(&pool),
         };
 
         let job_queue = DexTradeAccountingJobQueue::new(&pool);
@@ -433,7 +436,7 @@ mod tests {
 
         let (offchain_order, _offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
-                .build(crate::offchain_order::noop_order_placer())
+                .build(crate::offchain::order::noop_order_placer())
                 .await
                 .unwrap();
 
@@ -451,6 +454,7 @@ mod tests {
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: ctx.assets.clone(),
             counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
+            poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(&pool),
         };
 
         let job_queue = DexTradeAccountingJobQueue::new(&pool);

@@ -21,7 +21,6 @@ use tracing::{Level, warn};
 
 use url::Url;
 
-use crate::offchain::order_poller::OrderPollerCtx;
 use crate::onchain::{EvmConfig, EvmCtx, EvmSecrets};
 use crate::rebalancing::{RebalancingConfig, RebalancingCtx, RebalancingCtxError};
 use crate::telemetry::{TelemetryConfig, TelemetryCtx, TelemetrySecrets};
@@ -860,11 +859,8 @@ impl Ctx {
         self.redemption_wallet.ok_or(CtxError::MissingTokenization)
     }
 
-    pub(crate) const fn get_order_poller_ctx(&self) -> OrderPollerCtx {
-        OrderPollerCtx {
-            polling_interval: std::time::Duration::from_secs(self.order_polling_interval),
-            max_jitter: std::time::Duration::from_secs(self.order_polling_max_jitter),
-        }
+    pub(crate) const fn order_polling_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.order_polling_interval)
     }
 
     /// Returns the wallet address that owns orders on the orderbook.

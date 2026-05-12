@@ -93,7 +93,7 @@ mod tests {
     use st0x_float_macro::float;
 
     use super::*;
-    use crate::{Inventory, Settings, TradeDirection, TradingVenue};
+    use crate::{Direction, Inventory, Settings, TradingVenue};
 
     #[test]
     fn statement_variants_matches_serde_wire_format() {
@@ -128,7 +128,7 @@ mod tests {
             id: "0x0000000000000000000000000000000000000000000000000000000000000000:0".to_string(),
             filled_at: Utc::now(),
             venue: TradingVenue::Raindex,
-            direction: TradeDirection::Buy,
+            direction: Direction::Buy,
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares::new(float!(10)),
         };

@@ -248,12 +248,6 @@ impl Display for Shares {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("invalid direction: {direction_provided}")]
-pub struct InvalidDirectionError {
-    direction_provided: String,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SupportedExecutor {
     AlpacaBrokerApi,
@@ -289,40 +283,7 @@ impl std::str::FromStr for SupportedExecutor {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum Direction {
-    Buy,
-    Sell,
-}
-
-impl Direction {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Buy => "BUY",
-            Self::Sell => "SELL",
-        }
-    }
-}
-
-impl Display for Direction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-impl std::str::FromStr for Direction {
-    type Err = InvalidDirectionError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "BUY" => Ok(Self::Buy),
-            "SELL" => Ok(Self::Sell),
-            _ => Err(InvalidDirectionError {
-                direction_provided: s.to_string(),
-            }),
-        }
-    }
-}
+pub use st0x_dto::{Direction, InvalidDirectionError};
 
 /// An equity position with symbol, quantity, and optional market value.
 #[derive(Debug, Clone)]

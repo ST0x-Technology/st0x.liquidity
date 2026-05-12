@@ -1,15 +1,14 @@
 //! Loads filled trades from the event store for the initial dashboard state.
 
+use futures_util::{StreamExt, stream};
 use sqlx::SqlitePool;
 use tracing::warn;
 
 use st0x_dto::Trade;
 use st0x_event_sorcery::{load_all_ids, load_entity};
 
-use crate::offchain_order::OffchainOrder;
+use crate::offchain::order::OffchainOrder;
 use crate::onchain_trade::OnChainTrade;
-
-use super::event::{direction_to_dto, executor_to_venue};
 
 const MAX_TRADES: usize = 100;
 
@@ -17,10 +16,11 @@ const MAX_TRADES: usize = 100;
 ///
 /// Returns up to [`MAX_TRADES`] trades sorted by fill time (newest first).
 pub(crate) async fn load_trades(pool: &SqlitePool) -> Vec<Trade> {
-    let mut trades = Vec::new();
-
-    trades.extend(load_onchain_trades(pool).await);
-    trades.extend(load_offchain_trades(pool).await);
+    let mut trades: Vec<Trade> = load_onchain_trades(pool)
+        .await
+        .into_iter()
+        .chain(load_offchain_trades(pool).await)
+        .collect();
 
     trades.sort_by(|lhs, rhs| rhs.filled_at.cmp(&lhs.filled_at));
     trades.truncate(MAX_TRADES);
@@ -28,115 +28,52 @@ pub(crate) async fn load_trades(pool: &SqlitePool) -> Vec<Trade> {
     trades
 }
 
-fn onchain_to_trade(id: &crate::onchain_trade::OnChainTradeId, entity: &OnChainTrade) -> Trade {
-    Trade {
-        id: id.to_string(),
-        filled_at: entity.filled_at,
-        venue: st0x_dto::TradingVenue::Raindex,
-        direction: direction_to_dto(entity.direction),
-        symbol: entity.symbol.clone(),
-        shares: st0x_finance::FractionalShares::new(entity.amount),
-    }
-}
-
-fn offchain_to_trade(
-    id: &crate::offchain_order::OffchainOrderId,
-    order: &OffchainOrder,
-) -> Option<Trade> {
-    let OffchainOrder::Filled {
-        symbol,
-        shares,
-        direction,
-        executor,
-        filled_at,
-        ..
-    } = order
-    else {
-        return None;
-    };
-
-    Some(Trade {
-        id: id.to_string(),
-        filled_at: *filled_at,
-        venue: executor_to_venue(*executor),
-        direction: direction_to_dto(*direction),
-        symbol: symbol.clone(),
-        shares: st0x_finance::FractionalShares::new(shares.inner().inner()),
-    })
-}
-
 async fn load_onchain_trades(pool: &SqlitePool) -> Vec<Trade> {
-    let ids = match load_all_ids::<OnChainTrade>(pool).await {
-        Ok(ids) => ids,
-        Err(error) => {
-            warn!(?error, "Failed to load OnChainTrade IDs for trade history");
-            return Vec::new();
-        }
-    };
+    let ids = load_all_ids::<OnChainTrade>(pool)
+        .await
+        .inspect_err(|error| warn!(?error, "Failed to load OnChainTrade IDs for trade history"))
+        .unwrap_or_default();
 
-    let mut trades = Vec::with_capacity(ids.len());
-
-    for id in &ids {
-        if let Some(trade) = replay_onchain(pool, id).await {
-            trades.push(trade);
-        }
-    }
-
-    trades
-}
-
-async fn replay_onchain(
-    pool: &SqlitePool,
-    id: &crate::onchain_trade::OnChainTradeId,
-) -> Option<Trade> {
-    match load_entity::<OnChainTrade>(pool, id).await {
-        Ok(Some(entity)) => Some(onchain_to_trade(id, &entity)),
-        Ok(None) => {
-            warn!(?id, "OnChainTrade replayed to empty state");
-            None
-        }
-        Err(error) => {
-            warn!(?error, ?id, "Failed to load OnChainTrade");
-            None
-        }
-    }
+    stream::iter(ids)
+        .filter_map(|id| async move {
+            match load_entity::<OnChainTrade>(pool, &id).await {
+                Ok(Some(entity)) => Some(entity.to_trade(&id)),
+                Ok(None) => {
+                    warn!(?id, "OnChainTrade replayed to empty state");
+                    None
+                }
+                Err(error) => {
+                    warn!(?error, ?id, "Failed to load OnChainTrade");
+                    None
+                }
+            }
+        })
+        .collect()
+        .await
 }
 
 async fn load_offchain_trades(pool: &SqlitePool) -> Vec<Trade> {
-    let ids = match load_all_ids::<OffchainOrder>(pool).await {
-        Ok(ids) => ids,
-        Err(error) => {
-            warn!(?error, "Failed to load OffchainOrder IDs for trade history");
-            return Vec::new();
-        }
-    };
+    let ids = load_all_ids::<OffchainOrder>(pool)
+        .await
+        .inspect_err(|error| warn!(?error, "Failed to load OffchainOrder IDs for trade history"))
+        .unwrap_or_default();
 
-    let mut trades = Vec::with_capacity(ids.len());
-
-    for id in &ids {
-        if let Some(trade) = replay_offchain(pool, id).await {
-            trades.push(trade);
-        }
-    }
-
-    trades
-}
-
-async fn replay_offchain(
-    pool: &SqlitePool,
-    id: &crate::offchain_order::OffchainOrderId,
-) -> Option<Trade> {
-    match load_entity::<OffchainOrder>(pool, id).await {
-        Ok(Some(order)) => offchain_to_trade(id, &order),
-        Ok(None) => {
-            warn!(?id, "OffchainOrder replayed to empty state");
-            None
-        }
-        Err(error) => {
-            warn!(?error, ?id, "Failed to load OffchainOrder");
-            None
-        }
-    }
+    stream::iter(ids)
+        .filter_map(|id| async move {
+            match load_entity::<OffchainOrder>(pool, &id).await {
+                Ok(Some(order)) => order.try_to_trade(&id).ok(),
+                Ok(None) => {
+                    warn!(?id, "OffchainOrder replayed to empty state");
+                    None
+                }
+                Err(error) => {
+                    warn!(?error, ?id, "Failed to load OffchainOrder");
+                    None
+                }
+            }
+        })
+        .collect()
+        .await
 }
 
 #[cfg(test)]
@@ -147,7 +84,7 @@ mod tests {
     use st0x_float_macro::float;
 
     use super::*;
-    use crate::offchain_order::{OffchainOrderCommand, OffchainOrderId, noop_order_placer};
+    use crate::offchain::order::{OffchainOrderCommand, OffchainOrderId, noop_order_placer};
     use crate::onchain_trade::{OnChainTradeCommand, OnChainTradeId};
     use crate::test_utils::setup_test_db;
 
@@ -192,7 +129,7 @@ mod tests {
         assert_eq!(trades.len(), 1);
         assert_eq!(trades[0].symbol, Symbol::new("AAPL").unwrap());
         assert!(matches!(trades[0].venue, st0x_dto::TradingVenue::Raindex));
-        assert!(matches!(trades[0].direction, st0x_dto::TradeDirection::Buy));
+        assert!(matches!(trades[0].direction, st0x_dto::Direction::Buy));
     }
 
     #[tokio::test]
@@ -235,10 +172,7 @@ mod tests {
         assert_eq!(trades.len(), 1);
         assert_eq!(trades[0].symbol, Symbol::new("TSLA").unwrap());
         assert!(matches!(trades[0].venue, st0x_dto::TradingVenue::Alpaca));
-        assert!(matches!(
-            trades[0].direction,
-            st0x_dto::TradeDirection::Sell
-        ));
+        assert!(matches!(trades[0].direction, st0x_dto::Direction::Sell));
     }
 
     #[tokio::test]

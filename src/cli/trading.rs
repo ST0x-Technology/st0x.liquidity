@@ -19,7 +19,7 @@ use st0x_execution::{
 };
 
 use crate::config::{BrokerCtx, Ctx};
-use crate::offchain_order::{
+use crate::offchain::order::{
     OffchainOrderCommand, OffchainOrderId, OrderPlacementResult, OrderPlacer,
     build_offchain_order_cqrs,
 };

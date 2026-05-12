@@ -6,13 +6,12 @@
 //! it and calls [`Job::perform`] with the shared context.
 
 use apalis::layers::retry::backoff::Backoff;
-use apalis::prelude::{Attempt, Data, Status, TaskSink};
+use apalis::prelude::{Attempt, Data, TaskBuilder, TaskSink};
+use apalis_core::backend::TaskSinkError;
 use apalis_core::backend::poll_strategy::{BackoffConfig, IntervalStrategy, StrategyBuilder};
 use apalis_core::worker::context::WorkerContext;
 use apalis_core::worker::event::Event;
-use apalis_cron::Schedule;
-use apalis_sqlite::{Config, SqliteStorage};
-use chrono::{DateTime, TimeZone, Utc};
+use apalis_sqlite::{Config, SqliteContext, SqliteStorage};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sqlx::SqlitePool;
@@ -22,10 +21,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 use tracing::{debug, error, warn};
-
-use st0x_execution::Executor;
-
-use crate::offchain::order_poller::{OrderPollingError, OrderStatusPoller};
 
 /// Recovery timeout for the fail-stop circuit breaker. Effectively
 /// infinite for any plausible bot uptime; chosen to be finite so
@@ -70,26 +65,6 @@ impl Backoff for ExponentialBackoff {
 pub(crate) const RETRY_BACKOFF: ExponentialBackoff =
     ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(30));
 
-/// `apalis_cron::Schedule` impl that fires at a fixed interval after each tick.
-/// Construction is typed and infallible -- no cron-string parsing.
-#[derive(Clone, Debug)]
-pub(crate) struct FixedInterval {
-    interval: Duration,
-}
-
-impl FixedInterval {
-    pub(crate) const fn new(interval: Duration) -> Self {
-        Self { interval }
-    }
-}
-
-impl<Tz: TimeZone> Schedule<Tz> for FixedInterval {
-    fn next_tick(&mut self, timezone: &Tz) -> Option<DateTime<Tz>> {
-        let interval = chrono::Duration::from_std(self.interval).ok()?;
-        Some(Utc::now().with_timezone(timezone) + interval)
-    }
-}
-
 type Storage<Task> = SqliteStorage<
     Task,
     apalis_codec::json::JsonCodec<apalis_sqlite::CompactType>,
@@ -98,6 +73,13 @@ type Storage<Task> = SqliteStorage<
 
 /// Persistent job queue backed by apalis `SqliteStorage`.
 pub(crate) struct JobQueue<Task>(Storage<Task>);
+
+/// Concrete error returned by [`JobQueue::push`] / [`JobQueue::push_with_delay`].
+/// Wrapping [`TaskSinkError`] keeps the failure chain typed so callers can
+/// `#[from]` it into their own error enums instead of boxing.
+#[derive(Debug, thiserror::Error)]
+#[error("Failed to enqueue apalis job: {0}")]
+pub(crate) struct QueuePushError(#[from] pub(crate) TaskSinkError<sqlx::Error>);
 
 impl<Task> Clone for JobQueue<Task> {
     fn clone(&self) -> Self {
@@ -137,13 +119,23 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
         ))
     }
 
-    pub(crate) async fn push(
+    pub(crate) async fn push(&mut self, task: Task) -> Result<(), QueuePushError> {
+        Ok(TaskSink::push(&mut self.0, task).await?)
+    }
+
+    /// Schedules a task to run after `delay` from now. Used by self-rescheduling
+    /// jobs (e.g. status pollers waiting for a broker to fill an order) to
+    /// avoid burning the retry budget on a successful poll that simply hasn't
+    /// observed the terminal state yet.
+    pub(crate) async fn push_with_delay(
         &mut self,
         task: Task,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        TaskSink::push(&mut self.0, task)
-            .await
-            .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)
+        delay: Duration,
+    ) -> Result<(), QueuePushError> {
+        let scheduled = TaskBuilder::<Task, SqliteContext, _>::new(task)
+            .run_after(delay)
+            .build();
+        Ok(TaskSink::push_task(&mut self.0, scheduled).await?)
     }
 
     pub(crate) fn into_storage(self) -> Storage<Task> {
@@ -283,6 +275,9 @@ pub enum JobKind {
     OrderFill,
     Hedge,
     Backfill,
+    PollOrderStatus,
+    ReconcileOrderFill,
+    HandleOrderRejection,
 }
 
 /// Job execution error. Wraps the concrete `Job::Error` type at
@@ -310,6 +305,9 @@ pub struct FailureInjector {
     order_fill: Arc<Mutex<InjectionState>>,
     hedge: Arc<Mutex<InjectionState>>,
     backfill: Arc<Mutex<InjectionState>>,
+    poll_order_status: Arc<Mutex<InjectionState>>,
+    reconcile_order_fill: Arc<Mutex<InjectionState>>,
+    handle_order_rejection: Arc<Mutex<InjectionState>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -335,6 +333,9 @@ impl FailureInjector {
             order_fill: Arc::new(Mutex::new(InjectionState::Idle)),
             hedge: Arc::new(Mutex::new(InjectionState::Idle)),
             backfill: Arc::new(Mutex::new(InjectionState::Idle)),
+            poll_order_status: Arc::new(Mutex::new(InjectionState::Idle)),
+            reconcile_order_fill: Arc::new(Mutex::new(InjectionState::Idle)),
+            handle_order_rejection: Arc::new(Mutex::new(InjectionState::Idle)),
         }
     }
 
@@ -372,6 +373,9 @@ impl FailureInjector {
             JobKind::OrderFill => &self.order_fill,
             JobKind::Hedge => &self.hedge,
             JobKind::Backfill => &self.backfill,
+            JobKind::PollOrderStatus => &self.poll_order_status,
+            JobKind::ReconcileOrderFill => &self.reconcile_order_fill,
+            JobKind::HandleOrderRejection => &self.handle_order_rejection,
         };
 
         match mutex.lock() {
@@ -447,21 +451,6 @@ where
     })
 }
 
-/// apalis-cron handler for the order status poller. One invocation per tick.
-/// Per-order errors are absorbed inside [`OrderStatusPoller::poll_pending_orders`];
-/// only cycle-level failures (storage, projection) propagate here. Returning
-/// the error feeds apalis' retry/circuit-breaker stack so the next tick is not
-/// scheduled on top of a broken cycle.
-pub(crate) async fn poll_orders<E>(
-    _tick: apalis_cron::Tick<Utc>,
-    poller: Data<Arc<OrderStatusPoller<E>>>,
-) -> Result<(), OrderPollingError>
-where
-    E: Executor + Clone + Send + Sync + 'static,
-{
-    poller.poll_pending_orders().await
-}
-
 /// On-event handler shared by every supervised worker: when apalis
 /// reports a terminal job failure (retries exhausted), notify the
 /// monitor task and stop the worker.
@@ -478,28 +467,11 @@ pub(crate) fn on_terminal_failure(
     }
 }
 
-pub(crate) async fn cleanup_finished_jobs(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
-    let deleted = sqlx::query(
-        "DELETE FROM Jobs \
-         WHERE status = ? \
-         OR status = ? \
-         OR (status = ? AND max_attempts <= attempts)",
-    )
-    .bind(Status::Done.to_string())
-    .bind(Status::Killed.to_string())
-    .bind(Status::Failed.to_string())
-    .execute(pool)
-    .await?
-    .rows_affected();
-
-    Ok(deleted)
-}
-
 #[cfg(test)]
 mod tests {
     use apalis::layers::WorkerBuilderExt;
     use apalis::layers::retry::RetryPolicy;
-    use apalis::prelude::{Monitor, WorkerBuilder};
+    use apalis::prelude::{Monitor, Status, WorkerBuilder};
     use apalis_core::worker::event::Event;
     use apalis_core::worker::ext::circuit_breaker::{CircuitBreaker, config::CircuitBreakerConfig};
     use apalis_core::worker::ext::event_listener::EventListenerExt;
@@ -721,31 +693,21 @@ mod tests {
         insert_job(&pool, "pending", Status::Pending, 0, 25).await;
         insert_job(&pool, "running", Status::Running, 1, 25).await;
 
-        let deleted = cleanup_finished_jobs(&pool).await.unwrap();
+        let deleted = sqlx::query(
+            "DELETE FROM Jobs \
+             WHERE status = ? \
+             OR status = ? \
+             OR (status = ? AND max_attempts <= attempts)",
+        )
+        .bind(Status::Done.to_string())
+        .bind(Status::Killed.to_string())
+        .bind(Status::Failed.to_string())
+        .execute(&pool)
+        .await
+        .unwrap()
+        .rows_affected();
 
         assert_eq!(deleted, 3);
-        assert_eq!(
-            job_ids(&pool).await,
-            vec![
-                "failed-retryable".to_string(),
-                "pending".to_string(),
-                "running".to_string()
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn cleanup_finished_jobs_keeps_non_terminal_rows() {
-        let pool = setup_test_db().await;
-        setup_apalis_tables(&pool).await.unwrap();
-
-        insert_job(&pool, "failed-retryable", Status::Failed, 3, 25).await;
-        insert_job(&pool, "pending", Status::Pending, 0, 25).await;
-        insert_job(&pool, "running", Status::Running, 1, 25).await;
-
-        let deleted = cleanup_finished_jobs(&pool).await.unwrap();
-
-        assert_eq!(deleted, 0);
         assert_eq!(
             job_ids(&pool).await,
             vec![

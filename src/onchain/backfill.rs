@@ -339,8 +339,7 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
     for trade_event in trade_events {
         job_queue
             .push(AccountForDexTrade { trade: trade_event })
-            .await
-            .map_err(OnChainError::JobQueue)?;
+            .await?;
     }
 
     Ok(enqueued_count)

@@ -916,11 +916,22 @@ impl<W: Wallet> Tokenizer for AlpacaTokenizationService<W> {
             ..Default::default()
         };
 
-        let requests = self.client.list_requests(params).await?;
+        let mut requests = self.client.list_requests(params).await?;
+
+        // Fetch rejected requests as well so they remain "sticky" in the inflight list.
+        // This prevents duplicate redemption attempts after rejection.
+        let params_rejected = ListRequestsParams {
+            status: Some(TokenizationRequestStatus::Rejected),
+            ..Default::default()
+        };
+        requests.extend(self.client.list_requests(params_rejected).await?);
 
         Ok(requests
             .into_iter()
-            .filter(|request| request.status == TokenizationRequestStatus::Pending)
+            .filter(|request| match request.status {
+                TokenizationRequestStatus::Pending | TokenizationRequestStatus::Rejected => true,
+                TokenizationRequestStatus::Completed => false,
+            })
             .collect())
     }
 }
@@ -2400,7 +2411,7 @@ pub(crate) mod tests {
         let service =
             create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
 
-        let list_mock = server.mock(|when, then| {
+        let pending_mock = server.mock(|when, then| {
             when.method(GET)
                 .path(tokenization_requests_path())
                 .query_param("status", "pending");
@@ -2411,11 +2422,21 @@ pub(crate) mod tests {
                 )]));
         });
 
+        let rejected_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(tokenization_requests_path())
+                .query_param("status", "rejected");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([]));
+        });
+
         let result = service.list_pending_requests().await.unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, TokenizationRequestId("req_1".to_string()));
-        list_mock.assert();
+        pending_mock.assert();
+        rejected_mock.assert();
     }
 
     #[tokio::test]
@@ -2433,7 +2454,7 @@ pub(crate) mod tests {
         let mut completed_req = sample_tokenization_request_json("req_2", "redeem", "TSLA");
         completed_req["status"] = json!("completed");
 
-        let list_mock = server.mock(|when, then| {
+        let pending_mock = server.mock(|when, then| {
             when.method(GET)
                 .path(tokenization_requests_path())
                 .query_param("status", "pending");
@@ -2442,10 +2463,20 @@ pub(crate) mod tests {
                 .json_body(json!([pending_req, completed_req]));
         });
 
+        let rejected_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(tokenization_requests_path())
+                .query_param("status", "rejected");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([]));
+        });
+
         let result = service.list_pending_requests().await.unwrap();
 
         assert_eq!(result.len(), 1, "Should filter out non-pending requests");
         assert_eq!(result[0].id, TokenizationRequestId("req_1".to_string()));
-        list_mock.assert();
+        pending_mock.assert();
+        rejected_mock.assert();
     }
 }

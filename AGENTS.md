@@ -503,9 +503,15 @@ is the source of truth for terminology and naming conventions.
   - Groups 2 or 3 may be absent if unused; never add an empty group
   - **FORBIDDEN**: Empty lines within a group, imports out of group order
   - **FORBIDDEN**: Function-level imports. Always use top-of-module imports.
-    **Sole exception**: enum variant imports (`use MyEnum::*` or
-    `use MyEnum::{A, B, C}`) inside function bodies to avoid repetitive
-    qualification. Enum variant imports are never allowed at module level.
+    **Exceptions** (function-body `use` only when one of these applies):
+    1. Enum variant imports (`use MyEnum::*` or `use MyEnum::{A, B, C}`) to
+       avoid repetitive qualification. Enum variant imports are never allowed at
+       module level.
+    2. Imports used only inside `#[cfg(...)]`-gated code, where pulling them to
+       module scope would produce unused-import warnings under the inverse
+       feature configuration.
+    3. Imports inside macro definitions / generated code, where hygiene requires
+       the import live in the expansion site, not the caller's module.
   - Module declarations (`mod foo;`) can appear between imports if needed
   - This pattern applies to ALL modules including test modules
     (`#[cfg(test)] mod tests`)

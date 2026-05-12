@@ -34,6 +34,7 @@ serde.workspace = true
 serde_json.workspace = true
 sqlite-es.workspace = true
 sqlx.workspace = true
+st0x-dto = { version = "0.1.0", path = "../dto" }
 st0x-finance.workspace = true
 st0x-float-macro.workspace = true
 st0x-float-serde.workspace = true

@@ -567,8 +567,8 @@ async fn load_onchain_trade_rows(pool: &SqlitePool, filter: &TradeFilter) -> Vec
                 return None;
             }
 
-            let direction = filled["direction"].as_str().unwrap_or("Buy");
-            let amount = filled["amount"].as_str().unwrap_or("0");
+            let direction = filled["direction"].as_str()?;
+            let amount = filled["amount"].as_str()?;
 
             Some(TradeEntry {
                 id: aggregate_id,
@@ -622,8 +622,8 @@ async fn load_offchain_trade_rows(pool: &SqlitePool, filter: &TradeFilter) -> Ve
                 return None;
             }
 
-            let direction = filled["direction"].as_str().unwrap_or("Buy");
-            let shares = filled["shares"].as_str().unwrap_or("0");
+            let direction = filled["direction"].as_str()?;
+            let shares = filled["shares"].as_str()?;
 
             Some(TradeEntry {
                 id: view_id,

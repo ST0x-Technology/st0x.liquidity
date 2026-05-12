@@ -197,12 +197,6 @@ impl OnchainTradeBuilder {
     }
 
     #[must_use]
-    pub(crate) fn with_price(mut self, price: Float) -> Self {
-        self.trade.price = Usdc::new(price).unwrap();
-        self
-    }
-
-    #[must_use]
     pub(crate) fn with_log_index(mut self, index: u64) -> Self {
         self.trade.log_index = index;
         self

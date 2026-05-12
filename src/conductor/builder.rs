@@ -14,18 +14,24 @@ use st0x_evm::ReadOnlyEvm;
 use st0x_execution::Executor;
 use st0x_finance::{HasZero, Positive, Usd};
 
+use super::exit::MonitorTaskError;
 #[cfg(any(test, feature = "test-support"))]
 use super::job::FailureInjector;
-use super::job::{FAIL_STOP_RECOVERY_TIMEOUT, FixedInterval, build_supervised_worker};
+use super::job::{FAIL_STOP_RECOVERY_TIMEOUT, build_supervised_worker};
 use super::monitor::order_fills::OrderFillMonitor;
 use super::monitor::positions::PositionMonitor;
-use super::{Conductor, MonitorTaskError, build_order_poller, spawn_inventory_poller};
+use super::{Conductor, spawn_inventory_poller};
 use crate::config::Ctx;
 use crate::inventory::{
     InventoryPollingService, InventorySnapshot, InventorySnapshotId, WalletPollingCtx,
 };
-use crate::offchain::order_poller::build_order_poller_worker;
-use crate::offchain_order::OffchainOrder;
+use crate::offchain::order::handle_rejection::HandleOrderRejectionCtx;
+use crate::offchain::order::poll_status::PollOrderStatusCtx;
+use crate::offchain::order::reconcile_fill::ReconcileOrderFillCtx;
+use crate::offchain::order::{
+    HandleOrderRejection, HandleOrderRejectionJobQueue, OffchainOrder, PollOrderStatus,
+    PollOrderStatusJobQueue, ReconcileOrderFill, ReconcileOrderFillJobQueue,
+};
 use crate::onchain::backfill::{BackfillJobQueue, BackfillRange};
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::raindex::RaindexService;
@@ -74,6 +80,9 @@ pub(crate) fn spawn<Prov, Exec>(
     job_queue: DexTradeAccountingJobQueue,
     backfill_queue: BackfillJobQueue,
     hedge_queue: HedgeJobQueue,
+    poll_status_queue: PollOrderStatusJobQueue,
+    reconcile_queue: ReconcileOrderFillJobQueue,
+    rejection_queue: HandleOrderRejectionJobQueue,
     job_cleanup: JoinHandle<()>,
     executor_maintenance: Option<JoinHandle<()>>,
     rebalancer: Option<JoinHandle<()>>,
@@ -82,6 +91,7 @@ where
     Prov: Provider + Clone + Send + Sync + 'static,
     Exec: Executor + Clone + Send + Sync + 'static,
     TradeAccountingError: From<Exec::Error>,
+    crate::offchain::order::JobError: From<Exec::Error>,
 {
     info!("Starting conductor orchestration");
 
@@ -128,20 +138,34 @@ where
     ));
     log_optional_task_status("inventory poller", inventory_poller.is_some());
 
-    let order_poller = Arc::new(build_order_poller(
-        &context.ctx,
-        context.executor.clone(),
-        (*context.frameworks.offchain_order_projection).clone(),
-        context.frameworks.offchain_order.clone(),
-        context.frameworks.position.clone(),
-    ));
-    let order_poller_schedule = FixedInterval::new(order_poller.polling_interval());
+    let poll_interval = context.ctx.order_polling_interval();
+    info!("Constructing order-job context with poll interval: {poll_interval:?}");
+
+    let poll_status_ctx = Arc::new(PollOrderStatusCtx {
+        executor: context.executor.clone(),
+        offchain_order_projection: context.frameworks.offchain_order_projection.clone(),
+        poll_status_queue: poll_status_queue.clone(),
+        reconcile_queue: reconcile_queue.clone(),
+        rejection_queue: rejection_queue.clone(),
+        poll_interval,
+    });
+
+    let reconcile_ctx = Arc::new(ReconcileOrderFillCtx {
+        offchain_order: context.frameworks.offchain_order.clone(),
+        position: context.frameworks.position.clone(),
+    });
+
+    let rejection_ctx = Arc::new(HandleOrderRejectionCtx {
+        offchain_order: context.frameworks.offchain_order.clone(),
+        position: context.frameworks.position.clone(),
+    });
 
     let counter_trade_submission_lock = Arc::new(tokio::sync::Mutex::new(()));
 
     let hedge_ctx = Arc::new(HedgeCtx {
         position: context.frameworks.position.clone(),
         offchain_order: context.frameworks.offchain_order.clone(),
+        poll_status_queue: poll_status_queue.clone(),
     });
 
     let position_monitor = PositionMonitor::new(
@@ -161,6 +185,7 @@ where
         execution_threshold: context.execution_threshold,
         assets: context.ctx.assets.clone(),
         counter_trade_submission_lock,
+        poll_status_queue: poll_status_queue.clone(),
     };
 
     let accountant_ctx = Arc::new(AccountantCtx {
@@ -189,16 +214,98 @@ where
         .build()
         .run();
 
+    let monitor = spawn_apalis_monitor(MonitorWiring {
+        accountant_ctx,
+        hedge_ctx,
+        poll_status_ctx,
+        reconcile_ctx,
+        rejection_ctx,
+        job_queue,
+        hedge_queue,
+        backfill_queue,
+        poll_status_queue,
+        reconcile_queue,
+        rejection_queue,
+        #[cfg(any(test, feature = "test-support"))]
+        failure_injector: context.failure_injector,
+    });
+
+    Conductor {
+        supervisor,
+        monitor,
+        executor_maintenance,
+        rebalancer,
+        inventory_poller,
+        job_cleanup,
+    }
+}
+
+/// Owns every queue, ctx and toggle the apalis monitor needs. The wiring is
+/// only meaningful for one call to [`spawn_apalis_monitor`], which moves the
+/// whole struct into a `tokio::spawn` and registers each worker.
+struct MonitorWiring<Prov, Exec>
+where
+    Prov: Provider + Clone + Send + Sync + 'static,
+    Exec: Executor + Clone + Send + Sync + 'static,
+    TradeAccountingError: From<Exec::Error>,
+    crate::offchain::order::JobError: From<Exec::Error>,
+{
+    accountant_ctx: Arc<AccountantCtx<Prov, Exec>>,
+    hedge_ctx: Arc<HedgeCtx>,
+    poll_status_ctx: Arc<PollOrderStatusCtx<Exec>>,
+    reconcile_ctx: Arc<ReconcileOrderFillCtx>,
+    rejection_ctx: Arc<HandleOrderRejectionCtx>,
+    job_queue: DexTradeAccountingJobQueue,
+    hedge_queue: HedgeJobQueue,
+    backfill_queue: BackfillJobQueue,
+    poll_status_queue: PollOrderStatusJobQueue,
+    reconcile_queue: ReconcileOrderFillJobQueue,
+    rejection_queue: HandleOrderRejectionJobQueue,
     #[cfg(any(test, feature = "test-support"))]
-    let failure_injector = context.failure_injector;
+    failure_injector: FailureInjector,
+}
+
+fn spawn_apalis_monitor<Prov, Exec>(
+    wiring: MonitorWiring<Prov, Exec>,
+) -> JoinHandle<Result<(), MonitorTaskError>>
+where
+    Prov: Provider + Clone + Send + Sync + 'static,
+    Exec: Executor + Clone + Send + Sync + 'static,
+    TradeAccountingError: From<Exec::Error>,
+    crate::offchain::order::JobError: From<Exec::Error>,
+{
+    let MonitorWiring {
+        accountant_ctx,
+        hedge_ctx,
+        poll_status_ctx,
+        reconcile_ctx,
+        rejection_ctx,
+        job_queue,
+        hedge_queue,
+        backfill_queue,
+        poll_status_queue,
+        reconcile_queue,
+        rejection_queue,
+        #[cfg(any(test, feature = "test-support"))]
+        failure_injector,
+    } = wiring;
+
     #[cfg(any(test, feature = "test-support"))]
     let failure_injector_for_hedge = failure_injector.clone();
     #[cfg(any(test, feature = "test-support"))]
     let failure_injector_for_backfill = failure_injector.clone();
+    #[cfg(any(test, feature = "test-support"))]
+    let failure_injector_for_poll = failure_injector.clone();
+    #[cfg(any(test, feature = "test-support"))]
+    let failure_injector_for_reconcile = failure_injector.clone();
+    #[cfg(any(test, feature = "test-support"))]
+    let failure_injector_for_rejection = failure_injector.clone();
     let failure_notify = Arc::new(tokio::sync::Notify::new());
     let failure_notify_for_hedge = failure_notify.clone();
     let failure_notify_for_backfill = failure_notify.clone();
-    let failure_notify_for_poller = failure_notify.clone();
+    let failure_notify_for_poll = failure_notify.clone();
+    let failure_notify_for_reconcile = failure_notify.clone();
+    let failure_notify_for_rejection = failure_notify.clone();
     let failure_notify_for_select = failure_notify.clone();
 
     let fail_stop = CircuitBreakerConfig::default()
@@ -206,11 +313,13 @@ where
         .with_recovery_timeout(FAIL_STOP_RECOVERY_TIMEOUT);
     let fail_stop_for_hedge = fail_stop.clone();
     let fail_stop_for_backfill = fail_stop.clone();
-    let fail_stop_for_poller = fail_stop.clone();
+    let fail_stop_for_poll = fail_stop.clone();
+    let fail_stop_for_reconcile = fail_stop.clone();
+    let fail_stop_for_rejection = fail_stop.clone();
 
     let accountant_ctx_for_backfill = accountant_ctx.clone();
 
-    let monitor: JoinHandle<Result<(), MonitorTaskError>> = tokio::spawn(async move {
+    tokio::spawn(async move {
         let apalis_monitor = Monitor::new()
             .should_restart(|_ctx, _error, _attempt| false)
             .register(move |index| {
@@ -250,13 +359,39 @@ where
                 )
             })
             .register(move |index| {
-                build_order_poller_worker!(
+                build_supervised_worker!(
+                    ::<PollOrderStatusCtx<Exec>, PollOrderStatus>,
                     index,
-                    order_poller.clone(),
-                    order_poller_schedule.clone(),
-                    fail_stop_for_poller.clone(),
-                    failure_notify_for_poller.clone(),
-                    Exec,
+                    poll_status_queue.clone(),
+                    poll_status_ctx.clone(),
+                    fail_stop_for_poll.clone(),
+                    failure_notify_for_poll.clone(),
+                    #[cfg(any(test, feature = "test-support"))]
+                    failure_injector_for_poll.clone(),
+                )
+            })
+            .register(move |index| {
+                build_supervised_worker!(
+                    ::<ReconcileOrderFillCtx, ReconcileOrderFill>,
+                    index,
+                    reconcile_queue.clone(),
+                    reconcile_ctx.clone(),
+                    fail_stop_for_reconcile.clone(),
+                    failure_notify_for_reconcile.clone(),
+                    #[cfg(any(test, feature = "test-support"))]
+                    failure_injector_for_reconcile.clone(),
+                )
+            })
+            .register(move |index| {
+                build_supervised_worker!(
+                    ::<HandleOrderRejectionCtx, HandleOrderRejection>,
+                    index,
+                    rejection_queue.clone(),
+                    rejection_ctx.clone(),
+                    fail_stop_for_rejection.clone(),
+                    failure_notify_for_rejection.clone(),
+                    #[cfg(any(test, feature = "test-support"))]
+                    failure_injector_for_rejection.clone(),
                 )
             });
 
@@ -268,16 +403,7 @@ where
                 Err(source) => Err(MonitorTaskError::UnexpectedExit { source: Some(source) }),
             },
         }
-    });
-
-    Conductor {
-        supervisor,
-        monitor,
-        executor_maintenance,
-        rebalancer,
-        inventory_poller,
-        job_cleanup,
-    }
+    })
 }
 
 fn log_optional_task_status(task_name: &str, is_configured: bool) {

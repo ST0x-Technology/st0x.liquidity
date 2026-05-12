@@ -17,7 +17,7 @@ use st0x_execution::Executor;
 
 use crate::config::Ctx;
 use crate::equity_redemption::symbols_with_active_transfers;
-use crate::offchain_order::OffchainOrderId;
+use crate::offchain::order::OffchainOrderId;
 use crate::onchain::accumulator::check_execution_readiness;
 use crate::position::Position;
 use crate::trading::offchain::hedge::{HedgeJobQueue, PlaceHedge};

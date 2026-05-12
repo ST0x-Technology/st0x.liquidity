@@ -656,24 +656,37 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
     let crash_offchain_events = count_events(&crash_pool, "OffchainOrder").await?;
     crash_pool.close().await;
 
-    // The PositionMonitor may enqueue a small number of extra
-    // PlaceHedge jobs during recovery (before the projection catches
-    // up). These are idempotent — the aggregate rejects duplicates
-    // via PendingExecution. Allow a bounded delta to catch runaway
-    // re-enqueueing. The bound of 2 covers the window between crash
-    // and projection convergence: at most one extra scan per symbol
-    // can fire before the monitor sees the updated state.
-    const MAX_DUPLICATE_JOBS: i64 = 2;
+    // Crash recovery may produce slightly more or fewer jobs than the
+    // reference run. More jobs come from re-running backfill on restart
+    // and the PositionMonitor enqueueing extra PlaceHedge jobs during
+    // recovery (idempotent — the aggregate rejects duplicates via
+    // PendingExecution). Fewer jobs come from the duplicate-trade
+    // shortcut in `process_queued_trade`: a trade already processed
+    // before the crash skips PollOrderStatus / ReconcileOrderFill
+    // enqueuing on the second pass. Bound the delta in both directions
+    // to catch runaway re-enqueueing while tolerating these legitimate
+    // differences.
+    //
+    // `MAX_JOB_DELTA` is a safety margin, not an empirically measured
+    // bound. Bidirectional ±4 catches gross re-enqueue regressions while
+    // tolerating the legitimate ±1-3 spread observed during development.
+    // Revisit if recovery timing or backfill/monitor cadence changes -- a
+    // sudden spike past 4 indicates duplicate enqueueing, a drop below
+    // -4 indicates skipped recovery work.
+    //
+    // The bidirectional bound is intentionally loose: it cannot catch a
+    // recovery bug that silently skips a *required* poll re-enqueue. The
+    // direct invariant check below ("no pollable orders remain after
+    // recovery completes") covers that case.
+    const MAX_JOB_DELTA: i64 = 4;
 
     assert!(
-        crash_jobs >= ref_jobs && crash_jobs <= ref_jobs + MAX_DUPLICATE_JOBS,
-        "expected {ref_jobs}..={} jobs but got {crash_jobs}",
-        ref_jobs + MAX_DUPLICATE_JOBS,
+        (crash_jobs - ref_jobs).abs() <= MAX_JOB_DELTA,
+        "expected {ref_jobs}±{MAX_JOB_DELTA} jobs but got {crash_jobs}",
     );
     assert!(
-        crash_done_jobs >= ref_done_jobs && crash_done_jobs <= ref_done_jobs + MAX_DUPLICATE_JOBS,
-        "expected {ref_done_jobs}..={} done jobs but got {crash_done_jobs}",
-        ref_done_jobs + MAX_DUPLICATE_JOBS,
+        (crash_done_jobs - ref_done_jobs).abs() <= MAX_JOB_DELTA,
+        "expected {ref_done_jobs}±{MAX_JOB_DELTA} done jobs but got {crash_done_jobs}",
     );
     assert_eq!(
         crash_onchain_events, ref_onchain_events,
@@ -682,6 +695,26 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
     assert_eq!(
         crash_offchain_events, ref_offchain_events,
         "Crash recovery should persist the exact same OffchainOrder event count as reference",
+    );
+
+    // Direct invariant: after recovery, no offchain orders should remain
+    // in any non-terminal state. `Pending` means PlaceHedge was not
+    // re-enqueued; `Submitted`/`PartiallyFilled` mean PollOrderStatus was
+    // not re-enqueued. Any leftover signals that recovery silently dropped
+    // a required job and the order would otherwise sit forever.
+    let crash_pool = connect_db(&crash_infra.db_path).await?;
+    let non_terminal: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM offchain_order_view \
+         WHERE status IN ('Pending', 'Submitted', 'PartiallyFilled')",
+    )
+    .fetch_one(&crash_pool)
+    .await?;
+    crash_pool.close().await;
+    assert_eq!(
+        non_terminal.0, 0,
+        "Recovery left {} offchain orders in a non-terminal state -- a PlaceHedge or \
+         PollOrderStatus job was likely skipped",
+        non_terminal.0,
     );
 
     Ok(())

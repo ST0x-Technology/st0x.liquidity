@@ -20,7 +20,7 @@ use st0x_float_serde::{DebugFloat, DebugOptionFloat};
 
 use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
 
-use crate::offchain_order::OffchainOrderId;
+use crate::offchain::order::OffchainOrderId;
 use crate::threshold::ExecutionThreshold;
 
 #[derive(Clone, Serialize, Deserialize)]
