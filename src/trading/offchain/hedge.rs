@@ -13,7 +13,9 @@ use st0x_event_sorcery::{AggregateError, LifecycleError, Store};
 use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
 
 use crate::conductor::job::{Job, JobQueue, Label};
-use crate::offchain_order::{OffchainOrder, OffchainOrderCommand, OffchainOrderId};
+use crate::offchain::order::{
+    OffchainOrder, OffchainOrderCommand, OffchainOrderId, PollOrderStatus, PollOrderStatusJobQueue,
+};
 use crate::position::{Position, PositionCommand, PositionError};
 use crate::threshold::ExecutionThreshold;
 use crate::trading::onchain::trade_accountant::TradeAccountingError;
@@ -25,6 +27,7 @@ pub(crate) type HedgeJobQueue = JobQueue<PlaceHedge>;
 pub(crate) struct HedgeCtx {
     pub(crate) position: Arc<Store<Position>>,
     pub(crate) offchain_order: Arc<Store<OffchainOrder>>,
+    pub(crate) poll_status_queue: PollOrderStatusJobQueue,
 }
 
 /// A durable job that places an offsetting broker order for an accumulated
@@ -44,6 +47,34 @@ pub(crate) struct PlaceHedge {
     pub(crate) offchain_order_id: OffchainOrderId,
 }
 
+/// Recovery path for the `PendingExecution` rejection. The previous attempt
+/// for this position may have already submitted the order to the broker but
+/// failed before enqueueing the `PollOrderStatus` job (e.g. the queue push
+/// returned a transient error and apalis re-ran us). Without this re-enqueue,
+/// `Submitted`/`PartiallyFilled` orders stay un-polled until the bot restarts
+/// and the startup recovery sweep finds them.
+///
+/// Duplicate poll jobs are harmless: `dispatch_for_order_state` drops jobs
+/// whose target order is already in a terminal state.
+async fn recover_pending_poll_status(
+    ctx: &HedgeCtx,
+    pending_id: OffchainOrderId,
+) -> Result<(), TradeAccountingError> {
+    use OffchainOrder::{Failed, Filled, PartiallyFilled, Pending, Submitted};
+    match ctx.offchain_order.load(&pending_id).await? {
+        Some(Submitted { .. } | PartiallyFilled { .. }) => {
+            ctx.poll_status_queue
+                .clone()
+                .push(PollOrderStatus {
+                    offchain_order_id: pending_id,
+                })
+                .await?;
+            Ok(())
+        }
+        Some(Pending { .. } | Filled { .. } | Failed { .. }) | None => Ok(()),
+    }
+}
+
 impl Job<HedgeCtx> for PlaceHedge {
     type Output = ();
     type Error = TradeAccountingError;
@@ -61,13 +92,16 @@ impl Job<HedgeCtx> for PlaceHedge {
 
     async fn perform(&self, ctx: &HedgeCtx) -> Result<Self::Output, Self::Error> {
         // Only specific business rejections are safe to swallow:
-        // - PendingExecution: another hedge already claimed this
-        //   position — idempotent, no action needed.
-        // - ThresholdNotMet: position moved below threshold since
-        //   the monitor scanned — stale job, no action needed.
+        // - PendingExecution: another attempt already claimed this position
+        //   — usually idempotent, but if that attempt got the broker submitted
+        //   *without* enqueueing PollOrderStatus (e.g. the queue push failed
+        //   and apalis is now retrying us), we must re-enqueue the poll here
+        //   or the order sits in Submitted until the next bot restart.
+        // - ThresholdNotMet: position moved below threshold since the monitor
+        //   scanned — stale job, no action needed.
         //
-        // Everything else (lifecycle bugs, aggregate conflicts, DB
-        // errors) propagates so backon retries the job.
+        // Everything else (lifecycle bugs, aggregate conflicts, DB errors)
+        // propagates so backon retries the job.
         match ctx
             .position
             .send(
@@ -85,13 +119,25 @@ impl Job<HedgeCtx> for PlaceHedge {
             Ok(()) => {}
 
             Err(AggregateError::UserError(LifecycleError::Apply(
-                ref error @ (PositionError::PendingExecution { .. }
-                | PositionError::ThresholdNotMet { .. }),
+                PositionError::PendingExecution {
+                    offchain_order_id: pending_id,
+                },
+            ))) => {
+                info!(
+                    target: "hedge",
+                    symbol = %self.symbol, %pending_id,
+                    "Position already has a pending execution; recovering poll-status enqueue if needed"
+                );
+                return recover_pending_poll_status(ctx, pending_id).await;
+            }
+
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                ref error @ PositionError::ThresholdNotMet { .. },
             ))) => {
                 info!(
                     target: "hedge",
                     symbol = %self.symbol, %error,
-                    "Position rejected hedge placement, skipping"
+                    "Position below execution threshold, skipping"
                 );
                 return Ok(());
             }
@@ -111,18 +157,31 @@ impl Job<HedgeCtx> for PlaceHedge {
             )
             .await?;
 
-        if let Some(OffchainOrder::Failed { error, .. }) =
-            ctx.offchain_order.load(&self.offchain_order_id).await?
-        {
-            ctx.position
-                .send(
-                    &self.symbol,
-                    PositionCommand::FailOffChainOrder {
+        use OffchainOrder::{Failed, Filled, PartiallyFilled, Pending, Submitted};
+        match ctx.offchain_order.load(&self.offchain_order_id).await? {
+            Some(Failed { error, .. }) => {
+                ctx.position
+                    .send(
+                        &self.symbol,
+                        PositionCommand::FailOffChainOrder {
+                            offchain_order_id: self.offchain_order_id,
+                            error,
+                        },
+                    )
+                    .await?;
+            }
+
+            Some(Submitted { .. } | PartiallyFilled { .. }) => {
+                let mut queue = ctx.poll_status_queue.clone();
+
+                queue
+                    .push(PollOrderStatus {
                         offchain_order_id: self.offchain_order_id,
-                        error,
-                    },
-                )
-                .await?;
+                    })
+                    .await?;
+            }
+
+            Some(Filled { .. } | Pending { .. }) | None => {}
         }
 
         Ok(())
@@ -132,17 +191,18 @@ impl Job<HedgeCtx> for PlaceHedge {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::TxHash;
+    use std::any::type_name;
     use std::sync::Arc;
 
     use st0x_event_sorcery::StoreBuilder;
-    use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
+    use st0x_execution::{
+        Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor, Symbol,
+    };
     use st0x_float_macro::float;
-
-    use st0x_execution::ExecutorOrderId;
 
     use super::*;
     use crate::conductor::job::Job;
-    use crate::offchain_order::{OffchainOrder, OrderPlacementResult, OrderPlacer};
+    use crate::offchain::order::{OffchainOrder, OrderPlacementResult, OrderPlacer};
     use crate::position::{Position, PositionCommand, TradeId};
     use crate::test_utils::setup_test_db;
     use crate::threshold::ExecutionThreshold;
@@ -176,7 +236,7 @@ mod tests {
                 &self,
                 _order: st0x_execution::MarketOrder,
             ) -> Result<
-                crate::offchain_order::OrderPlacementResult,
+                crate::offchain::order::OrderPlacementResult,
                 Box<dyn std::error::Error + Send + Sync>,
             > {
                 Err("Broker rejected: insufficient buying power".into())
@@ -188,12 +248,14 @@ mod tests {
 
     struct TestInfra {
         ctx: HedgeCtx,
+        pool: sqlx::SqlitePool,
         position_projection: Arc<st0x_event_sorcery::Projection<Position>>,
         offchain_order_projection: Arc<st0x_event_sorcery::Projection<OffchainOrder>>,
     }
 
     async fn create_hedge_ctx(order_placer: Arc<dyn OrderPlacer>) -> TestInfra {
         let pool = setup_test_db().await;
+        crate::conductor::setup_apalis_tables(&pool).await.unwrap();
 
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .build(())
@@ -209,10 +271,12 @@ mod tests {
         let ctx = HedgeCtx {
             position: position.clone(),
             offchain_order,
+            poll_status_queue: PollOrderStatusJobQueue::new(&pool),
         };
 
         TestInfra {
             ctx,
+            pool,
             position_projection,
             offchain_order_projection,
         }
@@ -326,6 +390,7 @@ mod tests {
             ctx,
             position_projection,
             offchain_order_projection,
+            ..
         } = create_hedge_ctx(succeeding_order_placer()).await;
         let symbol = Symbol::new("AAPL").unwrap();
 
@@ -392,6 +457,58 @@ mod tests {
         assert!(
             matches!(result, Err(TradeAccountingError::PositionCommand(_))),
             "expected PositionCommand error for uninitialized position, got: {result:?}"
+        );
+    }
+
+    /// Simulates the retry path: a prior hedge attempt got the broker
+    /// `Submitted` but failed to enqueue the `PollOrderStatus` job, and apalis
+    /// is re-running the hedge. The retry must re-enqueue the poll so the
+    /// order doesn't sit `Submitted` until the next bot restart.
+    #[tokio::test]
+    async fn retry_after_failed_poll_enqueue_re_enqueues_poll() {
+        let TestInfra { ctx, pool, .. } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let job = hedge_job(&symbol, 2.0, Direction::Sell);
+
+        // First run: drives the order to `Submitted` and enqueues
+        // PollOrderStatus exactly once.
+        job.perform(&ctx).await.unwrap();
+
+        let poll_jobs_after_first: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+                .bind(type_name::<PollOrderStatus>())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            poll_jobs_after_first, 1,
+            "First hedge should enqueue exactly one PollOrderStatus job"
+        );
+
+        // Retry the same job. Position rejects with PendingExecution because
+        // the first run set the pending id. The recovery path must observe
+        // that the offchain order is still `Submitted` and push another
+        // PollOrderStatus rather than silently returning Ok.
+        job.perform(&ctx).await.unwrap();
+
+        let poll_jobs_after_retry: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+                .bind(type_name::<PollOrderStatus>())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            poll_jobs_after_retry, 2,
+            "Retry must re-enqueue PollOrderStatus when the order is still Submitted"
         );
     }
 }

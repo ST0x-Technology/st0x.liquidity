@@ -6,12 +6,11 @@ use sqlx::SqlitePool;
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
-use st0x_dto::{Statement, Trade, TradeDirection, TradingVenue};
+use st0x_dto::{Statement, Trade, TradingVenue};
 use st0x_event_sorcery::{EntityList, Never, Reactor, deps, load_entity};
-use st0x_execution::SupportedExecutor;
 
 use crate::equity_redemption::EquityRedemption;
-use crate::offchain_order::OffchainOrder;
+use crate::offchain::order::{OffchainOrder, OffchainOrderEvent};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeEvent};
 use crate::position::Position;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
@@ -60,22 +59,6 @@ impl Broadcaster {
     }
 }
 
-/// Convert a [`SupportedExecutor`] to a [`TradingVenue`] for the dashboard.
-pub(crate) fn executor_to_venue(executor: SupportedExecutor) -> TradingVenue {
-    match executor {
-        SupportedExecutor::AlpacaBrokerApi => TradingVenue::Alpaca,
-        SupportedExecutor::DryRun => TradingVenue::DryRun,
-    }
-}
-
-/// Convert an execution [`Direction`] to a [`TradeDirection`] for the dashboard.
-pub(crate) fn direction_to_dto(direction: st0x_execution::Direction) -> TradeDirection {
-    match direction {
-        st0x_execution::Direction::Buy => TradeDirection::Buy,
-        st0x_execution::Direction::Sell => TradeDirection::Sell,
-    }
-}
-
 #[async_trait]
 impl Reactor for Broadcaster {
     type Error = Never;
@@ -98,12 +81,13 @@ impl Reactor for Broadcaster {
                         id: id.to_string(),
                         filled_at: *filled_at,
                         venue: TradingVenue::Raindex,
-                        direction: direction_to_dto(*direction),
+                        direction: *direction,
                         symbol: symbol.clone(),
                         shares: st0x_finance::FractionalShares::new(*amount),
                     });
                 }
             })
+
             .on(|id, _event| async move {
                 match load_entity::<Position>(&self.pool, &id).await {
                     Ok(Some(position)) => {
@@ -117,51 +101,39 @@ impl Reactor for Broadcaster {
                     Err(error) => warn!(target: "dashboard", %id, ?error, "Failed to load position for broadcast"),
                 }
             })
+
             .on(|id, event| async move {
+                use OffchainOrderEvent::*;
                 match event {
-                    crate::offchain_order::OffchainOrderEvent::Filled { .. } => {
+                    Filled { .. } => {
                         match load_entity::<OffchainOrder>(&self.pool, &id).await {
-                            Ok(Some(OffchainOrder::Filled {
-                                symbol,
-                                shares,
-                                direction,
-                                executor,
-                                filled_at,
-                                ..
-                            })) => {
-                                self.broadcast_fill(Trade {
-                                    id: id.to_string(),
-                                    filled_at,
-                                    venue: executor_to_venue(executor),
-                                    direction: direction_to_dto(direction),
-                                    symbol,
-                                    shares: st0x_finance::FractionalShares::new(
-                                        shares.inner().inner(),
-                                    ),
-                                });
-                            }
-                            Ok(_) => {
-                                warn!(
+                            Ok(Some(order)) => match order.try_to_trade(&id) {
+                                Ok(trade) => self.broadcast_fill(trade),
+                                Err(error) => warn!(
                                     target: "dashboard",
-                                    %id,
+                                    %id, %error,
                                     "OffchainOrder not in Filled state after Filled event"
-                                );
-                            }
-                            Err(error) => {
-                                warn!(
-                                    target: "dashboard",
-                                    %id, ?error,
-                                    "Failed to load OffchainOrder for fill broadcast"
-                                );
-                            }
+                                ),
+                            },
+                            Ok(None) => warn!(
+                                target: "dashboard",
+                                %id,
+                                "OffchainOrder replayed to empty state"
+                            ),
+                            Err(error) => warn!(
+                                target: "dashboard",
+                                %id, ?error,
+                                "Failed to load OffchainOrder for fill broadcast"
+                            ),
                         }
                     }
-                    crate::offchain_order::OffchainOrderEvent::Placed { .. }
-                    | crate::offchain_order::OffchainOrderEvent::Submitted { .. }
-                    | crate::offchain_order::OffchainOrderEvent::PartiallyFilled { .. }
-                    | crate::offchain_order::OffchainOrderEvent::Failed { .. } => {}
+                    Placed { .. }
+                    | Submitted { .. }
+                    | PartiallyFilled { .. }
+                    | Failed { .. } => {}
                 }
             })
+
             .on(|id, _event| async move {
                 match load_entity::<TokenizedEquityMint>(&self.pool, &id).await {
                     Ok(Some(entity)) => self.broadcast_transfer(entity.to_dto(&id)),
@@ -169,6 +141,7 @@ impl Reactor for Broadcaster {
                     Err(error) => warn!(target: "dashboard", %id, ?error, "Failed to load mint for broadcast"),
                 }
             })
+
             .on(|id, _event| async move {
                 match load_entity::<EquityRedemption>(&self.pool, &id).await {
                     Ok(Some(entity)) => self.broadcast_transfer(entity.to_dto(&id)),
@@ -176,6 +149,7 @@ impl Reactor for Broadcaster {
                     Err(error) => warn!(target: "dashboard", %id, ?error, "Failed to load redemption for broadcast"),
                 }
             })
+
             .on(|id, _event| async move {
                 match load_entity::<UsdcRebalance>(&self.pool, &id).await {
                     Ok(Some(entity)) => self.broadcast_transfer(entity.to_dto(&id)),
@@ -196,7 +170,7 @@ mod tests {
     use st0x_execution::Symbol;
 
     use super::*;
-    use crate::offchain_order::{OffchainOrderCommand, OffchainOrderEvent, noop_order_placer};
+    use crate::offchain::order::{OffchainOrderCommand, OffchainOrderEvent, noop_order_placer};
     use crate::position::{PositionCommand, PositionEvent, TradeId};
     use crate::test_utils::setup_test_db;
 
@@ -251,7 +225,7 @@ mod tests {
         match msg {
             Statement::TradeFill(trade) => {
                 assert!(matches!(trade.venue, TradingVenue::Raindex));
-                assert!(matches!(trade.direction, TradeDirection::Buy));
+                assert!(matches!(trade.direction, st0x_dto::Direction::Buy));
                 assert_eq!(trade.symbol, Symbol::new("AAPL").unwrap());
             }
             other => panic!("expected TradeFill message, got {other:?}"),
@@ -269,7 +243,7 @@ mod tests {
         let harness = ReactorHarness::new(broadcaster);
 
         let now = chrono::Utc::now();
-        let id = crate::offchain_order::OffchainOrderId::new();
+        let id = crate::offchain::order::OffchainOrderId::new();
 
         store
             .send(
@@ -308,7 +282,7 @@ mod tests {
         match msg {
             Statement::TradeFill(trade) => {
                 assert!(matches!(trade.venue, TradingVenue::Alpaca));
-                assert!(matches!(trade.direction, TradeDirection::Sell));
+                assert!(matches!(trade.direction, st0x_dto::Direction::Sell));
                 assert_eq!(trade.symbol, Symbol::new("TSLA").unwrap());
             }
             other => panic!("expected TradeFill message, got {other:?}"),

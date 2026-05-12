@@ -338,6 +338,7 @@ mod tests {
     #[error("domain error")]
     struct CounterError;
 
+    #[derive(Debug)]
     enum CounterCommand {
         Create { initial: u32 },
         Increment,

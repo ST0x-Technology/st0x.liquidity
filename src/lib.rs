@@ -29,7 +29,6 @@ pub(crate) mod dashboard;
 mod equity_redemption;
 mod inventory;
 mod offchain;
-mod offchain_order;
 mod onchain;
 mod onchain_trade;
 mod position;
@@ -62,7 +61,7 @@ pub use config::{AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfi
 #[cfg(any(test, feature = "test-support"))]
 pub use inventory::ImbalanceThreshold;
 #[cfg(any(test, feature = "test-support"))]
-pub use offchain_order::{OffchainOrder, OffchainOrderId};
+pub use offchain::order::{OffchainOrder, OffchainOrderId};
 #[cfg(any(test, feature = "test-support"))]
 pub use position::Position;
 #[cfg(any(test, feature = "test-support"))]

@@ -192,7 +192,7 @@ pub trait EventSourced: Clone + Debug + Send + Sync + Sized + Serialize + Deseri
     /// Domain event type emitted by commands and applied during replay.
     type Event: DomainEvent;
     /// Command type that drives state transitions.
-    type Command: Send + Sync;
+    type Command: Debug + Send + Sync;
     /// Domain error type returned by command handlers and event
     /// application.
     type Error: DomainError;
@@ -317,12 +317,36 @@ impl<Entity: EventSourced> Store<Entity> {
     /// - Uninitialized -> `Entity::initialize`
     /// - Live -> `Entity::transition`
     /// - Failed -> returns the stored error
+    ///
+    /// Logs outcome at `debug` on success and `error` on failure,
+    /// including aggregate type, id, and command.
     pub async fn send(
         &self,
         id: &Entity::Id,
         command: Entity::Command,
     ) -> Result<(), SendError<Entity>> {
-        self.cqrs.execute(&id.to_string(), command).await
+        let command_repr = format!("{command:?}");
+        match self.cqrs.execute(&id.to_string(), command).await {
+            Ok(()) => {
+                tracing::debug!(
+                    aggregate = Entity::AGGREGATE_TYPE,
+                    %id,
+                    command = %command_repr,
+                    "Command succeeded"
+                );
+                Ok(())
+            }
+            Err(error) => {
+                tracing::error!(
+                    aggregate = Entity::AGGREGATE_TYPE,
+                    %id,
+                    command = %command_repr,
+                    %error,
+                    "Command failed"
+                );
+                Err(error)
+            }
+        }
     }
 
     /// Load an entity's current state directly from the event store.
@@ -732,6 +756,7 @@ mod tests {
     #[error("widget error")]
     struct WidgetError;
 
+    #[derive(Debug)]
     enum WidgetCommand {
         Create { name: String },
         Rename { name: String },

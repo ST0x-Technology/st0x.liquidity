@@ -24,7 +24,7 @@ use st0x_execution::{AlpacaAccountId, Direction, FractionalShares, Positive, Sym
 use st0x_finance::Usdc;
 
 use crate::config::{Ctx, Env};
-use crate::offchain_order::{OffchainOrder, OffchainOrderId, OrderPlacer};
+use crate::offchain::order::{OffchainOrder, OffchainOrderId, OrderPlacer};
 use crate::position::Position;
 use crate::symbol::cache::SymbolCache;
 use crate::vault_registry::VaultRegistry;

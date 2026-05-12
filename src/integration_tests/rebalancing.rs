@@ -35,7 +35,7 @@ use crate::config::{
 };
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId};
 use crate::inventory::{BroadcastingInventory, ImbalanceThreshold, InventoryView, Venue};
-use crate::offchain_order::OffchainOrderId;
+use crate::offchain::order::OffchainOrderId;
 use crate::onchain::mock::MockRaindex;
 use crate::onchain::raindex::Raindex;
 use crate::position::{Position, PositionCommand, TradeId};

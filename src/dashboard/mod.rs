@@ -276,7 +276,7 @@ mod tests {
     use rocket::config::Config;
     use rocket::fairing::AdHoc;
     use serde_json::json;
-    use st0x_dto::{Trade, TradeDirection, TradingVenue};
+    use st0x_dto::{Direction, Trade, TradingVenue};
     use std::sync::Mutex;
     use tokio::sync::oneshot;
     use tokio_tungstenite::connect_async;
@@ -288,7 +288,7 @@ mod tests {
             id: format!("test-fill-{symbol}"),
             filled_at: chrono::Utc::now(),
             venue: TradingVenue::Raindex,
-            direction: TradeDirection::Buy,
+            direction: Direction::Buy,
             symbol: st0x_finance::Symbol::new(symbol).unwrap(),
             shares: st0x_finance::FractionalShares::new(st0x_float_macro::float!(1)),
         })

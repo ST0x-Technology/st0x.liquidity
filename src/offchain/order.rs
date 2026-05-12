@@ -1,5 +1,34 @@
-//! OffchainOrder CQRS/ES aggregate for tracking broker
-//! order lifecycle: Pending -> Submitted -> Filled/Failed.
+//! OffchainOrder CQRS/ES aggregate for tracking broker order lifecycle
+//! (Pending -> Submitted -> Filled/Failed) plus the per-job machinery that
+//! drives that lifecycle to a terminal state.
+//!
+//! # Per-job module layout
+//!
+//! Each apalis job that operates on an `OffchainOrder` lives in its own file
+//! and carries its own `*Ctx` containing only the dependencies that job
+//! actually uses. There is no shared umbrella context -- bag-of-everything
+//! contexts obscure which job needs which dependency.
+//!
+//! - [`poll_status`] -- polls the broker for status and routes the result.
+//! - [`reconcile_fill`] -- records a successful fill on the aggregate and
+//!   position.
+//! - [`handle_rejection`] -- records a broker rejection on the aggregate and
+//!   position.
+//!
+//! [`JobError`] is shared across all three jobs because every job converts
+//! the same upstream error sources (executor errors, aggregate send failures,
+//! queue push failures). Splitting it per-job would duplicate `#[from]`
+//! conversions without adding type safety.
+
+pub(crate) mod handle_rejection;
+pub(crate) mod poll_status;
+pub(crate) mod reconcile_fill;
+
+pub(crate) use handle_rejection::{HandleOrderRejection, HandleOrderRejectionJobQueue};
+pub(crate) use poll_status::{
+    PollOrderStatus, PollOrderStatusJobQueue, recover_submitted_offchain_orders,
+};
+pub(crate) use reconcile_fill::{ReconcileOrderFill, ReconcileOrderFillJobQueue};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -9,12 +38,45 @@ use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use st0x_dto::{Direction, Trade, TradingVenue};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Projection, Store, StoreBuilder, Table};
 use st0x_execution::{
-    Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder, Positive,
-    SupportedExecutor, Symbol,
+    AlpacaBrokerApiError, ExecutionError, Executor, ExecutorOrderId, FractionalShares, MarketOrder,
+    PersistenceError, Positive, SupportedExecutor, Symbol,
 };
 use st0x_finance::Usd;
+
+use crate::conductor::job::QueuePushError;
+use crate::onchain::OnChainError;
+use crate::position::Position;
+
+/// Errors surfaced by the per-order job pipeline.
+///
+/// Each concrete executor error gets its own variant via `#[from]` rather
+/// than being boxed: the [`Job`](crate::conductor::job::Job) impls bound
+/// `JobError: From<E::Error>` so `?` lifts whichever executor error the
+/// caller picked. Adding a new executor means adding one variant here.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum JobError {
+    #[error("Execution error: {0}")]
+    Execution(#[from] ExecutionError),
+    #[error("Alpaca broker API error: {0}")]
+    AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
+    #[error("Database error: {0}")]
+    Database(#[from] sqlx::Error),
+    #[error("Persistence error: {0}")]
+    Persistence(#[from] PersistenceError),
+    #[error("Onchain error: {0}")]
+    OnChain(#[from] OnChainError),
+    #[error("Projection query error: {0}")]
+    OffchainOrderProjection(#[from] st0x_event_sorcery::ProjectionError<OffchainOrder>),
+    #[error("Offchain order aggregate error: {0}")]
+    OffchainOrderAggregate(#[from] st0x_event_sorcery::SendError<OffchainOrder>),
+    #[error("Position aggregate error: {0}")]
+    PositionAggregate(#[from] st0x_event_sorcery::SendError<Position>),
+    #[error("Failed to enqueue follow-up job: {0}")]
+    Enqueue(#[from] QueuePushError),
+}
 
 /// Constructs the offchain order CQRS framework with its view
 /// query. Used by CLI code.
@@ -372,6 +434,46 @@ impl EventSourced for OffchainOrder {
 }
 
 impl OffchainOrder {
+    /// Renders this order as a dashboard [`Trade`]. Only the `Filled` state
+    /// has the executed price and fill timestamp needed for a Trade; every
+    /// other state returns [`NotFilled`] so callers must acknowledge the
+    /// conversion can fail. Callers that want a silently-discarded `Option`
+    /// can write `.ok()`.
+    pub(crate) fn try_to_trade(&self, id: &OffchainOrderId) -> Result<Trade, NotFilled> {
+        use OffchainOrder::{Failed, PartiallyFilled, Pending, Submitted};
+        let Self::Filled {
+            symbol,
+            shares,
+            direction,
+            executor,
+            filled_at,
+            ..
+        } = self
+        else {
+            return Err(match self {
+                Pending { .. } => NotFilled { state: "Pending" },
+                Submitted { .. } => NotFilled { state: "Submitted" },
+                PartiallyFilled { .. } => NotFilled {
+                    state: "PartiallyFilled",
+                },
+                Failed { .. } => NotFilled { state: "Failed" },
+                Self::Filled { .. } => unreachable!(),
+            });
+        };
+
+        Ok(Trade {
+            id: id.to_string(),
+            filled_at: *filled_at,
+            venue: match executor {
+                SupportedExecutor::AlpacaBrokerApi => TradingVenue::Alpaca,
+                SupportedExecutor::DryRun => TradingVenue::DryRun,
+            },
+            direction: *direction,
+            symbol: symbol.clone(),
+            shares: FractionalShares::new(shares.inner().inner()),
+        })
+    }
+
     pub(crate) fn symbol(&self) -> &Symbol {
         use OffchainOrder::*;
         match self {
@@ -597,6 +699,16 @@ impl OffchainOrderId {
     pub(crate) fn new() -> Self {
         Self(Uuid::new_v4())
     }
+}
+
+/// Returned by [`OffchainOrder::try_to_trade`] when the order isn't in the
+/// `Filled` state. `state` is the variant name as a `&'static str` so
+/// diagnostics get the specific state without dragging the variant's data
+/// (which would include opaque error strings on `Failed`).
+#[derive(Debug, thiserror::Error)]
+#[error("OffchainOrder cannot be rendered as a Trade: current state is {state}")]
+pub(crate) struct NotFilled {
+    pub(crate) state: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]

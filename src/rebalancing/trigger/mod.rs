@@ -1977,7 +1977,7 @@ mod tests {
     use crate::inventory::snapshot::{InventorySnapshotEvent, InventorySnapshotId};
     use crate::inventory::view::Operator;
     use crate::inventory::{InventoryError, InventoryView, TransferOp, Venue};
-    use crate::offchain_order::OffchainOrderId;
+    use crate::offchain::order::OffchainOrderId;
     use crate::position::{PositionEvent, TradeId};
     use crate::threshold::ExecutionThreshold;
     use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
@@ -3806,8 +3806,11 @@ mod tests {
         // Verify imbalance triggers before reactor events
         trigger.check_and_trigger_usdc().await;
         assert!(
-            receiver.try_recv().is_ok(),
-            "Should trigger USDC rebalance before reactor events"
+            matches!(
+                receiver.try_recv(),
+                Ok(TriggeredOperation::UsdcAlpacaToBase { .. })
+            ),
+            "TooMuchOffchain (100/900) should trigger UsdcAlpacaToBase before reactor events"
         );
         trigger.clear_usdc_in_progress();
 
@@ -3840,8 +3843,11 @@ mod tests {
         // Verify imbalance triggers before reactor events
         trigger.check_and_trigger_usdc().await;
         assert!(
-            receiver.try_recv().is_ok(),
-            "Should trigger USDC rebalance before reactor events"
+            matches!(
+                receiver.try_recv(),
+                Ok(TriggeredOperation::UsdcBaseToAlpaca { .. })
+            ),
+            "TooMuchOnchain (900/100) should trigger UsdcBaseToAlpaca before reactor events"
         );
         trigger.clear_usdc_in_progress();
 
@@ -4504,8 +4510,11 @@ mod tests {
         // Verify imbalance triggers before snapshot
         trigger.check_and_trigger_usdc().await;
         assert!(
-            receiver.try_recv().is_ok(),
-            "Should trigger USDC rebalance with 90% ratio"
+            matches!(
+                receiver.try_recv(),
+                Ok(TriggeredOperation::UsdcBaseToAlpaca { .. })
+            ),
+            "TooMuchOnchain (90% ratio) should trigger UsdcBaseToAlpaca before snapshot"
         );
         trigger.clear_usdc_in_progress();
 

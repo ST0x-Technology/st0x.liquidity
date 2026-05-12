@@ -130,8 +130,8 @@ pub(crate) enum OnChainError {
     PositionProjection(#[from] ProjectionError<Position>),
     #[error("Market hours check failed")]
     MarketHoursCheck(#[source] Box<dyn std::error::Error + Send + Sync>),
-    #[error("Failed to push job into queue")]
-    JobQueue(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("Failed to push job into queue: {0}")]
+    JobQueue(#[from] crate::conductor::job::QueuePushError),
 }
 
 pub(crate) const USDC_ETHEREUM: Address = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");

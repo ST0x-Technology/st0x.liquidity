@@ -448,6 +448,7 @@ mod tests {
         Overflow { value: u32 },
     }
 
+    #[derive(Debug)]
     enum CounterCommand {
         Create { initial: u32 },
         Increment,

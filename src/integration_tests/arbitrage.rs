@@ -23,7 +23,12 @@ use std::sync::Arc;
 
 use st0x_event_sorcery::{Projection, Store, StoreBuilder, test_store};
 use st0x_evm::ReadOnlyEvm;
-use st0x_execution::{Direction, FractionalShares, MockExecutor, OrderState, Positive, Symbol};
+use st0x_execution::{
+    Direction, ExecutorOrderId, FractionalShares, MockExecutor, OrderState, Positive, Symbol,
+};
+use st0x_finance::Usd;
+use st0x_float_macro::float;
+use st0x_float_serde::format_float_with_fallback;
 
 use super::{ExpectedEvent, assert_events, fetch_events};
 use crate::bindings::IOrderBookV6::{self, TakeOrderV3};
@@ -36,13 +41,14 @@ use crate::conductor::{
     check_and_execute_accumulated_positions, discover_vaults_for_trade, process_queued_trade,
 };
 use crate::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
-use crate::offchain::order_poller::{OrderPollerCtx, OrderStatusPoller};
-use crate::offchain_order::{ExecutorOrderPlacer, OffchainOrder, OffchainOrderId};
+use crate::offchain::order::{
+    ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderId,
+};
 use crate::onchain::OnchainTrade;
 use crate::onchain::USDC_BASE;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::RaindexTradeEvent;
-use crate::position::Position;
+use crate::position::{Position, PositionCommand};
 use crate::symbol::cache::SymbolCache;
 use crate::test_utils::setup_test_db;
 use crate::threshold::ExecutionThreshold;
@@ -50,8 +56,6 @@ use crate::tokenization::alpaca::tests::setup_anvil;
 use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::trade_accountant::TradeAccountingError;
 use crate::vault_registry::VaultRegistryId;
-use st0x_float_macro::float;
-use st0x_float_serde::format_float_with_fallback;
 
 const TEST_AAPL: &str = "AAPL";
 const TEST_MSFT: &str = "MSFT";
@@ -114,20 +118,108 @@ impl AnvilTrade {
     }
 }
 
-/// Creates a poller with the default MockExecutor (returns Filled) and polls pending orders.
-async fn poll_and_fill(
+/// Drives every submitted offchain order through one polling cycle by asking
+/// `executor` for status and applying the same CQRS commands the
+/// [`PollOrderStatus`]/[`ReconcileOrderFill`]/[`HandleOrderRejection`] job
+/// chain would emit. Keeps integration tests focused on the broker→CQRS flow
+/// without spinning up the full apalis worker monitor.
+///
+/// [`PollOrderStatus`]: crate::offchain::order::PollOrderStatus
+/// [`ReconcileOrderFill`]: crate::offchain::order::ReconcileOrderFill
+/// [`HandleOrderRejection`]: crate::offchain::order::HandleOrderRejection
+async fn poll_submitted_orders<E: st0x_execution::Executor + Clone>(
+    executor: &E,
     offchain_order_projection: &Projection<OffchainOrder>,
-    offchain_order: &Arc<Store<crate::offchain_order::OffchainOrder>>,
+    offchain_order: &Arc<Store<crate::offchain::order::OffchainOrder>>,
     position: &Arc<Store<Position>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let poller = OrderStatusPoller::new(
-        OrderPollerCtx::default(),
-        MockExecutor::new(),
-        offchain_order_projection.clone(),
-        offchain_order.clone(),
-        position.clone(),
-    );
-    poller.poll_pending_orders().await?;
+    // Match the production poll path which polls both Submitted and
+    // PartiallyFilled orders. `filter` only takes one value, so load all
+    // and reject the irrelevant states in Rust.
+    let pollable: Vec<_> = offchain_order_projection
+        .load_all()
+        .await?
+        .into_iter()
+        .filter(|(_, order)| {
+            matches!(
+                order,
+                crate::offchain::order::OffchainOrder::Submitted { .. }
+                    | crate::offchain::order::OffchainOrder::PartiallyFilled { .. }
+            )
+        })
+        .collect();
+
+    for (order_id, order) in pollable {
+        let Some(executor_order_id) = order.executor_order_id() else {
+            continue;
+        };
+        let parsed = executor
+            .parse_order_id(executor_order_id.as_ref())
+            .map_err(|error| format!("parse_order_id: {error}"))?;
+        let state = executor
+            .get_order_status(&parsed)
+            .await
+            .map_err(|error| format!("get_order_status: {error}"))?;
+
+        use OrderState::{Failed, Filled, Pending, Submitted};
+        match state {
+            Filled {
+                price,
+                order_id: broker_order_id,
+                executed_at,
+            } => {
+                offchain_order
+                    .send(
+                        &order_id,
+                        OffchainOrderCommand::CompleteFill {
+                            price: Usd::new(price),
+                        },
+                    )
+                    .await?;
+
+                position
+                    .send(
+                        order.symbol(),
+                        PositionCommand::CompleteOffChainOrder {
+                            offchain_order_id: order_id,
+                            shares_filled: order.shares(),
+                            direction: order.direction(),
+                            executor_order_id: ExecutorOrderId::new(&broker_order_id),
+                            price: Usd::new(price),
+                            broker_timestamp: executed_at,
+                        },
+                    )
+                    .await?;
+            }
+
+            Failed { error_reason, .. } => {
+                let error =
+                    error_reason.unwrap_or_else(|| "Order failed with no error reason".to_string());
+
+                offchain_order
+                    .send(
+                        &order_id,
+                        OffchainOrderCommand::MarkFailed {
+                            error: error.clone(),
+                        },
+                    )
+                    .await?;
+
+                position
+                    .send(
+                        order.symbol(),
+                        PositionCommand::FailOffChainOrder {
+                            offchain_order_id: order_id,
+                            error,
+                        },
+                    )
+                    .await?;
+            }
+
+            Pending | Submitted { .. } => {}
+        }
+    }
+
     Ok(())
 }
 
@@ -557,7 +649,7 @@ async fn create_test_cqrs(
     TradeProcessingCqrs,
     Arc<Store<Position>>,
     Arc<Projection<Position>>,
-    Arc<Store<crate::offchain_order::OffchainOrder>>,
+    Arc<Store<crate::offchain::order::OffchainOrder>>,
     Arc<Projection<OffchainOrder>>,
 ) {
     create_test_cqrs_with_assets(
@@ -580,7 +672,7 @@ async fn create_test_cqrs_with_assets(
     TradeProcessingCqrs,
     Arc<Store<Position>>,
     Arc<Projection<Position>>,
-    Arc<Store<crate::offchain_order::OffchainOrder>>,
+    Arc<Store<crate::offchain::order::OffchainOrder>>,
     Arc<Projection<OffchainOrder>>,
 ) {
     let onchain_trade = Arc::new(test_store(pool.clone(), ()));
@@ -590,7 +682,7 @@ async fn create_test_cqrs_with_assets(
         .await
         .unwrap();
 
-    let order_placer: Arc<dyn crate::offchain_order::OrderPlacer> =
+    let order_placer: Arc<dyn crate::offchain::order::OrderPlacer> =
         Arc::new(ExecutorOrderPlacer(MockExecutor::new()));
 
     let (offchain_order, offchain_order_projection) =
@@ -599,6 +691,7 @@ async fn create_test_cqrs_with_assets(
             .await
             .unwrap();
 
+    crate::conductor::setup_apalis_tables(pool).await.unwrap();
     let cqrs = TradeProcessingCqrs {
         onchain_trade,
         position: position.clone(),
@@ -607,6 +700,7 @@ async fn create_test_cqrs_with_assets(
         execution_threshold: ExecutionThreshold::whole_share(),
         assets,
         counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
+        poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(pool),
     };
 
     (
@@ -708,13 +802,13 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
     assert_eq!(events[2].event_type, "PositionEvent::OnChainOrderFilled");
     let trade1_filled = &events[2].payload["OnChainOrderFilled"];
     assert_eq!(trade1_filled["amount"].as_str().unwrap(), "0.5");
-    assert_eq!(trade1_filled["direction"].as_str().unwrap(), "Sell");
+    assert_eq!(trade1_filled["direction"].as_str().unwrap(), "sell");
     assert_eq!(trade1_filled["price_usdc"].as_str().unwrap(), "100");
 
     assert_eq!(events[4].event_type, "PositionEvent::OnChainOrderFilled");
     let trade2_filled = &events[4].payload["OnChainOrderFilled"];
     assert_eq!(trade2_filled["amount"].as_str().unwrap(), "0.7");
-    assert_eq!(trade2_filled["direction"].as_str().unwrap(), "Sell");
+    assert_eq!(trade2_filled["direction"].as_str().unwrap(), "sell");
     assert_eq!(trade2_filled["price_usdc"].as_str().unwrap(), "100");
 
     // Payload spot-checks: OffChainOrderPlaced and Placed shares/direction
@@ -724,17 +818,23 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
         placed_pos["offchain_order_id"].as_str().unwrap(),
         order_id_str
     );
-    assert_eq!(placed_pos["direction"].as_str().unwrap(), "Buy");
+    assert_eq!(placed_pos["direction"].as_str().unwrap(), "buy");
     assert_eq!(placed_pos["shares"].as_str().unwrap(), "1.2");
 
     assert_eq!(events[6].event_type, "OffchainOrderEvent::Placed");
     let offchain_placed = &events[6].payload["Placed"];
     assert_eq!(offchain_placed["symbol"].as_str().unwrap(), TEST_AAPL);
-    assert_eq!(offchain_placed["direction"].as_str().unwrap(), "Buy");
+    assert_eq!(offchain_placed["direction"].as_str().unwrap(), "buy");
     assert_eq!(offchain_placed["shares"].as_str().unwrap(), "1.2");
 
     // Fulfillment: order poller detects the filled order and completes the lifecycle
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+    poll_submitted_orders(
+        &MockExecutor::new(),
+        &offchain_order_projection,
+        &offchain_order,
+        &position,
+    )
+    .await?;
 
     assert_position()
         .query(&position_query)
@@ -802,14 +902,12 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
         failed_at: Utc::now(),
         error_reason: Some("Broker rejected order".to_string()),
     });
-    OrderStatusPoller::new(
-        OrderPollerCtx::default(),
-        failed_executor,
-        offchain_order_projection.as_ref().clone(),
-        offchain_order.clone(),
-        position.clone(),
+    poll_submitted_orders(
+        &failed_executor,
+        offchain_order_projection.as_ref(),
+        &offchain_order,
+        &position,
     )
-    .poll_pending_orders()
     .await?;
 
     // After failure: pending cleared, position still has net exposure
@@ -844,7 +942,7 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
     assert_eq!(events[6].event_type, "OffchainOrderEvent::Placed");
     let placed = &events[6].payload["Placed"];
     assert_eq!(placed["symbol"].as_str().unwrap(), TEST_AAPL);
-    assert_eq!(placed["direction"].as_str().unwrap(), "Buy");
+    assert_eq!(placed["direction"].as_str().unwrap(), "buy");
 
     // Position checker finds the unexecuted position and retries
     check_and_execute_accumulated_positions(
@@ -864,7 +962,13 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
     )
     .await?;
 
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+    poll_submitted_orders(
+        &MockExecutor::new(),
+        &offchain_order_projection,
+        &offchain_order,
+        &position,
+    )
+    .await?;
 
     // Final: position fully hedged
     assert_position()
@@ -1027,11 +1131,17 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(events[9].event_type, "OffchainOrderEvent::Placed");
     let aapl_placed = &events[9].payload["Placed"];
     assert_eq!(aapl_placed["symbol"].as_str().unwrap(), TEST_AAPL);
-    assert_eq!(aapl_placed["direction"].as_str().unwrap(), "Buy");
+    assert_eq!(aapl_placed["direction"].as_str().unwrap(), "buy");
     assert_eq!(aapl_placed["shares"].as_str().unwrap(), "1.2");
 
     // Poll and fill AAPL, verify MSFT unchanged
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+    poll_submitted_orders(
+        &MockExecutor::new(),
+        &offchain_order_projection,
+        &offchain_order,
+        &position,
+    )
+    .await?;
 
     assert_position()
         .query(&position_query)
@@ -1115,11 +1225,17 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(events[16].event_type, "OffchainOrderEvent::Placed");
     let msft_placed = &events[16].payload["Placed"];
     assert_eq!(msft_placed["symbol"].as_str().unwrap(), TEST_MSFT);
-    assert_eq!(msft_placed["direction"].as_str().unwrap(), "Buy");
+    assert_eq!(msft_placed["direction"].as_str().unwrap(), "buy");
     assert_eq!(msft_placed["shares"].as_str().unwrap(), "1");
 
     // Poll and fill MSFT, both positions end fully hedged
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+    poll_submitted_orders(
+        &MockExecutor::new(),
+        &offchain_order_projection,
+        &offchain_order,
+        &position,
+    )
+    .await?;
 
     assert_position()
         .query(&position_query)
@@ -1234,20 +1350,20 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
     assert_eq!(events[2].event_type, "PositionEvent::OnChainOrderFilled");
     let trade1_filled = &events[2].payload["OnChainOrderFilled"];
     assert_eq!(trade1_filled["amount"].as_str().unwrap(), "0.5");
-    assert_eq!(trade1_filled["direction"].as_str().unwrap(), "Buy");
+    assert_eq!(trade1_filled["direction"].as_str().unwrap(), "buy");
     assert_eq!(trade1_filled["price_usdc"].as_str().unwrap(), "100");
 
     assert_eq!(events[4].event_type, "PositionEvent::OnChainOrderFilled");
     let trade2_filled = &events[4].payload["OnChainOrderFilled"];
     assert_eq!(trade2_filled["amount"].as_str().unwrap(), "0.7");
-    assert_eq!(trade2_filled["direction"].as_str().unwrap(), "Buy");
+    assert_eq!(trade2_filled["direction"].as_str().unwrap(), "buy");
     assert_eq!(trade2_filled["price_usdc"].as_str().unwrap(), "100");
 
     // Hedge direction should be Sell (opposite of onchain Buy), shares = abs(net)
     assert_eq!(events[6].event_type, "OffchainOrderEvent::Placed");
     assert_eq!(
         events[6].payload["Placed"]["direction"].as_str().unwrap(),
-        "Sell"
+        "sell"
     );
     assert_eq!(
         events[6].payload["Placed"]["shares"].as_str().unwrap(),
@@ -1255,7 +1371,13 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
     );
 
     // Fill the hedge order
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+    poll_submitted_orders(
+        &MockExecutor::new(),
+        &offchain_order_projection,
+        &offchain_order,
+        &position,
+    )
+    .await?;
 
     assert_position()
         .query(&position_query)
@@ -1329,18 +1451,18 @@ async fn exact_threshold_triggers_execution() -> Result<(), Box<dyn std::error::
     assert_eq!(events[2].event_type, "PositionEvent::OnChainOrderFilled");
     let filled = &events[2].payload["OnChainOrderFilled"];
     assert_eq!(filled["amount"].as_str().unwrap(), "1");
-    assert_eq!(filled["direction"].as_str().unwrap(), "Sell");
+    assert_eq!(filled["direction"].as_str().unwrap(), "sell");
     assert_eq!(filled["price_usdc"].as_str().unwrap(), "100");
 
     assert_eq!(events[3].event_type, "PositionEvent::OffChainOrderPlaced");
     let placed_pos = &events[3].payload["OffChainOrderPlaced"];
-    assert_eq!(placed_pos["direction"].as_str().unwrap(), "Buy");
+    assert_eq!(placed_pos["direction"].as_str().unwrap(), "buy");
     assert_eq!(placed_pos["shares"].as_str().unwrap(), "1");
 
     assert_eq!(events[4].event_type, "OffchainOrderEvent::Placed");
     let placed = &events[4].payload["Placed"];
     assert_eq!(placed["symbol"].as_str().unwrap(), TEST_AAPL);
-    assert_eq!(placed["direction"].as_str().unwrap(), "Buy");
+    assert_eq!(placed["direction"].as_str().unwrap(), "buy");
     assert_eq!(placed["shares"].as_str().unwrap(), "1");
 
     Ok(())
@@ -1364,7 +1486,13 @@ async fn position_checker_noop_when_hedged() -> Result<(), Box<dyn std::error::E
         .call()
         .await;
     trade1.submit(&cqrs).await?.expect("Threshold crossed");
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+    poll_submitted_orders(
+        &MockExecutor::new(),
+        &offchain_order_projection,
+        &offchain_order,
+        &position,
+    )
+    .await?;
 
     let events_before = fetch_events(&pool).await;
 
@@ -1420,7 +1548,13 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
         .submit(&cqrs)
         .await?
         .expect("First threshold crossing");
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+    poll_submitted_orders(
+        &MockExecutor::new(),
+        &offchain_order_projection,
+        &offchain_order,
+        &position,
+    )
+    .await?;
 
     assert_position()
         .query(&position_query)
@@ -1460,7 +1594,13 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
         .call()
         .await;
 
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+    poll_submitted_orders(
+        &MockExecutor::new(),
+        &offchain_order_projection,
+        &offchain_order,
+        &position,
+    )
+    .await?;
 
     assert_position()
         .query(&position_query)
@@ -1829,11 +1969,17 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
 
     assert_eq!(events[10].event_type, "OffchainOrderEvent::Placed");
     let placed = &events[10].payload["Placed"];
-    assert_eq!(placed["direction"].as_str().unwrap(), "Buy");
+    assert_eq!(placed["direction"].as_str().unwrap(), "buy");
     assert_eq!(placed["shares"].as_str().unwrap(), "1.1");
 
     // Fill the hedge and verify net returns to zero
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+    poll_submitted_orders(
+        &MockExecutor::new(),
+        &offchain_order_projection,
+        &offchain_order,
+        &position,
+    )
+    .await?;
 
     assert_position()
         .query(&position_query)
@@ -2060,7 +2206,13 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
     );
 
     // Fill first order -> net becomes -2
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+    poll_submitted_orders(
+        &MockExecutor::new(),
+        &offchain_order_projection,
+        &offchain_order,
+        &position,
+    )
+    .await?;
 
     assert_position()
         .query(&position_query)
@@ -2103,7 +2255,13 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
     );
 
     // Fill second order -> net becomes -1
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+    poll_submitted_orders(
+        &MockExecutor::new(),
+        &offchain_order_projection,
+        &offchain_order,
+        &position,
+    )
+    .await?;
 
     // Cycle 3: 1 remaining share, still capped to 1 (but matches)
     check_and_execute_accumulated_positions(
@@ -2135,7 +2293,13 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
     );
 
     // Fill third order -> fully hedged
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+    poll_submitted_orders(
+        &MockExecutor::new(),
+        &offchain_order_projection,
+        &offchain_order,
+        &position,
+    )
+    .await?;
 
     assert_position()
         .query(&position_query)
@@ -2252,14 +2416,12 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
         failed_at: Utc::now(),
         error_reason: Some("Broker rejected".to_string()),
     });
-    OrderStatusPoller::new(
-        OrderPollerCtx::default(),
-        failed_executor,
-        offchain_order_projection.as_ref().clone(),
-        offchain_order.clone(),
-        position.clone(),
+    poll_submitted_orders(
+        &failed_executor,
+        offchain_order_projection.as_ref(),
+        &offchain_order,
+        &position,
     )
-    .poll_pending_orders()
     .await?;
 
     // Pending cleared after failure, position still has -5 net
@@ -2332,7 +2494,13 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
     );
 
     // Fill the retry -> net becomes -3
-    poll_and_fill(&offchain_order_projection, &offchain_order, &position).await?;
+    poll_submitted_orders(
+        &MockExecutor::new(),
+        &offchain_order_projection,
+        &offchain_order,
+        &position,
+    )
+    .await?;
 
     assert_position()
         .query(&position_query)

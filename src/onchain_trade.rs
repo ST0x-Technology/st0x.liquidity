@@ -15,8 +15,10 @@ use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use st0x_dto::{Direction, Trade, TradingVenue};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
-use st0x_execution::{Direction, Symbol};
+use st0x_execution::Symbol;
+use st0x_finance::FractionalShares;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 
@@ -207,6 +209,17 @@ impl EventSourced for OnChainTrade {
 impl OnChainTrade {
     pub(crate) fn is_enriched(&self) -> bool {
         self.enrichment.is_some()
+    }
+
+    pub(crate) fn to_trade(&self, id: &OnChainTradeId) -> Trade {
+        Trade {
+            id: id.to_string(),
+            filled_at: self.filled_at,
+            venue: TradingVenue::Raindex,
+            direction: self.direction,
+            symbol: self.symbol.clone(),
+            shares: FractionalShares::new(self.amount),
+        }
     }
 }
 
