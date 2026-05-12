@@ -662,6 +662,30 @@ pub(crate) struct InFlightCashEntry {
     pub(crate) fetched_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct InFlightEquityEntry {
+    pub(crate) amount: FractionalShares,
+    pub(crate) fetched_at: DateTime<Utc>,
+}
+
+/// Locations where equity tokens may sit in transit between venues.
+///
+/// Like [`InFlightCashLocation`], these slots are populated from
+/// wallet-read snapshots and never enter the imbalance math. They
+/// give visibility into capital that has left one venue but has not
+/// yet landed on the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) enum InFlightEquityLocation {
+    /// Unwrapped equity tokens parked on the Base wallet (issuer
+    /// tokens not yet wrapped into vault shares, or unwrapped tokens
+    /// awaiting redemption journal to Alpaca).
+    BaseWalletUnwrapped,
+    /// Wrapped equity tokens parked on the Base wallet (vault shares
+    /// awaiting deposit into Raindex, or shares withdrawn from the
+    /// vault awaiting unwrapping).
+    BaseWalletWrapped,
+}
+
 /// Cross-aggregate projection tracking inventory across venues.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct InventoryView {
@@ -700,6 +724,17 @@ pub(crate) struct InventoryView {
     /// on terminal redemption events.
     #[serde(default)]
     active_redemptions: HashMap<Symbol, RedemptionAggregateId>,
+    /// Equity tokens observed at intermediate wallet locations between
+    /// the two venues, keyed by `(symbol, location)`. Populated from
+    /// wallet-read snapshots; does not feed the imbalance math.
+    ///
+    /// Wallet readings replace any prior value at the same location only when
+    /// the incoming `fetched_at` is at least as recent as the existing entry's.
+    /// Polls running concurrently against different RPC nodes can land out of
+    /// order, so dropping older snapshots prevents a stale reading from
+    /// overwriting a fresher one.
+    #[serde(default)]
+    inflight_equity: HashMap<(Symbol, InFlightEquityLocation), InFlightEquityEntry>,
 }
 
 impl InventoryView {
@@ -833,6 +868,7 @@ impl Default for InventoryView {
             active_usdc_rebalance: None,
             active_mints: HashMap::new(),
             active_redemptions: HashMap::new(),
+            inflight_equity: HashMap::new(),
         }
     }
 }
@@ -919,13 +955,17 @@ impl InventoryView {
         self.inflight_cash.get(&location).map(|entry| entry.amount)
     }
 
-    /// Returns a clone of the full in-flight cash map for use in tests
-    /// that need to assert no-op semantics across multiple events.
+    /// Returns the in-flight equity tokens observed at the given
+    /// intermediate location for a symbol.
     #[cfg(test)]
-    pub(crate) fn inflight_cash_snapshot(
+    pub(crate) fn inflight_equity_at(
         &self,
-    ) -> HashMap<InFlightCashLocation, InFlightCashEntry> {
-        self.inflight_cash.clone()
+        symbol: &Symbol,
+        location: InFlightEquityLocation,
+    ) -> Option<FractionalShares> {
+        self.inflight_equity
+            .get(&(symbol.clone(), location))
+            .map(|entry| entry.amount)
     }
 
     pub(crate) fn update_equity(
@@ -954,6 +994,7 @@ impl InventoryView {
             active_usdc_rebalance: self.active_usdc_rebalance,
             active_mints: self.active_mints,
             active_redemptions: self.active_redemptions,
+            inflight_equity: self.inflight_equity,
         })
     }
 
@@ -974,6 +1015,7 @@ impl InventoryView {
             active_usdc_rebalance: self.active_usdc_rebalance,
             active_mints: self.active_mints,
             active_redemptions: self.active_redemptions,
+            inflight_equity: self.inflight_equity,
         })
     }
 
@@ -1010,6 +1052,62 @@ impl InventoryView {
         self
     }
 
+    /// Record the latest wallet-read equity balances at an intermediate
+    /// location.
+    ///
+    /// Wallet readings replace any prior value at the same location only when
+    /// the incoming `fetched_at` is at least as recent as the existing entry's.
+    /// Polls running concurrently against different RPC nodes can land out of
+    /// order, so dropping older snapshots prevents a stale reading from
+    /// overwriting a fresher one.
+    ///
+    /// If any existing entry at this location is fresher than `fetched_at`,
+    /// the entire snapshot is rejected without modification.
+    ///
+    /// Otherwise, symbols absent from `balances` are removed from the view,
+    /// matching what the wallet reports.
+    pub(crate) fn set_inflight_equity_at_location(
+        mut self,
+        location: InFlightEquityLocation,
+        balances: &BTreeMap<Symbol, FractionalShares>,
+        fetched_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Self {
+        // Check if any existing entries at this location are fresher than the
+        // incoming snapshot. If so, reject it completely.
+        let is_stale = self
+            .inflight_equity
+            .iter()
+            .filter(|((_, existing_location), _)| *existing_location == location)
+            .any(|(_, entry)| entry.fetched_at > fetched_at);
+
+        if is_stale {
+            warn!(
+                target: "inventory",
+                ?location,
+                incoming_fetched_at = ?fetched_at,
+                "ignoring stale inflight_equity snapshot for location",
+            );
+            return self;
+        }
+
+        self.inflight_equity
+            .retain(|(_, existing_location), _| *existing_location != location);
+
+        for (symbol, amount) in balances {
+            self.inflight_equity.insert(
+                (symbol.clone(), location),
+                InFlightEquityEntry {
+                    amount: *amount,
+                    fetched_at,
+                },
+            );
+        }
+
+        self.last_updated = now;
+        self
+    }
+
     pub(crate) fn clear_equity_inflight(
         self,
         symbol: &Symbol,
@@ -1036,6 +1134,7 @@ impl InventoryView {
             active_usdc_rebalance: self.active_usdc_rebalance,
             active_mints: self.active_mints,
             active_redemptions: self.active_redemptions,
+            inflight_equity: self.inflight_equity,
         })
     }
 
@@ -1057,6 +1156,7 @@ impl InventoryView {
             active_usdc_rebalance: self.active_usdc_rebalance,
             active_mints: self.active_mints,
             active_redemptions: self.active_redemptions,
+            inflight_equity: self.inflight_equity,
         })
     }
 
@@ -1327,7 +1427,25 @@ impl InventoryView {
                 now,
             )),
 
-            BaseWalletUnwrappedEquity { .. } | BaseWalletWrappedEquity { .. } => Ok(self),
+            BaseWalletUnwrappedEquity {
+                balances,
+                fetched_at,
+            } => Ok(self.set_inflight_equity_at_location(
+                InFlightEquityLocation::BaseWalletUnwrapped,
+                balances,
+                *fetched_at,
+                now,
+            )),
+
+            BaseWalletWrappedEquity {
+                balances,
+                fetched_at,
+            } => Ok(self.set_inflight_equity_at_location(
+                InFlightEquityLocation::BaseWalletWrapped,
+                balances,
+                *fetched_at,
+                now,
+            )),
 
             InflightEquity {
                 mints, redemptions, ..
@@ -1436,7 +1554,25 @@ impl InventoryView {
                 now,
             )),
 
-            BaseWalletUnwrappedEquity { .. } | BaseWalletWrappedEquity { .. } => Ok(self),
+            BaseWalletUnwrappedEquity {
+                balances,
+                fetched_at,
+            } => Ok(self.set_inflight_equity_at_location(
+                InFlightEquityLocation::BaseWalletUnwrapped,
+                balances,
+                *fetched_at,
+                now,
+            )),
+
+            BaseWalletWrappedEquity {
+                balances,
+                fetched_at,
+            } => Ok(self.set_inflight_equity_at_location(
+                InFlightEquityLocation::BaseWalletWrapped,
+                balances,
+                *fetched_at,
+                now,
+            )),
 
             InflightEquity {
                 mints,
@@ -1706,6 +1842,7 @@ mod tests {
             active_usdc_rebalance: None,
             active_mints: HashMap::new(),
             active_redemptions: HashMap::new(),
+            inflight_equity: HashMap::new(),
         }
     }
 
@@ -1730,6 +1867,7 @@ mod tests {
             active_usdc_rebalance: None,
             active_mints: HashMap::new(),
             active_redemptions: HashMap::new(),
+            inflight_equity: HashMap::new(),
         }
     }
 
@@ -2208,6 +2346,315 @@ mod tests {
     }
 
     #[test]
+    fn set_inflight_equity_ignores_stale_fetched_at() {
+        let symbol_aapl = Symbol::new("AAPL").unwrap();
+        let earlier = Utc::now();
+        let later = earlier + Duration::seconds(30);
+        let fresh_fetched_at = earlier;
+        let stale_fetched_at = earlier - Duration::seconds(10);
+
+        let mut fresh_balances = BTreeMap::new();
+        fresh_balances.insert(symbol_aapl.clone(), shares(100));
+
+        let mut stale_balances = BTreeMap::new();
+        stale_balances.insert(symbol_aapl.clone(), shares(7));
+
+        let view = InventoryView::default()
+            .set_inflight_equity_at_location(
+                InFlightEquityLocation::BaseWalletUnwrapped,
+                &fresh_balances,
+                fresh_fetched_at,
+                earlier,
+            )
+            .set_inflight_equity_at_location(
+                InFlightEquityLocation::BaseWalletUnwrapped,
+                &stale_balances,
+                stale_fetched_at,
+                later,
+            );
+
+        assert_eq!(
+            view.inflight_equity_at(&symbol_aapl, InFlightEquityLocation::BaseWalletUnwrapped),
+            Some(shares(100)),
+            "stale snapshot must not overwrite fresher entry",
+        );
+        assert_eq!(
+            view.last_updated, earlier,
+            "dropping a stale snapshot must not advance last_updated",
+        );
+    }
+
+    #[test]
+    fn set_inflight_equity_replaces_when_fetched_at_equals_existing() {
+        let symbol_aapl = Symbol::new("AAPL").unwrap();
+        let fetched_at = Utc::now();
+        let now = fetched_at;
+
+        let mut first_balances = BTreeMap::new();
+        first_balances.insert(symbol_aapl.clone(), shares(50));
+
+        let mut second_balances = BTreeMap::new();
+        second_balances.insert(symbol_aapl.clone(), shares(75));
+
+        let view = InventoryView::default()
+            .set_inflight_equity_at_location(
+                InFlightEquityLocation::BaseWalletUnwrapped,
+                &first_balances,
+                fetched_at,
+                now,
+            )
+            .set_inflight_equity_at_location(
+                InFlightEquityLocation::BaseWalletUnwrapped,
+                &second_balances,
+                fetched_at,
+                now,
+            );
+
+        assert_eq!(
+            view.inflight_equity_at(&symbol_aapl, InFlightEquityLocation::BaseWalletUnwrapped),
+            Some(shares(75)),
+        );
+    }
+
+    #[test]
+    fn apply_snapshot_event_populates_inflight_equity_for_base_wallet_unwrapped() {
+        let symbol_aapl = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let mut balances = BTreeMap::new();
+        balances.insert(symbol_aapl.clone(), shares(12));
+
+        let view = InventoryView::default()
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::BaseWalletUnwrappedEquity {
+                    balances,
+                    fetched_at: now,
+                },
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(
+            view.inflight_equity_at(&symbol_aapl, InFlightEquityLocation::BaseWalletUnwrapped),
+            Some(shares(12)),
+            "BaseWalletUnwrappedEquity must populate the BaseWalletUnwrapped slot",
+        );
+        assert_eq!(
+            view.inflight_equity_at(&symbol_aapl, InFlightEquityLocation::BaseWalletWrapped),
+            None,
+            "BaseWalletWrapped slot must remain untouched",
+        );
+        assert_eq!(
+            view.equity_available(&symbol_aapl, Venue::MarketMaking),
+            None,
+            "wallet read must not initialize venue inventory",
+        );
+        assert_eq!(view.equity_available(&symbol_aapl, Venue::Hedging), None);
+    }
+
+    #[test]
+    fn apply_snapshot_event_populates_inflight_equity_for_base_wallet_wrapped() {
+        let symbol_aapl = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let mut balances = BTreeMap::new();
+        balances.insert(symbol_aapl.clone(), shares(9));
+
+        let view = InventoryView::default()
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::BaseWalletWrappedEquity {
+                    balances,
+                    fetched_at: now,
+                },
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(
+            view.inflight_equity_at(&symbol_aapl, InFlightEquityLocation::BaseWalletWrapped),
+            Some(shares(9)),
+        );
+        assert_eq!(
+            view.inflight_equity_at(&symbol_aapl, InFlightEquityLocation::BaseWalletUnwrapped),
+            None,
+        );
+    }
+
+    /// Wallet readings replace the prior balances at that location:
+    /// symbols absent from the new map drop out of the inflight_equity
+    /// map even if previously seen, because the chain reading is
+    /// authoritative.
+    #[test]
+    fn apply_snapshot_event_replaces_inflight_equity_at_same_location() {
+        let symbol_aapl = Symbol::new("AAPL").unwrap();
+        let symbol_tsla = Symbol::new("TSLA").unwrap();
+        let now = Utc::now();
+
+        let mut first = BTreeMap::new();
+        first.insert(symbol_aapl.clone(), shares(5));
+        first.insert(symbol_tsla.clone(), shares(3));
+
+        let after_first = InventoryView::default()
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::BaseWalletUnwrappedEquity {
+                    balances: first,
+                    fetched_at: now,
+                },
+                now,
+            )
+            .unwrap();
+
+        let mut second = BTreeMap::new();
+        second.insert(symbol_aapl.clone(), shares(2));
+
+        let after_second = after_first
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::BaseWalletUnwrappedEquity {
+                    balances: second,
+                    fetched_at: now,
+                },
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(
+            after_second
+                .inflight_equity_at(&symbol_aapl, InFlightEquityLocation::BaseWalletUnwrapped),
+            Some(shares(2)),
+            "AAPL balance must reflect the latest wallet read",
+        );
+        assert_eq!(
+            after_second
+                .inflight_equity_at(&symbol_tsla, InFlightEquityLocation::BaseWalletUnwrapped),
+            None,
+            "TSLA must drop out when absent from the latest wallet read",
+        );
+    }
+
+    /// The two equity inflight tracking systems must remain independent:
+    /// `Inventory<FractionalShares>::inflight` (managed by tokenization
+    /// lifecycle events) and the location-keyed `inflight_equity` map
+    /// (populated by wallet polls) describe different things and can
+    /// legitimately coexist mid-transfer.
+    #[test]
+    fn venue_inflight_and_inflight_equity_are_tracked_independently() {
+        let symbol_aapl = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let mut mints = BTreeMap::new();
+        mints.insert(symbol_aapl.clone(), shares(15));
+
+        let mut wallet_balances = BTreeMap::new();
+        wallet_balances.insert(symbol_aapl.clone(), shares(4));
+
+        let view = InventoryView::default()
+            .apply_inflight_snapshot(&mints, &BTreeMap::new(), now, now)
+            .unwrap()
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::BaseWalletWrappedEquity {
+                    balances: wallet_balances,
+                    fetched_at: now,
+                },
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(
+            view.equity_inflight(&symbol_aapl, Venue::Hedging),
+            Some(shares(15)),
+            "venue-level inflight reflects mint snapshot",
+        );
+        assert_eq!(
+            view.inflight_equity_at(&symbol_aapl, InFlightEquityLocation::BaseWalletWrapped),
+            Some(shares(4)),
+            "location-level inflight reflects the wallet read",
+        );
+    }
+
+    /// Wallet equity balances must NOT enter the imbalance math --
+    /// `check_equity_imbalance` operates on venue totals only, so wallet
+    /// readings can never mask or compensate a real venue imbalance.
+    #[test]
+    fn wallet_equity_balances_do_not_enter_imbalance_math() {
+        let symbol_aapl = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let baseline =
+            InventoryView::default().with_equity(symbol_aapl.clone(), shares(90), shares(10));
+
+        let imbalance_without_wallet = baseline
+            .check_equity_imbalance(&symbol_aapl, &threshold("0.5", "0.3"), &one_to_one_ratio())
+            .unwrap();
+        assert!(
+            matches!(
+                imbalance_without_wallet,
+                Some(Imbalance::TooMuchOnchain { .. })
+            ),
+            "venue imbalance is detected without wallet noise, got {imbalance_without_wallet:?}",
+        );
+
+        let mut wallet_balances = BTreeMap::new();
+        wallet_balances.insert(symbol_aapl.clone(), shares(10_000));
+
+        let with_huge_wallet = baseline
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::BaseWalletWrappedEquity {
+                    balances: wallet_balances,
+                    fetched_at: now,
+                },
+                now,
+            )
+            .unwrap();
+
+        let imbalance_with_wallet = with_huge_wallet
+            .check_equity_imbalance(&symbol_aapl, &threshold("0.5", "0.3"), &one_to_one_ratio())
+            .unwrap();
+        assert_eq!(
+            imbalance_without_wallet, imbalance_with_wallet,
+            "wallet equity readings must not alter the imbalance answer",
+        );
+    }
+
+    #[test]
+    fn force_apply_snapshot_event_also_populates_inflight_equity() {
+        let symbol_aapl = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let reason = std::sync::Arc::new(InventoryViewError::UsdBalanceConversion(-1));
+
+        let mut unwrapped = BTreeMap::new();
+        unwrapped.insert(symbol_aapl.clone(), shares(2));
+        let mut wrapped = BTreeMap::new();
+        wrapped.insert(symbol_aapl.clone(), shares(3));
+
+        let view = InventoryView::default()
+            .force_apply_snapshot_event(
+                &InventorySnapshotEvent::BaseWalletUnwrappedEquity {
+                    balances: unwrapped,
+                    fetched_at: now,
+                },
+                now,
+                reason.clone(),
+            )
+            .unwrap()
+            .force_apply_snapshot_event(
+                &InventorySnapshotEvent::BaseWalletWrappedEquity {
+                    balances: wrapped,
+                    fetched_at: now,
+                },
+                now,
+                reason,
+            )
+            .unwrap();
+
+        assert_eq!(
+            view.inflight_equity_at(&symbol_aapl, InFlightEquityLocation::BaseWalletUnwrapped),
+            Some(shares(2)),
+        );
+        assert_eq!(
+            view.inflight_equity_at(&symbol_aapl, InFlightEquityLocation::BaseWalletWrapped),
+            Some(shares(3)),
+        );
+    }
+
+    #[test]
     fn on_snapshot_rejects_stale_snapshot_predating_last_rebalancing() {
         let last_rebalancing = Utc::now();
         let stale_fetched_at = last_rebalancing - Duration::seconds(10);
@@ -2537,6 +2984,7 @@ mod tests {
             active_usdc_rebalance: None,
             active_mints: HashMap::new(),
             active_redemptions: HashMap::new(),
+            inflight_equity: HashMap::new(),
         };
 
         let dto = view.to_dto();
@@ -2583,6 +3031,7 @@ mod tests {
             active_usdc_rebalance: None,
             active_mints: HashMap::new(),
             active_redemptions: HashMap::new(),
+            inflight_equity: HashMap::new(),
         };
 
         let dto = view.to_dto();

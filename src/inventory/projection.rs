@@ -103,7 +103,7 @@ mod tests {
     use crate::inventory::snapshot::{
         InventorySnapshot, InventorySnapshotCommand, InventorySnapshotId,
     };
-    use crate::inventory::view::InFlightCashLocation;
+    use crate::inventory::view::{InFlightCashLocation, InFlightEquityLocation};
     use crate::inventory::{InventoryView, Venue};
     use crate::test_utils::setup_test_db;
 
@@ -134,6 +134,50 @@ mod tests {
     async fn read_usdc_available(inventory: &BroadcastingInventory, venue: Venue) -> Option<Usdc> {
         let view = inventory.read().await;
         view.usdc_available(venue)
+    }
+
+    /// Snapshot of USDC balances at every tracked location for a single
+    /// assertion -- venue inventory plus wallet readings.
+    struct UsdcLocationsSnapshot {
+        mm_available: Option<Usdc>,
+        hedging_available: Option<Usdc>,
+        ethereum_inflight: Option<Usdc>,
+        base_wallet_inflight: Option<Usdc>,
+    }
+
+    impl UsdcLocationsSnapshot {
+        async fn read(inventory: &BroadcastingInventory) -> Self {
+            let view = inventory.read().await;
+            Self {
+                mm_available: view.usdc_available(Venue::MarketMaking),
+                hedging_available: view.usdc_available(Venue::Hedging),
+                ethereum_inflight: view.inflight_cash_at(InFlightCashLocation::EthereumWallet),
+                base_wallet_inflight: view.inflight_cash_at(InFlightCashLocation::BaseWallet),
+            }
+        }
+    }
+
+    /// Snapshot of equity balances at every tracked location for a
+    /// single symbol -- venue inventory plus wallet readings.
+    struct EquityLocationsSnapshot {
+        mm_available: Option<FractionalShares>,
+        hedging_available: Option<FractionalShares>,
+        unwrapped_inflight: Option<FractionalShares>,
+        wrapped_inflight: Option<FractionalShares>,
+    }
+
+    impl EquityLocationsSnapshot {
+        async fn read(inventory: &BroadcastingInventory, symbol: &Symbol) -> Self {
+            let view = inventory.read().await;
+            Self {
+                mm_available: view.equity_available(symbol, Venue::MarketMaking),
+                hedging_available: view.equity_available(symbol, Venue::Hedging),
+                unwrapped_inflight: view
+                    .inflight_equity_at(symbol, InFlightEquityLocation::BaseWalletUnwrapped),
+                wrapped_inflight: view
+                    .inflight_equity_at(symbol, InFlightEquityLocation::BaseWalletWrapped),
+            }
+        }
     }
 
     #[tokio::test]
@@ -187,28 +231,19 @@ mod tests {
 
         projection.apply(&event).await.unwrap();
 
-        let (mm_available, hedging_available, ethereum_inflight, base_wallet_inflight) = {
-            let view = inventory.read().await;
-            (
-                view.usdc_available(Venue::MarketMaking),
-                view.usdc_available(Venue::Hedging),
-                view.inflight_cash_at(InFlightCashLocation::EthereumWallet),
-                view.inflight_cash_at(InFlightCashLocation::BaseWallet),
-            )
-        };
-
+        let snapshot = UsdcLocationsSnapshot::read(&inventory).await;
         assert_eq!(
-            mm_available, None,
+            snapshot.mm_available, None,
             "EthereumUsdc must not touch tracked venue inventory slots",
         );
-        assert_eq!(hedging_available, None);
+        assert_eq!(snapshot.hedging_available, None);
         assert_eq!(
-            ethereum_inflight,
+            snapshot.ethereum_inflight,
             Some(balance),
             "EthereumUsdc must populate the Ethereum inflight cash slot",
         );
         assert_eq!(
-            base_wallet_inflight, None,
+            snapshot.base_wallet_inflight, None,
             "BaseWallet inflight cash must remain untouched",
         );
     }
@@ -225,48 +260,61 @@ mod tests {
 
         projection.apply(&event).await.unwrap();
 
-        let (mm_available, hedging_available, ethereum_inflight, base_wallet_inflight) = {
-            let view = inventory.read().await;
-            (
-                view.usdc_available(Venue::MarketMaking),
-                view.usdc_available(Venue::Hedging),
-                view.inflight_cash_at(InFlightCashLocation::EthereumWallet),
-                view.inflight_cash_at(InFlightCashLocation::BaseWallet),
-            )
-        };
-
+        let snapshot = UsdcLocationsSnapshot::read(&inventory).await;
         assert_eq!(
-            mm_available, None,
+            snapshot.mm_available, None,
             "BaseWalletUsdc must not touch tracked venue inventory slots",
         );
-        assert_eq!(hedging_available, None);
+        assert_eq!(snapshot.hedging_available, None);
         assert_eq!(
-            base_wallet_inflight,
+            snapshot.base_wallet_inflight,
             Some(balance),
             "BaseWalletUsdc must populate the BaseWallet inflight cash slot",
         );
         assert_eq!(
-            ethereum_inflight, None,
+            snapshot.ethereum_inflight, None,
             "Ethereum inflight cash must remain untouched",
         );
     }
 
     #[tokio::test]
-    async fn apply_wallet_equity_events_remain_noops_on_view() {
+    async fn apply_base_wallet_unwrapped_equity_populates_inflight_equity_only() {
         let (projection, inventory) = make_projection();
 
-        let mut balances = std::collections::BTreeMap::new();
+        let mut balances = BTreeMap::new();
         balances.insert(symbol("AAPL"), shares(10));
-
-        let inflight_cash_before = inventory.read().await.inflight_cash_snapshot();
 
         projection
             .apply(&InventorySnapshotEvent::BaseWalletUnwrappedEquity {
-                balances: balances.clone(),
+                balances,
                 fetched_at: Utc::now(),
             })
             .await
             .unwrap();
+
+        let snapshot = EquityLocationsSnapshot::read(&inventory, &symbol("AAPL")).await;
+        assert_eq!(
+            snapshot.mm_available, None,
+            "BaseWalletUnwrappedEquity must not touch tracked venue inventory slots",
+        );
+        assert_eq!(snapshot.hedging_available, None);
+        assert_eq!(
+            snapshot.unwrapped_inflight,
+            Some(shares(10)),
+            "BaseWalletUnwrappedEquity must populate the BaseWalletUnwrapped slot",
+        );
+        assert_eq!(
+            snapshot.wrapped_inflight, None,
+            "BaseWalletWrapped slot must remain untouched",
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_base_wallet_wrapped_equity_populates_inflight_equity_only() {
+        let (projection, inventory) = make_projection();
+
+        let mut balances = BTreeMap::new();
+        balances.insert(symbol("AAPL"), shares(7));
 
         projection
             .apply(&InventorySnapshotEvent::BaseWalletWrappedEquity {
@@ -276,22 +324,20 @@ mod tests {
             .await
             .unwrap();
 
-        let (mm_available, hedging_available, inflight_cash_after) = {
-            let view = inventory.read().await;
-            (
-                view.equity_available(&symbol("AAPL"), Venue::MarketMaking),
-                view.equity_available(&symbol("AAPL"), Venue::Hedging),
-                view.inflight_cash_snapshot(),
-            )
-        };
+        let snapshot = EquityLocationsSnapshot::read(&inventory, &symbol("AAPL")).await;
         assert_eq!(
-            mm_available, None,
-            "BaseWalletUnwrappedEquity / BaseWalletWrappedEquity stay no-ops on venue equity",
+            snapshot.mm_available, None,
+            "BaseWalletWrappedEquity must not touch tracked venue inventory slots",
         );
-        assert_eq!(hedging_available, None);
+        assert_eq!(snapshot.hedging_available, None);
         assert_eq!(
-            inflight_cash_after, inflight_cash_before,
-            "wallet equity events must not mutate inflight_cash either",
+            snapshot.wrapped_inflight,
+            Some(shares(7)),
+            "BaseWalletWrappedEquity must populate the BaseWalletWrapped slot",
+        );
+        assert_eq!(
+            snapshot.unwrapped_inflight, None,
+            "BaseWalletUnwrapped slot must remain untouched",
         );
     }
 

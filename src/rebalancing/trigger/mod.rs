@@ -1031,11 +1031,9 @@ impl RebalancingTrigger {
             OffchainUsd { .. }
             | OffchainMarginSafeBuyingPower { .. }
             | EthereumUsdc { .. }
-            | BaseWalletUsdc { .. } => inventory.clone().apply_snapshot_event(&event, now),
-
-            BaseWalletUnwrappedEquity { .. } | BaseWalletWrappedEquity { .. } => {
-                Ok(inventory.clone())
-            }
+            | BaseWalletUsdc { .. }
+            | BaseWalletUnwrappedEquity { .. }
+            | BaseWalletWrappedEquity { .. } => inventory.clone().apply_snapshot_event(&event, now),
 
             InflightEquity { .. } => {
                 if let Some((mints, redemptions)) = &filtered_inflight {
@@ -1157,14 +1155,12 @@ impl RebalancingTrigger {
             OffchainUsd { .. }
             | OffchainMarginSafeBuyingPower { .. }
             | EthereumUsdc { .. }
-            | BaseWalletUsdc { .. } => {
+            | BaseWalletUsdc { .. }
+            | BaseWalletUnwrappedEquity { .. }
+            | BaseWalletWrappedEquity { .. } => {
                 inventory
                     .clone()
                     .force_apply_snapshot_event(&event, now, recovery_reason)
-            }
-
-            BaseWalletUnwrappedEquity { .. } | BaseWalletWrappedEquity { .. } => {
-                Ok(inventory.clone())
             }
 
             // Recovery for inflight snapshots: forward the original fetched_at
