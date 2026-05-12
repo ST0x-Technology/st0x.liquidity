@@ -12,6 +12,7 @@
       type = "git";
       url = "https://github.com/rainlanguage/rain.math.float";
       rev = "123dfa59f9d1c0b84333fb5b3aa7345de4a23790";
+      allRefs = true;
       submodules = true;
       flake = false;
     };
@@ -20,6 +21,7 @@
       type = "git";
       url = "https://github.com/rainlanguage/rain.orderbook";
       rev = "f7bf51ab3db0bac4f8551b91000c69cc5ba0db71";
+      allRefs = true;
       submodules = true;
       flake = false;
     };
@@ -177,15 +179,32 @@
               st0x-dto = st0xRust.dto;
             };
 
-            ci = rainix.mkTask.${system} {
+            ci = pkgs.writeShellApplication {
               name = "ci";
-              body = ''
+              text = ''
                 set -euxo pipefail
-                cargo check --workspace
-                cargo check --workspace --all-features
-                cargo nextest run --workspace --all-features
-                cargo clippy --workspace --all-targets --all-features
-                cargo fmt -- --check
+
+                # Backend: cargo check, test, clippy, fmt
+                nix develop .#ci-backend -c bash -c '
+                  set -euxo pipefail
+                  cargo check --workspace
+                  cargo check --workspace --all-features
+                  cargo nextest run --workspace --all-features
+                  cargo clippy --workspace --all-targets --all-features
+                  cargo fmt -- --check
+                '
+
+                # Dashboard: bun.nix freshness, DTO generation, lint, svelte-check
+                nix run .#genBunNix
+                nix fmt -- dashboard/bun.nix
+                nix run .#st0x-dto -- dashboard/src/lib/api
+                nix develop .#ci-dashboard -c bash -c '
+                  set -euxo pipefail
+                  cd dashboard
+                  bun install --frozen-lockfile
+                  bun run lint
+                  bun run check
+                '
               '';
             };
 
@@ -311,8 +330,12 @@
               body = ''
                 set -euo pipefail
                 ${infraPkgs.parseIdentity}
+                hash_before=$(sha256sum "$1")
                 ragenix --rules ./secret/secrets.nix -i "$identity" -e "$@"
-                exec ${rekeySecrets}
+                hash_after=$(sha256sum "$1")
+                if [ "$hash_before" != "$hash_after" ]; then
+                  ${rekeySecrets}
+                fi
               '';
             };
 

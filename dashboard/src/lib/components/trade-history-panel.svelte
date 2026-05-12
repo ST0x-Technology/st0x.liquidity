@@ -522,8 +522,8 @@
                         {:else if key === 'executor_order_id' && typeof value === 'object' && value !== null}
                           <span class="text-muted-foreground">{JSON.stringify(value)}</span>
                         {:else if key === 'pyth_price' && typeof value === 'object' && value !== null}
-                          {@const pyth = value as Record<string, unknown>}
-                          <span>${formatDecimal(String(pyth['value']), 3)} (conf: {pyth['conf']}, expo: {pyth['expo']})</span>
+                          {@const pyth = value as Record<string, string | number>}
+                          <span>${formatDecimal(String(pyth['value'] ?? '0'), 3)} (conf: {String(pyth['conf'] ?? '')}, expo: {String(pyth['expo'] ?? '')})</span>
                         {:else if typeof value === 'object' && value !== null}
                           {JSON.stringify(value)}
                         {:else if isNumeric(value)}

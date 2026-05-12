@@ -72,7 +72,7 @@
   const offset = reactive(0)
   const total = reactive(0)
   const hasMore = reactive(false)
-  const DEFAULT_LEVELS = ['ERROR', 'WARN', 'INFO', 'DEBUG'] as const
+  const DEFAULT_LEVELS = ['ERROR', 'WARN', 'INFO'] as const
   const OUR_CRATES = ALL_CRATES.filter((crt) => crt.startsWith('st0x_'))
 
   const selectedLevels = reactive<Set<string>>(new Set(DEFAULT_LEVELS))
