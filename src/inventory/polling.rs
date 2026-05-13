@@ -8,6 +8,7 @@
 
 use alloy::primitives::Address;
 use alloy::providers::RootProvider;
+use async_trait::async_trait;
 use futures_util::future::try_join_all;
 use rain_math_float::FloatError;
 use std::collections::{BTreeMap, HashMap};
@@ -569,6 +570,34 @@ fn compute_available_cash(
     let available_usd_cents = available.inner().to_cents()?;
 
     Ok((gross_usd_cents, available_usd_cents))
+}
+
+/// Erases the `Chain` and `Exe` parameters of [`InventoryPollingService`]
+/// so the apalis [`Job`] context isn't generic over them.
+#[async_trait]
+pub(crate) trait Poller: Send + Sync {
+    async fn poll(&self) -> Result<(), PollerError>;
+}
+
+/// Boxed source error from a [`Poller`] implementation. Polling errors are
+/// always logged and swallowed by the supervised inventory monitor; this
+/// wrapper only erases the underlying executor-specific error type.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub(crate) struct PollerError(pub(crate) Box<dyn std::error::Error + Send + Sync>);
+
+#[async_trait]
+impl<Chain, Exe> Poller for InventoryPollingService<Chain, Exe>
+where
+    Chain: Evm + Send + Sync + 'static,
+    Exe: Executor + Send + Sync + 'static,
+    Exe::Error: std::error::Error + Send + Sync + 'static,
+{
+    async fn poll(&self) -> Result<(), PollerError> {
+        Self::poll_and_record(self)
+            .await
+            .map_err(|error| PollerError(Box::new(error)))
+    }
 }
 
 #[cfg(test)]

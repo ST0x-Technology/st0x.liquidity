@@ -423,7 +423,7 @@ pub async fn count_events(pool: &SqlitePool, aggregate_type: &str) -> anyhow::Re
     Ok(row.0)
 }
 
-/// Counts total apalis jobs enqueued.
+/// Counts total apalis jobs enqueued in the trade-processing pipeline.
 pub async fn count_jobs(pool: &SqlitePool) -> anyhow::Result<i64> {
     let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM Jobs")
         .fetch_one(pool)
@@ -432,7 +432,8 @@ pub async fn count_jobs(pool: &SqlitePool) -> anyhow::Result<i64> {
     Ok(row.0)
 }
 
-/// Counts apalis jobs that have been processed (status = 'Done').
+/// Counts trade-processing apalis jobs that have been processed
+/// (status = 'Done').
 pub async fn count_done_jobs(pool: &SqlitePool) -> anyhow::Result<i64> {
     let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM Jobs WHERE status = 'Done'")
         .fetch_one(pool)

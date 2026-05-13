@@ -66,6 +66,14 @@ permission to do the obvious corrective work.
 - **Do not run commands to "show" output to the user.** The CLI truncates
   output. If you need the user to review something, explicitly ask them to look
   at it. Do not run `git diff` expecting the user to see output.
+- **Never say "standing by" or wait for permission once work has been
+  authorized.** When the user has given you a task, do it -- do not ask "want me
+  to proceed?" or pause for a go-ahead between subtasks. If multiple related
+  review threads or requests have been queued, work through them in sequence
+  without asking between each one. Asking for confirmation after the user has
+  already told you what to do wastes their time and signals you weren't
+  listening. Only stop and ask when you are actually blocked on a decision the
+  user must make, not as a polite checkpoint.
 
 ## Planning Hierarchy
 

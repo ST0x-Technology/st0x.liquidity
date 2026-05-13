@@ -20,7 +20,7 @@ use task_supervisor::SupervisorHandle;
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 
 use st0x_dto::Statement;
 use st0x_event_sorcery::{
@@ -40,8 +40,7 @@ use crate::equity_redemption::{
     EquityRedemption, interrupted_redemption_ids, symbols_with_stuck_redemptions,
 };
 use crate::inventory::{
-    BroadcastingInventory, Inventory, InventoryPollingService, InventoryProjection,
-    InventorySnapshot, Venue,
+    BroadcastingInventory, Inventory, InventoryProjection, InventorySnapshot, Venue,
 };
 use crate::offchain::order::{
     ExecutorOrderPlacer, HandleOrderRejectionJobQueue, OffchainOrder, OffchainOrderCommand,
@@ -118,9 +117,6 @@ pub(crate) struct Conductor {
     executor_maintenance: Option<JoinHandle<()>>,
     /// Periodic rebalancing loop. Absent when rebalancing is not configured.
     rebalancer: Option<JoinHandle<()>>,
-    /// Polls wallet balances and onchain state on a timer. Absent when
-    /// rebalancing (and therefore wallet context) is not configured.
-    inventory_poller: Option<JoinHandle<()>>,
     /// Periodically removes terminal rows from the persistent job queue.
     job_cleanup: JoinHandle<()>,
 }
@@ -277,7 +273,6 @@ impl Conductor {
             execution_threshold: ctx.execution_threshold,
             frameworks,
             pool,
-            poll_notify: Arc::new(tokio::sync::Notify::new()),
             wallet_polling,
             tokenizer,
             #[cfg(any(test, feature = "test-support"))]
@@ -324,9 +319,6 @@ impl Conductor {
         self.monitor.abort();
 
         if let Some(ref handle) = self.rebalancer {
-            handle.abort();
-        }
-        if let Some(ref handle) = self.inventory_poller {
             handle.abort();
         }
         if let Some(ref handle) = self.executor_maintenance {
@@ -984,37 +976,6 @@ async fn build_position_cqrs(
     Ok(StoreBuilder::<Position>::new(pool.clone())
         .build(())
         .await?)
-}
-
-fn spawn_inventory_poller<Chain, Exe>(
-    service: InventoryPollingService<Chain, Exe>,
-    poll_interval: std::time::Duration,
-    poll_notify: Arc<tokio::sync::Notify>,
-) -> JoinHandle<()>
-where
-    Chain: st0x_evm::Evm,
-    Exe: Executor + Clone + Send + 'static,
-{
-    info!("Starting inventory poller");
-
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(poll_interval);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {}
-                () = poll_notify.notified() => {
-                    debug!("Inventory poll triggered by notification");
-                }
-            }
-
-            trace!("Running inventory poll");
-            if let Err(error) = service.poll_and_record().await {
-                warn!(%error, "Inventory polling failed");
-            }
-        }
-    })
 }
 
 /// Discovers vaults from a trade and emits VaultRegistryCommands.
@@ -1851,7 +1812,6 @@ mod tests {
             monitor,
             executor_maintenance: None,
             rebalancer: None,
-            inventory_poller: None,
             job_cleanup,
         }
     }
