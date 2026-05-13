@@ -1055,6 +1055,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "apalis-cron"
+version = "1.0.0-rc.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "623a80caf0a084acf22cc3f43e49b984214e1c00b79779b16683ab55d46fa764"
+dependencies = [
+ "apalis-core",
+ "chrono",
+ "futures-util",
+ "ulid",
+]
+
+[[package]]
 name = "apalis-sql"
 version = "1.0.0-rc.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6920,6 +6932,7 @@ dependencies = [
  "apalis",
  "apalis-codec",
  "apalis-core",
+ "apalis-cron",
  "apalis-sqlite",
  "approx",
  "async-trait",
@@ -7219,6 +7232,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]
