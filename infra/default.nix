@@ -196,6 +196,7 @@ let
         text = ''
           ${resolveHost}
           trap _cleanup_identity EXIT
+          # shellcheck disable=SC2029
           exec ssh ''${identity:+-i "$identity"} "root@$host_ip" "$@"
         '';
       };
@@ -244,6 +245,65 @@ let
           echo "Restarting st0x-hedge on ${env}..."
           ssh ''${identity:+-i "$identity"} "root@$host_ip" "mkdir -p /run/st0x && touch /run/st0x/st0x-hedge.ready && systemctl restart st0x-hedge"
           ssh ''${identity:+-i "$identity"} "root@$host_ip" systemctl is-active st0x-hedge
+        '';
+      };
+
+      "${env}DbReset" = pkgs.writeShellApplication {
+        name = "${env}-db-reset";
+        runtimeInputs = sshInputs ++ [ pkgs.curl pkgs.python3 ];
+        text = ''
+          ${resolveHost}
+
+          if [ "''${1:-}" != "--yes" ]; then
+            echo "Refusing destructive reset without --yes" >&2
+            echo "Usage: ${env}-db-reset --yes" >&2
+            exit 1
+          fi
+          shift
+
+          ssh_remote() {
+            # shellcheck disable=SC2029
+            ssh ''${identity:+-i "$identity"} "root@$host_ip" "$@"
+          }
+
+          _restart_service() {
+            echo "Ensuring st0x-hedge is restarted on ${env}..." >&2
+            ssh_remote "mkdir -p /run/st0x && touch /run/st0x/st0x-hedge.ready && systemctl start st0x-hedge" || true
+            _cleanup_identity
+          }
+          trap _restart_service EXIT
+
+          config="/run/st0x/st0x-hedge.config"
+          db_path="/mnt/data/st0x-hedge.db"
+          backup_dir="/mnt/data/backups/$(date -u +%Y-%m-%d_%H%M%S)"
+
+          echo "Fetching latest Base block..."
+          latest_block=$(curl -sf https://mainnet.base.org \
+            -X POST -H "Content-Type: application/json" \
+            -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
+            | python3 -c "import sys,json; print(int(json.load(sys.stdin)['result'],16))")
+          target_block=$((latest_block - 2))
+          echo "Latest block: $latest_block, will backfill from: $target_block"
+
+          echo "Stopping st0x-hedge on ${env}..."
+          ssh_remote "systemctl stop st0x-hedge && rm -f /run/st0x/st0x-hedge.ready"
+
+          echo "Backing up database to $backup_dir..."
+          ssh_remote "mkdir -p $backup_dir && cp $db_path $db_path-wal $db_path-shm $db_path-journal $backup_dir/ 2>/dev/null; echo 'Backup done'"
+
+          echo "Deleting live database..."
+          ssh_remote "rm -f $db_path $db_path-wal $db_path-shm $db_path-journal"
+
+          echo "Updating deployment_block to $target_block..."
+          ssh_remote "sed -i 's/^deployment_block = .*/deployment_block = $target_block/' $config"
+          ssh_remote "grep -q '^deployment_block = $target_block$' $config"
+          echo "Verified deployment_block=$target_block"
+
+          echo "Starting st0x-hedge on ${env}..."
+          ssh_remote "mkdir -p /run/st0x && touch /run/st0x/st0x-hedge.ready && systemctl start st0x-hedge"
+          ssh_remote systemctl is-active st0x-hedge
+
+          echo "Database reset complete. Backup at: $backup_dir"
         '';
       };
 
