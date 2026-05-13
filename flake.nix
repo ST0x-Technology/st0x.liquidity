@@ -455,6 +455,7 @@
                     packages.ci
                     packages.secret
                     packages.rekey
+                    rainix.pkgs.${system}.foundry-bin
                   ]
                   ++ builtins.attrValues infraPkgs.packages
                   ++ builtins.attrValues deployScripts
