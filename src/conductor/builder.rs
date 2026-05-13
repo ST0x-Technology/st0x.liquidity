@@ -206,7 +206,15 @@ where
         context.pool,
     );
 
+    // Fail-fast: exit if any supervised task dies, relying on systemd restart for recovery.
+    // In test builds, use aggressive timeouts so a flaky WebSocket doesn't
+    // stall e2e tests for ~13 minutes of exponential backoff.
+    let is_test = cfg!(any(test, feature = "test-support"));
     let supervisor = SupervisorBuilder::default()
+        .with_max_restart_attempts(if is_test { 2 } else { 10 })
+        .with_max_backoff_exponent(if is_test { 2 } else { 8 })
+        .with_base_restart_delay(std::time::Duration::from_secs(1))
+        .with_dead_tasks_threshold(Some(0.0))
         .with_task("order-fill-monitor", order_fill_monitor)
         .with_task("position-monitor", position_monitor)
         .with_task("inventory-monitor", inventory_monitor)

@@ -1299,37 +1299,65 @@ async fn assert_usdc_rebalancing_onchain_state<P: Provider>(
     Ok(())
 }
 
-/// Asserts that at least one `EthereumUsdc` inventory snapshot was emitted.
+/// Asserts that the `InventorySnapshot` CQRS snapshot contains a non-null
+/// `ethereum_usdc` field, proving that Ethereum wallet polling ran at least
+/// once.
+///
+/// Reads from the snapshot table, not the events table, because
+/// `InventorySnapshot` uses `CompactAfterSnapshot` with `SNAPSHOT_SIZE = 1`
+/// -- the cleanup job can compact events before this assertion runs.
 pub(crate) async fn assert_ethereum_usdc_event_exists(
     db_path: &std::path::Path,
 ) -> anyhow::Result<()> {
     let pool = connect_db(db_path).await?;
-    let events = fetch_events_by_type(&pool, "InventorySnapshot").await?;
 
-    let has_ethereum_usdc = events
-        .iter()
-        .any(|event| event.event_type == "InventorySnapshotEvent::EthereumUsdc");
+    let payload_str: String = sqlx::query_scalar(
+        "SELECT payload FROM snapshots WHERE aggregate_type = 'InventorySnapshot' LIMIT 1",
+    )
+    .fetch_optional(&pool)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("No InventorySnapshot snapshot found"))?;
+
+    let payload: serde_json::Value = serde_json::from_str(&payload_str)?;
+    let ethereum_usdc = payload
+        .pointer("/Live/ethereum_usdc")
+        .ok_or_else(|| anyhow::anyhow!("Snapshot missing ethereum_usdc field: {payload}"))?;
+
     assert!(
-        has_ethereum_usdc,
-        "Expected EthereumUsdc snapshot from Ethereum wallet polling"
+        !ethereum_usdc.is_null(),
+        "Expected ethereum_usdc to be populated from Ethereum wallet polling, got null"
     );
 
     pool.close().await;
     Ok(())
 }
 
+/// Asserts that the `InventorySnapshot` CQRS snapshot contains a non-null
+/// `base_wallet_usdc` field, proving that Base wallet polling ran at least
+/// once.
+///
+/// Reads from the snapshot table for the same compaction reason as
+/// [`assert_ethereum_usdc_event_exists`].
 pub(crate) async fn assert_base_wallet_usdc_event_exists(
     db_path: &std::path::Path,
 ) -> anyhow::Result<()> {
     let pool = connect_db(db_path).await?;
-    let events = fetch_events_by_type(&pool, "InventorySnapshot").await?;
 
-    let has_base_wallet_usdc = events
-        .iter()
-        .any(|event| event.event_type == "InventorySnapshotEvent::BaseWalletUsdc");
+    let payload_str: String = sqlx::query_scalar(
+        "SELECT payload FROM snapshots WHERE aggregate_type = 'InventorySnapshot' LIMIT 1",
+    )
+    .fetch_optional(&pool)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("No InventorySnapshot snapshot found"))?;
+
+    let payload: serde_json::Value = serde_json::from_str(&payload_str)?;
+    let base_wallet_usdc = payload
+        .pointer("/Live/base_wallet_usdc")
+        .ok_or_else(|| anyhow::anyhow!("Snapshot missing base_wallet_usdc field: {payload}"))?;
+
     assert!(
-        has_base_wallet_usdc,
-        "Expected BaseWalletUsdc snapshot from Base wallet polling"
+        !base_wallet_usdc.is_null(),
+        "Expected base_wallet_usdc to be populated from Base wallet polling, got null"
     );
 
     pool.close().await;

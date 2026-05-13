@@ -395,10 +395,16 @@
             DATABASE_URL = "sqlite:dev.db";
             FOUNDRY_DISABLE_NIGHTLY_WARNING = true;
 
+            # sccache: caches compiled crates by content hash so parallel
+            # worktrees sharing the same dependency graph get cache hits
+            # instead of redundant rebuilds.
+            RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
+
             buildInputs = with pkgs;
               [
                 bacon
                 bun
+                sccache
                 sqlx-cli
                 cargo-expand
                 cargo-nextest
