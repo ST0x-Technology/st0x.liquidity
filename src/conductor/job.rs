@@ -126,7 +126,8 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
     /// Schedules a task to run after `delay` from now. Used by self-rescheduling
     /// jobs (e.g. status pollers waiting for a broker to fill an order) to
     /// avoid burning the retry budget on a successful poll that simply hasn't
-    /// observed the terminal state yet.
+    /// observed the terminal state yet. Apalis honours the timestamp via the
+    /// `Pending` row's `run_at` column.
     pub(crate) async fn push_with_delay(
         &mut self,
         task: Task,

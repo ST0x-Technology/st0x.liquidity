@@ -14,13 +14,14 @@ use st0x_evm::ReadOnlyEvm;
 use st0x_execution::Executor;
 use st0x_finance::{HasZero, Positive, Usd};
 
+use super::Conductor;
 use super::exit::MonitorTaskError;
 #[cfg(any(test, feature = "test-support"))]
 use super::job::FailureInjector;
 use super::job::{FAIL_STOP_RECOVERY_TIMEOUT, build_supervised_worker};
+use super::monitor::inventory::InventoryMonitor;
 use super::monitor::order_fills::OrderFillMonitor;
 use super::monitor::positions::PositionMonitor;
-use super::{Conductor, spawn_inventory_poller};
 use crate::config::Ctx;
 use crate::inventory::{
     InventoryPollingService, InventorySnapshot, InventorySnapshotId, WalletPollingCtx,
@@ -66,7 +67,6 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
     pub(crate) execution_threshold: ExecutionThreshold,
     pub(crate) frameworks: CqrsFrameworks,
     pub(crate) pool: SqlitePool,
-    pub(crate) poll_notify: Arc<tokio::sync::Notify>,
     pub(crate) wallet_polling: Option<WalletPollingCtx>,
     pub(crate) tokenizer: Option<Arc<dyn Tokenizer>>,
     #[cfg(any(test, feature = "test-support"))]
@@ -120,7 +120,7 @@ where
         owner: order_owner,
     };
 
-    let polling_service = InventoryPollingService::new(
+    let polling_service = Arc::new(InventoryPollingService::new(
         raindex_service,
         context.executor.clone(),
         context.frameworks.vault_registry.clone(),
@@ -129,14 +129,12 @@ where
         context.wallet_polling,
         context.tokenizer,
         reserved_cash,
-    );
-
-    let inventory_poller = Some(spawn_inventory_poller(
-        polling_service,
-        std::time::Duration::from_secs(context.ctx.inventory_poll_interval),
-        context.poll_notify.clone(),
     ));
-    log_optional_task_status("inventory poller", inventory_poller.is_some());
+
+    let inventory_monitor = InventoryMonitor {
+        poller: polling_service,
+        interval: std::time::Duration::from_secs(context.ctx.inventory_poll_interval),
+    };
 
     let poll_interval = context.ctx.order_polling_interval();
     info!("Constructing order-job context with poll interval: {poll_interval:?}");
@@ -211,6 +209,7 @@ where
     let supervisor = SupervisorBuilder::default()
         .with_task("order-fill-monitor", order_fill_monitor)
         .with_task("position-monitor", position_monitor)
+        .with_task("inventory-monitor", inventory_monitor)
         .build()
         .run();
 
@@ -235,7 +234,6 @@ where
         monitor,
         executor_maintenance,
         rebalancer,
-        inventory_poller,
         job_cleanup,
     }
 }
