@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx, CctpError};
@@ -121,7 +122,7 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
         frameworks: RebalancingCqrsFrameworks,
         equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
         usdc_in_progress: Arc<AtomicBool>,
-    ) -> JoinHandle<()> {
+    ) -> (JoinHandle<()>, CancellationToken) {
         let equity = Arc::new(CrossVenueEquityTransfer::new(
             self.raindex.clone(),
             self.tokenizer,
@@ -141,6 +142,8 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
             usdc_vault_id,
         ));
 
+        let shutdown_token = CancellationToken::new();
+
         let rebalancer = Rebalancer::new(
             Arc::clone(&equity) as _,
             equity as _,
@@ -149,12 +152,15 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
             operation_receiver,
             equity_in_progress,
             usdc_in_progress,
+            shutdown_token.clone(),
         );
 
         info!(target: "rebalance", "Rebalancing infrastructure initialized");
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             rebalancer.run().await;
-        })
+        });
+
+        (handle, shutdown_token)
     }
 }
 
@@ -416,7 +422,7 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(10);
 
-        let handle = services.spawn(
+        let (handle, _shutdown_token) = services.spawn(
             Address::random(),
             RaindexVaultId(B256::ZERO),
             rx,

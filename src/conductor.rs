@@ -18,8 +18,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use task_supervisor::SupervisorHandle;
 use tokio::sync::{Mutex, broadcast, mpsc};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
 use tokio::time::MissedTickBehavior;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use st0x_dto::Statement;
@@ -117,8 +118,17 @@ pub(crate) struct Conductor {
     executor_maintenance: Option<JoinHandle<()>>,
     /// Periodic rebalancing loop. Absent when rebalancing is not configured.
     rebalancer: Option<JoinHandle<()>>,
+    /// Cancelled during graceful shutdown to stop the rebalancer from
+    /// accepting new operations. The in-flight operation completes before
+    /// the task exits.
+    rebalancer_shutdown_token: CancellationToken,
     /// Periodically removes terminal rows from the persistent job queue.
     job_cleanup: JoinHandle<()>,
+    /// Cancelled by the outer shutdown handler to trigger graceful drain.
+    shutdown_token: CancellationToken,
+    /// Independent token for apalis — cancelled explicitly in Phase 2 after
+    /// producers are stopped.
+    apalis_shutdown_token: CancellationToken,
 }
 
 impl Conductor {
@@ -128,6 +138,7 @@ impl Conductor {
         pool: SqlitePool,
         event_sender: broadcast::Sender<Statement>,
         inventory: Arc<BroadcastingInventory>,
+        shutdown_token: CancellationToken,
     ) -> anyhow::Result<()>
     where
         E: Executor + Clone + Send + 'static,
@@ -171,6 +182,7 @@ impl Conductor {
             position_projection,
             snapshot,
             rebalancer,
+            rebalancer_shutdown_token,
             wallet_polling,
             tokenizer,
             service: rebalancing_service,
@@ -241,6 +253,7 @@ impl Conductor {
             pool,
             wallet_polling,
             tokenizer,
+            shutdown_token: shutdown_token.clone(),
             #[cfg(any(test, feature = "test-support"))]
             failure_injector: ctx.failure_injector.clone(),
         };
@@ -258,33 +271,98 @@ impl Conductor {
             .maybe_rebalancing_service(rebalancing_service)
             .maybe_executor_maintenance(executor_maintenance)
             .maybe_rebalancer(rebalancer)
+            .rebalancer_shutdown_token(rebalancer_shutdown_token)
             .job_cleanup(job_cleanup)
             .call();
 
         info!("Conductor is running");
         let result = conductor.wait_for_completion().await;
-        conductor.abort_all();
+        if result.is_err() {
+            conductor.abort_all();
+        }
         result
     }
 
     pub(crate) async fn wait_for_completion(&mut self) -> anyhow::Result<()> {
         let exit = tokio::select! {
+            biased;
+            () = self.shutdown_token.cancelled() => ConductorExit::GracefulShutdown,
             result = self.supervisor.wait() => ConductorExit::Supervisor(result),
             result = &mut self.monitor => ConductorExit::Monitor(result),
             result = &mut self.job_cleanup => ConductorExit::JobCleanup(result),
         };
 
-        exit.handle()?;
-        Ok(())
+        match exit {
+            ConductorExit::GracefulShutdown => self.drain_gracefully().await,
+            other => {
+                other.handle()?;
+                Ok(())
+            }
+        }
     }
 
+    /// Two-phase graceful drain: stop producers, then wait for consumers.
+    async fn drain_gracefully(&mut self) -> anyhow::Result<()> {
+        // Phase 1: stop supervised tasks (OrderFillMonitor, PositionMonitor)
+        // so they stop enqueuing new jobs.
+        info!(target: "shutdown", "Phase 1: stopping producers (supervisor)");
+        if let Err(error) = self.supervisor.shutdown() {
+            error!(target: "shutdown", %error, "Failed to shutdown supervisor");
+        }
+
+        // Wait for the supervisor to fully exit so producers are actually
+        // stopped before Phase 2 begins draining consumers.
+        if let Err(error) = self.supervisor.wait().await {
+            warn!(target: "shutdown", %error, "Supervisor exited with error during drain");
+        }
+
+        // Signal the rebalancer to stop accepting new operations, then
+        // wait for the in-flight operation (e.g. a vault deposit) to
+        // finish. This ensures onchain TXs complete and their CQRS events
+        // are persisted before shutdown.
+        self.rebalancer_shutdown_token.cancel();
+
+        if let Some(handle) = self.rebalancer.take() {
+            info!(target: "shutdown", "Draining rebalancer (waiting for in-flight operation)");
+
+            let abort_handle = handle.abort_handle();
+
+            match tokio::time::timeout(std::time::Duration::from_secs(60), handle).await {
+                Ok(Ok(())) => {
+                    info!(target: "shutdown", "Rebalancer drained cleanly");
+                }
+                Ok(Err(join_error)) => {
+                    warn!(target: "shutdown", %join_error, "Rebalancer task panicked during drain");
+                }
+                Err(_timeout) => {
+                    warn!(target: "shutdown", "Rebalancer drain timed out after 60s -- aborting");
+                    abort_handle.abort();
+                }
+            }
+        }
+
+        // Abort remaining non-critical background tasks.
+        self.abort_background_tasks();
+
+        // Phase 2: now that producers are stopped, signal apalis to drain
+        // in-flight jobs. The apalis token is independent of the outer
+        // shutdown token -- we cancel it explicitly after producers stop.
+        info!(target: "shutdown", "Phase 2: draining in-flight jobs");
+        self.apalis_shutdown_token.cancel();
+        check_monitor_drain_result((&mut self.monitor).await)
+    }
+
+    /// Abort all conductor tasks (force shutdown fallback).
     pub(crate) fn abort_all(&self) {
-        info!("Aborting all conductor tasks");
+        info!(target: "shutdown", "Aborting all conductor tasks");
         if let Err(error) = self.supervisor.shutdown() {
             error!(%error, "Failed to shutdown supervisor");
         }
         self.monitor.abort();
+        self.abort_background_tasks();
+    }
 
+    fn abort_background_tasks(&self) {
         if let Some(ref handle) = self.rebalancer {
             handle.abort();
         }
@@ -330,6 +408,31 @@ pub(crate) struct AccumulatedPositionExecutionCtx<'a> {
     pub(crate) counter_trade_submission_lock: &'a Mutex<()>,
     pub(crate) threshold: &'a ExecutionThreshold,
     pub(crate) assets: &'a AssetsConfig,
+}
+
+fn check_monitor_drain_result(
+    join_result: Result<Result<(), MonitorTaskError>, JoinError>,
+) -> anyhow::Result<()> {
+    let monitor_result = match join_result {
+        Ok(inner) => inner,
+        Err(join_error) => {
+            error!(%join_error, "Monitor task panicked during drain");
+            return Err(
+                anyhow::Error::from(join_error).context("Monitor task panicked during drain")
+            );
+        }
+    };
+
+    match monitor_result {
+        Ok(()) => {
+            info!("All jobs drained, shutdown complete");
+            Ok(())
+        }
+        Err(error) => {
+            error!(%error, "Monitor error during drain");
+            Err(error.into())
+        }
+    }
 }
 
 fn spawn_finished_job_cleanup(pool: SqlitePool, cleanup_interval: Duration) -> JoinHandle<()> {
@@ -438,6 +541,7 @@ struct RebalancingInfrastructure {
     position_projection: Arc<Projection<Position>>,
     snapshot: Arc<Store<InventorySnapshot>>,
     rebalancer: JoinHandle<()>,
+    rebalancer_shutdown_token: CancellationToken,
     tokenizer: Arc<dyn Tokenizer>,
     service: Arc<RebalancingService>,
 }
@@ -463,6 +567,7 @@ struct PositionAndRebalancing {
     position_projection: Arc<Projection<Position>>,
     snapshot: Arc<Store<InventorySnapshot>>,
     rebalancer: Option<JoinHandle<()>>,
+    rebalancer_shutdown_token: CancellationToken,
     wallet_polling: Option<crate::inventory::WalletPollingCtx>,
     tokenizer: Option<Arc<dyn Tokenizer>>,
     service: Option<Arc<RebalancingService>>,
@@ -513,6 +618,7 @@ impl PositionAndRebalancing {
                 position_projection: infra.position_projection,
                 snapshot: infra.snapshot,
                 rebalancer: Some(infra.rebalancer),
+                rebalancer_shutdown_token: infra.rebalancer_shutdown_token,
                 wallet_polling: Some(wallet_polling),
                 tokenizer: Some(infra.tokenizer),
                 service: Some(infra.service),
@@ -533,6 +639,7 @@ impl PositionAndRebalancing {
                 position_projection,
                 snapshot,
                 rebalancer: None,
+                rebalancer_shutdown_token: CancellationToken::new(),
                 wallet_polling: None,
                 tokenizer: None,
                 service: None,
@@ -749,7 +856,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             .and_then(|cash| cash.vault_ids.first().copied())
             .ok_or(CtxError::MissingCashVaultId)?;
 
-        let handle = services.spawn(
+        let (handle, rebalancer_shutdown_token) = services.spawn(
             market_maker_wallet,
             RaindexVaultId(usdc_vault_id),
             operation_receiver,
@@ -763,6 +870,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             position_projection: built.position_projection,
             snapshot: built.snapshot,
             rebalancer: handle,
+            rebalancer_shutdown_token,
             tokenizer,
             service: rebalancing_service,
         })
@@ -1852,7 +1960,10 @@ mod tests {
             monitor,
             executor_maintenance: None,
             rebalancer: None,
+            rebalancer_shutdown_token: CancellationToken::new(),
             job_cleanup,
+            shutdown_token: CancellationToken::new(),
+            apalis_shutdown_token: CancellationToken::new(),
         }
     }
 
@@ -4710,6 +4821,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn graceful_shutdown_drains_cleanly_when_token_cancelled() {
+        let supervisor = SupervisorBuilder::default().build().run();
+        let shutdown_token = CancellationToken::new();
+        let apalis_shutdown_token = CancellationToken::new();
+        let apalis_token_clone = apalis_shutdown_token.clone();
+
+        // Monitor that completes once its shutdown signal fires.
+        let monitor = tokio::spawn(async move {
+            apalis_token_clone.cancelled().await;
+            Ok::<(), MonitorTaskError>(())
+        });
+
+        let job_cleanup = tokio::spawn(pending::<()>());
+
+        let mut conductor = Conductor {
+            supervisor,
+            monitor,
+            executor_maintenance: None,
+            rebalancer: None,
+            rebalancer_shutdown_token: CancellationToken::new(),
+
+            job_cleanup,
+            shutdown_token: shutdown_token.clone(),
+            apalis_shutdown_token,
+        };
+
+        shutdown_token.cancel();
+        conductor.wait_for_completion().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_propagates_monitor_error() {
+        let supervisor = SupervisorBuilder::default().build().run();
+        let shutdown_token = CancellationToken::new();
+        let apalis_shutdown_token = CancellationToken::new();
+        let apalis_token_clone = apalis_shutdown_token.clone();
+
+        // Monitor returns an error after shutdown signal.
+        let monitor = tokio::spawn(async move {
+            apalis_token_clone.cancelled().await;
+            Err(MonitorTaskError::TerminalJobFailure)
+        });
+
+        let job_cleanup = tokio::spawn(pending::<()>());
+
+        let mut conductor = Conductor {
+            supervisor,
+            monitor,
+            executor_maintenance: None,
+            rebalancer: None,
+            rebalancer_shutdown_token: CancellationToken::new(),
+
+            job_cleanup,
+            shutdown_token: shutdown_token.clone(),
+            apalis_shutdown_token,
+        };
+
+        shutdown_token.cancel();
+        let result = conductor.wait_for_completion().await;
+        assert!(
+            result.is_err(),
+            "monitor error during drain should propagate"
+        );
+    }
+
+    #[test]
+    fn check_monitor_drain_result_ok() {
+        check_monitor_drain_result(Ok(Ok(()))).unwrap();
+    }
+
+    #[test]
+    fn check_monitor_drain_result_propagates_monitor_error() {
+        let error =
+            check_monitor_drain_result(Ok(Err(MonitorTaskError::TerminalJobFailure))).unwrap_err();
+
+        assert!(
+            error.to_string().contains("Apalis worker failed"),
+            "should propagate MonitorTaskError, got: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn dispatch_post_place_state_filled_clears_position_pending() {
         let pool = setup_test_db().await;
         let (frameworks, _projection) =
@@ -4810,5 +5003,15 @@ mod tests {
             position.pending_offchain_order_id, None,
             "Failed state must clear the position's pending offchain order id"
         );
+    }
+
+    #[tokio::test]
+    async fn check_monitor_drain_result_propagates_join_error() {
+        let handle = tokio::spawn(async { panic!("test panic") });
+        // Abort to get a JoinError::Cancelled.
+        handle.abort();
+        let join_error = handle.await.unwrap_err();
+
+        check_monitor_drain_result(Err(join_error)).unwrap_err();
     }
 }

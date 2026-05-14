@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use st0x_execution::{FractionalShares, Symbol};
@@ -38,6 +39,7 @@ pub(crate) struct Rebalancer {
     receiver: mpsc::Receiver<TriggeredOperation>,
     equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
     usdc_in_progress: Arc<AtomicBool>,
+    shutdown_token: CancellationToken,
 }
 
 impl Rebalancer {
@@ -49,6 +51,7 @@ impl Rebalancer {
         receiver: mpsc::Receiver<TriggeredOperation>,
         equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
         usdc_in_progress: Arc<AtomicBool>,
+        shutdown_token: CancellationToken,
     ) -> Self {
         Self {
             equity_to_mm,
@@ -58,19 +61,37 @@ impl Rebalancer {
             receiver,
             equity_in_progress,
             usdc_in_progress,
+            shutdown_token,
         }
     }
 
     /// Runs the rebalancer loop, receiving and executing operations.
-    /// Returns when the sender channel is closed.
+    ///
+    /// Stops accepting new operations when the shutdown token is
+    /// cancelled, but always finishes the in-flight operation before
+    /// returning. Also exits when the sender channel is closed.
     pub(crate) async fn run(mut self) {
         info!(target: "rebalance", "Rebalancer started");
 
-        while let Some(operation) = self.receiver.recv().await {
+        loop {
+            let operation = tokio::select! {
+                biased;
+                () = self.shutdown_token.cancelled() => {
+                    info!(target: "rebalance", "Rebalancer received shutdown signal");
+                    break;
+                }
+                received = self.receiver.recv() => {
+                    match received {
+                        Some(operation) => operation,
+                        None => break,
+                    }
+                }
+            };
+
             self.execute(operation).await;
         }
 
-        info!(target: "rebalance", "Rebalancer stopped (channel closed)");
+        info!(target: "rebalance", "Rebalancer stopped");
     }
 
     async fn execute(&self, operation: TriggeredOperation) {
@@ -180,6 +201,7 @@ mod tests {
             receiver,
             Arc::new(std::sync::RwLock::new(HashSet::new())),
             Arc::new(AtomicBool::new(false)),
+            CancellationToken::new(),
         );
 
         for operation in operations {

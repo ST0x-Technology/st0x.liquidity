@@ -583,6 +583,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
         receiver,
         Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        tokio_util::sync::CancellationToken::new(),
     );
 
     // One more onchain sell triggers the CQRS -> trigger -> Mint flow now that
@@ -798,6 +799,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
         receiver,
         Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        tokio_util::sync::CancellationToken::new(),
     );
 
     position_cqrs
@@ -1017,6 +1019,7 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
         receiver,
         Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        tokio_util::sync::CancellationToken::new(),
     );
 
     trigger.check_and_trigger_usdc().await;
@@ -1097,6 +1100,7 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
         receiver,
         Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        tokio_util::sync::CancellationToken::new(),
     );
 
     trigger.check_and_trigger_usdc().await;
@@ -1265,6 +1269,7 @@ async fn cash_reserve_shifts_offchain_balance_triggering_base_to_alpaca() {
         receiver,
         Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        tokio_util::sync::CancellationToken::new(),
     );
 
     // Drop all Arc clones holding the trigger so the mpsc channel closes
@@ -1452,6 +1457,7 @@ async fn mint_api_failure_produces_rejected_event() {
         receiver,
         Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        tokio_util::sync::CancellationToken::new(),
     );
 
     // One more sell triggers the CQRS -> trigger -> Mint flow
