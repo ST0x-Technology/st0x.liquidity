@@ -5,7 +5,9 @@ use async_trait::async_trait;
 use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Display};
+use std::sync::LazyLock;
 use tokio::task::JoinHandle;
+use tracing::{debug, info};
 
 pub(crate) use st0x_float_serde::{
     deserialize_float_from_number_or_string, deserialize_option_float_from_number_or_string,
@@ -452,6 +454,69 @@ pub(crate) fn buying_power_counter_trade_preflight(
     }
 }
 
+/// Minimum shares threshold for partial hedges. Below this amount, the order
+/// is too small for most brokers to accept and would produce repeated
+/// rejected-order attempts.
+static MINIMUM_PARTIAL_HEDGE_SHARES: LazyLock<Float> = LazyLock::new(|| float!(0.01));
+
+/// Resolves whether a sell counter-trade should proceed given the available
+/// broker inventory. Returns:
+/// - `Allowed` with full shares when inventory covers the request
+/// - `Allowed` with capped shares when inventory is partial but above the
+///   minimum threshold
+/// - `Skipped` when inventory is zero or below the minimum threshold
+pub(crate) fn resolve_sell_preflight(
+    order: MarketOrder,
+    available: FractionalShares,
+) -> Result<CounterTradePreflight, FloatError> {
+    let sufficient = available.inner().gte(order.shares.inner().inner())?;
+
+    if sufficient {
+        debug!(
+            target: "broker",
+            symbol = %order.symbol,
+            available = %available,
+            required = %order.shares,
+            "Preflight passed: sufficient equity for sell"
+        );
+
+        return Ok(CounterTradePreflight::Allowed {
+            reservation: Some(CounterTradeReservation::Equity {
+                symbol: order.symbol,
+                required: order.shares,
+                available,
+            }),
+        });
+    }
+
+    let above_minimum = available.inner().gte(*MINIMUM_PARTIAL_HEDGE_SHARES)?;
+
+    if above_minimum && let Ok(capped) = Positive::new(available) {
+        info!(
+            target: "broker",
+            symbol = %order.symbol,
+            available = %available,
+            requested = %order.shares,
+            "Partial hedge: capping sell to available inventory"
+        );
+
+        Ok(CounterTradePreflight::Allowed {
+            reservation: Some(CounterTradeReservation::Equity {
+                symbol: order.symbol,
+                required: capped,
+                available,
+            }),
+        })
+    } else {
+        Ok(CounterTradePreflight::Skipped(
+            CounterTradeSkipReason::InsufficientEquity {
+                required: order.shares,
+                available,
+            },
+        ))
+    }
+}
+
 /// Trait for converting executor contexts into their corresponding executor implementations
 #[async_trait]
 pub trait TryIntoExecutor {
@@ -802,5 +867,112 @@ mod tests {
             "expected zero, got {}",
             result.format().unwrap(),
         );
+    }
+
+    fn sell_order(symbol: &str, shares: &str) -> MarketOrder {
+        MarketOrder {
+            symbol: Symbol::new(symbol).unwrap(),
+            shares: Positive::new(FractionalShares::new(
+                Float::parse(shares.to_string()).unwrap(),
+            ))
+            .unwrap(),
+            direction: Direction::Sell,
+        }
+    }
+
+    fn frac_shares(value: &str) -> FractionalShares {
+        FractionalShares::new(Float::parse(value.to_string()).unwrap())
+    }
+
+    #[test]
+    fn resolve_sell_preflight_returns_full_shares_when_sufficient() {
+        let order = sell_order("AAPL", "10");
+        let available = frac_shares("15");
+
+        let result = resolve_sell_preflight(order, available).unwrap();
+
+        match result {
+            CounterTradePreflight::Allowed {
+                reservation: Some(CounterTradeReservation::Equity { required, .. }),
+            } => {
+                assert!(
+                    required.inner().inner().eq(float!(10)).unwrap(),
+                    "Should use full requested shares, got {required:?}"
+                );
+            }
+            other => panic!("Expected Allowed with full shares, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_sell_preflight_caps_to_available_when_partial() {
+        let order = sell_order("AAPL", "20");
+        let available = frac_shares("10");
+
+        let result = resolve_sell_preflight(order, available).unwrap();
+
+        match result {
+            CounterTradePreflight::Allowed {
+                reservation: Some(CounterTradeReservation::Equity { required, .. }),
+            } => {
+                assert!(
+                    required.inner().inner().eq(float!(10)).unwrap(),
+                    "Should cap to available shares, got {required:?}"
+                );
+            }
+            other => panic!("Expected Allowed with capped shares, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_sell_preflight_skips_when_zero_inventory() {
+        let order = sell_order("AAPL", "5");
+        let available = FractionalShares::ZERO;
+
+        let result = resolve_sell_preflight(order, available).unwrap();
+
+        assert!(
+            matches!(
+                result,
+                CounterTradePreflight::Skipped(CounterTradeSkipReason::InsufficientEquity { .. })
+            ),
+            "Should skip when available is zero, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_sell_preflight_skips_dust_below_minimum_threshold() {
+        let order = sell_order("AAPL", "5");
+        let available = frac_shares("0.001");
+
+        let result = resolve_sell_preflight(order, available).unwrap();
+
+        assert!(
+            matches!(
+                result,
+                CounterTradePreflight::Skipped(CounterTradeSkipReason::InsufficientEquity { .. })
+            ),
+            "Should skip when available is below minimum threshold (0.01), got {result:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_sell_preflight_allows_partial_at_minimum_threshold() {
+        let order = sell_order("AAPL", "5");
+        let available = frac_shares("0.01");
+
+        let result = resolve_sell_preflight(order, available).unwrap();
+
+        match result {
+            CounterTradePreflight::Allowed {
+                reservation: Some(CounterTradeReservation::Equity { required, .. }),
+            } => {
+                assert!(
+                    required.inner().inner().eq(float!(0.01)).unwrap(),
+                    "Should allow partial at exactly the minimum threshold, got {required:?}"
+                );
+            }
+            other => panic!("Expected Allowed at minimum threshold, got {other:?}"),
+        }
     }
 }

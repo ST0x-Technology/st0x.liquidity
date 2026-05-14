@@ -1238,7 +1238,7 @@ where
 
     let executor_type = executor.to_supported_executor();
 
-    let Some(execution) = check_execution_readiness(
+    let Some(mut execution) = check_execution_readiness(
         executor,
         &cqrs.position_projection,
         base_symbol,
@@ -1253,11 +1253,11 @@ where
 
     let _counter_trade_submission_guard = cqrs.counter_trade_submission_lock.lock().await;
 
-    if matches!(
-        preflight_counter_trade_submission(executor, &execution, None).await?,
-        CounterTradeSubmissionCheck::Skipped
-    ) {
-        return Ok(None);
+    match preflight_counter_trade_submission(executor, &execution, None).await? {
+        CounterTradeSubmissionCheck::Skipped => return Ok(None),
+        CounterTradeSubmissionCheck::Allowed { reservation } => {
+            clamp_shares_to_reservation(&mut execution, reservation.as_ref());
+        }
     }
 
     place_offchain_order(&execution, cqrs).await
@@ -1371,12 +1371,37 @@ impl CounterTradeBatchBudget {
 
 enum CounterTradeSubmissionCheck {
     Allowed {
-        // Read by the #[cfg(test)] batch-execution path;
-        // the production single-trade path only checks Skipped.
-        #[cfg_attr(not(test), allow(dead_code))]
         reservation: Option<CounterTradeReservation>,
     },
     Skipped,
+}
+
+/// When the preflight returns an equity reservation with fewer shares than
+/// requested, clamp the execution context to the allowed amount. This enables
+/// partial hedging: sell what's available instead of skipping entirely.
+pub(crate) fn clamp_shares_to_reservation(
+    execution: &mut ExecutionCtx,
+    reservation: Option<&CounterTradeReservation>,
+) {
+    match reservation {
+        Some(CounterTradeReservation::Equity { required, .. }) if *required < execution.shares => {
+            info!(
+                target: "hedge",
+                symbol = %execution.symbol,
+                requested = %execution.shares,
+                allowed = %required,
+                "Partial hedge: reducing order to available inventory"
+            );
+            execution.shares = *required;
+        }
+
+        // Equity with required == execution.shares: full inventory, no clamping needed.
+        // BuyingPower: buy-side reservations control dollar amounts, not share counts.
+        Some(
+            CounterTradeReservation::Equity { .. } | CounterTradeReservation::BuyingPower { .. },
+        )
+        | None => {}
+    }
 }
 
 fn log_counter_trade_skip(
@@ -1665,7 +1690,7 @@ where
 
     let mut batch_budget = CounterTradeBatchBudget::default();
 
-    for execution in ready_positions {
+    for mut execution in ready_positions {
         let reservation =
             match preflight_counter_trade_submission(executor, &execution, Some(&batch_budget))
                 .await?
@@ -1673,6 +1698,8 @@ where
                 CounterTradeSubmissionCheck::Allowed { reservation } => reservation,
                 CounterTradeSubmissionCheck::Skipped => continue,
             };
+
+        clamp_shares_to_reservation(&mut execution, reservation.as_ref());
 
         let offchain_order_id = OffchainOrderId::new();
 
@@ -2626,6 +2653,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trade_above_threshold_places_partial_hedge_with_available_inventory() {
+        let pool = setup_test_db().await;
+        let (frameworks, offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            ExecutionThreshold::whole_share(),
+            &pool,
+        )
+        .await;
+
+        let trade_event = make_trade_event(22);
+        // Onchain buy of 5 shares -> position net = +5 -> hedge needs to sell 5
+        let trade = test_trade_with_amount_and_direction(float!(5.0), 22, Direction::Buy);
+
+        // Broker only has 3 AAPL shares available
+        let executor = MockExecutor::new().with_inventory(ExecutionInventory {
+            positions: vec![EquityPosition {
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(float!(3.0)),
+                market_value: None,
+            }],
+            usd_balance_cents: 100_000,
+            margin_safe_buying_power_cents: Some(100_000),
+        });
+
+        let offchain_order_id = process_queued_trade(&executor, &trade_event, trade, &cqrs, true)
+            .await
+            .unwrap()
+            .expect("Should place a partial hedge order, not skip entirely");
+
+        let offchain_order = offchain_order_projection
+            .load(&offchain_order_id)
+            .await
+            .expect("offchain order should not be in failed lifecycle state")
+            .expect("offchain order view should exist");
+
+        match offchain_order {
+            OffchainOrder::Submitted { shares, .. } => {
+                assert_eq!(
+                    shares,
+                    Positive::new(FractionalShares::new(float!(3.0))).unwrap(),
+                    "Order should be placed with available shares (3), not requested (5)"
+                );
+            }
+            other => panic!("Expected Submitted with capped shares, got: {other:?}"),
+        }
+
+        let position = cqrs
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .expect("position should exist");
+
+        assert_eq!(
+            position.pending_offchain_order_id,
+            Some(offchain_order_id),
+            "Position should track the pending partial hedge order"
+        );
+    }
+
+    #[tokio::test]
+    async fn trade_above_threshold_still_skips_with_zero_inventory() {
+        let pool = setup_test_db().await;
+        let (frameworks, offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            ExecutionThreshold::whole_share(),
+            &pool,
+        )
+        .await;
+
+        let trade_event = make_trade_event(23);
+        let trade = test_trade_with_amount_and_direction(float!(1.5), 23, Direction::Buy);
+
+        // Broker has zero AAPL shares
+        let executor = MockExecutor::new().with_inventory(ExecutionInventory {
+            positions: vec![EquityPosition {
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(float!(0)),
+                market_value: None,
+            }],
+            usd_balance_cents: 100_000,
+            margin_safe_buying_power_cents: Some(100_000),
+        });
+
+        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result, None,
+            "Counter trade should still be skipped when broker has zero shares"
+        );
+
+        assert!(
+            offchain_order_projection
+                .load_all()
+                .await
+                .unwrap()
+                .is_empty(),
+            "No offchain orders should be created when inventory is zero"
+        );
+    }
+
+    #[tokio::test]
     async fn multiple_trades_accumulate_then_trigger() {
         let pool = setup_test_db().await;
         let (frameworks, _offchain_order_projection) =
@@ -2940,6 +3075,79 @@ mod tests {
             1,
             "Only one offchain order should be created when batch buying power is exhausted"
         );
+    }
+
+    #[tokio::test]
+    async fn periodic_checker_places_partial_hedge_with_limited_inventory() {
+        let pool = setup_test_db().await;
+        let (frameworks, offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            ExecutionThreshold::whole_share(),
+            &pool,
+        )
+        .await;
+
+        // Onchain buy -> positive net -> hedge needs to sell
+        acknowledge_fill(&cqrs.position, "AAPL", "5", Direction::Buy, 1).await;
+
+        // Broker only holds 2 AAPL shares (less than the 5 needed)
+        let executor = MockExecutor::new().with_inventory(ExecutionInventory {
+            positions: vec![EquityPosition {
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(float!(2.0)),
+                market_value: None,
+            }],
+            usd_balance_cents: 100_000,
+            margin_safe_buying_power_cents: Some(100_000),
+        });
+
+        check_and_execute_accumulated_positions(
+            &executor,
+            AccumulatedPositionExecutionCtx {
+                position: &cqrs.position,
+                position_projection: &cqrs.position_projection,
+                offchain_order: &cqrs.offchain_order,
+                counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
+                threshold: &cqrs.execution_threshold,
+                assets: &cqrs.assets,
+            },
+            |_| true,
+        )
+        .await
+        .unwrap();
+
+        let position = cqrs
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .expect("position should exist");
+
+        assert!(
+            position.pending_offchain_order_id.is_some(),
+            "Periodic checker should place a partial hedge order instead of skipping"
+        );
+
+        let offchain_order_id = position.pending_offchain_order_id.unwrap();
+
+        let offchain_order = offchain_order_projection
+            .load(&offchain_order_id)
+            .await
+            .expect("offchain order should not be in failed lifecycle state")
+            .expect("offchain order view should exist");
+
+        match offchain_order {
+            OffchainOrder::Submitted { shares, .. } => {
+                assert_eq!(
+                    shares,
+                    Positive::new(FractionalShares::new(float!(2.0))).unwrap(),
+                    "Batch order should be capped to available inventory (2), not requested (5)"
+                );
+            }
+            other => panic!("Expected Submitted with capped shares, got: {other:?}"),
+        }
     }
 
     #[tokio::test]

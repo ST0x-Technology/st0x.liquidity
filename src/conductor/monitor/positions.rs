@@ -10,10 +10,10 @@ use std::time::Duration;
 
 use sqlx::SqlitePool;
 use task_supervisor::{SupervisedTask, TaskResult};
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 use st0x_event_sorcery::Projection;
-use st0x_execution::Executor;
+use st0x_execution::{CounterTradePreflight, Executor, MarketOrder};
 
 use crate::config::Ctx;
 use crate::equity_redemption::symbols_with_active_transfers;
@@ -115,28 +115,22 @@ where
     }
 
     async fn check_and_enqueue_symbol(&mut self, symbol: &st0x_execution::Symbol) {
-        let executor_type = self.executor.to_supported_executor();
-
-        let readiness = match check_execution_readiness(
+        let Ok(Some(mut ready)) = check_execution_readiness(
             &self.executor,
             &self.position_projection,
             symbol,
-            executor_type,
+            self.executor.to_supported_executor(),
             &self.ctx.assets,
             true,
         )
         .await
-        {
-            Ok(readiness) => readiness,
-            Err(error) => {
-                error!(%symbol, %error, "Execution readiness check failed");
-                return;
-            }
-        };
-
-        let Some(ready) = readiness else {
+        .inspect_err(|error| error!(%symbol, %error, "Execution readiness check failed")) else {
             return;
         };
+
+        if !self.preflight_and_clamp_shares(&mut ready).await {
+            return;
+        }
 
         debug!(
             %ready.symbol, %ready.shares, ?ready.direction,
@@ -144,7 +138,7 @@ where
         );
 
         let job = PlaceHedge {
-            symbol: ready.symbol,
+            symbol: ready.symbol.clone(),
             direction: ready.direction,
             shares: ready.shares,
             executor: ready.executor,
@@ -153,7 +147,44 @@ where
         };
 
         if let Err(error) = self.hedge_queue.push(job).await {
-            error!(%symbol, %error, "Failed to enqueue hedge job");
+            error!(%ready.symbol, %error, "Failed to enqueue hedge job");
+        }
+    }
+
+    /// Checks broker inventory before enqueueing a hedge job. Returns `true`
+    /// if the order should proceed (possibly with reduced shares), `false` if
+    /// it should be skipped entirely.
+    async fn preflight_and_clamp_shares(
+        &self,
+        ready: &mut crate::onchain::accumulator::ExecutionCtx,
+    ) -> bool {
+        let order = MarketOrder {
+            symbol: ready.symbol.clone(),
+            shares: ready.shares,
+            direction: ready.direction,
+        };
+
+        match self.executor.preflight_counter_trade(order).await {
+            Ok(CounterTradePreflight::Allowed { reservation }) => {
+                crate::conductor::clamp_shares_to_reservation(ready, reservation.as_ref());
+                true
+            }
+            Ok(CounterTradePreflight::Skipped(reason)) => {
+                warn!(
+                    target: "hedge",
+                    symbol = %ready.symbol, %reason,
+                    "Skipping hedge enqueue: preflight rejected"
+                );
+                false
+            }
+            Err(error) => {
+                error!(
+                    target: "hedge",
+                    symbol = %ready.symbol, %error,
+                    "Preflight check failed during position scan"
+                );
+                false
+            }
         }
     }
 }

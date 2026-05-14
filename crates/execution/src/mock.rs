@@ -214,22 +214,7 @@ impl Executor for MockExecutor {
                     .find(|position| position.symbol == order.symbol)
                     .map_or(crate::FractionalShares::ZERO, |position| position.quantity);
 
-                if available.inner().gte(order.shares.inner().inner())? {
-                    Ok(CounterTradePreflight::Allowed {
-                        reservation: Some(CounterTradeReservation::Equity {
-                            symbol: order.symbol,
-                            required: order.shares,
-                            available,
-                        }),
-                    })
-                } else {
-                    Ok(CounterTradePreflight::Skipped(
-                        CounterTradeSkipReason::InsufficientEquity {
-                            required: order.shares,
-                            available,
-                        },
-                    ))
-                }
+                Ok(crate::resolve_sell_preflight(order, available)?)
             }
             Direction::Buy => {
                 let estimated_cost_cents = estimate_buffered_cost_cents(
@@ -448,6 +433,71 @@ mod tests {
                 required,
                 available,
             }) if required == positive_shares("2") && available == shares("0")
+        ));
+    }
+
+    #[tokio::test]
+    async fn preflight_counter_trade_allows_partial_sell_with_capped_shares() {
+        let executor = MockExecutor::new().with_inventory(crate::Inventory {
+            positions: vec![crate::EquityPosition {
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: shares("10"),
+                market_value: None,
+            }],
+            usd_balance_cents: 50_000,
+            margin_safe_buying_power_cents: Some(50_000),
+        });
+
+        let preflight = executor
+            .preflight_counter_trade(MarketOrder {
+                symbol: Symbol::new("AAPL").unwrap(),
+                shares: positive_shares("20"),
+                direction: Direction::Sell,
+            })
+            .await
+            .unwrap();
+
+        match preflight {
+            CounterTradePreflight::Allowed {
+                reservation: Some(CounterTradeReservation::Equity { required, .. }),
+            } => {
+                assert_eq!(
+                    required,
+                    positive_shares("10"),
+                    "Should cap to available shares"
+                );
+            }
+            other => panic!("Expected Allowed with capped shares, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn preflight_counter_trade_skips_sell_with_zero_inventory() {
+        let executor = MockExecutor::new().with_inventory(crate::Inventory {
+            positions: vec![crate::EquityPosition {
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: shares("0"),
+                market_value: None,
+            }],
+            usd_balance_cents: 50_000,
+            margin_safe_buying_power_cents: Some(50_000),
+        });
+
+        let preflight = executor
+            .preflight_counter_trade(MarketOrder {
+                symbol: Symbol::new("AAPL").unwrap(),
+                shares: positive_shares("5"),
+                direction: Direction::Sell,
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            preflight,
+            CounterTradePreflight::Skipped(CounterTradeSkipReason::InsufficientEquity {
+                required,
+                available,
+            }) if required == positive_shares("5") && available == shares("0")
         ));
     }
 

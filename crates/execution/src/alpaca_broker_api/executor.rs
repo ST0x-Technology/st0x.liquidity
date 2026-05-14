@@ -16,10 +16,9 @@ use super::journal::JournalResponse;
 use super::order::{AlpacaLimitOrder, ConversionDirection, CryptoOrderResponse};
 use super::{AlpacaBrokerApiError, AssetStatus, TimeInForce};
 use crate::{
-    CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason, Direction, Executor,
-    FractionalShares, InventoryResult, MarketOrder, OrderPlacement, OrderState, OrderStatus,
-    Positive, SupportedExecutor, Symbol, TryIntoExecutor, buying_power_counter_trade_preflight,
-    estimate_buffered_cost_cents,
+    CounterTradePreflight, Direction, Executor, FractionalShares, InventoryResult, MarketOrder,
+    OrderPlacement, OrderState, OrderStatus, Positive, SupportedExecutor, Symbol, TryIntoExecutor,
+    buying_power_counter_trade_preflight, estimate_buffered_cost_cents,
 };
 
 /// Response from the asset endpoint
@@ -194,30 +193,7 @@ impl Executor for AlpacaBrokerApi {
                     .find(|position| position.symbol == order.symbol)
                     .map_or(FractionalShares::ZERO, |position| position.quantity);
 
-                if available.inner().gte(order.shares.inner().inner())? {
-                    debug!(
-                        target: "broker",
-                        symbol = %order.symbol,
-                        available = %available,
-                        required = %order.shares,
-                        "Preflight passed: sufficient equity for sell"
-                    );
-
-                    Ok(CounterTradePreflight::Allowed {
-                        reservation: Some(CounterTradeReservation::Equity {
-                            symbol: order.symbol,
-                            required: order.shares,
-                            available,
-                        }),
-                    })
-                } else {
-                    Ok(CounterTradePreflight::Skipped(
-                        CounterTradeSkipReason::InsufficientEquity {
-                            required: order.shares,
-                            available,
-                        },
-                    ))
-                }
+                Ok(crate::resolve_sell_preflight(order, available)?)
             }
             Direction::Buy => {
                 let latest_trade_price = crate::alpaca_market_data::fetch_latest_trade_price(
