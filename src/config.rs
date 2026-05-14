@@ -1234,7 +1234,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
-            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            address = "0x0000000000000000000000000000000000000001"
         "#,
         )
         .unwrap();
@@ -1265,7 +1265,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
-            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            address = "0x0000000000000000000000000000000000000001"
         "#,
         )
     }
@@ -1288,7 +1288,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
-            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            address = "0x0000000000000000000000000000000000000001"
         "#,
         )
     }
@@ -1443,7 +1443,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
-            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            address = "0x0000000000000000000000000000000000000001"
 
             [broker.travel_rule]
             beneficiary_entity_name = "T0 TRADE (BVI) LTD"
@@ -1485,7 +1485,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
-            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            address = "0x0000000000000000000000000000000000000001"
 
             [broker.travel_rule]
             beneficiary_entity_name = "PLACEHOLDER"
@@ -1524,7 +1524,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
-            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            address = "0x0000000000000000000000000000000000000001"
 
             [broker.travel_rule]
             beneficiary_entity_name = "   "
@@ -1624,7 +1624,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
-            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            address = "0x0000000000000000000000000000000000000001"
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -1738,7 +1738,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
-            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            address = "0x0000000000000000000000000000000000000001"
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -1873,7 +1873,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
-            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            address = "0x0000000000000000000000000000000000000001"
 
             [hyperdx]
             service_name = "test-service"
@@ -2161,7 +2161,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
-            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            address = "0x0000000000000000000000000000000000000001"
         "#,
         );
 
@@ -2208,7 +2208,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
-            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            address = "0x0000000000000000000000000000000000000001"
         "#,
         );
 
@@ -3582,7 +3582,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
-            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            address = "0x0000000000000000000000000000000000000001"
         "#,
         );
         let secrets = toml_file(
@@ -3628,7 +3628,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
-            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            address = "0x0000000000000000000000000000000000000001"
         "#,
         );
         let secrets = toml_file(
@@ -3704,7 +3704,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
-            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            address = "0x0000000000000000000000000000000000000001"
 
             [broker.travel_rule]
             beneficiary_entity_name = "PLACEHOLDER"
@@ -3742,7 +3742,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
-            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            address = "0x0000000000000000000000000000000000000001"
         "#,
         );
         let secrets = dry_run_secrets_toml();

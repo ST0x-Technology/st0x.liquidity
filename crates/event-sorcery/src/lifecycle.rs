@@ -44,14 +44,13 @@ use crate::reactor::Reactor;
 ///
 /// Failed { .. } ---- any event ------> Failed { AlreadyFailed }
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 // Override serde's inferred bounds. Without this, serde derives
 // `Entity: Serialize + Deserialize` bounds, but Entity's serde
 // impls are already guaranteed by the EventSourced supertrait.
 // The empty bound avoids redundant constraints that confuse the
 // compiler when Entity has complex associated types.
 #[serde(bound = "")]
-#[derive(Default)]
 pub(crate) enum Lifecycle<Entity: EventSourced> {
     #[default]
     Uninitialized,
