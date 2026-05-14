@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
 use st0x_float_serde::format_float_with_fallback;
-use tracing::{error, warn};
+use tracing::warn;
 
 use st0x_evm::Evm;
 use st0x_execution::{Direction, FractionalShares, HasZero};

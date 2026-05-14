@@ -1,13 +1,23 @@
-{ pkgs, lib, modulesPath, st0x-cli, environment, volumeName, ... }:
+{
+  pkgs,
+  lib,
+  modulesPath,
+  st0x-cli,
+  environment,
+  volumeName,
+  ...
+}:
 
 let
   inherit (import ./keys.nix) roles;
   envRoles = roles.${environment};
 
-  tailscaleFqdn = {
-    prod = "st0x-liquidity-nixos.taile5cf8a.ts.net";
-    staging = "st0x-liquidity-staging.taile5cf8a.ts.net";
-  }.${environment};
+  tailscaleFqdn =
+    {
+      prod = "st0x-liquidity-nixos.taile5cf8a.ts.net";
+      staging = "st0x-liquidity-staging.taile5cf8a.ts.net";
+    }
+    .${environment};
   certDir = "/var/lib/tailscale-cert";
 
   services = import ./services.nix;
@@ -59,7 +69,8 @@ let
     };
   };
 
-in {
+in
+{
   imports = [
     (modulesPath + "/virtualisation/digital-ocean-config.nix")
     (modulesPath + "/profiles/qemu-guest.nix")
@@ -78,7 +89,10 @@ in {
       enable = true;
       network.enable = true;
       settings = {
-        datasource_list = [ "ConfigDrive" "Digitalocean" ];
+        datasource_list = [
+          "ConfigDrive"
+          "Digitalocean"
+        ];
         datasource.ConfigDrive = { };
         datasource.Digitalocean = { };
         cloud_init_modules = [
@@ -91,8 +105,12 @@ in {
           "update_hostname"
           "set_password"
         ];
-        cloud_config_modules =
-          [ "ssh-import-id" "keyboard" "runcmd" "disable_ec2_metadata" ];
+        cloud_config_modules = [
+          "ssh-import-id"
+          "keyboard"
+          "runcmd"
+          "disable_ec2_metadata"
+        ];
         cloud_final_modules = [
           "write_files_deferred"
           "puppet"
@@ -148,28 +166,30 @@ in {
         sslCertificateKey = "${certDir}/${tailscaleFqdn}.key";
         root = "/nix/var/nix/profiles/per-service/dashboard";
 
-        locations = let
-          port = "8001";
-          backend = "http://127.0.0.1:${port}";
-          apiProxy = path: { proxyPass = "${backend}${path}"; };
-          wsProxy = {
-            proxyPass = "${backend}/api/ws";
-            proxyWebsockets = true;
-            extraConfig = ''
-              proxy_connect_timeout 60;
-              proxy_send_timeout 60;
-              proxy_read_timeout 86400;
-            '';
+        locations =
+          let
+            port = "8001";
+            backend = "http://127.0.0.1:${port}";
+            apiProxy = path: { proxyPass = "${backend}${path}"; };
+            wsProxy = {
+              proxyPass = "${backend}/api/ws";
+              proxyWebsockets = true;
+              extraConfig = ''
+                proxy_connect_timeout 60;
+                proxy_send_timeout 60;
+                proxy_read_timeout 86400;
+              '';
+            };
+          in
+          {
+            "/".tryFiles = "$uri $uri/ /index.html";
+            "/api/ws" = wsProxy;
+            "/health" = apiProxy "/health";
+            "/logs" = apiProxy "/logs";
+            "/orders/" = apiProxy "/orders/";
+            "/trades" = apiProxy "/trades";
+            "/transfers" = apiProxy "/transfers";
           };
-        in {
-          "/".tryFiles = "$uri $uri/ /index.html";
-          "/api/ws" = wsProxy;
-          "/health" = apiProxy "/health";
-          "/logs" = apiProxy "/logs";
-          "/orders/" = apiProxy "/orders/";
-          "/trades" = apiProxy "/trades";
-          "/transfers" = apiProxy "/transfers";
-        };
       };
     };
 
@@ -215,7 +235,10 @@ in {
 
   nix = {
     settings = {
-      experimental-features = [ "nix-command" "flakes" ];
+      experimental-features = [
+        "nix-command"
+        "flakes"
+      ];
       auto-optimise-store = true;
       download-buffer-size = 268435456;
     };
@@ -247,19 +270,20 @@ in {
       # Clean up stale TUN device before tailscaled starts. During NixOS
       # activation the old tailscaled may still hold /dev/net/tun when the
       # new unit starts, causing a crash-loop.
-      tailscaled.serviceConfig.ExecStartPre =
-        [ "-${pkgs.iproute2}/bin/ip link delete tailscale0" ];
+      tailscaled.serviceConfig.ExecStartPre = [ "-${pkgs.iproute2}/bin/ip link delete tailscale0" ];
 
       # Provision a Tailscale-issued TLS certificate so the dashboard is
       # served over HTTPS. Runs before nginx to guarantee cert files exist.
       tailscale-cert = {
-        description =
-          "Provision Tailscale HTTPS certificate for ${tailscaleFqdn}";
+        description = "Provision Tailscale HTTPS certificate for ${tailscaleFqdn}";
         after = [ "tailscaled.service" ];
         wants = [ "tailscaled.service" ];
         before = [ "nginx.service" ];
         wantedBy = [ "multi-user.target" ];
-        path = [ pkgs.tailscale pkgs.jq ];
+        path = [
+          pkgs.tailscale
+          pkgs.jq
+        ];
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
@@ -268,8 +292,7 @@ in {
           # Reload nginx so it picks up renewed certs on subsequent runs
           # triggered by the timer. || true keeps the unit green on first
           # boot when nginx hasn't started yet.
-          ExecStartPost =
-            "+${pkgs.bash}/bin/bash -c 'systemctl is-active --quiet nginx.service && systemctl reload nginx.service || true'";
+          ExecStartPost = "+${pkgs.bash}/bin/bash -c 'systemctl is-active --quiet nginx.service && systemctl reload nginx.service || true'";
         };
         script = ''
           set -euo pipefail
@@ -326,9 +349,7 @@ in {
     # before it ever reaches the per-service profile that would install the
     # fix. Stop + reset-failed any managed service that is currently broken
     # so activation can complete; the service profile restarts it afterwards.
-    for svc in ${
-      builtins.concatStringsSep " " (builtins.attrNames enabledServices)
-    }; do
+    for svc in ${builtins.concatStringsSep " " (builtins.attrNames enabledServices)}; do
       state=$(${pkgs.systemd}/bin/systemctl show -p ActiveState --value "$svc.service" 2>/dev/null || echo "")
       if [ "$state" = "failed" ] || [ "$state" = "activating" ]; then
         ${pkgs.systemd}/bin/systemctl stop "$svc.service" 2>/dev/null || true

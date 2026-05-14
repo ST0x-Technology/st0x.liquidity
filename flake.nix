@@ -4,8 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
-    rainix.url =
-      "github:rainprotocol/rainix?rev=6e14de54456eb33821c2f334cf4d250bcc22c121";
+    rainix.url = "github:rainprotocol/rainix?rev=36342d3f1a104adf987793df7f101cf804e62a34";
     rainix.inputs.nixpkgs.follows = "nixpkgs";
 
     rain-math-float = {
@@ -50,8 +49,21 @@
     nixos-anywhere.inputs.nixpkgs.follows = "nixpkgs";
   };
 
-  outputs = { self, flake-utils, rainix, rain-math-float, rain-orderbook
-    , forge-std, bun2nix, ragenix, deploy-rs, disko, nixos-anywhere, crane, ...
+  outputs =
+    {
+      self,
+      flake-utils,
+      rainix,
+      rain-math-float,
+      rain-orderbook,
+      forge-std,
+      bun2nix,
+      ragenix,
+      deploy-rs,
+      disko,
+      nixos-anywhere,
+      crane,
+      ...
     }:
     let
       inherit (import ./keys.nix) keys;
@@ -68,69 +80,85 @@
         };
       };
       envNames = builtins.attrNames environments;
-    in {
-      nixosConfigurations = let
-        mkNixos = { environment, modules }:
-          rainix.inputs.nixpkgs.lib.nixosSystem {
-            system = "x86_64-linux";
-            specialArgs = {
-              inherit environment;
-              inherit (environments.${environment}) volumeName;
-              inherit (self.packages.x86_64-linux) st0x-cli;
+    in
+    {
+      nixosConfigurations =
+        let
+          mkNixos =
+            { environment, modules }:
+            rainix.inputs.nixpkgs.lib.nixosSystem {
+              system = "x86_64-linux";
+              specialArgs = {
+                inherit environment;
+                inherit (environments.${environment}) volumeName;
+                inherit (self.packages.x86_64-linux) st0x-cli;
+              };
+              modules = [ disko.nixosModules.disko ] ++ modules;
             };
-            modules = [ disko.nixosModules.disko ] ++ modules;
-          };
 
-        full = env:
-          mkNixos {
-            environment = env;
-            modules = [ ragenix.nixosModules.default ./os.nix ];
-          };
+          full =
+            env:
+            mkNixos {
+              environment = env;
+              modules = [
+                ragenix.nixosModules.default
+                ./os.nix
+              ];
+            };
 
-        bootstrap = env:
-          mkNixos {
-            environment = env;
-            modules = [ ./bootstrap.nix ];
-          };
+          bootstrap =
+            env:
+            mkNixos {
+              environment = env;
+              modules = [ ./bootstrap.nix ];
+            };
 
-      in builtins.listToAttrs (builtins.concatMap (env: [
-        {
-          name = environments.${env}.nodeName;
-          value = full env;
-        }
-        {
-          name = "${environments.${env}.nodeName}-bootstrap";
-          value = bootstrap env;
-        }
-      ]) envNames);
+        in
+        builtins.listToAttrs (
+          builtins.concatMap (env: [
+            {
+              name = environments.${env}.nodeName;
+              value = full env;
+            }
+            {
+              name = "${environments.${env}.nodeName}-bootstrap";
+              value = bootstrap env;
+            }
+          ]) envNames
+        );
 
-      deploy =
-        (import ./deploy.nix { inherit deploy-rs self environments; }).config;
-    } // flake-utils.lib.eachDefaultSystem (system:
+      deploy = (import ./deploy.nix { inherit deploy-rs self environments; }).config;
+    }
+    // flake-utils.lib.eachDefaultSystem (
+      system:
       let
         pkgs = import rainix.inputs.nixpkgs {
           inherit system;
-          config.allowUnfreePredicate = pkg:
-            builtins.elem (pkgs.lib.getName pkg) [ "terraform" ];
+          config.allowUnfreePredicate = pkg: builtins.elem (pkgs.lib.getName pkg) [ "terraform" ];
         };
 
-        craneLib =
-          (crane.mkLib pkgs).overrideToolchain rainix.rust-toolchain.${system};
+        craneLib = (crane.mkLib pkgs).overrideToolchain rainix.rust-toolchain.${system};
 
         rainixPkgs = rainix.packages.${system};
         infraPkgs = import ./infra {
-          inherit pkgs ragenix rainix system;
+          inherit
+            pkgs
+            ragenix
+            rainix
+            system
+            ;
           environments = envNames;
         };
-        rekeySecrets =
-          ''ragenix --rules ./secret/secrets.nix -i "$identity" -r'';
+        rekeySecrets = ''ragenix --rules ./secret/secrets.nix -i "$identity" -r'';
 
-        deployScripts = (import ./deploy.nix {
-          inherit deploy-rs self environments;
-        }).mkDeployScripts {
-          inherit pkgs infraPkgs;
-          localSystem = system;
-        };
+        deployScripts =
+          (import ./deploy.nix {
+            inherit deploy-rs self environments;
+          }).mkDeployScripts
+            {
+              inherit pkgs infraPkgs;
+              localSystem = system;
+            };
 
         # Patch the upstream rain.math.float source to silence
         # `unused_doc_comments` on a `///` block sitting on a `prop_compose!`
@@ -138,36 +166,49 @@
         # otherwise. Remove this wrapper once RAI-418 is fixed upstream.
         # Patch logic lives in scripts/patch-rain-math-float.nu so the
         # derivation body stays a thin shell.
-        rainMathFloatSrc = pkgs.runCommand "rain-math-float-patched" {
-          nativeBuildInputs = [ pkgs.nushell ];
-        } ''
-          cp -rL --no-preserve=mode ${rain-math-float} $out
-          chmod -R u+w $out
-          nu ${./scripts/patch-rain-math-float.nu} "$out"
-        '';
+        rainMathFloatSrc =
+          pkgs.runCommand "rain-math-float-patched"
+            {
+              nativeBuildInputs = [ pkgs.nushell ];
+            }
+            ''
+              cp -rL --no-preserve=mode ${rain-math-float} $out
+              chmod -R u+w $out
+              nu ${./scripts/patch-rain-math-float.nu} "$out"
+            '';
 
-        inherit (import ./nix/mk-abi.nix {
-          inherit pkgs;
-          foundry = rainix.pkgs.${system}.foundry-bin;
-          solc = rainix.pkgs.${system}.solc_0_8_25;
-        })
-          mkAbi;
+        inherit
+          (import ./nix/mk-abi.nix {
+            inherit pkgs;
+            foundry = rainix.pkgs.${system}.foundry-bin;
+            solc = rainix.pkgs.${system}.solc_0_8_25;
+          })
+          mkAbi
+          ;
 
-        inherit (import ./nix/abis.nix {
-          inherit pkgs mkAbi;
-          sources = {
-            inherit forge-std rain-orderbook;
-            rain-math-float = rainMathFloatSrc;
-          };
-        })
-          abis abiEnv;
+        inherit
+          (import ./nix/abis.nix {
+            inherit pkgs mkAbi;
+            sources = {
+              inherit forge-std rain-orderbook;
+              rain-math-float = rainMathFloatSrc;
+            };
+          })
+          abis
+          abiEnv
+          ;
 
         st0xRust = pkgs.callPackage ./rust.nix {
           inherit craneLib rainMathFloatSrc abiEnv;
         };
 
-      in rec {
-        packages = rainixPkgs // infraPkgs.packages // deployScripts // abis
+      in
+      rec {
+        packages =
+          rainixPkgs
+          // infraPkgs.packages
+          // deployScripts
+          // abis
           // {
             st0x-dto = st0xRust.dto;
             st0x-liquidity = st0xRust.package;
@@ -218,30 +259,33 @@
                 pkgs.cargo-nextest
                 rainix.rust-toolchain.${system}
               ];
-              text = let
-                backend =
-                  "cargo nextest run --test e2e -E 'test(=full_system::simulate)' --run-ignored ignored-only --no-capture";
+              text =
+                let
+                  backend = "cargo nextest run --test e2e -E 'test(=full_system::simulate)' --run-ignored ignored-only --no-capture";
 
-                dashboard = "cd dashboard && bun run dev";
+                  dashboard = "cd dashboard && bun run dev";
 
-                mockApi = "bun run e2e/mock-rest-api.ts";
+                  mockApi = "bun run e2e/mock-rest-api.ts";
 
-              in ''
-                exec mprocs "${backend}" "${dashboard}" "${mockApi}"
-              '';
+                in
+                ''
+                  exec mprocs "${backend}" "${dashboard}" "${mockApi}"
+                '';
             };
 
             # Sandbox-runnable test for scripts/patch-rain-math-float.nu so
             # the patch logic can't silently rot when upstream drifts.
             test-patch-rain-math-float =
-              pkgs.runCommand "test-patch-rain-math-float" {
-                nativeBuildInputs = [ pkgs.nushell ];
-              } ''
-                cp -r ${./scripts} scripts
-                chmod -R u+w scripts
-                nu scripts/patch-rain-math-float.test.nu
-                touch $out
-              '';
+              pkgs.runCommand "test-patch-rain-math-float"
+                {
+                  nativeBuildInputs = [ pkgs.nushell ];
+                }
+                ''
+                  cp -r ${./scripts} scripts
+                  chmod -R u+w scripts
+                  nu scripts/patch-rain-math-float.test.nu
+                  touch $out
+                '';
 
             genBunNix = rainix.mkTask.${system} {
               name = "gen-bun-nix";
@@ -253,19 +297,18 @@
 
             bootstrap = rainix.mkTask.${system} {
               name = "bootstrap-nixos";
-              additionalBuildInputs = infraPkgs.buildInputs
-                ++ [ nixos-anywhere.packages.${system}.default ];
+              additionalBuildInputs = infraPkgs.buildInputs ++ [ nixos-anywhere.packages.${system}.default ];
               body = ''
                 env="''${1:?usage: bootstrap <prod|staging>}"
                 shift
 
                 case "$env" in
-                  ${
-                    builtins.concatStringsSep "\n" (map (env: ''
+                  ${builtins.concatStringsSep "\n" (
+                    map (env: ''
                       ${env})
                         flake_config="${environments.${env}.nodeName}-bootstrap"
-                        host_key_field="host-${env}" ;;'') envNames)
-                  }
+                        host_key_field="host-${env}" ;;'') envNames
+                  )}
                   *)
                     echo "ERROR: unknown environment '$env'" >&2
                     exit 1 ;;
@@ -358,99 +401,107 @@
 
         checks = { inherit (packages) test-patch-rain-math-float; };
 
-        formatter = pkgs.nixfmt-classic;
+        formatter = pkgs.nixfmt-rfc-style;
 
-        devShells = let
-          # The cargo `rain-math-float` path-dep resolves through this symlink,
-          # so cargo and the nix builds always share the source we pinned as a
-          # flake input. Without it, cargo would reclone rain.math.float (and
-          # all of its solidity submodules) on every fresh checkout.
-          rainMathFloatLink = ''
-            mkdir -p .tmp
-            rm -rf .tmp/rain-math-float
-            ln -sfn ${rainMathFloatSrc} .tmp/rain-math-float
-          '';
+        devShells =
+          let
+            # The cargo `rain-math-float` path-dep resolves through this symlink,
+            # so cargo and the nix builds always share the source we pinned as a
+            # flake input. Without it, cargo would reclone rain.math.float (and
+            # all of its solidity submodules) on every fresh checkout.
+            rainMathFloatLink = ''
+              mkdir -p .tmp
+              rm -rf .tmp/rain-math-float
+              ln -sfn ${rainMathFloatSrc} .tmp/rain-math-float
+            '';
 
-          # Inputs every cargo build/test needs: rust toolchain + native libs
-          # the workspace links against. Deliberately omits foundry/slither/
-          # deno that rainix's full devShell brings in -- CI doesn't run them
-          # and they bloat the closure.
-          backendInputs = [
-            rainix.rust-toolchain.${system}
-            pkgs.openssl
-            pkgs.sqlite
-            pkgs.pkg-config
-          ];
-
-        in {
-          # Local development. Kitchen-sink shell with infra + deploy tooling,
-          # bacon, all the rainix extras. Not used by CI.
-          default = pkgs.mkShell ({
-            inherit (rainix.devShells.${system}.default) nativeBuildInputs;
-
-            shellHook = rainix.devShells.${system}.default.shellHook
-              + rainMathFloatLink;
-
-            SQLX_OFFLINE = true;
-            DATABASE_URL = "sqlite:dev.db";
-            FOUNDRY_DISABLE_NIGHTLY_WARNING = true;
-
-            # sccache: caches compiled crates by content hash so parallel
-            # worktrees sharing the same dependency graph get cache hits
-            # instead of redundant rebuilds.
-            RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
-
-            buildInputs = with pkgs;
-              [
-                bacon
-                bun
-                sccache
-                sqlx-cli
-                cargo-expand
-                cargo-nextest
-                ragenix.packages.${system}.default
-                packages.ci
-                packages.secret
-                packages.rekey
-              ] ++ builtins.attrValues infraPkgs.packages
-              ++ builtins.attrValues deployScripts
-              ++ rainix.devShells.${system}.default.buildInputs;
-          } // abiEnv);
-
-          # CI: cargo check/nextest/clippy + sqlx db reset. No terraform, no
-          # deploy scripts. abiEnv is needed because build.rs / sol! macros
-          # consume ST0X_*_ABI at compile time. foundry is required because
-          # tests spawn anvil for local EVM simulation.
-          ci-backend = pkgs.mkShell ({
-            buildInputs = backendInputs ++ [
-              pkgs.sqlx-cli
-              pkgs.cargo-nextest
-              rainix.pkgs.${system}.foundry-bin
+            # Inputs every cargo build/test needs: rust toolchain + native libs
+            # the workspace links against. Deliberately omits foundry/slither/
+            # deno that rainix's full devShell brings in -- CI doesn't run them
+            # and they bloat the closure.
+            backendInputs = [
+              rainix.rust-toolchain.${system}
+              pkgs.openssl
+              pkgs.sqlite
+              pkgs.pkg-config
             ];
 
-            shellHook = rainMathFloatLink;
+          in
+          {
+            # Local development. Rust-only rainix shell + infra/deploy tooling,
+            # bacon, sqlx, bun. Not used by CI.
+            default = pkgs.mkShell (
+              {
+                shellHook = rainix.devShells.${system}.rust-shell.shellHook + rainMathFloatLink;
 
-            SQLX_OFFLINE = true;
-            DATABASE_URL = "sqlite:dev.db";
-          } // abiEnv);
+                SQLX_OFFLINE = true;
+                DATABASE_URL = "sqlite:dev.db";
 
-          # CI dashboard: bun install + lint only. `nix build .#st0x-dashboard`
-          # and `nix run .#st0x-dto` realize their own closures and don't need
-          # this shell on PATH.
-          ci-dashboard = pkgs.mkShell { buildInputs = [ pkgs.bun ]; };
+                # sccache: caches compiled crates by content hash so parallel
+                # worktrees sharing the same dependency graph get cache hits
+                # instead of redundant rebuilds.
+                RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
 
-          # CI hooks: pre-commit invokes hook tools by absolute /nix/store
-          # path, so they must be realized. Inheriting rainix's default
-          # buildInputs covers deadnix/nil/nixfmt/statix/taplo/yamlfmt/
-          # shellcheck/deno without dragging in our infra closure.
-          ci-hooks = pkgs.mkShell ({
-            shellHook = rainix.devShells.${system}.default.shellHook
-              + rainMathFloatLink;
-            buildInputs = rainix.devShells.${system}.default.buildInputs
-              ++ [ pkgs.pre-commit ];
-          } // abiEnv);
-        };
-      });
+                buildInputs =
+                  with pkgs;
+                  [
+                    bacon
+                    bun
+                    sccache
+                    sqlx-cli
+                    cargo-expand
+                    cargo-nextest
+                    ragenix.packages.${system}.default
+                    packages.ci
+                    packages.secret
+                    packages.rekey
+                  ]
+                  ++ builtins.attrValues infraPkgs.packages
+                  ++ builtins.attrValues deployScripts
+                  ++ rainix.devShells.${system}.rust-shell.buildInputs;
+              }
+              // abiEnv
+            );
+
+            # CI: cargo check/nextest/clippy + sqlx db reset. No terraform, no
+            # deploy scripts. abiEnv is needed because build.rs / sol! macros
+            # consume ST0X_*_ABI at compile time. foundry is required because
+            # tests spawn anvil for local EVM simulation.
+            ci-backend = pkgs.mkShell (
+              {
+                buildInputs = backendInputs ++ [
+                  pkgs.sqlx-cli
+                  pkgs.cargo-nextest
+                  rainix.pkgs.${system}.foundry-bin
+                ];
+
+                shellHook = rainMathFloatLink;
+
+                SQLX_OFFLINE = true;
+                DATABASE_URL = "sqlite:dev.db";
+              }
+              // abiEnv
+            );
+
+            # CI dashboard: bun install + lint only. `nix build .#st0x-dashboard`
+            # and `nix run .#st0x-dto` realize their own closures and don't need
+            # this shell on PATH.
+            ci-dashboard = pkgs.mkShell { buildInputs = [ pkgs.bun ]; };
+
+            # CI hooks: pre-commit invokes hook tools by absolute /nix/store
+            # path, so they must be realized. rainix's rust-shell includes
+            # pre-commit + all linter packages (deadnix/nil/nixfmt/statix/
+            # taplo/yamlfmt/shellcheck/deno) without the heavy default closure.
+            ci-hooks = pkgs.mkShell (
+              {
+                shellHook = rainix.devShells.${system}.rust-shell.shellHook + rainMathFloatLink;
+                inherit (rainix.devShells.${system}.rust-shell) buildInputs;
+              }
+              // abiEnv
+            );
+          };
+      }
+    );
 
   nixConfig = {
     extra-substituters = [ "https://nix-community.cachix.org" ];

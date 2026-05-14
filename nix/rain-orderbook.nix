@@ -26,21 +26,14 @@ rec {
   };
 
   abiEnv = {
-    ST0X_IORDERBOOK_V6_ABI =
-      "${abi}/orderbook/IOrderBookV6.sol/IOrderBookV6.json";
+    ST0X_IORDERBOOK_V6_ABI = "${abi}/orderbook/IOrderBookV6.sol/IOrderBookV6.json";
     ST0X_ORDERBOOK_ABI = "${abi}/orderbook/OrderBookV6.sol/OrderBookV6.json";
     ST0X_TEST_ERC20_ABI = "${abi}/orderbook/ArbTest.sol/Token.json";
-    ST0X_TOFU_TOKEN_DECIMALS_ABI =
-      "${abi}/orderbook/TOFUTokenDecimals.sol/TOFUTokenDecimals.json";
-    ST0X_INTERPRETER_ABI =
-      "${abi}/interpreter/Rainterpreter.sol/Rainterpreter.json";
-    ST0X_STORE_ABI =
-      "${abi}/interpreter/RainterpreterStore.sol/RainterpreterStore.json";
-    ST0X_PARSER_ABI =
-      "${abi}/interpreter/RainterpreterParser.sol/RainterpreterParser.json";
-    ST0X_DEPLOYER_ABI =
-      "${abi}/interpreter/RainterpreterExpressionDeployer.sol/RainterpreterExpressionDeployer.json";
-    ST0X_DEPLOYABLE_ERC20_ABI =
-      "${abi}/interpreter/TestERC20.sol/TestERC20.json";
+    ST0X_TOFU_TOKEN_DECIMALS_ABI = "${abi}/orderbook/TOFUTokenDecimals.sol/TOFUTokenDecimals.json";
+    ST0X_INTERPRETER_ABI = "${abi}/interpreter/Rainterpreter.sol/Rainterpreter.json";
+    ST0X_STORE_ABI = "${abi}/interpreter/RainterpreterStore.sol/RainterpreterStore.json";
+    ST0X_PARSER_ABI = "${abi}/interpreter/RainterpreterParser.sol/RainterpreterParser.json";
+    ST0X_DEPLOYER_ABI = "${abi}/interpreter/RainterpreterExpressionDeployer.sol/RainterpreterExpressionDeployer.json";
+    ST0X_DEPLOYABLE_ERC20_ABI = "${abi}/interpreter/TestERC20.sol/TestERC20.json";
   };
 }

@@ -1,4 +1,8 @@
-{ pkgs, mkAbi, sources }:
+{
+  pkgs,
+  mkAbi,
+  sources,
+}:
 
 # Aggregator for the per-feature ABI derivations and the merged env-var map
 # they expose to cargo. Each entry under `nix/<feature>.nix` defines:
@@ -27,29 +31,35 @@ let
 
   envs = builtins.mapAttrs (_: feature: feature.abiEnv) features;
 
-  collisions = pkgs.lib.foldl (acc: name:
-    let
-      keys = builtins.attrNames envs.${name};
-      dups = builtins.filter (key: builtins.hasAttr key acc.seen) keys;
-      fresh = builtins.filter (key: !(builtins.hasAttr key acc.seen)) keys;
-      newSeen = pkgs.lib.genAttrs fresh (_: name);
-    in {
-      seen = acc.seen // newSeen;
-      dups = acc.dups
-        ++ map (key: "${key} (in ${acc.seen.${key}} and ${name})") dups;
-    }) {
-      seen = { };
-      dups = [ ];
-    } (builtins.attrNames envs);
+  collisions =
+    pkgs.lib.foldl
+      (
+        acc: name:
+        let
+          keys = builtins.attrNames envs.${name};
+          dups = builtins.filter (key: builtins.hasAttr key acc.seen) keys;
+          fresh = builtins.filter (key: !(builtins.hasAttr key acc.seen)) keys;
+          newSeen = pkgs.lib.genAttrs fresh (_: name);
+        in
+        {
+          seen = acc.seen // newSeen;
+          dups = acc.dups ++ map (key: "${key} (in ${acc.seen.${key}} and ${name})") dups;
+        }
+      )
+      {
+        seen = { };
+        dups = [ ];
+      }
+      (builtins.attrNames envs);
 
-  mergedEnv = if collisions.dups != [ ] then
-    throw
-    "abiEnv key collisions: ${builtins.concatStringsSep ", " collisions.dups}"
-  else
-    builtins.foldl' (acc: name: acc // envs.${name}) { }
-    (builtins.attrNames envs);
+  mergedEnv =
+    if collisions.dups != [ ] then
+      throw "abiEnv key collisions: ${builtins.concatStringsSep ", " collisions.dups}"
+    else
+      builtins.foldl' (acc: name: acc // envs.${name}) { } (builtins.attrNames envs);
 
-in {
+in
+{
   abis = builtins.mapAttrs (_: feature: feature.abi) features;
   abiEnv = mergedEnv;
 }

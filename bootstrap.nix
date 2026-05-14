@@ -1,10 +1,16 @@
-{ lib, modulesPath, environment, ... }:
+{
+  lib,
+  modulesPath,
+  environment,
+  ...
+}:
 
 let
   inherit (import ./keys.nix) roles;
   envRoles = roles.${environment};
 
-in {
+in
+{
   imports = [
     (modulesPath + "/virtualisation/digital-ocean-config.nix")
     (modulesPath + "/profiles/qemu-guest.nix")
@@ -23,7 +29,10 @@ in {
       enable = true;
       network.enable = true;
       settings = {
-        datasource_list = [ "ConfigDrive" "Digitalocean" ];
+        datasource_list = [
+          "ConfigDrive"
+          "Digitalocean"
+        ];
         datasource.ConfigDrive = { };
         datasource.Digitalocean = { };
       };
@@ -45,7 +54,10 @@ in {
     allowedTCPPorts = [ 22 ];
   };
 
-  nix.settings.experimental-features = [ "nix-command" "flakes" ];
+  nix.settings.experimental-features = [
+    "nix-command"
+    "flakes"
+  ];
 
   system.stateVersion = "24.11";
 }
