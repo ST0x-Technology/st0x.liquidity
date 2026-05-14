@@ -255,6 +255,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
+            required_confirmations: 0,
         }
     }
 

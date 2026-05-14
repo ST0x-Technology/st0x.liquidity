@@ -15,6 +15,14 @@ beneficiary_entity_name = "Acme Corp"
 [raindex]
 orderbook = "0x1111111111111111111111111111111111111111"
 deployment_block = 1
+# Number of block confirmations required before an event is considered
+# safe to ingest. Naive reorg protection (NOT real chain finality):
+# backfill caps `to_block` at `latest - required_confirmations`, and live
+# ingestion defers persistence until events are this many blocks deep.
+# A deep reorg exceeding this depth will still corrupt state; the
+# monitor surfaces that case loudly rather than masking it. Set
+# explicitly per chain based on observed reorg behavior.
+required_confirmations = 3
 
 # Wallet provider — select via `kind`:
 #   "turnkey"     — Turnkey secure enclave signing   (requires --features wallet-turnkey)

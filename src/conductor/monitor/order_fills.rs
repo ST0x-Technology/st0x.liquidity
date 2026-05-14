@@ -4,12 +4,25 @@
 //! On every (re)connect -- both initial startup and supervisor restarts
 //! after a WebSocket disconnect -- the monitor:
 //! 1. Subscribes to fresh `ClearV3` / `TakeOrderV3` streams.
-//! 2. Determines a cutoff block from the provider's current head.
+//! 2. Determines a cutoff block from the provider's latest tip minus
+//!    `required_confirmations`.
 //! 3. Enqueues a `BackfillRange` apalis job covering
 //!    `(checkpoint+1, cutoff)` to recover events emitted while the
-//!    previous subscription was unavailable.
-//! 4. Enters the live listen loop, advancing the backfill checkpoint
-//!    after every event is durably enqueued.
+//!    previous subscription was unavailable. The cutoff never exceeds
+//!    the confirmation boundary, so backfill never returns logs from
+//!    blocks that could still reorg (under the assumed reorg depth).
+//! 4. Enters the live listen loop, which buffers events in-memory and
+//!    only flushes (persists, advances checkpoint) once an event is
+//!    `required_confirmations` blocks behind the highest observed tip.
+//!    `removed: true` logs are observed explicitly -- dropped from the
+//!    buffer if present, or surfaced as a loud error if they target an
+//!    already-flushed event (which the confirmation gate should make
+//!    impossible under that assumption).
+//!
+//! Note: `required_confirmations` is a naive reorg-protection heuristic,
+//! not real chain finality. A deep reorg exceeding the configured depth
+//! will still corrupt state; the design surfaces that case loudly
+//! rather than masking it.
 //!
 //! The supervisor's restart policy provides automatic reconnection;
 //! this design keeps the disconnect-window data loss issue from
@@ -21,6 +34,7 @@ use alloy::providers::WsConnect;
 use alloy::sol_types;
 use futures_util::{Stream, StreamExt};
 use sqlx::SqlitePool;
+use std::collections::BTreeMap;
 use task_supervisor::{SupervisedTask, TaskResult};
 use tracing::{debug, error, info, trace, warn};
 
@@ -76,6 +90,16 @@ impl SupervisedTask for OrderFillMonitor {
 enum OrderFillMonitorError {
     #[error("{0} event stream closed unexpectedly")]
     StreamClosed(&'static str),
+    #[error(
+        "received `removed: true` for log past the confirmation depth \
+         (tx_hash={tx_hash:?}, log_index={log_index}, block={block_number}): \
+         a deep reorg crossed `required_confirmations` blocks; review chain stability"
+    )]
+    RemovedPastConfirmations {
+        tx_hash: alloy::primitives::TxHash,
+        log_index: u64,
+        block_number: u64,
+    },
 }
 
 impl OrderFillMonitor {
@@ -99,12 +123,13 @@ impl OrderFillMonitor {
             .await
     }
 
-    /// Enqueues a `BackfillRange` job for the gap since the last
-    /// checkpoint, then enters the live listen loop. Backfill is
-    /// enqueued before any awaitable work that could be preempted so
-    /// that the job is durably persisted even if the supervisor or
-    /// runtime aborts the task mid-startup. Split out so unit tests
-    /// can drive the post-subscribe path with mocked streams.
+    /// Enqueues a `BackfillRange` job for the gap between the last
+    /// checkpoint and the confirmation boundary, then enters the live
+    /// listen loop. Backfill is enqueued before any awaitable work
+    /// that could be preempted so that the job is durably persisted
+    /// even if the supervisor or runtime aborts the task mid-startup.
+    /// Split out so unit tests can drive the post-subscribe path with
+    /// mocked streams.
     async fn prepare_and_listen<P, ClearEvents, TakeOrderEvents>(
         &mut self,
         provider: &P,
@@ -118,18 +143,24 @@ impl OrderFillMonitor {
         TakeOrderEvents:
             Stream<Item = Result<(TakeOrderV3, alloy::rpc::types::Log), sol_types::Error>> + Unpin,
     {
-        // Cutoff is the provider's current head at the moment of
-        // (re)connect: events at or before this block are caught by
-        // backfill, events after it are caught by the live stream.
-        // The two ranges may overlap at the boundary; OnChainTrade
-        // deduplicates by (tx_hash, log_index).
-        let cutoff_block = provider.get_block_number().await?;
+        // Cutoff is the latest confirmed block at (re)connect time:
+        // events at or before this block are caught by backfill (which
+        // is guaranteed not to ingest logs above the confirmation
+        // boundary), events after it are caught by the live stream's
+        // buffer (which defers persistence until the same confirmation
+        // depth). The two ranges may overlap at the boundary;
+        // downstream dedupes by (tx_hash, log_index).
+        let cutoff_block = latest_confirmed_block(provider, self.evm_ctx.required_confirmations)
+            .await?
+            .unwrap_or(0);
         let from_block = backfill_start_block(&self.pool, &self.evm_ctx).await?;
 
         if from_block <= cutoff_block {
             info!(
                 from_block,
-                cutoff_block, "Enqueuing backfill range for missed events on (re)connect"
+                cutoff_block,
+                required_confirmations = self.evm_ctx.required_confirmations,
+                "Enqueuing backfill range for missed events on (re)connect"
             );
 
             self.backfill_queue
@@ -149,12 +180,26 @@ impl OrderFillMonitor {
     }
 }
 
+/// Latest block past the configured confirmation depth:
+/// `latest_tip - required_confirmations`. Returns `None` when the chain has
+/// fewer blocks than the requested confirmation depth (no block is
+/// safe to ingest yet). This is a naive reorg-protection heuristic,
+/// not real chain finality.
+pub(crate) async fn latest_confirmed_block<P: Provider>(
+    provider: &P,
+    required_confirmations: u64,
+) -> Result<Option<u64>, alloy::transports::RpcError<alloy::transports::TransportErrorKind>> {
+    let tip = provider.get_block_number().await?;
+    Ok(tip.checked_sub(required_confirmations))
+}
+
 /// Tracks the highest block observed on each WS subscription so the
-/// reconnect-time backfill checkpoint only advances past blocks that
-/// both streams have crossed. `listen()` merges two unordered
-/// subscriptions; advancing solely from the latest event would risk
-/// skipping straggling events on the other stream when a future
-/// backfill resumes from `checkpoint+1`.
+/// checkpoint only advances past blocks that both streams have
+/// crossed *and* that are behind the confirmation boundary. `listen()`
+/// merges two unordered subscriptions; advancing solely from the
+/// latest event on one stream would risk skipping straggling events
+/// on the other stream when a future backfill resumes from
+/// `checkpoint+1`.
 #[derive(Default)]
 struct StreamWatermarks {
     clear_high: Option<u64>,
@@ -170,12 +215,65 @@ impl StreamWatermarks {
         *slot = Some(slot.map_or(block, |existing| existing.max(block)));
     }
 
-    /// The highest block both streams have provably crossed. Returns
-    /// `None` until at least one event has been observed on each stream.
-    fn safe_advance_to(&self) -> Option<u64> {
+    /// The highest block both streams have provably crossed (returns
+    /// `None` until at least one event has been observed on each
+    /// stream). Caller intersects this with the confirmation boundary.
+    fn observed_on_both(&self) -> Option<u64> {
         self.clear_high
             .zip(self.take_high)
-            .and_then(|(clear, take)| clear.min(take).checked_sub(1))
+            .map(|(clear, take)| clear.min(take))
+    }
+
+    /// The highest block observed on *any* stream so far. Used as the
+    /// "tip" estimate for the buffer-flush confirmation check, since live
+    /// events implicitly tell us the chain head has at least reached
+    /// their block number.
+    fn highest_observed(&self) -> Option<u64> {
+        match (self.clear_high, self.take_high) {
+            (Some(clear), Some(take)) => Some(clear.max(take)),
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            (None, None) => None,
+        }
+    }
+}
+
+/// In-memory buffer of events emitted by the live WS subscription
+/// that have not yet reached `required_confirmations` blocks behind the
+/// tip.
+///
+/// Ordering by `(block_number, log_index)` lets us cheaply drain the
+/// prefix of entries whose block is at or below the confirmation
+/// boundary on every iteration. The buffer is local to the running
+/// monitor task; on supervisor restart it's dropped, but reconnect-time
+/// backfill (which also caps at the confirmation boundary) recovers
+/// any unflushed events whose blocks have since cleared the
+/// confirmation depth.
+#[derive(Default)]
+struct LiveEventBuffer {
+    entries: BTreeMap<(u64, u64), EmittedOnChain<RaindexTradeEvent>>,
+}
+
+impl LiveEventBuffer {
+    fn insert(&mut self, event: EmittedOnChain<RaindexTradeEvent>) {
+        self.entries
+            .insert((event.block_number, event.log_index), event);
+    }
+
+    /// Remove a buffered entry if present. Returns whether removal
+    /// happened, so the caller can distinguish "reverted before
+    /// confirmation depth reached" from "reverted after confirmation
+    /// depth reached" (the latter is an error our design should
+    /// prevent under the assumed reorg depth).
+    fn remove(&mut self, block_number: u64, log_index: u64) -> bool {
+        self.entries.remove(&(block_number, log_index)).is_some()
+    }
+
+    /// Drain all entries with `block_number <= boundary`. Returned
+    /// entries are ordered by `(block_number, log_index)`.
+    fn drain_through(&mut self, boundary: u64) -> Vec<EmittedOnChain<RaindexTradeEvent>> {
+        let keep = self.entries.split_off(&(boundary + 1, 0));
+        let drained = std::mem::replace(&mut self.entries, keep);
+        drained.into_values().collect()
     }
 }
 
@@ -192,6 +290,7 @@ impl OrderFillMonitor {
             Stream<Item = Result<(TakeOrderV3, alloy::rpc::types::Log), sol_types::Error>> + Unpin,
     {
         let mut watermarks = StreamWatermarks::default();
+        let mut buffer = LiveEventBuffer::default();
         loop {
             let (event, log) = tokio::select! {
                 item = clear_stream.next() => {
@@ -213,16 +312,21 @@ impl OrderFillMonitor {
                 }
             };
 
-            self.enqueue_trade_event(event, &log, &mut watermarks)
+            self.handle_log(event, &log, &mut watermarks, &mut buffer)
                 .await?;
         }
     }
 
-    async fn enqueue_trade_event(
+    /// Handles one log delivered by the live WS subscription:
+    /// observes the watermark, branches on `log.removed`, buffers
+    /// otherwise, and flushes the buffer up to the current
+    /// confirmation boundary derived from the highest observed tip.
+    async fn handle_log(
         &mut self,
         event: RaindexTradeEvent,
         log: &alloy::rpc::types::Log,
         watermarks: &mut StreamWatermarks,
+        buffer: &mut LiveEventBuffer,
     ) -> TaskResult {
         let trade_event = match EmittedOnChain::<RaindexTradeEvent>::from_log(event, log) {
             Ok(trade_event) => trade_event,
@@ -232,29 +336,133 @@ impl OrderFillMonitor {
             }
         };
 
-        let block_number = trade_event.block_number;
+        if log.removed {
+            return self.handle_removed(&trade_event, buffer);
+        }
+
+        watermarks.observe(&trade_event.event, trade_event.block_number);
 
         trace!(
             target: "hedge",
             tx_hash = ?trade_event.tx_hash,
             log_index = trade_event.log_index,
-            "Enqueuing trade accounting job"
+            block_number = trade_event.block_number,
+            "Buffering trade event pending confirmation depth"
         );
 
-        watermarks.observe(&trade_event.event, block_number);
+        buffer.insert(trade_event);
 
-        self.job_queue
-            .push(AccountForDexTrade { trade: trade_event })
-            .await?;
+        self.flush_buffer(buffer, watermarks).await
+    }
 
-        // Apalis storage now durably owns this event. Only advance the
-        // checkpoint past blocks that both streams have crossed --
-        // otherwise a straggling event on the slower stream could be
-        // skipped when a future backfill resumes from `checkpoint+1`.
-        // The checkpoint is monotonic via `MAX(...)` upsert, so calling
-        // `save_backfill_checkpoint` with a stale value is harmless.
-        if let Some(advance_to) = watermarks.safe_advance_to() {
-            save_backfill_checkpoint(&self.pool, &self.evm_ctx, advance_to).await?;
+    /// Handles a removed log. If the event is still buffered (i.e.,
+    /// reverted before reaching the configured confirmation depth),
+    /// drop it and log info -- the system never persisted it, so no
+    /// follow-up is needed.
+    ///
+    /// If the event is not in the buffer, it was already flushed and
+    /// downstream jobs have run against it. Our confirmation gate
+    /// should make this impossible under the assumed reorg depth; emit
+    /// a loud error tagged with the identifying metadata so the
+    /// deep-reorg case is visible to operators and is surfaced as an
+    /// error rather than silently consumed.
+    fn handle_removed(
+        &self,
+        trade_event: &EmittedOnChain<RaindexTradeEvent>,
+        buffer: &mut LiveEventBuffer,
+    ) -> TaskResult {
+        if buffer.remove(trade_event.block_number, trade_event.log_index) {
+            info!(
+                target: "hedge",
+                tx_hash = ?trade_event.tx_hash,
+                log_index = trade_event.log_index,
+                block_number = trade_event.block_number,
+                "Discarded reverted trade event before persistence (confirmation buffer absorbed reorg)"
+            );
+            return Ok(());
+        }
+
+        error!(
+            target: "hedge",
+            tx_hash = ?trade_event.tx_hash,
+            log_index = trade_event.log_index,
+            block_number = trade_event.block_number,
+            confirmations = self.evm_ctx.required_confirmations,
+            "Received `removed: true` for an already-confirmed trade event -- \
+             deep reorg crossed the confirmation depth"
+        );
+        Err(OrderFillMonitorError::RemovedPastConfirmations {
+            tx_hash: trade_event.tx_hash,
+            log_index: trade_event.log_index,
+            block_number: trade_event.block_number,
+        }
+        .into())
+    }
+
+    /// Flush any buffered events whose blocks are at or below the
+    /// confirmation boundary `highest_observed - confirmations`. Each
+    /// flushed event is pushed to the trade-accounting queue, and the
+    /// backfill checkpoint advances to the highest block that is both
+    /// past the confirmation depth *and* has been observed on both
+    /// subscriptions.
+    async fn flush_buffer(
+        &mut self,
+        buffer: &mut LiveEventBuffer,
+        watermarks: &StreamWatermarks,
+    ) -> TaskResult {
+        let Some(tip) = watermarks.highest_observed() else {
+            trace!(
+                target: "hedge",
+                "Skipping buffer flush: no highest_observed watermark yet"
+            );
+            return Ok(());
+        };
+        let Some(confirmation_boundary) = tip.checked_sub(self.evm_ctx.required_confirmations)
+        else {
+            trace!(
+                target: "hedge",
+                tip,
+                required_confirmations = self.evm_ctx.required_confirmations,
+                "Skipping buffer flush: tip too small for required_confirmations"
+            );
+            return Ok(());
+        };
+
+        let ready = buffer.drain_through(confirmation_boundary);
+        if ready.is_empty() {
+            return Ok(());
+        }
+
+        for trade_event in ready {
+            trace!(
+                target: "hedge",
+                tx_hash = ?trade_event.tx_hash,
+                log_index = trade_event.log_index,
+                block_number = trade_event.block_number,
+                "Flushing confirmed trade event to accounting queue"
+            );
+            self.job_queue
+                .push(AccountForDexTrade { trade: trade_event })
+                .await?;
+        }
+
+        // Apalis storage now durably owns flushed events. Advance the
+        // checkpoint to the highest block that is both past the
+        // confirmation depth and crossed by both streams -- the
+        // monotonic guard intersected with the confirmation boundary.
+        let Some(both_streams) = watermarks.observed_on_both() else {
+            trace!(
+                target: "hedge",
+                clear_high = ?watermarks.clear_high,
+                take_high = ?watermarks.take_high,
+                confirmation_boundary,
+                "Deferring checkpoint advance: only one stream observed so far"
+            );
+            return Ok(());
+        };
+        let advance_to = both_streams.min(confirmation_boundary);
+        if let Some(checkpoint) = advance_to.checked_sub(1) {
+            save_backfill_checkpoint(&self.pool, &self.evm_ctx, checkpoint).await?;
         }
 
         Ok(())
@@ -280,6 +488,12 @@ mod tests {
     }
 
     async fn create_test_monitor_with_pool() -> (OrderFillMonitor, SqlitePool, EvmCtx) {
+        create_test_monitor_with_confirmations(0).await
+    }
+
+    async fn create_test_monitor_with_confirmations(
+        required_confirmations: u64,
+    ) -> (OrderFillMonitor, SqlitePool, EvmCtx) {
         let pool = setup_test_db().await;
         setup_apalis_tables(&pool).await.unwrap();
         let job_queue = DexTradeAccountingJobQueue::new(&pool);
@@ -289,6 +503,7 @@ mod tests {
             ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
             orderbook: Address::ZERO,
             deployment_block: 1,
+            required_confirmations,
         };
 
         let monitor =
@@ -319,6 +534,30 @@ mod tests {
             config: TakeOrderConfigV4::default(),
             input: alloy::primitives::B256::ZERO,
             output: alloy::primitives::B256::ZERO,
+        }
+    }
+
+    fn log_at_block(block_number: u64) -> alloy::rpc::types::Log {
+        log_at_block_with_index(block_number, 0, false)
+    }
+
+    fn log_at_block_with_index(
+        block_number: u64,
+        log_index: u64,
+        removed: bool,
+    ) -> alloy::rpc::types::Log {
+        alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: Address::ZERO,
+                data: alloy::primitives::LogData::empty(),
+            },
+            block_hash: None,
+            block_number: Some(block_number),
+            block_timestamp: None,
+            transaction_hash: Some(alloy::primitives::B256::ZERO),
+            transaction_index: None,
+            log_index: Some(log_index),
+            removed,
         }
     }
 
@@ -409,14 +648,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enqueue_trade_event_persists_to_storage() {
+    async fn handle_log_persists_to_storage() {
         let (mut monitor, pool, _evm_ctx) = create_test_monitor_with_pool().await;
         let log = create_log(42);
         let event = RaindexTradeEvent::ClearV3(Box::new(test_clear_event()));
         let mut watermarks = StreamWatermarks::default();
+        let mut buffer = LiveEventBuffer::default();
 
         monitor
-            .enqueue_trade_event(event, &log, &mut watermarks)
+            .handle_log(event, &log, &mut watermarks, &mut buffer)
             .await
             .unwrap();
 
@@ -424,7 +664,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enqueue_trade_event_survives_invalid_log() {
+    async fn handle_log_survives_invalid_log() {
         let (mut monitor, pool, _evm_ctx) = create_test_monitor_with_pool().await;
 
         let invalid_log = alloy::rpc::types::Log {
@@ -443,9 +683,10 @@ mod tests {
 
         let event = RaindexTradeEvent::ClearV3(Box::new(test_clear_event()));
         let mut watermarks = StreamWatermarks::default();
+        let mut buffer = LiveEventBuffer::default();
 
         monitor
-            .enqueue_trade_event(event, &invalid_log, &mut watermarks)
+            .handle_log(event, &invalid_log, &mut watermarks, &mut buffer)
             .await
             .unwrap();
 
@@ -473,31 +714,16 @@ mod tests {
         assert_eq!(job_count(&pool).await, 2);
     }
 
-    fn log_at_block(block_number: u64) -> alloy::rpc::types::Log {
-        alloy::rpc::types::Log {
-            inner: alloy::primitives::Log {
-                address: Address::ZERO,
-                data: alloy::primitives::LogData::empty(),
-            },
-            block_hash: None,
-            block_number: Some(block_number),
-            block_timestamp: None,
-            transaction_hash: Some(alloy::primitives::B256::ZERO),
-            transaction_index: None,
-            log_index: Some(0),
-            removed: false,
-        }
-    }
-
     #[tokio::test]
-    async fn enqueue_trade_event_does_not_advance_until_both_streams_observed() {
+    async fn handle_log_does_not_advance_until_both_streams_observed() {
         let (mut monitor, pool, evm_ctx) = create_test_monitor_with_pool().await;
         let log = log_at_block(100);
         let event = RaindexTradeEvent::ClearV3(Box::new(test_clear_event()));
         let mut watermarks = StreamWatermarks::default();
+        let mut buffer = LiveEventBuffer::default();
 
         monitor
-            .enqueue_trade_event(event, &log, &mut watermarks)
+            .handle_log(event, &log, &mut watermarks, &mut buffer)
             .await
             .unwrap();
 
@@ -512,18 +738,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enqueue_trade_event_advances_to_min_of_both_streams() {
+    async fn handle_log_advances_to_min_of_both_streams() {
         let (mut monitor, pool, evm_ctx) = create_test_monitor_with_pool().await;
         let mut watermarks = StreamWatermarks::default();
+        let mut buffer = LiveEventBuffer::default();
 
         let clear_log = log_at_block(200);
         let take_log = log_at_block(150);
 
         monitor
-            .enqueue_trade_event(
+            .handle_log(
                 RaindexTradeEvent::ClearV3(Box::new(test_clear_event())),
                 &clear_log,
                 &mut watermarks,
+                &mut buffer,
             )
             .await
             .unwrap();
@@ -537,53 +765,60 @@ mod tests {
         );
 
         monitor
-            .enqueue_trade_event(
+            .handle_log(
                 RaindexTradeEvent::TakeOrderV3(Box::new(test_take_event())),
                 &take_log,
                 &mut watermarks,
+                &mut buffer,
             )
             .await
             .unwrap();
 
-        // Both observed: advance to min(200, 150) - 1 = 149.
+        // Both observed (clear=200, take=150). With required_confirmations=0,
+        // confirmation_boundary = 200, both_streams = 150,
+        // advance_to = 150, checkpoint = 149.
         assert_eq!(
             crate::onchain::backfill::load_backfill_checkpoint(&pool, &evm_ctx)
                 .await
                 .unwrap(),
             Some(149),
-            "checkpoint must advance to min(clear_high, take_high) - 1"
+            "checkpoint must advance to min(both_streams, confirmation_boundary) - 1"
         );
     }
 
     #[tokio::test]
-    async fn enqueue_trade_event_checkpoint_is_monotonic() {
+    async fn handle_log_checkpoint_is_monotonic() {
         let (mut monitor, pool, evm_ctx) = create_test_monitor_with_pool().await;
         let mut watermarks = StreamWatermarks::default();
+        let mut buffer = LiveEventBuffer::default();
 
         // Establish initial frontier at block 200 on both streams.
         monitor
-            .enqueue_trade_event(
+            .handle_log(
                 RaindexTradeEvent::ClearV3(Box::new(test_clear_event())),
                 &log_at_block(200),
                 &mut watermarks,
+                &mut buffer,
             )
             .await
             .unwrap();
         monitor
-            .enqueue_trade_event(
+            .handle_log(
                 RaindexTradeEvent::TakeOrderV3(Box::new(test_take_event())),
                 &log_at_block(200),
                 &mut watermarks,
+                &mut buffer,
             )
             .await
             .unwrap();
 
         // An out-of-order earlier event must not rewind the checkpoint.
         monitor
-            .enqueue_trade_event(
+            .handle_log(
                 RaindexTradeEvent::ClearV3(Box::new(test_clear_event())),
                 &log_at_block(50),
                 &mut watermarks,
+                &mut buffer,
             )
             .await
             .unwrap();
@@ -596,6 +831,51 @@ mod tests {
             checkpoint,
             Some(199),
             "checkpoint must never rewind when an out-of-order event is observed"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_and_listen_caps_cutoff_at_confirmation_boundary() {
+        // Backfill cutoff must be `latest - required_confirmations`,
+        // not the raw tip. With required_confirmations=3 and
+        // latest=105, cutoff=102.
+        let (mut monitor, pool, evm_ctx) = create_test_monitor_with_confirmations(3).await;
+
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 99)
+            .await
+            .unwrap();
+
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_success(&serde_json::Value::from(105_u64));
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let mut clear_stream =
+            stream::empty::<Result<(ClearV3, alloy::rpc::types::Log), sol_types::Error>>();
+        let mut take_stream =
+            stream::empty::<Result<(TakeOrderV3, alloy::rpc::types::Log), sol_types::Error>>();
+
+        let _ = monitor
+            .prepare_and_listen(&provider, &mut clear_stream, &mut take_stream)
+            .await;
+
+        let job_count = job_count(&pool).await;
+        assert_eq!(
+            job_count, 1,
+            "exactly one job (the BackfillRange) must be enqueued on reconnect"
+        );
+
+        let job_payload = sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT job FROM Jobs WHERE job_type LIKE '%BackfillRange%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let job: BackfillRange = serde_json::from_slice(&job_payload).unwrap();
+        assert_eq!(job.from_block, 100, "backfill must resume after checkpoint");
+        assert_eq!(
+            job.to_block, 102,
+            "backfill cutoff must equal latest tip minus required_confirmations"
         );
     }
 
@@ -615,7 +895,8 @@ mod tests {
             .unwrap();
 
         // Mock provider returns block 105 from `eth_blockNumber`,
-        // which the monitor will use as the cutoff.
+        // which (with required_confirmations=0) the monitor uses verbatim as
+        // the cutoff.
         let asserter = alloy::providers::mock::Asserter::new();
         asserter.push_success(&serde_json::Value::from(105_u64));
         let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
@@ -652,7 +933,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enqueue_trade_event_does_not_advance_on_invalid_log() {
+    async fn handle_log_does_not_advance_on_invalid_log() {
         let (mut monitor, pool, evm_ctx) = create_test_monitor_with_pool().await;
 
         let invalid_log = alloy::rpc::types::Log {
@@ -671,9 +952,10 @@ mod tests {
 
         let event = RaindexTradeEvent::ClearV3(Box::new(test_clear_event()));
         let mut watermarks = StreamWatermarks::default();
+        let mut buffer = LiveEventBuffer::default();
 
         monitor
-            .enqueue_trade_event(event, &invalid_log, &mut watermarks)
+            .handle_log(event, &invalid_log, &mut watermarks, &mut buffer)
             .await
             .unwrap();
 
@@ -685,5 +967,222 @@ mod tests {
             checkpoint, None,
             "checkpoint must not advance when the log lacks block metadata"
         );
+    }
+
+    #[tokio::test]
+    async fn handle_log_buffers_event_before_confirmations() {
+        // With required_confirmations=3, an event at block N must not be
+        // flushed until the tip advances to N+3. The first event at
+        // block 100 is the only signal we have; tip = 100,
+        // confirmation_boundary = 97. The event sits in the buffer.
+        let (mut monitor, pool, _evm_ctx) = create_test_monitor_with_confirmations(3).await;
+        let mut watermarks = StreamWatermarks::default();
+        let mut buffer = LiveEventBuffer::default();
+
+        let log = log_at_block(100);
+        monitor
+            .handle_log(
+                RaindexTradeEvent::ClearV3(Box::new(test_clear_event())),
+                &log,
+                &mut watermarks,
+                &mut buffer,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            job_count(&pool).await,
+            0,
+            "event at block 100 must not be flushed until tip reaches 103"
+        );
+        assert_eq!(
+            buffer.entries.len(),
+            1,
+            "event must remain buffered pending confirmation depth"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_log_flushes_when_confirmation_boundary_advances() {
+        // First event at block 100 (buffered). Second event at block
+        // 103 advances the tip to 103, so confirmation_boundary
+        // becomes 100. The block-100 event flushes.
+        let (mut monitor, pool, _evm_ctx) = create_test_monitor_with_confirmations(3).await;
+        let mut watermarks = StreamWatermarks::default();
+        let mut buffer = LiveEventBuffer::default();
+
+        monitor
+            .handle_log(
+                RaindexTradeEvent::ClearV3(Box::new(test_clear_event())),
+                &log_at_block(100),
+                &mut watermarks,
+                &mut buffer,
+            )
+            .await
+            .unwrap();
+        monitor
+            .handle_log(
+                RaindexTradeEvent::TakeOrderV3(Box::new(test_take_event())),
+                &log_at_block(103),
+                &mut watermarks,
+                &mut buffer,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            job_count(&pool).await,
+            1,
+            "block-100 event must flush once confirmation_boundary=100 is reached"
+        );
+        assert_eq!(
+            buffer.entries.len(),
+            1,
+            "block-103 event must remain buffered (boundary is 100)"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_log_removed_pre_confirmation_drops_from_buffer() {
+        // A `removed: true` log for a still-buffered event must drop
+        // it cleanly without erroring -- the confirmation buffer
+        // absorbed the reorg.
+        let (mut monitor, pool, _evm_ctx) = create_test_monitor_with_confirmations(3).await;
+        let mut watermarks = StreamWatermarks::default();
+        let mut buffer = LiveEventBuffer::default();
+
+        monitor
+            .handle_log(
+                RaindexTradeEvent::ClearV3(Box::new(test_clear_event())),
+                &log_at_block_with_index(100, 0, false),
+                &mut watermarks,
+                &mut buffer,
+            )
+            .await
+            .unwrap();
+        assert_eq!(buffer.entries.len(), 1, "event must be buffered");
+
+        monitor
+            .handle_log(
+                RaindexTradeEvent::ClearV3(Box::new(test_clear_event())),
+                &log_at_block_with_index(100, 0, true),
+                &mut watermarks,
+                &mut buffer,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            buffer.entries.len(),
+            0,
+            "removed log must drop the buffered entry"
+        );
+        assert_eq!(
+            job_count(&pool).await,
+            0,
+            "removed event must never be flushed to the job queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_log_removed_does_not_advance_watermark() {
+        // A removed log represents reverted chain state, so its block
+        // number must not contribute to the tip estimate. Otherwise an
+        // out-of-order `removed: true` could prematurely advance the
+        // confirmation boundary and flush still-unconfirmed entries.
+        let (mut monitor, _pool, _evm_ctx) = create_test_monitor_with_confirmations(3).await;
+        let mut watermarks = StreamWatermarks::default();
+        let mut buffer = LiveEventBuffer::default();
+
+        // Seed the buffer with an event at block 100 so handle_removed
+        // takes the buffered-drop branch instead of erroring.
+        monitor
+            .handle_log(
+                RaindexTradeEvent::ClearV3(Box::new(test_clear_event())),
+                &log_at_block_with_index(100, 0, false),
+                &mut watermarks,
+                &mut buffer,
+            )
+            .await
+            .unwrap();
+        assert_eq!(watermarks.highest_observed(), Some(100));
+
+        // A removed log at a far-future block must not advance the
+        // watermark -- the reverted chain doesn't prove forward
+        // progress.
+        monitor
+            .handle_log(
+                RaindexTradeEvent::TakeOrderV3(Box::new(test_take_event())),
+                &log_at_block_with_index(1000, 0, true),
+                &mut watermarks,
+                &mut buffer,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            watermarks.highest_observed(),
+            Some(100),
+            "removed log must not advance the watermark"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_log_removed_past_confirmations_errors() {
+        // If a `removed: true` log arrives for an event that is no
+        // longer in the buffer (i.e., already flushed), the
+        // confirmation gate failed -- a deep reorg crossed our depth.
+        // Must surface as a loud error rather than be silently
+        // consumed.
+        let (mut monitor, _pool, _evm_ctx) = create_test_monitor_with_confirmations(3).await;
+        let mut watermarks = StreamWatermarks::default();
+        let mut buffer = LiveEventBuffer::default();
+
+        // No prior insert -- simulate that the event was already
+        // flushed and the buffer no longer holds it.
+        let result = monitor
+            .handle_log(
+                RaindexTradeEvent::ClearV3(Box::new(test_clear_event())),
+                &log_at_block_with_index(100, 7, true),
+                &mut watermarks,
+                &mut buffer,
+            )
+            .await;
+
+        let error = result
+            .unwrap_err()
+            .downcast::<OrderFillMonitorError>()
+            .expect("expected OrderFillMonitorError");
+        assert!(
+            matches!(
+                *error,
+                OrderFillMonitorError::RemovedPastConfirmations {
+                    log_index: 7,
+                    block_number: 100,
+                    ..
+                }
+            ),
+            "expected RemovedPastConfirmations variant, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_confirmed_block_subtracts_confirmations() {
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_success(&serde_json::Value::from(105_u64));
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let confirmed = latest_confirmed_block(&provider, 3).await.unwrap();
+        assert_eq!(confirmed, Some(102));
+    }
+
+    #[tokio::test]
+    async fn latest_confirmed_block_returns_none_when_chain_too_shallow() {
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_success(&serde_json::Value::from(2_u64));
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let confirmed = latest_confirmed_block(&provider, 3).await.unwrap();
+        assert_eq!(confirmed, None);
     }
 }

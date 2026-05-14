@@ -634,6 +634,7 @@ mod tests {
             ws_rpc_url: "ws://localhost:8545".parse().unwrap(),
             orderbook: Address::ZERO,
             deployment_block: 0,
+            required_confirmations: 0,
         };
 
         let tx_hash =

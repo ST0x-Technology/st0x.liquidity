@@ -26,6 +26,9 @@ beneficiary_entity_name = "T0 TRADE (BVI) LTD"
 orderbook = "0xe522cB4a5fCb2eb31a52Ff41a4653d85A4fd7C9D"
 # Block number to start backfilling order events from.
 deployment_block = 43259507
+# Block confirmations required before an event is ingested
+# (naive reorg protection, not real chain finality).
+required_confirmations = 3
 
 # Wallet configuration (Turnkey secure enclave signing).
 [wallet]
