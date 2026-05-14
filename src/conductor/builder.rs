@@ -38,6 +38,10 @@ use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::raindex::RaindexService;
 use crate::onchain_trade::OnChainTrade;
 use crate::position::Position;
+use crate::rebalancing::{
+    EquityRebalancingCheck, EquityRebalancingCheckScheduler, RebalancingService,
+    UsdcRebalancingCheck, UsdcRebalancingCheckScheduler,
+};
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::ExecutionThreshold;
 use crate::tokenization::Tokenizer;
@@ -83,6 +87,9 @@ pub(crate) fn spawn<Prov, Exec>(
     poll_status_queue: PollOrderStatusJobQueue,
     reconcile_queue: ReconcileOrderFillJobQueue,
     rejection_queue: HandleOrderRejectionJobQueue,
+    equity_check_scheduler: EquityRebalancingCheckScheduler,
+    usdc_check_scheduler: UsdcRebalancingCheckScheduler,
+    rebalancing_service: Option<Arc<RebalancingService>>,
     job_cleanup: JoinHandle<()>,
     executor_maintenance: Option<JoinHandle<()>>,
     rebalancer: Option<JoinHandle<()>>,
@@ -221,21 +228,25 @@ where
         .build()
         .run();
 
-    let monitor = spawn_apalis_monitor(MonitorWiring {
+    let monitor = MonitorWiring {
         accountant_ctx,
         hedge_ctx,
         poll_status_ctx,
         reconcile_ctx,
         rejection_ctx,
+        rebalancing_check_ctx: rebalancing_service,
         job_queue,
         hedge_queue,
         backfill_queue,
         poll_status_queue,
         reconcile_queue,
         rejection_queue,
+        equity_check_scheduler,
+        usdc_check_scheduler,
         #[cfg(any(test, feature = "test-support"))]
         failure_injector: context.failure_injector,
-    });
+    }
+    .spawn_apalis_monitor();
 
     Conductor {
         supervisor,
@@ -247,8 +258,9 @@ where
 }
 
 /// Owns every queue, ctx and toggle the apalis monitor needs. The wiring is
-/// only meaningful for one call to [`spawn_apalis_monitor`], which moves the
-/// whole struct into a `tokio::spawn` and registers each worker.
+/// only meaningful for one call to [`MonitorWiring::spawn_apalis_monitor`],
+/// which moves the whole struct into a `tokio::spawn` and registers each
+/// worker.
 struct MonitorWiring<Prov, Exec>
 where
     Prov: Provider + Clone + Send + Sync + 'static,
@@ -261,155 +273,203 @@ where
     poll_status_ctx: Arc<PollOrderStatusCtx<Exec>>,
     reconcile_ctx: Arc<ReconcileOrderFillCtx>,
     rejection_ctx: Arc<HandleOrderRejectionCtx>,
+    rebalancing_check_ctx: Option<Arc<RebalancingService>>,
     job_queue: DexTradeAccountingJobQueue,
     hedge_queue: HedgeJobQueue,
     backfill_queue: BackfillJobQueue,
     poll_status_queue: PollOrderStatusJobQueue,
     reconcile_queue: ReconcileOrderFillJobQueue,
     rejection_queue: HandleOrderRejectionJobQueue,
+    equity_check_scheduler: EquityRebalancingCheckScheduler,
+    usdc_check_scheduler: UsdcRebalancingCheckScheduler,
     #[cfg(any(test, feature = "test-support"))]
     failure_injector: FailureInjector,
 }
 
-fn spawn_apalis_monitor<Prov, Exec>(
-    wiring: MonitorWiring<Prov, Exec>,
-) -> JoinHandle<Result<(), MonitorTaskError>>
+impl<Prov, Exec> MonitorWiring<Prov, Exec>
 where
     Prov: Provider + Clone + Send + Sync + 'static,
     Exec: Executor + Clone + Send + Sync + 'static,
     TradeAccountingError: From<Exec::Error>,
     crate::offchain::order::JobError: From<Exec::Error>,
 {
-    let MonitorWiring {
-        accountant_ctx,
-        hedge_ctx,
-        poll_status_ctx,
-        reconcile_ctx,
-        rejection_ctx,
-        job_queue,
-        hedge_queue,
-        backfill_queue,
-        poll_status_queue,
-        reconcile_queue,
-        rejection_queue,
+    fn spawn_apalis_monitor(self) -> JoinHandle<Result<(), MonitorTaskError>> {
+        let Self {
+            accountant_ctx,
+            hedge_ctx,
+            poll_status_ctx,
+            reconcile_ctx,
+            rejection_ctx,
+            rebalancing_check_ctx,
+            job_queue,
+            hedge_queue,
+            backfill_queue,
+            poll_status_queue,
+            reconcile_queue,
+            rejection_queue,
+            equity_check_scheduler,
+            usdc_check_scheduler,
+            #[cfg(any(test, feature = "test-support"))]
+            failure_injector,
+        } = self;
+
         #[cfg(any(test, feature = "test-support"))]
-        failure_injector,
-    } = wiring;
+        let failure_injector_for_hedge = failure_injector.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let failure_injector_for_backfill = failure_injector.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let failure_injector_for_poll = failure_injector.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let failure_injector_for_reconcile = failure_injector.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let failure_injector_for_rejection = failure_injector.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let failure_injector_for_equity_rebalancing_check = failure_injector.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let failure_injector_for_usdc_rebalancing_check = failure_injector.clone();
+        let failure_notify = Arc::new(tokio::sync::Notify::new());
+        let failure_notify_for_hedge = failure_notify.clone();
+        let failure_notify_for_backfill = failure_notify.clone();
+        let failure_notify_for_poll = failure_notify.clone();
+        let failure_notify_for_reconcile = failure_notify.clone();
+        let failure_notify_for_rejection = failure_notify.clone();
+        let failure_notify_for_equity_rebalancing_check = failure_notify.clone();
+        let failure_notify_for_usdc_rebalancing_check = failure_notify.clone();
+        let failure_notify_for_select = failure_notify.clone();
 
-    #[cfg(any(test, feature = "test-support"))]
-    let failure_injector_for_hedge = failure_injector.clone();
-    #[cfg(any(test, feature = "test-support"))]
-    let failure_injector_for_backfill = failure_injector.clone();
-    #[cfg(any(test, feature = "test-support"))]
-    let failure_injector_for_poll = failure_injector.clone();
-    #[cfg(any(test, feature = "test-support"))]
-    let failure_injector_for_reconcile = failure_injector.clone();
-    #[cfg(any(test, feature = "test-support"))]
-    let failure_injector_for_rejection = failure_injector.clone();
-    let failure_notify = Arc::new(tokio::sync::Notify::new());
-    let failure_notify_for_hedge = failure_notify.clone();
-    let failure_notify_for_backfill = failure_notify.clone();
-    let failure_notify_for_poll = failure_notify.clone();
-    let failure_notify_for_reconcile = failure_notify.clone();
-    let failure_notify_for_rejection = failure_notify.clone();
-    let failure_notify_for_select = failure_notify.clone();
+        let fail_stop = CircuitBreakerConfig::default()
+            .with_failure_threshold(1)
+            .with_recovery_timeout(FAIL_STOP_RECOVERY_TIMEOUT);
+        let fail_stop_for_hedge = fail_stop.clone();
+        let fail_stop_for_backfill = fail_stop.clone();
+        let fail_stop_for_poll = fail_stop.clone();
+        let fail_stop_for_reconcile = fail_stop.clone();
+        let fail_stop_for_rejection = fail_stop.clone();
+        let fail_stop_for_equity_rebalancing_check = fail_stop.clone();
+        let fail_stop_for_usdc_rebalancing_check = fail_stop.clone();
 
-    let fail_stop = CircuitBreakerConfig::default()
-        .with_failure_threshold(1)
-        .with_recovery_timeout(FAIL_STOP_RECOVERY_TIMEOUT);
-    let fail_stop_for_hedge = fail_stop.clone();
-    let fail_stop_for_backfill = fail_stop.clone();
-    let fail_stop_for_poll = fail_stop.clone();
-    let fail_stop_for_reconcile = fail_stop.clone();
-    let fail_stop_for_rejection = fail_stop.clone();
+        let accountant_ctx_for_backfill = accountant_ctx.clone();
 
-    let accountant_ctx_for_backfill = accountant_ctx.clone();
+        tokio::spawn(async move {
+            let monitor = Monitor::new()
+                .should_restart(|_ctx, _error, _attempt| false)
+                .register(move |index| {
+                    build_supervised_worker!(
+                        ::<AccountantCtx<Prov, Exec>, AccountForDexTrade>,
+                        index,
+                        job_queue.clone(),
+                        accountant_ctx.clone(),
+                        fail_stop.clone(),
+                        failure_notify.clone(),
+                        #[cfg(any(test, feature = "test-support"))]
+                        failure_injector.clone(),
+                    )
+                })
+                .register(move |index| {
+                    build_supervised_worker!(
+                        ::<HedgeCtx, PlaceHedge>,
+                        index,
+                        hedge_queue.clone(),
+                        hedge_ctx.clone(),
+                        fail_stop_for_hedge.clone(),
+                        failure_notify_for_hedge.clone(),
+                        #[cfg(any(test, feature = "test-support"))]
+                        failure_injector_for_hedge.clone(),
+                    )
+                })
+                .register(move |index| {
+                    build_supervised_worker!(
+                        ::<AccountantCtx<Prov, Exec>, BackfillRange>,
+                        index,
+                        backfill_queue.clone(),
+                        accountant_ctx_for_backfill.clone(),
+                        fail_stop_for_backfill.clone(),
+                        failure_notify_for_backfill.clone(),
+                        #[cfg(any(test, feature = "test-support"))]
+                        failure_injector_for_backfill.clone(),
+                    )
+                })
+                .register(move |index| {
+                    build_supervised_worker!(
+                        ::<PollOrderStatusCtx<Exec>, PollOrderStatus>,
+                        index,
+                        poll_status_queue.clone(),
+                        poll_status_ctx.clone(),
+                        fail_stop_for_poll.clone(),
+                        failure_notify_for_poll.clone(),
+                        #[cfg(any(test, feature = "test-support"))]
+                        failure_injector_for_poll.clone(),
+                    )
+                })
+                .register(move |index| {
+                    build_supervised_worker!(
+                        ::<ReconcileOrderFillCtx, ReconcileOrderFill>,
+                        index,
+                        reconcile_queue.clone(),
+                        reconcile_ctx.clone(),
+                        fail_stop_for_reconcile.clone(),
+                        failure_notify_for_reconcile.clone(),
+                        #[cfg(any(test, feature = "test-support"))]
+                        failure_injector_for_reconcile.clone(),
+                    )
+                })
+                .register(move |index| {
+                    build_supervised_worker!(
+                        ::<HandleOrderRejectionCtx, HandleOrderRejection>,
+                        index,
+                        rejection_queue.clone(),
+                        rejection_ctx.clone(),
+                        fail_stop_for_rejection.clone(),
+                        failure_notify_for_rejection.clone(),
+                        #[cfg(any(test, feature = "test-support"))]
+                        failure_injector_for_rejection.clone(),
+                    )
+                });
 
-    tokio::spawn(async move {
-        let apalis_monitor = Monitor::new()
-            .should_restart(|_ctx, _error, _attempt| false)
-            .register(move |index| {
-                build_supervised_worker!(
-                    ::<AccountantCtx<Prov, Exec>, AccountForDexTrade>,
-                    index,
-                    job_queue.clone(),
-                    accountant_ctx.clone(),
-                    fail_stop.clone(),
-                    failure_notify.clone(),
-                    #[cfg(any(test, feature = "test-support"))]
-                    failure_injector.clone(),
-                )
-            })
-            .register(move |index| {
-                build_supervised_worker!(
-                    ::<HedgeCtx, PlaceHedge>,
-                    index,
-                    hedge_queue.clone(),
-                    hedge_ctx.clone(),
-                    fail_stop_for_hedge.clone(),
-                    failure_notify_for_hedge.clone(),
-                    #[cfg(any(test, feature = "test-support"))]
-                    failure_injector_for_hedge.clone(),
-                )
-            })
-            .register(move |index| {
-                build_supervised_worker!(
-                    ::<AccountantCtx<Prov, Exec>, BackfillRange>,
-                    index,
-                    backfill_queue.clone(),
-                    accountant_ctx_for_backfill.clone(),
-                    fail_stop_for_backfill.clone(),
-                    failure_notify_for_backfill.clone(),
-                    #[cfg(any(test, feature = "test-support"))]
-                    failure_injector_for_backfill.clone(),
-                )
-            })
-            .register(move |index| {
-                build_supervised_worker!(
-                    ::<PollOrderStatusCtx<Exec>, PollOrderStatus>,
-                    index,
-                    poll_status_queue.clone(),
-                    poll_status_ctx.clone(),
-                    fail_stop_for_poll.clone(),
-                    failure_notify_for_poll.clone(),
-                    #[cfg(any(test, feature = "test-support"))]
-                    failure_injector_for_poll.clone(),
-                )
-            })
-            .register(move |index| {
-                build_supervised_worker!(
-                    ::<ReconcileOrderFillCtx, ReconcileOrderFill>,
-                    index,
-                    reconcile_queue.clone(),
-                    reconcile_ctx.clone(),
-                    fail_stop_for_reconcile.clone(),
-                    failure_notify_for_reconcile.clone(),
-                    #[cfg(any(test, feature = "test-support"))]
-                    failure_injector_for_reconcile.clone(),
-                )
-            })
-            .register(move |index| {
-                build_supervised_worker!(
-                    ::<HandleOrderRejectionCtx, HandleOrderRejection>,
-                    index,
-                    rejection_queue.clone(),
-                    rejection_ctx.clone(),
-                    fail_stop_for_rejection.clone(),
-                    failure_notify_for_rejection.clone(),
-                    #[cfg(any(test, feature = "test-support"))]
-                    failure_injector_for_rejection.clone(),
-                )
-            });
+            let apalis_monitor = if let Some(rebalancing_service) = rebalancing_check_ctx {
+                let equity_service = Arc::clone(&rebalancing_service);
+                let usdc_service = rebalancing_service;
+                let equity_queue = equity_check_scheduler.queue().clone();
+                let usdc_queue = usdc_check_scheduler.queue().clone();
+                monitor
+                    .register(move |index| {
+                        build_supervised_worker!(
+                            ::<RebalancingService, EquityRebalancingCheck>,
+                            index,
+                            equity_queue.clone(),
+                            equity_service.clone(),
+                            fail_stop_for_equity_rebalancing_check.clone(),
+                            failure_notify_for_equity_rebalancing_check.clone(),
+                            #[cfg(any(test, feature = "test-support"))]
+                            failure_injector_for_equity_rebalancing_check.clone(),
+                        )
+                    })
+                    .register(move |index| {
+                        build_supervised_worker!(
+                            ::<RebalancingService, UsdcRebalancingCheck>,
+                            index,
+                            usdc_queue.clone(),
+                            usdc_service.clone(),
+                            fail_stop_for_usdc_rebalancing_check.clone(),
+                            failure_notify_for_usdc_rebalancing_check.clone(),
+                            #[cfg(any(test, feature = "test-support"))]
+                            failure_injector_for_usdc_rebalancing_check.clone(),
+                        )
+                    })
+            } else {
+                monitor
+            };
 
-        tokio::select! {
-            biased;
-            () = failure_notify_for_select.notified() => Err(MonitorTaskError::TerminalJobFailure),
-            result = apalis_monitor.run() => match result {
-                Ok(()) => Err(MonitorTaskError::UnexpectedExit { source: None }),
-                Err(source) => Err(MonitorTaskError::UnexpectedExit { source: Some(source) }),
-            },
-        }
-    })
+            tokio::select! {
+                biased;
+                () = failure_notify_for_select.notified() => Err(MonitorTaskError::TerminalJobFailure),
+                result = apalis_monitor.run() => match result {
+                    Ok(()) => Err(MonitorTaskError::UnexpectedExit { source: None }),
+                    Err(source) => Err(MonitorTaskError::UnexpectedExit { source: Some(source) }),
+                },
+            }
+        })
+    }
 }
 
 fn log_optional_task_status(task_name: &str, is_configured: bool) {

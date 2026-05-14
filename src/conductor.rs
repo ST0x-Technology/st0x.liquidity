@@ -59,8 +59,8 @@ use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
 use crate::rebalancing::{
-    RebalancerServices, RebalancingCqrsFrameworks, RebalancingCtx, RebalancingTrigger,
-    RebalancingTriggerConfig,
+    RebalancerServices, RebalancingCqrsFrameworks, RebalancingCtx, RebalancingSchedulers,
+    RebalancingService, RebalancingServiceConfig,
 };
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::ExecutionThreshold;
@@ -121,43 +121,6 @@ pub(crate) struct Conductor {
     job_cleanup: JoinHandle<()>,
 }
 
-fn base_wallet_unwrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Address> {
-    ctx.assets
-        .equities
-        .symbols
-        .iter()
-        .filter(|(symbol, _)| ctx.is_trading_enabled(symbol) || ctx.is_rebalancing_enabled(symbol))
-        .map(|(symbol, config)| (symbol.clone(), config.tokenized_equity))
-        .collect()
-}
-
-fn base_wallet_wrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Address> {
-    ctx.assets
-        .equities
-        .symbols
-        .iter()
-        .filter(|(symbol, _)| ctx.is_trading_enabled(symbol) || ctx.is_rebalancing_enabled(symbol))
-        .map(|(symbol, config)| (symbol.clone(), config.tokenized_equity_derivative))
-        .collect()
-}
-
-/// Context for vault discovery operations during trade processing.
-pub(crate) struct VaultDiscoveryCtx<'a> {
-    pub(crate) vault_registry: &'a Store<VaultRegistry>,
-    pub(crate) orderbook: Address,
-    pub(crate) order_owner: Address,
-}
-
-#[cfg(test)]
-pub(crate) struct AccumulatedPositionExecutionCtx<'a> {
-    pub(crate) position: &'a Store<Position>,
-    pub(crate) position_projection: &'a Projection<Position>,
-    pub(crate) offchain_order: &'a Arc<Store<OffchainOrder>>,
-    pub(crate) counter_trade_submission_lock: &'a Mutex<()>,
-    pub(crate) threshold: &'a ExecutionThreshold,
-    pub(crate) assets: &'a AssetsConfig,
-}
-
 impl Conductor {
     pub(crate) async fn run<E>(
         executor_ctx: impl TryIntoExecutor<Executor = E>,
@@ -184,6 +147,7 @@ impl Conductor {
         setup_apalis_tables(&pool).await?;
         let job_queue = DexTradeAccountingJobQueue::new(&pool);
         let backfill_queue = BackfillJobQueue::new(&pool);
+        let schedulers = RebalancingSchedulers::new(&pool);
 
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
             .build(())
@@ -209,6 +173,7 @@ impl Conductor {
             rebalancer,
             wallet_polling,
             tokenizer,
+            service: rebalancing_service,
         } = PositionAndRebalancing::setup(
             rebalancing,
             &ctx,
@@ -217,6 +182,7 @@ impl Conductor {
             event_sender,
             vault_registry.clone(),
             vault_registry_projection.clone(),
+            schedulers.clone(),
         )
         .await?;
 
@@ -287,6 +253,9 @@ impl Conductor {
             .poll_status_queue(poll_status_queue)
             .reconcile_queue(reconcile_queue)
             .rejection_queue(rejection_queue)
+            .equity_check_scheduler(schedulers.equity)
+            .usdc_check_scheduler(schedulers.usdc)
+            .maybe_rebalancing_service(rebalancing_service)
             .maybe_executor_maintenance(executor_maintenance)
             .maybe_rebalancer(rebalancer)
             .job_cleanup(job_cleanup)
@@ -297,9 +266,7 @@ impl Conductor {
         conductor.abort_all();
         result
     }
-}
 
-impl Conductor {
     pub(crate) async fn wait_for_completion(&mut self) -> anyhow::Result<()> {
         let exit = tokio::select! {
             result = self.supervisor.wait() => ConductorExit::Supervisor(result),
@@ -326,6 +293,43 @@ impl Conductor {
         }
         self.job_cleanup.abort();
     }
+}
+
+fn base_wallet_unwrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Address> {
+    ctx.assets
+        .equities
+        .symbols
+        .iter()
+        .filter(|(symbol, _)| ctx.is_trading_enabled(symbol) || ctx.is_rebalancing_enabled(symbol))
+        .map(|(symbol, config)| (symbol.clone(), config.tokenized_equity))
+        .collect()
+}
+
+fn base_wallet_wrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Address> {
+    ctx.assets
+        .equities
+        .symbols
+        .iter()
+        .filter(|(symbol, _)| ctx.is_trading_enabled(symbol) || ctx.is_rebalancing_enabled(symbol))
+        .map(|(symbol, config)| (symbol.clone(), config.tokenized_equity_derivative))
+        .collect()
+}
+
+/// Context for vault discovery operations during trade processing.
+pub(crate) struct VaultDiscoveryCtx<'a> {
+    pub(crate) vault_registry: &'a Store<VaultRegistry>,
+    pub(crate) orderbook: Address,
+    pub(crate) order_owner: Address,
+}
+
+#[cfg(test)]
+pub(crate) struct AccumulatedPositionExecutionCtx<'a> {
+    pub(crate) position: &'a Store<Position>,
+    pub(crate) position_projection: &'a Projection<Position>,
+    pub(crate) offchain_order: &'a Arc<Store<OffchainOrder>>,
+    pub(crate) counter_trade_submission_lock: &'a Mutex<()>,
+    pub(crate) threshold: &'a ExecutionThreshold,
+    pub(crate) assets: &'a AssetsConfig,
 }
 
 fn spawn_finished_job_cleanup(pool: SqlitePool, cleanup_interval: Duration) -> JoinHandle<()> {
@@ -435,6 +439,7 @@ struct RebalancingInfrastructure {
     snapshot: Arc<Store<InventorySnapshot>>,
     rebalancer: JoinHandle<()>,
     tokenizer: Arc<dyn Tokenizer>,
+    service: Arc<RebalancingService>,
 }
 
 /// Shared infrastructure dependencies needed to spawn rebalancing.
@@ -445,6 +450,7 @@ struct RebalancingDeps {
     event_sender: broadcast::Sender<Statement>,
     vault_registry: Arc<Store<VaultRegistry>>,
     vault_registry_projection: Arc<Projection<VaultRegistry>>,
+    schedulers: RebalancingSchedulers,
 }
 
 /// Position + rebalancing-adjacent infrastructure produced during conductor
@@ -459,6 +465,7 @@ struct PositionAndRebalancing {
     rebalancer: Option<JoinHandle<()>>,
     wallet_polling: Option<crate::inventory::WalletPollingCtx>,
     tokenizer: Option<Arc<dyn Tokenizer>>,
+    service: Option<Arc<RebalancingService>>,
 }
 
 impl PositionAndRebalancing {
@@ -470,6 +477,7 @@ impl PositionAndRebalancing {
         event_sender: broadcast::Sender<Statement>,
         vault_registry: Arc<Store<VaultRegistry>>,
         vault_registry_projection: Arc<Projection<VaultRegistry>>,
+        schedulers: RebalancingSchedulers,
     ) -> anyhow::Result<Self> {
         if let Some(rebalancing_ctx) = rebalancing {
             let wallet_ctx = ctx.wallet()?;
@@ -488,6 +496,7 @@ impl PositionAndRebalancing {
                     event_sender,
                     vault_registry,
                     vault_registry_projection,
+                    schedulers,
                 },
             )
             .await?;
@@ -506,11 +515,12 @@ impl PositionAndRebalancing {
                 rebalancer: Some(infra.rebalancer),
                 wallet_polling: Some(wallet_polling),
                 tokenizer: Some(infra.tokenizer),
+                service: Some(infra.service),
             })
         } else {
             let (position, position_projection) = build_position_cqrs(pool).await?;
 
-            // Without the trigger, the projection is the only subscriber
+            // Without the service, the projection is the only subscriber
             // keeping the dashboard view in sync.
             let inventory_projection = Arc::new(InventoryProjection::new(inventory));
             let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
@@ -525,6 +535,7 @@ impl PositionAndRebalancing {
                 rebalancer: None,
                 wallet_polling: None,
                 tokenizer: None,
+                service: None,
             })
         }
     }
@@ -655,8 +666,8 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             .cloned()
             .collect();
 
-        let rebalancing_trigger = Arc::new(RebalancingTrigger::new(
-            RebalancingTriggerConfig {
+        let rebalancing_service = Arc::new(RebalancingService::new(
+            RebalancingServiceConfig {
                 equity: rebalancing_ctx.equity,
                 usdc: rebalancing_ctx.usdc,
                 transfer_timeout: rebalancing_ctx.transfer_timeout,
@@ -669,19 +680,20 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             deps.inventory.clone(),
             operation_sender,
             wrapper.clone(),
+            deps.schedulers,
         ));
 
-        let equity_in_progress = Arc::clone(&rebalancing_trigger.equity_in_progress);
-        let usdc_in_progress = Arc::clone(&rebalancing_trigger.usdc_in_progress);
+        let equity_in_progress = Arc::clone(&rebalancing_service.equity_in_progress);
+        let usdc_in_progress = Arc::clone(&rebalancing_service.usdc_in_progress);
 
         let broadcaster = Arc::new(Broadcaster::new(deps.event_sender, deps.pool.clone()));
-        let manifest = QueryManifest::new(rebalancing_trigger.clone(), broadcaster);
+        let manifest = QueryManifest::new(rebalancing_service.clone(), broadcaster);
 
         let built = manifest
             .build(deps.pool.clone(), equity_transfer_services)
             .await?;
 
-        rebalancing_trigger
+        rebalancing_service
             .set_stores(built.mint.clone(), built.redemption.clone())
             .await;
 
@@ -696,7 +708,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
 
         recover_interrupted_tokenization_aggregates(
             &deps.pool,
-            &rebalancing_trigger,
+            &rebalancing_service,
             deps.inventory.as_ref(),
             &recovery_transfer,
             built.mint.clone(),
@@ -752,6 +764,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             snapshot: built.snapshot,
             rebalancer: handle,
             tokenizer,
+            service: rebalancing_service,
         })
     })
 }
@@ -792,7 +805,7 @@ async fn recover_stuck_redemptions(
 
 async fn recover_interrupted_tokenization_aggregates(
     pool: &SqlitePool,
-    rebalancing_trigger: &RebalancingTrigger,
+    rebalancing_service: &RebalancingService,
     inventory: &BroadcastingInventory,
     transfer: &CrossVenueEquityTransfer,
     mint_store: Arc<Store<TokenizedEquityMint>>,
@@ -808,7 +821,7 @@ async fn recover_interrupted_tokenization_aggregates(
             ));
         };
 
-        rebalancing_trigger
+        rebalancing_service
             .recover_mint_state(mint_id, &mint)
             .await?;
     }
@@ -820,7 +833,7 @@ async fn recover_interrupted_tokenization_aggregates(
             ));
         };
 
-        rebalancing_trigger
+        rebalancing_service
             .recover_redemption_state(redemption_id, &redemption)
             .await?;
     }
@@ -1819,7 +1832,7 @@ mod tests {
     use crate::inventory::{ImbalanceThreshold, Inventory, InventoryView, Venue};
     use crate::offchain::order::OrderPlacementResult;
     use crate::onchain::trade::OnchainTrade;
-    use crate::rebalancing::{RebalancingTrigger, TriggeredOperation};
+    use crate::rebalancing::{RebalancingSchedulers, RebalancingService, TriggeredOperation};
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
     use crate::threshold::ExecutionThreshold;
     use crate::trading::onchain::inclusion::EmittedOnChain;
@@ -3267,7 +3280,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn position_events_reach_rebalancing_trigger() {
+    async fn position_events_reach_rebalancing_service() {
         let pool = setup_test_db().await;
         let symbol = Symbol::new("AAPL").unwrap();
 
@@ -3303,8 +3316,8 @@ mod tests {
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
 
-        let trigger = Arc::new(RebalancingTrigger::new(
-            RebalancingTriggerConfig {
+        let trigger = Arc::new(RebalancingService::new(
+            RebalancingServiceConfig {
                 equity: ImbalanceThreshold {
                     target: float!(0.5),
                     deviation: float!(0.2),
@@ -3326,10 +3339,12 @@ mod tests {
             inventory,
             operation_sender,
             Arc::new(MockWrapper::new()),
+            RebalancingSchedulers::new(&pool),
         ));
+        let reactor = trigger.clone();
 
         let (position_store, _position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .with(Arc::clone(&trigger))
+            .with(Arc::clone(&reactor))
             .build(())
             .await
             .unwrap();
@@ -3351,6 +3366,9 @@ mod tests {
                     block_timestamp: chrono::Utc::now(),
                 },
             )
+            .await
+            .unwrap();
+        crate::rebalancing::drain_pending_jobs(&reactor)
             .await
             .unwrap();
 
@@ -3399,8 +3417,8 @@ mod tests {
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
 
-        let trigger = Arc::new(RebalancingTrigger::new(
-            RebalancingTriggerConfig {
+        let trigger = Arc::new(RebalancingService::new(
+            RebalancingServiceConfig {
                 equity: threshold,
                 usdc: Some(threshold),
                 transfer_timeout: Duration::from_secs(30 * 60),
@@ -3416,10 +3434,12 @@ mod tests {
             Arc::clone(&inventory),
             operation_sender,
             Arc::new(MockWrapper::new()),
+            RebalancingSchedulers::new(&pool),
         ));
+        let reactor = trigger.clone();
 
         let (position_store, _position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .with(Arc::clone(&trigger))
+            .with(Arc::clone(&reactor))
             .build(())
             .await
             .unwrap();
@@ -3512,8 +3532,8 @@ mod tests {
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
 
-        let trigger = Arc::new(RebalancingTrigger::new(
-            RebalancingTriggerConfig {
+        let trigger = Arc::new(RebalancingService::new(
+            RebalancingServiceConfig {
                 equity: ImbalanceThreshold {
                     target: float!(0.5),
                     deviation: float!(0.2),
@@ -3535,10 +3555,12 @@ mod tests {
             inventory,
             operation_sender,
             Arc::new(MockWrapper::new()),
+            RebalancingSchedulers::new(&pool),
         ));
+        let reactor = trigger.clone();
 
         let (position_store, _position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .with(trigger.clone())
+            .with(reactor.clone())
             .build(())
             .await
             .unwrap();
@@ -3579,6 +3601,7 @@ mod tests {
         Arc<Store<Position>>,
         mpsc::Receiver<TriggeredOperation>,
         Symbol,
+        Arc<RebalancingService>,
     ) {
         let pool = setup_test_db().await;
         let symbol = Symbol::new("AAPL").unwrap();
@@ -3640,8 +3663,8 @@ mod tests {
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
 
-        let trigger = Arc::new(RebalancingTrigger::new(
-            RebalancingTriggerConfig {
+        let trigger = Arc::new(RebalancingService::new(
+            RebalancingServiceConfig {
                 equity: ImbalanceThreshold {
                     target: float!(0.5),
                     deviation: float!(0.2),
@@ -3663,20 +3686,23 @@ mod tests {
             inventory,
             operation_sender,
             Arc::new(MockWrapper::new()),
+            RebalancingSchedulers::new(&pool),
         ));
+        let reactor = trigger.clone();
 
         let (position_store, _position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .with(trigger)
+            .with(Arc::clone(&reactor))
             .build(())
             .await
             .unwrap();
 
-        (position_store, receiver, symbol)
+        (position_store, receiver, symbol, reactor)
     }
 
     #[tokio::test]
     async fn position_event_causing_imbalance_triggers_redemption() {
-        let (position_store, mut receiver, symbol) = setup_near_upper_threshold_position().await;
+        let (position_store, mut receiver, symbol, reactor) =
+            setup_near_upper_threshold_position().await;
         let test_token = address!("0x1234567890123456789012345678901234567890");
 
         // No position commands yet -> no triggers fired.
@@ -3708,6 +3734,9 @@ mod tests {
             )
             .await
             .unwrap();
+        crate::rebalancing::drain_pending_jobs(&reactor)
+            .await
+            .unwrap();
 
         let triggered = receiver.try_recv().unwrap();
         let TriggeredOperation::Redemption {
@@ -3726,7 +3755,8 @@ mod tests {
 
     #[tokio::test]
     async fn in_progress_guard_blocks_duplicate_trigger() {
-        let (position_store, mut receiver, symbol) = setup_near_upper_threshold_position().await;
+        let (position_store, mut receiver, symbol, reactor) =
+            setup_near_upper_threshold_position().await;
         let test_token = address!("0x1234567890123456789012345678901234567890");
 
         // First fill pushes over: 85/120 = 70.8% > 70% -> triggers Redemption(25).
@@ -3746,6 +3776,9 @@ mod tests {
                     block_timestamp: chrono::Utc::now(),
                 },
             )
+            .await
+            .unwrap();
+        crate::rebalancing::drain_pending_jobs(&reactor)
             .await
             .unwrap();
 
@@ -3780,6 +3813,9 @@ mod tests {
                     block_timestamp: chrono::Utc::now(),
                 },
             )
+            .await
+            .unwrap();
+        crate::rebalancing::drain_pending_jobs(&reactor)
             .await
             .unwrap();
 

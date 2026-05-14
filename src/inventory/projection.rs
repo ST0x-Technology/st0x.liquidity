@@ -2,7 +2,7 @@
 //! [`BroadcastingInventory`] that feeds the dashboard WS.
 //!
 //! When rebalancing is enabled the projection is owned by
-//! `RebalancingTrigger`, which calls [`Self::apply`] before its
+//! `RebalancingService`, which calls [`Self::apply`] before its
 //! threshold checks so rebalancing decisions only run against a
 //! successfully-folded view. When rebalancing is disabled the
 //! projection is registered directly as the sole subscriber on the
@@ -453,7 +453,7 @@ mod tests {
             read_equity_available(&inventory, &symbol("RKLB"), Venue::MarketMaking).await,
             Some(shares(42)),
             "snapshot dispatched through store must reach BroadcastingInventory \
-             via the projection even when no RebalancingTrigger is registered",
+             via the projection even when no RebalancingService is registered",
         );
     }
 }

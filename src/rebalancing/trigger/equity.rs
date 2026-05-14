@@ -5,11 +5,15 @@ use std::sync::Arc;
 
 use alloy::primitives::Address;
 use rain_math_float::{Float, FloatError};
-use tracing::{debug, trace};
+use serde::{Deserialize, Serialize};
+use tracing::{debug, trace, warn};
 
 use st0x_execution::{FractionalShares, Positive, Symbol};
 
-use super::{TokenAddressError, TriggeredOperation};
+use super::{RebalancingService, TokenAddressError, TriggeredOperation};
+#[cfg(any(test, feature = "test-support"))]
+use crate::conductor::job::JobKind;
+use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::inventory::{
     BroadcastingInventory, EquityImbalanceError, Imbalance, ImbalanceThreshold,
 };
@@ -187,6 +191,122 @@ fn truncate_for_alpaca(
     }
 
     Ok(truncated)
+}
+
+/// Per-symbol equity rebalancing check.
+///
+/// Carries the symbol to evaluate as the payload; every other
+/// dependency the worker needs lives on [`RebalancingService`]. Per-symbol
+/// failures retry/back off independently, and snapshots affecting multiple
+/// symbols fan out into parallel work.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct EquityRebalancingCheck {
+    pub symbol: Symbol,
+}
+
+pub(crate) type EquityRebalancingCheckJobQueue = JobQueue<EquityRebalancingCheck>;
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum EquityRebalancingCheckJobError {
+    #[error(transparent)]
+    EquityTrigger(#[from] EquityTriggerError),
+}
+
+impl Job<RebalancingService> for EquityRebalancingCheck {
+    type Output = ();
+    type Error = EquityRebalancingCheckJobError;
+
+    const WORKER_NAME: &'static str = "equity-rebalancing-check-worker";
+    #[cfg(any(test, feature = "test-support"))]
+    const JOB_KIND: JobKind = JobKind::EquityRebalancingCheck;
+
+    fn label(&self) -> Label {
+        Label::new(format!("EquityRebalancingCheck({})", self.symbol))
+    }
+
+    async fn perform(&self, trigger: &RebalancingService) -> Result<Self::Output, Self::Error> {
+        trigger.check_and_trigger_equity(&self.symbol).await?;
+        Ok(())
+    }
+}
+
+/// Owns the equity-check queue and the domain-level operations
+/// callers (the reactor, the conductor wiring) want: enqueue a check
+/// for a symbol, cancel pending checks after a terminal event. Keeps
+/// queue plumbing out of [`RebalancingService`] and out of the
+/// conductor wiring.
+#[derive(Clone)]
+pub(crate) struct EquityRebalancingCheckScheduler {
+    queue: EquityRebalancingCheckJobQueue,
+}
+
+impl EquityRebalancingCheckScheduler {
+    pub(crate) fn new(pool: &sqlx::SqlitePool) -> Self {
+        Self {
+            queue: EquityRebalancingCheckJobQueue::new(pool),
+        }
+    }
+
+    pub(crate) fn queue(&self) -> &EquityRebalancingCheckJobQueue {
+        &self.queue
+    }
+
+    /// Best-effort enqueue. Failures are logged: an enqueue miss only
+    /// delays the next imbalance check, which the next snapshot will
+    /// re-trigger.
+    pub(super) async fn enqueue_check(&self, symbol: Symbol) {
+        let mut queue = self.queue.clone();
+        if let Err(QueuePushError(error)) = queue.push(EquityRebalancingCheck { symbol }).await {
+            warn!(target: "rebalance", %error, "Failed to enqueue EquityRebalancingCheck job");
+        }
+    }
+
+    pub(super) async fn cancel_pending(&self) {
+        self.queue.cancel_all_pending().await;
+    }
+}
+
+/// Test helper: synchronously drain every pending equity-check row
+/// the service enqueued, running each job's [`Job::perform`] and
+/// marking the row `Done`.
+#[cfg(test)]
+pub(crate) async fn drain_pending_equity_jobs(
+    service: &std::sync::Arc<RebalancingService>,
+) -> Result<usize, EquityRebalancingCheckJobError> {
+    let pool = service.equity_scheduler.queue().pool().clone();
+    let mut processed = 0usize;
+
+    let job_type = std::any::type_name::<EquityRebalancingCheck>();
+
+    loop {
+        let row: Option<(String, Vec<u8>)> = sqlx::query_as(
+            "SELECT id, job FROM Jobs \
+             WHERE status = 'Pending' AND job_type = ? \
+             ORDER BY run_at LIMIT 1",
+        )
+        .bind(job_type)
+        .fetch_optional(&pool)
+        .await
+        .expect("query pending equity-check jobs");
+
+        let Some((id, payload)) = row else {
+            break;
+        };
+
+        let job: EquityRebalancingCheck =
+            serde_json::from_slice(&payload).expect("deserialize EquityRebalancingCheck payload");
+        job.perform(service).await?;
+
+        sqlx::query("UPDATE Jobs SET status = 'Done' WHERE id = ?")
+            .bind(&id)
+            .execute(&pool)
+            .await
+            .expect("mark equity-check job done");
+
+        processed += 1;
+    }
+
+    Ok(processed)
 }
 
 #[cfg(test)]
@@ -689,6 +809,101 @@ mod tests {
         let result = truncate_for_alpaca(&symbol, original).unwrap();
 
         assert_eq!(result, original);
+    }
+
+    #[test]
+    fn cap_shares_returns_input_when_no_limit() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let amount = shares(123);
+        assert_eq!(cap_shares(&symbol, amount, None), amount);
+    }
+
+    #[test]
+    fn cap_shares_returns_input_when_below_limit() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let amount = shares(10);
+        let limit = Some(Positive::new(shares(50)).unwrap());
+        assert_eq!(cap_shares(&symbol, amount, limit), amount);
+    }
+
+    #[test]
+    fn cap_shares_returns_input_when_equal_to_limit() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let amount = shares(50);
+        let limit = Some(Positive::new(shares(50)).unwrap());
+        assert_eq!(cap_shares(&symbol, amount, limit), amount);
+    }
+
+    #[test]
+    fn cap_shares_returns_limit_when_above_limit() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let amount = shares(100);
+        let limit_value = shares(50);
+        assert_eq!(
+            cap_shares(&symbol, amount, Some(Positive::new(limit_value).unwrap())),
+            limit_value
+        );
+    }
+
+    #[test]
+    fn equity_rebalancing_check_label_includes_symbol() {
+        let job = EquityRebalancingCheck {
+            symbol: Symbol::new("RKLB").unwrap(),
+        };
+        assert_eq!(job.label().as_str(), "EquityRebalancingCheck(RKLB)");
+    }
+
+    async fn count_pending_equity_check_jobs(pool: &sqlx::SqlitePool) -> i64 {
+        let job_type = std::any::type_name::<EquityRebalancingCheck>();
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(job_type)
+        .fetch_one(pool)
+        .await
+        .expect("count pending equity-check jobs")
+    }
+
+    #[tokio::test]
+    async fn equity_scheduler_enqueue_check_inserts_pending_row() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let scheduler = EquityRebalancingCheckScheduler::new(&pool);
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        scheduler.enqueue_check(symbol).await;
+
+        assert_eq!(count_pending_equity_check_jobs(&pool).await, 1);
+    }
+
+    #[tokio::test]
+    async fn equity_scheduler_cancel_pending_marks_pending_rows_done() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let scheduler = EquityRebalancingCheckScheduler::new(&pool);
+
+        scheduler.enqueue_check(Symbol::new("AAPL").unwrap()).await;
+        scheduler.enqueue_check(Symbol::new("MSFT").unwrap()).await;
+        assert_eq!(count_pending_equity_check_jobs(&pool).await, 2);
+
+        scheduler.cancel_pending().await;
+
+        assert_eq!(
+            count_pending_equity_check_jobs(&pool).await,
+            0,
+            "cancel_pending must drain all pending rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn equity_scheduler_enqueue_after_cancel_creates_fresh_row() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let scheduler = EquityRebalancingCheckScheduler::new(&pool);
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        scheduler.enqueue_check(symbol.clone()).await;
+        scheduler.cancel_pending().await;
+        scheduler.enqueue_check(symbol).await;
+
+        assert_eq!(count_pending_equity_check_jobs(&pool).await, 1);
     }
 
     #[tokio::test]

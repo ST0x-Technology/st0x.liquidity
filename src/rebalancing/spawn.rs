@@ -185,7 +185,7 @@ mod tests {
     use crate::config::{AssetsConfig, EquitiesConfig};
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::mock::MockRaindex;
-    use crate::rebalancing::RebalancingTriggerConfig;
+    use crate::rebalancing::RebalancingServiceConfig;
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::tokenization::alpaca::AlpacaTokenizationService;
     use crate::tokenization::mock::MockTokenizer;
@@ -221,7 +221,7 @@ mod tests {
     fn trigger_config_uses_equity_from_ctx() {
         let ctx = make_ctx();
 
-        let trigger_config = RebalancingTriggerConfig {
+        let trigger_config = RebalancingServiceConfig {
             equity: ctx.equity,
             usdc: ctx.usdc,
             transfer_timeout: ctx.transfer_timeout,
@@ -240,7 +240,7 @@ mod tests {
     fn trigger_config_uses_usdc_from_ctx() {
         let ctx = make_ctx();
 
-        let trigger_config = RebalancingTriggerConfig {
+        let trigger_config = RebalancingServiceConfig {
             equity: ctx.equity,
             usdc: ctx.usdc,
             transfer_timeout: ctx.transfer_timeout,
