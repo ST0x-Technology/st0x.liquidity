@@ -1,38 +1,48 @@
-{ pkgs, ragenix, rainix, system, environments }:
+{
+  pkgs,
+  ragenix,
+  rainix,
+  system,
+  environments,
+}:
 
 let
-  buildInputs =
-    [ pkgs.terraform pkgs.rage pkgs.jq ragenix.packages.${system}.default ];
+  buildInputs = [
+    pkgs.terraform
+    pkgs.rage
+    pkgs.jq
+    ragenix.packages.${system}.default
+  ];
 
   sshBuildInputs = [ pkgs.rage ];
 
   tfPlanFile = "infra/tfplan";
 
-  mkEncrypted = { file, role }: {
-    path = file;
-    agePath = "${file}.age";
-    decrypt = ''
-      if [ -f ${file}.age ]; then
-        if [ -z "''${identity:-}" ]; then
-          echo "ERROR: decrypting ${file}.age requires an identity. Options:" >&2
-          echo "  -i <path>                    explicit key" >&2
-          echo "  SSH_IDENTITY=<path>          env var" >&2
-          echo "  --op op://vault/item         1Password CLI" >&2
-          echo "  ~/.ssh/id_ed25519            default key" >&2
-          exit 1
+  mkEncrypted =
+    { file, role }:
+    {
+      path = file;
+      agePath = "${file}.age";
+      decrypt = ''
+        if [ -f ${file}.age ]; then
+          if [ -z "''${identity:-}" ]; then
+            echo "ERROR: decrypting ${file}.age requires an identity. Options:" >&2
+            echo "  -i <path>                    explicit key" >&2
+            echo "  SSH_IDENTITY=<path>          env var" >&2
+            echo "  --op op://vault/item         1Password CLI" >&2
+            echo "  ~/.ssh/id_ed25519            default key" >&2
+            exit 1
+          fi
+          rage -d -i "$identity" ${file}.age > ${file}
         fi
-        rage -d -i "$identity" ${file}.age > ${file}
-      fi
-    '';
-    encrypt = ''
-      if [ -f ${file} ]; then
-        nix eval --raw --file ${
-          ../keys.nix
-        } roles.${role} --apply 'builtins.concatStringsSep "\n"' \
-          | rage -e -R /dev/stdin -o ${file}.age ${file}
-      fi
-    '';
-  };
+      '';
+      encrypt = ''
+        if [ -f ${file} ]; then
+          nix eval --raw --file ${../keys.nix} roles.${role} --apply 'builtins.concatStringsSep "\n"' \
+            | rage -e -R /dev/stdin -o ${file}.age ${file}
+        fi
+      '';
+    };
 
   state = mkEncrypted {
     file = "infra/terraform.tfstate";
@@ -44,16 +54,19 @@ let
   };
 
   # Per-environment remote IP caches for SSH access
-  mkRemote = env: sshRole:
+  mkRemote =
+    env: sshRole:
     mkEncrypted {
       file = "infra/.remote-${env}";
       role = sshRole;
     };
 
-  remoteFiles = builtins.listToAttrs (map (env: {
-    name = env;
-    value = mkRemote env "${env}.ssh";
-  }) environments);
+  remoteFiles = builtins.listToAttrs (
+    map (env: {
+      name = env;
+      value = mkRemote env "${env}.ssh";
+    }) environments
+  );
 
   # Callers must invoke _cleanup_identity in their own cleanup/on_exit,
   # or call it explicitly before exec, to remove the temporary key file.
@@ -109,10 +122,13 @@ let
 
   syncRemotes = ''
     if [ -f ${state.path} ]; then
-      ${
-        builtins.concatStringsSep "\n" (map (env:
-          let rf = remoteFiles.${env};
-          in ''
+      ${builtins.concatStringsSep "\n" (
+        map (
+          env:
+          let
+            rf = remoteFiles.${env};
+          in
+          ''
             jq -r '.outputs.${env}_droplet_ipv4.value // empty' ${state.path} > ${rf.path} || true
             if [ -s ${rf.path} ]; then
               ${rf.encrypt}
@@ -120,8 +136,9 @@ let
               rm -f ${rf.agePath}
             fi
             rm -f ${rf.path}
-          '') environments)
-      }
+          ''
+        ) environments
+      )}
     fi
   '';
 
@@ -157,7 +174,8 @@ let
     ${vars.encrypt}
   '';
 
-  mkEnv = env:
+  mkEnv =
+    env:
     let
       remoteFile = remoteFiles.${env};
       outputKey = "${env}_droplet_ipv4";
@@ -187,7 +205,8 @@ let
         fi
       '';
 
-    in {
+    in
+    {
       inherit resolveIp resolveHost;
 
       "${env}Remote" = pkgs.writeShellApplication {
@@ -203,7 +222,10 @@ let
 
       "${env}Status" = pkgs.writeShellApplication {
         name = "${env}-status";
-        runtimeInputs = sshBuildInputs ++ [ pkgs.openssh pkgs.nushell ];
+        runtimeInputs = sshBuildInputs ++ [
+          pkgs.openssh
+          pkgs.nushell
+        ];
         text = ''
           ${resolveHost}
           trap _cleanup_identity EXIT
@@ -250,7 +272,10 @@ let
 
       "${env}DbReset" = pkgs.writeShellApplication {
         name = "${env}-db-reset";
-        runtimeInputs = sshInputs ++ [ pkgs.curl pkgs.python3 ];
+        runtimeInputs = sshInputs ++ [
+          pkgs.curl
+          pkgs.python3
+        ];
         text = ''
           ${resolveHost}
 
@@ -309,8 +334,11 @@ let
 
       "${env}Dashboard" = pkgs.writeShellApplication {
         name = "${env}-dashboard";
-        runtimeInputs = sshBuildInputs
-          ++ [ pkgs.openssh pkgs.nushell pkgs.bun ];
+        runtimeInputs = sshBuildInputs ++ [
+          pkgs.openssh
+          pkgs.nushell
+          pkgs.bun
+        ];
         text = ''
           ${resolveHost}
           trap _cleanup_identity EXIT
@@ -320,21 +348,32 @@ let
       };
     };
 
-  envResults = builtins.listToAttrs (map (env: {
-    name = env;
-    value = mkEnv env;
-  }) environments);
+  envResults = builtins.listToAttrs (
+    map (env: {
+      name = env;
+      value = mkEnv env;
+    }) environments
+  );
 
-  perEnv =
-    builtins.mapAttrs (_: result: { inherit (result) resolveIp resolveHost; })
-    envResults;
+  perEnv = builtins.mapAttrs (_: result: { inherit (result) resolveIp resolveHost; }) envResults;
 
-  envPkgs = builtins.foldl' (acc: env:
-    acc // builtins.removeAttrs envResults.${env} [ "resolveIp" "resolveHost" ])
-    { } environments;
+  envPkgs = builtins.foldl' (
+    acc: env:
+    acc
+    // builtins.removeAttrs envResults.${env} [
+      "resolveIp"
+      "resolveHost"
+    ]
+  ) { } environments;
 
-in {
-  inherit buildInputs sshBuildInputs parseIdentity tfRekey;
+in
+{
+  inherit
+    buildInputs
+    sshBuildInputs
+    parseIdentity
+    tfRekey
+    ;
   inherit perEnv;
 
   packages = {
@@ -390,5 +429,6 @@ in {
         ${vars.encrypt}
       '';
     };
-  } // envPkgs;
+  }
+  // envPkgs;
 }

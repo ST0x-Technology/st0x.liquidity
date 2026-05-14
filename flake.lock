@@ -183,15 +183,15 @@
     "flake-compat_2": {
       "flake": false,
       "locked": {
-        "lastModified": 1747046372,
-        "narHash": "sha256-CIVLLkVgvHYbgI2UpXvIIBJ12HWgX+fjA8Xf8PUmqCY=",
-        "owner": "edolstra",
+        "lastModified": 1767039857,
+        "narHash": "sha256-vNpUSpF5Nuw8xvDLj2KCwwksIbjua2LZCqhV1LNRDns=",
+        "owner": "NixOS",
         "repo": "flake-compat",
-        "rev": "9100a0f413b0c601e0533d1d94ffd501ce2e7885",
+        "rev": "5edf11c44bc78a0d334f6334cdaf7d60d732daab",
         "type": "github"
       },
       "original": {
-        "owner": "edolstra",
+        "owner": "NixOS",
         "repo": "flake-compat",
         "type": "github"
       }
@@ -345,11 +345,11 @@
         "nixpkgs": "nixpkgs_4"
       },
       "locked": {
-        "lastModified": 1762758214,
-        "narHash": "sha256-ZMmfyWLFDPuSPUGTLRUyO+YBbsLh1ezhfX8XH73BQ7M=",
+        "lastModified": 1773213477,
+        "narHash": "sha256-Pv1Z3QqGkSGEUV+9pM5vYIiI7VJo7Tfm6ZmR+JSp1zo=",
         "owner": "shazow",
         "repo": "foundry.nix",
-        "rev": "018aec114ac46c6ac68c27ac29bf20b03fb55d5d",
+        "rev": "3c73daa86c823d706824fd9bbcb85aa23fd0f668",
         "type": "github"
       },
       "original": {
@@ -365,11 +365,11 @@
         "nixpkgs": "nixpkgs_5"
       },
       "locked": {
-        "lastModified": 1762441963,
-        "narHash": "sha256-j+rNQ119ffYUkYt2YYS6rnd6Jh/crMZmbqpkGLXaEt0=",
+        "lastModified": 1774104215,
+        "narHash": "sha256-EAtviqz0sEAxdHS4crqu7JGR5oI3BwaqG0mw7CmXkO8=",
         "owner": "cachix",
         "repo": "git-hooks.nix",
-        "rev": "8e7576e79b88c16d7ee3bbd112c8d90070832885",
+        "rev": "f799ae951fde0627157f40aec28dec27b22076d0",
         "type": "github"
       },
       "original": {
@@ -557,22 +557,6 @@
         "type": "github"
       }
     },
-    "nixpkgs-old": {
-      "locked": {
-        "lastModified": 1749104371,
-        "narHash": "sha256-m2NmOPd6XgBiskmUq/BS9Xxuf3z0ebnGVfSKNAO5NEM=",
-        "owner": "nixos",
-        "repo": "nixpkgs",
-        "rev": "48975d7f9b9960ed33c4e8561bcce20cc0c2de5b",
-        "type": "github"
-      },
-      "original": {
-        "owner": "nixos",
-        "repo": "nixpkgs",
-        "rev": "48975d7f9b9960ed33c4e8561bcce20cc0c2de5b",
-        "type": "github"
-      }
-    },
     "nixpkgs_2": {
       "locked": {
         "lastModified": 1774106199,
@@ -621,11 +605,11 @@
     },
     "nixpkgs_5": {
       "locked": {
-        "lastModified": 1759417375,
-        "narHash": "sha256-O7eHcgkQXJNygY6AypkF9tFhsoDQjpNEojw3eFs73Ow=",
+        "lastModified": 1770073757,
+        "narHash": "sha256-Vy+G+F+3E/Tl+GMNgiHl9Pah2DgShmIUBJXmbiQPHbI=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "dc704e6102e76aad573f63b74c742cd96f8f1e6c",
+        "rev": "47472570b1e607482890801aeaf29bfb749884f6",
         "type": "github"
       },
       "original": {
@@ -653,11 +637,11 @@
     },
     "nixpkgs_7": {
       "locked": {
-        "lastModified": 1748662220,
-        "narHash": "sha256-7gGa49iB9nCnFk4h/g9zwjlQAyjtpgcFkODjcOQS0Es=",
+        "lastModified": 1771923393,
+        "narHash": "sha256-Fy0+UXELv9hOE8WjYhJt8fMDLYTU2Dqn3cX4BwoGBos=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "59138c7667b7970d205d6a05a8bfa2d78caa3643",
+        "rev": "ea7f1f06811ce7fcc81d6c6fd4213150c23edcf2",
         "type": "github"
       },
       "original": {
@@ -738,22 +722,21 @@
         "nixpkgs": [
           "nixpkgs"
         ],
-        "nixpkgs-old": "nixpkgs-old",
         "rust-overlay": "rust-overlay_2",
         "solc": "solc"
       },
       "locked": {
-        "lastModified": 1769712124,
-        "narHash": "sha256-mh383jxD04TyagiBm0NueyquGP/qiwSJCEE3F1ZkYZg=",
+        "lastModified": 1778603756,
+        "narHash": "sha256-NvDLyiFNV5weq6Cp9OSqFs0DmTsNxY8d3OrUGDb/Wsc=",
         "owner": "rainprotocol",
         "repo": "rainix",
-        "rev": "6e14de54456eb33821c2f334cf4d250bcc22c121",
+        "rev": "36342d3f1a104adf987793df7f101cf804e62a34",
         "type": "github"
       },
       "original": {
         "owner": "rainprotocol",
         "repo": "rainix",
-        "rev": "6e14de54456eb33821c2f334cf4d250bcc22c121",
+        "rev": "36342d3f1a104adf987793df7f101cf804e62a34",
         "type": "github"
       }
     },
@@ -799,11 +782,11 @@
         "nixpkgs": "nixpkgs_6"
       },
       "locked": {
-        "lastModified": 1762742448,
-        "narHash": "sha256-XMxV0h13gg63s0sV6beihCIqdpcJhtbse6DHI743nvo=",
+        "lastModified": 1773216618,
+        "narHash": "sha256-iZlowevS+xKLGOXtZwpIrz3SWe7PtoGUfEeVZNib+WE=",
         "owner": "oxalica",
         "repo": "rust-overlay",
-        "rev": "7f3556887e3375dc26ff1601b57c93ee286f2c5e",
+        "rev": "07d7dc6fcc5eae76b4fb0e19d4afd939437bec97",
         "type": "github"
       },
       "original": {
@@ -819,11 +802,11 @@
         "solc-macos-amd64-list-json": "solc-macos-amd64-list-json"
       },
       "locked": {
-        "lastModified": 1756368702,
-        "narHash": "sha256-cqEHv7uCV0LibmQphyiXZ1+jYtGjMNb9Pae4tfcAcF8=",
+        "lastModified": 1772085240,
+        "narHash": "sha256-+NEcuhT2A0QQumVx9Ze6g2iuNicyuW028Jq/HUJHGh4=",
         "owner": "hellwolf",
         "repo": "solc.nix",
-        "rev": "d83e90df2fa8359a690f6baabf76099432193c3f",
+        "rev": "d3cc119973e484ea366f4b997b404bb00d7829ca",
         "type": "github"
       },
       "original": {
@@ -835,13 +818,13 @@
     "solc-macos-amd64-list-json": {
       "flake": false,
       "locked": {
-        "narHash": "sha256-AvITkfpNYgCypXuLJyqco0li+unVw39BAfdOZvd/SPE=",
+        "narHash": "sha256-oEiXc95EghuYCudzkPA9XBFOnMdgWFfTO2/4XUfSTpc=",
         "type": "file",
-        "url": "https://github.com/argotorg/solc-bin/raw/26fc3fd/macosx-amd64/list.json"
+        "url": "https://github.com/argotorg/solc-bin/raw/83cb756/macosx-amd64/list.json"
       },
       "original": {
         "type": "file",
-        "url": "https://github.com/argotorg/solc-bin/raw/26fc3fd/macosx-amd64/list.json"
+        "url": "https://github.com/argotorg/solc-bin/raw/83cb756/macosx-amd64/list.json"
       }
     },
     "systems": {

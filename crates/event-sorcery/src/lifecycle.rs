@@ -51,7 +51,9 @@ use crate::reactor::Reactor;
 // The empty bound avoids redundant constraints that confuse the
 // compiler when Entity has complex associated types.
 #[serde(bound = "")]
+#[derive(Default)]
 pub(crate) enum Lifecycle<Entity: EventSourced> {
+    #[default]
     Uninitialized,
     Live(Entity),
     Failed {
@@ -67,12 +69,6 @@ impl<Entity: EventSourced> Lifecycle<Entity> {
             Self::Uninitialized => Ok(None),
             Self::Failed { error, .. } => Err(error),
         }
-    }
-}
-
-impl<Entity: EventSourced> Default for Lifecycle<Entity> {
-    fn default() -> Self {
-        Self::Uninitialized
     }
 }
 
