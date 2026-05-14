@@ -209,6 +209,7 @@ describe('createWebSocket', () => {
             usdcDeviation: null,
             cashReserved: null,
             executionThreshold: '$2', assets: [],
+            wallet: null,
             logLevel: 'Debug',
             serverPort: 8001,
             orderbook: '0x0',

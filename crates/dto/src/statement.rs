@@ -154,6 +154,7 @@ mod tests {
                 cash_reserved: None,
                 execution_threshold: "1 share".to_string(),
                 assets: Vec::new(),
+                wallet: None,
                 log_level: "Debug".to_string(),
                 server_port: 8001,
                 orderbook: "0x0".to_string(),

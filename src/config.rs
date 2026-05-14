@@ -392,6 +392,8 @@ pub struct Ctx {
     /// Always derived from the configured `[wallet]` address.
     pub(crate) order_owner: Address,
     pub(crate) wallet: Option<crate::wallet::OnchainWalletCtx>,
+    /// Non-secret wallet metadata for the dashboard config dialog.
+    pub(crate) wallet_meta: Option<WalletMeta>,
     pub execution_threshold: ExecutionThreshold,
     pub(crate) assets: AssetsConfig,
     pub(crate) travel_rule: Option<TravelRuleConfig>,
@@ -485,6 +487,7 @@ impl std::fmt::Debug for Ctx {
             .field("trading_mode", &self.trading_mode)
             .field("order_owner", &self.order_owner)
             .field("wallet_configured", &self.wallet.is_some())
+            .field("wallet_meta", &self.wallet_meta)
             .field("execution_threshold", &self.execution_threshold)
             .field("assets", &self.assets)
             .field("travel_rule_configured", &self.travel_rule.is_some())
@@ -558,6 +561,8 @@ struct ValidatedParts {
     /// a `[wallet]` section. Actual async wallet construction is deferred
     /// to `load_files`.
     wallet_inputs: WalletInputs,
+    /// Non-secret wallet metadata for the dashboard config dialog.
+    wallet_meta: WalletMeta,
 }
 
 struct WalletInputs {
@@ -565,6 +570,15 @@ struct WalletInputs {
     secrets: toml::Value,
     base_rpc_url: Url,
     ethereum_rpc_url: Url,
+}
+
+/// Non-secret wallet metadata extracted from the config TOML during
+/// parsing. Displayed on the dashboard config dialog.
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct WalletMeta {
+    pub(crate) kind: String,
+    pub(crate) address: Address,
+    pub(crate) organization_id: Option<String>,
 }
 
 /// Single validation path shared by [`Ctx::load_files`] and
@@ -603,7 +617,7 @@ fn parse_and_validate(
 
     // Validate wallet config/secrets pairing and required RPC URLs.
     // Actual wallet construction (async, connects to RPC) is deferred.
-    let wallet_inputs = match (config.wallet, secrets.wallet) {
+    let (wallet_inputs, wallet_meta) = match (config.wallet, secrets.wallet) {
         (Some(wallet_config), Some(wallet_secrets)) => {
             let Some(base_url) = base_rpc_url else {
                 return Err(CtxError::WalletMissingRpcUrl {
@@ -617,12 +631,22 @@ fn parse_and_validate(
                 });
             };
 
-            WalletInputs {
-                config: wallet_config,
-                secrets: wallet_secrets,
-                base_rpc_url: base_url,
-                ethereum_rpc_url: eth_url,
-            }
+            let wallet_meta = WalletMeta::deserialize(wallet_config.clone()).map_err(|source| {
+                CtxError::ConfigToml {
+                    path: config_path.to_path_buf(),
+                    source,
+                }
+            })?;
+
+            (
+                WalletInputs {
+                    config: wallet_config,
+                    secrets: wallet_secrets,
+                    base_rpc_url: base_url,
+                    ethereum_rpc_url: eth_url,
+                },
+                wallet_meta,
+            )
         }
         (Some(_), None) => return Err(CtxError::WalletSecretsMissing),
         (None, Some(_)) => {
@@ -758,6 +782,7 @@ fn parse_and_validate(
             .transpose()?,
         redemption_wallet,
         wallet_inputs,
+        wallet_meta,
     })
 }
 
@@ -807,6 +832,7 @@ impl Ctx {
             trading_mode: parts.trading_mode,
             order_owner,
             wallet: Some(wallet),
+            wallet_meta: Some(parts.wallet_meta),
             execution_threshold: parts.execution_threshold,
             assets: parts.assets,
             travel_rule: parts.travel_rule,
@@ -954,6 +980,7 @@ impl Ctx {
             trading_mode,
             order_owner,
             wallet,
+            wallet_meta: None,
             execution_threshold,
             assets,
             travel_rule,
@@ -1178,6 +1205,7 @@ pub(crate) mod tests {
             trading_mode: TradingMode::Standalone,
             order_owner,
             wallet: None,
+            wallet_meta: None,
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
@@ -1206,6 +1234,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
+            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         "#,
         )
         .unwrap();
@@ -1236,6 +1265,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
+            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         "#,
         )
     }
@@ -1258,6 +1288,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
+            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         "#,
         )
     }
@@ -1412,6 +1443,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
+            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
             [broker.travel_rule]
             beneficiary_entity_name = "T0 TRADE (BVI) LTD"
@@ -1453,6 +1485,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
+            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
             [broker.travel_rule]
             beneficiary_entity_name = "PLACEHOLDER"
@@ -1491,6 +1524,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
+            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
             [broker.travel_rule]
             beneficiary_entity_name = "   "
@@ -1590,6 +1624,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
+            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -1703,6 +1738,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
+            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -1837,6 +1873,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
+            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
             [hyperdx]
             service_name = "test-service"
@@ -2124,6 +2161,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
+            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         "#,
         );
 
@@ -2170,6 +2208,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
+            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         "#,
         );
 
@@ -3543,6 +3582,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
+            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         "#,
         );
         let secrets = toml_file(
@@ -3588,6 +3628,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
+            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         "#,
         );
         let secrets = toml_file(
@@ -3663,6 +3704,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
+            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
             [broker.travel_rule]
             beneficiary_entity_name = "PLACEHOLDER"
@@ -3700,6 +3742,7 @@ pub(crate) mod tests {
 
             [wallet]
             kind = "private-key"
+            address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         "#,
         );
         let secrets = dry_run_secrets_toml();
