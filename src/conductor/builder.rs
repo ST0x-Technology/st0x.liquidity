@@ -7,6 +7,7 @@ use sqlx::SqlitePool;
 use std::sync::Arc;
 use task_supervisor::SupervisorBuilder;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use st0x_event_sorcery::{Projection, Store};
@@ -73,6 +74,7 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
     pub(crate) pool: SqlitePool,
     pub(crate) wallet_polling: Option<WalletPollingCtx>,
     pub(crate) tokenizer: Option<Arc<dyn Tokenizer>>,
+    pub(crate) shutdown_token: CancellationToken,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) failure_injector: FailureInjector,
 }
@@ -93,6 +95,7 @@ pub(crate) fn spawn<Prov, Exec>(
     job_cleanup: JoinHandle<()>,
     executor_maintenance: Option<JoinHandle<()>>,
     rebalancer: Option<JoinHandle<()>>,
+    rebalancer_shutdown_token: CancellationToken,
 ) -> Conductor
 where
     Prov: Provider + Clone + Send + Sync + 'static,
@@ -206,6 +209,9 @@ where
         job_queue: job_queue.clone(),
     });
 
+    let apalis_shutdown_token = CancellationToken::new();
+    let apalis_shutdown_token_for_struct = apalis_shutdown_token.clone();
+
     let order_fill_monitor = OrderFillMonitor::new(
         context.ctx.evm.clone(),
         job_queue.clone(),
@@ -243,6 +249,7 @@ where
         rejection_queue,
         equity_check_scheduler,
         usdc_check_scheduler,
+        apalis_shutdown_token,
         #[cfg(any(test, feature = "test-support"))]
         failure_injector: context.failure_injector,
     }
@@ -253,7 +260,10 @@ where
         monitor,
         executor_maintenance,
         rebalancer,
+        rebalancer_shutdown_token,
         job_cleanup,
+        shutdown_token: context.shutdown_token,
+        apalis_shutdown_token: apalis_shutdown_token_for_struct,
     }
 }
 
@@ -282,6 +292,7 @@ where
     rejection_queue: HandleOrderRejectionJobQueue,
     equity_check_scheduler: EquityRebalancingCheckScheduler,
     usdc_check_scheduler: UsdcRebalancingCheckScheduler,
+    apalis_shutdown_token: CancellationToken,
     #[cfg(any(test, feature = "test-support"))]
     failure_injector: FailureInjector,
 }
@@ -309,6 +320,7 @@ where
             rejection_queue,
             equity_check_scheduler,
             usdc_check_scheduler,
+            apalis_shutdown_token,
             #[cfg(any(test, feature = "test-support"))]
             failure_injector,
         } = self;
@@ -460,11 +472,29 @@ where
                 monitor
             };
 
+            let is_draining = apalis_shutdown_token.clone();
+
+            let shutdown_signal = async {
+                apalis_shutdown_token.cancelled().await;
+                Ok(())
+            };
+
+            // No inner shutdown_timeout — the outer 30s timeout in
+            // drain_bot_with_timeout owns force-abort. This avoids a semantic
+            // gap where apalis reports Ok(()) for both clean drain and timeout,
+            // making the two cases indistinguishable.
+
             tokio::select! {
                 biased;
-                () = failure_notify_for_select.notified() => Err(MonitorTaskError::TerminalJobFailure),
-                result = apalis_monitor.run() => match result {
-                    Ok(()) => Err(MonitorTaskError::UnexpectedExit { source: None }),
+                // During drain, suppress terminal job failures — let remaining
+                // workers finish instead of short-circuiting the drain.
+                () = failure_notify_for_select.notified(),
+                    if !is_draining.is_cancelled() =>
+                {
+                    Err(MonitorTaskError::TerminalJobFailure)
+                }
+                result = apalis_monitor.run_with_signal(shutdown_signal) => match result {
+                    Ok(()) => Ok(()),
                     Err(source) => Err(MonitorTaskError::UnexpectedExit { source: Some(source) }),
                 },
             }

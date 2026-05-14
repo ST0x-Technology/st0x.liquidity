@@ -39,11 +39,12 @@ pub(super) enum ConductorExit {
     Supervisor(Result<(), SupervisorError>),
     Monitor(Result<Result<(), MonitorTaskError>, JoinError>),
     JobCleanup(Result<(), JoinError>),
+    GracefulShutdown,
 }
 
 impl ConductorExit {
     pub(super) fn handle(self) -> Result<(), ConductorExitError> {
-        use ConductorExit::{JobCleanup, Monitor, Supervisor};
+        use ConductorExit::{GracefulShutdown, JobCleanup, Monitor, Supervisor};
         match self {
             Supervisor(Ok(())) => {
                 info!("Supervisor finished");
@@ -80,6 +81,9 @@ impl ConductorExit {
                 task: "Job cleanup",
                 source,
             }),
+
+            // Handled directly in wait_for_completion before calling handle().
+            GracefulShutdown => Ok(()),
         }
     }
 }
