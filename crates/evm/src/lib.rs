@@ -160,6 +160,17 @@ pub enum EvmError {
         tx_hash: alloy::primitives::TxHash,
         timeout_secs: u64,
     },
+    /// Transaction was dropped from the mempool (not found via
+    /// `eth_getTransactionByHash` after initial propagation window).
+    #[error(
+        "transaction {tx_hash} dropped from mempool \
+         (not found after {elapsed_secs}s)"
+    )]
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    TransactionDropped {
+        tx_hash: alloy::primitives::TxHash,
+        elapsed_secs: u64,
+    },
     #[cfg(feature = "local-signer")]
     #[error("invalid private key: {0}")]
     InvalidPrivateKey(#[from] alloy::signers::k256::ecdsa::Error),
@@ -601,6 +612,12 @@ pub(crate) async fn wait_for_receipt(
 #[cfg(any(feature = "turnkey", feature = "local-signer"))]
 const CONFIRMATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
+/// Number of receipt polls before checking whether the transaction was
+/// dropped from the mempool. Gives the tx time to propagate before
+/// concluding it was never broadcast.
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+const DROPPED_TX_CHECK_AFTER_POLLS: u32 = 3;
+
 /// Parameterized version of [`wait_for_receipt`] for testability.
 #[cfg(any(feature = "turnkey", feature = "local-signer"))]
 pub(crate) async fn wait_for_receipt_with_config(
@@ -614,12 +631,29 @@ pub(crate) async fn wait_for_receipt_with_config(
     let mut poll = interval(poll_interval);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    let start = std::time::Instant::now();
+
     // Phase 1: wait for inclusion (with timeout).
     let (receipt, receipt_block) = timeout(inclusion_timeout, async {
+        let mut poll_count = 0u32;
+
         loop {
             poll.tick().await;
+            poll_count += 1;
 
             let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? else {
+                // After initial propagation window, check if the tx
+                // still exists in the mempool. If not, it was dropped
+                // and will never mine.
+                if poll_count >= DROPPED_TX_CHECK_AFTER_POLLS
+                    && provider.get_transaction_by_hash(tx_hash).await?.is_none()
+                {
+                    return Err(EvmError::TransactionDropped {
+                        tx_hash,
+                        elapsed_secs: start.elapsed().as_secs(),
+                    });
+                }
+
                 continue;
             };
 
@@ -964,7 +998,7 @@ mod tests {
 
     #[cfg(feature = "local-signer")]
     #[tokio::test]
-    async fn wait_for_receipt_times_out_for_unknown_tx() {
+    async fn wait_for_receipt_detects_dropped_tx() {
         let anvil = Anvil::new().spawn();
         let provider = ProviderBuilder::new()
             .disable_recommended_fillers()
@@ -977,14 +1011,14 @@ mod tests {
             fake_hash,
             1,
             std::time::Duration::from_millis(50),
-            std::time::Duration::from_millis(200),
+            std::time::Duration::from_secs(30),
             std::time::Duration::from_secs(60),
         )
         .await;
 
         assert!(
-            matches!(result, Err(EvmError::ReceiptTimeout { tx_hash, .. }) if tx_hash == fake_hash),
-            "expected ReceiptTimeout for nonexistent tx, got: {result:?}"
+            matches!(result, Err(EvmError::TransactionDropped { tx_hash, .. }) if tx_hash == fake_hash),
+            "expected TransactionDropped for nonexistent tx, got: {result:?}"
         );
     }
 
