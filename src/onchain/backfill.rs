@@ -14,7 +14,7 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::time::Duration;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use st0x_evm::Evm;
 use st0x_execution::Executor;
@@ -314,6 +314,25 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
         .into_iter()
         .chain(take_logs)
         .sorted_by_key(|log| (log.block_number, log.log_index))
+        .filter(|log| {
+            // Callers cap `to_block` at the confirmation boundary,
+            // so `removed: true` here implies a deep reorg crossing
+            // that depth. Surface it loudly rather than silently
+            // ingesting; skip the log so we don't persist a vanished
+            // event.
+            if log.removed {
+                error!(
+                    target: "orderbook",
+                    tx_hash = ?log.transaction_hash,
+                    log_index = ?log.log_index,
+                    block_number = ?log.block_number,
+                    "Backfill returned `removed: true` for a log past the confirmation depth -- \
+                     deep reorg detected; skipping"
+                );
+                return false;
+            }
+            true
+        })
         .filter_map(|log| {
             if let Ok(clear_event) = log.log_decode::<ClearV3>() {
                 let event = RaindexTradeEvent::ClearV3(Box::new(clear_event.data().clone()));
@@ -402,6 +421,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
+            required_confirmations: 0,
         };
 
         let start_block = backfill_start_block(&pool, &evm_ctx).await.unwrap();
@@ -416,6 +436,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
+            required_confirmations: 0,
         };
 
         save_backfill_checkpoint(&pool, &evm_ctx, 80).await.unwrap();
@@ -432,6 +453,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
+            required_confirmations: 0,
         };
 
         save_backfill_checkpoint(&pool, &evm_ctx, 20).await.unwrap();
@@ -455,6 +477,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
+            required_confirmations: 0,
         };
 
         backfill_events(
@@ -483,6 +506,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
+            required_confirmations: 0,
         };
 
         save_backfill_checkpoint(&pool, &evm_ctx, 100)
@@ -518,6 +542,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
+            required_confirmations: 0,
         };
 
         save_backfill_checkpoint(&pool, &evm_ctx, 100)
@@ -551,6 +576,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
+            required_confirmations: 0,
         };
 
         save_backfill_checkpoint(&pool, &evm_ctx, 100)
@@ -669,6 +695,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
+            required_confirmations: 0,
         };
 
         let clear_config = IOrderBookV6::ClearConfigV2 {
@@ -732,6 +759,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
+            required_confirmations: 0,
         };
 
         let take_event = IOrderBookV6::TakeOrderV3 {
@@ -796,6 +824,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
+            required_confirmations: 0,
         };
 
         let different_order = get_test_order();
@@ -892,6 +921,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
+            required_confirmations: 0,
         };
 
         let asserter = Asserter::new();
@@ -931,6 +961,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
+            required_confirmations: 0,
         };
 
         let asserter = Asserter::new();
@@ -1009,6 +1040,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
+            required_confirmations: 0,
         };
 
         let tx_hash1 =
@@ -1058,6 +1090,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1000,
+            required_confirmations: 0,
         };
 
         let asserter = Asserter::new();
@@ -1094,6 +1127,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 500,
+            required_confirmations: 0,
         };
 
         let asserter = Asserter::new();
@@ -1131,6 +1165,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
+            required_confirmations: 0,
         };
 
         let take_event = create_test_take_event(
@@ -1171,6 +1206,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
+            required_confirmations: 0,
         };
 
         let asserter = Asserter::new();
@@ -1205,6 +1241,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
+            required_confirmations: 0,
         };
 
         let valid_take_event = create_test_take_event(
@@ -1293,6 +1330,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
+            required_confirmations: 0,
         };
 
         let tx_hash1 =
@@ -1336,6 +1374,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
+            required_confirmations: 0,
         };
 
         let asserter = Asserter::new();
@@ -1369,6 +1408,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
+            required_confirmations: 0,
         };
 
         let asserter = Asserter::new();
@@ -1408,6 +1448,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
+            required_confirmations: 0,
         };
 
         let asserter = Asserter::new();
@@ -1453,6 +1494,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
+            required_confirmations: 0,
         };
 
         // Create malformed log with invalid event signature
@@ -1496,6 +1538,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_backfill_skips_removed_logs() {
+        // Backfill caller caps `to_block` at the confirmation
+        // boundary, so a `removed: true` log here implies a deep
+        // reorg. We must skip it (logged as error) rather than
+        // ingesting a vanished event.
+        let pool = setup_test_db().await;
+        let job_queue = setup_job_queue(&pool).await;
+        let order = get_test_order();
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            orderbook: address!("0x1111111111111111111111111111111111111111"),
+            deployment_block: 1,
+            required_confirmations: 0,
+        };
+
+        let take_event = create_test_take_event(
+            &order,
+            uint!(100_000_000_U256),
+            uint!(9_000_000_000_000_000_000_U256),
+        );
+        let tx_hash =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+        let mut removed_log = create_test_log(evm_ctx.orderbook, &take_event, 50, tx_hash);
+        removed_log.removed = true;
+
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::json!([]));
+        asserter.push_success(&serde_json::json!([removed_log]));
+
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        backfill_events(
+            &provider,
+            &evm_ctx,
+            &pool,
+            100,
+            test_retry_strategy(),
+            job_queue,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            job_count(&pool).await,
+            0,
+            "logs with removed=true must be skipped, not ingested"
+        );
+    }
+
+    #[tokio::test]
     async fn test_backfill_events_single_block_range() {
         let pool = setup_test_db().await;
         let job_queue = setup_job_queue(&pool).await;
@@ -1503,6 +1595,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 42,
+            required_confirmations: 0,
         };
 
         let asserter = Asserter::new();
@@ -1533,6 +1626,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
+            required_confirmations: 0,
         };
 
         let order = get_test_order();
@@ -1582,6 +1676,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
+            required_confirmations: 0,
         };
 
         let asserter = Asserter::new();
@@ -1611,6 +1706,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
+            required_confirmations: 0,
         };
 
         let order = get_test_order();
@@ -1667,6 +1763,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
+            required_confirmations: 0,
         };
 
         let order = get_test_order();
@@ -1718,6 +1815,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
+            required_confirmations: 0,
         };
 
         let asserter = Asserter::new();
@@ -1757,6 +1855,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 100,
+            required_confirmations: 0,
         };
 
         // No RPC calls should be made when deployment block > end block
@@ -1785,6 +1884,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
+            required_confirmations: 0,
         };
 
         let order = get_test_order();
@@ -1860,6 +1960,7 @@ mod tests {
             ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
+            required_confirmations: 0,
         };
 
         // Should start from deployment_block (50) to end_block (100)

@@ -38,6 +38,13 @@ pub(crate) use trade::TradeValidationError;
 pub(crate) struct EvmConfig {
     pub(crate) orderbook: Address,
     pub(crate) deployment_block: u64,
+    /// Number of confirmations a block must have before its events are
+    /// ingested. Naive reorg protection: both backfill and live
+    /// ingestion treat the latest tip block minus this value as the
+    /// highest safe block. This is a heuristic, not real chain finality
+    /// -- a deep reorg crossing this depth will still corrupt state.
+    /// Must be set explicitly -- no silent default.
+    pub(crate) required_confirmations: u64,
 }
 
 #[derive(Deserialize)]
@@ -60,6 +67,7 @@ pub(crate) struct EvmCtx {
     pub(crate) ws_rpc_url: Url,
     pub(crate) orderbook: Address,
     pub(crate) deployment_block: u64,
+    pub(crate) required_confirmations: u64,
 }
 
 impl std::fmt::Debug for EvmCtx {
@@ -68,6 +76,7 @@ impl std::fmt::Debug for EvmCtx {
             .field("ws_rpc_url", &"[REDACTED]")
             .field("orderbook", &self.orderbook)
             .field("deployment_block", &self.deployment_block)
+            .field("required_confirmations", &self.required_confirmations)
             .finish()
     }
 }
@@ -78,6 +87,7 @@ impl EvmCtx {
             ws_rpc_url: secrets.ws,
             orderbook: config.orderbook,
             deployment_block: config.deployment_block,
+            required_confirmations: config.required_confirmations,
         }
     }
 }

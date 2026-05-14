@@ -934,6 +934,7 @@ impl Ctx {
         ws_rpc_url: Url,
         orderbook: Address,
         deployment_block: u64,
+        #[builder(default = 0)] required_confirmations: u64,
         broker: BrokerCtx,
         trading_mode: TradingMode,
         order_owner: Address,
@@ -969,6 +970,7 @@ impl Ctx {
                 ws_rpc_url,
                 orderbook,
                 deployment_block,
+                required_confirmations,
             },
             order_polling_interval: 1,
             order_polling_max_jitter: 0,
@@ -1194,6 +1196,7 @@ pub(crate) mod tests {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1111111111111111111111111111111111111111"),
                 deployment_block: 1,
+                required_confirmations: 0,
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
@@ -1231,6 +1234,7 @@ pub(crate) mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
+            required_confirmations = 3
 
             [wallet]
             kind = "private-key"
@@ -1256,6 +1260,7 @@ pub(crate) mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
 
             deployment_block = 1
+            required_confirmations = 3
 
             [broker]
             counter_trade_slippage_bps = 100
@@ -1282,6 +1287,7 @@ pub(crate) mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
 
             deployment_block = 1
+            required_confirmations = 3
 
             [broker]
             counter_trade_slippage_bps = 100
@@ -1403,6 +1409,7 @@ pub(crate) mod tests {
             orderbook = "not-an-address"
 
             deployment_block = 1
+            required_confirmations = 3
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -1440,6 +1447,7 @@ pub(crate) mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
 
             deployment_block = 1
+            required_confirmations = 3
 
             [wallet]
             kind = "private-key"
@@ -1482,6 +1490,7 @@ pub(crate) mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
 
             deployment_block = 1
+            required_confirmations = 3
 
             [wallet]
             kind = "private-key"
@@ -1521,6 +1530,7 @@ pub(crate) mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
 
             deployment_block = 1
+            required_confirmations = 3
 
             [wallet]
             kind = "private-key"
@@ -1588,6 +1598,7 @@ pub(crate) mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
 
             deployment_block = 1
+            required_confirmations = 3
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -1621,6 +1632,7 @@ pub(crate) mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
 
             deployment_block = 1
+            required_confirmations = 3
 
             [wallet]
             kind = "private-key"
@@ -1678,6 +1690,7 @@ pub(crate) mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
+            required_confirmations = 3
 
             [broker]
             counter_trade_slippage_bps = 100
@@ -1735,6 +1748,7 @@ pub(crate) mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
 
             deployment_block = 1
+            required_confirmations = 3
 
             [wallet]
             kind = "private-key"
@@ -1784,6 +1798,7 @@ pub(crate) mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
+            required_confirmations = 3
 
             [tokenization]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -1870,6 +1885,7 @@ pub(crate) mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
 
             deployment_block = 1
+            required_confirmations = 3
 
             [wallet]
             kind = "private-key"
@@ -1919,6 +1935,7 @@ pub(crate) mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
 
             deployment_block = 1
+            required_confirmations = 3
 
             [hyperdx]
             service_name = "test-service"
@@ -1978,6 +1995,7 @@ pub(crate) mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
+            required_confirmations = 3
 
             [broker]
             counter_trade_slippage_bps = 100
@@ -2031,6 +2049,7 @@ pub(crate) mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
+            required_confirmations = 3
 
             [broker]
             counter_trade_slippage_bps = 100
@@ -2088,6 +2107,7 @@ pub(crate) mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
+            required_confirmations = 3
 
             [wallet]
             kind = "private-key"
@@ -2151,6 +2171,7 @@ pub(crate) mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
+            required_confirmations = 3
 
 
             [broker]
@@ -2198,6 +2219,7 @@ pub(crate) mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
+            required_confirmations = 3
 
 
             [broker]
@@ -2293,6 +2315,7 @@ pub(crate) mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
 
             deployment_block = 1
+            required_confirmations = 3
 
             [broker]
             counter_trade_slippage_bps = 0
@@ -2428,6 +2451,7 @@ pub(crate) mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
+            required_confirmations = 3
 
             [tokenization]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -2612,6 +2636,7 @@ pub(crate) mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
 
             deployment_block = 1
+            required_confirmations = 3
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -2641,6 +2666,7 @@ pub(crate) mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
 
             deployment_block = 1
+            required_confirmations = 3
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -2672,6 +2698,7 @@ pub(crate) mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
 
             deployment_block = 1
+            required_confirmations = 3
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -2700,6 +2727,7 @@ pub(crate) mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
 
             deployment_block = 1
+            required_confirmations = 3
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -2781,6 +2809,7 @@ pub(crate) mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
 
             deployment_block = 1
+            required_confirmations = 3
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -3497,6 +3526,7 @@ pub(crate) mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
 
             deployment_block = 1
+            required_confirmations = 3
         "#,
         );
         let secrets = dry_run_secrets_toml();
@@ -3541,6 +3571,7 @@ pub(crate) mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
+            required_confirmations = 3
         "#,
         );
         let secrets = toml_file(
@@ -3572,6 +3603,7 @@ pub(crate) mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
+            required_confirmations = 3
 
 
             [broker]
@@ -3618,6 +3650,7 @@ pub(crate) mod tests {
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
+            required_confirmations = 3
 
 
             [broker]
@@ -3701,6 +3734,7 @@ pub(crate) mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
 
             deployment_block = 1
+            required_confirmations = 3
 
             [wallet]
             kind = "private-key"
@@ -3739,6 +3773,7 @@ pub(crate) mod tests {
             orderbook = "0x1111111111111111111111111111111111111111"
 
             deployment_block = 1
+            required_confirmations = 3
 
             [wallet]
             kind = "private-key"

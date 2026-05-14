@@ -663,6 +663,7 @@ mod tests {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 deployment_block: 1,
+                required_confirmations: 0,
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
