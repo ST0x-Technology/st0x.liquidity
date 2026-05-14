@@ -11,14 +11,13 @@ use tracing::{error, info, warn};
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_finance::Usdc;
 
-use super::equity::{Equity, MintError, RedemptionError};
+use super::equity::{Equity, MintTransferError, RedemptionError};
 use super::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
 use super::trigger::TriggeredOperation;
 use super::usdc::UsdcTransferError;
 
 /// Type-erased equity transfer (hedging -> market-making).
-type EquityToMarketMaking =
-    dyn CrossVenueTransfer<HedgingVenue, MarketMakingVenue, Asset = Equity, Error = MintError>;
+type EquityToMarketMaking = dyn CrossVenueTransfer<HedgingVenue, MarketMakingVenue, Asset = Equity, Error = MintTransferError>;
 
 /// Type-erased equity transfer (market-making -> hedging).
 type EquityToHedging = dyn CrossVenueTransfer<MarketMakingVenue, HedgingVenue, Asset = Equity, Error = RedemptionError>;
@@ -130,8 +129,18 @@ impl Rebalancer {
             .transfer(Equity { symbol, quantity })
             .await
         {
-            error!(target: "rebalance", ?error, symbol = %log_symbol, %quantity, "Equity transfer to market-making venue failed");
-            self.clear_equity_in_progress(&log_symbol);
+            match &error {
+                MintTransferError::PreReceipt(_) => {
+                    error!(target: "rebalance", ?error, symbol = %log_symbol, %quantity,
+                        "Mint failed before tokens received; clearing guard for retry");
+                    self.clear_equity_in_progress(&log_symbol);
+                }
+
+                MintTransferError::PostReceipt(_) => {
+                    error!(target: "rebalance", ?error, symbol = %log_symbol, %quantity,
+                        "Mint failed after tokens received; keeping guard set for recovery");
+                }
+            }
         }
     }
 
@@ -305,5 +314,122 @@ mod tests {
     #[tokio::test]
     async fn run_terminates_when_channel_closes() {
         execute(vec![]).await;
+    }
+
+    /// Mint transfer that always returns the configured error.
+    struct FailingMintTransfer {
+        error: std::sync::Mutex<Option<MintTransferError>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for FailingMintTransfer {
+        type Asset = Equity;
+        type Error = MintTransferError;
+
+        async fn transfer(&self, _asset: Self::Asset) -> Result<(), Self::Error> {
+            Err(self.error.lock().unwrap().take().unwrap())
+        }
+    }
+
+    fn make_pre_receipt_error() -> MintTransferError {
+        use crate::rebalancing::equity::MintError;
+        use crate::tokenized_equity_mint::IssuerRequestId;
+
+        MintTransferError::PreReceipt(MintError::EntityNotFound {
+            issuer_request_id: IssuerRequestId::new("test-pre".to_string()),
+            expected_state: "test",
+        })
+    }
+
+    fn make_post_receipt_error() -> MintTransferError {
+        use crate::rebalancing::equity::MintError;
+        use crate::tokenized_equity_mint::IssuerRequestId;
+
+        MintTransferError::PostReceipt(MintError::EntityNotFound {
+            issuer_request_id: IssuerRequestId::new("test-post".to_string()),
+            expected_state: "test",
+        })
+    }
+
+    #[tokio::test]
+    async fn pre_receipt_mint_failure_clears_guard() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let equity_in_progress = Arc::new(std::sync::RwLock::new(HashSet::from([symbol.clone()])));
+        let usdc_in_progress = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = mpsc::channel(10);
+
+        let failing_mint = Arc::new(FailingMintTransfer {
+            error: std::sync::Mutex::new(Some(make_pre_receipt_error())),
+        });
+        let equity = Arc::new(MockCrossVenueEquityTransfer::new());
+        let usdc = Arc::new(MockUsdcRebalance::new());
+
+        let rebalancer = Rebalancer::new(
+            failing_mint,
+            Arc::clone(&equity) as Arc<EquityToHedging>,
+            Arc::clone(&usdc) as Arc<UsdcToMarketMaking>,
+            Arc::clone(&usdc) as Arc<UsdcToHedging>,
+            receiver,
+            Arc::clone(&equity_in_progress),
+            usdc_in_progress,
+            CancellationToken::new(),
+        );
+
+        sender
+            .send(TriggeredOperation::Mint {
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(float!(10)),
+            })
+            .await
+            .unwrap();
+        drop(sender);
+
+        rebalancer.run().await;
+
+        assert!(
+            !equity_in_progress.read().unwrap().contains(&symbol),
+            "guard should be cleared after pre-receipt failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_receipt_mint_failure_keeps_guard() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let equity_in_progress = Arc::new(std::sync::RwLock::new(HashSet::from([symbol.clone()])));
+        let usdc_in_progress = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = mpsc::channel(10);
+
+        let failing_mint = Arc::new(FailingMintTransfer {
+            error: std::sync::Mutex::new(Some(make_post_receipt_error())),
+        });
+        let equity = Arc::new(MockCrossVenueEquityTransfer::new());
+        let usdc = Arc::new(MockUsdcRebalance::new());
+
+        let rebalancer = Rebalancer::new(
+            failing_mint,
+            Arc::clone(&equity) as Arc<EquityToHedging>,
+            Arc::clone(&usdc) as Arc<UsdcToMarketMaking>,
+            Arc::clone(&usdc) as Arc<UsdcToHedging>,
+            receiver,
+            Arc::clone(&equity_in_progress),
+            usdc_in_progress,
+            CancellationToken::new(),
+        );
+
+        sender
+            .send(TriggeredOperation::Mint {
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(float!(10)),
+            })
+            .await
+            .unwrap();
+        drop(sender);
+
+        rebalancer.run().await;
+
+        assert!(
+            equity_in_progress.read().unwrap().contains(&symbol),
+            "guard should remain set after post-receipt failure"
+        );
     }
 }

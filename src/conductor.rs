@@ -139,6 +139,7 @@ impl Conductor {
         event_sender: broadcast::Sender<Statement>,
         inventory: Arc<BroadcastingInventory>,
         shutdown_token: CancellationToken,
+        recovery_cell: Arc<tokio::sync::OnceCell<crate::api::RecoveryHandle>>,
     ) -> anyhow::Result<()>
     where
         E: Executor + Clone + Send + 'static,
@@ -186,6 +187,7 @@ impl Conductor {
             wallet_polling,
             tokenizer,
             service: rebalancing_service,
+            recovery_transfer,
         } = PositionAndRebalancing::setup(
             rebalancing,
             &ctx,
@@ -274,6 +276,13 @@ impl Conductor {
             .rebalancer_shutdown_token(rebalancer_shutdown_token)
             .job_cleanup(job_cleanup)
             .call();
+
+        // Publish the recovery handle only after all startup work
+        // (inventory hydration, orphan recovery, store builds) completes
+        // so /transfers/resume returns 503 until the conductor is ready.
+        if let Some(transfer) = recovery_transfer {
+            let _ = recovery_cell.set(crate::api::RecoveryHandle { transfer });
+        }
 
         info!("Conductor is running");
         let result = conductor.wait_for_completion().await;
@@ -544,6 +553,7 @@ struct RebalancingInfrastructure {
     rebalancer_shutdown_token: CancellationToken,
     tokenizer: Arc<dyn Tokenizer>,
     service: Arc<RebalancingService>,
+    recovery_transfer: Arc<CrossVenueEquityTransfer>,
 }
 
 /// Shared infrastructure dependencies needed to spawn rebalancing.
@@ -571,6 +581,7 @@ struct PositionAndRebalancing {
     wallet_polling: Option<crate::inventory::WalletPollingCtx>,
     tokenizer: Option<Arc<dyn Tokenizer>>,
     service: Option<Arc<RebalancingService>>,
+    recovery_transfer: Option<Arc<CrossVenueEquityTransfer>>,
 }
 
 impl PositionAndRebalancing {
@@ -622,6 +633,7 @@ impl PositionAndRebalancing {
                 wallet_polling: Some(wallet_polling),
                 tokenizer: Some(infra.tokenizer),
                 service: Some(infra.service),
+                recovery_transfer: Some(infra.recovery_transfer),
             })
         } else {
             let (position, position_projection) = build_position_cqrs(pool).await?;
@@ -643,6 +655,7 @@ impl PositionAndRebalancing {
                 wallet_polling: None,
                 tokenizer: None,
                 service: None,
+                recovery_transfer: None,
             })
         }
     }
@@ -804,14 +817,14 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             .set_stores(built.mint.clone(), built.redemption.clone())
             .await;
 
-        let recovery_transfer = CrossVenueEquityTransfer::new(
+        let recovery_transfer = Arc::new(CrossVenueEquityTransfer::new(
             raindex_service.clone(),
             tokenizer.clone(),
             wrapper.clone(),
             market_maker_wallet,
             built.mint.clone(),
             built.redemption.clone(),
-        );
+        ));
 
         recover_interrupted_tokenization_aggregates(
             &deps.pool,
@@ -873,6 +886,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             rebalancer_shutdown_token,
             tokenizer,
             service: rebalancing_service,
+            recovery_transfer,
         })
     })
 }

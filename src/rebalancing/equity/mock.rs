@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use st0x_execution::{FractionalShares, Symbol};
 
-use super::{Equity, MintError, RedemptionError};
+use super::{Equity, MintTransferError, RedemptionError};
 use crate::rebalancing::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
 
 /// Parameters captured from a hedging-to-market-making (mint) call.
@@ -64,7 +64,7 @@ impl MockCrossVenueEquityTransfer {
 #[async_trait]
 impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for MockCrossVenueEquityTransfer {
     type Asset = Equity;
-    type Error = MintError;
+    type Error = MintTransferError;
 
     async fn transfer(&self, asset: Self::Asset) -> Result<(), Self::Error> {
         self.mint_count.fetch_add(1, Ordering::SeqCst);

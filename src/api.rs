@@ -1,6 +1,8 @@
-//! HTTP API endpoints for health checks, log retrieval, and order status.
+//! HTTP API endpoints for health checks, log retrieval, order status,
+//! and transfer recovery.
 
 use std::str::FromStr;
+use std::sync::Arc;
 use std::sync::LazyLock;
 
 use chrono::{DateTime, Utc};
@@ -10,11 +12,14 @@ use rocket::request::FromParam;
 use rocket::response::content::RawJson;
 use rocket::serde::json::Json;
 use rocket::serde::{Deserialize, Serialize};
-use rocket::{Route, State, get, routes};
+use rocket::{Route, State, get, post, routes};
 use sqlx::SqlitePool;
+use tokio::sync::Mutex;
+use tracing::{error, info};
 
 use crate::config::Ctx;
 use crate::dashboard::transfer_loader::TransferKind;
+use crate::rebalancing::equity::CrossVenueEquityTransfer;
 
 impl<'a> FromParam<'a> for TransferKind {
     type Error = String;
@@ -896,6 +901,154 @@ async fn raindex_orders(ctx: &State<Ctx>) -> RawJson<String> {
     }
 }
 
+#[derive(Serialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+/// Shared handle for resuming interrupted tokenization transfers at
+/// runtime, set by the conductor after startup completes.
+pub(crate) struct RecoveryHandle {
+    pub(crate) transfer: Arc<CrossVenueEquityTransfer>,
+}
+
+/// Prevents concurrent `/transfers/resume` requests from racing through
+/// duplicate mint/redemption recovery flows.
+pub(crate) struct ResumeLock(pub(crate) Mutex<()>);
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InterruptedTransfersResponse {
+    interrupted_mints: Vec<String>,
+    interrupted_redemptions: Vec<String>,
+}
+
+#[get("/transfers/interrupted")]
+async fn interrupted_transfers(
+    pool: &State<SqlitePool>,
+) -> Result<Json<InterruptedTransfersResponse>, (Status, Json<ErrorResponse>)> {
+    let mints = crate::tokenized_equity_mint::interrupted_mint_ids(pool.inner())
+        .await
+        .map_err(|error| {
+            error!(?error, "Failed to query interrupted mints");
+            (
+                Status::InternalServerError,
+                Json(ErrorResponse {
+                    error: "Failed to query interrupted mints".to_string(),
+                }),
+            )
+        })?;
+
+    let redemptions = crate::equity_redemption::interrupted_redemption_ids(pool.inner())
+        .await
+        .map_err(|error| {
+            error!(?error, "Failed to query interrupted redemptions");
+            (
+                Status::InternalServerError,
+                Json(ErrorResponse {
+                    error: "Failed to query interrupted redemptions".to_string(),
+                }),
+            )
+        })?;
+
+    Ok(Json(InterruptedTransfersResponse {
+        interrupted_mints: mints.into_iter().map(|id| id.to_string()).collect(),
+        interrupted_redemptions: redemptions.into_iter().map(|id| id.to_string()).collect(),
+    }))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResumeResponse {
+    mints_attempted: usize,
+    mints_failed: usize,
+    redemptions_attempted: usize,
+    redemptions_failed: usize,
+}
+
+#[post("/transfers/resume")]
+async fn resume_transfers(
+    pool: &State<SqlitePool>,
+    recovery: &State<Arc<tokio::sync::OnceCell<RecoveryHandle>>>,
+    resume_lock: &State<ResumeLock>,
+) -> Result<Json<ResumeResponse>, (Status, Json<ErrorResponse>)> {
+    let _guard = resume_lock.0.try_lock().map_err(|_| {
+        (
+            Status::Conflict,
+            Json(ErrorResponse {
+                error: "A resume operation is already in progress".to_string(),
+            }),
+        )
+    })?;
+
+    let handle = recovery.get().ok_or_else(|| {
+        (
+            Status::ServiceUnavailable,
+            Json(ErrorResponse {
+                error: "Recovery not ready yet (conductor still starting)".to_string(),
+            }),
+        )
+    })?;
+
+    let mints = crate::tokenized_equity_mint::interrupted_mint_ids(pool.inner())
+        .await
+        .map_err(|error| {
+            error!(?error, "Failed to query interrupted mints");
+            (
+                Status::InternalServerError,
+                Json(ErrorResponse {
+                    error: "Failed to query interrupted mints".to_string(),
+                }),
+            )
+        })?;
+
+    let redemptions = crate::equity_redemption::interrupted_redemption_ids(pool.inner())
+        .await
+        .map_err(|error| {
+            error!(?error, "Failed to query interrupted redemptions");
+            (
+                Status::InternalServerError,
+                Json(ErrorResponse {
+                    error: "Failed to query interrupted redemptions".to_string(),
+                }),
+            )
+        })?;
+
+    let mints_attempted = mints.len();
+    let redemptions_attempted = redemptions.len();
+    let mut mints_failed = 0usize;
+    let mut redemptions_failed = 0usize;
+
+    for mint_id in &mints {
+        if let Err(error) = handle.transfer.resume_mint(mint_id).await {
+            error!(%mint_id, ?error, "Failed to resume mint");
+            mints_failed += 1;
+        }
+    }
+
+    for redemption_id in &redemptions {
+        if let Err(error) = handle.transfer.resume_redemption(redemption_id).await {
+            error!(%redemption_id, ?error, "Failed to resume redemption");
+            redemptions_failed += 1;
+        }
+    }
+
+    info!(
+        mints_attempted,
+        mints_failed,
+        redemptions_attempted,
+        redemptions_failed,
+        "Transfer recovery completed via API"
+    );
+
+    Ok(Json(ResumeResponse {
+        mints_attempted,
+        mints_failed,
+        redemptions_attempted,
+        redemptions_failed,
+    }))
+}
+
 pub(crate) fn routes() -> Vec<Route> {
     routes![
         health,
@@ -905,7 +1058,9 @@ pub(crate) fn routes() -> Vec<Route> {
         trade_events,
         transfers_endpoint,
         transfer_events,
-        raindex_orders
+        raindex_orders,
+        interrupted_transfers,
+        resume_transfers
     ]
 }
 
@@ -919,7 +1074,7 @@ mod tests {
     #[test]
     fn test_num_of_routes() {
         let routes_list = routes();
-        assert_eq!(routes_list.len(), 8);
+        assert_eq!(routes_list.len(), 10);
     }
 
     #[tokio::test]
@@ -1303,5 +1458,52 @@ mod tests {
 
         assert_eq!(parsed["unavailable"], true);
         assert!(parsed["reason"].as_str().unwrap().contains("error"));
+    }
+
+    async fn create_test_pool() -> SqlitePool {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn interrupted_transfers_returns_empty_on_fresh_db() {
+        let pool = create_test_pool().await;
+        let rocket = rocket::build()
+            .mount("/", routes![interrupted_transfers])
+            .manage(pool);
+        let client = Client::tracked(rocket).await.unwrap();
+
+        let response = client.get("/transfers/interrupted").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+
+        assert_eq!(body["interruptedMints"], serde_json::json!([]));
+        assert_eq!(body["interruptedRedemptions"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn resume_transfers_returns_503_before_conductor_ready() {
+        let pool = create_test_pool().await;
+        let recovery = Arc::new(tokio::sync::OnceCell::<RecoveryHandle>::new());
+        let rocket = rocket::build()
+            .mount("/", routes![resume_transfers])
+            .manage(pool)
+            .manage(recovery)
+            .manage(ResumeLock(Mutex::new(())));
+        let client = Client::tracked(rocket).await.unwrap();
+
+        let response = client.post("/transfers/resume").dispatch().await;
+        assert_eq!(response.status(), Status::ServiceUnavailable);
+
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+
+        assert_eq!(
+            body["error"],
+            "Recovery not ready yet (conductor still starting)"
+        );
     }
 }

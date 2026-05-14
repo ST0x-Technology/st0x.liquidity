@@ -103,14 +103,22 @@ pub async fn run_bot_session_with_event_channel(
     ));
 
     let shutdown_token = CancellationToken::new();
+    let recovery_cell = Arc::new(tokio::sync::OnceCell::new());
 
-    let server_task = spawn_server_task(&ctx, &pool, event_sender.clone(), inventory.clone());
+    let server_task = spawn_server_task(
+        &ctx,
+        &pool,
+        event_sender.clone(),
+        inventory.clone(),
+        recovery_cell.clone(),
+    );
     let bot_task = tokio::spawn(Box::pin(run_conductor_session(
         ctx,
         pool,
         event_sender,
         inventory,
         shutdown_token.clone(),
+        recovery_cell,
     )));
 
     await_shutdown(server_task, bot_task, shutdown_token).await?;
@@ -124,6 +132,7 @@ fn spawn_server_task(
     pool: &SqlitePool,
     event_sender: broadcast::Sender<Statement>,
     inventory: Arc<inventory::BroadcastingInventory>,
+    recovery_cell: Arc<tokio::sync::OnceCell<api::RecoveryHandle>>,
 ) -> JoinHandle<Result<Rocket<Ignite>, rocket::Error>> {
     let rocket_config = rocket::Config::figment()
         .merge(("port", ctx.server_port))
@@ -141,7 +150,9 @@ fn spawn_server_task(
             inventory,
             pool: pool.clone(),
             settings: dashboard::settings_from_ctx(ctx),
-        });
+        })
+        .manage(recovery_cell)
+        .manage(api::ResumeLock(tokio::sync::Mutex::new(())));
 
     tokio::spawn(rocket.launch())
 }
@@ -314,6 +325,7 @@ async fn run_conductor_session(
     event_sender: broadcast::Sender<Statement>,
     inventory: Arc<inventory::BroadcastingInventory>,
     shutdown_token: CancellationToken,
+    recovery_cell: Arc<tokio::sync::OnceCell<api::RecoveryHandle>>,
 ) -> anyhow::Result<()> {
     let result = match ctx.broker.clone() {
         BrokerCtx::DryRun => {
@@ -325,6 +337,7 @@ async fn run_conductor_session(
                 event_sender,
                 inventory,
                 shutdown_token,
+                recovery_cell,
             ))
             .await
         }
@@ -337,6 +350,7 @@ async fn run_conductor_session(
                 event_sender,
                 inventory,
                 shutdown_token,
+                recovery_cell,
             ))
             .await
         }
@@ -397,6 +411,7 @@ mod tests {
             create_test_event_sender(),
             create_test_inventory(),
             CancellationToken::new(),
+            Arc::new(tokio::sync::OnceCell::new()),
         ))
         .await
         .unwrap_err();
@@ -488,6 +503,7 @@ mod tests {
             create_test_event_sender(),
             create_test_inventory(),
             CancellationToken::new(),
+            Arc::new(tokio::sync::OnceCell::new()),
         ))
         .await
         .unwrap_err();

@@ -292,6 +292,23 @@ impl From<SendError<TokenizedEquityMint>> for MintError {
     }
 }
 
+/// Distinguishes mint failures before vs after tokens were received from
+/// Alpaca. Post-receipt failures must NOT clear the in-progress guard
+/// because real tokens exist in the wallet and startup recovery will
+/// resume them.
+#[derive(Debug, Error)]
+pub(crate) enum MintTransferError {
+    /// Failure before Alpaca delivered tokens. Safe to clear guard and
+    /// retry from scratch.
+    #[error(transparent)]
+    PreReceipt(MintError),
+
+    /// Failure after tokens were received (verify/wrap/deposit stage).
+    /// Tokens exist in the wallet; guard must stay set for recovery.
+    #[error(transparent)]
+    PostReceipt(MintError),
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum RedemptionError {
     #[error(transparent)]
@@ -960,7 +977,7 @@ impl CrossVenueEquityTransfer {
 #[async_trait]
 impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTransfer {
     type Asset = Equity;
-    type Error = MintError;
+    type Error = MintTransferError;
 
     #[instrument(target = "rebalance", skip_all, fields(symbol = %asset.symbol, quantity = %asset.quantity))]
     async fn transfer(&self, asset: Self::Asset) -> Result<(), Self::Error> {
@@ -969,6 +986,7 @@ impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTra
 
         debug!(target: "rebalance", %issuer_request_id, wallet = %self.wallet, "Requesting mint");
 
+        // Pre-receipt: no tokens exist yet, safe to retry on failure.
         self.mint_store
             .send(
                 &issuer_request_id,
@@ -979,17 +997,25 @@ impl CrossVenueTransfer<HedgingVenue, MarketMakingVenue> for CrossVenueEquityTra
                     wallet: self.wallet,
                 },
             )
-            .await?;
+            .await
+            .map_err(|error| MintTransferError::PreReceipt(error.into()))?;
 
         info!(target: "rebalance", "Mint request accepted, polling for completion");
 
         self.mint_store
             .send(&issuer_request_id, TokenizedEquityMintCommand::Poll)
-            .await?;
+            .await
+            .map_err(|error| MintTransferError::PreReceipt(error.into()))?;
 
-        let tokens_received = self.load_tokens_received(&issuer_request_id).await?;
+        // Post-receipt: tokens exist in wallet from this point on.
+        let tokens_received = self
+            .load_tokens_received(&issuer_request_id)
+            .await
+            .map_err(MintTransferError::PostReceipt)?;
+
         self.finalize_received_mint(&issuer_request_id, tokens_received)
             .await
+            .map_err(MintTransferError::PostReceipt)
     }
 }
 
@@ -1323,8 +1349,8 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(error, MintError::Wrapper(_)),
-            "Expected Wrapper error, got: {error:?}"
+            matches!(error, MintTransferError::PostReceipt(MintError::Wrapper(_))),
+            "Expected PostReceipt(Wrapper) error, got: {error:?}"
         );
     }
 
@@ -1348,8 +1374,8 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(error, MintError::Raindex(_)),
-            "Expected Raindex error, got: {error:?}"
+            matches!(error, MintTransferError::PostReceipt(MintError::Raindex(_))),
+            "Expected PostReceipt(Raindex) error, got: {error:?}"
         );
     }
 
@@ -1375,9 +1401,11 @@ mod tests {
         assert!(
             matches!(
                 error,
-                MintError::Wrapper(WrapperError::SymbolNotConfigured(_))
+                MintTransferError::PostReceipt(MintError::Wrapper(
+                    WrapperError::SymbolNotConfigured(_)
+                ))
             ),
-            "Expected Wrapper(SymbolNotConfigured) error, got: {error:?}"
+            "Expected PostReceipt(Wrapper(SymbolNotConfigured)) error, got: {error:?}"
         );
     }
 
@@ -1403,9 +1431,11 @@ mod tests {
         assert!(
             matches!(
                 error,
-                MintError::Wrapper(WrapperError::SymbolNotConfigured(_))
+                MintTransferError::PostReceipt(MintError::Wrapper(
+                    WrapperError::SymbolNotConfigured(_)
+                ))
             ),
-            "Expected Wrapper(SymbolNotConfigured) error, got: {error:?}"
+            "Expected PostReceipt(Wrapper(SymbolNotConfigured)) error, got: {error:?}"
         );
     }
 
@@ -1477,9 +1507,11 @@ mod tests {
         assert!(
             matches!(
                 error,
-                MintError::Verification(MintVerificationError::ReceiptNotFound { .. })
+                MintTransferError::PostReceipt(MintError::Verification(
+                    MintVerificationError::ReceiptNotFound { .. }
+                ))
             ),
-            "Expected Verification(ReceiptNotFound) error, got: {error:?}"
+            "Expected PostReceipt(Verification(ReceiptNotFound)) error, got: {error:?}"
         );
     }
 
@@ -1508,9 +1540,11 @@ mod tests {
         assert!(
             matches!(
                 error,
-                MintError::Verification(MintVerificationError::TransactionReverted { .. })
+                MintTransferError::PostReceipt(MintError::Verification(
+                    MintVerificationError::TransactionReverted { .. }
+                ))
             ),
-            "Expected Verification(TransactionReverted) error, got: {error:?}"
+            "Expected PostReceipt(Verification(TransactionReverted)) error, got: {error:?}"
         );
     }
 
@@ -1539,9 +1573,11 @@ mod tests {
         assert!(
             matches!(
                 error,
-                MintError::Verification(MintVerificationError::NoMatchingTransfer { .. })
+                MintTransferError::PostReceipt(MintError::Verification(
+                    MintVerificationError::NoMatchingTransfer { .. }
+                ))
             ),
-            "Expected Verification(NoMatchingTransfer) error, got: {error:?}"
+            "Expected PostReceipt(Verification(NoMatchingTransfer)) error, got: {error:?}"
         );
     }
 
@@ -1570,7 +1606,9 @@ mod tests {
         assert!(
             matches!(
                 error,
-                MintError::Verification(MintVerificationError::InsufficientTransferAmount { .. })
+                MintTransferError::PostReceipt(MintError::Verification(
+                    MintVerificationError::InsufficientTransferAmount { .. }
+                ))
             ),
             "Expected Verification(InsufficientTransferAmount) error, got: {error:?}"
         );
