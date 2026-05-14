@@ -687,10 +687,6 @@ mod tests {
                 self.inner.parse_order_id(order_id_str)
             }
 
-            async fn run_executor_maintenance(&self) -> Option<tokio::task::JoinHandle<()>> {
-                self.inner.run_executor_maintenance().await
-            }
-
             async fn get_inventory(&self) -> Result<st0x_execution::InventoryResult, Self::Error> {
                 self.inner.get_inventory().await
             }

@@ -7,7 +7,6 @@ use std::sync::{
 use async_trait::async_trait;
 use rain_math_float::Float;
 use st0x_float_macro::float;
-use tokio::task::JoinHandle;
 use tracing::{debug, info};
 
 /// Hardcoded mock price returned by `MockExecutor::get_order_status`.
@@ -176,10 +175,6 @@ impl Executor for MockExecutor {
     fn parse_order_id(&self, order_id_str: &str) -> Result<Self::OrderId, Self::Error> {
         // For MockExecutor, OrderId is String, so just clone the input
         Ok(order_id_str.to_string())
-    }
-
-    async fn run_executor_maintenance(&self) -> Option<JoinHandle<()>> {
-        None
     }
 
     async fn get_inventory(&self) -> Result<InventoryResult, Self::Error> {

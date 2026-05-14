@@ -70,7 +70,10 @@ use crate::tokenization::alpaca::AlpacaTokenizationService;
 use crate::tokenized_equity_mint::{TokenizedEquityMint, interrupted_mint_ids};
 use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::trade_accountant::{DexTradeAccountingJobQueue, TradeAccountingError};
-use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryId};
+use crate::vault_registry::{
+    SeedVaultRegistry, SeedVaultRegistryCtx, SeedVaultRegistryJobQueue, VaultRegistry,
+    VaultRegistryCommand, VaultRegistryId,
+};
 use crate::wrapper::WrapperService;
 
 pub(crate) use builder::CqrsFrameworks;
@@ -108,14 +111,11 @@ pub(crate) struct TradeProcessingCqrs {
 /// accounting) into a unified lifecycle. Waits for either the supervisor or
 /// the apalis monitor to exit, then aborts all remaining tasks.
 pub(crate) struct Conductor {
-    /// Manages long-running tasks (order fill monitor, position monitor)
-    /// with automatic restart.
+    /// Manages long-running tasks (order fill monitor, position monitor,
+    /// executor maintenance) with automatic restart.
     supervisor: SupervisorHandle,
     /// Runs the apalis job queue workers that process trade accounting jobs.
     monitor: JoinHandle<Result<(), MonitorTaskError>>,
-    /// Periodic executor upkeep (e.g. Schwab token refresh). Absent when
-    /// the executor requires no background maintenance.
-    executor_maintenance: Option<JoinHandle<()>>,
     /// Periodic rebalancing loop. Absent when rebalancing is not configured.
     rebalancer: Option<JoinHandle<()>>,
     /// Cancelled during graceful shutdown to stop the rebalancer from
@@ -147,7 +147,6 @@ impl Conductor {
         crate::offchain::order::JobError: From<E::Error>,
     {
         let executor = executor_ctx.try_into_executor().await?;
-        let executor_maintenance = executor.run_executor_maintenance().await;
 
         let ws = WsConnect::new(ctx.evm.ws_rpc_url.as_str());
         let provider = ProviderBuilder::new()
@@ -170,7 +169,18 @@ impl Conductor {
                 .build(())
                 .await?;
 
-        seed_vault_registry_from_config(&vault_registry, &ctx).await?;
+        let seed_vault_registry_queue = SeedVaultRegistryJobQueue::new(&pool);
+        let seed_vault_registry_ctx = Arc::new(SeedVaultRegistryCtx::from_config(
+            vault_registry.clone(),
+            &ctx,
+        )?);
+
+        // Run the seeding logic inline at startup so downstream wiring
+        // (RaindexService, trade accounting, inventory polling) starts
+        // with a populated registry. The same code path is registered
+        // below as an apalis worker so the queue retries on failure if
+        // seeding is re-triggered later (e.g. from a recovery flow).
+        crate::conductor::job::Job::perform(&SeedVaultRegistry, &seed_vault_registry_ctx).await?;
 
         let rebalancing = match ctx.rebalancing_ctx() {
             Ok(ctx) => Some(ctx.clone()),
@@ -271,7 +281,8 @@ impl Conductor {
             .equity_check_scheduler(schedulers.equity)
             .usdc_check_scheduler(schedulers.usdc)
             .maybe_rebalancing_service(rebalancing_service)
-            .maybe_executor_maintenance(executor_maintenance)
+            .seed_vault_registry_queue(seed_vault_registry_queue)
+            .seed_vault_registry_ctx(seed_vault_registry_ctx)
             .maybe_rebalancer(rebalancer)
             .rebalancer_shutdown_token(rebalancer_shutdown_token)
             .job_cleanup(job_cleanup)
@@ -373,9 +384,6 @@ impl Conductor {
 
     fn abort_background_tasks(&self) {
         if let Some(ref handle) = self.rebalancer {
-            handle.abort();
-        }
-        if let Some(ref handle) = self.executor_maintenance {
             handle.abort();
         }
         self.job_cleanup.abort();
@@ -659,71 +667,6 @@ impl PositionAndRebalancing {
             })
         }
     }
-}
-
-/// Pre-seeds the vault registry with vault IDs from config.
-///
-/// Assets with a `vault_id` in config get their vaults registered
-/// immediately at startup, so rebalancing can work even before any
-/// onchain trades have been observed.
-async fn seed_vault_registry_from_config(
-    vault_registry: &Store<VaultRegistry>,
-    ctx: &Ctx,
-) -> anyhow::Result<()> {
-    // Pre-flight validation: ensure every rebalancing-enabled equity has at
-    // least one vault_id before performing any writes to the vault registry.
-    for (symbol, equity_config) in &ctx.assets.equities.symbols {
-        if equity_config.vault_ids.is_empty() && ctx.is_rebalancing_enabled(symbol) {
-            return Err(CtxError::MissingEquityVaultId {
-                symbol: symbol.clone(),
-            }
-            .into());
-        }
-    }
-
-    let vault_registry_id = VaultRegistryId {
-        orderbook: ctx.evm.orderbook,
-        owner: ctx.order_owner(),
-    };
-
-    for (symbol, equity_config) in &ctx.assets.equities.symbols {
-        for vault_id in &equity_config.vault_ids {
-            debug!(
-                %symbol,
-                %vault_id,
-                token = %equity_config.tokenized_equity_derivative,
-                "Seeding equity vault from config"
-            );
-
-            vault_registry
-                .send(
-                    &vault_registry_id,
-                    VaultRegistryCommand::SeedEquityVaultFromConfig {
-                        token: equity_config.tokenized_equity_derivative,
-                        vault_id: *vault_id,
-                        symbol: symbol.clone(),
-                    },
-                )
-                .await?;
-        }
-    }
-
-    if let Some(cash) = &ctx.assets.cash {
-        for vault_id in &cash.vault_ids {
-            info!(%vault_id, "Seeding USDC vault from config");
-
-            vault_registry
-                .send(
-                    &vault_registry_id,
-                    VaultRegistryCommand::SeedUsdcVaultFromConfig {
-                        vault_id: *vault_id,
-                    },
-                )
-                .await?;
-        }
-    }
-
-    Ok(())
 }
 
 fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
@@ -1972,7 +1915,6 @@ mod tests {
         Conductor {
             supervisor,
             monitor,
-            executor_maintenance: None,
             rebalancer: None,
             rebalancer_shutdown_token: CancellationToken::new(),
             job_cleanup,
@@ -4292,73 +4234,6 @@ mod tests {
         assert!(
             onchain_trade.enrichment.is_none(),
             "Should not have enrichment when enrichment fields were None"
-        );
-    }
-
-    #[tokio::test]
-    async fn seed_vault_registry_rejects_missing_vault_id_without_side_effects() {
-        let pool = setup_test_db().await;
-        let vault_registry: Store<VaultRegistry> = test_store(pool.clone(), ());
-
-        // Two equities with rebalancing enabled: one has a vault_id, one does not.
-        // The pre-flight validation must reject before any seeds are applied.
-        let mut symbols = HashMap::new();
-
-        symbols.insert(
-            Symbol::new("AAPL").unwrap(),
-            EquityAssetConfig {
-                tokenized_equity: Address::ZERO,
-                tokenized_equity_derivative: Address::ZERO,
-                vault_ids: vec![fixed_bytes!(
-                    "0x0000000000000000000000000000000000000000000000000000000000000001"
-                )],
-                trading: OperationMode::Disabled,
-                rebalancing: OperationMode::Enabled,
-                operational_limit: None,
-            },
-        );
-
-        symbols.insert(
-            Symbol::new("TSLA").unwrap(),
-            EquityAssetConfig {
-                tokenized_equity: Address::ZERO,
-                tokenized_equity_derivative: Address::ZERO,
-                vault_ids: Vec::new(),
-                trading: OperationMode::Disabled,
-                rebalancing: OperationMode::Enabled,
-                operational_limit: None,
-            },
-        );
-
-        let ctx = Ctx {
-            assets: AssetsConfig {
-                equities: EquitiesConfig {
-                    operational_limit: None,
-                    symbols,
-                },
-                cash: None,
-            },
-            ..create_test_ctx_with_order_owner(Address::ZERO)
-        };
-
-        let error = seed_vault_registry_from_config(&vault_registry, &ctx)
-            .await
-            .expect_err("should fail when vault_id is missing for TSLA");
-
-        let ctx_error = error
-            .downcast_ref::<CtxError>()
-            .expect("error should be CtxError");
-
-        assert!(
-            matches!(ctx_error, CtxError::MissingEquityVaultId { symbol } if symbol.to_string() == "TSLA"),
-            "expected MissingEquityVaultId for TSLA, got: {ctx_error:?}"
-        );
-
-        let registry = load_vault_registry(&vault_registry).await;
-
-        assert!(
-            registry.is_none(),
-            "Vault registry should have no state after validation failure"
         );
     }
 
