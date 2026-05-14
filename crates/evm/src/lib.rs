@@ -32,6 +32,9 @@ pub mod error_decoding;
 pub use error_decoding::{IntoErrorRegistry, NoOpErrorRegistry, OpenChainErrorRegistry};
 use error_decoding::{decode_reverted_receipt, decode_rpc_revert};
 
+pub mod nonce;
+pub use nonce::ResettableNonceManager;
+
 #[cfg(feature = "local-signer")]
 pub mod local;
 #[cfg(feature = "turnkey")]
@@ -163,6 +166,22 @@ pub enum EvmError {
     #[cfg(feature = "turnkey")]
     #[error("Turnkey error: {0}")]
     Turnkey(#[from] turnkey::TurnkeyError),
+}
+
+impl EvmError {
+    /// Returns `true` if this is a "nonce too low" RPC error, which
+    /// occurs when an external process (e.g. CLI) submitted
+    /// transactions from the same wallet, advancing the chain nonce
+    /// past the locally cached value.
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    pub(crate) fn is_nonce_too_low(&self) -> bool {
+        match self {
+            Self::Transport(rpc_error) => rpc_error
+                .as_error_resp()
+                .is_some_and(|payload| payload.message.contains("nonce too low")),
+            _ => false,
+        }
+    }
 }
 
 impl From<std::convert::Infallible> for EvmError {
@@ -784,6 +803,7 @@ mod tests {
     }
 
     /// Parser that succeeds with a JSON value (`Some`) or fails (`None`).
+    #[allow(dead_code)]
     struct MaybeParser(Option<serde_json::Value>);
 
     impl Parser for MaybeParser {

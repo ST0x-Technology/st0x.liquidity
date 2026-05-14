@@ -6845,6 +6845,8 @@ dependencies = [
  "alloy-signer-turnkey",
  "anyhow",
  "async-trait",
+ "dashmap",
+ "futures",
  "httpmock",
  "rain-error-decoding",
  "rand 0.8.6",
