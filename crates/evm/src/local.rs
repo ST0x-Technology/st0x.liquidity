@@ -155,6 +155,9 @@ where
                 let error = EvmError::from(error);
 
                 if !error.is_nonce_too_low() {
+                    warn!(target: "wallet", %contract, note, "Transaction rejected \
+                        by RPC -- invalidating nonce cache to prevent nonce gap");
+                    self.nonce_manager.invalidate();
                     return Err(error);
                 }
 
@@ -165,8 +168,12 @@ where
                 self.signing_provider
                     .send_transaction(tx)
                     .await
-                    .inspect_err(|error| {
-                        error!(target: "wallet", %error, "Nonce-too-low retry also failed");
+                    .map_err(|error| {
+                        let error = EvmError::from(error);
+                        error!(target: "wallet", %error, "Nonce-too-low retry also failed \
+                            -- invalidating nonce cache");
+                        self.nonce_manager.invalidate();
+                        error
                     })?
             }
         };
@@ -366,6 +373,51 @@ mod tests {
             receipt_a.transaction_hash, receipt_b.transaction_hash,
             "transactions must have different hashes (distinct nonces)"
         );
+    }
+
+    /// Verifies that the nonce cache is invalidated when a transaction
+    /// is rejected by the RPC for a reason other than nonce-too-low.
+    ///
+    /// Without invalidation, the nonce manager would hold a stale
+    /// cached nonce (incremented but never consumed on-chain), causing
+    /// all subsequent transactions to use a future nonce and stall.
+    #[tokio::test]
+    async fn nonce_cache_invalidated_on_rpc_rejection() {
+        let (_anvil, wallet, token_address, _signer) = setup_anvil_with_token().await;
+
+        let recipient = Address::random();
+        let excessive_amount = U256::from(999_999_999) * U256::from(10).pow(U256::from(18));
+
+        // First call: reverts at RPC simulation (insufficient balance).
+        // This should invalidate the nonce cache.
+        let _error = wallet
+            .submit::<NoOpErrorRegistry, _>(
+                token_address,
+                IERC20::transferCall {
+                    to: recipient,
+                    amount: excessive_amount,
+                },
+                "should revert",
+            )
+            .await
+            .unwrap_err();
+
+        // Second call: valid transfer. If the nonce cache was not
+        // invalidated, this would use a stale nonce (N+1 instead of N)
+        // and either hang or fail.
+        let receipt = wallet
+            .submit::<NoOpErrorRegistry, _>(
+                token_address,
+                IERC20::transferCall {
+                    to: recipient,
+                    amount: U256::from(1000),
+                },
+                "should succeed after revert",
+            )
+            .await
+            .expect("transaction after revert should succeed (nonce cache was invalidated)");
+
+        assert!(receipt.status(), "valid transfer should succeed");
     }
 
     #[tokio::test]

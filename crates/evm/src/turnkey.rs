@@ -264,6 +264,9 @@ where
                 let error = EvmError::from(error);
 
                 if !error.is_nonce_too_low() {
+                    warn!(target: "wallet", %contract, note, %error, "Transaction \
+                        send failed -- invalidating nonce cache to prevent nonce gap");
+                    self.nonce_manager.invalidate();
                     return Err(error);
                 }
 
@@ -274,8 +277,12 @@ where
                 self.signing_provider
                     .send_transaction(tx)
                     .await
-                    .inspect_err(|error| {
-                        error!(target: "wallet", %error, "Nonce-too-low retry also failed");
+                    .map_err(|error| {
+                        let error = EvmError::from(error);
+                        error!(target: "wallet", %error, "Nonce-too-low retry also failed \
+                            -- invalidating nonce cache");
+                        self.nonce_manager.invalidate();
+                        error
                     })?
             }
         };

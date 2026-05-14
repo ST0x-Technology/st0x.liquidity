@@ -20,6 +20,7 @@ use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
 use st0x_event_sorcery::{SendError, Store};
+use st0x_evm::EvmError;
 use st0x_execution::{FractionalShares, SharesBlockchain, SharesConversionError, Symbol};
 
 use super::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
@@ -286,6 +287,36 @@ pub(crate) enum MintError {
     },
 }
 
+/// Selector for `ERC20InsufficientBalance(address,uint256,uint256)`.
+const ERC20_INSUFFICIENT_BALANCE_SELECTOR: &str = "0xe450d38c";
+
+impl MintError {
+    /// Returns `true` if the underlying error is an RPC-level
+    /// `ERC20InsufficientBalance` revert, indicating the wallet has
+    /// zero tokens because they were already deposited in a previous
+    /// session.
+    ///
+    /// Matches both `Raindex` and `Wrapper` variants: currently only
+    /// `Raindex` is reachable from `try_deposit_or_recover`, but the
+    /// broader match keeps this predicate correct for any `MintError`
+    /// regardless of call site.
+    fn is_insufficient_balance_revert(&self) -> bool {
+        let (Self::Raindex(RaindexError::Evm(EvmError::Transport(rpc_error)))
+        | Self::Wrapper(WrapperError::Evm(EvmError::Transport(rpc_error)))) = self
+        else {
+            return false;
+        };
+
+        rpc_error.as_error_resp().is_some_and(|payload| {
+            payload.data.as_ref().is_some_and(|data| {
+                data.get()
+                    .trim_matches('"')
+                    .starts_with(ERC20_INSUFFICIENT_BALANCE_SELECTOR)
+            })
+        })
+    }
+}
+
 impl From<SendError<TokenizedEquityMint>> for MintError {
     fn from(error: SendError<TokenizedEquityMint>) -> Self {
         Self::Aggregate(Box::new(error))
@@ -478,6 +509,63 @@ impl CrossVenueEquityTransfer {
         Ok(())
     }
 
+    /// Attempts vault deposit; if it reverts with `ERC20InsufficientBalance`,
+    /// the deposit already landed in a previous session -- advance the
+    /// aggregate to terminal state. Used by both the `TokensWrapped` and
+    /// `WrapSubmitted` resume paths.
+    ///
+    /// # Invariant: tokens only leave the wallet via vault deposit
+    ///
+    /// This recovery assumes that the *only* way wrapped tokens leave the
+    /// wallet is through a successful Raindex vault deposit. Under this
+    /// invariant, a zero balance at retry time proves the deposit landed
+    /// in a prior session that crashed before persisting the CQRS event.
+    ///
+    /// If this invariant is violated (e.g. manual token transfer, bug in
+    /// another code path), the recovery would incorrectly mark the mint
+    /// complete while tokens are lost. The invariant holds today because
+    /// the wrap -> deposit lifecycle is the sole consumer of these tokens
+    /// and runs atomically within a single task.
+    async fn try_deposit_or_recover(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+        symbol: &Symbol,
+        wrapped_token: Address,
+        wrapped_shares: U256,
+    ) -> Result<(), MintError> {
+        match self
+            .deposit_wrapped_mint(issuer_request_id, symbol, wrapped_token, wrapped_shares)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) if error.is_insufficient_balance_revert() => {
+                warn!(
+                    target: "rebalance",
+                    %issuer_request_id,
+                    %symbol,
+                    ?error,
+                    "Vault deposit reverted on resume -- deposit likely \
+                    already landed in a previous session; closing operation"
+                );
+
+                // TxHash::ZERO signals that the real deposit TX hash is
+                // unknown -- the deposit succeeded in a previous session
+                // that crashed before persisting the CQRS event.
+                self.mint_store
+                    .send(
+                        issuer_request_id,
+                        TokenizedEquityMintCommand::DepositToVault {
+                            vault_deposit_tx_hash: TxHash::ZERO,
+                        },
+                    )
+                    .await?;
+
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     async fn verify_received_mint(
         &self,
         tokens_received: &TokensReceivedData,
@@ -588,7 +676,7 @@ impl CrossVenueEquityTransfer {
 
                     info!(target: "rebalance", %wrap_tx_hash, %wrapped_shares, "Wrap confirmed on resume, depositing to Raindex vault");
                     return self
-                        .deposit_wrapped_mint(
+                        .try_deposit_or_recover(
                             issuer_request_id,
                             &symbol,
                             wrapped_token,
@@ -603,8 +691,9 @@ impl CrossVenueEquityTransfer {
                 } => {
                     info!(%issuer_request_id, "Resuming wrapped mint");
                     let wrapped_token = self.wrapper.lookup_derivative(&symbol)?;
+
                     return self
-                        .deposit_wrapped_mint(
+                        .try_deposit_or_recover(
                             issuer_request_id,
                             &symbol,
                             wrapped_token,
@@ -1611,6 +1700,169 @@ mod tests {
                 ))
             ),
             "Expected Verification(InsufficientTransferAmount) error, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_mint_recovers_when_deposit_reverts() {
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockRaindex::reverting_deposit()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let id = IssuerRequestId::new("ISS-REVERT-RECOVERY");
+
+        // Advance the aggregate to TokensWrapped state manually:
+        // RequestMint -> MintAccepted -> TokensReceived -> WrapSubmitted
+        // -> TokensWrapped
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(10),
+                    wallet: transfer.wallet,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Poll advances to TokensReceived
+        transfer
+            .mint_store
+            .send(&id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+
+        let wrap_tx = TxHash::random();
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SubmitWrap {
+                    wrap_tx_hash: wrap_tx,
+                },
+            )
+            .await
+            .unwrap();
+
+        let wrapped_shares = U256::from(10_000_000_000_000_000_000u128);
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::WrapTokens {
+                    wrap_tx_hash: wrap_tx,
+                    wrapped_shares,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Verify we're in TokensWrapped state
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::TokensWrapped { .. }),
+            "Expected TokensWrapped, got: {entity:?}"
+        );
+
+        // Resume should detect zero balance and advance to terminal
+        transfer.resume_mint(&id).await.unwrap();
+
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        let TokenizedEquityMint::DepositedIntoRaindex {
+            vault_deposit_tx_hash,
+            ..
+        } = entity
+        else {
+            panic!("Expected DepositedIntoRaindex after revert recovery, got: {entity:?}");
+        };
+        assert_eq!(
+            vault_deposit_tx_hash,
+            TxHash::ZERO,
+            "Recovered deposit must use TxHash::ZERO sentinel"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_mint_from_wrap_submitted_recovers_when_deposit_reverts() {
+        let mock_wrapper = MockWrapper::new();
+        let wrap_tx = TxHash::random();
+
+        // Pre-seed the mock so confirm_wrap recognises the tx hash that the
+        // aggregate will store in WrapSubmitted state.
+        mock_wrapper.seed_submitted_amount(wrap_tx, U256::from(10_000_000_000_000_000_000u128));
+
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockRaindex::reverting_deposit()),
+            Arc::new(mock_wrapper),
+        )
+        .await;
+
+        let id = IssuerRequestId::new("ISS-WRAP-SUBMITTED-RECOVERY");
+
+        // Advance aggregate to WrapSubmitted state:
+        // RequestMint -> MintAccepted -> TokensReceived -> WrapSubmitted
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(10),
+                    wallet: transfer.wallet,
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer
+            .mint_store
+            .send(&id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SubmitWrap {
+                    wrap_tx_hash: wrap_tx,
+                },
+            )
+            .await
+            .unwrap();
+
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::WrapSubmitted { .. }),
+            "Expected WrapSubmitted, got: {entity:?}"
+        );
+
+        // Resume from WrapSubmitted: confirms wrap, then deposit reverts,
+        // recovery should advance to terminal state.
+        transfer.resume_mint(&id).await.unwrap();
+
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        let TokenizedEquityMint::DepositedIntoRaindex {
+            vault_deposit_tx_hash,
+            ..
+        } = entity
+        else {
+            panic!(
+                "Expected DepositedIntoRaindex after WrapSubmitted revert recovery, got: {entity:?}"
+            );
+        };
+        assert_eq!(
+            vault_deposit_tx_hash,
+            TxHash::ZERO,
+            "Recovered deposit must use TxHash::ZERO sentinel"
         );
     }
 }
