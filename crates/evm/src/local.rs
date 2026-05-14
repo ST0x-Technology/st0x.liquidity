@@ -14,8 +14,9 @@ use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
 use serde::Deserialize;
-use tracing::info;
+use tracing::{error, info, warn};
 
+use crate::nonce::ResettableNonceManager;
 use crate::{Evm, EvmError, TryIntoWallet, Wallet, WalletCtx};
 
 /// Secrets needed to construct a [`RawPrivateKeyWallet`].
@@ -24,13 +25,20 @@ pub struct PrivateKeySecrets {
     pub private_key: B256,
 }
 
-/// Provider type produced by wrapping a base provider with default fillers
+/// Provider type produced by wrapping a base provider with fillers
 /// and a [`WalletFiller`].
+///
+/// Uses [`ResettableNonceManager`] instead of alloy's default
+/// `CachedNonceManager` so the nonce cache can be invalidated when
+/// external processes (e.g. CLI commands) advance the chain nonce.
 pub type SignerProvider<P> = FillProvider<
     JoinFill<
         JoinFill<
-            Identity,
-            JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
+            JoinFill<
+                JoinFill<JoinFill<Identity, GasFiller>, BlobGasFiller>,
+                NonceFiller<ResettableNonceManager>,
+            >,
+            ChainIdFiller,
         >,
         WalletFiller<EthereumWallet>,
     >,
@@ -55,6 +63,10 @@ pub struct RawPrivateKeyWallet<P: Provider> {
     /// Provider wrapped with gas/nonce/chain-id/wallet fillers for
     /// transaction signing and submission.
     signing_provider: SignerProvider<P>,
+    /// Shared nonce manager — cloned from the one inside
+    /// `signing_provider` so we can call [`invalidate()`] on "nonce
+    /// too low" errors without needing to traverse the filler chain.
+    nonce_manager: ResettableNonceManager,
     required_confirmations: u64,
 }
 
@@ -74,8 +86,14 @@ impl<P: Provider + Clone + Send + Sync + 'static> RawPrivateKeyWallet<P> {
         let eth_wallet = EthereumWallet::from(signer);
 
         let base_provider = provider.clone();
+        let nonce_manager = ResettableNonceManager::default();
 
         let signing_provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .filler(GasFiller)
+            .filler(BlobGasFiller::default())
+            .with_nonce_management(nonce_manager.clone())
+            .filler(ChainIdFiller::default())
             .wallet(eth_wallet)
             .connect_provider(provider);
 
@@ -86,6 +104,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> RawPrivateKeyWallet<P> {
         Ok(Self {
             provider: base_provider,
             signing_provider,
+            nonce_manager,
             required_confirmations,
         })
     }
@@ -130,7 +149,28 @@ where
             .to(contract)
             .input(calldata.into());
 
-        let pending = self.signing_provider.send_transaction(tx).await?;
+        let pending = match self.signing_provider.send_transaction(tx.clone()).await {
+            Ok(pending) => pending,
+            Err(error) => {
+                let error = EvmError::from(error);
+
+                if !error.is_nonce_too_low() {
+                    return Err(error);
+                }
+
+                warn!(target: "wallet", %contract, note, "Nonce too low — \
+                    invalidating cache and retrying (external nonce change detected)");
+                self.nonce_manager.invalidate();
+
+                self.signing_provider
+                    .send_transaction(tx)
+                    .await
+                    .inspect_err(|error| {
+                        error!(target: "wallet", %error, "Nonce-too-low retry also failed");
+                    })?
+            }
+        };
+
         let tx_hash = *pending.tx_hash();
 
         info!(target: "wallet", %tx_hash, note, "Transaction submitted");
@@ -306,6 +346,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after, amount);
+    }
+
+    #[tokio::test]
+    async fn concurrent_sends_use_distinct_nonces() {
+        let (_anvil, wallet, _token_address, signer_address) = setup_anvil_with_token().await;
+
+        let (receipt_a, receipt_b) = tokio::join!(
+            wallet.send(signer_address, Bytes::new(), "concurrent-a"),
+            wallet.send(signer_address, Bytes::new(), "concurrent-b"),
+        );
+
+        let receipt_a = receipt_a.expect("concurrent send A should succeed");
+        let receipt_b = receipt_b.expect("concurrent send B should succeed");
+
+        assert!(receipt_a.status(), "tx A should succeed");
+        assert!(receipt_b.status(), "tx B should succeed");
+        assert_ne!(
+            receipt_a.transaction_hash, receipt_b.transaction_hash,
+            "transactions must have different hashes (distinct nonces)"
+        );
     }
 
     #[tokio::test]

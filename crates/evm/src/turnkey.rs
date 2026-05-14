@@ -17,8 +17,9 @@ use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use alloy_signer_turnkey::{TurnkeySigner, TurnkeySignerError};
 use async_trait::async_trait;
 use serde::Deserialize;
-use tracing::info;
+use tracing::{error, info, warn};
 
+use crate::nonce::ResettableNonceManager;
 use crate::{Evm, EvmError, TryIntoWallet, Wallet, WalletCtx};
 
 /// Turnkey organization identifier (non-secret, lives in plaintext
@@ -80,13 +81,20 @@ impl std::fmt::Debug for TurnkeyCredentials {
     }
 }
 
-/// Provider type produced by wrapping a base provider with default
-/// fillers and a [`WalletFiller`] backed by a Turnkey signer.
+/// Provider type produced by wrapping a base provider with fillers
+/// and a [`WalletFiller`] backed by a Turnkey signer.
+///
+/// Uses [`ResettableNonceManager`] instead of alloy's default
+/// `CachedNonceManager` so the nonce cache can be invalidated when
+/// external processes (e.g. CLI commands) advance the chain nonce.
 type SignerProvider<P> = FillProvider<
     JoinFill<
         JoinFill<
-            Identity,
-            JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
+            JoinFill<
+                JoinFill<JoinFill<Identity, GasFiller>, BlobGasFiller>,
+                NonceFiller<ResettableNonceManager>,
+            >,
+            ChainIdFiller,
         >,
         WalletFiller<EthereumWallet>,
     >,
@@ -108,6 +116,10 @@ pub struct TurnkeyWallet<P: Provider> {
     /// Provider wrapped with gas/nonce/chain-id/wallet fillers for
     /// transaction signing and submission.
     signing_provider: SignerProvider<P>,
+    /// Shared nonce manager — cloned from the one inside
+    /// `signing_provider` so we can call [`invalidate()`] on "nonce
+    /// too low" errors without needing to traverse the filler chain.
+    nonce_manager: ResettableNonceManager,
     address: Address,
     required_confirmations: u64,
 }
@@ -149,7 +161,14 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
         let eth_wallet = EthereumWallet::from(signer);
 
         let base_provider = ctx.provider.clone();
+        let nonce_manager = ResettableNonceManager::default();
+
         let signing_provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .filler(GasFiller)
+            .filler(BlobGasFiller::default())
+            .with_nonce_management(nonce_manager.clone())
+            .filler(ChainIdFiller::default())
             .wallet(eth_wallet)
             .connect_provider(ctx.provider);
 
@@ -160,6 +179,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
         Ok(Self {
             provider: base_provider,
             signing_provider,
+            nonce_manager,
             address,
             required_confirmations,
         })
@@ -184,14 +204,21 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
         let eth_wallet = EthereumWallet::from(signer);
 
         let base_provider = provider.clone();
+        let nonce_manager = ResettableNonceManager::default();
 
         let signing_provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .filler(GasFiller)
+            .filler(BlobGasFiller::default())
+            .with_nonce_management(nonce_manager.clone())
+            .filler(ChainIdFiller::default())
             .wallet(eth_wallet)
             .connect_provider(provider);
 
         Ok(Self {
             provider: base_provider,
             signing_provider,
+            nonce_manager,
             address,
             required_confirmations,
         })
@@ -231,7 +258,28 @@ where
             .to(contract)
             .input(calldata.into());
 
-        let pending = self.signing_provider.send_transaction(tx).await?;
+        let pending = match self.signing_provider.send_transaction(tx.clone()).await {
+            Ok(pending) => pending,
+            Err(error) => {
+                let error = EvmError::from(error);
+
+                if !error.is_nonce_too_low() {
+                    return Err(error);
+                }
+
+                warn!(target: "wallet", %contract, note, "Nonce too low — \
+                    invalidating cache and retrying (external nonce change detected)");
+                self.nonce_manager.invalidate();
+
+                self.signing_provider
+                    .send_transaction(tx)
+                    .await
+                    .inspect_err(|error| {
+                        error!(target: "wallet", %error, "Nonce-too-low retry also failed");
+                    })?
+            }
+        };
+
         let tx_hash = *pending.tx_hash();
 
         info!(target: "wallet", %tx_hash, note, "Transaction submitted");
