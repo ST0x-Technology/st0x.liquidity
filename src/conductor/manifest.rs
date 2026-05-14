@@ -22,8 +22,7 @@ use crate::dashboard::Broadcaster;
 use crate::equity_redemption::EquityRedemption;
 use crate::inventory::InventorySnapshot;
 use crate::position::Position;
-use crate::rebalancing::RebalancingTrigger;
-use crate::rebalancing::equity::EquityTransferServices;
+use crate::rebalancing::{RebalancingService, equity::EquityTransferServices};
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
 
@@ -33,7 +32,7 @@ use crate::usdc_rebalance::UsdcRebalance;
 /// Exhaustive destructuring in [`Self::build()`]
 /// ensures every field is handled.
 pub(super) struct QueryManifest {
-    rebalancing_trigger: Arc<RebalancingTrigger>,
+    rebalancing_service: Arc<RebalancingService>,
     broadcaster: Arc<Broadcaster>,
 }
 
@@ -49,11 +48,11 @@ pub(super) struct BuiltFrameworks {
 
 impl QueryManifest {
     pub(super) fn new(
-        rebalancing_trigger: Arc<RebalancingTrigger>,
+        rebalancing_service: Arc<RebalancingService>,
         broadcaster: Arc<Broadcaster>,
     ) -> Self {
         Self {
-            rebalancing_trigger,
+            rebalancing_service,
             broadcaster,
         }
     }
@@ -69,37 +68,37 @@ impl QueryManifest {
         services: EquityTransferServices,
     ) -> anyhow::Result<BuiltFrameworks> {
         let Self {
-            rebalancing_trigger,
+            rebalancing_service,
             broadcaster,
         } = self;
 
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
-            .with(rebalancing_trigger.clone())
+            .with(rebalancing_service.clone())
             .build(())
             .await?;
 
         let mint = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
-            .with(rebalancing_trigger.clone())
+            .with(rebalancing_service.clone())
             .with(broadcaster.clone())
             .build(services.clone())
             .await?;
 
         let redemption = StoreBuilder::<EquityRedemption>::new(pool.clone())
-            .with(rebalancing_trigger.clone())
+            .with(rebalancing_service.clone())
             .with(broadcaster.clone())
             .build(services)
             .await?;
 
         let usdc = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-            .with(rebalancing_trigger.clone())
+            .with(rebalancing_service.clone())
             .with(broadcaster)
             .build(())
             .await?;
 
-        // The trigger owns the snapshot projection internally, so it's
-        // the sole subscriber here.
+        // The reactor's underlying trigger owns the snapshot projection
+        // internally, so it's the sole subscriber here.
         let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
-            .with(rebalancing_trigger)
+            .with(rebalancing_service)
             .build(())
             .await?;
 
@@ -130,13 +129,13 @@ mod tests {
     use crate::inventory::snapshot::{InventorySnapshotCommand, InventorySnapshotId};
     use crate::inventory::{BroadcastingInventory, ImbalanceThreshold, InventoryView, Venue};
     use crate::onchain::mock::MockRaindex;
-    use crate::rebalancing::RebalancingTriggerConfig;
+    use crate::rebalancing::{RebalancingSchedulers, RebalancingService, RebalancingServiceConfig};
     use crate::test_utils::setup_test_db;
     use crate::tokenization::mock::MockTokenizer;
     use crate::wrapper::mock::MockWrapper;
 
-    fn test_trigger_config() -> RebalancingTriggerConfig {
-        RebalancingTriggerConfig {
+    fn test_trigger_config() -> RebalancingServiceConfig {
+        RebalancingServiceConfig {
             equity: ImbalanceThreshold {
                 target: float!(0.5),
                 deviation: float!(0.2),
@@ -168,7 +167,7 @@ mod tests {
             event_sender.clone(),
         ));
 
-        let rebalancing_trigger = Arc::new(RebalancingTrigger::new(
+        let rebalancing_service = Arc::new(RebalancingService::new(
             test_trigger_config(),
             vault_registry,
             Address::ZERO,
@@ -176,10 +175,11 @@ mod tests {
             inventory.clone(),
             operation_sender,
             Arc::new(MockWrapper::new()),
+            RebalancingSchedulers::new(&pool),
         ));
 
         let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
-        let manifest = QueryManifest::new(rebalancing_trigger, broadcaster);
+        let manifest = QueryManifest::new(rebalancing_service, broadcaster);
 
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
@@ -217,7 +217,7 @@ mod tests {
             event_sender.clone(),
         ));
 
-        let rebalancing_trigger = Arc::new(RebalancingTrigger::new(
+        let rebalancing_service = Arc::new(RebalancingService::new(
             test_trigger_config(),
             vault_registry,
             Address::ZERO,
@@ -225,9 +225,10 @@ mod tests {
             inventory.clone(),
             operation_sender,
             Arc::new(MockWrapper::new()),
+            RebalancingSchedulers::new(&pool),
         ));
         let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
-        let manifest = QueryManifest::new(rebalancing_trigger, broadcaster);
+        let manifest = QueryManifest::new(rebalancing_service, broadcaster);
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
             tokenizer: Arc::new(MockTokenizer::new()),

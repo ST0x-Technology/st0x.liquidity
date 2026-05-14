@@ -6,13 +6,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
 use rain_math_float::{Float, FloatError};
+use serde::{Deserialize, Serialize};
 
 use st0x_float_macro::float;
 use tracing::{debug, trace, warn};
 
 use st0x_finance::Usdc;
 
-use super::{RebalancingTrigger, RebalancingTriggerError, TriggeredOperation};
+use super::{RebalancingService, RebalancingServiceError, TriggeredOperation};
+#[cfg(any(test, feature = "test-support"))]
+use crate::conductor::job::JobKind;
+use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::inventory::{
     BroadcastingInventory, Imbalance, ImbalanceThreshold, Inventory, TransferOp, Venue,
 };
@@ -348,12 +352,12 @@ fn truncate_for_transfer(amount: Usdc) -> Result<Usdc, FloatError> {
     Ok(truncated)
 }
 
-impl RebalancingTrigger {
+impl RebalancingService {
     pub(super) async fn on_usdc_rebalance(
         &self,
         id: UsdcRebalanceId,
         event: UsdcRebalanceEvent,
-    ) -> Result<(), RebalancingTriggerError> {
+    ) -> Result<(), RebalancingServiceError> {
         let event_sync_guard = self.usdc_event_sync.lock().await;
 
         if self
@@ -385,8 +389,13 @@ impl RebalancingTrigger {
 
         drop(event_sync_guard);
 
+        // A terminal USDC transfer cleared the in-progress claim, so we
+        // cancel any pre-rebalance checks and push a fresh one against
+        // the post-rebalance inventory.
         if is_terminal {
-            self.check_and_trigger_usdc().await;
+            self.equity_scheduler.cancel_pending().await;
+            self.usdc_scheduler.cancel_pending().await;
+            self.usdc_scheduler.enqueue_check().await;
         }
 
         Ok(())
@@ -396,7 +405,7 @@ impl RebalancingTrigger {
         &self,
         id: &UsdcRebalanceId,
         event: &UsdcRebalanceEvent,
-    ) -> Result<(), RebalancingTriggerError> {
+    ) -> Result<(), RebalancingServiceError> {
         use UsdcRebalanceEvent::*;
 
         match event {
@@ -467,9 +476,9 @@ impl RebalancingTrigger {
         direction: &RebalanceDirection,
         amount: Usdc,
         event: &UsdcRebalanceEvent,
-    ) -> Result<(), RebalancingTriggerError> {
+    ) -> Result<(), RebalancingServiceError> {
         let stage = UsdcRebalanceStage::from_event(event).ok_or(
-            RebalancingTriggerError::MissingUsdcTrackingContext {
+            RebalancingServiceError::MissingUsdcTrackingContext {
                 id: id.clone(),
                 event: UsdcTrackingEvent::Initiated,
             },
@@ -477,7 +486,7 @@ impl RebalancingTrigger {
         let last_progress_at =
             stage
                 .timestamp(event)
-                .ok_or(RebalancingTriggerError::MissingUsdcTrackingContext {
+                .ok_or(RebalancingServiceError::MissingUsdcTrackingContext {
                     id: id.clone(),
                     event: UsdcTrackingEvent::Initiated,
                 })?;
@@ -589,11 +598,11 @@ impl RebalancingTrigger {
         &self,
         id: &UsdcRebalanceId,
         amount_received: Usdc,
-    ) -> Result<(), RebalancingTriggerError> {
+    ) -> Result<(), RebalancingServiceError> {
         let mut tracking = self.usdc_tracking.write().await;
         let Some(existing) = tracking.get_mut(id) else {
             warn!(target: "rebalance", id = %id, "Bridged event missing USDC tracking context");
-            return Err(RebalancingTriggerError::MissingUsdcTrackingContext {
+            return Err(RebalancingServiceError::MissingUsdcTrackingContext {
                 id: id.clone(),
                 event: UsdcTrackingEvent::Bridged,
             });
@@ -608,10 +617,10 @@ impl RebalancingTrigger {
     async fn complete_alpaca_to_base_deposit(
         &self,
         id: &UsdcRebalanceId,
-    ) -> Result<(), RebalancingTriggerError> {
+    ) -> Result<(), RebalancingServiceError> {
         let Some(tracking) = self.usdc_tracking.read().await.get(id).cloned() else {
             warn!(target: "rebalance", id = %id, "DepositConfirmed event missing USDC tracking context");
-            return Err(RebalancingTriggerError::MissingUsdcTrackingContext {
+            return Err(RebalancingServiceError::MissingUsdcTrackingContext {
                 id: id.clone(),
                 event: UsdcTrackingEvent::DepositConfirmed,
             });
@@ -623,7 +632,7 @@ impl RebalancingTrigger {
                 id = %id,
                 "DepositConfirmed event missing bridged amount for USDC rebalance"
             );
-            return Err(RebalancingTriggerError::MissingUsdcBridgedAmount { id: id.clone() });
+            return Err(RebalancingServiceError::MissingUsdcBridgedAmount { id: id.clone() });
         };
 
         self.complete_usdc_rebalance(id, UsdcTrackingEvent::DepositConfirmed, amount_received)
@@ -633,7 +642,7 @@ impl RebalancingTrigger {
     async fn cancel_tracked_usdc_rebalance(
         &self,
         id: &UsdcRebalanceId,
-    ) -> Result<(), RebalancingTriggerError> {
+    ) -> Result<(), RebalancingServiceError> {
         let Some(tracking) = self.usdc_tracking.read().await.get(id).cloned() else {
             debug!(
                 target: "rebalance",
@@ -668,10 +677,10 @@ impl RebalancingTrigger {
         id: &UsdcRebalanceId,
         event: UsdcTrackingEvent,
         settled_amount: Usdc,
-    ) -> Result<(), RebalancingTriggerError> {
+    ) -> Result<(), RebalancingServiceError> {
         let Some(tracking) = self.usdc_tracking.read().await.get(id).cloned() else {
             warn!(target: "rebalance", id = %id, "Terminal success event missing USDC tracking context");
-            return Err(RebalancingTriggerError::MissingUsdcTrackingContext {
+            return Err(RebalancingServiceError::MissingUsdcTrackingContext {
                 id: id.clone(),
                 event,
             });
@@ -689,7 +698,7 @@ impl RebalancingTrigger {
                 ?settled_amount,
                 "Settled USDC amount exceeds initiated amount"
             );
-            return Err(RebalancingTriggerError::SettledUsdcExceedsInitiatedAmount {
+            return Err(RebalancingServiceError::SettledUsdcExceedsInitiatedAmount {
                 id: id.clone(),
                 event,
                 initiated_amount,
@@ -728,15 +737,129 @@ impl RebalancingTrigger {
     }
 }
 
+/// USDC rebalancing check. Payload-less because USDC is a single
+/// global balance, not per-symbol.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct UsdcRebalancingCheck;
+
+pub(crate) type UsdcRebalancingCheckJobQueue = JobQueue<UsdcRebalancingCheck>;
+
+/// USDC checks never propagate errors: the trigger logs and skips on
+/// arithmetic/threshold issues, matching the pre-job direct-call
+/// semantics.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum UsdcRebalancingCheckJobError {}
+
+impl Job<RebalancingService> for UsdcRebalancingCheck {
+    type Output = ();
+    type Error = UsdcRebalancingCheckJobError;
+
+    const WORKER_NAME: &'static str = "usdc-rebalancing-check-worker";
+    #[cfg(any(test, feature = "test-support"))]
+    const JOB_KIND: JobKind = JobKind::UsdcRebalancingCheck;
+
+    fn label(&self) -> Label {
+        Label::new("UsdcRebalancingCheck")
+    }
+
+    async fn perform(&self, trigger: &RebalancingService) -> Result<Self::Output, Self::Error> {
+        trigger.check_and_trigger_usdc().await;
+        Ok(())
+    }
+}
+
+/// Owns the USDC-check queue and the domain-level operations
+/// callers (the reactor, the conductor wiring) want: enqueue a check,
+/// cancel pending checks after a terminal event. Keeps queue plumbing
+/// out of [`RebalancingService`] and out of the conductor wiring.
+#[derive(Clone)]
+pub(crate) struct UsdcRebalancingCheckScheduler {
+    queue: UsdcRebalancingCheckJobQueue,
+}
+
+impl UsdcRebalancingCheckScheduler {
+    pub(crate) fn new(pool: &sqlx::SqlitePool) -> Self {
+        Self {
+            queue: UsdcRebalancingCheckJobQueue::new(pool),
+        }
+    }
+
+    pub(crate) fn queue(&self) -> &UsdcRebalancingCheckJobQueue {
+        &self.queue
+    }
+
+    /// Best-effort enqueue. Failures are logged: an enqueue miss only
+    /// delays the next imbalance check, which the next snapshot will
+    /// re-trigger.
+    pub(super) async fn enqueue_check(&self) {
+        let mut queue = self.queue.clone();
+        if let Err(QueuePushError(error)) = queue.push(UsdcRebalancingCheck).await {
+            warn!(target: "rebalance", %error, "Failed to enqueue UsdcRebalancingCheck job");
+        }
+    }
+
+    pub(super) async fn cancel_pending(&self) {
+        self.queue.cancel_all_pending().await;
+    }
+}
+
+/// Test helper: synchronously drain every pending USDC-check row the
+/// service enqueued, running each job's [`Job::perform`] and marking
+/// the row `Done`.
+#[cfg(test)]
+pub(crate) async fn drain_pending_usdc_jobs(service: &Arc<RebalancingService>) -> usize {
+    let pool = service.usdc_scheduler.queue().pool().clone();
+    let mut processed = 0usize;
+
+    let job_type = std::any::type_name::<UsdcRebalancingCheck>();
+
+    loop {
+        let row: Option<(String, Vec<u8>)> = sqlx::query_as(
+            "SELECT id, job FROM Jobs \
+             WHERE status = 'Pending' AND job_type = ? \
+             ORDER BY run_at LIMIT 1",
+        )
+        .bind(job_type)
+        .fetch_optional(&pool)
+        .await
+        .expect("query pending usdc-check jobs");
+
+        let Some((id, payload)) = row else {
+            break;
+        };
+
+        let job: UsdcRebalancingCheck =
+            serde_json::from_slice(&payload).expect("deserialize UsdcRebalancingCheck payload");
+        match job.perform(service).await {
+            Ok(()) => {}
+            Err(never) => match never {},
+        }
+
+        sqlx::query("UPDATE Jobs SET status = 'Done' WHERE id = ?")
+            .bind(&id)
+            .execute(&pool)
+            .await
+            .expect("mark usdc-check job done");
+
+        processed += 1;
+    }
+
+    processed
+}
+
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::TxHash;
+    use chrono::TimeZone;
     use tokio::sync::broadcast;
+    use uuid::Uuid;
 
     use st0x_dto::Statement;
     use st0x_float_macro::float;
 
     use super::*;
     use crate::inventory::InventoryView;
+    use crate::usdc_rebalance::TransferRef;
 
     #[test]
     fn test_guard_releases_on_drop() {
@@ -989,5 +1112,557 @@ mod tests {
             ),
             "Cap of $30 should produce BelowMinimumWithdrawal, got {result:?}"
         );
+    }
+
+    fn ts(seconds: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(seconds, 0).unwrap()
+    }
+
+    fn initiated_event(direction: RebalanceDirection, amount: Usdc) -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::Initiated {
+            direction,
+            amount,
+            withdrawal_ref: TransferRef::OnchainTx(TxHash::ZERO),
+            initiated_at: ts(100),
+        }
+    }
+
+    fn conversion_initiated_event(
+        direction: RebalanceDirection,
+        amount: Usdc,
+    ) -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::ConversionInitiated {
+            direction,
+            amount,
+            order_id: Uuid::nil(),
+            initiated_at: ts(101),
+        }
+    }
+
+    fn conversion_confirmed_event(
+        direction: RebalanceDirection,
+        filled_amount: Usdc,
+    ) -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::ConversionConfirmed {
+            direction,
+            filled_amount,
+            converted_at: ts(102),
+        }
+    }
+
+    fn withdrawal_confirmed_event() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::WithdrawalConfirmed {
+            confirmed_at: ts(103),
+        }
+    }
+
+    fn bridging_initiated_event() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash: TxHash::ZERO,
+            burned_at: ts(104),
+        }
+    }
+
+    fn bridge_attestation_received_event() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::BridgeAttestationReceived {
+            attestation: vec![],
+            cctp_nonce: 0,
+            attested_at: ts(105),
+        }
+    }
+
+    fn bridged_event(amount_received: Usdc) -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::Bridged {
+            mint_tx_hash: TxHash::ZERO,
+            amount_received,
+            fee_collected: Usdc::new(float!(0)),
+            minted_at: ts(106),
+        }
+    }
+
+    fn deposit_initiated_event() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::DepositInitiated {
+            deposit_ref: TransferRef::OnchainTx(TxHash::ZERO),
+            deposit_initiated_at: ts(107),
+        }
+    }
+
+    fn deposit_confirmed_event(direction: RebalanceDirection) -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::DepositConfirmed {
+            direction,
+            deposit_confirmed_at: ts(108),
+        }
+    }
+
+    fn conversion_failed_event() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::ConversionFailed {
+            reason: "boom".into(),
+            failed_at: ts(109),
+        }
+    }
+
+    fn withdrawal_failed_event() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::WithdrawalFailed {
+            reason: "boom".into(),
+            failed_at: ts(110),
+        }
+    }
+
+    fn bridging_failed_event() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::BridgingFailed {
+            burn_tx_hash: None,
+            cctp_nonce: None,
+            reason: "boom".into(),
+            failed_at: ts(111),
+        }
+    }
+
+    fn deposit_failed_event() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::DepositFailed {
+            deposit_ref: None,
+            reason: "boom".into(),
+            failed_at: ts(112),
+        }
+    }
+
+    #[test]
+    fn truncate_for_transfer_preserves_value_within_six_decimals() {
+        let original = Usdc::new(float!(123.456789));
+        let result = truncate_for_transfer(original).unwrap();
+        assert_eq!(result, original);
+    }
+
+    #[test]
+    fn truncate_for_transfer_drops_seventh_decimal() {
+        let original = Usdc::new(float!(1.1234567));
+        let result = truncate_for_transfer(original).unwrap();
+        assert_eq!(result, Usdc::new(float!(1.123456)));
+    }
+
+    #[test]
+    fn truncate_for_transfer_drops_excess_precision() {
+        let original = Usdc::new(float!(99.123456789012345));
+        let result = truncate_for_transfer(original).unwrap();
+        assert_eq!(result, Usdc::new(float!(99.123456)));
+    }
+
+    #[test]
+    fn truncate_for_transfer_zero_is_zero() {
+        let result = truncate_for_transfer(Usdc::new(float!(0))).unwrap();
+        assert_eq!(result, Usdc::new(float!(0)));
+    }
+
+    #[test]
+    fn truncate_for_transfer_whole_dollar_is_unchanged() {
+        let original = Usdc::new(float!(51));
+        let result = truncate_for_transfer(original).unwrap();
+        assert_eq!(result, original);
+    }
+
+    #[test]
+    fn cap_usdc_returns_input_when_no_limit() {
+        let amount = Usdc::new(float!(500));
+        assert_eq!(cap_usdc(amount, None), amount);
+    }
+
+    #[test]
+    fn cap_usdc_returns_input_when_below_limit() {
+        let amount = Usdc::new(float!(100));
+        let limit = Some(Usdc::new(float!(500)));
+        assert_eq!(cap_usdc(amount, limit), amount);
+    }
+
+    #[test]
+    fn cap_usdc_returns_input_when_equal_to_limit() {
+        let amount = Usdc::new(float!(500));
+        let limit = Some(Usdc::new(float!(500)));
+        assert_eq!(cap_usdc(amount, limit), amount);
+    }
+
+    #[test]
+    fn cap_usdc_returns_limit_when_above_limit() {
+        let amount = Usdc::new(float!(1000));
+        let limit_value = Usdc::new(float!(500));
+        assert_eq!(cap_usdc(amount, Some(limit_value)), limit_value);
+    }
+
+    #[test]
+    fn from_event_maps_conversion_initiated_to_stage() {
+        let event =
+            conversion_initiated_event(RebalanceDirection::AlpacaToBase, Usdc::new(float!(1)));
+        assert_eq!(
+            UsdcRebalanceStage::from_event(&event),
+            Some(UsdcRebalanceStage::ConversionInitiated)
+        );
+    }
+
+    #[test]
+    fn from_event_maps_alpaca_to_base_conversion_confirmed_to_stage() {
+        let event =
+            conversion_confirmed_event(RebalanceDirection::AlpacaToBase, Usdc::new(float!(1)));
+        assert_eq!(
+            UsdcRebalanceStage::from_event(&event),
+            Some(UsdcRebalanceStage::ConversionConfirmed)
+        );
+    }
+
+    #[test]
+    fn from_event_skips_base_to_alpaca_conversion_confirmed() {
+        let event =
+            conversion_confirmed_event(RebalanceDirection::BaseToAlpaca, Usdc::new(float!(1)));
+        assert_eq!(UsdcRebalanceStage::from_event(&event), None);
+    }
+
+    #[test]
+    fn from_event_maps_initiated_to_stage() {
+        let event = initiated_event(RebalanceDirection::AlpacaToBase, Usdc::new(float!(1)));
+        assert_eq!(
+            UsdcRebalanceStage::from_event(&event),
+            Some(UsdcRebalanceStage::Initiated)
+        );
+    }
+
+    #[test]
+    fn from_event_maps_withdrawal_confirmed_to_stage() {
+        assert_eq!(
+            UsdcRebalanceStage::from_event(&withdrawal_confirmed_event()),
+            Some(UsdcRebalanceStage::WithdrawalConfirmed)
+        );
+    }
+
+    #[test]
+    fn from_event_maps_bridging_initiated_to_stage() {
+        assert_eq!(
+            UsdcRebalanceStage::from_event(&bridging_initiated_event()),
+            Some(UsdcRebalanceStage::BridgingInitiated)
+        );
+    }
+
+    #[test]
+    fn from_event_maps_bridge_attestation_received_to_stage() {
+        assert_eq!(
+            UsdcRebalanceStage::from_event(&bridge_attestation_received_event()),
+            Some(UsdcRebalanceStage::BridgeAttestationReceived)
+        );
+    }
+
+    #[test]
+    fn from_event_maps_bridged_to_stage() {
+        assert_eq!(
+            UsdcRebalanceStage::from_event(&bridged_event(Usdc::new(float!(99)))),
+            Some(UsdcRebalanceStage::Bridged)
+        );
+    }
+
+    #[test]
+    fn from_event_maps_deposit_initiated_to_stage() {
+        assert_eq!(
+            UsdcRebalanceStage::from_event(&deposit_initiated_event()),
+            Some(UsdcRebalanceStage::DepositInitiated)
+        );
+    }
+
+    #[test]
+    fn from_event_maps_deposit_confirmed_to_stage() {
+        assert_eq!(
+            UsdcRebalanceStage::from_event(&deposit_confirmed_event(
+                RebalanceDirection::AlpacaToBase
+            )),
+            Some(UsdcRebalanceStage::DepositConfirmed)
+        );
+    }
+
+    #[test]
+    fn from_event_skips_conversion_failed() {
+        assert_eq!(
+            UsdcRebalanceStage::from_event(&conversion_failed_event()),
+            None
+        );
+    }
+
+    #[test]
+    fn from_event_skips_withdrawal_failed() {
+        assert_eq!(
+            UsdcRebalanceStage::from_event(&withdrawal_failed_event()),
+            None
+        );
+    }
+
+    #[test]
+    fn from_event_skips_bridging_failed() {
+        assert_eq!(
+            UsdcRebalanceStage::from_event(&bridging_failed_event()),
+            None
+        );
+    }
+
+    #[test]
+    fn from_event_skips_deposit_failed() {
+        assert_eq!(
+            UsdcRebalanceStage::from_event(&deposit_failed_event()),
+            None
+        );
+    }
+
+    #[test]
+    fn timestamp_extracts_initiated_at_from_conversion_initiated() {
+        let event =
+            conversion_initiated_event(RebalanceDirection::AlpacaToBase, Usdc::new(float!(1)));
+        assert_eq!(
+            UsdcRebalanceStage::ConversionInitiated.timestamp(&event),
+            Some(ts(101))
+        );
+    }
+
+    #[test]
+    fn timestamp_extracts_converted_at_from_conversion_confirmed() {
+        let event =
+            conversion_confirmed_event(RebalanceDirection::AlpacaToBase, Usdc::new(float!(1)));
+        assert_eq!(
+            UsdcRebalanceStage::ConversionConfirmed.timestamp(&event),
+            Some(ts(102))
+        );
+    }
+
+    #[test]
+    fn timestamp_extracts_initiated_at_from_initiated() {
+        let event = initiated_event(RebalanceDirection::BaseToAlpaca, Usdc::new(float!(1)));
+        assert_eq!(
+            UsdcRebalanceStage::Initiated.timestamp(&event),
+            Some(ts(100))
+        );
+    }
+
+    #[test]
+    fn timestamp_extracts_confirmed_at_from_withdrawal_confirmed() {
+        assert_eq!(
+            UsdcRebalanceStage::WithdrawalConfirmed.timestamp(&withdrawal_confirmed_event()),
+            Some(ts(103))
+        );
+    }
+
+    #[test]
+    fn timestamp_extracts_burned_at_from_bridging_initiated() {
+        assert_eq!(
+            UsdcRebalanceStage::BridgingInitiated.timestamp(&bridging_initiated_event()),
+            Some(ts(104))
+        );
+    }
+
+    #[test]
+    fn timestamp_extracts_attested_at_from_bridge_attestation_received() {
+        assert_eq!(
+            UsdcRebalanceStage::BridgeAttestationReceived
+                .timestamp(&bridge_attestation_received_event()),
+            Some(ts(105))
+        );
+    }
+
+    #[test]
+    fn timestamp_extracts_minted_at_from_bridged() {
+        assert_eq!(
+            UsdcRebalanceStage::Bridged.timestamp(&bridged_event(Usdc::new(float!(99)))),
+            Some(ts(106))
+        );
+    }
+
+    #[test]
+    fn timestamp_extracts_deposit_initiated_at_from_deposit_initiated() {
+        assert_eq!(
+            UsdcRebalanceStage::DepositInitiated.timestamp(&deposit_initiated_event()),
+            Some(ts(107))
+        );
+    }
+
+    #[test]
+    fn timestamp_extracts_deposit_confirmed_at_from_deposit_confirmed() {
+        assert_eq!(
+            UsdcRebalanceStage::DepositConfirmed
+                .timestamp(&deposit_confirmed_event(RebalanceDirection::AlpacaToBase)),
+            Some(ts(108))
+        );
+    }
+
+    #[test]
+    fn timestamp_returns_none_when_stage_does_not_match_event() {
+        let event = withdrawal_confirmed_event();
+        assert_eq!(UsdcRebalanceStage::Initiated.timestamp(&event), None);
+    }
+
+    fn tracking(direction: RebalanceDirection, stage: UsdcRebalanceStage) -> UsdcRebalanceTracking {
+        UsdcRebalanceTracking {
+            direction,
+            initiated_amount: Usdc::new(float!(100)),
+            bridged_amount_received: None,
+            stage,
+            last_progress_at: ts(0),
+        }
+    }
+
+    #[test]
+    fn source_venue_alpaca_to_base_is_hedging() {
+        let entry = tracking(
+            RebalanceDirection::AlpacaToBase,
+            UsdcRebalanceStage::Initiated,
+        );
+        assert_eq!(entry.source_venue(), Venue::Hedging);
+    }
+
+    #[test]
+    fn source_venue_base_to_alpaca_is_market_making() {
+        let entry = tracking(
+            RebalanceDirection::BaseToAlpaca,
+            UsdcRebalanceStage::Initiated,
+        );
+        assert_eq!(entry.source_venue(), Venue::MarketMaking);
+    }
+
+    #[test]
+    fn source_transfer_started_alpaca_to_base_false_during_conversion_initiated() {
+        let entry = tracking(
+            RebalanceDirection::AlpacaToBase,
+            UsdcRebalanceStage::ConversionInitiated,
+        );
+        assert!(!entry.source_transfer_started());
+    }
+
+    #[test]
+    fn source_transfer_started_alpaca_to_base_false_during_conversion_confirmed() {
+        let entry = tracking(
+            RebalanceDirection::AlpacaToBase,
+            UsdcRebalanceStage::ConversionConfirmed,
+        );
+        assert!(!entry.source_transfer_started());
+    }
+
+    #[test]
+    fn source_transfer_started_alpaca_to_base_true_after_initiated() {
+        let entry = tracking(
+            RebalanceDirection::AlpacaToBase,
+            UsdcRebalanceStage::Initiated,
+        );
+        assert!(entry.source_transfer_started());
+    }
+
+    #[test]
+    fn source_transfer_started_alpaca_to_base_true_after_bridged() {
+        let entry = tracking(
+            RebalanceDirection::AlpacaToBase,
+            UsdcRebalanceStage::Bridged,
+        );
+        assert!(entry.source_transfer_started());
+    }
+
+    #[test]
+    fn source_transfer_started_base_to_alpaca_always_true_during_conversion_initiated() {
+        let entry = tracking(
+            RebalanceDirection::BaseToAlpaca,
+            UsdcRebalanceStage::ConversionInitiated,
+        );
+        assert!(entry.source_transfer_started());
+    }
+
+    #[test]
+    fn source_transfer_started_base_to_alpaca_always_true_during_conversion_confirmed() {
+        let entry = tracking(
+            RebalanceDirection::BaseToAlpaca,
+            UsdcRebalanceStage::ConversionConfirmed,
+        );
+        assert!(entry.source_transfer_started());
+    }
+
+    #[test]
+    fn track_progress_updates_stage_and_timestamp() {
+        let mut entry = tracking(
+            RebalanceDirection::AlpacaToBase,
+            UsdcRebalanceStage::Initiated,
+        );
+        entry.track_progress(&withdrawal_confirmed_event());
+        assert_eq!(entry.stage, UsdcRebalanceStage::WithdrawalConfirmed);
+        assert_eq!(entry.last_progress_at, ts(103));
+    }
+
+    #[test]
+    fn track_progress_does_not_change_state_when_event_yields_no_stage() {
+        let mut entry = tracking(
+            RebalanceDirection::AlpacaToBase,
+            UsdcRebalanceStage::Initiated,
+        );
+        entry.track_progress(&withdrawal_failed_event());
+        assert_eq!(entry.stage, UsdcRebalanceStage::Initiated);
+        assert_eq!(entry.last_progress_at, ts(0));
+    }
+
+    #[test]
+    fn usdc_rebalancing_check_label_is_static() {
+        assert_eq!(
+            UsdcRebalancingCheck.label().as_str(),
+            "UsdcRebalancingCheck"
+        );
+    }
+
+    async fn count_pending_usdc_check_jobs(pool: &sqlx::SqlitePool) -> i64 {
+        let job_type = std::any::type_name::<UsdcRebalancingCheck>();
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(job_type)
+        .fetch_one(pool)
+        .await
+        .expect("count pending usdc-check jobs")
+    }
+
+    #[tokio::test]
+    async fn usdc_scheduler_enqueue_check_inserts_pending_row() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let scheduler = UsdcRebalancingCheckScheduler::new(&pool);
+
+        scheduler.enqueue_check().await;
+
+        assert_eq!(count_pending_usdc_check_jobs(&pool).await, 1);
+    }
+
+    #[tokio::test]
+    async fn usdc_scheduler_cancel_pending_marks_pending_rows_done() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let scheduler = UsdcRebalancingCheckScheduler::new(&pool);
+
+        scheduler.enqueue_check().await;
+        scheduler.enqueue_check().await;
+        assert_eq!(count_pending_usdc_check_jobs(&pool).await, 2);
+
+        scheduler.cancel_pending().await;
+
+        assert_eq!(
+            count_pending_usdc_check_jobs(&pool).await,
+            0,
+            "cancel_pending must drain all pending rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn usdc_scheduler_enqueue_after_cancel_creates_fresh_row() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let scheduler = UsdcRebalancingCheckScheduler::new(&pool);
+
+        scheduler.enqueue_check().await;
+        scheduler.cancel_pending().await;
+        scheduler.enqueue_check().await;
+
+        assert_eq!(count_pending_usdc_check_jobs(&pool).await, 1);
+    }
+
+    #[test]
+    fn track_progress_skips_base_to_alpaca_conversion_confirmed() {
+        let mut entry = tracking(
+            RebalanceDirection::BaseToAlpaca,
+            UsdcRebalanceStage::DepositConfirmed,
+        );
+        entry.track_progress(&conversion_confirmed_event(
+            RebalanceDirection::BaseToAlpaca,
+            Usdc::new(float!(50)),
+        ));
+        assert_eq!(entry.stage, UsdcRebalanceStage::DepositConfirmed);
+        assert_eq!(entry.last_progress_at, ts(0));
     }
 }

@@ -1,5 +1,5 @@
 //! Integration tests for the inventory rebalancing pipeline: position changes
-//! flow through the RebalancingTrigger (wired as a CQRS query processor),
+//! flow through the RebalancingService (wired as a CQRS query processor),
 //! update the InventoryView, detect equity or USDC imbalances, and dispatch
 //! operations through the Rebalancer to drive mints, redemptions, and USDC
 //! transfers to completion.
@@ -44,7 +44,8 @@ use crate::rebalancing::equity::{CrossVenueEquityTransfer, Equity, EquityTransfe
 use crate::rebalancing::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
 use crate::rebalancing::usdc::mock::MockUsdcRebalance;
 use crate::rebalancing::{
-    Rebalancer, RebalancingTrigger, RebalancingTriggerConfig, TriggeredOperation,
+    Rebalancer, RebalancingSchedulers, RebalancingService, RebalancingServiceConfig,
+    TriggeredOperation, drain_pending_jobs,
 };
 use crate::test_utils::setup_test_db;
 use crate::threshold::ExecutionThreshold;
@@ -111,8 +112,8 @@ async fn discover_deterministic_tx_hash(
     tx_hash
 }
 
-fn test_trigger_config() -> RebalancingTriggerConfig {
-    RebalancingTriggerConfig {
+fn test_trigger_config() -> RebalancingServiceConfig {
+    RebalancingServiceConfig {
         equity: ImbalanceThreshold {
             target: float!(0.5),
             deviation: float!(0.2),
@@ -149,14 +150,15 @@ fn test_trigger_config() -> RebalancingTriggerConfig {
 }
 
 /// Mirrors the private `build_position_cqrs()` from `src/conductor/mod.rs`,
-/// wiring the RebalancingTrigger as a Position CQRS query processor so that
-/// position events flow through trigger.dispatch() -> inventory update.
-async fn build_position_cqrs_with_trigger(
+/// wiring the `RebalancingService` as a Position CQRS query processor so
+/// that position events flow through it into inventory bookkeeping +
+/// follow-up check enqueueing.
+async fn build_position_cqrs_with_service(
     pool: &SqlitePool,
-    trigger: &Arc<RebalancingTrigger>,
+    service: &Arc<RebalancingService>,
 ) -> Arc<Store<Position>> {
     let (store, _projection) = StoreBuilder::<Position>::new(pool.clone())
-        .with(Arc::clone(trigger))
+        .with(Arc::clone(service))
         .build(())
         .await
         .unwrap();
@@ -165,12 +167,13 @@ async fn build_position_cqrs_with_trigger(
 }
 
 /// Shared state for equity rebalancing tests (mint and redemption) that
-/// wires up the Position CQRS with a RebalancingTrigger as a query processor.
+/// wires up the Position CQRS with a `RebalancingService` as a query
+/// processor.
 struct EquityTriggerFixture {
     pool: SqlitePool,
     symbol: Symbol,
     aggregate_id: String,
-    trigger: Arc<RebalancingTrigger>,
+    service: Arc<RebalancingService>,
     inventory: Arc<BroadcastingInventory>,
     position_cqrs: Arc<Store<Position>>,
     receiver: mpsc::Receiver<TriggeredOperation>,
@@ -198,7 +201,7 @@ async fn setup_equity_trigger() -> EquityTriggerFixture {
 
     let wrapper = Arc::new(MockWrapper::new());
 
-    let trigger = Arc::new(RebalancingTrigger::new(
+    let service = Arc::new(RebalancingService::new(
         test_trigger_config(),
         vault_registry,
         TEST_ORDERBOOK,
@@ -206,15 +209,16 @@ async fn setup_equity_trigger() -> EquityTriggerFixture {
         Arc::clone(&inventory),
         sender,
         wrapper,
+        RebalancingSchedulers::new(&pool),
     ));
 
-    let position_cqrs = build_position_cqrs_with_trigger(&pool, &trigger).await;
+    let position_cqrs = build_position_cqrs_with_service(&pool, &service).await;
 
     EquityTriggerFixture {
         pool,
         symbol,
         aggregate_id,
-        trigger,
+        service,
         inventory,
         position_cqrs,
         receiver,
@@ -416,16 +420,16 @@ fn build_equity_transfer_with_wrapper(
 }
 
 /// Builds `CrossVenueEquityTransfer` with mint and redemption stores wired to
-/// the `RebalancingTrigger` as a query processor. This mirrors the production
+/// the `RebalancingService` as a query processor. This mirrors the production
 /// wiring in `Conductor` via `QueryManifest::build()`, ensuring mint/redemption
 /// lifecycle events flow through the trigger and update inflight state.
-async fn build_equity_transfer_with_trigger(
+async fn build_equity_transfer_with_service(
     pool: &SqlitePool,
     raindex: Arc<dyn crate::onchain::raindex::Raindex>,
     tokenizer: Arc<dyn Tokenizer>,
     mock_wrapper: MockWrapper,
     wallet: Address,
-    trigger: &Arc<RebalancingTrigger>,
+    service: &Arc<RebalancingService>,
 ) -> Arc<CrossVenueEquityTransfer> {
     let wrapper: Arc<dyn crate::wrapper::Wrapper> = Arc::new(mock_wrapper);
 
@@ -436,13 +440,13 @@ async fn build_equity_transfer_with_trigger(
     };
 
     let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
-        .with(Arc::clone(trigger))
+        .with(Arc::clone(service))
         .build(equity_services.clone())
         .await
         .unwrap();
 
     let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
-        .with(Arc::clone(trigger))
+        .with(Arc::clone(service))
         .build(equity_services)
         .await
         .unwrap();
@@ -458,7 +462,7 @@ async fn build_equity_transfer_with_trigger(
 }
 
 /// Verifies the full equity mint rebalancing pipeline: position CQRS commands
-/// flow through the RebalancingTrigger (registered as a Query processor),
+/// flow through the RebalancingService (registered as a Query processor),
 /// update the InventoryView, detect an equity imbalance, and dispatch a Mint
 /// operation through the Rebalancer to the CrossVenueEquityTransfer which
 /// drives the TokenizedEquityMint aggregate to completion via the Alpaca
@@ -470,7 +474,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
         pool,
         symbol,
         aggregate_id,
-        trigger,
+        service,
         inventory: _,
         position_cqrs,
         receiver,
@@ -601,11 +605,12 @@ async fn equity_offchain_imbalance_triggers_mint() {
         )
         .await
         .unwrap();
+    drain_pending_jobs(&service).await.unwrap();
 
-    // Both trigger and position_cqrs hold Arc<RebalancingTrigger> which owns the
+    // Both trigger and position_cqrs hold Arc<RebalancingService> which owns the
     // mpsc sender. Both must be dropped to close the channel so rebalancer.run()
     // can exit after processing all queued operations.
-    drop(trigger);
+    drop(service);
     drop(position_cqrs);
 
     rebalancer.run().await;
@@ -710,7 +715,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
 }
 
 /// Verifies the full equity redemption rebalancing pipeline: position CQRS
-/// commands flow through the RebalancingTrigger, detect too much onchain equity,
+/// commands flow through the RebalancingService, detect too much onchain equity,
 /// and dispatch a Redemption operation through the Rebalancer to the real
 /// CrossVenueEquityTransfer. The transfer sends tokens on Anvil, then drives the
 /// EquityRedemption aggregate through TokensSent -> Detected -> Completed via
@@ -726,7 +731,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
         pool,
         symbol,
         aggregate_id,
-        trigger,
+        service,
         inventory: _,
         position_cqrs,
         receiver,
@@ -813,8 +818,9 @@ async fn equity_onchain_imbalance_triggers_redemption() {
         )
         .await
         .unwrap();
+    drain_pending_jobs(&service).await.unwrap();
 
-    drop(trigger);
+    drop(service);
     drop(position_cqrs);
     rebalancer.run().await;
 
@@ -962,7 +968,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
 }
 
 /// Verifies USDC rebalancing dispatch: a USDC imbalance triggers the
-/// RebalancingTrigger to send a UsdcAlpacaToBase operation through the channel
+/// RebalancingService to send a UsdcAlpacaToBase operation through the channel
 /// to the Rebalancer, which dispatches to the USDC manager. Uses mocked managers
 /// since the real USDC flow requires CCTP bridge and vault transactions.
 #[tokio::test]
@@ -989,7 +995,7 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
     let wrapper = Arc::new(MockWrapper::new());
 
-    let trigger = RebalancingTrigger::new(
+    let trigger = RebalancingService::new(
         test_trigger_config(),
         vault_registry,
         TEST_ORDERBOOK,
@@ -997,6 +1003,7 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
         Arc::clone(&inventory),
         sender,
         wrapper,
+        RebalancingSchedulers::new(&pool),
     );
 
     let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
@@ -1068,7 +1075,7 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
     let wrapper = Arc::new(MockWrapper::new());
 
-    let trigger = RebalancingTrigger::new(
+    let trigger = RebalancingService::new(
         test_trigger_config(),
         vault_registry,
         TEST_ORDERBOOK,
@@ -1076,6 +1083,7 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
         Arc::clone(&inventory),
         sender,
         wrapper,
+        RebalancingSchedulers::new(&pool),
     );
 
     let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
@@ -1155,7 +1163,7 @@ async fn cash_reserve_shifts_offchain_balance_triggering_base_to_alpaca() {
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
     let wrapper = Arc::new(MockWrapper::new());
 
-    let trigger = Arc::new(RebalancingTrigger::new(
+    let service = Arc::new(RebalancingService::new(
         test_trigger_config(),
         Arc::clone(&vault_registry),
         TEST_ORDERBOOK,
@@ -1163,11 +1171,13 @@ async fn cash_reserve_shifts_offchain_balance_triggering_base_to_alpaca() {
         Arc::clone(&inventory),
         sender,
         wrapper,
+        RebalancingSchedulers::new(&pool),
     ));
 
-    // Build snapshot store with trigger as reactor — mirrors production wiring
-    // in QueryManifest::build. Snapshot events from polling flow through the
-    // trigger's on_snapshot, updating the BroadcastingInventory.
+    // Build snapshot store with the service as the CQRS subscriber — mirrors
+    // production wiring in QueryManifest::build. Snapshot events from polling
+    // flow through the service's on_snapshot, updating the
+    // BroadcastingInventory and scheduling follow-up imbalance checks.
     let (_, vault_registry_projection) = StoreBuilder::<VaultRegistry>::new(pool.clone())
         .build(())
         .await
@@ -1180,7 +1190,7 @@ async fn cash_reserve_shifts_offchain_balance_triggering_base_to_alpaca() {
 
     let snapshot_store =
         StoreBuilder::<crate::inventory::snapshot::InventorySnapshot>::new(pool.clone())
-            .with(Arc::clone(&trigger))
+            .with(Arc::clone(&service))
             .build(())
             .await
             .unwrap();
@@ -1242,7 +1252,7 @@ async fn cash_reserve_shifts_offchain_balance_triggering_base_to_alpaca() {
     drop(view);
 
     // Trigger checks thresholds against the reserve-shifted inventory.
-    trigger.check_and_trigger_usdc().await;
+    service.check_and_trigger_usdc().await;
 
     let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
     let usdc = Arc::new(MockUsdcRebalance::new());
@@ -1259,9 +1269,9 @@ async fn cash_reserve_shifts_offchain_balance_triggering_base_to_alpaca() {
 
     // Drop all Arc clones holding the trigger so the mpsc channel closes
     // and rebalancer.run() terminates after processing queued operations.
-    // The snapshot store (held by polling_service and locally) keeps the
-    // trigger alive via its reactor list.
-    drop(trigger);
+    // The reactor (which wraps the trigger) is also held by the snapshot
+    // store's reactor list.
+    drop(service);
     drop(snapshot_store);
     drop(polling_service);
 
@@ -1314,7 +1324,7 @@ async fn balanced_usdc_without_reserve_triggers_no_rebalancing() {
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
     let wrapper = Arc::new(MockWrapper::new());
 
-    let trigger = RebalancingTrigger::new(
+    let trigger = RebalancingService::new(
         test_trigger_config(),
         vault_registry,
         TEST_ORDERBOOK,
@@ -1322,6 +1332,7 @@ async fn balanced_usdc_without_reserve_triggers_no_rebalancing() {
         Arc::clone(&inventory),
         sender,
         wrapper,
+        RebalancingSchedulers::new(&pool),
     );
 
     trigger.check_and_trigger_usdc().await;
@@ -1334,7 +1345,7 @@ async fn balanced_usdc_without_reserve_triggers_no_rebalancing() {
     );
 }
 
-/// Verifies that setting `usdc: None` in `RebalancingTriggerConfig`
+/// Verifies that setting `usdc: None` in `RebalancingServiceConfig`
 /// disables USDC rebalancing entirely: even with a severe imbalance,
 /// `check_and_trigger_usdc` dispatches no operations.
 #[tokio::test]
@@ -1359,8 +1370,8 @@ async fn usdc_none_disables_usdc_rebalancing() {
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
     let wrapper = Arc::new(MockWrapper::new());
 
-    let trigger = RebalancingTrigger::new(
-        RebalancingTriggerConfig {
+    let trigger = RebalancingService::new(
+        RebalancingServiceConfig {
             usdc: None,
             ..test_trigger_config()
         },
@@ -1370,6 +1381,7 @@ async fn usdc_none_disables_usdc_rebalancing() {
         Arc::clone(&inventory),
         sender,
         wrapper,
+        RebalancingSchedulers::new(&pool),
     );
 
     trigger.check_and_trigger_usdc().await;
@@ -1392,7 +1404,7 @@ async fn mint_api_failure_produces_rejected_event() {
         pool,
         symbol,
         aggregate_id,
-        trigger,
+        service,
         inventory: _,
         position_cqrs,
         receiver,
@@ -1461,8 +1473,9 @@ async fn mint_api_failure_produces_rejected_event() {
         )
         .await
         .unwrap();
+    drain_pending_jobs(&service).await.unwrap();
 
-    drop(trigger);
+    drop(service);
     drop(position_cqrs);
 
     rebalancer.run().await;
@@ -1547,7 +1560,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         }),
     };
 
-    let config = RebalancingTriggerConfig {
+    let config = RebalancingServiceConfig {
         equity: ImbalanceThreshold {
             target: float!(0.5),
             deviation: float!(0.2),
@@ -1565,7 +1578,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
     let wrapper = Arc::new(MockWrapper::new());
 
-    let trigger = RebalancingTrigger::new(
+    let trigger = RebalancingService::new(
         config,
         vault_registry,
         TEST_ORDERBOOK,
@@ -1573,6 +1586,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         Arc::clone(&inventory),
         sender,
         wrapper,
+        RebalancingSchedulers::new(&pool),
     );
 
     // Cycle 1: excess = 450, capped to 100
@@ -1678,7 +1692,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
             reserved: None,
         }),
     };
-    let config = RebalancingTriggerConfig {
+    let config = RebalancingServiceConfig {
         equity: ImbalanceThreshold {
             target: float!(0.5),
             deviation: float!(0.2),
@@ -1696,7 +1710,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
     let wrapper = Arc::new(MockWrapper::new());
 
-    let trigger = RebalancingTrigger::new(
+    let trigger = RebalancingService::new(
         config,
         vault_registry,
         TEST_ORDERBOOK,
@@ -1704,6 +1718,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
         Arc::clone(&inventory),
         sender,
         wrapper,
+        RebalancingSchedulers::new(&pool),
     );
 
     // First trigger fires: excess = 400, capped to 100
@@ -1780,7 +1795,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
         .await;
 
         let (sender, mut receiver) = mpsc::channel(10);
-        let wide_config = RebalancingTriggerConfig {
+        let wide_config = RebalancingServiceConfig {
             equity: ImbalanceThreshold {
                 target: float!(0.5),
                 deviation: float!(0.4),
@@ -1803,7 +1818,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
         };
         let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
         let wrapper = Arc::new(MockWrapper::new());
-        let trigger = RebalancingTrigger::new(
+        let trigger = RebalancingService::new(
             wide_config,
             vault_registry,
             TEST_ORDERBOOK,
@@ -1811,6 +1826,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
             Arc::clone(&inventory),
             sender,
             wrapper,
+            RebalancingSchedulers::new(&pool),
         );
 
         trigger.check_and_trigger_usdc().await;
@@ -1841,7 +1857,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
         .await;
 
         let (sender, mut receiver) = mpsc::channel(10);
-        let tight_config = RebalancingTriggerConfig {
+        let tight_config = RebalancingServiceConfig {
             equity: ImbalanceThreshold {
                 target: float!(0.5),
                 deviation: float!(0.1),
@@ -1864,7 +1880,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
         };
         let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
         let wrapper = Arc::new(MockWrapper::new());
-        let trigger = RebalancingTrigger::new(
+        let trigger = RebalancingService::new(
             tight_config,
             vault_registry,
             TEST_ORDERBOOK,
@@ -1872,6 +1888,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
             Arc::clone(&inventory),
             sender,
             wrapper,
+            RebalancingSchedulers::new(&pool),
         );
 
         trigger.check_and_trigger_usdc().await;
@@ -1906,7 +1923,7 @@ async fn mint_accepted_sets_offchain_inflight() {
         pool,
         symbol,
         aggregate_id: _,
-        trigger,
+        service,
         inventory,
         position_cqrs,
         mut receiver,
@@ -1959,13 +1976,13 @@ async fn mint_accepted_sets_offchain_inflight() {
 
     // Wire mint/redemption stores with trigger so lifecycle events update
     // inflight state through the trigger's Reactor
-    let equity_transfer = build_equity_transfer_with_trigger(
+    let equity_transfer = build_equity_transfer_with_service(
         &pool,
         raindex,
         tokenizer,
         mock_wrapper,
         signer.address(),
-        &trigger,
+        &service,
     )
     .await;
 
@@ -2004,6 +2021,7 @@ async fn mint_accepted_sets_offchain_inflight() {
         )
         .await
         .unwrap();
+    drain_pending_jobs(&service).await.unwrap();
 
     // Receive the dispatched Mint operation and get the quantity
     let operation = receiver
@@ -2102,7 +2120,7 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
         pool,
         symbol,
         aggregate_id: _,
-        trigger,
+        service,
         inventory,
         position_cqrs,
         mut receiver,
@@ -2151,13 +2169,13 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
     let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
     let mock_wrapper = MockWrapper::new().with_tokenized_shares(token_address);
 
-    let equity_transfer = build_equity_transfer_with_trigger(
+    let equity_transfer = build_equity_transfer_with_service(
         &pool,
         raindex,
         tokenizer,
         mock_wrapper,
         signer.address(),
-        &trigger,
+        &service,
     )
     .await;
 
@@ -2208,6 +2226,7 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
         )
         .await
         .unwrap();
+    drain_pending_jobs(&service).await.unwrap();
 
     // Receive the dispatched Mint operation
     let operation = receiver
@@ -2277,7 +2296,7 @@ async fn transfer_failed_cancels_redemption_inflight() {
         pool,
         symbol,
         aggregate_id: _,
-        trigger,
+        service,
         inventory,
         position_cqrs,
         receiver: _,
@@ -2305,7 +2324,7 @@ async fn transfer_failed_cancels_redemption_inflight() {
     };
 
     let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
-        .with(Arc::clone(&trigger))
+        .with(Arc::clone(&service))
         .build(equity_services)
         .await
         .unwrap();

@@ -142,6 +142,34 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
     pub(crate) fn into_storage(self) -> Storage<Task> {
         self.0
     }
+
+    /// Returns the underlying `SqlitePool`. Used by callers that need to
+    /// query or mutate the apalis Jobs table directly.
+    pub(crate) fn pool(&self) -> &SqlitePool {
+        self.0.pool()
+    }
+
+    /// Mark every pending row of this queue's task type as `Done`. Used by
+    /// callers that need to discard stale work after a terminal domain event
+    /// invalidates everything queued before it.
+    pub(crate) async fn cancel_all_pending(&self) {
+        let job_type = std::any::type_name::<Task>();
+        if let Err(error) = sqlx::query(
+            "UPDATE Jobs SET status = 'Done' \
+             WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(job_type)
+        .execute(self.pool())
+        .await
+        {
+            warn!(
+                target: "rebalance",
+                %error,
+                job_type,
+                "Failed to cancel pending rows for job type",
+            );
+        }
+    }
 }
 
 /// A persistent, retryable unit of work backed by apalis storage.
@@ -279,6 +307,8 @@ pub enum JobKind {
     PollOrderStatus,
     ReconcileOrderFill,
     HandleOrderRejection,
+    EquityRebalancingCheck,
+    UsdcRebalancingCheck,
 }
 
 /// Job execution error. Wraps the concrete `Job::Error` type at
@@ -309,6 +339,8 @@ pub struct FailureInjector {
     poll_order_status: Arc<Mutex<InjectionState>>,
     reconcile_order_fill: Arc<Mutex<InjectionState>>,
     handle_order_rejection: Arc<Mutex<InjectionState>>,
+    equity_rebalancing_check: Arc<Mutex<InjectionState>>,
+    usdc_rebalancing_check: Arc<Mutex<InjectionState>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -337,6 +369,8 @@ impl FailureInjector {
             poll_order_status: Arc::new(Mutex::new(InjectionState::Idle)),
             reconcile_order_fill: Arc::new(Mutex::new(InjectionState::Idle)),
             handle_order_rejection: Arc::new(Mutex::new(InjectionState::Idle)),
+            equity_rebalancing_check: Arc::new(Mutex::new(InjectionState::Idle)),
+            usdc_rebalancing_check: Arc::new(Mutex::new(InjectionState::Idle)),
         }
     }
 
@@ -377,6 +411,8 @@ impl FailureInjector {
             JobKind::PollOrderStatus => &self.poll_order_status,
             JobKind::ReconcileOrderFill => &self.reconcile_order_fill,
             JobKind::HandleOrderRejection => &self.handle_order_rejection,
+            JobKind::EquityRebalancingCheck => &self.equity_rebalancing_check,
+            JobKind::UsdcRebalancingCheck => &self.usdc_rebalancing_check,
         };
 
         match mutex.lock() {

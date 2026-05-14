@@ -147,6 +147,7 @@ pub(crate) fn get_test_log() -> Log {
 pub(crate) async fn setup_test_db() -> SqlitePool {
     let pool = SqlitePool::connect(":memory:").await.unwrap();
     sqlx::migrate!().run(&pool).await.unwrap();
+    crate::conductor::setup_apalis_tables(&pool).await.unwrap();
     pool
 }
 
