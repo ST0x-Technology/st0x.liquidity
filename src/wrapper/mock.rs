@@ -99,6 +99,16 @@ impl MockWrapper {
         mock.failure = MockFailure::DerivativeLookup;
         mock
     }
+
+    /// Pre-seeds a tx hash into `submitted_amounts` so that `confirm_wrap`
+    /// recognises it. Used by tests that manually advance the aggregate to
+    /// `WrapSubmitted` without going through `submit_wrap`.
+    pub(crate) fn seed_submitted_amount(&self, tx_hash: TxHash, amount: U256) {
+        self.submitted_amounts
+            .lock()
+            .unwrap()
+            .insert(tx_hash, amount);
+    }
 }
 
 #[async_trait]
