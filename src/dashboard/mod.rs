@@ -186,6 +186,15 @@ pub(crate) fn settings_from_ctx(ctx: &crate::config::Ctx) -> st0x_dto::Settings 
         .and_then(|cash| cash.reserved)
         .map(Positive::inner);
 
+    let wallet = ctx
+        .wallet_meta
+        .as_ref()
+        .map(|meta| st0x_dto::WalletSettings {
+            kind: meta.kind.clone(),
+            address: format!("{:#x}", meta.address),
+            organization_id: meta.organization_id.clone(),
+        });
+
     st0x_dto::Settings {
         equity_target,
         equity_deviation,
@@ -194,6 +203,7 @@ pub(crate) fn settings_from_ctx(ctx: &crate::config::Ctx) -> st0x_dto::Settings 
         cash_reserved,
         execution_threshold,
         assets,
+        wallet,
         log_level: format!("{:?}", ctx.log_level),
         server_port: ctx.server_port,
         orderbook: format!("{:#x}", ctx.evm.orderbook),
@@ -307,6 +317,7 @@ mod tests {
                 cash_reserved: None,
                 execution_threshold: "$2".to_string(),
                 assets: Vec::new(),
+                wallet: None,
                 log_level: "Debug".to_string(),
                 server_port: 8001,
                 orderbook: "0x0".to_string(),
@@ -346,6 +357,7 @@ mod tests {
                 cash_reserved: None,
                 execution_threshold: "$2".to_string(),
                 assets: Vec::new(),
+                wallet: None,
                 log_level: "Debug".to_string(),
                 server_port: 8001,
                 orderbook: "0x0".to_string(),
@@ -372,6 +384,7 @@ mod tests {
                 cash_reserved: None,
                 execution_threshold: "$2".to_string(),
                 assets: Vec::new(),
+                wallet: None,
                 log_level: "Debug".to_string(),
                 server_port: 8001,
                 orderbook: "0x0".to_string(),

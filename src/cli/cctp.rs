@@ -275,6 +275,7 @@ mod tests {
             trading_mode: TradingMode::Standalone,
             order_owner: Address::ZERO,
             wallet: None,
+            wallet_meta: None,
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),

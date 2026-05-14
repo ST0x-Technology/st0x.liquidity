@@ -50,6 +50,7 @@ pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
     CurrentState::export_all_to(out_dir)?;
     Settings::export_all_to(out_dir)?;
     AssetSettings::export_all_to(out_dir)?;
+    WalletSettings::export_all_to(out_dir)?;
     Trade::export_all_to(out_dir)?;
     Position::export_all_to(out_dir)?;
     SymbolInventory::export_all_to(out_dir)?;
@@ -98,6 +99,7 @@ mod tests {
                 cash_reserved: None,
                 execution_threshold: "$2".to_string(),
                 assets: Vec::new(),
+                wallet: None,
                 log_level: "Debug".to_string(),
                 server_port: 8001,
                 orderbook: "0x0000000000000000000000000000000000000000".to_string(),

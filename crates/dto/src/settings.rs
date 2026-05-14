@@ -18,6 +18,9 @@ pub struct Settings {
     pub execution_threshold: String,
     pub assets: Vec<AssetSettings>,
 
+    // Wallet
+    pub wallet: Option<WalletSettings>,
+
     // Operational config
     pub log_level: String,
     pub server_port: u16,
@@ -30,6 +33,22 @@ pub struct Settings {
     pub order_polling_interval: u64,
     #[ts(type = "number")]
     pub inventory_poll_interval: u64,
+}
+
+/// Wallet provider settings shown in the config dialog.
+///
+/// Exposes only non-secret metadata: wallet kind, address, and
+/// backend-specific identifiers (e.g., Turnkey organization ID).
+/// The private key / API key is never included.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct WalletSettings {
+    /// Signing backend: `"turnkey"` or `"private-key"`.
+    pub kind: String,
+    /// Hex-encoded Ethereum address (e.g., `"0xabcd…"`).
+    pub address: String,
+    /// Turnkey organization ID (present only for `kind = "turnkey"`).
+    pub organization_id: Option<String>,
 }
 
 /// Per-asset operational settings.

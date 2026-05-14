@@ -86,6 +86,24 @@
     </div>
 
     <div class="space-y-2 font-mono text-xs">
+      {#if settings.wallet}
+        <div class="flex justify-between">
+          <span class="text-muted-foreground">Wallet</span>
+          <span>{settings.wallet.kind}</span>
+        </div>
+        <div class="flex justify-between">
+          <span class="text-muted-foreground">Address</span>
+          <span class="ml-4 truncate">{settings.wallet.address}</span>
+        </div>
+        {#if settings.wallet.kind === 'turnkey' && settings.wallet.organizationId}
+          <div class="flex justify-between">
+            <span class="text-muted-foreground">Turnkey org</span>
+            <span class="ml-4 truncate">{settings.wallet.organizationId}</span>
+          </div>
+        {/if}
+        <div class="border-t border-border my-2"></div>
+      {/if}
+
       <div class="flex justify-between"><span class="text-muted-foreground">Log level</span><span>{settings.logLevel}</span></div>
       <div class="flex justify-between"><span class="text-muted-foreground">Server port</span><span>{String(settings.serverPort)}</span></div>
       <div class="flex justify-between"><span class="text-muted-foreground">Deployment block</span><span>{String(settings.deploymentBlock)}</span></div>
