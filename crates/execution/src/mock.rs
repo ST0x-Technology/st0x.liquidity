@@ -16,8 +16,8 @@ static MOCK_FILL_PRICE: LazyLock<Float> = LazyLock::new(|| float!(100));
 use crate::{
     CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason,
     DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, Direction, ExecutionError, Executor, Inventory,
-    InventoryResult, MarketOrder, OrderPlacement, OrderState, SupportedExecutor, TryIntoExecutor,
-    estimate_buffered_cost_cents,
+    InventoryResult, LimitOrder, MarketOrder, MarketSession, OrderPlacement, OrderState,
+    SupportedExecutor, TryIntoExecutor, estimate_buffered_cost_cents,
 };
 
 /// Context for MockExecutor (unit struct - no context needed)
@@ -33,6 +33,7 @@ pub struct MockExecutor {
     inventory_result: InventoryResult,
     order_status_override: Option<OrderState>,
     market_open: bool,
+    market_session_override: Option<MarketSession>,
     preflight_price: Float,
 }
 
@@ -45,6 +46,7 @@ impl MockExecutor {
             inventory_result: InventoryResult::Unimplemented,
             order_status_override: None,
             market_open: true,
+            market_session_override: None,
             preflight_price: *MOCK_FILL_PRICE,
         }
     }
@@ -57,6 +59,7 @@ impl MockExecutor {
             inventory_result: InventoryResult::Unimplemented,
             order_status_override: None,
             market_open: true,
+            market_session_override: None,
             preflight_price: *MOCK_FILL_PRICE,
         }
     }
@@ -79,6 +82,15 @@ impl MockExecutor {
     #[must_use]
     pub fn with_market_open(mut self, open: bool) -> Self {
         self.market_open = open;
+        self
+    }
+
+    /// Configures the market session returned by `market_session()`.
+    /// When set, this takes precedence over `market_open` for the
+    /// `market_session()` method.
+    #[must_use]
+    pub fn with_market_session(mut self, session: MarketSession) -> Self {
+        self.market_session_override = Some(session);
         self
     }
 
@@ -243,6 +255,56 @@ impl Executor for MockExecutor {
                 }
             }
         }
+    }
+
+    async fn market_session(&self) -> Result<MarketSession, Self::Error> {
+        if let Some(session) = self.market_session_override {
+            return Ok(session);
+        }
+
+        if self.market_open {
+            Ok(MarketSession::Regular)
+        } else {
+            Ok(MarketSession::Closed)
+        }
+    }
+
+    async fn place_limit_order(
+        &self,
+        order: LimitOrder,
+    ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
+        if self.should_fail {
+            return Err(ExecutionError::MockFailure {
+                message: self.failure_message.clone(),
+            });
+        }
+
+        let order_id = self.generate_order_id();
+
+        debug!(
+            target: "broker",
+            "[TEST] Would execute limit order: {} {} shares of {} at {} (order_id: {})",
+            order.direction, order.shares, order.symbol, order.limit_price, order_id
+        );
+
+        Ok(OrderPlacement {
+            order_id,
+            symbol: order.symbol,
+            shares: order.shares,
+            direction: order.direction,
+            placed_at: chrono::Utc::now(),
+        })
+    }
+
+    async fn cancel_order(&self, order_id: &Self::OrderId) -> Result<(), Self::Error> {
+        if self.should_fail {
+            return Err(ExecutionError::MockFailure {
+                message: self.failure_message.clone(),
+            });
+        }
+
+        debug!(target: "broker", "[TEST] Would cancel order: {}", order_id);
+        Ok(())
     }
 }
 

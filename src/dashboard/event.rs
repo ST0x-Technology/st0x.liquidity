@@ -127,10 +127,12 @@ impl Reactor for Broadcaster {
                             ),
                         }
                     }
-                    Placed { .. }
-                    | Submitted { .. }
-                    | PartiallyFilled { .. }
-                    | Failed { .. } => {}
+	                    Placed { .. }
+	                    | Submitted { .. }
+	                    | PartiallyFilled { .. }
+	                    | CancelRequested { .. }
+	                    | Failed { .. }
+	                    | Cancelled { .. } => {}
                 }
             })
 
@@ -256,6 +258,7 @@ mod tests {
                     .unwrap(),
                     direction: st0x_execution::Direction::Sell,
                     executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
                 },
             )
             .await

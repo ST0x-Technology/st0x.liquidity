@@ -71,7 +71,9 @@ impl Job<ReconcileOrderFillCtx> for ReconcileOrderFill {
         // with the order already in `Filled`. Re-sending `CompleteFill`
         // would surface `AlreadyCompleted` and stall the job forever, so
         // we only run step 1 when the order is still pre-terminal.
-        use OffchainOrder::{Failed, Filled, PartiallyFilled, Pending, Submitted};
+        use OffchainOrder::{
+            Cancelled, Cancelling, Failed, Filled, PartiallyFilled, Pending, Submitted,
+        };
         match &order {
             Filled { .. } => {
                 info!(
@@ -80,7 +82,7 @@ impl Job<ReconcileOrderFillCtx> for ReconcileOrderFill {
                 );
             }
 
-            Submitted { .. } | PartiallyFilled { .. } => {
+            Submitted { .. } | PartiallyFilled { .. } | Cancelling { .. } => {
                 ctx.offchain_order
                     .send(
                         &self.offchain_order_id,
@@ -89,7 +91,7 @@ impl Job<ReconcileOrderFillCtx> for ReconcileOrderFill {
                     .await?;
             }
 
-            Pending { .. } | Failed { .. } => {
+            Pending { .. } | Failed { .. } | Cancelled { .. } => {
                 warn!(
                     offchain_order_id = %self.offchain_order_id,
                     state = ?order,
@@ -238,6 +240,7 @@ mod tests {
                     shares,
                     direction,
                     executor: SupportedExecutor::DryRun,
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
                 },
             )
             .await

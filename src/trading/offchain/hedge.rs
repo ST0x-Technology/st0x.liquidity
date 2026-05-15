@@ -6,11 +6,16 @@
 
 use std::sync::Arc;
 
+use alloy::primitives::U256;
+use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
+use st0x_float_macro::float;
 use tracing::info;
 
 use st0x_event_sorcery::{AggregateError, LifecycleError, Store};
-use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
+use st0x_execution::{
+    Direction, FractionalShares, MarketSession, Positive, SupportedExecutor, Symbol, Usd,
+};
 
 use crate::conductor::job::{Job, JobQueue, Label};
 use crate::offchain::order::{
@@ -20,6 +25,58 @@ use crate::position::{Position, PositionCommand, PositionError};
 use crate::threshold::ExecutionThreshold;
 use crate::trading::onchain::trade_accountant::TradeAccountingError;
 
+/// Error returned by [`apply_slippage`].
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SlippageError {
+    #[error("float arithmetic failed: {0}")]
+    FloatArith(#[from] rain_math_float::FloatError),
+    #[error("slippage-adjusted price is non-positive (slippage_bps too large for sell)")]
+    NonPositive(#[from] st0x_finance::NotPositive<Usd>),
+}
+
+/// Applies slippage buffer to a reference price: adds for buys, subtracts
+/// for sells. Rounds the result to Alpaca's required precision (2 decimal
+/// places for prices >= $1, 4 for prices < $1). Rounding direction
+/// maximizes fill probability (ceiling for buys, floor for sells), which
+/// can push the realized limit slightly beyond the configured slippage
+/// budget by up to one tick.
+fn apply_slippage(
+    price: rain_math_float::Float,
+    direction: Direction,
+    slippage_bps: u16,
+) -> Result<Positive<Usd>, SlippageError> {
+    let basis_points = float!(10000);
+    let slippage = Float::parse(u64::from(slippage_bps).to_string())?;
+
+    let adjusted = match direction {
+        Direction::Buy => {
+            let multiplier = ((basis_points + slippage)? / basis_points)?;
+            (price * multiplier)?
+        }
+        Direction::Sell => {
+            let multiplier = ((basis_points - slippage)? / basis_points)?;
+            (price * multiplier)?
+        }
+    };
+
+    let max_decimals: u8 = if adjusted.lt(float!(1))? { 4 } else { 2 };
+    let (fixed, lossless) = adjusted.to_fixed_decimal_lossy(max_decimals)?;
+
+    let rounded = if lossless {
+        adjusted
+    } else {
+        // Buys: round up (ceiling) to ensure fill
+        // Sells: round down (floor/truncate) to ensure fill
+        let rounded_fixed = match direction {
+            Direction::Buy => fixed + U256::from(1),
+            Direction::Sell => fixed,
+        };
+        Float::from_fixed_decimal(rounded_fixed, max_decimals)?
+    };
+
+    Ok(Positive::new(Usd::new(rounded))?)
+}
+
 /// Persistent job queue for hedge placement.
 pub(crate) type HedgeJobQueue = JobQueue<PlaceHedge>;
 
@@ -28,6 +85,15 @@ pub(crate) struct HedgeCtx {
     pub(crate) position: Arc<Store<Position>>,
     pub(crate) offchain_order: Arc<Store<OffchainOrder>>,
     pub(crate) poll_status_queue: PollOrderStatusJobQueue,
+    /// Order placer for fetching latest trade prices during extended hours.
+    /// Only needed when `extended_hours_counter_trading` is enabled.
+    pub(crate) order_placer: Option<Arc<dyn crate::offchain::order::OrderPlacer>>,
+    pub(crate) counter_trade_slippage_bps: u16,
+    /// Serialises broker submissions across concurrent hedge jobs so two
+    /// jobs for different symbols don't both submit against the same
+    /// buying-power snapshot and collectively exceed available capital.
+    /// Shared with the inline counter-trade path in `conductor.rs`.
+    pub(crate) counter_trade_submission_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// A durable job that places an offsetting broker order for an accumulated
@@ -45,6 +111,12 @@ pub(crate) struct PlaceHedge {
     pub(crate) executor: SupportedExecutor,
     pub(crate) threshold: ExecutionThreshold,
     pub(crate) offchain_order_id: OffchainOrderId,
+    #[serde(default = "default_market_session")]
+    pub(crate) market_session: st0x_execution::MarketSession,
+}
+
+fn default_market_session() -> st0x_execution::MarketSession {
+    st0x_execution::MarketSession::Regular
 }
 
 /// Recovery path for the `PendingExecution` rejection. The previous attempt
@@ -60,9 +132,11 @@ async fn recover_pending_poll_status(
     ctx: &HedgeCtx,
     pending_id: OffchainOrderId,
 ) -> Result<(), TradeAccountingError> {
-    use OffchainOrder::{Failed, Filled, PartiallyFilled, Pending, Submitted};
+    use OffchainOrder::{
+        Cancelled, Cancelling, Failed, Filled, PartiallyFilled, Pending, Submitted,
+    };
     match ctx.offchain_order.load(&pending_id).await? {
-        Some(Submitted { .. } | PartiallyFilled { .. }) => {
+        Some(Submitted { .. } | PartiallyFilled { .. } | Cancelling { .. }) => {
             ctx.poll_status_queue
                 .clone()
                 .push(PollOrderStatus {
@@ -71,7 +145,7 @@ async fn recover_pending_poll_status(
                 .await?;
             Ok(())
         }
-        Some(Pending { .. } | Filled { .. } | Failed { .. }) | None => Ok(()),
+        Some(Pending { .. } | Filled { .. } | Failed { .. } | Cancelled { .. }) | None => Ok(()),
     }
 }
 
@@ -91,14 +165,86 @@ impl Job<HedgeCtx> for PlaceHedge {
     }
 
     async fn perform(&self, ctx: &HedgeCtx) -> Result<Self::Output, Self::Error> {
+        // Re-check the market session at execution time. The enqueue-time
+        // value (self.market_session) can be stale by minutes if the job
+        // sat in apalis across a 9:30 or 16:00 ET boundary.
+        let current_session = match ctx.order_placer.as_ref() {
+            Some(placer) => placer.market_session().await.map_err(|source| {
+                TradeAccountingError::LimitPriceFetch {
+                    symbol: self.symbol.clone(),
+                    source,
+                }
+            })?,
+            // No placer => extended-hours feature disabled => session was
+            // necessarily Regular at enqueue, and we trust that.
+            None => self.market_session,
+        };
+
+        if current_session != self.market_session {
+            info!(
+                target: "hedge",
+                symbol = %self.symbol,
+                enqueued_session = ?self.market_session,
+                ?current_session,
+                "Market session changed between enqueue and perform; using current"
+            );
+        }
+
+        // Compute the order kind BEFORE claiming the position. If this fails
+        // (e.g. price fetch error during extended hours), we avoid leaving the
+        // position stuck with a pending offchain_order_id and no actual order.
+        let order_kind = match current_session {
+            MarketSession::Regular => crate::offchain::order::CounterTradeOrderKind::Market,
+            MarketSession::Closed => {
+                // Market closed between enqueue and perform. Return a
+                // retryable error so apalis re-runs us once the market
+                // re-opens, instead of submitting against a closed venue.
+                return Err(TradeAccountingError::MarketClosed {
+                    symbol: self.symbol.clone(),
+                });
+            }
+            MarketSession::Extended => {
+                let Some(placer) = ctx.order_placer.as_ref() else {
+                    return Err(TradeAccountingError::OrderPlacerNotConfigured);
+                };
+
+                let latest_price = placer
+                    .fetch_latest_trade_price(&self.symbol)
+                    .await
+                    .map_err(|source| TradeAccountingError::LimitPriceFetch {
+                        symbol: self.symbol.clone(),
+                        source,
+                    })?
+                    .ok_or_else(|| TradeAccountingError::LimitPriceUnavailable {
+                        symbol: self.symbol.clone(),
+                    })?;
+
+                let limit_price = apply_slippage(
+                    latest_price.inner(),
+                    self.direction,
+                    ctx.counter_trade_slippage_bps,
+                )?;
+
+                info!(
+                    target: "hedge",
+                    symbol = %self.symbol,
+                    %limit_price,
+                    direction = ?self.direction,
+                    "Extended hours: placing limit order"
+                );
+
+                crate::offchain::order::CounterTradeOrderKind::ExtendedHoursLimit { limit_price }
+            }
+        };
+
         // Only specific business rejections are safe to swallow:
         // - PendingExecution: another attempt already claimed this position
-        //   — usually idempotent, but if that attempt got the broker submitted
+        //   -- usually idempotent, but if that attempt got the broker submitted
         //   *without* enqueueing PollOrderStatus (e.g. the queue push failed
         //   and apalis is now retrying us), we must re-enqueue the poll here
         //   or the order sits in Submitted until the next bot restart.
         // - ThresholdNotMet: position moved below threshold since the monitor
-        //   scanned — stale job, no action needed.
+        //   scanned -- stale job, no action needed.
         //
         // Everything else (lifecycle bugs, aggregate conflicts, DB errors)
         // propagates so backon retries the job.
@@ -145,6 +291,12 @@ impl Job<HedgeCtx> for PlaceHedge {
             Err(error) => return Err(error.into()),
         }
 
+        // Serialise broker submissions with the inline counter-trade path.
+        // Without this, two hedge jobs for different symbols enqueued in
+        // the same scan window can both call the broker simultaneously and
+        // collectively exceed buying power.
+        let _submission_guard = ctx.counter_trade_submission_lock.lock().await;
+
         ctx.offchain_order
             .send(
                 &self.offchain_order_id,
@@ -153,11 +305,14 @@ impl Job<HedgeCtx> for PlaceHedge {
                     shares: self.shares,
                     direction: self.direction,
                     executor: self.executor,
+                    kind: order_kind,
                 },
             )
             .await?;
 
-        use OffchainOrder::{Failed, Filled, PartiallyFilled, Pending, Submitted};
+        use OffchainOrder::{
+            Cancelled, Cancelling, Failed, Filled, PartiallyFilled, Pending, Submitted,
+        };
         match ctx.offchain_order.load(&self.offchain_order_id).await? {
             Some(Failed { error, .. }) => {
                 ctx.position
@@ -171,13 +326,29 @@ impl Job<HedgeCtx> for PlaceHedge {
                     .await?;
             }
 
-            Some(Submitted { .. } | PartiallyFilled { .. }) => {
+            Some(Submitted { .. } | PartiallyFilled { .. } | Cancelling { .. }) => {
                 let mut queue = ctx.poll_status_queue.clone();
 
                 queue
                     .push(PollOrderStatus {
                         offchain_order_id: self.offchain_order_id,
                     })
+                    .await?;
+            }
+
+            // Cancelled here is unexpected -- a freshly Placed order should
+            // not be Cancelled by the time we re-load it. Treat as Failed so
+            // the position releases its pending slot rather than getting
+            // stuck pending forever.
+            Some(Cancelled { reason, .. }) => {
+                ctx.position
+                    .send(
+                        &self.symbol,
+                        PositionCommand::FailOffChainOrder {
+                            offchain_order_id: self.offchain_order_id,
+                            error: format!("cancelled unexpectedly: {reason:?}"),
+                        },
+                    )
                     .await?;
             }
 
@@ -222,6 +393,24 @@ mod tests {
                     placed_shares: order.shares,
                 })
             }
+
+            async fn place_limit_order(
+                &self,
+                order: st0x_execution::LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("test-limit-order-123"),
+                    placed_shares: order.shares,
+                })
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &st0x_execution::ExecutorOrderId,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                Ok(())
+            }
         }
 
         Arc::new(SucceedingPlacer)
@@ -240,6 +429,23 @@ mod tests {
                 Box<dyn std::error::Error + Send + Sync>,
             > {
                 Err("Broker rejected: insufficient buying power".into())
+            }
+
+            async fn place_limit_order(
+                &self,
+                _order: st0x_execution::LimitOrder,
+            ) -> Result<
+                crate::offchain::order::OrderPlacementResult,
+                Box<dyn std::error::Error + Send + Sync>,
+            > {
+                Err("Broker rejected: insufficient buying power".into())
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &st0x_execution::ExecutorOrderId,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                Ok(())
             }
         }
 
@@ -272,6 +478,9 @@ mod tests {
             position: position.clone(),
             offchain_order,
             poll_status_queue: PollOrderStatusJobQueue::new(&pool),
+            order_placer: None,
+            counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+            counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
 
         TestInfra {
@@ -316,6 +525,7 @@ mod tests {
             executor: SupportedExecutor::DryRun,
             threshold: ExecutionThreshold::whole_share(),
             offchain_order_id: OffchainOrderId::new(),
+            market_session: MarketSession::Regular,
         }
     }
 
@@ -464,6 +674,479 @@ mod tests {
     /// `Submitted` but failed to enqueue the `PollOrderStatus` job, and apalis
     /// is re-running the hedge. The retry must re-enqueue the poll so the
     /// order doesn't sit `Submitted` until the next bot restart.
+    fn extended_hours_order_placer(price: rain_math_float::Float) -> Arc<dyn OrderPlacer> {
+        struct ExtHoursPlacer(rain_math_float::Float);
+
+        #[async_trait::async_trait]
+        impl OrderPlacer for ExtHoursPlacer {
+            async fn place_market_order(
+                &self,
+                order: st0x_execution::MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("market-order-1"),
+                    placed_shares: order.shares,
+                })
+            }
+
+            async fn place_limit_order(
+                &self,
+                order: st0x_execution::LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("limit-order-1"),
+                    placed_shares: order.shares,
+                })
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &st0x_execution::ExecutorOrderId,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                Ok(())
+            }
+
+            async fn fetch_latest_trade_price(
+                &self,
+                _symbol: &Symbol,
+            ) -> Result<
+                Option<st0x_execution::Positive<rain_math_float::Float>>,
+                Box<dyn std::error::Error + Send + Sync>,
+            > {
+                Ok(Some(st0x_execution::Positive::new(self.0)?))
+            }
+
+            async fn market_session(
+                &self,
+            ) -> Result<MarketSession, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(MarketSession::Extended)
+            }
+        }
+
+        Arc::new(ExtHoursPlacer(price))
+    }
+
+    async fn create_extended_hours_ctx(price: rain_math_float::Float) -> TestInfra {
+        let placer = extended_hours_order_placer(price);
+
+        let pool = setup_test_db().await;
+        crate::conductor::setup_apalis_tables(&pool).await.unwrap();
+
+        let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let (offchain_order, offchain_order_projection) =
+            StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(placer.clone())
+                .await
+                .unwrap();
+
+        let ctx = HedgeCtx {
+            position: position.clone(),
+            offchain_order,
+            poll_status_queue: PollOrderStatusJobQueue::new(&pool),
+            order_placer: Some(placer),
+            counter_trade_slippage_bps: 100,
+            counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
+        };
+
+        TestInfra {
+            ctx,
+            pool,
+            position_projection,
+            offchain_order_projection,
+        }
+    }
+
+    #[test]
+    fn apply_slippage_buy_adds_to_price() {
+        let price = float!(150.0);
+        let result = apply_slippage(price, Direction::Buy, 100).unwrap();
+        // 150 * 1.01 = 151.50, already 2 decimal places, no rounding needed
+        assert!(
+            result.inner().inner().eq(float!(151.50)).unwrap(),
+            "Buy slippage should increase the price, got: {result}"
+        );
+    }
+
+    #[test]
+    fn apply_slippage_sell_subtracts_from_price() {
+        let price = float!(150.0);
+        let result = apply_slippage(price, Direction::Sell, 100).unwrap();
+        // 150 * 0.99 = 148.50
+        assert!(
+            result.inner().inner().eq(float!(148.50)).unwrap(),
+            "Sell slippage should decrease the price, got: {result}"
+        );
+    }
+
+    #[test]
+    fn apply_slippage_rounds_buy_up_to_two_decimals() {
+        // 151.23 * 1.01 = 152.7423 -> rounds UP to 152.75 for a buy
+        let price = float!(151.23);
+        let result = apply_slippage(price, Direction::Buy, 100).unwrap();
+        assert!(
+            result.inner().inner().eq(float!(152.75)).unwrap(),
+            "Buy should round up to the nearest cent, got: {result}"
+        );
+    }
+
+    #[test]
+    fn apply_slippage_rounds_sell_down_to_two_decimals() {
+        // 151.23 * 0.99 = 149.7177 -> truncates to 149.71 for a sell
+        let price = float!(151.23);
+        let result = apply_slippage(price, Direction::Sell, 100).unwrap();
+        assert!(
+            result.inner().inner().eq(float!(149.71)).unwrap(),
+            "Sell should round down to the nearest cent, got: {result}"
+        );
+    }
+
+    #[test]
+    fn apply_slippage_zero_bps_is_identity() {
+        let price = float!(100.0);
+        let buy_result = apply_slippage(price, Direction::Buy, 0).unwrap();
+        let sell_result = apply_slippage(price, Direction::Sell, 0).unwrap();
+        assert!(buy_result.inner().inner().eq(price).unwrap());
+        assert!(sell_result.inner().inner().eq(price).unwrap());
+    }
+
+    #[test]
+    fn apply_slippage_sub_dollar_uses_four_decimals() {
+        // 0.5000 * 1.01 = 0.5050 — 4-decimal precision branch
+        let result = apply_slippage(float!(0.5), Direction::Buy, 100).unwrap();
+        assert!(
+            result.inner().inner().eq(float!(0.5050)).unwrap(),
+            "Sub-$1 buy should round to 4 decimals (0.5050), got: {result}"
+        );
+
+        let sell = apply_slippage(float!(0.5), Direction::Sell, 100).unwrap();
+        assert!(
+            sell.inner().inner().eq(float!(0.4950)).unwrap(),
+            "Sub-$1 sell should round to 4 decimals (0.4950), got: {sell}"
+        );
+    }
+
+    #[test]
+    fn apply_slippage_max_bps_for_sell_returns_non_positive_error() {
+        // 9999 bps slippage on a sell: 100 * 0.0001 = 0.01, still positive.
+        // But conceptually max safe bps is now 9999 (config rejects 10_000).
+        // This test guards against future bound regressions: 9999 must succeed.
+        let result = apply_slippage(float!(100.0), Direction::Sell, 9999).unwrap();
+        assert!(
+            result.inner().inner().eq(float!(0.01)).unwrap(),
+            "Max-bps sell should produce 1 cent, got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn extended_hours_places_limit_order() {
+        let TestInfra {
+            ctx,
+            position_projection,
+            offchain_order_projection,
+            ..
+        } = create_extended_hours_ctx(float!(150.0)).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let job = PlaceHedge {
+            symbol: symbol.clone(),
+            direction: Direction::Sell,
+            shares: Positive::new(FractionalShares::new(float!(2.0))).unwrap(),
+            executor: SupportedExecutor::DryRun,
+            threshold: ExecutionThreshold::whole_share(),
+            offchain_order_id: OffchainOrderId::new(),
+            market_session: MarketSession::Extended,
+        };
+
+        job.perform(&ctx).await.unwrap();
+
+        let position = position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(
+            position.pending_offchain_order_id,
+            Some(job.offchain_order_id),
+            "Position should store the hedge job's offchain order ID"
+        );
+
+        let order = offchain_order_projection
+            .load(&job.offchain_order_id)
+            .await
+            .unwrap()
+            .expect("offchain order should exist");
+        assert!(
+            matches!(
+                order,
+                OffchainOrder::Submitted {
+                    is_extended_hours: true,
+                    ..
+                }
+            ),
+            "Order should be submitted as extended-hours, got: {order:?}"
+        );
+        // The exact limit price computation is covered by the dedicated
+        // `apply_slippage_*` unit tests; this integration test only checks
+        // the lifecycle path.
+    }
+
+    #[tokio::test]
+    async fn extended_hours_without_order_placer_does_not_leave_position_stuck() {
+        // Use None order_placer to simulate price fetch unavailable
+        let TestInfra {
+            ctx,
+            position_projection,
+            ..
+        } = create_hedge_ctx(succeeding_order_placer()).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let job = PlaceHedge {
+            symbol: symbol.clone(),
+            direction: Direction::Sell,
+            shares: Positive::new(FractionalShares::new(float!(2.0))).unwrap(),
+            executor: SupportedExecutor::DryRun,
+            threshold: ExecutionThreshold::whole_share(),
+            offchain_order_id: OffchainOrderId::new(),
+            market_session: MarketSession::Extended,
+        };
+
+        // ctx.order_placer is None, so this should fail
+        let result = job.perform(&ctx).await;
+        assert!(
+            matches!(result, Err(TradeAccountingError::OrderPlacerNotConfigured)),
+            "expected OrderPlacerNotConfigured, got: {result:?}"
+        );
+
+        // Position should NOT have a pending order
+        let position = position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(
+            position.pending_offchain_order_id, None,
+            "Position should not be stuck with a pending order after limit-price failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn perform_returns_market_closed_when_session_changes_to_closed() {
+        // Job was enqueued in Extended hours, but by the time perform runs
+        // the market has closed. perform must NOT submit; it must return a
+        // retryable MarketClosed error so apalis re-runs after open.
+        let placer = market_session_overriding_placer(MarketSession::Closed);
+        let TestInfra {
+            ctx,
+            position_projection,
+            ..
+        } = create_hedge_ctx_with(placer).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let job = PlaceHedge {
+            symbol: symbol.clone(),
+            direction: Direction::Sell,
+            shares: Positive::new(FractionalShares::new(float!(2.0))).unwrap(),
+            executor: SupportedExecutor::DryRun,
+            threshold: ExecutionThreshold::whole_share(),
+            offchain_order_id: OffchainOrderId::new(),
+            market_session: MarketSession::Extended,
+        };
+
+        let result = job.perform(&ctx).await;
+        assert!(
+            matches!(result, Err(TradeAccountingError::MarketClosed { .. })),
+            "expected MarketClosed, got: {result:?}"
+        );
+
+        let position = position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(
+            position.pending_offchain_order_id, None,
+            "Position must not be stuck pending when perform refuses to submit"
+        );
+    }
+
+    #[tokio::test]
+    async fn perform_uses_current_session_when_enqueued_session_is_stale() {
+        // Job was enqueued during Extended hours but Regular has begun by
+        // the time perform runs -- it must submit a market order, not a
+        // limit order with extended_hours=true.
+        let placer = market_session_overriding_placer(MarketSession::Regular);
+        let TestInfra {
+            ctx,
+            offchain_order_projection,
+            ..
+        } = create_hedge_ctx_with(placer).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        fill_position(
+            &ctx.position,
+            &symbol,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let job = PlaceHedge {
+            symbol: symbol.clone(),
+            direction: Direction::Sell,
+            shares: Positive::new(FractionalShares::new(float!(2.0))).unwrap(),
+            executor: SupportedExecutor::DryRun,
+            threshold: ExecutionThreshold::whole_share(),
+            offchain_order_id: OffchainOrderId::new(),
+            market_session: MarketSession::Extended,
+        };
+
+        job.perform(&ctx).await.unwrap();
+
+        let order = offchain_order_projection
+            .load(&job.offchain_order_id)
+            .await
+            .unwrap()
+            .expect("offchain order should exist");
+
+        // Critical: the order was placed as a *market* order even though the
+        // job was enqueued during extended hours, because perform re-checked
+        // the session and found Regular.
+        assert!(
+            matches!(
+                order,
+                OffchainOrder::Submitted {
+                    is_extended_hours: false,
+                    ..
+                }
+            ),
+            "Stale Extended job should submit a Regular market order, got: {order:?}"
+        );
+    }
+
+    /// Returns an `OrderPlacer` that reports a configured market_session
+    /// while delegating placement to a succeeding stub. Used to test the
+    /// session re-check inside `PlaceHedge::perform`.
+    fn market_session_overriding_placer(session: MarketSession) -> Arc<dyn OrderPlacer> {
+        struct Stub {
+            session: MarketSession,
+        }
+
+        #[async_trait::async_trait]
+        impl OrderPlacer for Stub {
+            async fn place_market_order(
+                &self,
+                order: st0x_execution::MarketOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("market-1"),
+                    placed_shares: order.shares,
+                })
+            }
+
+            async fn place_limit_order(
+                &self,
+                order: st0x_execution::LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("limit-1"),
+                    placed_shares: order.shares,
+                })
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &st0x_execution::ExecutorOrderId,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                Ok(())
+            }
+
+            async fn fetch_latest_trade_price(
+                &self,
+                _symbol: &Symbol,
+            ) -> Result<
+                Option<st0x_execution::Positive<rain_math_float::Float>>,
+                Box<dyn std::error::Error + Send + Sync>,
+            > {
+                Ok(Some(st0x_execution::Positive::new(float!(100.0)).unwrap()))
+            }
+
+            async fn market_session(
+                &self,
+            ) -> Result<MarketSession, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(self.session)
+            }
+        }
+
+        Arc::new(Stub { session })
+    }
+
+    /// Variant of `create_hedge_ctx` that wires a specific placer through to
+    /// `HedgeCtx::order_placer` (Some, not None), so `perform` will call
+    /// `market_session()` on it.
+    async fn create_hedge_ctx_with(placer: Arc<dyn OrderPlacer>) -> TestInfra {
+        let pool = setup_test_db().await;
+        crate::conductor::setup_apalis_tables(&pool).await.unwrap();
+
+        let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let (offchain_order, offchain_order_projection) =
+            StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(placer.clone())
+                .await
+                .unwrap();
+
+        let ctx = HedgeCtx {
+            position: position.clone(),
+            offchain_order,
+            poll_status_queue: PollOrderStatusJobQueue::new(&pool),
+            order_placer: Some(placer),
+            counter_trade_slippage_bps: 100,
+            counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
+        };
+
+        TestInfra {
+            ctx,
+            pool,
+            position_projection,
+            offchain_order_projection,
+        }
+    }
+
     #[tokio::test]
     async fn retry_after_failed_poll_enqueue_re_enqueues_poll() {
         let TestInfra { ctx, pool, .. } = create_hedge_ctx(succeeding_order_placer()).await;

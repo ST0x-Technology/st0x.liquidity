@@ -153,6 +153,7 @@ mod tests {
                     shares: Positive::new(FractionalShares::new(float!(50))).unwrap(),
                     direction: Direction::Sell,
                     executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
                 },
             )
             .await
@@ -292,6 +293,7 @@ mod tests {
                     shares: Positive::new(FractionalShares::new(float!(10))).unwrap(),
                     direction: Direction::Buy,
                     executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
                 },
             )
             .await

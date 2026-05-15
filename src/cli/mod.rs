@@ -1144,6 +1144,7 @@ mod tests {
             },
             travel_rule: None,
             rest_api: None,
+            extended_hours_counter_trading: false,
             redemption_wallet: None,
             #[cfg(feature = "test-support")]
             failure_injector: crate::conductor::job::FailureInjector::new(),
@@ -1337,6 +1338,7 @@ mod tests {
             r#"
                 database_url = ":memory:"
                 apalis_finished_job_cleanup_interval_secs = 3600
+                extended_hours_counter_trading = false
 
                 [assets.equities]
 

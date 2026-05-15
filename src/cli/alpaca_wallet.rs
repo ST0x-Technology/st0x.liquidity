@@ -751,6 +751,7 @@ mod tests {
             },
             travel_rule: None,
             rest_api: None,
+            extended_hours_counter_trading: false,
             redemption_wallet: None,
             #[cfg(feature = "test-support")]
             failure_injector: crate::conductor::job::FailureInjector::new(),
@@ -842,6 +843,7 @@ mod tests {
             execution_threshold: ExecutionThreshold::whole_share(),
             travel_rule: None,
             rest_api: None,
+            extended_hours_counter_trading: false,
             redemption_wallet: Some(Address::ZERO),
             #[cfg(feature = "test-support")]
             failure_injector: crate::conductor::job::FailureInjector::new(),

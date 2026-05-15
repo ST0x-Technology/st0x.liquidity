@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use st0x_float_serde::DebugOptionFloat;
 
-use crate::{Direction, FractionalShares, Positive, Symbol};
+use crate::{Direction, FractionalShares, Positive, Symbol, Usd};
 
 pub mod state;
 pub mod status;
@@ -29,6 +29,11 @@ pub struct OrderUpdate<OrderId> {
     pub status: OrderStatus,
     pub updated_at: DateTime<Utc>,
     pub price: Option<Float>,
+    /// Cumulative quantity filled at the broker so far. `None` when no
+    /// fills have occurred. Required for `OrderStatus::PartiallyFilled`
+    /// so the caller can reconcile the local aggregate via
+    /// `UpdatePartialFill`.
+    pub shares_filled: Option<Float>,
 }
 
 impl<OrderId: Debug> Debug for OrderUpdate<OrderId> {
@@ -41,6 +46,7 @@ impl<OrderId: Debug> Debug for OrderUpdate<OrderId> {
             .field("status", &self.status)
             .field("updated_at", &self.updated_at)
             .field("price", &DebugOptionFloat(&self.price))
+            .field("shares_filled", &DebugOptionFloat(&self.shares_filled))
             .finish()
     }
 }
@@ -50,4 +56,16 @@ pub struct MarketOrder {
     pub symbol: Symbol,
     pub shares: Positive<FractionalShares>,
     pub direction: Direction,
+}
+
+/// Broker-agnostic limit order for automated counter-trading during extended
+/// hours. The executor implementation converts this to its broker-specific
+/// limit order type (e.g. `AlpacaLimitOrder`).
+#[derive(Debug, Clone)]
+pub struct LimitOrder {
+    pub symbol: Symbol,
+    pub shares: Positive<FractionalShares>,
+    pub direction: Direction,
+    pub limit_price: Positive<Usd>,
+    pub extended_hours: bool,
 }
