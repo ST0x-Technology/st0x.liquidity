@@ -31,7 +31,8 @@ use st0x_event_sorcery::{
 use st0x_evm::Wallet;
 use st0x_execution::{
     ClientOrderId, CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason,
-    ExecutionError, Executor, FractionalShares, MarketOrder, Symbol, TryIntoExecutor,
+    ExecutionError, Executor, FractionalShares, MarketOrder, MarketSession, Positive, Symbol,
+    TryIntoExecutor,
 };
 
 use crate::alpaca_wallet::AlpacaWalletService;
@@ -109,6 +110,7 @@ pub(crate) struct TradeProcessingCqrs {
     /// hook the order stays `Submitted` forever -- the system has no other
     /// trigger to ask the broker about an in-flight order.
     pub(crate) poll_status_queue: PollOrderStatusJobQueue,
+    pub(crate) extended_hours_counter_trading: bool,
 }
 
 /// Orchestrates the bot's runtime by composing long-running supervised tasks
@@ -1202,6 +1204,24 @@ async fn recover_single_orphaned_order(
             }
         }
 
+        OffchainOrder::Failed {
+            shares_filled: Some(shares_filled),
+            avg_price: Some(price),
+            executor_order_id: Some(executor_order_id),
+            direction,
+            ..
+        } if Positive::new(shares_filled).is_ok() => {
+            info!(%symbol, %order_id, "Orphaned order already Failed with partial fill -- recovering");
+            PositionCommand::CompleteOffChainOrder {
+                offchain_order_id: order_id,
+                shares_filled: Positive::new(shares_filled)?,
+                direction,
+                executor_order_id,
+                price,
+                broker_timestamp: Utc::now(),
+            }
+        }
+
         OffchainOrder::Failed { .. } => {
             info!(%symbol, %order_id, "Orphaned order already Failed -- recovering");
             PositionCommand::FailOffChainOrder {
@@ -1210,7 +1230,42 @@ async fn recover_single_orphaned_order(
             }
         }
 
-        OffchainOrder::Submitted { .. } | OffchainOrder::PartiallyFilled { .. } => {
+        OffchainOrder::Cancelled {
+            shares_filled,
+            avg_price,
+            direction,
+            executor_order_id,
+            reason,
+            ..
+        } => {
+            info!(%symbol, %order_id, ?reason, "Orphaned order already Cancelled -- recovering");
+
+            if let Ok(positive_filled) = Positive::new(shares_filled) {
+                let Some(price) = avg_price else {
+                    anyhow::bail!(
+                        "cancelled order {order_id} for {symbol} has {shares_filled} shares filled but no average price"
+                    );
+                };
+
+                PositionCommand::CompleteOffChainOrder {
+                    offchain_order_id: order_id,
+                    shares_filled: positive_filled,
+                    direction,
+                    executor_order_id,
+                    price,
+                    broker_timestamp: Utc::now(),
+                }
+            } else {
+                PositionCommand::FailOffChainOrder {
+                    offchain_order_id: order_id,
+                    error: format!("recovered cancelled order: {reason:?}"),
+                }
+            }
+        }
+
+        OffchainOrder::Submitted { .. }
+        | OffchainOrder::PartiallyFilled { .. }
+        | OffchainOrder::Cancelling { .. } => {
             debug!(%symbol, %order_id, "Pending offchain order still in progress");
             return Ok(());
         }
@@ -1506,11 +1561,26 @@ where
         executor_type,
         &cqrs.assets,
         asset_enabled,
+        cqrs.extended_hours_counter_trading,
     )
     .await?
     else {
         return Ok(None);
     };
+
+    // Extended-hours counter-trades are handled by the CheckPositions job
+    // which has access to the OrderPlacer for price lookups. The inline path
+    // can only place market orders.
+    if execution.market_session == MarketSession::Extended {
+        info!(
+            target: "hedge",
+            symbol = %execution.symbol,
+            shares = %execution.shares,
+            direction = ?execution.direction,
+            "Extended hours: deferring hedge to CheckPositions job (poll-driven, not event-driven)"
+        );
+        return Ok(None);
+    }
 
     let _counter_trade_submission_guard = cqrs.counter_trade_submission_lock.lock().await;
 
@@ -1782,7 +1852,9 @@ async fn dispatch_post_place_state(
     cqrs: &TradeProcessingCqrs,
     offchain_order_id: OffchainOrderId,
 ) -> Result<Option<OffchainOrderId>, TradeAccountingError> {
-    use OffchainOrder::{Failed, Filled, PartiallyFilled, Pending, Submitted};
+    use OffchainOrder::{
+        Cancelled, Cancelling, Failed, Filled, PartiallyFilled, Pending, Submitted,
+    };
     match loaded {
         Some(Failed { error, .. }) => {
             cqrs.position
@@ -1798,7 +1870,7 @@ async fn dispatch_post_place_state(
             Ok(Some(offchain_order_id))
         }
 
-        Some(Submitted { .. } | PartiallyFilled { .. }) => {
+        Some(Submitted { .. } | PartiallyFilled { .. } | Cancelling { .. }) => {
             let mut queue = cqrs.poll_status_queue.clone();
 
             queue
@@ -1836,7 +1908,7 @@ async fn dispatch_post_place_state(
             Ok(None)
         }
 
-        Some(Pending { .. } | Filled { .. }) => {
+        Some(Pending { .. } | Filled { .. } | Cancelled { .. }) => {
             cqrs.position
                 .send(
                     &execution.symbol,
@@ -1918,6 +1990,7 @@ async fn execute_create_offchain_order(
         direction: execution.direction,
         executor: execution.executor,
         client_order_id: ClientOrderId::from_uuid(client_order_id_source.as_uuid()),
+        kind: crate::offchain::order::CounterTradeOrderKind::Market,
     };
 
     match cqrs.offchain_order.send(&offchain_order_id, command).await {
@@ -2046,6 +2119,7 @@ where
             direction: execution.direction,
             executor: execution.executor,
             client_order_id: ClientOrderId::from_uuid(client_order_id_source.as_uuid()),
+            kind: crate::offchain::order::CounterTradeOrderKind::Market,
         };
 
         let place_result = offchain_order.send(&offchain_order_id, command).await;
@@ -2735,6 +2809,24 @@ mod tests {
                     placed_shares: order.shares,
                 })
             }
+
+            async fn place_limit_order(
+                &self,
+                order: st0x_execution::LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("TEST_BROKER_LIMIT_ORD"),
+                    placed_shares: order.shares,
+                })
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &st0x_execution::ExecutorOrderId,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                Ok(())
+            }
         }
 
         Arc::new(TestOrderPlacer)
@@ -2806,6 +2898,7 @@ mod tests {
             },
             counter_trade_submission_lock: Arc::new(Mutex::new(())),
             poll_status_queue: PollOrderStatusJobQueue::new(pool),
+            extended_hours_counter_trading: false,
         }
     }
 
@@ -3503,6 +3596,28 @@ mod tests {
                     executor_order_id: ExecutorOrderId::new("TEST_BROKER_ORD"),
                     placed_shares: order.shares,
                 })
+            }
+
+            async fn place_limit_order(
+                &self,
+                order: st0x_execution::LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err("Broker rejected first order".into());
+                }
+
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("TEST_BROKER_LIMIT_ORD"),
+                    placed_shares: order.shares,
+                })
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &st0x_execution::ExecutorOrderId,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                Ok(())
             }
         }
 
@@ -4348,6 +4463,21 @@ mod tests {
                 {
                     Err("API error (403 Forbidden): trade denied due to pattern day trading protection".into())
                 }
+
+                async fn place_limit_order(
+                    &self,
+                    _order: st0x_execution::LimitOrder,
+                ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+                {
+                    Err("API error (403 Forbidden): trade denied due to pattern day trading protection".into())
+                }
+
+                async fn cancel_order(
+                    &self,
+                    _executor_order_id: &st0x_execution::ExecutorOrderId,
+                ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                    Ok(())
+                }
             }
 
             Arc::new(RejectingOrderPlacer)
@@ -4442,6 +4572,21 @@ mod tests {
                 ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
                 {
                     Err("Broker rejected: insufficient buying power".into())
+                }
+
+                async fn place_limit_order(
+                    &self,
+                    _order: st0x_execution::LimitOrder,
+                ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+                {
+                    Err("Broker rejected: insufficient buying power".into())
+                }
+
+                async fn cancel_order(
+                    &self,
+                    _executor_order_id: &st0x_execution::ExecutorOrderId,
+                ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                    Ok(())
                 }
             }
 
@@ -4682,6 +4827,7 @@ mod tests {
                     direction: Direction::Sell,
                     executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
                     client_order_id: ClientOrderId::from_uuid(offchain_order_id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
                 },
             )
             .await
@@ -4805,6 +4951,27 @@ mod tests {
                     .unwrap(),
                 })
             }
+
+            async fn place_limit_order(
+                &self,
+                _order: st0x_execution::LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("test-submitted-limit"),
+                    placed_shares: Positive::new(st0x_execution::FractionalShares::new(float!(
+                        0.5
+                    )))
+                    .unwrap(),
+                })
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &st0x_execution::ExecutorOrderId,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                Ok(())
+            }
         }
 
         let order_placer: Arc<dyn crate::offchain::order::OrderPlacer> = Arc::new(BlockingPlacer);
@@ -4872,6 +5039,7 @@ mod tests {
                     direction: Direction::Sell,
                     executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
                     client_order_id: ClientOrderId::from_uuid(offchain_order_id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
                 },
             )
             .await
@@ -4967,6 +5135,7 @@ mod tests {
                     direction: Direction::Sell,
                     executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
                     client_order_id: ClientOrderId::from_uuid(offchain_order_id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
                 },
             )
             .await
@@ -5059,6 +5228,7 @@ mod tests {
             direction: Direction::Sell,
             shares,
             executor: st0x_execution::SupportedExecutor::DryRun,
+            market_session: st0x_execution::MarketSession::Regular,
         }
     }
 
@@ -5131,6 +5301,7 @@ mod tests {
             direction: Direction::Sell,
             executor: st0x_execution::SupportedExecutor::DryRun,
             placed_at: Utc::now(),
+            is_extended_hours: false,
         };
 
         let execution = execution_ctx_for(&symbol, shares);
@@ -5314,6 +5485,9 @@ mod tests {
             shares,
             direction: Direction::Sell,
             executor: st0x_execution::SupportedExecutor::DryRun,
+            shares_filled: None,
+            avg_price: None,
+            executor_order_id: None,
             error: "broker rejected".to_string(),
             placed_at: Utc::now(),
             failed_at: Utc::now(),

@@ -62,6 +62,7 @@ pub struct AlpacaLimitOrder {
     pub direction: Direction,
     pub limit_price: AlpacaLimitPrice,
     pub extended_hours: bool,
+    pub client_order_id: ClientOrderId,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -139,6 +140,7 @@ pub(super) struct LimitOrderRequest {
     pub limit_price: AlpacaLimitPrice,
     pub time_in_force: &'static str,
     pub extended_hours: bool,
+    pub client_order_id: ClientOrderId,
 }
 
 fn serialize_symbol<S>(symbol: &Symbol, serializer: S) -> Result<S::Ok, S::Error>
@@ -452,14 +454,36 @@ pub(super) async fn place_limit_order(
         limit_price: limit_order.limit_price.clone(),
         time_in_force: TimeInForce::Day.as_api_str(),
         extended_hours: limit_order.extended_hours,
+        client_order_id: limit_order.client_order_id.clone(),
     };
 
-    let response = client.place_limit_order(&request).await?;
+    // Same lost-response reconciliation as place_market_order: a re-used
+    // client_order_id rejected with a 422 means the broker already accepted a
+    // prior attempt whose response was lost. Adopt the order it accepted so the
+    // apalis retry is idempotent instead of double-submitting a live limit
+    // order during thin extended-hours liquidity.
+    let (order_id, shares) = match client.place_limit_order(&request).await {
+        Ok(response) => (response.id, placed_shares),
+        Err(error) if is_duplicate_client_order_id(&error) => {
+            debug!(
+                client_order_id = %limit_order.client_order_id,
+                "Broker rejected duplicate client_order_id; reconciling the order it already accepted"
+            );
+            let existing = client
+                .get_order_by_client_order_id(&limit_order.client_order_id)
+                .await?
+                .ok_or_else(|| AlpacaBrokerApiError::DuplicateOrderNotFound {
+                    client_order_id: limit_order.client_order_id.clone(),
+                })?;
+            (existing.id, existing.quantity)
+        }
+        Err(error) => return Err(error),
+    };
 
     Ok(OrderPlacement {
-        order_id: response.id.to_string(),
+        order_id: order_id.to_string(),
         symbol: limit_order.symbol,
-        shares: placed_shares,
+        shares,
         direction: limit_order.direction,
         placed_at: Utc::now(),
     })
@@ -484,13 +508,14 @@ pub(super) async fn get_order_status(
 
     let status = map_broker_status_to_order_status(response.status);
     let price = response.filled_average_price;
+    let shares_filled = response.filled_quantity;
 
     if response.status == BrokerOrderStatus::PartiallyFilled {
         debug!(
             order_id,
             symbol = %response.symbol,
             ordered_qty = %response.quantity.inner(),
-            filled_qty = ?response.filled_quantity,
+            filled_qty = ?shares_filled,
             "Order is partially filled"
         );
     }
@@ -503,6 +528,7 @@ pub(super) async fn get_order_status(
         status,
         updated_at: Utc::now(),
         price,
+        shares_filled,
     })
 }
 
@@ -512,18 +538,23 @@ fn map_broker_status_to_order_status(status: BrokerOrderStatus) -> OrderStatus {
         BrokerOrderStatus::New
         | BrokerOrderStatus::Accepted
         | BrokerOrderStatus::PendingNew
-        | BrokerOrderStatus::PartiallyFilled
         | BrokerOrderStatus::AcceptedForBidding
         | BrokerOrderStatus::PendingCancel
         | BrokerOrderStatus::PendingReplace
         | BrokerOrderStatus::Stopped => OrderStatus::Submitted,
 
+        // Partially filled -- distinct from Submitted so the poll loop can
+        // drive `UpdatePartialFill` on the aggregate before any cancel.
+        BrokerOrderStatus::PartiallyFilled => OrderStatus::PartiallyFilled,
+
         // Successfully filled
         BrokerOrderStatus::Filled => OrderStatus::Filled,
 
+        // Cancelled by the broker after a cancel request was accepted.
+        BrokerOrderStatus::Canceled => OrderStatus::Cancelled,
+
         // Failed/terminal statuses
-        BrokerOrderStatus::Canceled
-        | BrokerOrderStatus::Expired
+        BrokerOrderStatus::Expired
         | BrokerOrderStatus::DoneForDay
         | BrokerOrderStatus::Rejected
         | BrokerOrderStatus::Replaced
@@ -897,6 +928,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn place_limit_order_reconciles_duplicate_client_order_id() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let client_order_uuid = uuid!("88888888-8888-4888-8888-888888888888");
+        let client_order_id = client_order_uuid.to_string();
+        let existing_order_id = "904837e3-3b76-47ec-b432-046db621571b";
+
+        // Same lost-response case as the market path: the broker rejects the
+        // re-used client_order_id with a 422 because it already recorded the
+        // original extended-hours limit order whose 2xx was lost in flight.
+        let place_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(422)
+                .header("content-type", "application/json")
+                .json_body(json!({"message": "client_order_id must be unique"}));
+        });
+
+        let lookup_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(
+                    "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders:by_client_order_id",
+                )
+                .query_param("client_order_id", client_order_id.as_str());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": existing_order_id,
+                    "symbol": "AAPL",
+                    "qty": "7",
+                    "side": "buy",
+                    "status": "new",
+                    "filled_avg_price": null
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let limit_order = AlpacaLimitOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            // Recomputed intent is 10 shares, but the broker already holds the
+            // original 7-share limit order under this key; we adopt it.
+            shares: Positive::new(FractionalShares::new(float!(10))).unwrap(),
+            direction: Direction::Buy,
+            limit_price: AlpacaLimitPrice::try_new(
+                Positive::new(Usd::new(float!(195.25))).unwrap(),
+            )
+            .unwrap(),
+            extended_hours: true,
+            client_order_id: ClientOrderId::from_uuid(client_order_uuid),
+        };
+
+        let placement = place_limit_order(&client, limit_order).await.unwrap();
+
+        place_mock.assert();
+        lookup_mock.assert();
+        assert_eq!(placement.order_id, existing_order_id);
+        assert_eq!(placement.shares.inner(), FractionalShares::new(float!(7)));
+        assert_eq!(placement.direction, Direction::Buy);
+    }
+
+    #[tokio::test]
     async fn place_market_order_errors_when_duplicate_order_not_found() {
         let server = MockServer::start();
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
@@ -1023,6 +1115,7 @@ mod tests {
             )
             .unwrap(),
             extended_hours: false,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         };
 
         let placement = place_limit_order(&client, limit_order).await.unwrap();
@@ -1071,6 +1164,7 @@ mod tests {
             limit_price: AlpacaLimitPrice::try_new(Positive::new(Usd::new(float!(210))).unwrap())
                 .unwrap(),
             extended_hours: true,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         };
 
         let placement = place_limit_order(&client, limit_order).await.unwrap();
@@ -1155,6 +1249,7 @@ mod tests {
             )
             .unwrap(),
             extended_hours: false,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         };
 
         let placement = place_limit_order(&client, limit_order).await.unwrap();
@@ -1555,6 +1650,7 @@ mod tests {
             limit_price: AlpacaLimitPrice::try_new(Positive::new(Usd::new(float!(17.45))).unwrap())
                 .unwrap(),
             extended_hours: false,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         };
 
         let placement = place_limit_order(&client, limit_order).await.unwrap();
@@ -1588,6 +1684,7 @@ mod tests {
             )
             .unwrap(),
             extended_hours: false,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         };
 
         let err = place_limit_order(&client, limit_order).await.unwrap_err();

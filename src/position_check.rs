@@ -9,20 +9,25 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use apalis::prelude::Status;
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use st0x_config::Ctx;
-use st0x_event_sorcery::Projection;
-use st0x_execution::{ClientOrderId, CounterTradePreflight, Executor, MarketOrder, Symbol};
+use st0x_event_sorcery::{Projection, Store};
+use st0x_execution::{
+    ClientOrderId, CounterTradePreflight, Executor, MarketOrder, MarketSession, Positive, Symbol,
+};
 
 use crate::conductor::clamp_shares_to_reservation;
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::equity_redemption::symbols_with_active_transfers;
-use crate::offchain::order::OffchainOrderId;
+use crate::offchain::order::{
+    CancellationReason, OffchainOrder, OffchainOrderCommand, OffchainOrderId,
+};
 use crate::onchain::accumulator::{ExecutionCtx, check_execution_readiness};
-use crate::position::Position;
+use crate::position::{Position, PositionCommand};
 use crate::trading::offchain::hedge::{HedgeJobQueue, PlaceHedge};
 
 pub(crate) type CheckPositionsJobQueue = JobQueue<CheckPositions>;
@@ -31,6 +36,10 @@ pub(crate) type CheckPositionsJobQueue = JobQueue<CheckPositions>;
 pub(crate) struct CheckPositionsCtx<E: Executor + Clone + Send + Sync + 'static> {
     pub(crate) executor: E,
     pub(crate) position_projection: Arc<Projection<Position>>,
+    /// Command stores used by the extended-hours cancel-and-replace pass to
+    /// cancel stale limit orders and finalize the owning position.
+    pub(crate) offchain_order: Arc<Store<OffchainOrder>>,
+    pub(crate) position: Arc<Store<Position>>,
     pub(crate) hedge_queue: HedgeJobQueue,
     pub(crate) check_positions_queue: CheckPositionsJobQueue,
     pub(crate) ctx: Ctx,
@@ -58,12 +67,27 @@ pub(crate) enum CheckPositionsError {
 /// [`PlaceHedge`] for any symbol whose net exposure has crossed the execution
 /// threshold.
 ///
-/// The job carries no state -- the scan reads everything from the position
-/// projection on each run. A single instance is enqueued at startup; each
-/// run re-enqueues itself with a delay equal to the configured check
-/// interval.
+/// The scan reads positions from the projection on each run. A single instance
+/// is enqueued at startup; each run re-enqueues itself with a delay equal to
+/// the configured check interval.
+///
+/// The only state carried across runs is `last_seen_session`: the stateless
+/// job persists the previously observed market session in its own payload so
+/// the next run can detect an Extended -> Regular transition and trigger the
+/// extended-hours cancel-and-replace pass exactly once per transition.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub(crate) struct CheckPositions;
+pub(crate) struct CheckPositions {
+    /// Market session observed by the previous scan, carried in the job payload
+    /// so the stateless self-rescheduling job can detect an Extended/Closed ->
+    /// Regular transition. `None` on the bootstrap job and after any
+    /// process restart: a `None` previous session deliberately does NOT trigger
+    /// cancel-and-replace (startup recovery owns orphaned extended-hours
+    /// orders), it only records the observed session for the next tick.
+    /// `#[serde(default)]` lets job payloads enqueued before this field existed
+    /// deserialize cleanly.
+    #[serde(default)]
+    last_seen_session: Option<MarketSession>,
+}
 
 impl<E> Job<CheckPositionsCtx<E>> for CheckPositions
 where
@@ -82,8 +106,25 @@ where
     }
 
     async fn perform(&self, ctx: &CheckPositionsCtx<E>) -> Result<Self::Output, Self::Error> {
+        let next_session = if ctx.ctx.extended_hours_counter_trading {
+            // Every tick: clear any position whose pending order has gone
+            // terminal (e.g. a cancellation the poller has since confirmed).
+            // This is the recovery half of cancel-and-replace and is what lets
+            // the transition pass below fire exactly once instead of re-running
+            // until each cancellation confirms.
+            ctx.finalize_terminal_pending_positions().await;
+            // Only on a fresh transition into regular hours: request
+            // cancellation of still-live extended-hours limit orders so they're
+            // replaced with market orders. Advances the carried session as soon
+            // as cancellation is requested.
+            ctx.request_extended_hours_cancellations(self.last_seen_session)
+                .await
+        } else {
+            self.last_seen_session
+        };
+
         ctx.scan_and_enqueue().await?;
-        ctx.reschedule().await
+        ctx.reschedule(next_session).await
     }
 }
 
@@ -124,6 +165,7 @@ where
             self.executor.to_supported_executor(),
             &self.ctx.assets,
             true,
+            self.ctx.extended_hours_counter_trading,
         )
         .await
         .inspect_err(|error| error!(%symbol, %error, "Execution readiness check failed"));
@@ -149,6 +191,7 @@ where
             executor: ready.executor,
             threshold: self.ctx.execution_threshold,
             offchain_order_id: OffchainOrderId::new(),
+            market_session: ready.market_session,
         };
 
         let mut queue = self.hedge_queue.clone();
@@ -194,12 +237,325 @@ where
         }
     }
 
-    async fn reschedule(&self) -> Result<(), CheckPositionsError> {
+    async fn reschedule(
+        &self,
+        last_seen_session: Option<MarketSession>,
+    ) -> Result<(), CheckPositionsError> {
         let mut queue = self.check_positions_queue.clone();
         queue
-            .push_with_delay(CheckPositions, self.check_interval)
+            .push_with_delay(CheckPositions { last_seen_session }, self.check_interval)
             .await?;
         Ok(())
+    }
+
+    /// Clears every position whose pending offchain order has reached a
+    /// terminal state, applying any recorded fill and releasing the pending
+    /// reference so the symbol can resume hedging.
+    ///
+    /// Runs every scan, independent of the market session: this is the recovery
+    /// half of cancel-and-replace. The transition pass only *requests*
+    /// cancellation (moving the order to `Cancelling`); the poller later drives
+    /// it terminal, and this method clears the owning position on a subsequent
+    /// tick -- so the transition pass need not re-run until confirmation. It
+    /// also recovers any position left referencing an already-terminal order by
+    /// a prior transient failure.
+    async fn finalize_terminal_pending_positions(&self) {
+        let all_positions = match self.position_projection.load_all().await {
+            Ok(positions) => positions,
+            Err(error) => {
+                warn!("Failed to load positions for terminal-order finalization: {error}");
+                return;
+            }
+        };
+
+        for (symbol, position) in &all_positions {
+            let Some(offchain_order_id) = position.pending_offchain_order_id else {
+                continue;
+            };
+
+            let order = match self.offchain_order.load(&offchain_order_id).await {
+                Ok(Some(order)) => order,
+                Ok(None) => continue,
+                Err(error) => {
+                    warn!(%symbol, %offchain_order_id, %error, "Failed to load offchain order for finalization");
+                    continue;
+                }
+            };
+
+            // Only terminal orders need position finalization here. Live and
+            // in-flight orders (Pending/Submitted/PartiallyFilled/Cancelling)
+            // are owned by the poll loop and reconcile jobs.
+            if matches!(
+                order,
+                OffchainOrder::Cancelled { .. }
+                    | OffchainOrder::Failed { .. }
+                    | OffchainOrder::Filled { .. }
+            ) {
+                self.finalize_position_for_terminal_order(symbol, offchain_order_id, &order)
+                    .await;
+            }
+        }
+    }
+
+    /// On a fresh transition into regular hours, requests broker cancellation
+    /// of any still-live extended-hours limit orders so they can be replaced
+    /// with market orders. Returns the session value to carry forward in the
+    /// next job payload.
+    ///
+    /// Fires exactly once per transition: it advances the carried session as
+    /// soon as cancellation has been *requested* (the order moves to
+    /// `Cancelling`), rather than blocking until the poller confirms the
+    /// terminal `Cancelled`. The poller drives the order terminal and
+    /// [`Self::finalize_terminal_pending_positions`] clears the position on a
+    /// later tick. `previous_session = None` (bootstrap / post-restart) does
+    /// NOT fire -- startup recovery owns orphaned orders -- it only records the
+    /// observed session. A transient lookup/send failure keeps the prior
+    /// session so the transition is retried next tick rather than skipped.
+    async fn request_extended_hours_cancellations(
+        &self,
+        previous_session: Option<MarketSession>,
+    ) -> Option<MarketSession> {
+        let session = match self.executor.market_session().await {
+            Ok(session) => session,
+            Err(error) => {
+                warn!("Failed to check market session for cancel-and-replace: {error}");
+                return previous_session;
+            }
+        };
+
+        let transitioned_into_regular = session == MarketSession::Regular
+            && matches!(previous_session, Some(previous) if previous != MarketSession::Regular);
+        if !transitioned_into_regular {
+            return Some(session);
+        }
+
+        let all_positions = match self.position_projection.load_all().await {
+            Ok(positions) => positions,
+            Err(error) => {
+                warn!("Failed to load positions for cancel-and-replace: {error}");
+                return previous_session;
+            }
+        };
+
+        let mut all_requested = true;
+        for (symbol, position) in &all_positions {
+            let Some(offchain_order_id) = position.pending_offchain_order_id else {
+                continue;
+            };
+
+            let order = match self.offchain_order.load(&offchain_order_id).await {
+                Ok(Some(order)) => order,
+                Ok(None) => continue,
+                Err(error) => {
+                    warn!(%symbol, %offchain_order_id, %error, "Failed to load offchain order for cancel-and-replace");
+                    all_requested = false;
+                    continue;
+                }
+            };
+
+            // Only live extended-hours orders need cancelling. Terminal orders
+            // are handled by finalize_terminal_pending_positions, and orders
+            // already Cancelling are awaiting the poller's confirmation.
+            let is_live_extended_hours = matches!(
+                &order,
+                OffchainOrder::Submitted { is_extended_hours, .. }
+                    | OffchainOrder::PartiallyFilled { is_extended_hours, .. }
+                    if *is_extended_hours
+            );
+            if !is_live_extended_hours {
+                continue;
+            }
+
+            info!(
+                target: "hedge",
+                %symbol,
+                %offchain_order_id,
+                "Regular hours: cancelling extended-hours limit order for market-order replacement"
+            );
+
+            if let Err(error) = self
+                .offchain_order
+                .send(
+                    &offchain_order_id,
+                    OffchainOrderCommand::CancelOrder {
+                        reason: CancellationReason::MarketOpenReplacement,
+                    },
+                )
+                .await
+            {
+                warn!(%symbol, %offchain_order_id, %error, "Failed to request cancellation of extended-hours order");
+                all_requested = false;
+            }
+        }
+
+        if all_requested {
+            Some(session)
+        } else {
+            previous_session
+        }
+    }
+
+    /// After a successful cancel (or a recovery scan finding an already-
+    /// terminal order), propagate the broker's actual fill quantity to the
+    /// position aggregate so net is correctly debited. Otherwise a partial
+    /// fill recorded on the offchain side is invisible to the position
+    /// scanner and the next cycle re-hedges the same shares.
+    async fn finalize_position_for_terminal_order(
+        &self,
+        symbol: &Symbol,
+        offchain_order_id: OffchainOrderId,
+        order: &OffchainOrder,
+    ) -> bool {
+        // Try to apply any partial fill first.
+        if let OffchainOrder::Cancelled {
+            shares_filled,
+            avg_price,
+            direction,
+            executor_order_id,
+            ..
+        } = order
+            && let Ok(positive_filled) = Positive::new(*shares_filled)
+        {
+            let Some(avg_price) = avg_price else {
+                warn!(
+                    %symbol, %offchain_order_id,
+                    "Cancelled order has partial fill without avg price; leaving position pending"
+                );
+                return false;
+            };
+
+            if let Err(error) = self
+                .position
+                .send(
+                    symbol,
+                    PositionCommand::CompleteOffChainOrder {
+                        offchain_order_id,
+                        shares_filled: positive_filled,
+                        direction: *direction,
+                        executor_order_id: executor_order_id.clone(),
+                        price: *avg_price,
+                        broker_timestamp: Utc::now(),
+                    },
+                )
+                .await
+            {
+                warn!(
+                    %symbol, %offchain_order_id, %error,
+                    "Failed to apply partial-fill CompleteOffChainOrder after cancel"
+                );
+                return false;
+            }
+            return true;
+        }
+
+        match order {
+            // Filled (short-circuit case): the broker fully filled the
+            // order between our last poll and the cancel. Apply the full
+            // fill to the position.
+            OffchainOrder::Filled {
+                shares,
+                direction,
+                executor_order_id,
+                price,
+                ..
+            } => {
+                if let Err(error) = self
+                    .position
+                    .send(
+                        symbol,
+                        PositionCommand::CompleteOffChainOrder {
+                            offchain_order_id,
+                            shares_filled: *shares,
+                            direction: *direction,
+                            executor_order_id: executor_order_id.clone(),
+                            price: *price,
+                            broker_timestamp: Utc::now(),
+                        },
+                    )
+                    .await
+                {
+                    warn!(
+                        %symbol, %offchain_order_id, %error,
+                        "Failed to apply short-circuit fill after cancel"
+                    );
+                    return false;
+                }
+                true
+            }
+            OffchainOrder::Failed {
+                shares_filled: Some(shares_filled),
+                avg_price: Some(avg_price),
+                direction,
+                executor_order_id: Some(executor_order_id),
+                ..
+            } => {
+                let command = Positive::new(*shares_filled).map_or_else(
+                    |_| PositionCommand::FailOffChainOrder {
+                        offchain_order_id,
+                        error: "broker failed order before any fill".to_string(),
+                    },
+                    |positive_filled| PositionCommand::CompleteOffChainOrder {
+                        offchain_order_id,
+                        shares_filled: positive_filled,
+                        direction: *direction,
+                        executor_order_id: executor_order_id.clone(),
+                        price: *avg_price,
+                        broker_timestamp: Utc::now(),
+                    },
+                );
+
+                if let Err(error) = self.position.send(symbol, command).await {
+                    warn!(
+                        %symbol, %offchain_order_id, %error,
+                        "Failed to apply partial-fill CompleteOffChainOrder after broker failure"
+                    );
+                    return false;
+                }
+                true
+            }
+            // Cancelled with no partial fill, or Failed at the broker with
+            // no recorded fill -- nothing to apply to net, just clear pending.
+            OffchainOrder::Cancelled { .. } | OffchainOrder::Failed { .. } => {
+                let error_message = match order {
+                    OffchainOrder::Cancelled { reason, .. } => {
+                        format!("Cancelled: {reason:?}")
+                    }
+                    OffchainOrder::Failed { error, .. } => error.clone(),
+                    _ => unreachable!(),
+                };
+                if let Err(error) = self
+                    .position
+                    .send(
+                        symbol,
+                        PositionCommand::FailOffChainOrder {
+                            offchain_order_id,
+                            error: error_message,
+                        },
+                    )
+                    .await
+                {
+                    warn!(
+                        %symbol, %offchain_order_id, %error,
+                        "Failed to clear position pending state after cancel"
+                    );
+                    return false;
+                }
+                true
+            }
+            // Live or pre-terminal states should not appear here -- we
+            // just successfully cancelled or the scan retry was triggered.
+            // Log and skip.
+            OffchainOrder::Pending { .. }
+            | OffchainOrder::Submitted { .. }
+            | OffchainOrder::PartiallyFilled { .. }
+            | OffchainOrder::Cancelling { .. } => {
+                warn!(
+                    %symbol, %offchain_order_id, state = ?order,
+                    "Order in non-terminal state after cancel attempt; skipping position finalize"
+                );
+                false
+            }
+        }
     }
 }
 
@@ -215,7 +571,7 @@ pub(crate) async fn bootstrap_check_positions(
     queue: &CheckPositionsJobQueue,
 ) -> Result<(), CheckPositionsError> {
     purge_pending_check_positions_jobs(pool).await?;
-    queue.clone().push(CheckPositions).await?;
+    queue.clone().push(CheckPositions::default()).await?;
     Ok(())
 }
 
@@ -277,9 +633,20 @@ mod tests {
 
         let executor = MockExecutorCtx.try_into_executor().await.unwrap();
 
+        let order_placer: Arc<dyn crate::offchain::order::OrderPlacer> = Arc::new(
+            crate::offchain::order::ExecutorOrderPlacer(executor.clone()),
+        );
+        let (offchain_order, _offchain_order_projection) =
+            StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(order_placer)
+                .await
+                .unwrap();
+
         let ctx = CheckPositionsCtx {
             executor,
             position_projection,
+            offchain_order,
+            position: position.clone(),
             hedge_queue: HedgeJobQueue::new(&pool),
             check_positions_queue: CheckPositionsJobQueue::new(&pool),
             ctx: ctx_cfg,
@@ -388,7 +755,7 @@ mod tests {
         )
         .await;
 
-        CheckPositions.perform(&ctx).await.unwrap();
+        CheckPositions::default().perform(&ctx).await.unwrap();
 
         assert_eq!(count_jobs(&pool, &hedge_job_type()).await, 2);
     }
@@ -409,7 +776,7 @@ mod tests {
         )
         .await;
 
-        CheckPositions.perform(&ctx).await.unwrap();
+        CheckPositions::default().perform(&ctx).await.unwrap();
 
         assert_eq!(count_jobs(&pool, &hedge_job_type()).await, 0);
     }
@@ -421,7 +788,7 @@ mod tests {
         let interval = Duration::from_secs(42);
         let (ctx, _position) = build_ctx(pool.clone(), cfg, interval).await;
 
-        CheckPositions.perform(&ctx).await.unwrap();
+        CheckPositions::default().perform(&ctx).await.unwrap();
 
         assert_eq!(count_jobs(&pool, &check_positions_job_type()).await, 1);
 
@@ -436,6 +803,55 @@ mod tests {
         assert!(
             (run_at - expected).abs() <= 2,
             "expected run_at near {expected}, got {run_at}"
+        );
+    }
+
+    /// Reads the `last_seen_session` carried in the single rescheduled
+    /// [`CheckPositions`] job payload.
+    async fn rescheduled_session(pool: &SqlitePool) -> Option<MarketSession> {
+        let job: Vec<u8> = sqlx::query_scalar("SELECT job FROM Jobs WHERE job_type = ? LIMIT 1")
+            .bind(check_positions_job_type())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let parsed: CheckPositions = serde_json::from_slice(&job).unwrap();
+        parsed.last_seen_session
+    }
+
+    #[tokio::test]
+    async fn carries_observed_session_into_rescheduled_payload() {
+        let pool = setup_test_db().await;
+        // Extended-hours enabled so the cancel-and-replace pass runs and the
+        // observed Regular session is carried forward. MockExecutor reports an
+        // open (Regular) market by default; with no prior session the pass runs
+        // cleanly (no pending orders) and advances the carried session.
+        let cfg = Ctx {
+            extended_hours_counter_trading: true,
+            ..dry_run_ctx(&["AAPL"])
+        };
+        let (ctx, _position) = build_ctx(pool.clone(), cfg, Duration::from_secs(60)).await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        assert_eq!(
+            rescheduled_session(&pool).await,
+            Some(MarketSession::Regular),
+            "first scan in regular hours should carry the observed session forward"
+        );
+    }
+
+    #[tokio::test]
+    async fn extended_hours_disabled_leaves_carried_session_unset() {
+        let pool = setup_test_db().await;
+        let cfg = dry_run_ctx(&["AAPL"]);
+        let (ctx, _position) = build_ctx(pool.clone(), cfg, Duration::from_secs(60)).await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        assert_eq!(
+            rescheduled_session(&pool).await,
+            None,
+            "with extended hours disabled the cancel-and-replace pass never runs, so no session is observed"
         );
     }
 
@@ -461,7 +877,7 @@ mod tests {
             .await;
         }
 
-        CheckPositions.perform(&ctx).await.unwrap();
+        CheckPositions::default().perform(&ctx).await.unwrap();
 
         assert_eq!(
             count_jobs(&pool, &hedge_job_type()).await,

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use st0x_event_sorcery::Store;
+use st0x_execution::Positive;
 
 use crate::conductor::job::{Job, JobQueue, Label};
 use crate::offchain::order::{JobError, OffchainOrder, OffchainOrderCommand, OffchainOrderId};
@@ -64,7 +65,9 @@ impl Job<HandleOrderRejectionCtx> for HandleOrderRejection {
         // order already in `Failed`. Re-sending `MarkFailed` would surface
         // `AlreadyCompleted` and stall the job forever, so we only run
         // step 1 when the order has not yet been marked failed.
-        use OffchainOrder::{Failed, Filled, PartiallyFilled, Pending, Submitted};
+        use OffchainOrder::{
+            Cancelled, Cancelling, Failed, Filled, PartiallyFilled, Pending, Submitted,
+        };
         match &order {
             Failed { .. } => {
                 info!(
@@ -73,7 +76,7 @@ impl Job<HandleOrderRejectionCtx> for HandleOrderRejection {
                 );
             }
 
-            Pending { .. } | Submitted { .. } | PartiallyFilled { .. } => {
+            Pending { .. } | Submitted { .. } | PartiallyFilled { .. } | Cancelling { .. } => {
                 ctx.offchain_order
                     .send(
                         &self.offchain_order_id,
@@ -90,6 +93,13 @@ impl Job<HandleOrderRejectionCtx> for HandleOrderRejection {
                     "HandleOrderRejection: order already Filled, cannot mark failed -- skipping"
                 );
                 return Ok(());
+            }
+
+            Cancelled { .. } => {
+                info!(
+                    offchain_order_id = %self.offchain_order_id,
+                    "HandleOrderRejection: order already Cancelled -- skipping MarkFailed, resuming position update"
+                );
             }
         }
 
@@ -111,18 +121,86 @@ impl Job<HandleOrderRejectionCtx> for HandleOrderRejection {
             return Ok(());
         }
 
-        ctx.position
-            .send(
-                &symbol,
-                PositionCommand::FailOffChainOrder {
-                    offchain_order_id: self.offchain_order_id,
-                    error: self.error.clone(),
-                },
-            )
-            .await?;
+        let position_command = match &order {
+            PartiallyFilled {
+                shares_filled,
+                direction,
+                executor_order_id,
+                avg_price,
+                ..
+            }
+            | Cancelling {
+                shares_filled,
+                direction,
+                executor_order_id,
+                avg_price: Some(avg_price),
+                ..
+            }
+            | Failed {
+                shares_filled: Some(shares_filled),
+                avg_price: Some(avg_price),
+                executor_order_id: Some(executor_order_id),
+                direction,
+                ..
+            } => position_command_for_retained_fill(
+                self.offchain_order_id,
+                *shares_filled,
+                *direction,
+                executor_order_id.clone(),
+                *avg_price,
+                self.error.clone(),
+            ),
+            Pending { .. }
+            | Submitted { .. }
+            | Cancelling {
+                avg_price: None, ..
+            }
+            | Failed {
+                shares_filled: None,
+                ..
+            }
+            | Failed {
+                avg_price: None, ..
+            }
+            | Failed {
+                executor_order_id: None,
+                ..
+            }
+            | Cancelled { .. } => PositionCommand::FailOffChainOrder {
+                offchain_order_id: self.offchain_order_id,
+                error: self.error.clone(),
+            },
+            Filled { .. } => unreachable!("filled orders return before position update"),
+        };
+
+        ctx.position.send(&symbol, position_command).await?;
 
         Ok(())
     }
+}
+
+fn position_command_for_retained_fill(
+    offchain_order_id: OffchainOrderId,
+    shares_filled: st0x_execution::FractionalShares,
+    direction: st0x_execution::Direction,
+    executor_order_id: st0x_execution::ExecutorOrderId,
+    avg_price: st0x_finance::Usd,
+    fallback_error: String,
+) -> PositionCommand {
+    Positive::new(shares_filled).map_or_else(
+        |_| PositionCommand::FailOffChainOrder {
+            offchain_order_id,
+            error: fallback_error,
+        },
+        |positive_filled| PositionCommand::CompleteOffChainOrder {
+            offchain_order_id,
+            shares_filled: positive_filled,
+            direction,
+            executor_order_id,
+            price: avg_price,
+            broker_timestamp: chrono::Utc::now(),
+        },
+    )
 }
 
 #[cfg(test)]
@@ -231,6 +309,7 @@ mod tests {
                     direction,
                     executor: SupportedExecutor::DryRun,
                     client_order_id: ClientOrderId::from_uuid(offchain_order_id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
                 },
             )
             .await
@@ -346,6 +425,59 @@ mod tests {
         assert_eq!(
             position_after.pending_offchain_order_id, None,
             "Retry must clear the position's pending state by running step 2"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_after_failed_partial_fill_completes_position_fill() {
+        let infra = build_test_infra().await;
+        let symbol = Symbol::new("TSLA").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let order_id =
+            submit_offchain_order(&infra, &symbol, "wtTSLA", shares, Direction::Sell).await;
+
+        infra
+            .ctx
+            .offchain_order
+            .send(
+                &order_id,
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled: FractionalShares::new(float!(1)),
+                    avg_price: st0x_finance::Usd::new(float!(150)),
+                },
+            )
+            .await
+            .unwrap();
+        infra
+            .ctx
+            .offchain_order
+            .send(
+                &order_id,
+                OffchainOrderCommand::MarkFailed {
+                    error: "broker failed after partial fill".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        HandleOrderRejection {
+            offchain_order_id: order_id,
+            error: "broker failed after partial fill".to_string(),
+        }
+        .perform(&infra.ctx)
+        .await
+        .unwrap();
+
+        let position_after = infra
+            .ctx
+            .position
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert_eq!(
+            position_after.pending_offchain_order_id, None,
+            "Retry must clear pending by completing the retained partial fill"
         );
     }
 

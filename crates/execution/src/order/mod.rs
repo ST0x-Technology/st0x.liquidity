@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use st0x_float_serde::DebugOptionFloat;
 
-use crate::{Direction, FractionalShares, Positive, Symbol};
+use crate::{Direction, FractionalShares, Positive, Symbol, Usd};
 
 pub mod state;
 pub mod status;
@@ -105,6 +105,11 @@ pub struct OrderUpdate<OrderId> {
     pub status: OrderStatus,
     pub updated_at: DateTime<Utc>,
     pub price: Option<Float>,
+    /// Cumulative quantity filled at the broker so far. `None` when no
+    /// fills have occurred. Required for `OrderStatus::PartiallyFilled`
+    /// so the caller can reconcile the local aggregate via
+    /// `UpdatePartialFill`.
+    pub shares_filled: Option<Float>,
 }
 
 impl<OrderId: Debug> Debug for OrderUpdate<OrderId> {
@@ -117,6 +122,7 @@ impl<OrderId: Debug> Debug for OrderUpdate<OrderId> {
             .field("status", &self.status)
             .field("updated_at", &self.updated_at)
             .field("price", &DebugOptionFloat(&self.price))
+            .field("shares_filled", &DebugOptionFloat(&self.shares_filled))
             .finish()
     }
 }
@@ -195,4 +201,21 @@ mod tests {
         let cli: ClientOrderId = serde_json::from_value(json!(PREFIXED)).unwrap();
         assert_eq!(cli, ClientOrderId::Cli(ID));
     }
+}
+
+/// Broker-agnostic limit order for automated counter-trading during extended
+/// hours. The executor implementation converts this to its broker-specific
+/// limit order type (e.g. `AlpacaLimitOrder`).
+#[derive(Debug, Clone)]
+pub struct LimitOrder {
+    pub symbol: Symbol,
+    pub shares: Positive<FractionalShares>,
+    pub direction: Direction,
+    pub limit_price: Positive<Usd>,
+    pub extended_hours: bool,
+    /// Forwarded to the broker so that retries of a logically identical
+    /// extended-hours placement (e.g. apalis re-running a job after a lost
+    /// placement response) are deduped by the broker rather than submitting a
+    /// second live limit order. Mirrors [`MarketOrder::client_order_id`].
+    pub client_order_id: ClientOrderId,
 }

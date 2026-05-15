@@ -154,6 +154,7 @@ mod tests {
                     direction: Direction::Sell,
                     executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
                     client_order_id: ClientOrderId::from_uuid(id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
                 },
             )
             .await
@@ -294,6 +295,7 @@ mod tests {
                     direction: Direction::Buy,
                     executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
                     client_order_id: ClientOrderId::from_uuid(id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
                 },
             )
             .await

@@ -162,7 +162,7 @@ async fn poll_submitted_orders<E: st0x_execution::Executor + Clone>(
             .await
             .map_err(|error| format!("get_order_status: {error}"))?;
 
-        use OrderState::{Failed, Filled, Pending, Submitted};
+        use OrderState::{Cancelled, Failed, Filled, PartiallyFilled, Pending, Submitted};
         match state {
             Filled {
                 price,
@@ -217,7 +217,7 @@ async fn poll_submitted_orders<E: st0x_execution::Executor + Clone>(
                     .await?;
             }
 
-            Pending | Submitted { .. } => {}
+            Pending | Submitted { .. } | PartiallyFilled { .. } | Cancelled { .. } => {}
         }
     }
 
@@ -702,6 +702,7 @@ async fn create_test_cqrs_with_assets(
         assets,
         counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
         poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(pool),
+        extended_hours_counter_trading: false,
     };
 
     (
@@ -902,6 +903,8 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
     let failed_executor = MockExecutor::new().with_order_status(OrderState::Failed {
         failed_at: Utc::now(),
         error_reason: Some("Broker rejected order".to_string()),
+        shares_filled: None,
+        avg_price: None,
     });
     poll_submitted_orders(
         &failed_executor,
@@ -2418,6 +2421,8 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
     let failed_executor = MockExecutor::new().with_order_status(OrderState::Failed {
         failed_at: Utc::now(),
         error_reason: Some("Broker rejected".to_string()),
+        shares_filled: None,
+        avg_price: None,
     });
     poll_submitted_orders(
         &failed_executor,
