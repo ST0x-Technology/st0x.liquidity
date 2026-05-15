@@ -73,8 +73,19 @@ const MOCK_ORDERS = {
   },
 };
 
+const rawPort = process.env["MOCK_REST_API_PORT"];
+if (rawPort === undefined) {
+  throw new Error("MOCK_REST_API_PORT must be set");
+}
+const port = Number(rawPort);
+if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+  throw new Error(
+    `MOCK_REST_API_PORT must be a valid u16 port number, got: ${rawPort}`,
+  );
+}
+
 const server = Bun.serve({
-  port: 8099,
+  port,
   fetch(request: Request) {
     const url = new URL(request.url);
 

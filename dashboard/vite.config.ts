@@ -2,15 +2,18 @@ import tailwindcss from '@tailwindcss/vite'
 import { sveltekit } from '@sveltejs/kit/vite'
 import { defineConfig } from 'vite'
 
+const backendPort = process.env['BACKEND_PORT'] ?? '8001'
+const backendUrl = `http://localhost:${backendPort}`
+
 export default defineConfig({
   plugins: [tailwindcss(), sveltekit()],
   server: {
     proxy: {
-      '/logs': 'http://localhost:8001',
-      '/health': 'http://localhost:8001',
-      '/orders': 'http://localhost:8001',
-      '/trades': 'http://localhost:8001',
-      '/transfers': 'http://localhost:8001',
+      '/logs': backendUrl,
+      '/health': backendUrl,
+      '/orders': backendUrl,
+      '/trades': backendUrl,
+      '/transfers': backendUrl,
     }
   }
 })

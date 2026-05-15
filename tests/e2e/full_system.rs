@@ -67,6 +67,7 @@ fn build_full_system_ctx<P: Provider + Clone>(
     cctp: CctpOverrides,
     rest_api_url: Option<&str>,
     cash_reserved: Option<Positive<Usd>>,
+    server_port: u16,
 ) -> anyhow::Result<Ctx> {
     let alpaca_auth = AlpacaBrokerApiCtx {
         api_key: TEST_API_KEY.to_owned(),
@@ -143,7 +144,7 @@ fn build_full_system_ctx<P: Provider + Clone>(
             }),
         })
         .inventory_poll_interval(15)
-        .server_port(8001)
+        .server_port(server_port)
         .maybe_rest_api(
             rest_api_url
                 .map(|url| st0x_hedge::config::RestApiCtx::unauthenticated(url.to_string())),
@@ -273,6 +274,7 @@ async fn full_system() -> anyhow::Result<()> {
         .equity_vault_ids(&equity_vault_ids)
         .cash_vault_id(usdc_vault_id)
         .cctp(cctp.cctp_overrides())
+        .server_port(8001)
         .call()?;
 
     let mut bot = spawn_bot_with_event_channel(ctx, event_sender);
@@ -462,14 +464,20 @@ async fn full_system() -> anyhow::Result<()> {
 #[ignore = "infinite simulation -- run via nix run .#simulate"]
 #[allow(clippy::too_many_lines)]
 async fn simulate() -> anyhow::Result<()> {
-    let log_dir = std::path::PathBuf::from("/tmp/st0x-simulate-logs");
+    let server_port: u16 = std::env::var("SIMULATE_BOT_PORT")
+        .expect("SIMULATE_BOT_PORT must be set (run via `nix run .#simulate`)")
+        .parse()
+        .expect("SIMULATE_BOT_PORT must be a valid u16 port number");
+
+    let log_dir = std::path::PathBuf::from(format!("/tmp/st0x-simulate-logs-{server_port}"));
     std::fs::create_dir_all(&log_dir)?;
     let _log_guard = crate::test_infra::init_tracing_with_log_dir(&log_dir);
 
     let aapl_broker_price = float!(150.25);
     let tsla_broker_price = float!(245.00);
 
-    let db_path = std::path::PathBuf::from("/tmp/st0x-liquidity-simulate.sqlite");
+    let db_path =
+        std::path::PathBuf::from(format!("/tmp/st0x-liquidity-simulate-{server_port}.sqlite"));
     let _ = std::fs::remove_file(&db_path);
     let _ = std::fs::remove_file(db_path.with_extension("sqlite-shm"));
     let _ = std::fs::remove_file(db_path.with_extension("sqlite-wal"));
@@ -568,13 +576,14 @@ async fn simulate() -> anyhow::Result<()> {
         .cash_vault_id(usdc_vault_id)
         .cctp(cctp.cctp_overrides())
         .cash_reserved(Positive::new(Usd::new(float!(50000)))?)
+        .server_port(server_port)
         .call()?;
     ctx.log_dir = Some(log_dir.display().to_string());
 
     debug!("Starting bot");
     let mut bot = spawn_bot_with_event_channel(ctx, event_sender);
 
-    poll_for_ready(&mut bot, 8001).await;
+    poll_for_ready(&mut bot, server_port).await;
     info!("Bot ready. Starting continuous trade simulation.");
 
     let orders = [
