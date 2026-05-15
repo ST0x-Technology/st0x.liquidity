@@ -1,6 +1,6 @@
 //! Inventory view for tracking cross-venue asset positions.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::{Add, Sub};
 use std::sync::{Arc, LazyLock};
 
@@ -735,6 +735,14 @@ pub(crate) struct InventoryView {
     /// overwriting a fresher one.
     #[serde(default)]
     inflight_equity: HashMap<(Symbol, InFlightEquityLocation), InFlightEquityEntry>,
+    /// Symbols that appeared in the most recent inflight mint poll.
+    /// Used to detect when a symbol disappears from the poll (request
+    /// completed or rejected) so its inflight can be zeroed.
+    #[serde(default)]
+    previous_inflight_mint_symbols: HashSet<Symbol>,
+    /// Symbols that appeared in the most recent inflight redemption poll.
+    #[serde(default)]
+    previous_inflight_redemption_symbols: HashSet<Symbol>,
 }
 
 impl InventoryView {
@@ -869,6 +877,8 @@ impl Default for InventoryView {
             active_mints: HashMap::new(),
             active_redemptions: HashMap::new(),
             inflight_equity: HashMap::new(),
+            previous_inflight_mint_symbols: HashSet::new(),
+            previous_inflight_redemption_symbols: HashSet::new(),
         }
     }
 }
@@ -995,6 +1005,8 @@ impl InventoryView {
             active_mints: self.active_mints,
             active_redemptions: self.active_redemptions,
             inflight_equity: self.inflight_equity,
+            previous_inflight_mint_symbols: self.previous_inflight_mint_symbols,
+            previous_inflight_redemption_symbols: self.previous_inflight_redemption_symbols,
         })
     }
 
@@ -1016,6 +1028,8 @@ impl InventoryView {
             active_mints: self.active_mints,
             active_redemptions: self.active_redemptions,
             inflight_equity: self.inflight_equity,
+            previous_inflight_mint_symbols: self.previous_inflight_mint_symbols,
+            previous_inflight_redemption_symbols: self.previous_inflight_redemption_symbols,
         })
     }
 
@@ -1135,6 +1149,8 @@ impl InventoryView {
             active_mints: self.active_mints,
             active_redemptions: self.active_redemptions,
             inflight_equity: self.inflight_equity,
+            previous_inflight_mint_symbols: self.previous_inflight_mint_symbols,
+            previous_inflight_redemption_symbols: self.previous_inflight_redemption_symbols,
         })
     }
 
@@ -1157,6 +1173,8 @@ impl InventoryView {
             active_mints: self.active_mints,
             active_redemptions: self.active_redemptions,
             inflight_equity: self.inflight_equity,
+            previous_inflight_mint_symbols: self.previous_inflight_mint_symbols,
+            previous_inflight_redemption_symbols: self.previous_inflight_redemption_symbols,
         })
     }
 
@@ -1259,11 +1277,12 @@ impl InventoryView {
 
     /// Apply an inflight equity snapshot from the tokenization provider poll.
     ///
-    /// Only sets inflight for symbols **present** in the maps. Symbols absent
-    /// from the maps are left untouched — their inflight is managed exclusively
-    /// by CQRS terminal events (`TransferOp::Complete`, `TransferOp::Cancel`).
-    /// This prevents a race where the poll sees no pending request (e.g. after
-    /// a fast rejection) and zeros inflight before the CQRS event arrives.
+    /// Sets inflight for symbols **present** in the maps. For symbols
+    /// that were in the **previous** poll but are now **absent**, zeros
+    /// their inflight — the pending request completed, was rejected, or
+    /// was cancelled. Symbols that were never in any poll (CQRS-only
+    /// inflight via `TransferOp::Start`) are left untouched, preventing
+    /// a race where the poll fires before Alpaca detects the transfer.
     ///
     /// Skips symbols whose `last_rebalancing` is more recent than `fetched_at`,
     /// because a stale poll could otherwise re-introduce inflight that was
@@ -1279,8 +1298,12 @@ impl InventoryView {
         fetched_at: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
-        let mut view = self;
+        let mut this = self;
+        let prev_mints = std::mem::take(&mut this.previous_inflight_mint_symbols);
+        let prev_redemptions = std::mem::take(&mut this.previous_inflight_redemption_symbols);
+        let mut view = this;
 
+        // Set inflight for symbols present in the poll.
         for (symbol, &quantity) in mints {
             if view.is_stale_for_symbol(symbol, fetched_at) {
                 debug!(
@@ -1319,7 +1342,55 @@ impl InventoryView {
             )?;
         }
 
+        // Zero inflight for symbols that were in the previous poll but
+        // disappeared. These are requests that completed or were rejected.
+        for symbol in &prev_mints {
+            if !mints.contains_key(symbol) && !view.is_stale_for_symbol(symbol, fetched_at) {
+                view = view.update_equity(
+                    symbol,
+                    Inventory::set_inflight(Venue::Hedging, FractionalShares::ZERO),
+                    now,
+                )?;
+            }
+        }
+
+        for symbol in &prev_redemptions {
+            if !redemptions.contains_key(symbol) && !view.is_stale_for_symbol(symbol, fetched_at) {
+                view = view.update_equity(
+                    symbol,
+                    Inventory::set_inflight(Venue::MarketMaking, FractionalShares::ZERO),
+                    now,
+                )?;
+            }
+        }
+
+        // Track current poll symbols for next cycle's cleanup.
+        view.previous_inflight_mint_symbols = mints.keys().cloned().collect();
+        view.previous_inflight_redemption_symbols = redemptions.keys().cloned().collect();
+
         Ok(view)
+    }
+
+    /// Remove a symbol from the previous inflight mint marker set.
+    ///
+    /// Called when a new mint transfer starts (MintAccepted event) to
+    /// prevent the next inflight poll from incorrectly zeroing the new
+    /// inflight. Without this, a poll that fires before Alpaca reflects
+    /// the new pending request would see the symbol in `prev_mints` but
+    /// absent from the current poll, and zero it.
+    pub(crate) fn clear_previous_inflight_mint_marker(mut self, symbol: &Symbol) -> Self {
+        self.previous_inflight_mint_symbols.remove(symbol);
+        self
+    }
+
+    /// Remove a symbol from the previous inflight redemption marker set.
+    ///
+    /// Called when a new redemption transfer starts (VaultWithdrawPending
+    /// event) for the same reason as
+    /// [`Self::clear_previous_inflight_mint_marker`].
+    pub(crate) fn clear_previous_inflight_redemption_marker(mut self, symbol: &Symbol) -> Self {
+        self.previous_inflight_redemption_symbols.remove(symbol);
+        self
     }
 
     /// Fold an [`InventorySnapshotEvent`] into this view under normal
@@ -1843,6 +1914,8 @@ mod tests {
             active_mints: HashMap::new(),
             active_redemptions: HashMap::new(),
             inflight_equity: HashMap::new(),
+            previous_inflight_mint_symbols: HashSet::new(),
+            previous_inflight_redemption_symbols: HashSet::new(),
         }
     }
 
@@ -1868,6 +1941,8 @@ mod tests {
             active_mints: HashMap::new(),
             active_redemptions: HashMap::new(),
             inflight_equity: HashMap::new(),
+            previous_inflight_mint_symbols: HashSet::new(),
+            previous_inflight_redemption_symbols: HashSet::new(),
         }
     }
 
@@ -2942,6 +3017,120 @@ mod tests {
     }
 
     #[test]
+    fn clear_previous_mint_marker_prevents_incorrect_zeroing() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        // Poll 1: AAPL has a pending mint.
+        let mut mints = BTreeMap::new();
+        mints.insert(symbol.clone(), shares(10));
+
+        let view = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .apply_inflight_snapshot(&mints, &BTreeMap::new(), now, now)
+            .unwrap();
+
+        assert_eq!(
+            view.equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(10)),
+        );
+
+        // The old mint completes (inflight cleared via TransferOp::Complete).
+        let view = view
+            .update_equity(
+                &symbol,
+                Inventory::transfer(Venue::Hedging, TransferOp::Complete, shares(10)),
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(
+            view.equity_inflight(&symbol, Venue::Hedging),
+            Some(FractionalShares::ZERO),
+        );
+
+        // A new mint starts (MintAccepted sets inflight via
+        // TransferOp::Start) and clears the previous poll marker.
+        let view = view
+            .update_equity(
+                &symbol,
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, shares(20)),
+                now,
+            )
+            .unwrap()
+            .clear_previous_inflight_mint_marker(&symbol);
+
+        assert_eq!(
+            view.equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(20)),
+        );
+
+        // Poll 2: Alpaca hasn't reflected the new request yet (empty).
+        // Without the marker clear, this would zero the new inflight.
+        let view = view
+            .apply_inflight_snapshot(&BTreeMap::new(), &BTreeMap::new(), now, now)
+            .unwrap();
+
+        assert_eq!(
+            view.equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(20)),
+            "New inflight must be preserved when previous poll marker \
+             was cleared by MintAccepted"
+        );
+    }
+
+    #[test]
+    fn clear_previous_redemption_marker_prevents_incorrect_zeroing() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        // Poll 1: AAPL has a pending redemption.
+        let mut redemptions = BTreeMap::new();
+        redemptions.insert(symbol.clone(), shares(10));
+
+        let view = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .apply_inflight_snapshot(&BTreeMap::new(), &redemptions, now, now)
+            .unwrap();
+
+        assert_eq!(
+            view.equity_inflight(&symbol, Venue::MarketMaking),
+            Some(shares(10)),
+        );
+
+        // Old redemption completes.
+        let view = view
+            .update_equity(
+                &symbol,
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Complete, shares(10)),
+                now,
+            )
+            .unwrap();
+
+        // New redemption starts and clears the previous poll marker.
+        let view = view
+            .update_equity(
+                &symbol,
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, shares(15)),
+                now,
+            )
+            .unwrap()
+            .clear_previous_inflight_redemption_marker(&symbol);
+
+        // Poll 2: empty (Alpaca hasn't reflected the new request).
+        let view = view
+            .apply_inflight_snapshot(&BTreeMap::new(), &BTreeMap::new(), now, now)
+            .unwrap();
+
+        assert_eq!(
+            view.equity_inflight(&symbol, Venue::MarketMaking),
+            Some(shares(15)),
+            "New redemption inflight must be preserved when previous \
+             poll marker was cleared by VaultWithdrawPending"
+        );
+    }
+
+    #[test]
     fn to_dto_converts_equities_and_usdc() {
         let aapl = Symbol::new("AAPL").unwrap();
         let view = InventoryView::default()
@@ -2985,6 +3174,8 @@ mod tests {
             active_mints: HashMap::new(),
             active_redemptions: HashMap::new(),
             inflight_equity: HashMap::new(),
+            previous_inflight_mint_symbols: HashSet::new(),
+            previous_inflight_redemption_symbols: HashSet::new(),
         };
 
         let dto = view.to_dto();
@@ -3032,6 +3223,8 @@ mod tests {
             active_mints: HashMap::new(),
             active_redemptions: HashMap::new(),
             inflight_equity: HashMap::new(),
+            previous_inflight_mint_symbols: HashSet::new(),
+            previous_inflight_redemption_symbols: HashSet::new(),
         };
 
         let dto = view.to_dto();

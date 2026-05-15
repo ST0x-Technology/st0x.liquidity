@@ -1965,6 +1965,16 @@ impl RebalancingService {
             self.apply_equity_update(&symbol, update).await?;
         }
 
+        // When a new mint transfer starts, clear the previous poll marker
+        // so the next inflight poll won't incorrectly zero the new inflight
+        // if Alpaca hasn't reflected the request yet.
+        if matches!(event, TokenizedEquityMintEvent::MintAccepted { .. }) {
+            let mut inventory = self.inventory.write().await;
+            *inventory = inventory
+                .clone()
+                .clear_previous_inflight_mint_marker(&symbol);
+        }
+
         self.update_active_mint(&id, &symbol, &event).await;
 
         let is_terminal = if Self::is_terminal_mint_event(&event) {
@@ -2012,6 +2022,16 @@ impl RebalancingService {
 
         if let Some(update) = Self::redemption_inventory_update(&event, tracking.quantity) {
             self.apply_equity_update(&symbol, update).await?;
+        }
+
+        // When a new redemption transfer starts, clear the previous poll
+        // marker so the next inflight poll won't incorrectly zero the new
+        // inflight if Alpaca hasn't reflected the request yet.
+        if matches!(event, EquityRedemptionEvent::VaultWithdrawPending { .. }) {
+            let mut inventory = self.inventory.write().await;
+            *inventory = inventory
+                .clone()
+                .clear_previous_inflight_redemption_marker(&symbol);
         }
 
         self.update_active_redemption(&id, &symbol, &event).await;
