@@ -250,7 +250,12 @@
             };
 
             # Mock infra + bot + dashboard + continuous user trades.
-            # Run with `nix run .#simulate`, press `q` to exit
+            #
+            # Run with `nix run .#simulate`, press `q` to exit. Picks the
+            # lowest port offset whose bot/vite/mock-api ports are all
+            # free, so multiple instances can run side-by-side without
+            # collisions. The dashboard auto-opens in the browser on
+            # start.
             simulate = pkgs.writeShellApplication {
               name = "simulate";
               runtimeInputs = [
@@ -259,18 +264,50 @@
                 pkgs.cargo-nextest
                 rainix.rust-toolchain.${system}
               ];
-              text =
-                let
-                  backend = "cargo nextest run --test e2e -E 'test(=full_system::simulate)' --run-ignored ignored-only --no-capture";
+              text = ''
+                                port_free() {
+                                  ! (echo >"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+                                }
 
-                  dashboard = "cd dashboard && bun run dev";
+                                offset=0
+                                max_offset=9
+                                while (( offset <= max_offset )); do
+                                  bot_port=$((8001 + offset))
+                                  vite_port=$((5173 + offset))
+                                  mock_api_port=$((8099 + offset))
+                                  if port_free "$bot_port" \
+                                    && port_free "$vite_port" \
+                                    && port_free "$mock_api_port"; then
+                                    break
+                                  fi
+                                  offset=$((offset + 1))
+                                done
 
-                  mockApi = "bun run e2e/mock-rest-api.ts";
+                                if (( offset > max_offset )); then
+                                  echo "simulate: no free port offset in [0..$max_offset]" >&2
+                                  exit 1
+                                fi
 
-                in
-                ''
-                  exec mprocs "${backend}" "${dashboard}" "${mockApi}"
-                '';
+                                echo "simulate: offset=$offset (bot=$bot_port \
+                vite=$vite_port mock_api=$mock_api_port)"
+
+                                backend="SIMULATE_BOT_PORT=$bot_port \
+                                  cargo nextest run --test e2e \
+                                  -E 'test(=full_system::simulate)' \
+                                  --run-ignored ignored-only --no-capture"
+
+                                dashboard="cd dashboard && \
+                                  BACKEND_PORT=$bot_port \
+                                  PUBLIC_BACKEND_PORT=$bot_port \
+                                  PUBLIC_SIMULATE_REV=${self.shortRev or self.dirtyShortRev or "unknown"} \
+                                  PUBLIC_SIMULATE_SOURCE_ID=${builtins.substring 0 8 (baseNameOf self.outPath)} \
+                                  bun run dev --port=$vite_port --strictPort --open"
+
+                                mockApi="MOCK_REST_API_PORT=$mock_api_port \
+                                  bun run e2e/mock-rest-api.ts"
+
+                                exec mprocs "$backend" "$dashboard" "$mockApi"
+              '';
             };
 
             # Sandbox-runnable test for scripts/patch-rain-math-float.nu so

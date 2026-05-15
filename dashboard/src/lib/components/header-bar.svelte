@@ -2,9 +2,44 @@
   import { onMount } from 'svelte'
   import { Badge } from '$lib/components/ui/badge'
   import type { ConnectionState } from '$lib/websocket'
-  import { getApiBaseUrl } from '$lib/env'
+  import {
+    getApiBaseUrl,
+    getSimulateRev,
+    getSimulateBackendPort,
+    getSimulateSourceId,
+  } from '$lib/env'
   import { formatUtcClock, FETCH_TIMEOUT_MS } from '$lib/time'
   import { reactive } from '$lib/frp.svelte'
+
+  const simulateRev = getSimulateRev()
+  const simulateBackendPort = getSimulateBackendPort()
+  const simulateSourceId = getSimulateSourceId()
+
+  const simulateLabel = simulateRev
+    ? `simulate · ${simulateRev}${
+        simulateBackendPort ? `:${simulateBackendPort}` : ''
+      }${simulateSourceId ? ` · ${simulateSourceId}` : ''}`
+    : null
+
+  const pageTitle = simulateLabel
+    ? `${simulateLabel} · st0x.liquidity`
+    : 'st0x.liquidity'
+
+  const hashString = (input: string): number => {
+    let hash = 0
+    for (let i = 0; i < input.length; i++) {
+      hash = (hash * 31 + input.charCodeAt(i)) | 0
+    }
+    return hash
+  }
+
+  const simulateHue = simulateSourceId !== null
+    ? Math.abs(hashString(simulateSourceId)) % 360
+    : null
+
+  const simulateBackground = simulateHue !== null
+    ? `hsl(${String(simulateHue)} 70% 35%)`
+    : null
 
   type Props = {
     connectionStatus: ConnectionState
@@ -78,9 +113,24 @@
   )
 </script>
 
-<header class="shrink-0 border-b bg-card px-2 py-2 shadow-sm md:px-4 md:py-3">
+<svelte:head>
+  <title>{pageTitle}</title>
+</svelte:head>
+
+<header
+  class="shrink-0 border-b bg-card px-2 py-2 shadow-sm md:px-4 md:py-3"
+  style:background-color={simulateBackground}
+  style:color={simulateBackground !== null ? 'white' : null}
+>
   <div class="flex items-center justify-between gap-2">
-    <h1 class="text-sm font-semibold md:text-lg">st0x.liquidity</h1>
+    <h1 class="text-sm font-semibold md:text-lg">
+      st0x.liquidity
+      {#if simulateLabel}
+        <Badge variant="outline" class="ml-2 font-mono text-xs">
+          {simulateLabel}
+        </Badge>
+      {/if}
+    </h1>
 
     <div class="flex items-center gap-2 md:gap-4">
       <span class="font-mono text-xs text-muted-foreground">
