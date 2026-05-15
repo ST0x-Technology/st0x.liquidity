@@ -162,3 +162,24 @@ rebalancing = "disabled"
 vault_id = "0xfab"
 tokenized_equity = "0xfbde45df60249203b12148452fc77c3b5f811eb2"
 tokenized_equity_derivative = "0x2512EC661f0bA089c275EA105E31bAD6FcFcf319"
+
+[assets.equities.QQQM]
+trading = "disabled"
+rebalancing = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0x09ee803ba675052e10a54bfc8e18c0f67793056b"
+tokenized_equity_derivative = "0x823FF7Bbde2869aAe73A6CD53e7f614442836757"
+
+[assets.equities.VWO]
+trading = "disabled"
+rebalancing = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0x0acfea6833c4a3f41bf2fbd736aa9eea547d90ee"
+tokenized_equity_derivative = "0x23ec6886b49D7ab123E9ee8e474D2fa7AB6Cbc2d"
+
+[assets.equities.ARKK]
+trading = "disabled"
+rebalancing = "disabled"
+vault_id = "0xfab"
+tokenized_equity = "0x323804af6f3bb463d688b854667c6870a0fc06ad"
+tokenized_equity_derivative = "0x9FfF48B4535AF3765Ac9E1b164720EDc01DF8EE7"

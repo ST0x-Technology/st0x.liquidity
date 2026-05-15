@@ -213,7 +213,7 @@
   }
 
   const directionColor = (direction: string): string =>
-    direction === 'Buy' ? 'text-green-500' : 'text-red-500'
+    direction === 'buy' ? 'text-green-500' : 'text-red-500'
 
   const fmtSize = (value: string): string => formatDecimal(value, 3)
 

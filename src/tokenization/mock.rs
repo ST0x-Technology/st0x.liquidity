@@ -321,8 +321,8 @@ impl Tokenizer for MockTokenizer {
             .pending_requests
             .iter()
             .filter(|request| match request.status {
-                TokenizationRequestStatus::Pending | TokenizationRequestStatus::Rejected => true,
-                TokenizationRequestStatus::Completed => false,
+                TokenizationRequestStatus::Pending => true,
+                TokenizationRequestStatus::Completed | TokenizationRequestStatus::Rejected => false,
             })
             .cloned()
             .collect())

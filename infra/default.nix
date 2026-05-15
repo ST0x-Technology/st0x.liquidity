@@ -278,13 +278,26 @@ let
         ];
         text = ''
           ${resolveHost}
+          trap _cleanup_identity EXIT
 
-          if [ "''${1:-}" != "--yes" ]; then
+          stay_stopped=false
+          for arg in "$@"; do
+            case "$arg" in
+              --yes) ;;
+              --stopped) stay_stopped=true ;;
+              *)
+                echo "Unknown flag: $arg" >&2
+                echo "Usage: ${env}-db-reset --yes [--stopped]" >&2
+                exit 1
+                ;;
+            esac
+          done
+
+          if ! printf '%s\n' "$@" | grep -qx -- '--yes'; then
             echo "Refusing destructive reset without --yes" >&2
-            echo "Usage: ${env}-db-reset --yes" >&2
+            echo "Usage: ${env}-db-reset --yes [--stopped]" >&2
             exit 1
           fi
-          shift
 
           ssh_remote() {
             # shellcheck disable=SC2029
@@ -292,8 +305,10 @@ let
           }
 
           _restart_service() {
-            echo "Ensuring st0x-hedge is restarted on ${env}..." >&2
-            ssh_remote "mkdir -p /run/st0x && touch /run/st0x/st0x-hedge.ready && systemctl start st0x-hedge" || true
+            if [ "$stay_stopped" = false ]; then
+              echo "Ensuring st0x-hedge is restarted on ${env}..." >&2
+              ssh_remote "mkdir -p /run/st0x && touch /run/st0x/st0x-hedge.ready && systemctl start st0x-hedge" || true
+            fi
             _cleanup_identity
           }
           trap _restart_service EXIT
@@ -324,9 +339,13 @@ let
           ssh_remote "grep -q '^deployment_block = $target_block$' $config"
           echo "Verified deployment_block=$target_block"
 
-          echo "Starting st0x-hedge on ${env}..."
-          ssh_remote "mkdir -p /run/st0x && touch /run/st0x/st0x-hedge.ready && systemctl start st0x-hedge"
-          ssh_remote systemctl is-active st0x-hedge
+          if [ "$stay_stopped" = false ]; then
+            echo "Starting st0x-hedge on ${env}..."
+            ssh_remote "mkdir -p /run/st0x && touch /run/st0x/st0x-hedge.ready && systemctl start st0x-hedge"
+            ssh_remote systemctl is-active st0x-hedge
+          else
+            echo "Bot left stopped (--stopped flag). Start manually with ${env}-bot-start."
+          fi
 
           echo "Database reset complete. Backup at: $backup_dir"
         '';
