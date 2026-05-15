@@ -2,7 +2,6 @@
 members = [
   ".",
   "crates/dto",
-  "crates/event-sorcery",
   "crates/execution",
   "crates/finance",
   "crates/bridge",
@@ -95,7 +94,7 @@ sqlx = { version = "0.8.6", features = [
 ] }
 st0x-bridge = { path = "crates/bridge" }
 st0x-dto = { path = "crates/dto" }
-st0x-event-sorcery = { path = "crates/event-sorcery" }
+st0x-event-sorcery = { git = "https://github.com/ST0x-Technology/event-sorcery.git", branch = "docs/examples", package = "event-sorcery" }
 st0x-evm = { path = "crates/evm" }
 st0x-execution = { path = "crates/execution" }
 st0x-finance = { path = "crates/finance" }
@@ -184,7 +183,6 @@ rocket.workspace = true
 rocket_ws.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sqlite-es.workspace = true
 sqlx.workspace = true
 st0x-bridge = { workspace = true, features = ["cctp"] }
 st0x-dto.workspace = true

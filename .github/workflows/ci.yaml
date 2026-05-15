@@ -73,16 +73,10 @@ jobs:
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: Cache cargo artifacts
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/git/db/
-            ~/.cargo/registry/cache/
-            ~/.cargo/registry/index/
-            target/${{ matrix.cache_target }}/
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ matrix.cache_target }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'flake.lock', 'flake.nix', 'rust.nix') }}
-          restore-keys: |
-            cargo-${{ runner.os }}-${{ runner.arch }}-${{ matrix.cache_target }}-
+          shared-key: ${{ matrix.cache_target }}
+          workspaces: . -> target/${{ matrix.cache_target }}
 
       - name: ${{ matrix.name }}
         run: ${{ matrix.command }}
