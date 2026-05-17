@@ -415,9 +415,11 @@ For detailed implementation requirements, see @crates/execution/AGENTS.md
 
 ### Core Flow
 
-The main event loop (`src/lib.rs`) monitors WebSocket streams (`ClearV2`,
-`TakeOrderV2`) from Raindex, converts events to `Trade` objects, and spawns
-async execution flows per event. Idempotency via `(tx_hash, log_index)` keys.
+The `Conductor` (`src/conductor/`) orchestrates the runtime. `OrderFillMonitor`
+(`src/conductor/monitor/order_fills.rs`) subscribes to `ClearV3/TakeOrderV3`
+WebSocket streams from Raindex, converts events to `AccountForDexTrade` apalis
+jobs, and persists them for processing. Idempotency via `(tx_hash, log_index)`
+keys.
 
 ### Configuration
 
