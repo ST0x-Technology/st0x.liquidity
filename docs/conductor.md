@@ -47,21 +47,25 @@ SupervisorBuilder::default()
 
 ### OrderFillMonitor
 
-Defined in `src/conductor/order_fill_monitor.rs`. Subscribes to
+Defined in `src/conductor/monitor/order_fills.rs`. Subscribes to
 ClearV3/TakeOrderV3 WebSocket streams and pushes each event into the
 `DexTradeAccountingJobQueue` as an `AccountForDexTrade` job.
 
 ```rust
 struct OrderFillMonitor {
-    ws_url: Url,
-    orderbook: Address,
+    evm_ctx: EvmCtx,
     job_queue: DexTradeAccountingJobQueue,
+    backfill_queue: BackfillJobQueue,
+    pool: SqlitePool,
 }
 ```
 
-The WebSocket connection is created inside `run()`. On disconnect or error,
-`run()` returns `Err(...)`, the supervisor restarts the task, and a fresh
-connection is established.
+The WebSocket connection is created inside `run()`. On every (re)connect the
+monitor also enqueues a `BackfillRange` job covering the gap between the last
+persisted checkpoint and the current confirmation boundary, so events missed
+during a disconnect are recovered without relying on the live stream. On
+disconnect or error, `run()` returns `Err(...)`, the supervisor restarts the
+task, and a fresh connection is established.
 
 ## One-shot jobs (apalis + Job trait)
 
@@ -205,7 +209,10 @@ registry, executor. Wrapped in `Arc` and injected via apalis `Data`.
 
 `builder::spawn()` (`src/conductor/builder.rs`) uses `#[bon::builder]` to
 construct a running `Conductor`. Required parameters: `ConductorCtx` (shared
-dependencies), `DexTradeAccountingJobQueue`, `DexEventStreams`. Optional:
+dependencies) and the set of job queues (`DexTradeAccountingJobQueue`,
+`BackfillJobQueue`, `HedgeJobQueue`, `PollOrderStatusJobQueue`,
+`ReconcileOrderFillJobQueue`, `HandleOrderRejectionJobQueue`) and schedulers
+(`EquityRebalancingCheckScheduler`, `UsdcRebalancingCheckScheduler`). Optional:
 `executor_maintenance`, `rebalancer`.
 
 `ConductorCtx` bundles the shared dependencies (config, symbol cache, provider,
@@ -216,9 +223,12 @@ executor, CQRS frameworks, execution threshold, wallet polling config).
 - `run()` -- the single entry point. Sets up apalis tables, CQRS frameworks,
   determines cutoff block, backfills historical events, then calls
   `builder::spawn()` to start the runtime
-- `wait_for_completion()` -- `tokio::select!` across supervisor, apalis monitor,
-  order poller, and position checker; returns when any exits
-- `abort_all()` -- shuts down supervisor, aborts all task handles
+- `wait_for_completion()` -- `tokio::select!` across shutdown token, supervisor,
+  apalis monitor, and job-cleanup task. On graceful shutdown signal, performs a
+  two-phase drain: (1) stops supervised producers (OrderFillMonitor, etc.),
+  (2) signals apalis to drain in-flight jobs before exiting.
+- `abort_all()` -- shuts down supervisor, aborts apalis monitor and all
+  background task handles (force shutdown fallback)
 
 ## Startup sequencing
 
