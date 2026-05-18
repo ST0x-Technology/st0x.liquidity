@@ -9,7 +9,7 @@ use std::sync::Arc;
 use task_supervisor::SupervisorBuilder;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use st0x_config::{Ctx, ExecutionThreshold};
 use st0x_event_sorcery::{Projection, Store};
@@ -41,6 +41,9 @@ use crate::onchain::raindex::RaindexService;
 use crate::onchain_trade::OnChainTrade;
 use crate::position::Position;
 use crate::position_check::{CheckPositions, CheckPositionsCtx, CheckPositionsJobQueue};
+use crate::rebalancing::usdc::{
+    TransferUsdcToHedging, TransferUsdcToHedgingCtx, TransferUsdcToHedgingJobQueue,
+};
 use crate::rebalancing::{
     EquityRebalancingCheck, EquityRebalancingCheckScheduler, RebalancingService,
     UsdcRebalancingCheck, UsdcRebalancingCheckScheduler,
@@ -100,6 +103,8 @@ pub(crate) fn spawn<Prov, Exec>(
     wrapped_equity_recovery_ctx: Option<Arc<WrappedEquityRecoveryCtx>>,
     equity_check_scheduler: EquityRebalancingCheckScheduler,
     usdc_check_scheduler: UsdcRebalancingCheckScheduler,
+    transfer_usdc_to_hedging_queue: TransferUsdcToHedgingJobQueue,
+    transfer_usdc_to_hedging_ctx: Option<Arc<TransferUsdcToHedgingCtx>>,
     rebalancing_service: Option<Arc<RebalancingService>>,
     seed_vault_registry_queue: SeedVaultRegistryJobQueue,
     seed_vault_registry_ctx: Arc<SeedVaultRegistryCtx>,
@@ -297,6 +302,8 @@ where
         wrapped_equity_recovery_ctx,
         equity_check_scheduler,
         usdc_check_scheduler,
+        transfer_usdc_to_hedging_queue,
+        transfer_usdc_to_hedging_ctx,
         apalis_shutdown_token,
         seed_vault_registry_queue,
         #[cfg(any(test, feature = "test-support"))]
@@ -345,6 +352,8 @@ where
     wrapped_equity_recovery_ctx: Option<Arc<WrappedEquityRecoveryCtx>>,
     equity_check_scheduler: EquityRebalancingCheckScheduler,
     usdc_check_scheduler: UsdcRebalancingCheckScheduler,
+    transfer_usdc_to_hedging_queue: TransferUsdcToHedgingJobQueue,
+    transfer_usdc_to_hedging_ctx: Option<Arc<TransferUsdcToHedgingCtx>>,
     apalis_shutdown_token: CancellationToken,
     seed_vault_registry_queue: SeedVaultRegistryJobQueue,
     #[cfg(any(test, feature = "test-support"))]
@@ -380,6 +389,8 @@ where
             wrapped_equity_recovery_ctx,
             equity_check_scheduler,
             usdc_check_scheduler,
+            transfer_usdc_to_hedging_queue,
+            transfer_usdc_to_hedging_ctx,
             apalis_shutdown_token,
             seed_vault_registry_queue,
             #[cfg(any(test, feature = "test-support"))]
@@ -406,6 +417,8 @@ where
         let failure_injector_for_wrapped_equity_recovery = failure_injector.clone();
         #[cfg(any(test, feature = "test-support"))]
         let failure_injector_for_check_positions = failure_injector.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let failure_injector_for_transfer_usdc_to_hedging = failure_injector.clone();
         let failure_notify = Arc::new(tokio::sync::Notify::new());
         let failure_notify_for_hedge = failure_notify.clone();
         let failure_notify_for_backfill = failure_notify.clone();
@@ -417,6 +430,7 @@ where
         let failure_notify_for_seed_vault_registry = failure_notify.clone();
         let failure_notify_for_wrapped_equity_recovery = failure_notify.clone();
         let failure_notify_for_check_positions = failure_notify.clone();
+        let failure_notify_for_transfer_usdc_to_hedging = failure_notify.clone();
         let failure_notify_for_select = failure_notify.clone();
 
         let fail_stop = CircuitBreakerConfig::default()
@@ -432,6 +446,7 @@ where
         let fail_stop_for_seed_vault_registry = fail_stop.clone();
         let fail_stop_for_wrapped_equity_recovery = fail_stop.clone();
         let fail_stop_for_check_positions = fail_stop.clone();
+        let fail_stop_for_transfer_usdc_to_hedging = fail_stop.clone();
 
         let accountant_ctx_for_backfill = accountant_ctx.clone();
 
@@ -579,6 +594,16 @@ where
                 failure_injector_for_wrapped_equity_recovery,
             );
 
+            let apalis_monitor = register_transfer_usdc_to_hedging_worker(
+                apalis_monitor,
+                transfer_usdc_to_hedging_ctx,
+                transfer_usdc_to_hedging_queue,
+                fail_stop_for_transfer_usdc_to_hedging,
+                failure_notify_for_transfer_usdc_to_hedging,
+                #[cfg(any(test, feature = "test-support"))]
+                failure_injector_for_transfer_usdc_to_hedging,
+            );
+
             let is_draining = apalis_shutdown_token.clone();
 
             let shutdown_signal = async {
@@ -643,6 +668,40 @@ fn register_wrapped_equity_recovery_worker(
             index,
             recovery_queue.clone(),
             recovery_ctx.clone(),
+            fail_stop.clone(),
+            failure_notify.clone(),
+            #[cfg(any(test, feature = "test-support"))]
+            failure_injector.clone(),
+        )
+    })
+}
+
+/// Conditionally registers the `TransferUsdcToHedging` worker. The ctx is
+/// `None` when rebalancing is disabled in config; in that case the queue is
+/// still constructed (so tests that build it directly compile) but no worker
+/// consumes it.
+fn register_transfer_usdc_to_hedging_worker(
+    monitor: Monitor,
+    transfer_ctx: Option<Arc<TransferUsdcToHedgingCtx>>,
+    transfer_queue: TransferUsdcToHedgingJobQueue,
+    fail_stop: CircuitBreakerConfig,
+    failure_notify: Arc<tokio::sync::Notify>,
+    #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
+) -> Monitor {
+    let Some(transfer_ctx) = transfer_ctx else {
+        warn!(
+            "TransferUsdcToHedging worker not registered: rebalancing disabled \
+             (no transfer ctx). Base->Alpaca USDC transfers will not be processed."
+        );
+        return monitor;
+    };
+
+    monitor.register(move |index| {
+        build_supervised_worker!(
+            ::<TransferUsdcToHedgingCtx, TransferUsdcToHedging>,
+            index,
+            transfer_queue.clone(),
+            transfer_ctx.clone(),
             fail_stop.clone(),
             failure_notify.clone(),
             #[cfg(any(test, feature = "test-support"))]

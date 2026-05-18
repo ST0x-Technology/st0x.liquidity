@@ -44,6 +44,7 @@ use crate::position::{Position, PositionCommand, TradeId};
 use crate::rebalancing::equity::mock::MockCrossVenueEquityTransfer;
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, Equity, EquityTransferServices};
 use crate::rebalancing::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
+use crate::rebalancing::usdc::TransferUsdcToHedging;
 use crate::rebalancing::usdc::mock::MockUsdcRebalance;
 use crate::rebalancing::{
     Rebalancer, RebalancingSchedulers, RebalancingService, RebalancingServiceConfig,
@@ -1115,21 +1116,47 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
 
     rebalancer.run().await;
 
+    // Base->Alpaca is dispatched via the TransferUsdcToHedging apalis job
+    // queue, not the Rebalancer mpsc channel. Assert exactly one pending row
+    // with the expected payload.
+    let job_type = std::any::type_name::<TransferUsdcToHedging>();
+
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM Jobs \
+         WHERE status = 'Pending' AND job_type = ?",
+    )
+    .bind(job_type)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
     assert_eq!(
-        usdc.base_to_alpaca_calls(),
-        1,
-        "Expected USDC manager to be called once for base_to_alpaca"
+        pending, 1,
+        "Expected exactly one pending TransferUsdcToHedging job"
     );
 
-    let call = usdc
-        .last_base_to_alpaca_call()
-        .expect("Expected a captured call");
+    let payload: Vec<u8> = sqlx::query_scalar(
+        "SELECT job FROM Jobs \
+         WHERE status = 'Pending' AND job_type = ?",
+    )
+    .bind(job_type)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let job: TransferUsdcToHedging =
+        serde_json::from_slice(&payload).expect("deserialize TransferUsdcToHedging payload");
     assert_eq!(
-        call.amount,
+        job.amount,
         Usdc::new(float!(400)),
         "Expected excess of $400 (actual $900 - target $500)"
     );
 
+    assert_eq!(
+        usdc.base_to_alpaca_calls(),
+        0,
+        "Rebalancer mpsc path should not be exercised for Base->Alpaca anymore",
+    );
     assert_eq!(
         usdc.alpaca_to_base_calls(),
         0,

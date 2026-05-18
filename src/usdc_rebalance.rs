@@ -199,8 +199,18 @@ pub(crate) enum UsdcRebalanceCommand {
     /// Valid only from `DepositConfirmed` state.
     /// Amount must match the aggregate's deposit amount for consistency.
     InitiatePostDepositConversion { order_id: Uuid, amount: Usdc },
-    /// Start a new rebalancing operation. Valid only from `Uninitialized` state or
-    /// `ConversionComplete` state (for AlpacaToBase direction).
+    /// Record the intent to withdraw from source BEFORE the on-chain call.
+    /// Captures the chain head (`from_block`) so a crash mid-withdrawal can be
+    /// recovered by scanning from that block instead of blindly re-withdrawing
+    /// (which would double-spend). Valid from `Uninitialized` (BaseToAlpaca) or
+    /// `ConversionComplete` (AlpacaToBase).
+    BeginWithdrawal {
+        direction: RebalanceDirection,
+        amount: Usdc,
+        from_block: u64,
+    },
+    /// Start a new rebalancing operation by recording the submitted withdrawal
+    /// transaction. Valid only from `WithdrawalSubmitting` state.
     Initiate {
         direction: RebalanceDirection,
         amount: Usdc,
@@ -208,7 +218,11 @@ pub(crate) enum UsdcRebalanceCommand {
     },
     /// Confirm successful withdrawal from source. Valid only from `Withdrawing` state.
     ConfirmWithdrawal,
-    /// Record the CCTP burn transaction. Valid only from `WithdrawalComplete` state.
+    /// Record the intent to burn for CCTP bridging BEFORE the on-chain call.
+    /// Captures the chain head (`from_block`) for crash recovery, mirroring
+    /// [`BeginWithdrawal`]. Valid only from `WithdrawalComplete` state.
+    BeginBridging { from_block: u64 },
+    /// Record the CCTP burn transaction. Valid only from `BridgingSubmitting` state.
     InitiateBridging { burn_tx: TxHash },
     /// Record the Circle attestation. Valid only from `Bridging` state.
     /// The cctp_nonce is extracted from the attested message (not the burn tx, which has placeholder).
@@ -267,6 +281,14 @@ pub(crate) enum UsdcRebalanceEvent {
         reason: String,
         failed_at: DateTime<Utc>,
     },
+    /// Intent to withdraw from source recorded before the on-chain call.
+    /// Captures the chain head for crash-safe recovery.
+    WithdrawalSubmitting {
+        direction: RebalanceDirection,
+        amount: Usdc,
+        from_block: u64,
+        submitting_at: DateTime<Utc>,
+    },
     /// Rebalancing operation started. Records direction, amount, and withdrawal reference.
     Initiated {
         direction: RebalanceDirection,
@@ -280,6 +302,12 @@ pub(crate) enum UsdcRebalanceEvent {
     WithdrawalFailed {
         reason: String,
         failed_at: DateTime<Utc>,
+    },
+    /// Intent to burn for CCTP bridging recorded before the on-chain call.
+    /// Captures the chain head for crash-safe recovery.
+    BridgingSubmitting {
+        from_block: u64,
+        submitting_at: DateTime<Utc>,
     },
     /// CCTP burn transaction submitted. Records burn hash for attestation lookup.
     BridgingInitiated {
@@ -335,9 +363,11 @@ impl DomainEvent for UsdcRebalanceEvent {
             Self::ConversionInitiated { .. } => "UsdcRebalanceEvent::ConversionInitiated",
             Self::ConversionConfirmed { .. } => "UsdcRebalanceEvent::ConversionConfirmed",
             Self::ConversionFailed { .. } => "UsdcRebalanceEvent::ConversionFailed",
+            Self::WithdrawalSubmitting { .. } => "UsdcRebalanceEvent::WithdrawalSubmitting",
             Self::Initiated { .. } => "UsdcRebalanceEvent::Initiated",
             Self::WithdrawalConfirmed { .. } => "UsdcRebalanceEvent::WithdrawalConfirmed",
             Self::WithdrawalFailed { .. } => "UsdcRebalanceEvent::WithdrawalFailed",
+            Self::BridgingSubmitting { .. } => "UsdcRebalanceEvent::BridgingSubmitting",
             Self::BridgingInitiated { .. } => "UsdcRebalanceEvent::BridgingInitiated",
             Self::BridgeAttestationReceived { .. } => {
                 "UsdcRebalanceEvent::BridgeAttestationReceived"
@@ -388,6 +418,15 @@ pub(crate) enum UsdcRebalance {
         initiated_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
     },
+    /// Withdrawal intent recorded; the on-chain withdraw is about to be (or has
+    /// just been) submitted. `from_block` is the chain head captured before the
+    /// call so resume can scan for an already-submitted withdrawal.
+    WithdrawalSubmitting {
+        direction: RebalanceDirection,
+        amount: Usdc,
+        from_block: u64,
+        initiated_at: DateTime<Utc>,
+    },
     /// Withdrawal from source has been initiated
     Withdrawing {
         direction: RebalanceDirection,
@@ -410,6 +449,15 @@ pub(crate) enum UsdcRebalance {
         reason: String,
         initiated_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
+    },
+    /// Bridging intent recorded; the on-chain CCTP burn is about to be (or has
+    /// just been) submitted. `from_block` is the chain head captured before the
+    /// call so resume can scan for an already-submitted burn.
+    BridgingSubmitting {
+        direction: RebalanceDirection,
+        amount: Usdc,
+        from_block: u64,
+        initiated_at: DateTime<Utc>,
     },
     /// CCTP bridging has been initiated (burn transaction submitted)
     /// Note: cctp_nonce is not available here - it's only known after attestation.
@@ -564,7 +612,13 @@ impl UsdcRebalance {
                 *failed_at,
             ),
 
-            Self::Withdrawing {
+            Self::WithdrawalSubmitting {
+                direction,
+                amount,
+                initiated_at,
+                ..
+            }
+            | Self::Withdrawing {
                 direction,
                 amount,
                 initiated_at,
@@ -589,6 +643,19 @@ impl UsdcRebalance {
                 UsdcBridgeStatus::Withdrawing,
                 *initiated_at,
                 *confirmed_at,
+            ),
+
+            Self::BridgingSubmitting {
+                direction,
+                amount,
+                initiated_at,
+                ..
+            } => (
+                direction,
+                *amount,
+                UsdcBridgeStatus::Bridging,
+                *initiated_at,
+                *initiated_at,
             ),
 
             Self::Bridging {
@@ -715,6 +782,18 @@ impl EventSourced for UsdcRebalance {
                 initiated_at: *initiated_at,
             }),
 
+            WithdrawalSubmitting {
+                direction,
+                amount,
+                from_block,
+                submitting_at,
+            } => Some(Self::WithdrawalSubmitting {
+                direction: direction.clone(),
+                amount: *amount,
+                from_block: *from_block,
+                initiated_at: *submitting_at,
+            }),
+
             Initiated {
                 direction,
                 amount,
@@ -792,6 +871,36 @@ impl EventSourced for UsdcRebalance {
             },
 
             (
+                WithdrawalSubmitting { from_block, .. },
+                Self::ConversionComplete {
+                    direction,
+                    filled_amount,
+                    initiated_at,
+                    ..
+                },
+            ) => Self::WithdrawalSubmitting {
+                direction: direction.clone(),
+                amount: *filled_amount,
+                from_block: *from_block,
+                initiated_at: *initiated_at,
+            },
+
+            (
+                Initiated { withdrawal_ref, .. },
+                Self::WithdrawalSubmitting {
+                    direction,
+                    amount,
+                    initiated_at,
+                    ..
+                },
+            ) => Self::Withdrawing {
+                direction: direction.clone(),
+                amount: *amount,
+                withdrawal_ref: withdrawal_ref.clone(),
+                initiated_at: *initiated_at,
+            },
+
+            (
                 Initiated { withdrawal_ref, .. },
                 Self::ConversionComplete {
                     direction,
@@ -839,11 +948,32 @@ impl EventSourced for UsdcRebalance {
             },
 
             (
+                BridgingSubmitting { from_block, .. },
+                Self::WithdrawalComplete {
+                    direction,
+                    amount,
+                    initiated_at,
+                    ..
+                },
+            ) => Self::BridgingSubmitting {
+                direction: direction.clone(),
+                amount: *amount,
+                from_block: *from_block,
+                initiated_at: *initiated_at,
+            },
+
+            (
                 BridgingInitiated {
                     burn_tx_hash,
                     burned_at,
                 },
-                Self::WithdrawalComplete {
+                Self::BridgingSubmitting {
+                    direction,
+                    amount,
+                    initiated_at,
+                    ..
+                }
+                | Self::WithdrawalComplete {
                     direction,
                     amount,
                     initiated_at,
@@ -913,6 +1043,12 @@ impl EventSourced for UsdcRebalance {
                     failed_at,
                 },
                 Self::WithdrawalComplete {
+                    direction,
+                    amount,
+                    initiated_at,
+                    ..
+                }
+                | Self::BridgingSubmitting {
                     direction,
                     amount,
                     initiated_at,
@@ -1035,6 +1171,17 @@ impl EventSourced for UsdcRebalance {
                 initiated_at: Utc::now(),
             }]),
 
+            BeginWithdrawal {
+                direction,
+                amount,
+                from_block,
+            } => Ok(vec![WithdrawalSubmitting {
+                direction,
+                amount,
+                from_block,
+                submitting_at: Utc::now(),
+            }]),
+
             Initiate {
                 direction,
                 amount,
@@ -1056,7 +1203,9 @@ impl EventSourced for UsdcRebalance {
                 Err(UsdcRebalanceError::WithdrawalNotInitiated)
             }
 
-            InitiateBridging { .. } => Err(UsdcRebalanceError::WithdrawalNotConfirmed),
+            BeginBridging { .. } | InitiateBridging { .. } => {
+                Err(UsdcRebalanceError::WithdrawalNotConfirmed)
+            }
 
             ReceiveAttestation { .. } | FailBridging { .. } => {
                 Err(UsdcRebalanceError::BridgingNotInitiated)
@@ -1085,6 +1234,11 @@ impl EventSourced for UsdcRebalance {
             InitiatePostDepositConversion { order_id, amount } => {
                 self.transition_post_deposit_conversion(order_id, amount)
             }
+            BeginWithdrawal {
+                direction,
+                amount,
+                from_block,
+            } => self.transition_begin_withdrawal(direction, amount, from_block),
             Initiate {
                 direction,
                 amount,
@@ -1092,6 +1246,7 @@ impl EventSourced for UsdcRebalance {
             } => self.transition_initiate_withdrawal(direction, amount, withdrawal),
             ConfirmWithdrawal => self.transition_confirm_withdrawal(),
             FailWithdrawal { reason } => self.transition_fail_withdrawal(reason),
+            BeginBridging { from_block } => self.transition_begin_bridging(from_block),
             InitiateBridging { burn_tx } => self.transition_initiate_bridging(burn_tx),
             ReceiveAttestation {
                 attestation,
@@ -1179,11 +1334,14 @@ impl UsdcRebalance {
         }])
     }
 
-    fn transition_initiate_withdrawal(
+    /// Records withdrawal intent (the chain head) before the on-chain
+    /// withdraw, for the AlpacaToBase post-conversion path. The BaseToAlpaca
+    /// fresh-start path records the same intent via [`Self::initialize`].
+    fn transition_begin_withdrawal(
         &self,
         direction: RebalanceDirection,
         amount: Usdc,
-        withdrawal: TransferRef,
+        from_block: u64,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         let Self::ConversionComplete {
@@ -1196,7 +1354,7 @@ impl UsdcRebalance {
         };
         if direction != *conv_direction {
             return Err(UsdcRebalanceError::InvalidCommand {
-                command: "Initiate".to_string(),
+                command: "BeginWithdrawal".to_string(),
                 state: "ConversionComplete with different \
                         direction"
                     .to_string(),
@@ -1204,7 +1362,7 @@ impl UsdcRebalance {
         }
         if amount != *conv_filled_amount {
             return Err(UsdcRebalanceError::InvalidCommand {
-                command: "Initiate".to_string(),
+                command: "BeginWithdrawal".to_string(),
                 state: format!(
                     "ConversionComplete with amount \
                      mismatch: expected {:?}, got {:?}",
@@ -1213,9 +1371,57 @@ impl UsdcRebalance {
                 ),
             });
         }
-        Ok(vec![Initiated {
+        Ok(vec![WithdrawalSubmitting {
             direction,
             amount: *conv_filled_amount,
+            from_block,
+            submitting_at: Utc::now(),
+        }])
+    }
+
+    /// Records the submitted withdrawal transaction, advancing to `Withdrawing`.
+    /// Valid from `WithdrawalSubmitting` (the crash-safe path the manager uses)
+    /// or directly from `ConversionComplete` (AlpacaToBase post-conversion).
+    fn transition_initiate_withdrawal(
+        &self,
+        direction: RebalanceDirection,
+        amount: Usdc,
+        withdrawal: TransferRef,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        let (expected_direction, expected_amount) = match self {
+            Self::WithdrawalSubmitting {
+                direction, amount, ..
+            } => (direction, amount),
+            Self::ConversionComplete {
+                direction,
+                filled_amount,
+                ..
+            } => (direction, filled_amount),
+            _ => return Err(UsdcRebalanceError::AlreadyInitiated),
+        };
+        if direction != *expected_direction {
+            return Err(UsdcRebalanceError::InvalidCommand {
+                command: "Initiate".to_string(),
+                state: "withdrawal entry state with different \
+                        direction"
+                    .to_string(),
+            });
+        }
+        if amount != *expected_amount {
+            return Err(UsdcRebalanceError::InvalidCommand {
+                command: "Initiate".to_string(),
+                state: format!(
+                    "withdrawal entry state with amount \
+                     mismatch: expected {:?}, got {:?}",
+                    expected_amount.inner(),
+                    amount.inner()
+                ),
+            });
+        }
+        Ok(vec![Initiated {
+            direction,
+            amount: *expected_amount,
             withdrawal_ref: withdrawal,
             initiated_at: Utc::now(),
         }])
@@ -1228,6 +1434,7 @@ impl UsdcRebalance {
                 confirmed_at: Utc::now(),
             }]),
             Self::WithdrawalComplete { .. }
+            | Self::BridgingSubmitting { .. }
             | Self::WithdrawalFailed { .. }
             | Self::Bridging { .. }
             | Self::Attested { .. }
@@ -1251,6 +1458,7 @@ impl UsdcRebalance {
                 failed_at: Utc::now(),
             }]),
             Self::WithdrawalComplete { .. }
+            | Self::BridgingSubmitting { .. }
             | Self::WithdrawalFailed { .. }
             | Self::Bridging { .. }
             | Self::Attested { .. }
@@ -1263,6 +1471,40 @@ impl UsdcRebalance {
         }
     }
 
+    /// Records bridging intent (the chain head) before the on-chain CCTP burn.
+    /// Valid only from `WithdrawalComplete`.
+    fn transition_begin_bridging(
+        &self,
+        from_block: u64,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed { .. }
+            | Self::WithdrawalSubmitting { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalFailed { .. } => Err(UsdcRebalanceError::WithdrawalNotConfirmed),
+            Self::WithdrawalComplete { .. } => Ok(vec![BridgingSubmitting {
+                from_block,
+                submitting_at: Utc::now(),
+            }]),
+            Self::BridgingSubmitting { .. }
+            | Self::Bridging { .. }
+            | Self::Attested { .. }
+            | Self::Bridged { .. }
+            | Self::BridgingFailed { .. }
+            | Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. } => Err(UsdcRebalanceError::InvalidCommand {
+                command: "BeginBridging".to_string(),
+                state: "bridging already started".to_string(),
+            }),
+        }
+    }
+
+    /// Records the submitted CCTP burn transaction, advancing the intent state
+    /// to `Bridging`. Valid only from `BridgingSubmitting`.
     fn transition_initiate_bridging(
         &self,
         burn_tx: TxHash,
@@ -1272,12 +1514,17 @@ impl UsdcRebalance {
             Self::Converting { .. }
             | Self::ConversionComplete { .. }
             | Self::ConversionFailed { .. }
+            | Self::WithdrawalSubmitting { .. }
             | Self::Withdrawing { .. }
             | Self::WithdrawalFailed { .. } => Err(UsdcRebalanceError::WithdrawalNotConfirmed),
-            Self::WithdrawalComplete { .. } => Ok(vec![BridgingInitiated {
-                burn_tx_hash: burn_tx,
-                burned_at: Utc::now(),
-            }]),
+            // Valid from `BridgingSubmitting` (the crash-safe path the manager
+            // uses) or directly from `WithdrawalComplete`.
+            Self::WithdrawalComplete { .. } | Self::BridgingSubmitting { .. } => {
+                Ok(vec![BridgingInitiated {
+                    burn_tx_hash: burn_tx,
+                    burned_at: Utc::now(),
+                }])
+            }
             Self::Bridging { .. }
             | Self::Attested { .. }
             | Self::Bridged { .. }
@@ -1301,8 +1548,10 @@ impl UsdcRebalance {
             Self::Converting { .. }
             | Self::ConversionComplete { .. }
             | Self::ConversionFailed { .. }
+            | Self::WithdrawalSubmitting { .. }
             | Self::Withdrawing { .. }
             | Self::WithdrawalComplete { .. }
+            | Self::BridgingSubmitting { .. }
             | Self::WithdrawalFailed { .. } => Err(UsdcRebalanceError::BridgingNotInitiated),
             Self::Bridging { .. } => Ok(vec![BridgeAttestationReceived {
                 attestation,
@@ -1332,8 +1581,10 @@ impl UsdcRebalance {
             Self::Converting { .. }
             | Self::ConversionComplete { .. }
             | Self::ConversionFailed { .. }
+            | Self::WithdrawalSubmitting { .. }
             | Self::Withdrawing { .. }
             | Self::WithdrawalComplete { .. }
+            | Self::BridgingSubmitting { .. }
             | Self::WithdrawalFailed { .. }
             | Self::Bridging { .. } => Err(UsdcRebalanceError::AttestationNotReceived),
             Self::Attested { .. } => Ok(vec![Bridged {
@@ -1359,16 +1610,21 @@ impl UsdcRebalance {
             Self::Converting { .. }
             | Self::ConversionComplete { .. }
             | Self::ConversionFailed { .. }
+            | Self::WithdrawalSubmitting { .. }
             | Self::Withdrawing { .. }
             | Self::WithdrawalFailed { .. } => Err(UsdcRebalanceError::BridgingNotInitiated),
-            // Pre-bridging failure (e.g. USDC-to-U256 conversion error after
-            // withdrawal succeeded but before CCTP burn was initiated).
-            Self::WithdrawalComplete { .. } => Ok(vec![BridgingFailed {
-                burn_tx_hash: None,
-                cctp_nonce: None,
-                reason,
-                failed_at: Utc::now(),
-            }]),
+            // Pre-burn failure: withdrawal succeeded and (for BridgingSubmitting)
+            // the burn intent was recorded, but no burn tx exists yet -- e.g. a
+            // USDC-to-U256 conversion error or a burn that failed before the
+            // BridgingInitiated event was persisted.
+            Self::WithdrawalComplete { .. } | Self::BridgingSubmitting { .. } => {
+                Ok(vec![BridgingFailed {
+                    burn_tx_hash: None,
+                    cctp_nonce: None,
+                    reason,
+                    failed_at: Utc::now(),
+                }])
+            }
             Self::Bridging { burn_tx_hash, .. } => Ok(vec![BridgingFailed {
                 burn_tx_hash: Some(*burn_tx_hash),
                 cctp_nonce: None,
@@ -1402,8 +1658,10 @@ impl UsdcRebalance {
             Self::Converting { .. }
             | Self::ConversionComplete { .. }
             | Self::ConversionFailed { .. }
+            | Self::WithdrawalSubmitting { .. }
             | Self::Withdrawing { .. }
             | Self::WithdrawalComplete { .. }
+            | Self::BridgingSubmitting { .. }
             | Self::WithdrawalFailed { .. }
             | Self::Bridging { .. }
             | Self::Attested { .. }
@@ -1427,8 +1685,10 @@ impl UsdcRebalance {
             Self::Converting { .. }
             | Self::ConversionComplete { .. }
             | Self::ConversionFailed { .. }
+            | Self::WithdrawalSubmitting { .. }
             | Self::Withdrawing { .. }
             | Self::WithdrawalComplete { .. }
+            | Self::BridgingSubmitting { .. }
             | Self::WithdrawalFailed { .. }
             | Self::Bridging { .. }
             | Self::Attested { .. }
@@ -1456,8 +1716,10 @@ impl UsdcRebalance {
             Self::Converting { .. }
             | Self::ConversionComplete { .. }
             | Self::ConversionFailed { .. }
+            | Self::WithdrawalSubmitting { .. }
             | Self::Withdrawing { .. }
             | Self::WithdrawalComplete { .. }
+            | Self::BridgingSubmitting { .. }
             | Self::WithdrawalFailed { .. }
             | Self::Bridging { .. }
             | Self::Attested { .. }
@@ -1607,6 +1869,180 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, LifecycleError::UnexpectedEvent { .. }));
+    }
+
+    #[tokio::test]
+    async fn begin_withdrawal_from_uninitialized_records_intent_with_chain_head() {
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given_no_previous_events()
+            .when(UsdcRebalanceCommand::BeginWithdrawal {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(500.00)),
+                from_block: 42,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::WithdrawalSubmitting {
+            direction,
+            amount,
+            from_block,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected WithdrawalSubmitting event, got {:?}", events[0]);
+        };
+        assert_eq!(*direction, RebalanceDirection::BaseToAlpaca);
+        assert_eq!(*amount, Usdc::new(float!(500.00)));
+        assert_eq!(*from_block, 42);
+    }
+
+    #[tokio::test]
+    async fn initiate_from_withdrawal_submitting_advances_to_withdrawing() {
+        let tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000abc");
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![UsdcRebalanceEvent::WithdrawalSubmitting {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(500.00)),
+                from_block: 42,
+                submitting_at: Utc::now(),
+            }])
+            .when(UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(500.00)),
+                withdrawal: TransferRef::OnchainTx(tx_hash),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::Initiated { withdrawal_ref, .. } = &events[0] else {
+            panic!("Expected Initiated event, got {:?}", events[0]);
+        };
+        assert_eq!(*withdrawal_ref, TransferRef::OnchainTx(tx_hash));
+    }
+
+    #[tokio::test]
+    async fn initiate_with_amount_mismatch_from_withdrawal_submitting_errors() {
+        let tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000abc");
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![UsdcRebalanceEvent::WithdrawalSubmitting {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(500.00)),
+                from_block: 42,
+                submitting_at: Utc::now(),
+            }])
+            .when(UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(999.00)),
+                withdrawal: TransferRef::OnchainTx(tx_hash),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn begin_bridging_from_withdrawal_complete_records_intent_with_chain_head() {
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc::new(float!(500.00)),
+                    withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
+                        "0x0000000000000000000000000000000000000000000000000000000000000001"
+                    )),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::BeginBridging { from_block: 99 })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::BridgingSubmitting { from_block, .. } = &events[0] else {
+            panic!("Expected BridgingSubmitting event, got {:?}", events[0]);
+        };
+        assert_eq!(*from_block, 99);
+    }
+
+    #[tokio::test]
+    async fn initiate_bridging_from_bridging_submitting_records_burn() {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000bad");
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc::new(float!(500.00)),
+                    withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
+                        "0x0000000000000000000000000000000000000000000000000000000000000001"
+                    )),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingSubmitting {
+                    from_block: 99,
+                    submitting_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::InitiateBridging { burn_tx })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::BridgingInitiated { burn_tx_hash, .. } = &events[0] else {
+            panic!("Expected BridgingInitiated event, got {:?}", events[0]);
+        };
+        assert_eq!(*burn_tx_hash, burn_tx);
+    }
+
+    #[test]
+    fn intent_first_event_sequence_replays_through_withdrawal_and_bridging() {
+        let state = replay::<UsdcRebalance>(vec![
+            UsdcRebalanceEvent::WithdrawalSubmitting {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(500.00)),
+                from_block: 42,
+                submitting_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(500.00)),
+                withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
+                    "0x0000000000000000000000000000000000000000000000000000000000000001"
+                )),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::WithdrawalConfirmed {
+                confirmed_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::BridgingSubmitting {
+                from_block: 99,
+                submitting_at: Utc::now(),
+            },
+        ])
+        .unwrap();
+
+        assert!(
+            matches!(state, Some(UsdcRebalance::BridgingSubmitting { from_block, .. }) if from_block == 99),
+            "Expected BridgingSubmitting state after intent-first sequence, got {state:?}"
+        );
     }
 
     #[tokio::test]
