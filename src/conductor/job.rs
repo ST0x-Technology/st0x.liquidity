@@ -309,6 +309,7 @@ pub enum JobKind {
     HandleOrderRejection,
     EquityRebalancingCheck,
     UsdcRebalancingCheck,
+    WrappedEquityRecovery,
 }
 
 /// Job execution error. Wraps the concrete `Job::Error` type at
@@ -341,6 +342,7 @@ pub struct FailureInjector {
     handle_order_rejection: Arc<Mutex<InjectionState>>,
     equity_rebalancing_check: Arc<Mutex<InjectionState>>,
     usdc_rebalancing_check: Arc<Mutex<InjectionState>>,
+    wrapped_equity_recovery: Arc<Mutex<InjectionState>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -371,6 +373,7 @@ impl FailureInjector {
             handle_order_rejection: Arc::new(Mutex::new(InjectionState::Idle)),
             equity_rebalancing_check: Arc::new(Mutex::new(InjectionState::Idle)),
             usdc_rebalancing_check: Arc::new(Mutex::new(InjectionState::Idle)),
+            wrapped_equity_recovery: Arc::new(Mutex::new(InjectionState::Idle)),
         }
     }
 
@@ -413,6 +416,7 @@ impl FailureInjector {
             JobKind::HandleOrderRejection => &self.handle_order_rejection,
             JobKind::EquityRebalancingCheck => &self.equity_rebalancing_check,
             JobKind::UsdcRebalancingCheck => &self.usdc_rebalancing_check,
+            JobKind::WrappedEquityRecovery => &self.wrapped_equity_recovery,
         };
 
         match mutex.lock() {
