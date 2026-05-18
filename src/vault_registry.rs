@@ -22,10 +22,9 @@ use st0x_execution::Symbol;
 
 use st0x_event_sorcery::{DomainEvent, EventSourced, Never, Projection, SendError, Store, Table};
 
-#[cfg(any(test, feature = "test-support"))]
-use crate::conductor::job::JobKind;
+use st0x_config::{Ctx, CtxError};
+
 use crate::conductor::job::{Job, JobQueue, Label};
-use crate::config::{Ctx, CtxError};
 
 /// Typed identifier for VaultRegistry aggregates, keyed by
 /// orderbook and owner address pair.
@@ -556,8 +555,10 @@ impl Job<SeedVaultRegistryCtx> for SeedVaultRegistry {
     type Error = SeedVaultRegistryError;
 
     const WORKER_NAME: &'static str = "seed-vault-registry-worker";
+
     #[cfg(any(test, feature = "test-support"))]
-    const JOB_KIND: JobKind = JobKind::SeedVaultRegistry;
+    const JOB_KIND: crate::conductor::job::JobKind =
+        crate::conductor::job::JobKind::SeedVaultRegistry;
 
     fn label(&self) -> Label {
         Label::new("SeedVaultRegistry")
@@ -1178,9 +1179,9 @@ mod tests {
     /// the top of this module so [`SeedVaultRegistryCtx::from_config`]
     /// can exercise the production construction path.
     fn ctx_with_seeded_assets() -> Ctx {
-        use crate::config::tests::create_test_ctx_with_order_owner;
-        use crate::config::{
+        use st0x_config::{
             AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, OperationMode,
+            create_test_ctx_with_order_owner,
         };
         use std::collections::HashMap;
 
@@ -1234,8 +1235,10 @@ mod tests {
 
     #[tokio::test]
     async fn from_config_rejects_missing_vault_id() {
-        use crate::config::tests::create_test_ctx_with_order_owner;
-        use crate::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
+        use st0x_config::{
+            AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode,
+            create_test_ctx_with_order_owner,
+        };
         use std::collections::HashMap;
 
         // Two equities with rebalancing enabled: one has a vault_id, one
@@ -1348,7 +1351,7 @@ mod tests {
 
     // Proves the gap is closed: enqueuing a SeedVaultRegistry job and
     // forcing the job to fail (via the FailureInjector armed for this
-    // JobKind, which short-circuits before reaching the aggregate
+    // job type, which short-circuits before reaching the aggregate
     // command) results in apalis retrying the job before halting. The
     // `attempts` column on the Jobs row shows >1 when retries actually
     // happened.
@@ -1364,9 +1367,7 @@ mod tests {
         use apalis_core::worker::ext::event_listener::EventListenerExt;
         use std::time::Duration;
 
-        use crate::conductor::job::{
-            FAIL_STOP_RECOVERY_TIMEOUT, FailureInjector, JobKind, JobQueue, work,
-        };
+        use crate::conductor::job::{FAIL_STOP_RECOVERY_TIMEOUT, FailureInjector, JobQueue, work};
         use crate::conductor::setup_apalis_tables;
 
         let pool = setup_test_db().await;
@@ -1379,7 +1380,7 @@ mod tests {
         queue.push(SeedVaultRegistry).await.unwrap();
 
         let injector = FailureInjector::new();
-        injector.arm(JobKind::SeedVaultRegistry);
+        injector.arm(crate::conductor::job::JobKind::SeedVaultRegistry);
 
         let queue_for_worker = queue.clone();
         let ctx_for_worker = seed_ctx.clone();
@@ -1397,7 +1398,6 @@ mod tests {
                         .backend(queue_for_worker.clone().into_storage())
                         .data(ctx_for_worker.clone())
                         .data(injector_for_worker.clone())
-                        .data(JobKind::SeedVaultRegistry)
                         .concurrency(1)
                         .retry(RetryPolicy::retries(3))
                         .break_circuit_with(fail_stop)

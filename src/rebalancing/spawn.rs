@@ -16,11 +16,12 @@ use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiError, EmptySymbolError, Executor, Symbol,
 };
 
+use st0x_config::RebalancingCtx;
+
 use super::equity::CrossVenueEquityTransfer;
 use super::usdc::CrossVenueCashTransfer;
-use super::{Rebalancer, RebalancingCtx, TriggeredOperation};
+use super::{Rebalancer, TriggeredOperation};
 use crate::alpaca_wallet::AlpacaWalletService;
-use crate::config::EquityAssetConfig;
 use crate::equity_redemption::EquityRedemption;
 use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
@@ -28,6 +29,7 @@ use crate::tokenization::Tokenizer;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
 use crate::wrapper::WrapperService;
+use st0x_config::EquityAssetConfig;
 
 /// Errors that can occur when spawning the rebalancer.
 #[derive(Debug, thiserror::Error)]
@@ -188,7 +190,6 @@ mod tests {
 
     use super::*;
     use crate::alpaca_wallet::AlpacaWalletService;
-    use crate::config::{AssetsConfig, EquitiesConfig};
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::RebalancingServiceConfig;
@@ -197,6 +198,7 @@ mod tests {
     use crate::tokenization::mock::MockTokenizer;
     use crate::vault_registry::VaultRegistry;
     use crate::wrapper::mock::MockWrapper;
+    use st0x_config::{AssetsConfig, EquitiesConfig};
     use st0x_float_macro::float;
 
     type BaseProvider = FillProvider<

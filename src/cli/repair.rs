@@ -61,13 +61,13 @@ pub(super) async fn fail_pending_offchain_order_command<W: Write>(
 mod tests {
     use alloy::primitives::TxHash;
 
+    use st0x_config::ExecutionThreshold;
     use st0x_execution::{Direction, FractionalShares};
     use st0x_float_macro::float;
 
     use super::*;
     use crate::position::TradeId;
     use crate::test_utils::{positive_shares, setup_test_db};
-    use crate::threshold::ExecutionThreshold;
 
     async fn seed_pending_position(
         pool: &SqlitePool,

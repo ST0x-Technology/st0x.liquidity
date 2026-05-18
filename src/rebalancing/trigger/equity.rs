@@ -11,8 +11,6 @@ use tracing::{debug, trace, warn};
 use st0x_execution::{FractionalShares, Positive, Symbol};
 
 use super::{RebalancingService, TokenAddressError, TriggeredOperation};
-#[cfg(any(test, feature = "test-support"))]
-use crate::conductor::job::JobKind;
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::inventory::{
     BroadcastingInventory, EquityImbalanceError, Imbalance, ImbalanceThreshold,
@@ -217,8 +215,10 @@ impl Job<RebalancingService> for EquityRebalancingCheck {
     type Error = EquityRebalancingCheckJobError;
 
     const WORKER_NAME: &'static str = "equity-rebalancing-check-worker";
+
     #[cfg(any(test, feature = "test-support"))]
-    const JOB_KIND: JobKind = JobKind::EquityRebalancingCheck;
+    const JOB_KIND: crate::conductor::job::JobKind =
+        crate::conductor::job::JobKind::EquityRebalancingCheck;
 
     fn label(&self) -> Label {
         Label::new(format!("EquityRebalancingCheck({})", self.symbol))

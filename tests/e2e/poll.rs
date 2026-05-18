@@ -10,11 +10,14 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
+use st0x_config::Ctx;
 use st0x_dto::Statement;
 use st0x_execution::FractionalShares;
 use st0x_execution::alpaca_broker_api::OrderStatus;
-use st0x_hedge::config::Ctx;
-use st0x_hedge::{run_bot_session, run_bot_session_with_event_channel};
+use st0x_hedge::{
+    FailureInjector, run_bot_session, run_bot_session_with_event_channel,
+    run_bot_session_with_injector,
+};
 
 /// Spawns the full bot as a background task.
 pub fn spawn_bot(ctx: Ctx) -> JoinHandle<anyhow::Result<()>> {
@@ -28,6 +31,16 @@ pub fn spawn_bot_with_event_channel(
     event_sender: broadcast::Sender<Statement>,
 ) -> JoinHandle<anyhow::Result<()>> {
     tokio::spawn(run_bot_session_with_event_channel(ctx, event_sender))
+}
+
+/// Spawns the full bot using a caller-supplied [`FailureInjector`] so the
+/// test can arm specific job kinds for failure injection.
+pub fn spawn_bot_with_injector(
+    ctx: Ctx,
+    injector: FailureInjector,
+) -> JoinHandle<anyhow::Result<()>> {
+    let (event_sender, _) = broadcast::channel::<Statement>(256);
+    tokio::spawn(run_bot_session_with_injector(ctx, event_sender, injector))
 }
 
 /// Polls the bot's health endpoint until it responds, panicking if the

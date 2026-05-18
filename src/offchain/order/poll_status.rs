@@ -17,8 +17,6 @@ use st0x_event_sorcery::Projection;
 use st0x_execution::{Executor, ExecutorOrderId, OrderState, SupportedExecutor, Symbol};
 use st0x_finance::Usd;
 
-#[cfg(any(test, feature = "test-support"))]
-use crate::conductor::job::JobKind;
 use crate::conductor::job::{Job, JobQueue, Label};
 use crate::offchain::order::handle_rejection::{
     HandleOrderRejection, HandleOrderRejectionJobQueue,
@@ -56,8 +54,10 @@ where
     type Error = JobError;
 
     const WORKER_NAME: &'static str = "poll-order-status-worker";
+
     #[cfg(any(test, feature = "test-support"))]
-    const JOB_KIND: JobKind = JobKind::PollOrderStatus;
+    const JOB_KIND: crate::conductor::job::JobKind =
+        crate::conductor::job::JobKind::PollOrderStatus;
 
     fn label(&self) -> Label {
         Label::new(format!("PollOrderStatus:{}", self.offchain_order_id))
@@ -362,7 +362,7 @@ mod tests {
     use crate::offchain::order::{OffchainOrderCommand, noop_order_placer};
     use crate::position::{Position, PositionCommand, TradeId};
     use crate::test_utils::{OnchainTradeBuilder, setup_test_db};
-    use crate::threshold::ExecutionThreshold;
+    use st0x_config::ExecutionThreshold;
 
     const TEST_POLL_INTERVAL: Duration = Duration::from_secs(15);
 

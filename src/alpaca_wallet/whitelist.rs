@@ -8,7 +8,7 @@ use alloy::primitives::Address;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::config::TravelRuleConfig;
+use st0x_config::TravelRuleConfig;
 
 use super::transfer::{Network, TokenSymbol};
 

@@ -5,6 +5,7 @@ use sqlx::SqlitePool;
 pub(crate) use std::time::Duration;
 use tokio::task::JoinHandle;
 
+use st0x_config::{AssetsConfig, BrokerCtx, Ctx};
 pub(crate) use st0x_event_sorcery::Projection;
 use st0x_execution::alpaca_broker_api::{AlpacaBrokerMock, TEST_API_KEY, TEST_API_SECRET};
 use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
@@ -12,7 +13,6 @@ pub(crate) use st0x_execution::{FractionalShares, Positive, Symbol};
 pub(crate) use st0x_hedge::ExecutionThreshold;
 use st0x_hedge::TradingMode;
 use st0x_hedge::bindings::IOrderBookV6;
-use st0x_hedge::config::{AssetsConfig, BrokerCtx, Ctx};
 pub(crate) use st0x_hedge::{OffchainOrder, Position};
 
 pub(crate) use crate::assert::ExpectedPosition;

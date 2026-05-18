@@ -11,15 +11,15 @@ use alloy::sol_types::SolEvent;
 use chrono::{DateTime, Utc};
 use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
-use st0x_float_serde::format_float_with_fallback;
 use tracing::warn;
 
+use st0x_config::EvmCtx;
 use st0x_evm::Evm;
 use st0x_execution::{Direction, FractionalShares, HasZero};
+use st0x_float_serde::format_float_with_fallback;
 
 use super::pyth::{extract_pyth_price, raw_price_to_pyth_price};
 use crate::bindings::IOrderBookV6::{ClearV3, OrderV4, TakeOrderV3};
-use crate::onchain::EvmCtx;
 use crate::onchain::OnChainError;
 use crate::onchain::io::{TokenizedSymbol, TradeDetails, Usdc, WrappedTokenizedShares};
 use crate::onchain::pyth::FeedIdCache;
@@ -433,8 +433,8 @@ mod tests {
 
     use super::*;
     use crate::bindings::IOrderBookV6;
-    use crate::onchain::EvmCtx;
     use crate::symbol::cache::SymbolCache;
+    use st0x_config::EvmCtx;
     use st0x_float_macro::float;
 
     #[test]

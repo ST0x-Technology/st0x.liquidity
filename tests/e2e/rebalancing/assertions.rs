@@ -25,6 +25,7 @@ use sqlx::SqlitePool;
 use tokio::task::JoinHandle;
 
 use st0x_bridge::cctp::CctpAttestationMock;
+use st0x_config::{BrokerCtx, Ctx};
 use st0x_evm::{Evm, EvmError, Wallet};
 use st0x_execution::alpaca_broker_api::{
     AlpacaBrokerMock, OrderSide, OrderStatus, TEST_API_KEY, TEST_API_SECRET, TransferDirection,
@@ -36,7 +37,6 @@ use st0x_execution::{
 use st0x_finance::{Positive, Usd};
 pub(crate) use st0x_hedge::UsdcRebalancing;
 use st0x_hedge::bindings::IOrderBookV6;
-use st0x_hedge::config::{BrokerCtx, Ctx};
 pub(crate) use st0x_hedge::mock_api::REDEMPTION_WALLET;
 use st0x_hedge::mock_api::{AlpacaTokenizationMock, TokenizationStatus};
 pub(crate) use st0x_hedge::mock_api::{RedemptionOutcome, TokenizationRequestType};
@@ -248,8 +248,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
         .usdc(usdc_rebalancing)
         .call();
 
-    let wallet_ctx =
-        st0x_hedge::wallet::OnchainWalletCtx::from_wallets(base_wallet.clone(), base_wallet);
+    let wallet_ctx = st0x_config::OnchainWalletCtx::from_wallets(base_wallet.clone(), base_wallet);
 
     let assets = AssetsConfig {
         equities: EquitiesConfig {
@@ -343,8 +342,7 @@ where
         .with_circle_api_base(cctp.attestation_base_url)
         .with_cctp_addresses(cctp.token_messenger, cctp.message_transmitter);
 
-    let wallet_ctx =
-        st0x_hedge::wallet::OnchainWalletCtx::from_wallets(base_wallet, ethereum_wallet);
+    let wallet_ctx = st0x_config::OnchainWalletCtx::from_wallets(base_wallet, ethereum_wallet);
 
     Ctx::for_test()
         .database_url(db_path.display().to_string())

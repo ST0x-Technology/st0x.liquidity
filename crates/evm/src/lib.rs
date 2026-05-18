@@ -43,6 +43,11 @@ pub mod turnkey;
 #[cfg(feature = "mock")]
 pub mod test_chain;
 
+#[cfg(feature = "test-support")]
+pub mod stub;
+#[cfg(feature = "test-support")]
+pub use stub::StubWallet;
+
 /// Wallet backend discriminant. Deserialized from a `kind` field in
 /// wallet config sections. Variants are feature-gated so unconfigured
 /// backends fail at parse time with "unknown variant".

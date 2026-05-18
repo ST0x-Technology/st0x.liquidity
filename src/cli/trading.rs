@@ -18,7 +18,6 @@ use st0x_execution::{
     MockExecutorCtx, OrderPlacement, OrderState, Positive, Symbol, TimeInForce, TryIntoExecutor,
 };
 
-use crate::config::{BrokerCtx, Ctx};
 use crate::offchain::order::{
     OffchainOrderCommand, OffchainOrderId, OrderPlacementResult, OrderPlacer,
     build_offchain_order_cqrs,
@@ -28,7 +27,8 @@ use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::{OnChainError, OnchainTrade, TradeValidationError};
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::symbol::cache::SymbolCache;
-use crate::threshold::ExecutionThreshold;
+use st0x_config::ExecutionThreshold;
+use st0x_config::{BrokerCtx, Ctx};
 use st0x_float_serde::format_float_with_fallback;
 
 /// OrderPlacer for the CLI that delegates to the broker-specific executor
@@ -643,12 +643,13 @@ mod tests {
     use serde_json::json;
     use url::Url;
 
-    use super::*;
-    use crate::config::{AssetsConfig, BrokerCtx, EquitiesConfig, LogLevel, TradingMode};
-    use crate::onchain::EvmCtx;
-    use crate::test_utils::{positive_shares, setup_test_db};
-    use crate::threshold::ExecutionThreshold;
+    use st0x_config::{
+        AssetsConfig, BrokerCtx, EquitiesConfig, EvmCtx, ExecutionThreshold, LogLevel, TradingMode,
+    };
     use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+
+    use super::*;
+    use crate::test_utils::{positive_shares, setup_test_db};
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b"));
@@ -684,8 +685,6 @@ mod tests {
             travel_rule: None,
             rest_api: None,
             redemption_wallet: None,
-            #[cfg(feature = "test-support")]
-            failure_injector: crate::conductor::job::FailureInjector::new(),
         }
     }
 

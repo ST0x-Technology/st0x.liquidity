@@ -5,9 +5,8 @@ use alloy::primitives::{Address, Bytes};
 use std::io::{BufRead, Write};
 use thiserror::Error;
 
+use st0x_config::Ctx;
 use st0x_evm::Wallet;
-
-use crate::config::Ctx;
 
 #[derive(Debug, Error)]
 pub(crate) enum SubmitError {

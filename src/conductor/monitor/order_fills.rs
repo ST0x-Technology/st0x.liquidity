@@ -38,8 +38,9 @@ use std::collections::BTreeMap;
 use task_supervisor::{SupervisedTask, TaskResult};
 use tracing::{debug, error, info, trace, warn};
 
+use st0x_config::EvmCtx;
+
 use crate::bindings::IOrderBookV6::{ClearV3, IOrderBookV6Instance, TakeOrderV3};
-use crate::onchain::EvmCtx;
 use crate::onchain::backfill::{
     BackfillJobQueue, BackfillRange, backfill_start_block, save_backfill_checkpoint,
 };

@@ -70,7 +70,7 @@ impl OnchainWalletCtx {
         not(any(feature = "wallet-turnkey", feature = "wallet-private-key")),
         allow(clippy::redundant_clone)
     )]
-    pub(crate) async fn new(
+    pub async fn new(
         wallet_config: toml::Value,
         wallet_secrets: toml::Value,
         base_rpc_url: Url,
@@ -100,11 +100,11 @@ impl OnchainWalletCtx {
         })
     }
 
-    pub(crate) fn base_wallet(&self) -> &Arc<dyn Wallet<Provider = RootProvider>> {
+    pub fn base_wallet(&self) -> &Arc<dyn Wallet<Provider = RootProvider>> {
         &self.base_wallet
     }
 
-    pub(crate) fn ethereum_wallet(&self) -> &Arc<dyn Wallet<Provider = RootProvider>> {
+    pub fn ethereum_wallet(&self) -> &Arc<dyn Wallet<Provider = RootProvider>> {
         &self.ethereum_wallet
     }
 }
@@ -119,7 +119,7 @@ fn http_client_with_retry(url: Url) -> RpcClient {
     RpcClient::builder().layer(retry_layer).http(url)
 }
 
-pub(crate) async fn build_wallet(
+pub async fn build_wallet(
     kind: &WalletKind,
     wallet_config: toml::Value,
     wallet_secrets: toml::Value,
@@ -137,13 +137,13 @@ pub(crate) async fn build_wallet(
         .await?)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl OnchainWalletCtx {
     /// Create a stub wallet context for tests.
-    pub(crate) fn stub() -> Self {
+    pub fn stub() -> Self {
         use alloy::primitives::Address;
 
-        let stub_wallet = crate::test_utils::StubWallet::stub(Address::ZERO);
+        let stub_wallet = st0x_evm::StubWallet::stub(Address::ZERO);
 
         Self {
             base_wallet: stub_wallet.clone(),
