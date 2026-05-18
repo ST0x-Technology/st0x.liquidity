@@ -188,6 +188,7 @@ impl Conductor {
             tokenizer,
             service: rebalancing_service,
             recovery_transfer,
+            wrapped_equity_recovery_store,
         } = PositionAndRebalancing::setup(
             rebalancing,
             &ctx,
@@ -232,6 +233,24 @@ impl Conductor {
         let mut poll_status_queue = PollOrderStatusJobQueue::new(&pool);
         let reconcile_queue = ReconcileOrderFillJobQueue::new(&pool);
         let rejection_queue = HandleOrderRejectionJobQueue::new(&pool);
+        let wrapped_equity_recovery_queue =
+            crate::wrapped_equity_recovery::WrappedEquityRecoveryJobQueue::new(&pool);
+
+        let wrapped_equity_recovery_ctx = match (
+            wrapped_equity_recovery_store,
+            recovery_transfer.clone(),
+            rebalancing_service.clone(),
+        ) {
+            (Some(store), Some(transfer), Some(service)) => Some(Arc::new(
+                crate::wrapped_equity_recovery::WrappedEquityRecoveryCtx {
+                    inventory: inventory.clone(),
+                    store,
+                    transfer,
+                    equity_in_progress: service.equity_in_progress.clone(),
+                },
+            )),
+            _ => None,
+        };
 
         recover_submitted_offchain_orders(
             &frameworks.offchain_order_projection,
@@ -272,6 +291,8 @@ impl Conductor {
             .poll_status_queue(poll_status_queue)
             .reconcile_queue(reconcile_queue)
             .rejection_queue(rejection_queue)
+            .wrapped_equity_recovery_queue(wrapped_equity_recovery_queue)
+            .maybe_wrapped_equity_recovery_ctx(wrapped_equity_recovery_ctx)
             .equity_check_scheduler(schedulers.equity)
             .usdc_check_scheduler(schedulers.usdc)
             .maybe_rebalancing_service(rebalancing_service)
@@ -563,6 +584,8 @@ struct RebalancingInfrastructure {
     tokenizer: Arc<dyn Tokenizer>,
     service: Arc<RebalancingService>,
     recovery_transfer: Arc<CrossVenueEquityTransfer>,
+    wrapped_equity_recovery_store:
+        Arc<Store<crate::wrapped_equity_recovery::WrappedEquityRecovery>>,
 }
 
 /// Shared infrastructure dependencies needed to spawn rebalancing.
@@ -591,6 +614,8 @@ struct PositionAndRebalancing {
     tokenizer: Option<Arc<dyn Tokenizer>>,
     service: Option<Arc<RebalancingService>>,
     recovery_transfer: Option<Arc<CrossVenueEquityTransfer>>,
+    wrapped_equity_recovery_store:
+        Option<Arc<Store<crate::wrapped_equity_recovery::WrappedEquityRecovery>>>,
 }
 
 impl PositionAndRebalancing {
@@ -643,6 +668,7 @@ impl PositionAndRebalancing {
                 tokenizer: Some(infra.tokenizer),
                 service: Some(infra.service),
                 recovery_transfer: Some(infra.recovery_transfer),
+                wrapped_equity_recovery_store: Some(infra.wrapped_equity_recovery_store),
             })
         } else {
             let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
@@ -666,6 +692,7 @@ impl PositionAndRebalancing {
                 tokenizer: None,
                 service: None,
                 recovery_transfer: None,
+                wrapped_equity_recovery_store: None,
             })
         }
     }
@@ -901,6 +928,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             tokenizer,
             service: rebalancing_service,
             recovery_transfer,
+            wrapped_equity_recovery_store: built.wrapped_equity_recovery,
         })
     })
 }
