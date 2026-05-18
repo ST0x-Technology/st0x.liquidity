@@ -9,10 +9,12 @@ use tokio::sync::broadcast;
 use tracing::{info, trace, warn};
 
 use st0x_dto::{CurrentState, Statement};
+use st0x_event_sorcery::{load_all_ids, load_entity};
 use st0x_finance::Positive;
 
 use crate::config::OperationMode;
 use crate::inventory::BroadcastingInventory;
+use crate::position::Position;
 use crate::threshold::ExecutionThreshold;
 
 mod event;
@@ -229,54 +231,33 @@ fn float_to_f64(value: rain_math_float::Float, fallback: f64) -> f64 {
 }
 
 async fn load_positions(pool: &SqlitePool) -> Vec<st0x_dto::Position> {
-    let rows: Vec<(String, Option<String>, Option<String>)> = match sqlx::query_as(
-        "SELECT symbol, net_position, \
-         json_extract(payload, '$.Live.last_price_usdc') \
-         FROM position_view WHERE symbol IS NOT NULL",
-    )
-    .fetch_all(pool)
-    .await
-    {
-        Ok(rows) => rows,
+    let ids = match load_all_ids::<Position>(pool).await {
+        Ok(ids) => ids,
         Err(error) => {
             warn!(target: "dashboard", %error, "Failed to load positions for dashboard");
             return Vec::new();
         }
     };
 
-    rows.into_iter()
-        .filter_map(|(raw_symbol, net_str, price_str)| {
-            let symbol = st0x_execution::Symbol::new(&raw_symbol)
-                .inspect_err(|error| {
-                    warn!(target: "dashboard", %error, %raw_symbol, "Invalid symbol in position view, skipping");
-                })
-                .ok()?;
+    let mut positions = Vec::with_capacity(ids.len());
 
-            let net = net_str
-                .and_then(|value| match rain_math_float::Float::parse(value) {
-                    Ok(float) => Some(float),
-                    Err(error) => {
-                        warn!(target: "dashboard", %error, %raw_symbol, "Unparseable net_position, skipping");
-                        None
-                    }
-                })
-                .unwrap_or_else(|| st0x_float_macro::float!(0));
+    for id in ids {
+        match load_entity::<Position>(pool, &id).await {
+            Ok(Some(position)) => positions.push(st0x_dto::Position {
+                symbol: position.symbol,
+                net: position.net.inner(),
+                last_price_usdc: position.last_price_usdc,
+            }),
+            Ok(None) => {
+                warn!(target: "dashboard", %id, "Position disappeared while loading dashboard state");
+            }
+            Err(error) => {
+                warn!(target: "dashboard", %id, ?error, "Failed to load position for dashboard");
+            }
+        }
+    }
 
-            let last_price_usdc = price_str.and_then(|value| {
-                rain_math_float::Float::parse(value)
-                    .inspect_err(|error| {
-                        warn!(target: "dashboard", %error, %raw_symbol, "Unparseable last_price_usdc, ignoring");
-                    })
-                    .ok()
-            });
-
-            Some(st0x_dto::Position {
-                symbol,
-                net,
-                last_price_usdc,
-            })
-        })
-        .collect()
+    positions
 }
 
 #[cfg(test)]

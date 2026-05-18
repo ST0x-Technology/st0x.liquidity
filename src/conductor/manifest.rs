@@ -74,6 +74,7 @@ impl QueryManifest {
 
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .with(rebalancing_service.clone())
+            .with(broadcaster.clone())
             .build(())
             .await?;
 
@@ -115,23 +116,33 @@ impl QueryManifest {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::Address;
+    use alloy::primitives::{Address, TxHash, fixed_bytes};
     use std::collections::{BTreeMap, HashSet};
     use std::time::Duration;
     use tokio::sync::{broadcast, mpsc};
 
+    use st0x_dto::Statement;
     use st0x_event_sorcery::test_store;
-    use st0x_execution::{FractionalShares, Symbol};
+    use st0x_execution::{Direction, FractionalShares, Symbol};
+    use st0x_finance::Usdc;
     use st0x_float_macro::float;
 
     use super::*;
     use crate::config::{AssetsConfig, EquitiesConfig};
     use crate::inventory::snapshot::{InventorySnapshotCommand, InventorySnapshotId};
-    use crate::inventory::{BroadcastingInventory, ImbalanceThreshold, InventoryView, Venue};
+    use crate::inventory::{
+        BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, Operator, Venue,
+    };
     use crate::onchain::mock::MockRaindex;
-    use crate::rebalancing::{RebalancingSchedulers, RebalancingService, RebalancingServiceConfig};
+    use crate::position::{PositionCommand, TradeId};
+    use crate::rebalancing::{
+        RebalancingSchedulers, RebalancingService, RebalancingServiceConfig, TriggeredOperation,
+        drain_pending_jobs,
+    };
     use crate::test_utils::setup_test_db;
+    use crate::threshold::ExecutionThreshold;
     use crate::tokenization::mock::MockTokenizer;
+    use crate::vault_registry::{VaultRegistryCommand, VaultRegistryId};
     use crate::wrapper::mock::MockWrapper;
 
     fn test_trigger_config() -> RebalancingServiceConfig {
@@ -264,7 +275,141 @@ mod tests {
             Some(FractionalShares::new(float!(7))),
             "manifest build must wire the InventorySnapshot store so that \
              live commands dispatch through the trigger's projection into \
-             BroadcastingInventory",
+            BroadcastingInventory",
+        );
+    }
+
+    #[tokio::test]
+    async fn build_frameworks_broadcasts_live_position_updates() {
+        let pool = setup_test_db().await;
+        let (operation_sender, mut operation_receiver) = mpsc::channel(10);
+        let (event_sender, mut event_receiver) = broadcast::channel(10);
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let orderbook = Address::repeat_byte(0xAB);
+        let owner = Address::repeat_byte(0xCD);
+        let token = Address::repeat_byte(0xEF);
+        let vault_registry = Arc::new(test_store(pool.clone(), ()));
+        vault_registry
+            .send(
+                &VaultRegistryId { orderbook, owner },
+                VaultRegistryCommand::SeedEquityVaultFromConfig {
+                    token,
+                    vault_id: fixed_bytes!(
+                        "0x0000000000000000000000000000000000000000000000000000000000000001"
+                    ),
+                    symbol: symbol.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let initial_inventory = InventoryView::default()
+            .with_equity(
+                symbol.clone(),
+                FractionalShares::ZERO,
+                FractionalShares::ZERO,
+            )
+            .with_usdc(Usdc::new(float!(1000000)), Usdc::new(float!(1000000)))
+            .update_equity(
+                &symbol,
+                Inventory::available(
+                    Venue::MarketMaking,
+                    Operator::Add,
+                    FractionalShares::new(float!(20)),
+                ),
+                chrono::Utc::now(),
+            )
+            .unwrap()
+            .update_equity(
+                &symbol,
+                Inventory::available(
+                    Venue::Hedging,
+                    Operator::Add,
+                    FractionalShares::new(float!(80)),
+                ),
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        let inventory = Arc::new(BroadcastingInventory::new(
+            initial_inventory,
+            event_sender.clone(),
+        ));
+
+        let rebalancing_service = Arc::new(RebalancingService::new(
+            test_trigger_config(),
+            vault_registry,
+            orderbook,
+            owner,
+            inventory,
+            operation_sender,
+            Arc::new(MockWrapper::new()),
+            RebalancingSchedulers::new(&pool),
+        ));
+        let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
+        let manifest = QueryManifest::new(rebalancing_service.clone(), broadcaster);
+        let services = EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::new()),
+        };
+        let built = manifest.build(pool, services).await.unwrap();
+
+        built
+            .position
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        tx_hash: TxHash::ZERO,
+                        log_index: 0,
+                    },
+                    amount: FractionalShares::new(float!(2)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let message = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let message = event_receiver
+                    .recv()
+                    .await
+                    .expect("position command should broadcast dashboard update");
+
+                if matches!(message, Statement::PositionUpdate(_)) {
+                    return message;
+                }
+            }
+        })
+        .await
+        .expect("position command should broadcast dashboard update");
+
+        match message {
+            Statement::PositionUpdate(position) => {
+                assert_eq!(position.symbol, symbol);
+                assert!(position.net.eq(float!(2)).unwrap());
+                assert!(
+                    position
+                        .last_price_usdc
+                        .expect("position update should include last price")
+                        .eq(float!(150))
+                        .unwrap()
+                );
+            }
+            other => panic!("expected PositionUpdate message, got {other:?}"),
+        }
+
+        drain_pending_jobs(&rebalancing_service).await.unwrap();
+        let triggered = operation_receiver.try_recv();
+        assert!(
+            matches!(triggered, Ok(TriggeredOperation::Mint { .. })),
+            "expected rebalancing subscriber to receive position event, got {triggered:?}"
         );
     }
 }

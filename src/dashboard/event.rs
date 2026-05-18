@@ -12,7 +12,7 @@ use st0x_event_sorcery::{EntityList, Never, Reactor, deps, load_entity};
 use crate::equity_redemption::EquityRedemption;
 use crate::offchain::order::{OffchainOrder, OffchainOrderEvent};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeEvent};
-use crate::position::Position;
+use crate::position::{Position, PositionEvent};
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
 
@@ -88,7 +88,15 @@ impl Reactor for Broadcaster {
                 }
             })
 
-            .on(|id, _event| async move {
+            .on(|id, event| async move {
+                if !matches!(
+                    event,
+                    PositionEvent::OnChainOrderFilled { .. }
+                        | PositionEvent::OffChainOrderFilled { .. }
+                ) {
+                    return;
+                }
+
                 match load_entity::<Position>(&self.pool, &id).await {
                     Ok(Some(position)) => {
                         self.broadcast_position(st0x_dto::Position {
@@ -327,14 +335,21 @@ mod tests {
             .await
             .unwrap();
 
-        let initialized = PositionEvent::Initialized {
-            symbol: symbol.clone(),
-            threshold,
-            initialized_at: now,
-        };
-
         harness
-            .receive::<Position>(symbol.clone(), initialized)
+            .receive::<Position>(
+                symbol.clone(),
+                PositionEvent::OnChainOrderFilled {
+                    trade_id: TradeId {
+                        tx_hash: alloy::primitives::TxHash::ZERO,
+                        log_index: 0,
+                    },
+                    amount: st0x_execution::FractionalShares::new(st0x_float_macro::float!(1)),
+                    direction: st0x_execution::Direction::Buy,
+                    price_usdc: st0x_float_macro::float!(150),
+                    block_timestamp: now,
+                    seen_at: now,
+                },
+            )
             .await
             .unwrap();
 

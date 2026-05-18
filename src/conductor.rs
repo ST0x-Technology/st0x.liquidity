@@ -636,7 +636,8 @@ impl PositionAndRebalancing {
                 recovery_transfer: Some(infra.recovery_transfer),
             })
         } else {
-            let (position, position_projection) = build_position_cqrs(pool).await?;
+            let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
+            let (position, position_projection) = build_position_cqrs(pool, broadcaster).await?;
 
             // Without the service, the projection is the only subscriber
             // keeping the dashboard view in sync.
@@ -1107,8 +1108,10 @@ async fn recover_single_orphaned_order(
 /// (without rebalancing trigger). Used when rebalancing is disabled.
 async fn build_position_cqrs(
     pool: &SqlitePool,
+    broadcaster: Arc<Broadcaster>,
 ) -> anyhow::Result<(Arc<Store<Position>>, Arc<Projection<Position>>)> {
     Ok(StoreBuilder::<Position>::new(pool.clone())
+        .with(broadcaster)
         .build(())
         .await?)
 }
@@ -1979,6 +1982,11 @@ mod tests {
             shutdown_token: CancellationToken::new(),
             apalis_shutdown_token: CancellationToken::new(),
         }
+    }
+
+    fn test_broadcaster(pool: &SqlitePool) -> (Arc<Broadcaster>, broadcast::Receiver<Statement>) {
+        let (sender, receiver) = broadcast::channel(16);
+        (Arc::new(Broadcaster::new(sender, pool.clone())), receiver)
     }
 
     async fn insert_finished_job(pool: &SqlitePool, id: &str) {
@@ -3960,7 +3968,9 @@ mod tests {
 
         // First "session": create position store, execute commands.
         {
-            let (position_store, position_projection) = build_position_cqrs(&pool).await.unwrap();
+            let (broadcaster, _receiver) = test_broadcaster(&pool);
+            let (position_store, position_projection) =
+                build_position_cqrs(&pool, broadcaster).await.unwrap();
 
             position_store
                 .send(
@@ -3994,7 +4004,9 @@ mod tests {
 
         // Second "session": create NEW position store against the same pool.
         {
-            let (_position_store, position_projection) = build_position_cqrs(&pool).await.unwrap();
+            let (broadcaster, _receiver) = test_broadcaster(&pool);
+            let (_position_store, position_projection) =
+                build_position_cqrs(&pool, broadcaster).await.unwrap();
 
             let position = position_projection
                 .load(&symbol)
@@ -4012,6 +4024,125 @@ mod tests {
                 FractionalShares::new(float!(10)),
                 "Accumulated long should survive restart via persisted view"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_position_cqrs_broadcasts_live_position_updates() {
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let (broadcaster, mut receiver) = test_broadcaster(&pool);
+        let (position_store, _position_projection) =
+            build_position_cqrs(&pool, broadcaster).await.unwrap();
+
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 0,
+                    },
+                    amount: FractionalShares::new(float!(3)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let message = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("position command should broadcast dashboard update")
+            .expect("position command should broadcast dashboard update");
+
+        match message {
+            Statement::PositionUpdate(position) => {
+                assert_eq!(position.symbol, symbol);
+                assert!(position.net.eq(float!(3)).unwrap());
+                assert!(
+                    position
+                        .last_price_usdc
+                        .expect("position update should include last price")
+                        .eq(float!(150))
+                        .unwrap()
+                );
+            }
+            other => panic!("expected PositionUpdate message, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_rebalancing_setup_broadcasts_live_position_updates() {
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let (event_sender, mut event_receiver) = broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default(),
+            event_sender.clone(),
+        ));
+        let (vault_registry, vault_registry_projection) =
+            StoreBuilder::<VaultRegistry>::new(pool.clone())
+                .build(())
+                .await
+                .unwrap();
+
+        let position_and_rebalancing = PositionAndRebalancing::setup(
+            None,
+            &ctx,
+            &pool,
+            inventory,
+            event_sender,
+            vault_registry,
+            vault_registry_projection,
+            RebalancingSchedulers::new(&pool),
+        )
+        .await
+        .unwrap();
+
+        position_and_rebalancing
+            .position
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 0,
+                    },
+                    amount: FractionalShares::new(float!(3)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let message =
+            tokio::time::timeout(std::time::Duration::from_secs(1), event_receiver.recv())
+                .await
+                .expect("position command should broadcast through setup event sender")
+                .expect("position command should broadcast through setup event sender");
+
+        match message {
+            Statement::PositionUpdate(position) => {
+                assert_eq!(position.symbol, symbol);
+                assert!(position.net.eq(float!(3)).unwrap());
+                assert!(
+                    position
+                        .last_price_usdc
+                        .expect("position update should include last price")
+                        .eq(float!(150))
+                        .unwrap()
+                );
+            }
+            other => panic!("expected PositionUpdate message, got {other:?}"),
         }
     }
 

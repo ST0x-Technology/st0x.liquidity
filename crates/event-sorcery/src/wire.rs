@@ -152,9 +152,15 @@ where
             other => ReconcileError::Persistence(PersistenceError::UnknownError(Box::new(other))),
         })?;
 
-        self.queries.push(Box::new(ReactorBridge {
-            reactor: projection.clone(),
-        }));
+        // The materialized view is the source for reconnect snapshots.
+        // Update it before side-effect reactors emit notifications so a
+        // client that reconnects after a broadcast cannot read a stale view.
+        self.queries.insert(
+            0,
+            Box::new(ReactorBridge {
+                reactor: projection.clone(),
+            }),
+        );
 
         let cqrs = sqlite_snapshot_cqrs(self.pool.clone(), self.queries, services);
         Ok((Arc::new(Store::new(cqrs, self.pool)), projection))
@@ -209,9 +215,34 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct EventB;
 
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct ProjectedAggregate {
+        value: i64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    enum ProjectedEvent {
+        Created { value: i64 },
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum ProjectedCommand {
+        Create { value: i64 },
+    }
+
     impl DomainEvent for EventB {
         fn event_type(&self) -> String {
             "EventB".to_string()
+        }
+
+        fn event_version(&self) -> String {
+            "1.0".to_string()
+        }
+    }
+
+    impl DomainEvent for ProjectedEvent {
+        fn event_type(&self) -> String {
+            "ProjectedEvent::Created".to_string()
         }
 
         fn event_version(&self) -> String {
@@ -279,6 +310,47 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl EventSourced for ProjectedAggregate {
+        type Id = String;
+        type Event = ProjectedEvent;
+        type Command = ProjectedCommand;
+        type Error = Never;
+        type Services = ();
+        type Materialized = Table;
+
+        const AGGREGATE_TYPE: &'static str = "ProjectedAggregate";
+        const PROJECTION: Table = Table("projected_aggregate_view");
+        const SCHEMA_VERSION: u64 = 1;
+
+        fn originate(event: &ProjectedEvent) -> Option<Self> {
+            match event {
+                ProjectedEvent::Created { value } => Some(Self { value: *value }),
+            }
+        }
+
+        fn evolve(_entity: &Self, _event: &ProjectedEvent) -> Result<Option<Self>, Never> {
+            Ok(None)
+        }
+
+        async fn initialize(
+            command: ProjectedCommand,
+            _services: &(),
+        ) -> Result<Vec<ProjectedEvent>, Never> {
+            match command {
+                ProjectedCommand::Create { value } => Ok(vec![ProjectedEvent::Created { value }]),
+            }
+        }
+
+        async fn transition(
+            &self,
+            _command: ProjectedCommand,
+            _services: &(),
+        ) -> Result<Vec<ProjectedEvent>, Never> {
+            Ok(vec![])
+        }
+    }
+
     struct MultiEntityReactor;
 
     deps!(MultiEntityReactor, [AggregateA, AggregateB]);
@@ -317,10 +389,58 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn single_entity_wiring() {
+    struct ProjectionReadingReactor {
+        pool: SqlitePool,
+        sender: tokio::sync::mpsc::Sender<Option<i64>>,
+    }
+
+    deps!(ProjectionReadingReactor, [ProjectedAggregate]);
+
+    #[async_trait]
+    impl Reactor for ProjectionReadingReactor {
+        type Error = Never;
+
+        async fn react(
+            &self,
+            event: <Self::Dependencies as EntityList>::Event,
+        ) -> Result<(), Self::Error> {
+            event
+                .on(|id, _event| async move {
+                    let value = load_projected_value(&self.pool, &id).await;
+                    self.sender.send(value).await.unwrap();
+                })
+                .exhaustive()
+                .await;
+
+            Ok(())
+        }
+    }
+
+    async fn load_projected_value(pool: &SqlitePool, id: &str) -> Option<i64> {
+        let payload: Option<String> =
+            sqlx::query_scalar("SELECT payload FROM projected_aggregate_view WHERE view_id = ?")
+                .bind(id)
+                .fetch_optional(pool)
+                .await
+                .unwrap();
+
+        payload.and_then(|payload| {
+            match serde_json::from_str::<Lifecycle<ProjectedAggregate>>(&payload).unwrap() {
+                Lifecycle::Live(entity) => Some(entity.value),
+                Lifecycle::Uninitialized | Lifecycle::Failed { .. } => None,
+            }
+        })
+    }
+
+    async fn setup_pool() -> SqlitePool {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn single_entity_wiring() {
+        let pool = setup_pool().await;
 
         let _store = StoreBuilder::<AggregateA>::new(pool.clone())
             .with(Arc::new(SingleEntityReactor))
@@ -331,8 +451,7 @@ mod tests {
 
     #[tokio::test]
     async fn multi_entity_wiring() {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+        let pool = setup_pool().await;
 
         let multi = Arc::new(MultiEntityReactor);
         let single = Arc::new(SingleEntityReactor);
@@ -349,5 +468,50 @@ mod tests {
             .build(())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn projected_entities_update_views_before_registered_reactors() {
+        let pool = setup_pool().await;
+        sqlx::query(
+            "CREATE TABLE projected_aggregate_view ( \
+                 view_id TEXT NOT NULL PRIMARY KEY, \
+                 version BIGINT NOT NULL, \
+                 payload TEXT NOT NULL \
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let reactor = Arc::new(ProjectionReadingReactor {
+            pool: pool.clone(),
+            sender,
+        });
+        let (store, _projection) = StoreBuilder::<ProjectedAggregate>::new(pool.clone())
+            .with(reactor)
+            .build(())
+            .await
+            .unwrap();
+
+        store
+            .send(
+                &"projected-1".to_string(),
+                ProjectedCommand::Create { value: 42 },
+            )
+            .await
+            .unwrap();
+
+        let value_seen_by_reactor =
+            tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+                .await
+                .expect("registered reactor should receive the projected event")
+                .expect("registered reactor should receive the projected event");
+        assert_eq!(
+            value_seen_by_reactor,
+            Some(42),
+            "registered reactors must observe the updated projection"
+        );
     }
 }
