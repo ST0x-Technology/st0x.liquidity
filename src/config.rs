@@ -69,6 +69,7 @@ pub struct EquityAssetConfig {
     pub vault_ids: Vec<B256>,
     pub trading: OperationMode,
     pub rebalancing: OperationMode,
+    pub wrapped_equity_recovery: OperationMode,
     pub operational_limit: Option<Positive<FractionalShares>>,
 }
 
@@ -2692,6 +2693,7 @@ pub(crate) mod tests {
             tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             trading = "enabled"
             rebalancing = "disabled"
+            wrapped_equity_recovery = "disabled"
             bogus_field = "should fail"
 
             [raindex]
@@ -2861,6 +2863,7 @@ pub(crate) mod tests {
             vault_id = "0xfab"
             trading = "disabled"
             rebalancing = "enabled"
+            wrapped_equity_recovery = "disabled"
             operational_limit = 5
 
             [equities.SPYM]
@@ -2868,6 +2871,7 @@ pub(crate) mod tests {
             tokenized_equity_derivative = "0x31c2c14134e6e3b7ef9478297f199331133fc2d8"
             trading = "disabled"
             rebalancing = "disabled"
+            wrapped_equity_recovery = "disabled"
 
             [cash]
             vault_id = "0x0000000000000000000000000000000000000000000000000000000000000fab"
@@ -2905,6 +2909,7 @@ pub(crate) mod tests {
             vault_id = "0xfab"
             trading = "disabled"
             rebalancing = "enabled"
+            wrapped_equity_recovery = "disabled"
         "#;
 
         let config: AssetsConfig = toml::from_str(toml_str).unwrap();
@@ -2924,6 +2929,7 @@ pub(crate) mod tests {
             vault_ids = ["0xfab", "0xfab2"]
             trading = "disabled"
             rebalancing = "enabled"
+            wrapped_equity_recovery = "disabled"
         "#;
 
         let config: AssetsConfig = toml::from_str(toml_str).unwrap();
@@ -2947,6 +2953,7 @@ pub(crate) mod tests {
             tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             rebalancing = "disabled"
+            wrapped_equity_recovery = "disabled"
         "#;
 
         let result = toml::from_str::<AssetsConfig>(toml_str);
@@ -2963,12 +2970,30 @@ pub(crate) mod tests {
             tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             trading = "enabled"
+            wrapped_equity_recovery = "disabled"
         "#;
 
         let result = toml::from_str::<AssetsConfig>(toml_str);
         assert!(
             result.is_err(),
             "Expected error for missing rebalancing field, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn equity_missing_wrapped_equity_recovery_field_rejects() {
+        let toml_str = r#"
+            [equities.AAPL]
+            tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            trading = "enabled"
+            rebalancing = "disabled"
+        "#;
+
+        let result = toml::from_str::<AssetsConfig>(toml_str);
+        assert!(
+            result.is_err(),
+            "Expected error for missing wrapped_equity_recovery field, got {result:?}"
         );
     }
 
@@ -2980,6 +3005,7 @@ pub(crate) mod tests {
             tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             trading = "enabled"
             rebalancing = "disabled"
+            wrapped_equity_recovery = "disabled"
             operational_limit = 10
 
             [equities.TSLA]
@@ -2987,6 +3013,7 @@ pub(crate) mod tests {
             tokenized_equity_derivative = "0xdddddddddddddddddddddddddddddddddddddddd"
             trading = "enabled"
             rebalancing = "disabled"
+            wrapped_equity_recovery = "disabled"
         "#;
 
         let config: AssetsConfig = toml::from_str(toml_str).unwrap();
@@ -3013,6 +3040,7 @@ pub(crate) mod tests {
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -3059,6 +3087,7 @@ pub(crate) mod tests {
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -3108,6 +3137,7 @@ pub(crate) mod tests {
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -3238,6 +3268,7 @@ pub(crate) mod tests {
                     tokenized_equity_derivative = "0x{derivative_byte:02x}{:0>38}"
                     trading = "{trading}"
                     rebalancing = "{rebalancing}"
+                    wrapped_equity_recovery = "disabled"
                     "#,
                     "", "",
                 );

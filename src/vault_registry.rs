@@ -1193,6 +1193,7 @@ mod tests {
                 vault_ids: vec![TEST_VAULT_ID],
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -1249,6 +1250,7 @@ mod tests {
                 vault_ids: vec![TEST_VAULT_ID],
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -1260,6 +1262,7 @@ mod tests {
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
             },
         );

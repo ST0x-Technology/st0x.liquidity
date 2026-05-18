@@ -277,6 +277,7 @@ mod tests {
             vault_ids: Vec::new(),
             trading: OperationMode::Enabled,
             rebalancing: OperationMode::Disabled,
+            wrapped_equity_recovery: OperationMode::Disabled,
             operational_limit: None,
         }
     }

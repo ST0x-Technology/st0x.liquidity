@@ -60,6 +60,10 @@ tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 trading = "enabled"
 rebalancing = "disabled"
+# Auto-recovery for wrapped equity tokens detected in bot wallets:
+# resumes a stalled mint/redemption that owns the balance, or
+# deposits orphaned tokens back into the Raindex vault.
+wrapped_equity_recovery = "disabled"
 # Single vault: vault_ids = "0xab12"
 # Multiple vaults: vault_ids = ["0xab12", "0xcd34"]
 # operational_limit = 100.0

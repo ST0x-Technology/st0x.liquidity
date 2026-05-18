@@ -26,7 +26,9 @@
 
 pub(crate) mod assertions;
 
+use alloy::primitives::TxHash;
 use rain_math_float::Float;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::collections::HashMap;
 
 use st0x_execution::SharesBlockchain;
@@ -34,9 +36,10 @@ use st0x_finance::{FractionalShares, Positive, Usd};
 use st0x_float_macro::float;
 use st0x_hedge::OperationMode;
 use st0x_hedge::bindings::IOrderBookV6;
+use st0x_hedge::cli::seed_mint_at_tokens_wrapped_for_test;
 
 use self::assertions::*;
-use crate::assert::assert_single_clean_aggregate;
+use crate::assert::{StoredEvent, assert_single_clean_aggregate};
 
 fn aggregate_id_for_event(events: &[crate::assert::StoredEvent], event_type: &str) -> String {
     events
@@ -265,6 +268,7 @@ async fn equity_mint_handles_direct_high_precision_sell_price() -> anyhow::Resul
         .cash_vault_id(cash_vault_id)
         .usdc_rebalancing(UsdcRebalancing::Disabled)
         .cash_rebalancing(OperationMode::Disabled)
+        .wrapped_equity_recovery(OperationMode::Disabled)
         .redemption_wallet(REDEMPTION_WALLET)
         .call()?;
     let mut bot = spawn_bot(ctx);
@@ -408,6 +412,7 @@ async fn equity_imbalance_triggers_mint() -> anyhow::Result<()> {
         .cash_vault_id(cash_vault_id)
         .usdc_rebalancing(UsdcRebalancing::Disabled)
         .cash_rebalancing(OperationMode::Disabled)
+        .wrapped_equity_recovery(OperationMode::Disabled)
         .redemption_wallet(REDEMPTION_WALLET)
         .call()?;
     let mut bot = spawn_bot(ctx);
@@ -537,6 +542,7 @@ async fn equity_imbalance_triggers_redemption() -> anyhow::Result<()> {
         .cash_vault_id(cash_vault_id)
         .usdc_rebalancing(UsdcRebalancing::Disabled)
         .cash_rebalancing(OperationMode::Disabled)
+        .wrapped_equity_recovery(OperationMode::Disabled)
         .redemption_wallet(REDEMPTION_WALLET)
         .call()?;
 
@@ -657,6 +663,7 @@ async fn equity_redemption_buy_inv_repeating_reciprocal_regression() -> anyhow::
         .cash_vault_id(cash_vault_id)
         .usdc_rebalancing(UsdcRebalancing::Disabled)
         .cash_rebalancing(OperationMode::Disabled)
+        .wrapped_equity_recovery(OperationMode::Disabled)
         .redemption_wallet(REDEMPTION_WALLET)
         .call()?;
     let mut bot = spawn_bot(ctx);
@@ -790,6 +797,7 @@ async fn equity_redemption_buy_literal_reciprocal_regression() -> anyhow::Result
         .cash_vault_id(cash_vault_id)
         .usdc_rebalancing(UsdcRebalancing::Disabled)
         .cash_rebalancing(OperationMode::Disabled)
+        .wrapped_equity_recovery(OperationMode::Disabled)
         .redemption_wallet(REDEMPTION_WALLET)
         .call()?;
     let mut bot = spawn_bot(ctx);
@@ -917,6 +925,7 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
         .equity_tokens(&infra.equity_addresses)
         .usdc_vault_id(usdc_vault_id)
         .cctp(cctp.cctp_overrides())
+        .wrapped_equity_recovery(OperationMode::Disabled)
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -1106,6 +1115,7 @@ async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
         .usdc_vault_id(usdc_vault_id)
         .cctp(cctp.cctp_overrides())
         .reserved(reserved)
+        .wrapped_equity_recovery(OperationMode::Disabled)
         .call()?;
     let mut bot = spawn_bot(ctx);
 
@@ -1252,6 +1262,7 @@ async fn redemption_rejected_preserves_inflight_via_sticky() -> anyhow::Result<(
         .cash_vault_id(cash_vault_id)
         .usdc_rebalancing(UsdcRebalancing::Disabled)
         .cash_rebalancing(OperationMode::Disabled)
+        .wrapped_equity_recovery(OperationMode::Disabled)
         .redemption_wallet(REDEMPTION_WALLET)
         .call()?;
 
@@ -1389,6 +1400,7 @@ async fn pending_requests_filtered_by_wallet() -> anyhow::Result<()> {
         .cash_vault_id(cash_vault_id)
         .usdc_rebalancing(UsdcRebalancing::Disabled)
         .cash_rebalancing(OperationMode::Disabled)
+        .wrapped_equity_recovery(OperationMode::Disabled)
         .redemption_wallet(REDEMPTION_WALLET)
         .call()?;
 
@@ -1540,6 +1552,7 @@ async fn inflight_polling_emits_events_for_pending_requests() -> anyhow::Result<
         .cash_vault_id(cash_vault_id)
         .usdc_rebalancing(UsdcRebalancing::Disabled)
         .cash_rebalancing(OperationMode::Disabled)
+        .wrapped_equity_recovery(OperationMode::Disabled)
         .redemption_wallet(REDEMPTION_WALLET)
         .call()?;
 
@@ -1689,6 +1702,7 @@ async fn interrupted_mint_resumes_after_restart() -> anyhow::Result<()> {
         .cash_vault_id(cash_vault_id)
         .usdc_rebalancing(UsdcRebalancing::Disabled)
         .cash_rebalancing(OperationMode::Disabled)
+        .wrapped_equity_recovery(OperationMode::Disabled)
         .redemption_wallet(REDEMPTION_WALLET)
         .call()?;
     let mut bot1 = spawn_bot(ctx1);
@@ -1750,6 +1764,7 @@ async fn interrupted_mint_resumes_after_restart() -> anyhow::Result<()> {
         .cash_vault_id(cash_vault_id)
         .usdc_rebalancing(UsdcRebalancing::Disabled)
         .cash_rebalancing(OperationMode::Disabled)
+        .wrapped_equity_recovery(OperationMode::Disabled)
         .redemption_wallet(REDEMPTION_WALLET)
         .call()?;
     let mut bot2 = spawn_bot(ctx2);
@@ -1882,6 +1897,7 @@ async fn interrupted_redemption_resumes_after_restart() -> anyhow::Result<()> {
         .cash_vault_id(cash_vault_id)
         .usdc_rebalancing(UsdcRebalancing::Disabled)
         .cash_rebalancing(OperationMode::Disabled)
+        .wrapped_equity_recovery(OperationMode::Disabled)
         .redemption_wallet(REDEMPTION_WALLET)
         .call()?;
     let mut bot1 = spawn_bot(ctx1);
@@ -1934,6 +1950,7 @@ async fn interrupted_redemption_resumes_after_restart() -> anyhow::Result<()> {
         .cash_vault_id(cash_vault_id)
         .usdc_rebalancing(UsdcRebalancing::Disabled)
         .cash_rebalancing(OperationMode::Disabled)
+        .wrapped_equity_recovery(OperationMode::Disabled)
         .redemption_wallet(REDEMPTION_WALLET)
         .call()?;
     let mut bot2 = spawn_bot(ctx2);
@@ -2072,6 +2089,7 @@ async fn inflight_state_survives_restart() -> anyhow::Result<()> {
         .cash_vault_id(cash_vault_id)
         .usdc_rebalancing(UsdcRebalancing::Disabled)
         .cash_rebalancing(OperationMode::Disabled)
+        .wrapped_equity_recovery(OperationMode::Disabled)
         .redemption_wallet(REDEMPTION_WALLET)
         .call()?;
 
@@ -2135,6 +2153,7 @@ async fn inflight_state_survives_restart() -> anyhow::Result<()> {
         .cash_vault_id(cash_vault_id)
         .usdc_rebalancing(UsdcRebalancing::Disabled)
         .cash_rebalancing(OperationMode::Disabled)
+        .wrapped_equity_recovery(OperationMode::Disabled)
         .redemption_wallet(REDEMPTION_WALLET)
         .call()?;
 
@@ -2192,7 +2211,16 @@ async fn wrapped_equity_in_bot_wallet_recovers_into_raindex() -> anyhow::Result<
     let onchain_price = float!("150.00");
     let broker_fill_price = float!("150.00");
 
-    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
+    // Match the broker position to the equity deposited into the Raindex
+    // vault by `setup_order` below so the inventory comes up balanced. Without
+    // a matching offchain position the regular rebalancing trigger fires
+    // first and holds the symbol's `equity_in_progress` guard, blocking the
+    // recovery job long enough to time out.
+    let infra = TestInfra::start(
+        vec![("AAPL", broker_fill_price)],
+        vec![("AAPL", float!("1"))],
+    )
+    .await?;
 
     let wrapped_token = infra.equity_addresses[0].1;
 
@@ -2245,6 +2273,7 @@ async fn wrapped_equity_in_bot_wallet_recovers_into_raindex() -> anyhow::Result<
         .cash_vault_id(cash_vault_id)
         .usdc_rebalancing(UsdcRebalancing::Disabled)
         .cash_rebalancing(OperationMode::Disabled)
+        .wrapped_equity_recovery(OperationMode::Enabled)
         .redemption_wallet(REDEMPTION_WALLET)
         .call()?;
 
@@ -2310,6 +2339,177 @@ async fn wrapped_equity_in_bot_wallet_recovers_into_raindex() -> anyhow::Result<
     assert_single_clean_aggregate(
         &recovery_events,
         &["WrappedEquityRecoveryEvent::RecoveryFailed"],
+    );
+
+    bot.abort();
+    Ok(())
+}
+
+/// Active-mint counterpart to the orphan recovery test: a TokenizedEquityMint
+/// aggregate persisted in `TokensWrapped` state must be driven to
+/// `DepositedIntoRaindex` once the bot starts. The wtSTOCK left over from
+/// `deploy_equity_vault` supplies the wallet balance that the mint
+/// "wrapped"; the bot's recovery path (either startup `resume_interrupted`
+/// or the inventory-triggered WrappedEquityRecovery job, whichever races
+/// first) finishes the Raindex deposit.
+///
+/// Asserts the terminal scenario rather than which path finished it: the mint
+/// reaches `DepositedIntoRaindex`, the owner wallet is drained of wtSTOCK, and
+/// the configured Raindex vault holds the deposited shares.
+#[test_log::test(tokio::test)]
+async fn active_mint_in_tokens_wrapped_recovers_into_raindex_vault() -> anyhow::Result<()> {
+    let onchain_price = float!("150.00");
+    let broker_fill_price = float!("150.00");
+
+    // Balance the broker against the equity vault deposited by `setup_order`
+    // so the rebalancing trigger doesn't race the seeded mint's startup
+    // recovery for the symbol's `equity_in_progress` guard.
+    let infra = TestInfra::start(
+        vec![("AAPL", broker_fill_price)],
+        vec![("AAPL", float!("1"))],
+    )
+    .await?;
+    let wrapped_token = infra.equity_addresses[0].1;
+
+    let prepared = infra
+        .base_chain
+        .setup_order()
+        .symbol("AAPL")
+        .amount(float!("1"))
+        .price(onchain_price)
+        .direction(TakeDirection::SellEquity)
+        .call()
+        .await?;
+
+    let owner_wrapped_balance_before =
+        crate::base_chain::IERC20::new(wrapped_token, &infra.base_chain.provider)
+            .balanceOf(infra.base_chain.owner)
+            .call()
+            .await?;
+
+    assert!(
+        owner_wrapped_balance_before > U256::ZERO,
+        "Test precondition: owner wallet should hold wtSTOCK after vault deployment",
+    );
+
+    // Seed a TokenizedEquityMint at TokensWrapped pointing to the wtSTOCK
+    // already sitting in the owner wallet. The seeded `wrapped_shares` must
+    // be <= the wallet balance so the on-chain Raindex deposit can clear.
+    // The DB file doesn't exist yet (the bot creates it on first launch), so
+    // open it with `create_if_missing` and apply migrations before seeding.
+    let seeded_shares = owner_wrapped_balance_before;
+
+    let pool = SqlitePoolOptions::new()
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(&infra.db_path)
+                .create_if_missing(true),
+        )
+        .await?;
+
+    sqlx::migrate!("./migrations").run(&pool).await?;
+
+    seed_mint_at_tokens_wrapped_for_test(
+        &pool,
+        "ISS-RECOVERY-E2E",
+        "AAPL",
+        infra.base_chain.owner,
+        TxHash::random(),
+        seeded_shares,
+        float!("1"),
+    )
+    .await?;
+
+    pool.close().await;
+
+    let current_block = infra.base_chain.provider.get_block_number().await?;
+    let cash_vault_id = prepared.input_vault_id;
+    let equity_vault_id = prepared.output_vault_id;
+    let equity_vault_ids = HashMap::from([("AAPL".to_owned(), equity_vault_id)]);
+
+    let orderbook = IOrderBookV6::IOrderBookV6Instance::new(
+        infra.base_chain.orderbook,
+        &infra.base_chain.provider,
+    );
+
+    let vault_balance_before = orderbook
+        .vaultBalance2(infra.base_chain.owner, wrapped_token, equity_vault_id)
+        .call()
+        .await?;
+
+    let ctx = build_rebalancing_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .equity_tokens(&infra.equity_addresses)
+        .equity_vault_ids(&equity_vault_ids)
+        .cash_vault_id(cash_vault_id)
+        .usdc_rebalancing(UsdcRebalancing::Disabled)
+        .cash_rebalancing(OperationMode::Disabled)
+        .wrapped_equity_recovery(OperationMode::Enabled)
+        .redemption_wallet(REDEMPTION_WALLET)
+        .call()?;
+
+    let mut bot = spawn_bot(ctx);
+
+    poll_for_events_with_timeout(
+        &mut bot,
+        &infra.db_path,
+        "TokenizedEquityMintEvent::DepositedIntoRaindex",
+        1,
+        Duration::from_secs(60),
+    )
+    .await;
+
+    let owner_wrapped_balance_after =
+        crate::base_chain::IERC20::new(wrapped_token, &infra.base_chain.provider)
+            .balanceOf(infra.base_chain.owner)
+            .call()
+            .await?;
+
+    assert_eq!(
+        owner_wrapped_balance_after,
+        U256::ZERO,
+        "Recovery should drain the bot wallet of wtSTOCK \
+         (started with {owner_wrapped_balance_before}, still holding {owner_wrapped_balance_after})",
+    );
+
+    let vault_balance_after = orderbook
+        .vaultBalance2(infra.base_chain.owner, wrapped_token, equity_vault_id)
+        .call()
+        .await?;
+
+    let vault_balance_before_shares = Float::from_raw(vault_balance_before)
+        .to_fixed_decimal_lossy(18)?
+        .0;
+    let vault_balance_after_shares = Float::from_raw(vault_balance_after)
+        .to_fixed_decimal_lossy(18)?
+        .0;
+    let vault_delta_shares = vault_balance_after_shares - vault_balance_before_shares;
+
+    assert!(
+        vault_delta_shares >= owner_wrapped_balance_before,
+        "Recovery should deposit at least the wallet snapshot into the configured \
+         Raindex vault (vault delta is {vault_delta_shares}, expected at least \
+         {owner_wrapped_balance_before})",
+    );
+
+    let pool = connect_db(&infra.db_path).await?;
+    let mint_events = fetch_events_by_type(&pool, "TokenizedEquityMint").await?;
+    pool.close().await;
+
+    let seeded_mint_events: Vec<StoredEvent> = mint_events
+        .into_iter()
+        .filter(|event| event.aggregate_id == "ISS-RECOVERY-E2E")
+        .collect();
+
+    assert_event_subsequence(
+        &seeded_mint_events,
+        &[
+            "TokenizedEquityMintEvent::TokensWrapped",
+            "TokenizedEquityMintEvent::DepositedIntoRaindex",
+        ],
     );
 
     bot.abort();
