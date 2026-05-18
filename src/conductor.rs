@@ -241,14 +241,20 @@ impl Conductor {
             recovery_transfer.clone(),
             rebalancing_service.clone(),
         ) {
-            (Some(store), Some(transfer), Some(service)) => Some(Arc::new(
-                crate::wrapped_equity_recovery::WrappedEquityRecoveryCtx {
-                    inventory: inventory.clone(),
-                    store,
-                    transfer,
-                    equity_in_progress: service.equity_in_progress.clone(),
-                },
-            )),
+            (Some(store), Some(transfer), Some(service)) => {
+                let raindex = transfer.raindex();
+                let wrapper = transfer.wrapper();
+                Some(Arc::new(
+                    crate::wrapped_equity_recovery::WrappedEquityRecoveryCtx {
+                        inventory: inventory.clone(),
+                        store,
+                        transfer,
+                        equity_in_progress: service.equity_in_progress.clone(),
+                        raindex,
+                        wrapper,
+                    },
+                ))
+            }
             _ => None,
         };
 

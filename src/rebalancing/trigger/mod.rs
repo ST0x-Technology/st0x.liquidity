@@ -14,6 +14,8 @@ pub(crate) use usdc::{
 pub(crate) struct RebalancingSchedulers {
     pub(crate) equity: EquityRebalancingCheckScheduler,
     pub(crate) usdc: UsdcRebalancingCheckScheduler,
+    pub(crate) wrapped_equity_recovery:
+        crate::wrapped_equity_recovery::WrappedEquityRecoveryJobQueue,
 }
 
 impl RebalancingSchedulers {
@@ -21,6 +23,8 @@ impl RebalancingSchedulers {
         Self {
             equity: EquityRebalancingCheckScheduler::new(pool),
             usdc: UsdcRebalancingCheckScheduler::new(pool),
+            wrapped_equity_recovery:
+                crate::wrapped_equity_recovery::WrappedEquityRecoveryJobQueue::new(pool),
         }
     }
 }
@@ -529,6 +533,8 @@ pub(crate) struct RebalancingService {
     wrapper: Arc<dyn Wrapper>,
     pub(super) equity_scheduler: EquityRebalancingCheckScheduler,
     pub(super) usdc_scheduler: UsdcRebalancingCheckScheduler,
+    pub(super) wrapped_equity_recovery_queue:
+        crate::wrapped_equity_recovery::WrappedEquityRecoveryJobQueue,
     /// Tracks symbol/quantity for in-flight mints. The initial `MintRequested`
     /// event carries this data; follow-up events don't.
     mint_tracking: Arc<RwLock<HashMap<IssuerRequestId, MintTracking>>>,
@@ -578,6 +584,7 @@ impl RebalancingService {
         let RebalancingSchedulers {
             equity: equity_scheduler,
             usdc: usdc_scheduler,
+            wrapped_equity_recovery: wrapped_equity_recovery_queue,
         } = schedulers;
         Self {
             config,
@@ -591,6 +598,7 @@ impl RebalancingService {
             wrapper,
             equity_scheduler,
             usdc_scheduler,
+            wrapped_equity_recovery_queue,
             mint_tracking: Arc::new(RwLock::new(HashMap::new())),
             redemption_tracking: Arc::new(RwLock::new(HashMap::new())),
             usdc_tracking: Arc::new(RwLock::new(HashMap::new())),
@@ -1317,6 +1325,29 @@ impl RebalancingService {
             OnchainUsdc { .. } | OffchainUsd { .. } => {
                 self.usdc_scheduler.enqueue_check().await;
             }
+            // Wrapped equity in the bot wallet (outside Raindex) triggers
+            // a recovery dispatch job per symbol with a positive balance.
+            // RAI-87.
+            BaseWalletWrappedEquity { balances, .. } => {
+                for (symbol, amount) in balances {
+                    if *amount == FractionalShares::ZERO {
+                        continue;
+                    }
+                    let mut queue = self.wrapped_equity_recovery_queue.clone();
+                    if let Err(error) = queue
+                        .push(crate::wrapped_equity_recovery::WrappedEquityRecoveryJob {
+                            symbol: symbol.clone(),
+                        })
+                        .await
+                    {
+                        warn!(
+                            target: "rebalance",
+                            %symbol, ?error,
+                            "Failed to enqueue WrappedEquityRecoveryJob",
+                        );
+                    }
+                }
+            }
             // Wallet-read USDC events update `inflight_cash` for
             // visibility but don't drive triggers here.
             // Suppression-aware re-triggering will be added once
@@ -1324,7 +1355,6 @@ impl RebalancingService {
             EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
-            | BaseWalletWrappedEquity { .. }
             // Buying power is display-only and doesn't feed venue
             // balances, so it never drives a rebalance.
             | OffchainMarginSafeBuyingPower { .. }
