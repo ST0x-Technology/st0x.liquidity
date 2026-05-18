@@ -25,6 +25,7 @@ use crate::position::Position;
 use crate::rebalancing::{RebalancingService, equity::EquityTransferServices};
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
+use crate::wrapped_equity_recovery::WrappedEquityRecovery;
 
 /// All query processors that must be created and wired when
 /// rebalancing is enabled.
@@ -44,6 +45,7 @@ pub(super) struct BuiltFrameworks {
     pub(super) redemption: Arc<Store<EquityRedemption>>,
     pub(super) usdc: Arc<Store<UsdcRebalance>>,
     pub(super) snapshot: Arc<Store<InventorySnapshot>>,
+    pub(super) wrapped_equity_recovery: Arc<Store<WrappedEquityRecovery>>,
 }
 
 impl QueryManifest {
@@ -102,6 +104,10 @@ impl QueryManifest {
             .build(())
             .await?;
 
+        let wrapped_equity_recovery = StoreBuilder::<WrappedEquityRecovery>::new(pool.clone())
+            .build(())
+            .await?;
+
         Ok(BuiltFrameworks {
             position,
             position_projection,
@@ -109,6 +115,7 @@ impl QueryManifest {
             redemption,
             usdc,
             snapshot,
+            wrapped_equity_recovery,
         })
     }
 }

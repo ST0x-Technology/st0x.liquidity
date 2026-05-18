@@ -89,6 +89,10 @@ pub(crate) fn spawn<Prov, Exec>(
     poll_status_queue: PollOrderStatusJobQueue,
     reconcile_queue: ReconcileOrderFillJobQueue,
     rejection_queue: HandleOrderRejectionJobQueue,
+    wrapped_equity_recovery_queue: crate::wrapped_equity_recovery::WrappedEquityRecoveryJobQueue,
+    wrapped_equity_recovery_ctx: Option<
+        Arc<crate::wrapped_equity_recovery::WrappedEquityRecoveryCtx>,
+    >,
     equity_check_scheduler: EquityRebalancingCheckScheduler,
     usdc_check_scheduler: UsdcRebalancingCheckScheduler,
     rebalancing_service: Option<Arc<RebalancingService>>,
@@ -247,6 +251,8 @@ where
         poll_status_queue,
         reconcile_queue,
         rejection_queue,
+        wrapped_equity_recovery_queue,
+        wrapped_equity_recovery_ctx,
         equity_check_scheduler,
         usdc_check_scheduler,
         apalis_shutdown_token,
@@ -290,6 +296,9 @@ where
     poll_status_queue: PollOrderStatusJobQueue,
     reconcile_queue: ReconcileOrderFillJobQueue,
     rejection_queue: HandleOrderRejectionJobQueue,
+    wrapped_equity_recovery_queue: crate::wrapped_equity_recovery::WrappedEquityRecoveryJobQueue,
+    wrapped_equity_recovery_ctx:
+        Option<Arc<crate::wrapped_equity_recovery::WrappedEquityRecoveryCtx>>,
     equity_check_scheduler: EquityRebalancingCheckScheduler,
     usdc_check_scheduler: UsdcRebalancingCheckScheduler,
     apalis_shutdown_token: CancellationToken,
@@ -318,6 +327,8 @@ where
             poll_status_queue,
             reconcile_queue,
             rejection_queue,
+            wrapped_equity_recovery_queue,
+            wrapped_equity_recovery_ctx,
             equity_check_scheduler,
             usdc_check_scheduler,
             apalis_shutdown_token,
@@ -339,6 +350,8 @@ where
         let failure_injector_for_equity_rebalancing_check = failure_injector.clone();
         #[cfg(any(test, feature = "test-support"))]
         let failure_injector_for_usdc_rebalancing_check = failure_injector.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let failure_injector_for_wrapped_equity_recovery = failure_injector.clone();
         let failure_notify = Arc::new(tokio::sync::Notify::new());
         let failure_notify_for_hedge = failure_notify.clone();
         let failure_notify_for_backfill = failure_notify.clone();
@@ -347,6 +360,7 @@ where
         let failure_notify_for_rejection = failure_notify.clone();
         let failure_notify_for_equity_rebalancing_check = failure_notify.clone();
         let failure_notify_for_usdc_rebalancing_check = failure_notify.clone();
+        let failure_notify_for_wrapped_equity_recovery = failure_notify.clone();
         let failure_notify_for_select = failure_notify.clone();
 
         let fail_stop = CircuitBreakerConfig::default()
@@ -359,6 +373,7 @@ where
         let fail_stop_for_rejection = fail_stop.clone();
         let fail_stop_for_equity_rebalancing_check = fail_stop.clone();
         let fail_stop_for_usdc_rebalancing_check = fail_stop.clone();
+        let fail_stop_for_wrapped_equity_recovery = fail_stop.clone();
 
         let accountant_ctx_for_backfill = accountant_ctx.clone();
 
@@ -470,6 +485,24 @@ where
                     })
             } else {
                 monitor
+            };
+
+            let apalis_monitor = if let Some(recovery_ctx) = wrapped_equity_recovery_ctx {
+                apalis_monitor.register(move |index| {
+                    build_supervised_worker!(
+                        ::<crate::wrapped_equity_recovery::WrappedEquityRecoveryCtx,
+                          crate::wrapped_equity_recovery::WrappedEquityRecoveryJob>,
+                        index,
+                        wrapped_equity_recovery_queue.clone(),
+                        recovery_ctx.clone(),
+                        fail_stop_for_wrapped_equity_recovery.clone(),
+                        failure_notify_for_wrapped_equity_recovery.clone(),
+                        #[cfg(any(test, feature = "test-support"))]
+                        failure_injector_for_wrapped_equity_recovery.clone(),
+                    )
+                })
+            } else {
+                apalis_monitor
             };
 
             let is_draining = apalis_shutdown_token.clone();
