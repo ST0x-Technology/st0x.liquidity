@@ -1028,7 +1028,6 @@ impl InventoryView {
 
     /// Returns the in-flight equity tokens observed at the given
     /// intermediate location for a symbol.
-    #[cfg(test)]
     pub(crate) fn inflight_equity_at(
         &self,
         symbol: &Symbol,
@@ -1372,11 +1371,17 @@ impl InventoryView {
     }
 
     /// Returns the aggregate ID of the in-flight mint for `symbol`, if any.
+    ///
+    /// Consumed by the wrapped-equity recovery dispatcher to load the
+    /// stalled aggregate via `Store::load`.
     pub(crate) fn active_mint(&self, symbol: &Symbol) -> Option<&IssuerRequestId> {
         self.active_mints.get(symbol)
     }
 
     /// Returns the aggregate ID of the in-flight redemption for `symbol`, if any.
+    ///
+    /// Consumed by the wrapped-equity recovery dispatcher to load the
+    /// stalled aggregate via `Store::load`.
     pub(crate) fn active_redemption(&self, symbol: &Symbol) -> Option<&RedemptionAggregateId> {
         self.active_redemptions.get(symbol)
     }

@@ -506,6 +506,19 @@ pub(crate) struct CrossVenueEquityTransfer {
 }
 
 impl CrossVenueEquityTransfer {
+    /// Returns the Raindex service handle so external dispatchers (the
+    /// wrapped-equity recovery job) can submit deposits without
+    /// re-creating a service.
+    pub(crate) fn raindex(&self) -> Arc<dyn Raindex> {
+        self.raindex.clone()
+    }
+
+    /// Returns the Wrapper service handle so external dispatchers can
+    /// resolve symbol -> wtSTOCK addresses.
+    pub(crate) fn wrapper(&self) -> Arc<dyn Wrapper> {
+        self.wrapper.clone()
+    }
+
     pub(crate) fn new(
         raindex: Arc<dyn Raindex>,
         tokenizer: Arc<dyn Tokenizer>,
