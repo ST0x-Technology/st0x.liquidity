@@ -1552,17 +1552,17 @@ impl InventoryView {
                 })
             }
 
-            OffchainMarginSafeBuyingPower {
-                margin_safe_buying_power_cents,
+            OffchainCashBuyingPower {
+                cash_buying_power_cents,
                 ..
             } => {
                 debug!(
                     target: "inventory",
-                    ?margin_safe_buying_power_cents,
-                    "apply_snapshot_event: OffchainMarginSafeBuyingPower"
+                    ?cash_buying_power_cents,
+                    "apply_snapshot_event: OffchainCashBuyingPower"
                 );
                 Ok(Self {
-                    buying_power_cents: *margin_safe_buying_power_cents,
+                    buying_power_cents: *cash_buying_power_cents,
                     ..self
                 })
             }
@@ -1702,11 +1702,11 @@ impl InventoryView {
                 })
             }
 
-            OffchainMarginSafeBuyingPower {
-                margin_safe_buying_power_cents,
+            OffchainCashBuyingPower {
+                cash_buying_power_cents,
                 ..
             } => Ok(Self {
-                buying_power_cents: *margin_safe_buying_power_cents,
+                buying_power_cents: *cash_buying_power_cents,
                 ..self
             }),
 

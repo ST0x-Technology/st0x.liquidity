@@ -40,7 +40,9 @@ pub struct UsdcInventory {
     /// Gross offchain USD balance before cash reserve subtraction.
     #[ts(type = "string | null")]
     pub offchain_gross: Option<Usdc>,
-    /// Margin-safe buying power from the offchain broker, formatted as USD string.
+    /// Cash buying power from the offchain broker (Alpaca's `cash` field --
+    /// includes unsettled T+1 equity-sale proceeds, excludes margin),
+    /// formatted as USD string.
     pub buying_power: Option<String>,
     /// USDC observed at intermediate wallet locations between venues.
     pub inflight_cash: InFlightCash,

@@ -24,7 +24,8 @@ markets by providing continuous two-sided liquidity.
 - **Fractional Share Support**: Executes fractional shares on Alpaca; dry-run
   mirrors the same execution model for testing
 - **Alpaca Hedge Preflight**: Checks available offchain shares for sells and
-  margin-safe buying power for buys before submitting Alpaca hedge orders
+  cash buying power for buys (includes unsettled T+1 equity-sale proceeds,
+  excludes margin) before submitting Alpaca hedge orders
 - **Serialized Counter-Trade Submission**: Within one bot process, queued and
   periodic hedge submissions share a lock and reserve budget against active
   offchain orders before placing new Alpaca counter-trades

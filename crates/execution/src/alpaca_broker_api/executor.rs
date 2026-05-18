@@ -209,7 +209,7 @@ impl Executor for AlpacaBrokerApi {
                     self.counter_trade_slippage_bps,
                 )?;
 
-                let available_buying_power_cents = account_funds.margin_safe_buying_power_cents;
+                let available_buying_power_cents = account_funds.cash_buying_power_cents;
                 let preflight = buying_power_counter_trade_preflight(
                     estimated_cost_cents,
                     available_buying_power_cents,
@@ -349,7 +349,8 @@ mod tests {
     };
     use crate::alpaca_broker_api::order::AlpacaLimitPrice;
     use crate::{
-        CounterTradePreflight, CounterTradeSkipReason, Direction, FractionalShares, Positive, Usd,
+        CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason, Direction,
+        FractionalShares, Positive, Usd,
     };
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
@@ -676,7 +677,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_preflight_counter_trade_skips_buy_without_margin_safe_buying_power() {
+    async fn test_preflight_counter_trade_skips_buy_without_cash() {
         let server = MockServer::start();
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
@@ -688,8 +689,7 @@ mod tests {
                 .json_body(json!({
                     "id": "904837e3-3b76-47ec-b432-046db621571b",
                     "status": "ACTIVE",
-                    "cash": "1000.00",
-                    "non_marginable_buying_power": "100.00"
+                    "cash": "100.00"
                 }));
         });
         let latest_trade_mock = create_latest_trade_mock(&server, "100.00");
@@ -712,6 +712,52 @@ mod tests {
                 estimated_cost_cents,
                 available_buying_power_cents,
             }) if estimated_cost_cents == 20_200 && available_buying_power_cents == 10_000
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_preflight_counter_trade_allows_buy_using_unsettled_proceeds() {
+        // Verifies the policy from adrs/1-cash-bp-for-equity-hedges.md: cash
+        // (which includes unsettled T+1 equity-sale proceeds) is the budget,
+        // not non_marginable_buying_power. Here NM-BP would have rejected the
+        // buy, but cash covers it -- so the preflight allows it.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let account_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "status": "ACTIVE",
+                    "cash": "35000.00",
+                    "non_marginable_buying_power": "31.55"
+                }));
+        });
+        let latest_trade_mock = create_latest_trade_mock(&server, "100.00");
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        let preflight = executor
+            .preflight_counter_trade(MarketOrder {
+                symbol: Symbol::new("AAPL").unwrap(),
+                shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
+                direction: Direction::Buy,
+            })
+            .await
+            .unwrap();
+
+        account_mock.assert_calls(2);
+        latest_trade_mock.assert();
+        assert!(matches!(
+            preflight,
+            CounterTradePreflight::Allowed {
+                reservation: Some(CounterTradeReservation::BuyingPower {
+                    estimated_cost_cents,
+                    available_buying_power_cents,
+                }),
+            } if estimated_cost_cents == 20_200 && available_buying_power_cents == 3_500_000
         ));
     }
 

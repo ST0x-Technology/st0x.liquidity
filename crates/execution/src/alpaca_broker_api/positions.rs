@@ -16,7 +16,7 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct AccountFunds {
     pub(super) cash_balance_cents: i64,
-    pub(super) margin_safe_buying_power_cents: i64,
+    pub(super) cash_buying_power_cents: i64,
 }
 
 /// Position response from Alpaca Broker API.
@@ -50,18 +50,12 @@ impl std::fmt::Debug for PositionResponse {
 struct AccountDetailsResponse {
     #[serde(deserialize_with = "deserialize_float_from_number_or_string")]
     cash: Float,
-    #[serde(deserialize_with = "deserialize_float_from_number_or_string")]
-    non_marginable_buying_power: Float,
 }
 
 impl std::fmt::Debug for AccountDetailsResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AccountDetailsResponse")
             .field("cash", &DebugFloat(&self.cash))
-            .field(
-                "non_marginable_buying_power",
-                &DebugFloat(&self.non_marginable_buying_power),
-            )
             .finish()
     }
 }
@@ -115,7 +109,7 @@ pub(super) async fn fetch_inventory(
     Ok(Inventory {
         positions: broker_positions,
         usd_balance_cents: account_funds.cash_balance_cents,
-        margin_safe_buying_power_cents: Some(account_funds.margin_safe_buying_power_cents),
+        cash_buying_power_cents: Some(account_funds.cash_buying_power_cents),
     })
 }
 
@@ -124,12 +118,10 @@ pub(super) async fn get_account_funds(
 ) -> Result<AccountFunds, AlpacaBrokerApiError> {
     let account = get_account_details(client).await?;
     let cash_balance_cents = to_cash_value_cents(account.cash)?;
-    let margin_safe_buying_power_cents =
-        to_cash_value_cents(account.non_marginable_buying_power)?.min(cash_balance_cents);
 
     Ok(AccountFunds {
         cash_balance_cents,
-        margin_safe_buying_power_cents,
+        cash_buying_power_cents: cash_balance_cents,
     })
 }
 
@@ -256,8 +248,7 @@ mod tests {
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
-                    "cash": "50000.00",
-                    "non_marginable_buying_power": "50000.00"
+                    "cash": "50000.00"
                 }));
         });
 
@@ -269,7 +260,7 @@ mod tests {
 
         assert_eq!(state.positions.len(), 2);
         assert_eq!(state.usd_balance_cents, 5_000_000);
-        assert_eq!(state.margin_safe_buying_power_cents, Some(5_000_000));
+        assert_eq!(state.cash_buying_power_cents, Some(5_000_000));
 
         let aapl = state
             .positions
@@ -302,8 +293,7 @@ mod tests {
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
-                    "cash": "100000.00",
-                    "non_marginable_buying_power": "100000.00"
+                    "cash": "100000.00"
                 }));
         });
 
@@ -315,7 +305,7 @@ mod tests {
 
         assert!(state.positions.is_empty());
         assert_eq!(state.usd_balance_cents, 10_000_000);
-        assert_eq!(state.margin_safe_buying_power_cents, Some(10_000_000));
+        assert_eq!(state.cash_buying_power_cents, Some(10_000_000));
     }
 
     #[tokio::test]
@@ -343,8 +333,7 @@ mod tests {
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
-                    "cash": "50000.00",
-                    "non_marginable_buying_power": "50000.00"
+                    "cash": "50000.00"
                 }));
         });
 
@@ -382,8 +371,7 @@ mod tests {
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
-                    "cash": "50000.00",
-                    "non_marginable_buying_power": "50000.00"
+                    "cash": "50000.00"
                 }));
         });
 
@@ -427,8 +415,7 @@ mod tests {
                 .header("content-type", "application/json")
                 .json_body(json!({
                     // 0.001 fractional cents after multiplying by 100
-                    "cash": "100.001",
-                    "non_marginable_buying_power": "100.001"
+                    "cash": "100.001"
                 }));
         });
 
@@ -466,8 +453,7 @@ mod tests {
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
-                    "cash": "50000.00",
-                    "non_marginable_buying_power": "50000.00"
+                    "cash": "50000.00"
                 }));
         });
 
@@ -513,8 +499,7 @@ mod tests {
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
-                    "cash": "50000.00",
-                    "non_marginable_buying_power": "50000.00"
+                    "cash": "50000.00"
                 }));
         });
 
@@ -535,7 +520,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_inventory_requires_non_marginable_buying_power() {
+    async fn fetch_inventory_requires_cash() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([]));
+        });
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({}));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let error = fetch_inventory(&client).await.unwrap_err();
+
+        assert!(matches!(error, AlpacaBrokerApiError::HttpClient(_)));
+    }
+
+    #[tokio::test]
+    async fn fetch_inventory_uses_cash_for_buying_power_ignoring_non_marginable() {
+        // Reproduces the production MSTR scenario from
+        // adrs/1-cash-bp-for-equity-hedges.md: NM-BP lags behind cash after a
+        // recent equity sale because the proceeds haven't settled. We now
+        // report `cash` directly as the equity buying power, so the hedge
+        // proceeds without waiting for T+1 settlement.
         let server = MockServer::start();
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
@@ -553,14 +570,16 @@ mod tests {
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
-                    "cash": "50000.00"
+                    "cash": "35000.00",
+                    "non_marginable_buying_power": "31.55"
                 }));
         });
 
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
-        let error = fetch_inventory(&client).await.unwrap_err();
+        let inventory = fetch_inventory(&client).await.unwrap();
 
-        assert!(matches!(error, AlpacaBrokerApiError::HttpClient(_)));
+        assert_eq!(inventory.usd_balance_cents, 3_500_000);
+        assert_eq!(inventory.cash_buying_power_cents, Some(3_500_000));
     }
 
     #[tokio::test]
@@ -598,8 +617,7 @@ mod tests {
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
-                    "cash": "10000.00",
-                    "non_marginable_buying_power": "10000.00"
+                    "cash": "10000.00"
                 }));
         });
 

@@ -365,7 +365,7 @@ mod tests {
                 market_value: Some(Float::parse("15000".to_string()).unwrap()),
             }],
             usd_balance_cents: 5_000_000,
-            margin_safe_buying_power_cents: Some(5_000_000),
+            cash_buying_power_cents: Some(5_000_000),
         };
 
         let executor = MockExecutor::new().with_inventory(inventory.clone());
@@ -378,7 +378,7 @@ mod tests {
                 assert_eq!(fetched.positions[0].symbol, Symbol::new("AAPL").unwrap());
                 assert_eq!(fetched.positions[0].quantity, shares("100"));
                 assert_eq!(fetched.usd_balance_cents, 5_000_000);
-                assert_eq!(fetched.margin_safe_buying_power_cents, Some(5_000_000));
+                assert_eq!(fetched.cash_buying_power_cents, Some(5_000_000));
             }
             InventoryResult::Unimplemented => {
                 panic!("Expected Fetched, got Unimplemented")
@@ -401,7 +401,7 @@ mod tests {
         let inventory = crate::Inventory {
             positions: vec![],
             usd_balance_cents: 10_000,
-            margin_safe_buying_power_cents: Some(10_000),
+            cash_buying_power_cents: Some(10_000),
         };
 
         let executor = MockExecutor::new().with_inventory(inventory);
@@ -415,7 +415,7 @@ mod tests {
         let executor = MockExecutor::new().with_inventory(crate::Inventory {
             positions: vec![],
             usd_balance_cents: 50_000,
-            margin_safe_buying_power_cents: Some(50_000),
+            cash_buying_power_cents: Some(50_000),
         });
 
         let preflight = executor
@@ -445,7 +445,7 @@ mod tests {
                 market_value: None,
             }],
             usd_balance_cents: 50_000,
-            margin_safe_buying_power_cents: Some(50_000),
+            cash_buying_power_cents: Some(50_000),
         });
 
         let preflight = executor
@@ -480,7 +480,7 @@ mod tests {
                 market_value: None,
             }],
             usd_balance_cents: 50_000,
-            margin_safe_buying_power_cents: Some(50_000),
+            cash_buying_power_cents: Some(50_000),
         });
 
         let preflight = executor
@@ -507,7 +507,7 @@ mod tests {
             .with_inventory(crate::Inventory {
                 positions: vec![],
                 usd_balance_cents: 10_000,
-                margin_safe_buying_power_cents: Some(10_000),
+                cash_buying_power_cents: Some(10_000),
             })
             .with_preflight_price(float!(100));
 

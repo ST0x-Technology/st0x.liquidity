@@ -1215,7 +1215,7 @@ async fn cash_reserve_shifts_offchain_balance_triggering_base_to_alpaca() {
     let executor = MockExecutor::new().with_inventory(ExecutorInventory {
         positions: vec![],
         usd_balance_cents: 50_000,
-        margin_safe_buying_power_cents: Some(50_000),
+        cash_buying_power_cents: Some(50_000),
     });
 
     let asserter = Asserter::new();
