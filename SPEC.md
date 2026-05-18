@@ -1903,6 +1903,148 @@ Base to Alpaca:
 - **Total rebalancing time**: Dominated by Alpaca deposit/withdrawal (~minutes)
   rather than bridge time
 
+#### WrappedEquityRecovery Aggregate
+
+**Purpose**: Records every automated recovery action triggered by detecting
+wrapped equity tokens (wtSTOCK) on the Base wallet outside the Raindex vault.
+Provides a first-class audit trail for in-flight capital that the normal
+transfer flow couldn't deliver to its destination -- whether because an
+underlying `TokenizedEquityMint`/`EquityRedemption` stalled at an intermediate
+state or because the tokens arrived at the wallet without an in-flight transfer
+to attribute them to (e.g. external deposit, prior-process crash after
+compaction).
+
+**Trigger**: The inventory polling job emits
+`InventorySnapshotEvent::BaseWalletWrappedEquity { balances }` whenever it
+observes wtSTOCK in the bot wallet outside Raindex. The rebalancing reactor
+consumes the event and enqueues one `WrappedEquityRecoveryJob { symbol }` per
+symbol with a positive balance. The job is the single place that decides which
+recovery path applies and drives it through this aggregate.
+
+**Aggregate ID**: `WrappedEquityRecoveryId(Uuid)` — a fresh UUID per detection
+event. Multiple recoveries for the same symbol are independent aggregates.
+
+**Services**: `WrappedEquityRecoveryServices { raindex: Arc<dyn Raindex> }` —
+only the orphan deposit path needs to call out to a service. The active
+mint/redemption paths only record the dispatch decision; the underlying
+`TokenizedEquityMint` or `EquityRedemption` aggregate continues to own the
+physical work and its own audit trail.
+
+##### State Flow
+
+```mermaid
+stateDiagram-v2
+    [*] --> Detected: Detect (records symbol + shares)
+    Detected --> DispatchedToMint: DispatchToMint (active mint found)
+    Detected --> DispatchedToRedemption: DispatchToRedemption (active redemption found)
+    Detected --> OrphanDepositSubmitted: SubmitOrphanDeposit (no active transfer)
+    OrphanDepositSubmitted --> OrphanDeposited: ConfirmOrphanDeposit
+    DispatchedToMint --> Completed: CompleteRecovery
+    DispatchedToRedemption --> Completed: CompleteRecovery
+    OrphanDeposited --> Completed: CompleteRecovery
+    Detected --> Failed: FailRecovery
+    DispatchedToMint --> Failed: FailRecovery
+    DispatchedToRedemption --> Failed: FailRecovery
+    OrphanDepositSubmitted --> Failed: FailRecovery
+```
+
+- `Detect` is the initialization command and records the trigger (symbol,
+  wrapped share quantity, detected_at). The job sends it as soon as it observes
+  a non-zero balance for the symbol.
+- `DispatchToMint` / `DispatchToRedemption` record the dispatch decision when
+  the inventory view shows an active aggregate the recovery can resume. The job
+  then calls the existing `CrossVenueEquityTransfer::resume_mint` /
+  `resume_redemption`; the audit trail for the actual deposit/unwrap lives on
+  the underlying aggregate's event stream.
+- `SubmitOrphanDeposit` runs only when no active mint or redemption is
+  attributable to the symbol. The aggregate's `Services` calls
+  `Raindex::submit_deposit` and the event records the resulting tx hash.
+- `ConfirmOrphanDeposit` waits for the deposit to be mined and records
+  confirmation. After confirmation `CompleteRecovery` moves the aggregate to
+  `Completed`.
+- `CompleteRecovery` and `FailRecovery` are explicit terminal transitions.
+  `Completed` carries a `RecoveryOutcome` enum identifying which path was taken.
+  `Failed` carries the reason for downstream investigation.
+
+##### States
+
+```rust
+enum WrappedEquityRecovery {
+    Detected { symbol, shares, detected_at },
+    DispatchedToMint { symbol, shares, detected_at, mint_id, dispatched_at },
+    DispatchedToRedemption {
+        symbol, shares, detected_at, redemption_id, dispatched_at,
+    },
+    OrphanDepositSubmitted {
+        symbol, shares, detected_at,
+        vault_deposit_tx_hash, submitted_at,
+    },
+    OrphanDeposited {
+        symbol, shares, detected_at,
+        vault_deposit_tx_hash, submitted_at, deposited_at,
+    },
+    Completed { symbol, shares, outcome, completed_at },
+    Failed { symbol, shares, reason, failed_at },
+}
+
+enum RecoveryOutcome {
+    MintResumed { mint_id },
+    RedemptionResumed { redemption_id },
+    OrphanDeposited { vault_deposit_tx_hash },
+}
+```
+
+##### Commands
+
+```rust
+enum WrappedEquityRecoveryCommand {
+    Detect { symbol, shares },
+    DispatchToMint { mint_id },
+    DispatchToRedemption { redemption_id },
+    SubmitOrphanDeposit,                       // services.raindex.submit_deposit
+    ConfirmOrphanDeposit { vault_deposit_tx_hash },
+    CompleteRecovery { outcome },
+    FailRecovery { reason },
+}
+```
+
+##### Events
+
+```rust
+enum WrappedEquityRecoveryEvent {
+    Detected { symbol, shares, detected_at },
+    DispatchedToMint { mint_id, dispatched_at },
+    DispatchedToRedemption { redemption_id, dispatched_at },
+    OrphanDepositSubmitted { vault_deposit_tx_hash, submitted_at },
+    OrphanDeposited { vault_deposit_tx_hash, deposited_at },
+    RecoveryCompleted { outcome, completed_at },
+    RecoveryFailed { reason, failed_at },
+}
+```
+
+##### Business Rules
+
+- `Detect` only initializes; subsequent `Detect` commands on a live aggregate
+  are rejected. Each polling-triggered recovery creates its own aggregate.
+- `DispatchToMint` / `DispatchToRedemption` are only valid from `Detected` and
+  are mutually exclusive — at most one is dispatched per recovery.
+- `SubmitOrphanDeposit` is only valid from `Detected` and runs the side effect
+  inside the command handler so the event is emitted iff the deposit was
+  submitted onchain.
+- `ConfirmOrphanDeposit` is only valid from `OrphanDepositSubmitted` and only
+  succeeds after the confirmation count required by the onchain config.
+- `CompleteRecovery` is valid from any non-terminal state where the dispatched
+  work has succeeded.
+- `Completed` and `Failed` are terminal states.
+
+##### Concurrency
+
+The job claims the same `equity_in_progress` guard the normal rebalancing
+trigger uses. If another task is already driving the symbol's transfer the
+recovery job logs at debug and exits without writing an aggregate; the next
+polling tick re-evaluates. This keeps the recovery dispatch from racing the
+mint/redemption tasks already driven by apalis.
+
 #### Rebalancing Triggers
 
 ##### Inventory Tracking
