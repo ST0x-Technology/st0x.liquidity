@@ -43,6 +43,7 @@ let
         # the activation script exits non-zero and deploy-rs rolls back.
         "${cfg.profilePath}/bin/validate-config --config ${cfg.configPath} --secrets ${cfg.decryptedSecretPath}"
         "(chown st0x:st0x /mnt/data/*.db /mnt/data/*.db-wal /mnt/data/*.db-shm /mnt/data/*.db-journal 2>/dev/null || true)"
+        "(chown -R st0x:st0x /mnt/data/logs 2>/dev/null || true)"
         "echo '${gitRev}' > /run/st0x/${name}.git-rev"
         "touch ${cfg.markerFile}"
         "systemctl restart ${name}"
