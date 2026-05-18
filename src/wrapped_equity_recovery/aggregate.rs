@@ -114,11 +114,11 @@ pub(crate) enum WrappedEquityRecoveryCommand {
     DispatchToRedemption {
         redemption_id: RedemptionAggregateId,
     },
-    /// Orphan path. Submits the Raindex deposit via `Services::raindex`.
-    /// Side effect runs inside the handler so the event is emitted iff
-    /// the deposit was actually submitted onchain.
-    SubmitOrphanDeposit,
-    /// Orphan path. Waits for the deposit transaction to confirm.
+    /// Orphan path. Records that the job submitted a Raindex deposit and
+    /// captures the tx hash. The job submits the tx onchain before
+    /// emitting this command -- the aggregate is a pure event recorder.
+    SubmitOrphanDeposit { vault_deposit_tx_hash: TxHash },
+    /// Orphan path. Records that the deposit tx confirmed.
     ConfirmOrphanDeposit { vault_deposit_tx_hash: TxHash },
     /// Closes the recovery with the dispatched-or-deposited outcome.
     CompleteRecovery { outcome: RecoveryOutcome },
@@ -245,27 +245,220 @@ impl EventSourced for WrappedEquityRecovery {
     const PROJECTION: Nil = Nil;
     const SCHEMA_VERSION: u64 = 1;
 
-    fn originate(_event: &Self::Event) -> Option<Self> {
-        todo!("originate WrappedEquityRecovery from Detected event")
+    fn originate(event: &Self::Event) -> Option<Self> {
+        match event {
+            WrappedEquityRecoveryEvent::Detected {
+                symbol,
+                shares,
+                detected_at,
+            } => Some(Self::Detected {
+                symbol: symbol.clone(),
+                shares: *shares,
+                detected_at: *detected_at,
+            }),
+            _ => None,
+        }
     }
 
-    fn evolve(_entity: &Self, _event: &Self::Event) -> Result<Option<Self>, Self::Error> {
-        todo!("evolve WrappedEquityRecovery across state transitions")
+    #[allow(clippy::too_many_lines)]
+    fn evolve(entity: &Self, event: &Self::Event) -> Result<Option<Self>, Self::Error> {
+        use WrappedEquityRecoveryEvent::*;
+
+        Ok(match (entity, event) {
+            (
+                Self::Detected {
+                    symbol,
+                    shares,
+                    detected_at,
+                },
+                DispatchedToMint {
+                    mint_id,
+                    dispatched_at,
+                },
+            ) => Some(Self::DispatchedToMint {
+                symbol: symbol.clone(),
+                shares: *shares,
+                detected_at: *detected_at,
+                mint_id: mint_id.clone(),
+                dispatched_at: *dispatched_at,
+            }),
+            (
+                Self::Detected {
+                    symbol,
+                    shares,
+                    detected_at,
+                },
+                DispatchedToRedemption {
+                    redemption_id,
+                    dispatched_at,
+                },
+            ) => Some(Self::DispatchedToRedemption {
+                symbol: symbol.clone(),
+                shares: *shares,
+                detected_at: *detected_at,
+                redemption_id: redemption_id.clone(),
+                dispatched_at: *dispatched_at,
+            }),
+            (
+                Self::Detected {
+                    symbol,
+                    shares,
+                    detected_at,
+                },
+                OrphanDepositSubmitted {
+                    vault_deposit_tx_hash,
+                    submitted_at,
+                },
+            ) => Some(Self::OrphanDepositSubmitted {
+                symbol: symbol.clone(),
+                shares: *shares,
+                detected_at: *detected_at,
+                vault_deposit_tx_hash: *vault_deposit_tx_hash,
+                submitted_at: *submitted_at,
+            }),
+            (
+                Self::OrphanDepositSubmitted {
+                    symbol,
+                    shares,
+                    detected_at,
+                    submitted_at,
+                    ..
+                },
+                OrphanDeposited {
+                    vault_deposit_tx_hash,
+                    deposited_at,
+                },
+            ) => Some(Self::OrphanDeposited {
+                symbol: symbol.clone(),
+                shares: *shares,
+                detected_at: *detected_at,
+                vault_deposit_tx_hash: *vault_deposit_tx_hash,
+                submitted_at: *submitted_at,
+                deposited_at: *deposited_at,
+            }),
+            (
+                Self::DispatchedToMint { symbol, shares, .. }
+                | Self::DispatchedToRedemption { symbol, shares, .. }
+                | Self::OrphanDeposited { symbol, shares, .. },
+                RecoveryCompleted {
+                    outcome,
+                    completed_at,
+                },
+            ) => Some(Self::Completed {
+                symbol: symbol.clone(),
+                shares: *shares,
+                outcome: outcome.clone(),
+                completed_at: *completed_at,
+            }),
+            (
+                Self::Detected { symbol, shares, .. }
+                | Self::DispatchedToMint { symbol, shares, .. }
+                | Self::DispatchedToRedemption { symbol, shares, .. }
+                | Self::OrphanDepositSubmitted { symbol, shares, .. }
+                | Self::OrphanDeposited { symbol, shares, .. },
+                RecoveryFailed { reason, failed_at },
+            ) => Some(Self::Failed {
+                symbol: symbol.clone(),
+                shares: *shares,
+                reason: reason.clone(),
+                failed_at: *failed_at,
+            }),
+            _ => None,
+        })
     }
 
     async fn initialize(
-        _command: Self::Command,
+        command: Self::Command,
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
-        todo!("initialize: only `Detect` is valid here")
+        match command {
+            WrappedEquityRecoveryCommand::Detect { symbol, shares } => {
+                Ok(vec![WrappedEquityRecoveryEvent::Detected {
+                    symbol,
+                    shares,
+                    detected_at: Utc::now(),
+                }])
+            }
+            WrappedEquityRecoveryCommand::DispatchToMint { .. }
+            | WrappedEquityRecoveryCommand::DispatchToRedemption { .. }
+            | WrappedEquityRecoveryCommand::SubmitOrphanDeposit { .. }
+            | WrappedEquityRecoveryCommand::ConfirmOrphanDeposit { .. }
+            | WrappedEquityRecoveryCommand::CompleteRecovery { .. }
+            | WrappedEquityRecoveryCommand::FailRecovery { .. } => {
+                Err(WrappedEquityRecoveryError::InvalidTransition {
+                    state: "Uninitialized".to_string(),
+                })
+            }
+        }
     }
 
     async fn transition(
         &self,
-        _command: Self::Command,
+        command: Self::Command,
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
-        todo!("transition: route command based on (state, command)")
+        use WrappedEquityRecoveryCommand::*;
+
+        let now = Utc::now();
+        match (self, command) {
+            (Self::Completed { .. } | Self::Failed { .. }, _) => {
+                Err(WrappedEquityRecoveryError::Terminal)
+            }
+            (_, Detect { .. }) => Err(WrappedEquityRecoveryError::AlreadyInitialized),
+            (Self::Detected { .. }, DispatchToMint { mint_id }) => {
+                Ok(vec![WrappedEquityRecoveryEvent::DispatchedToMint {
+                    mint_id,
+                    dispatched_at: now,
+                }])
+            }
+            (Self::Detected { .. }, DispatchToRedemption { redemption_id }) => {
+                Ok(vec![WrappedEquityRecoveryEvent::DispatchedToRedemption {
+                    redemption_id,
+                    dispatched_at: now,
+                }])
+            }
+            (
+                Self::Detected { .. },
+                SubmitOrphanDeposit {
+                    vault_deposit_tx_hash,
+                },
+            ) => Ok(vec![WrappedEquityRecoveryEvent::OrphanDepositSubmitted {
+                vault_deposit_tx_hash,
+                submitted_at: now,
+            }]),
+            (
+                Self::OrphanDepositSubmitted { .. },
+                ConfirmOrphanDeposit {
+                    vault_deposit_tx_hash,
+                },
+            ) => Ok(vec![WrappedEquityRecoveryEvent::OrphanDeposited {
+                vault_deposit_tx_hash,
+                deposited_at: now,
+            }]),
+            (
+                Self::DispatchedToMint { .. }
+                | Self::DispatchedToRedemption { .. }
+                | Self::OrphanDeposited { .. },
+                CompleteRecovery { outcome },
+            ) => Ok(vec![WrappedEquityRecoveryEvent::RecoveryCompleted {
+                outcome,
+                completed_at: now,
+            }]),
+            (
+                Self::Detected { .. }
+                | Self::DispatchedToMint { .. }
+                | Self::DispatchedToRedemption { .. }
+                | Self::OrphanDepositSubmitted { .. }
+                | Self::OrphanDeposited { .. },
+                FailRecovery { reason },
+            ) => Ok(vec![WrappedEquityRecoveryEvent::RecoveryFailed {
+                reason,
+                failed_at: now,
+            }]),
+            (state, _) => Err(WrappedEquityRecoveryError::InvalidTransition {
+                state: format!("{state:?}"),
+            }),
+        }
     }
 }
 
@@ -387,7 +580,12 @@ mod tests {
         let services = services();
 
         let events = detected
-            .transition(WrappedEquityRecoveryCommand::SubmitOrphanDeposit, &services)
+            .transition(
+                WrappedEquityRecoveryCommand::SubmitOrphanDeposit {
+                    vault_deposit_tx_hash: fake_tx_hash(),
+                },
+                &services,
+            )
             .await
             .expect("SubmitOrphanDeposit should succeed from Detected");
 
