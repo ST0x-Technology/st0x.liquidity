@@ -74,6 +74,10 @@ use crate::vault_registry::{
     SeedVaultRegistry, SeedVaultRegistryCtx, SeedVaultRegistryJobQueue, VaultRegistry,
     VaultRegistryCommand, VaultRegistryId,
 };
+use crate::wrapped_equity_recovery::{
+    WrappedEquityRecovery, WrappedEquityRecoveryCtx, WrappedEquityRecoveryJobQueue,
+    WrappedEquityRecoveryServices,
+};
 use crate::wrapper::WrapperService;
 
 pub(crate) use builder::CqrsFrameworks;
@@ -198,6 +202,9 @@ impl Conductor {
             tokenizer,
             service: rebalancing_service,
             recovery_transfer,
+            wrapped_equity_recovery_store,
+            mint_store,
+            redemption_store,
         } = PositionAndRebalancing::setup(
             rebalancing,
             &ctx,
@@ -242,6 +249,25 @@ impl Conductor {
         let mut poll_status_queue = PollOrderStatusJobQueue::new(&pool);
         let reconcile_queue = ReconcileOrderFillJobQueue::new(&pool);
         let rejection_queue = HandleOrderRejectionJobQueue::new(&pool);
+        let wrapped_equity_recovery_queue = WrappedEquityRecoveryJobQueue::new(&pool);
+
+        let wrapped_equity_recovery_ctx = match (
+            wrapped_equity_recovery_store,
+            rebalancing_service.clone(),
+            mint_store,
+            redemption_store,
+        ) {
+            (Some(store), Some(service), Some(mint_store), Some(redemption_store)) => {
+                Some(Arc::new(WrappedEquityRecoveryCtx {
+                    inventory: inventory.clone(),
+                    store,
+                    mint_store,
+                    redemption_store,
+                    equity_in_progress: service.equity_in_progress.clone(),
+                }))
+            }
+            _ => None,
+        };
 
         recover_submitted_offchain_orders(
             &frameworks.offchain_order_projection,
@@ -282,6 +308,8 @@ impl Conductor {
             .poll_status_queue(poll_status_queue)
             .reconcile_queue(reconcile_queue)
             .rejection_queue(rejection_queue)
+            .wrapped_equity_recovery_queue(wrapped_equity_recovery_queue)
+            .maybe_wrapped_equity_recovery_ctx(wrapped_equity_recovery_ctx)
             .equity_check_scheduler(schedulers.equity)
             .usdc_check_scheduler(schedulers.usdc)
             .maybe_rebalancing_service(rebalancing_service)
@@ -571,6 +599,9 @@ struct RebalancingInfrastructure {
     tokenizer: Arc<dyn Tokenizer>,
     service: Arc<RebalancingService>,
     recovery_transfer: Arc<CrossVenueEquityTransfer>,
+    wrapped_equity_recovery_store: Arc<Store<WrappedEquityRecovery>>,
+    mint_store: Arc<Store<TokenizedEquityMint>>,
+    redemption_store: Arc<Store<EquityRedemption>>,
 }
 
 /// Shared infrastructure dependencies needed to spawn rebalancing.
@@ -599,6 +630,9 @@ struct PositionAndRebalancing {
     tokenizer: Option<Arc<dyn Tokenizer>>,
     service: Option<Arc<RebalancingService>>,
     recovery_transfer: Option<Arc<CrossVenueEquityTransfer>>,
+    wrapped_equity_recovery_store: Option<Arc<Store<WrappedEquityRecovery>>>,
+    mint_store: Option<Arc<Store<TokenizedEquityMint>>>,
+    redemption_store: Option<Arc<Store<EquityRedemption>>>,
 }
 
 impl PositionAndRebalancing {
@@ -651,6 +685,9 @@ impl PositionAndRebalancing {
                 tokenizer: Some(infra.tokenizer),
                 service: Some(infra.service),
                 recovery_transfer: Some(infra.recovery_transfer),
+                wrapped_equity_recovery_store: Some(infra.wrapped_equity_recovery_store),
+                mint_store: Some(infra.mint_store),
+                redemption_store: Some(infra.redemption_store),
             })
         } else {
             let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
@@ -674,6 +711,9 @@ impl PositionAndRebalancing {
                 tokenizer: None,
                 service: None,
                 recovery_transfer: None,
+                wrapped_equity_recovery_store: None,
+                mint_store: None,
+                redemption_store: None,
             })
         }
     }
@@ -783,6 +823,18 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             built.redemption.clone(),
         ));
 
+        // Built outside `QueryManifest` because the recovery aggregate's
+        // services include `recovery_transfer`, which depends on the
+        // mint/redemption stores produced by the manifest above.
+        let wrapped_equity_recovery_store =
+            StoreBuilder::<WrappedEquityRecovery>::new(deps.pool.clone())
+                .build(WrappedEquityRecoveryServices {
+                    raindex: raindex_service.clone(),
+                    wrapper: wrapper.clone(),
+                    transfer: recovery_transfer.clone(),
+                })
+                .await?;
+
         recover_interrupted_tokenization_aggregates(
             &deps.pool,
             &rebalancing_service,
@@ -826,6 +878,9 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             .and_then(|cash| cash.vault_ids.first().copied())
             .ok_or(CtxError::MissingCashVaultId)?;
 
+        let mint_store = frameworks.mint.clone();
+        let redemption_store = frameworks.redemption.clone();
+
         let (handle, rebalancer_shutdown_token) = services.spawn(
             market_maker_wallet,
             RaindexVaultId(usdc_vault_id),
@@ -844,6 +899,9 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             tokenizer,
             service: rebalancing_service,
             recovery_transfer,
+            wrapped_equity_recovery_store,
+            mint_store,
+            redemption_store,
         })
     })
 }

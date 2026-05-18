@@ -829,6 +829,25 @@ pub(crate) enum EquityRedemption {
 }
 
 impl EquityRedemption {
+    /// Returns the requested quantity carried by the aggregate in every
+    /// state. Wrapped-equity recovery compares this against the wallet
+    /// snapshot so an audit mismatch surfaces before dispatch.
+    pub(crate) fn quantity(&self) -> Float {
+        match self {
+            Self::VaultWithdrawPending { quantity, .. }
+            | Self::VaultWithdrawSubmitted { quantity, .. }
+            | Self::WithdrawnFromRaindex { quantity, .. }
+            | Self::UnwrapPending { quantity, .. }
+            | Self::UnwrapSubmitted { quantity, .. }
+            | Self::TokensUnwrapped { quantity, .. }
+            | Self::SendPending { quantity, .. }
+            | Self::TokensSent { quantity, .. }
+            | Self::Pending { quantity, .. }
+            | Self::Completed { quantity, .. }
+            | Self::Failed { quantity, .. } => *quantity,
+        }
+    }
+
     pub(crate) fn to_dto(&self, id: &RedemptionAggregateId) -> TransferOperation {
         match self {
             Self::VaultWithdrawPending {

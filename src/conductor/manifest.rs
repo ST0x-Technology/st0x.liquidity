@@ -37,6 +37,10 @@ pub(super) struct QueryManifest {
 }
 
 /// Built CQRS frameworks from the wiring process.
+///
+/// `WrappedEquityRecovery` is built outside this manifest because its
+/// services include `CrossVenueEquityTransfer`, which is constructed
+/// downstream (from the `mint`/`redemption` stores this manifest produces).
 pub(super) struct BuiltFrameworks {
     pub(super) position: Arc<Store<Position>>,
     pub(super) position_projection: Arc<Projection<Position>>,

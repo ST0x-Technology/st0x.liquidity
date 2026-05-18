@@ -1056,6 +1056,22 @@ impl PartialEq for TokenizedEquityMint {
 impl Eq for TokenizedEquityMint {}
 
 impl TokenizedEquityMint {
+    /// Returns the requested quantity carried by the aggregate in every
+    /// non-terminal state. Wrapped-equity recovery compares this against the
+    /// wallet snapshot so an audit mismatch surfaces before dispatch.
+    pub(crate) fn quantity(&self) -> Float {
+        match self {
+            Self::MintRequested { quantity, .. }
+            | Self::MintAccepted { quantity, .. }
+            | Self::TokensReceived { quantity, .. }
+            | Self::WrapSubmitted { quantity, .. }
+            | Self::TokensWrapped { quantity, .. }
+            | Self::VaultDepositSubmitted { quantity, .. }
+            | Self::DepositedIntoRaindex { quantity, .. }
+            | Self::Failed { quantity, .. } => *quantity,
+        }
+    }
+
     pub(crate) fn to_dto(&self, id: &IssuerRequestId) -> TransferOperation {
         use EquityMintStatus::*;
 
