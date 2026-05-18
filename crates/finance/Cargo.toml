@@ -5,8 +5,13 @@ edition.workspace = true
 license.workspace = true
 homepage.workspace = true
 
+[features]
+default = []
+test-support = ["dep:proptest"]
+
 [dependencies]
 alloy-primitives.workspace = true
+proptest = { workspace = true, optional = true }
 rain-math-float.workspace = true
 serde = { workspace = true, features = ["derive"] }
 st0x-float-macro.workspace = true

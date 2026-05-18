@@ -8,6 +8,7 @@ default = []
 mock = ["local-signer", "dep:url", "dep:anyhow"]
 local-signer = []
 turnkey = ["dep:alloy-signer-turnkey"]
+test-support = ["dep:url"]
 
 [dependencies]
 alloy.workspace = true

@@ -25,6 +25,7 @@ use st0x_float_macro::float;
 use tokio::sync::broadcast;
 use tracing::{debug, info};
 
+use st0x_config::{BrokerCtx, Ctx};
 use st0x_dto::Statement;
 use st0x_event_sorcery::Projection;
 use st0x_evm::Wallet;
@@ -34,7 +35,6 @@ use st0x_execution::{
     DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, FractionalShares, Symbol, TimeInForce,
 };
 use st0x_finance::{Positive, Usd};
-use st0x_hedge::config::{BrokerCtx, Ctx};
 use st0x_hedge::mock_api::REDEMPTION_WALLET;
 use st0x_hedge::{
     AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, ImbalanceThreshold,
@@ -119,8 +119,7 @@ fn build_full_system_ctx<P: Provider + Clone>(
         .with_circle_api_base(cctp.attestation_base_url)
         .with_cctp_addresses(cctp.token_messenger, cctp.message_transmitter);
 
-    let wallet_ctx =
-        st0x_hedge::wallet::OnchainWalletCtx::from_wallets(base_wallet, ethereum_wallet);
+    let wallet_ctx = st0x_config::OnchainWalletCtx::from_wallets(base_wallet, ethereum_wallet);
 
     Ctx::for_test()
         .database_url(db_path.display().to_string())
@@ -146,8 +145,7 @@ fn build_full_system_ctx<P: Provider + Clone>(
         .inventory_poll_interval(15)
         .server_port(server_port)
         .maybe_rest_api(
-            rest_api_url
-                .map(|url| st0x_hedge::config::RestApiCtx::unauthenticated(url.to_string())),
+            rest_api_url.map(|url| st0x_config::RestApiCtx::unauthenticated(url.to_string())),
         )
         .redemption_wallet(REDEMPTION_WALLET)
         .call()

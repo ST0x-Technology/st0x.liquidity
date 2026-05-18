@@ -11,8 +11,8 @@ use st0x_finance::Usdc;
 
 use super::CctpChain;
 use crate::bindings::IERC20;
-use crate::config::Ctx;
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
+use st0x_config::Ctx;
 use st0x_float_serde::format_float_with_fallback;
 
 impl CctpChain {
@@ -250,9 +250,9 @@ mod tests {
     use st0x_finance::Usdc;
 
     use super::*;
-    use crate::config::{AssetsConfig, BrokerCtx, CtxError, EquitiesConfig, LogLevel, TradingMode};
-    use crate::onchain::EvmCtx;
-    use crate::threshold::ExecutionThreshold;
+    use st0x_config::EvmCtx;
+    use st0x_config::ExecutionThreshold;
+    use st0x_config::{AssetsConfig, BrokerCtx, CtxError, EquitiesConfig, LogLevel, TradingMode};
 
     fn create_ctx_without_rebalancing() -> Ctx {
         Ctx {
@@ -286,7 +286,7 @@ mod tests {
             rest_api: None,
             redemption_wallet: None,
             #[cfg(feature = "test-support")]
-            failure_injector: crate::conductor::job::FailureInjector::new(),
+            failure_injector: st0x_config::FailureInjector::new(),
         }
     }
 

@@ -23,11 +23,11 @@ use st0x_execution::alpaca_broker_api::AlpacaLimitPrice;
 use st0x_execution::{AlpacaAccountId, Direction, FractionalShares, Positive, Symbol, TimeInForce};
 use st0x_finance::Usdc;
 
-use crate::config::{Ctx, Env};
 use crate::offchain::order::{OffchainOrder, OffchainOrderId, OrderPlacer};
 use crate::position::Position;
 use crate::symbol::cache::SymbolCache;
 use crate::vault_registry::VaultRegistry;
+use st0x_config::{Ctx, Env};
 
 /// Direction for transferring assets between trading venues.
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1109,10 +1109,10 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::config::{AssetsConfig, BrokerCtx, EquitiesConfig, LogLevel, TradingMode};
-    use crate::onchain::EvmCtx;
     use crate::test_utils::{positive_shares, setup_test_db};
-    use crate::threshold::ExecutionThreshold;
+    use st0x_config::EvmCtx;
+    use st0x_config::ExecutionThreshold;
+    use st0x_config::{AssetsConfig, BrokerCtx, EquitiesConfig, LogLevel, TradingMode};
 
     fn create_test_ctx() -> Ctx {
         Ctx {
@@ -1146,7 +1146,7 @@ mod tests {
             rest_api: None,
             redemption_wallet: None,
             #[cfg(feature = "test-support")]
-            failure_injector: crate::conductor::job::FailureInjector::new(),
+            failure_injector: st0x_config::FailureInjector::new(),
         }
     }
 

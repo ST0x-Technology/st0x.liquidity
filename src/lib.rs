@@ -17,7 +17,7 @@ use tracing::{error, info, warn};
 use st0x_dto::Statement;
 use st0x_execution::MockExecutorCtx;
 
-use crate::config::{BrokerCtx, Ctx};
+use st0x_config::{BrokerCtx, Ctx};
 
 /// How long to wait for in-flight work to drain before force-aborting.
 /// Outer timeout for the entire graceful shutdown sequence. Must exceed
@@ -33,7 +33,6 @@ pub mod bindings;
 pub(crate) mod bindings;
 pub mod cli;
 mod conductor;
-pub mod config;
 pub(crate) mod dashboard;
 mod equity_redemption;
 mod inventory;
@@ -45,8 +44,6 @@ mod position_check;
 mod rebalancing;
 mod shares;
 mod symbol;
-pub mod telemetry;
-mod threshold;
 mod tokenization;
 mod trading;
 #[cfg(feature = "mock")]
@@ -54,22 +51,10 @@ pub use tokenization::mock_api;
 mod tokenized_equity_mint;
 mod usdc_rebalance;
 mod vault_registry;
-#[cfg(any(test, feature = "test-support"))]
-pub mod wallet;
-#[cfg(not(any(test, feature = "test-support")))]
-pub(crate) mod wallet;
 mod wrapper;
 
-pub use telemetry::{FileLogGuard, TelemetryError, TelemetryGuard, mk_env_filter, setup_tracing};
+pub use st0x_config::{FileLogGuard, TelemetryError, TelemetryGuard, mk_env_filter, setup_tracing};
 
-#[cfg(feature = "test-support")]
-pub use conductor::job::{FailureInjector, JobKind};
-#[cfg(any(test, feature = "test-support"))]
-pub use config::TradingMode;
-#[cfg(any(test, feature = "test-support"))]
-pub use config::{AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
-#[cfg(any(test, feature = "test-support"))]
-pub use inventory::ImbalanceThreshold;
 #[cfg(any(test, feature = "test-support"))]
 pub use offchain::order::{OffchainOrder, OffchainOrderId};
 #[cfg(any(test, feature = "test-support"))]
@@ -82,9 +67,17 @@ pub fn check_positions_job_type() -> &'static str {
     std::any::type_name::<position_check::CheckPositions>()
 }
 #[cfg(any(test, feature = "test-support"))]
-pub use rebalancing::{RebalancingCtx, RebalancingCtxError, UsdcRebalancing};
+pub use st0x_config::ExecutionThreshold;
 #[cfg(any(test, feature = "test-support"))]
-pub use threshold::ExecutionThreshold;
+pub use st0x_config::TradingMode;
+#[cfg(any(test, feature = "test-support"))]
+pub use st0x_config::{
+    AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, OperationMode,
+};
+#[cfg(feature = "test-support")]
+pub use st0x_config::{FailureInjector, JobKind};
+#[cfg(any(test, feature = "test-support"))]
+pub use st0x_config::{ImbalanceThreshold, RebalancingCtx, RebalancingCtxError, UsdcRebalancing};
 
 #[cfg(test)]
 mod integration_tests;
@@ -381,7 +374,7 @@ mod tests {
     use alloy::primitives::address;
 
     use super::*;
-    use crate::config::tests::create_test_ctx_with_order_owner;
+    use st0x_config::create_test_ctx_with_order_owner;
 
     // `Ctx::load_files` parses `orderbook` into `Address`, so runtime tests
     // only exercise already-validated addresses. Invalid orderbook input is

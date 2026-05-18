@@ -17,7 +17,8 @@ use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 use tracing::{error, info};
 
-use crate::config::Ctx;
+use st0x_config::Ctx;
+
 use crate::dashboard::transfer_loader::TransferKind;
 use crate::rebalancing::equity::CrossVenueEquityTransfer;
 
@@ -1069,7 +1070,7 @@ mod tests {
     use rocket::local::asynchronous::Client;
 
     use super::*;
-    use crate::config::tests::create_test_ctx_with_order_owner;
+    use st0x_config::create_test_ctx_with_order_owner;
 
     #[test]
     fn test_num_of_routes() {
@@ -1349,7 +1350,7 @@ mod tests {
     #[tokio::test]
     async fn raindex_orders_returns_unavailable_when_upstream_unreachable() {
         let mut ctx = create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
-        ctx.rest_api = Some(crate::config::RestApiCtx::unauthenticated(
+        ctx.rest_api = Some(st0x_config::RestApiCtx::unauthenticated(
             "http://127.0.0.1:1".to_string(),
         ));
 
@@ -1405,7 +1406,7 @@ mod tests {
         });
 
         let mut ctx = create_test_ctx_with_order_owner(owner);
-        ctx.rest_api = Some(crate::config::RestApiCtx::unauthenticated(
+        ctx.rest_api = Some(st0x_config::RestApiCtx::unauthenticated(
             mock_server.base_url(),
         ));
 
@@ -1438,7 +1439,7 @@ mod tests {
         });
 
         let mut ctx = create_test_ctx_with_order_owner(owner);
-        ctx.rest_api = Some(crate::config::RestApiCtx::unauthenticated(
+        ctx.rest_api = Some(st0x_config::RestApiCtx::unauthenticated(
             mock_server.base_url(),
         ));
 

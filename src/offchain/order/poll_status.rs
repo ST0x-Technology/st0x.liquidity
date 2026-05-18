@@ -362,7 +362,7 @@ mod tests {
     use crate::offchain::order::{OffchainOrderCommand, noop_order_placer};
     use crate::position::{Position, PositionCommand, TradeId};
     use crate::test_utils::{OnchainTradeBuilder, setup_test_db};
-    use crate::threshold::ExecutionThreshold;
+    use st0x_config::ExecutionThreshold;
 
     const TEST_POLL_INTERVAL: Duration = Duration::from_secs(15);
 

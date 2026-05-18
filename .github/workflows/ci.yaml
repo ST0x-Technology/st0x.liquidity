@@ -101,7 +101,7 @@ jobs:
           fi
 
   dashboard:
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -130,7 +130,7 @@ jobs:
         run: nix build .#st0x-dashboard
 
   hooks:
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 

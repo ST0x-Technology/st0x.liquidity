@@ -21,10 +21,10 @@ use tracing::{Level, warn};
 
 use url::Url;
 
-use crate::onchain::{EvmConfig, EvmCtx, EvmSecrets};
-use crate::rebalancing::{RebalancingConfig, RebalancingCtx, RebalancingCtxError};
-use crate::telemetry::{TelemetryConfig, TelemetryCtx, TelemetrySecrets};
-use crate::threshold::{ExecutionThreshold, InvalidThresholdError};
+use crate::{
+    EvmConfig, EvmCtx, EvmSecrets, ExecutionThreshold, InvalidThresholdError, RebalancingConfig,
+    RebalancingCtx, RebalancingCtxError, TelemetryConfig, TelemetryCtx, TelemetrySecrets,
+};
 use st0x_float_macro::float;
 
 /// Alpaca minimum execution threshold: $2.
@@ -203,10 +203,10 @@ struct RestApiSecrets {
 /// dashboard tab) are gracefully disabled.
 #[derive(Clone)]
 pub struct RestApiCtx {
-    pub(crate) url: String,
-    pub(crate) key_id: Option<String>,
-    pub(crate) key_secret: Option<String>,
-    pub(crate) http_client: reqwest::Client,
+    pub url: String,
+    pub key_id: Option<String>,
+    pub key_secret: Option<String>,
+    pub http_client: reqwest::Client,
 }
 
 impl std::fmt::Debug for RestApiCtx {
@@ -276,7 +276,7 @@ struct BrokerConfig {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TravelRuleConfig {
-    pub(crate) beneficiary_entity_name: String,
+    pub beneficiary_entity_name: String,
 }
 
 impl TravelRuleConfig {
@@ -375,34 +375,34 @@ pub enum TradingMode {
 /// encrypted secrets, and derived runtime state.
 #[derive(Clone)]
 pub struct Ctx {
-    pub(crate) database_url: String,
+    pub database_url: String,
     pub log_level: LogLevel,
     pub log_dir: Option<String>,
-    pub(crate) server_port: u16,
-    pub(crate) evm: EvmCtx,
-    pub(crate) order_polling_interval: u64,
-    pub(crate) order_polling_max_jitter: u64,
-    pub(crate) position_check_interval: u64,
-    pub(crate) inventory_poll_interval: u64,
-    pub(crate) apalis_finished_job_cleanup_interval_secs: u64,
-    pub(crate) broker: BrokerCtx,
+    pub server_port: u16,
+    pub evm: EvmCtx,
+    pub order_polling_interval: u64,
+    pub order_polling_max_jitter: u64,
+    pub position_check_interval: u64,
+    pub inventory_poll_interval: u64,
+    pub apalis_finished_job_cleanup_interval_secs: u64,
+    pub broker: BrokerCtx,
     pub telemetry: Option<TelemetryCtx>,
     pub trading_mode: TradingMode,
     /// The onchain address that owns orders on the orderbook.
     /// Always derived from the configured `[wallet]` address.
-    pub(crate) order_owner: Address,
-    pub(crate) wallet: Option<crate::wallet::OnchainWalletCtx>,
+    pub order_owner: Address,
+    pub wallet: Option<crate::wallet::OnchainWalletCtx>,
     /// Non-secret wallet metadata for the dashboard config dialog.
-    pub(crate) wallet_meta: Option<WalletMeta>,
+    pub wallet_meta: Option<WalletMeta>,
     pub execution_threshold: ExecutionThreshold,
-    pub(crate) assets: AssetsConfig,
-    pub(crate) travel_rule: Option<TravelRuleConfig>,
-    pub(crate) rest_api: Option<RestApiCtx>,
+    pub assets: AssetsConfig,
+    pub travel_rule: Option<TravelRuleConfig>,
+    pub rest_api: Option<RestApiCtx>,
     /// Alpaca redemption wallet from `[tokenization]`.
     /// `Some` when the config includes a `[tokenization]` section.
-    pub(crate) redemption_wallet: Option<Address>,
+    pub redemption_wallet: Option<Address>,
     #[cfg(feature = "test-support")]
-    pub failure_injector: crate::conductor::job::FailureInjector,
+    pub failure_injector: crate::FailureInjector,
 }
 
 /// Runtime broker configuration assembled from `BrokerSecrets`.
@@ -413,7 +413,7 @@ pub enum BrokerCtx {
 }
 
 impl BrokerCtx {
-    pub(crate) fn to_supported_executor(&self) -> SupportedExecutor {
+    pub fn to_supported_executor(&self) -> SupportedExecutor {
         match self {
             Self::AlpacaBrokerApi(_) => SupportedExecutor::AlpacaBrokerApi,
             Self::DryRun => SupportedExecutor::DryRun,
@@ -575,10 +575,10 @@ struct WalletInputs {
 /// Non-secret wallet metadata extracted from the config TOML during
 /// parsing. Displayed on the dashboard config dialog.
 #[derive(Clone, Debug, Deserialize)]
-pub(crate) struct WalletMeta {
-    pub(crate) kind: String,
-    pub(crate) address: Address,
-    pub(crate) organization_id: Option<String>,
+pub struct WalletMeta {
+    pub kind: String,
+    pub address: Address,
+    pub organization_id: Option<String>,
 }
 
 /// Single validation path shared by [`Ctx::load_files`] and
@@ -669,7 +669,7 @@ fn parse_and_validate(
                 return Err(RebalancingCtxError::NotAlpacaBroker.into());
             };
 
-            let minimum = *crate::rebalancing::trigger::ALPACA_MINIMUM_WITHDRAWAL;
+            let minimum = *crate::ALPACA_MINIMUM_WITHDRAWAL;
 
             if let Some(cash) = &config.assets.cash
                 && cash.rebalancing == OperationMode::Enabled
@@ -839,7 +839,7 @@ impl Ctx {
             rest_api: parts.rest_api,
             redemption_wallet: parts.redemption_wallet,
             #[cfg(feature = "test-support")]
-            failure_injector: crate::conductor::job::FailureInjector::new(),
+            failure_injector: crate::FailureInjector::new(),
         })
     }
 
@@ -869,30 +869,30 @@ impl Ctx {
         configure_sqlite_pool(&self.database_url).await
     }
 
-    pub(crate) fn rebalancing_ctx(&self) -> Result<&RebalancingCtx, CtxError> {
+    pub fn rebalancing_ctx(&self) -> Result<&RebalancingCtx, CtxError> {
         match &self.trading_mode {
             TradingMode::Rebalancing(ctx) => Ok(ctx),
             TradingMode::Standalone => Err(CtxError::NotRebalancing),
         }
     }
 
-    pub(crate) fn wallet(&self) -> Result<&crate::wallet::OnchainWalletCtx, CtxError> {
+    pub fn wallet(&self) -> Result<&crate::wallet::OnchainWalletCtx, CtxError> {
         self.wallet.as_ref().ok_or(CtxError::WalletNotConfigured)
     }
 
     /// Returns the redemption wallet from the `[tokenization]` config section.
-    pub(crate) fn redemption_wallet(&self) -> Result<Address, CtxError> {
+    pub fn redemption_wallet(&self) -> Result<Address, CtxError> {
         self.redemption_wallet.ok_or(CtxError::MissingTokenization)
     }
 
-    pub(crate) const fn order_polling_interval(&self) -> std::time::Duration {
+    pub const fn order_polling_interval(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.order_polling_interval)
     }
 
     /// Returns the wallet address that owns orders on the orderbook.
     ///
     /// Always derived from the configured `[wallet]` address.
-    pub(crate) fn order_owner(&self) -> Address {
+    pub fn order_owner(&self) -> Address {
         self.order_owner
     }
 
@@ -900,7 +900,7 @@ impl Ctx {
     ///
     /// Fail-closed: assets not present in the config are treated as
     /// trading-disabled.
-    pub(crate) fn is_trading_enabled(&self, symbol: &Symbol) -> bool {
+    pub fn is_trading_enabled(&self, symbol: &Symbol) -> bool {
         self.assets
             .equities
             .symbols
@@ -912,7 +912,7 @@ impl Ctx {
     ///
     /// Assets not present in the config are treated as rebalancing-disabled
     /// by default.
-    pub(crate) fn is_rebalancing_enabled(&self, symbol: &Symbol) -> bool {
+    pub fn is_rebalancing_enabled(&self, symbol: &Symbol) -> bool {
         self.assets
             .equities
             .symbols
@@ -989,7 +989,7 @@ impl Ctx {
             rest_api,
             redemption_wallet,
             #[cfg(feature = "test-support")]
-            failure_injector: crate::conductor::job::FailureInjector::new(),
+            failure_injector: crate::FailureInjector::new(),
         })
     }
 }
@@ -1124,7 +1124,7 @@ impl CtxError {
     }
 }
 
-pub(crate) async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
+pub async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
     // PRAGMAs are set via SqliteConnectOptions so they apply to every
     // connection the pool opens, not just the first one.
     //
@@ -1167,8 +1167,46 @@ pub(crate) async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePo
     Ok(pool)
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub fn create_test_ctx_with_order_owner(order_owner: alloy::primitives::Address) -> Ctx {
+    use crate::{EvmCtx, ExecutionThreshold};
+
+    Ctx {
+        database_url: ":memory:".to_owned(),
+        log_level: LogLevel::Debug,
+        log_dir: None,
+        server_port: 8080,
+        evm: EvmCtx {
+            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+            orderbook: alloy::primitives::address!("0x1111111111111111111111111111111111111111"),
+            deployment_block: 1,
+        },
+        order_polling_interval: 15,
+        order_polling_max_jitter: 5,
+        position_check_interval: 60,
+        inventory_poll_interval: 60,
+        apalis_finished_job_cleanup_interval_secs: 3600,
+        broker: BrokerCtx::DryRun,
+        telemetry: None,
+        trading_mode: TradingMode::Standalone,
+        order_owner,
+        wallet: None,
+        wallet_meta: None,
+        execution_threshold: ExecutionThreshold::whole_share(),
+        assets: AssetsConfig {
+            equities: EquitiesConfig::default(),
+            cash: None,
+        },
+        travel_rule: None,
+        rest_api: None,
+        redemption_wallet: None,
+        #[cfg(feature = "test-support")]
+        failure_injector: crate::FailureInjector::new(),
+    }
+}
+
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use alloy::primitives::{Address, address};
     use std::io::Write;
     use tempfile::NamedTempFile;
@@ -1177,49 +1215,12 @@ pub(crate) mod tests {
     use st0x_float_macro::float;
 
     use super::*;
-    use crate::onchain::EvmCtx;
-    use crate::threshold::ExecutionThreshold;
+    use crate::ExecutionThreshold;
 
     fn toml_file(content: &str) -> NamedTempFile {
         let mut file = NamedTempFile::new().unwrap();
         file.write_all(content.as_bytes()).unwrap();
         file
-    }
-
-    pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
-        Ctx {
-            database_url: ":memory:".to_owned(),
-            log_level: LogLevel::Debug,
-            log_dir: None,
-            server_port: 8080,
-            evm: EvmCtx {
-                ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
-                orderbook: address!("0x1111111111111111111111111111111111111111"),
-                deployment_block: 1,
-                required_confirmations: 0,
-            },
-            order_polling_interval: 15,
-            order_polling_max_jitter: 5,
-            position_check_interval: 60,
-            inventory_poll_interval: 60,
-            apalis_finished_job_cleanup_interval_secs: 3600,
-            broker: BrokerCtx::DryRun,
-            telemetry: None,
-            trading_mode: TradingMode::Standalone,
-            order_owner,
-            wallet: None,
-            wallet_meta: None,
-            execution_threshold: ExecutionThreshold::whole_share(),
-            assets: AssetsConfig {
-                equities: EquitiesConfig::default(),
-                cash: None,
-            },
-            travel_rule: None,
-            rest_api: None,
-            redemption_wallet: None,
-            #[cfg(feature = "test-support")]
-            failure_injector: crate::conductor::job::FailureInjector::new(),
-        }
     }
 
     fn minimal_config_toml() -> NamedTempFile {
@@ -1335,11 +1336,17 @@ pub(crate) mod tests {
     }
 
     fn example_config_toml() -> &'static Path {
-        Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/example.config.toml"))
+        Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example.config.toml"
+        ))
     }
 
     fn example_secrets_toml() -> &'static Path {
-        Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/example.secrets.toml"))
+        Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example.secrets.toml"
+        ))
     }
 
     #[test]
@@ -2498,7 +2505,7 @@ pub(crate) mod tests {
 
     #[test]
     fn server_config_toml_is_valid() {
-        let config_str = include_str!("../config/prod/st0x-hedge.toml");
+        let config_str = include_str!("../../../config/prod/st0x-hedge.toml");
         let config: Config = toml::from_str(config_str).unwrap();
 
         let global_limit = config
@@ -2539,31 +2546,35 @@ pub(crate) mod tests {
 
     #[test]
     fn example_config_toml_is_valid() {
-        let config_str = include_str!("../example.config.toml");
+        let config_str = include_str!("../../../example.config.toml");
         let _: Config = toml::from_str(config_str).unwrap();
     }
 
     #[test]
     fn example_secrets_toml_is_valid() {
-        let secrets_str = include_str!("../example.secrets.toml");
+        let secrets_str = include_str!("../../../example.secrets.toml");
         let _: Secrets = toml::from_str(secrets_str).unwrap();
     }
 
     #[test]
     fn e2e_config_toml_is_valid() {
-        let config_str = include_str!("../e2e/config.toml");
+        let config_str = include_str!("../../../e2e/config.toml");
         let _: Config = toml::from_str(config_str).unwrap();
     }
 
     #[test]
     fn e2e_secrets_toml_is_valid() {
-        let secrets_str = include_str!("../e2e/secrets.toml");
+        let secrets_str = include_str!("../../../e2e/secrets.toml");
         let _: Secrets = toml::from_str(secrets_str).unwrap();
     }
 
     #[test]
     fn all_repo_config_tomls_are_valid() {
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
         let config_dir = repo_root.join("config");
 
         // Walk config/ subdirectories (config/prod/, config/staging/) to
@@ -2608,7 +2619,11 @@ pub(crate) mod tests {
 
     #[test]
     fn all_repo_secrets_tomls_are_valid() {
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
         let secret_paths = [
             repo_root.join("example.secrets.toml"),
             repo_root.join("e2e/secrets.toml"),

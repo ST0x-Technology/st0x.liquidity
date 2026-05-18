@@ -17,8 +17,8 @@ use crate::offchain::order::{
     OffchainOrder, OffchainOrderCommand, OffchainOrderId, PollOrderStatus, PollOrderStatusJobQueue,
 };
 use crate::position::{Position, PositionCommand, PositionError};
-use crate::threshold::ExecutionThreshold;
 use crate::trading::onchain::trade_accountant::TradeAccountingError;
+use st0x_config::ExecutionThreshold;
 
 /// Persistent job queue for hedge placement.
 pub(crate) type HedgeJobQueue = JobQueue<PlaceHedge>;
@@ -205,7 +205,7 @@ mod tests {
     use crate::offchain::order::{OffchainOrder, OrderPlacementResult, OrderPlacer};
     use crate::position::{Position, PositionCommand, TradeId};
     use crate::test_utils::setup_test_db;
-    use crate::threshold::ExecutionThreshold;
+    use st0x_config::ExecutionThreshold;
 
     fn succeeding_order_placer() -> Arc<dyn OrderPlacer> {
         struct SucceedingPlacer;

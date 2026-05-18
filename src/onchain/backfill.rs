@@ -19,7 +19,8 @@ use tracing::{debug, error, info, trace, warn};
 use st0x_evm::Evm;
 use st0x_execution::Executor;
 
-use super::EvmCtx;
+use st0x_config::EvmCtx;
+
 use super::OnChainError;
 use crate::bindings::IOrderBookV6::{ClearV3, TakeOrderV3};
 use crate::conductor::job::{Job, Label};
@@ -392,8 +393,8 @@ mod tests {
     use super::*;
     use crate::bindings::IOrderBookV6;
     use crate::conductor::setup_apalis_tables;
-    use crate::onchain::EvmCtx;
     use crate::test_utils::{get_test_order, setup_test_db};
+    use st0x_config::EvmCtx;
 
     fn test_retry_strategy() -> ExponentialBuilder {
         ExponentialBuilder::default()

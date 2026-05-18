@@ -73,22 +73,24 @@ use thiserror::Error;
 use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::{EnvFilter, Registry};
 
+use crate::LogLevel;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TelemetryConfig {
-    pub(crate) service_name: String,
+pub struct TelemetryConfig {
+    pub service_name: String,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TelemetrySecrets {
-    pub(crate) api_key: String,
+pub struct TelemetrySecrets {
+    pub api_key: String,
 }
 
 #[derive(Clone)]
 pub struct TelemetryCtx {
-    pub(crate) api_key: String,
-    pub(crate) service_name: String,
+    pub api_key: String,
+    pub service_name: String,
 }
 
 impl std::fmt::Debug for TelemetryCtx {
@@ -101,7 +103,7 @@ impl std::fmt::Debug for TelemetryCtx {
 }
 
 impl TelemetryCtx {
-    pub(crate) fn new(
+    pub fn new(
         config: Option<TelemetryConfig>,
         secrets: Option<TelemetrySecrets>,
     ) -> Result<Option<Self>, TelemetryAssemblyError> {
@@ -264,10 +266,7 @@ pub struct FileLogGuard {
     _guard: tracing_appender::non_blocking::WorkerGuard,
 }
 
-pub fn setup_tracing(
-    log_level: &crate::config::LogLevel,
-    log_dir: Option<&str>,
-) -> Option<FileLogGuard> {
+pub fn setup_tracing(log_level: &LogLevel, log_dir: Option<&str>) -> Option<FileLogGuard> {
     let level: tracing::Level = log_level.into();
     let env_filter = mk_env_filter(level);
 
@@ -314,7 +313,8 @@ fn mk_telemetry_filter(level: tracing::Level) -> EnvFilter {
 
 fn mk_crate_filter(level: tracing::Level) -> EnvFilter {
     // TODO: parse from the manifest or something
-    const CRATES: [&str; 9] = [
+    const CRATES: [&str; 10] = [
+        "config",
         "hedge",
         "bridge",
         "dto",

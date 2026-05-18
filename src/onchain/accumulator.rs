@@ -5,9 +5,9 @@ use tracing::info;
 use st0x_event_sorcery::Projection;
 use st0x_execution::{Direction, Executor, FractionalShares, Positive, SupportedExecutor, Symbol};
 
-use crate::config::AssetsConfig;
 use crate::onchain::OnChainError;
 use crate::position::Position;
+use st0x_config::AssetsConfig;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExecutionCtx {
@@ -169,10 +169,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
     use crate::position::{Position, PositionCommand, TradeId};
     use crate::test_utils::setup_test_db;
-    use crate::threshold::ExecutionThreshold;
+    use st0x_config::ExecutionThreshold;
+    use st0x_config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
     use st0x_float_macro::float;
 
     async fn create_test_position_infra(

@@ -9,6 +9,8 @@ use serde::Deserialize;
 use std::fmt::Debug;
 
 mod id;
+#[cfg(feature = "test-support")]
+pub mod proptest;
 mod shares;
 mod symbol;
 mod usd;

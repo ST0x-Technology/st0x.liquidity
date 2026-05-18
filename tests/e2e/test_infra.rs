@@ -17,11 +17,11 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use st0x_bridge::cctp::CctpAttestationMock;
+use st0x_config::mk_env_filter;
+use st0x_config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
 use st0x_execution::Symbol;
 use st0x_execution::alpaca_broker_api::{AlpacaBrokerMock, MockPosition};
-use st0x_hedge::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
 use st0x_hedge::mock_api::{AlpacaTokenizationMock, REDEMPTION_WALLET};
-use st0x_hedge::telemetry::mk_env_filter;
 
 use crate::base_chain::{BaseChain, DeployableERC20};
 
