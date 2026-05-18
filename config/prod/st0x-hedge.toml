@@ -1,5 +1,7 @@
 # HTTP API port for the dashboard and health checks.
 server_port = 8001
+# HTTP port for the apalis-board job queue UI.
+board_port = 8002
 # Minimum log level: trace, debug, info, warn, error.
 log_level = "trace"
 # Directory for rotated log files (stdout if omitted).

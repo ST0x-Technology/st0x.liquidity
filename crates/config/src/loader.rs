@@ -167,6 +167,7 @@ struct Config {
     log_level: Option<LogLevel>,
     log_dir: Option<String>,
     server_port: Option<u16>,
+    board_port: u16,
     raindex: EvmConfig,
     order_polling_interval: Option<u64>,
     order_polling_max_jitter: Option<u64>,
@@ -379,6 +380,7 @@ pub struct Ctx {
     pub log_level: LogLevel,
     pub log_dir: Option<String>,
     pub server_port: u16,
+    pub board_port: u16,
     pub evm: EvmCtx,
     pub order_polling_interval: u64,
     pub order_polling_max_jitter: u64,
@@ -473,6 +475,7 @@ impl std::fmt::Debug for Ctx {
             .field("log_level", &self.log_level)
             .field("log_dir", &self.log_dir)
             .field("server_port", &self.server_port)
+            .field("board_port", &self.board_port)
             .field("evm", &self.evm)
             .field("order_polling_interval", &self.order_polling_interval)
             .field("order_polling_max_jitter", &self.order_polling_max_jitter)
@@ -542,6 +545,7 @@ struct ValidatedParts {
     log_level: LogLevel,
     log_dir: Option<String>,
     server_port: u16,
+    board_port: u16,
     evm: EvmCtx,
     order_polling_interval: u64,
     order_polling_max_jitter: u64,
@@ -752,6 +756,7 @@ fn parse_and_validate(
         log_level,
         log_dir: config.log_dir,
         server_port: config.server_port.unwrap_or(8080),
+        board_port: config.board_port,
         evm,
         order_polling_interval,
         order_polling_max_jitter: config.order_polling_max_jitter.unwrap_or(5),
@@ -820,6 +825,7 @@ impl Ctx {
             log_level: parts.log_level,
             log_dir: parts.log_dir,
             server_port: parts.server_port,
+            board_port: parts.board_port,
             evm: parts.evm,
             order_polling_interval: parts.order_polling_interval,
             order_polling_max_jitter: parts.order_polling_max_jitter,
@@ -943,6 +949,7 @@ impl Ctx {
         #[builder(default = 2)] inventory_poll_interval: u64,
         #[builder(default = 3600)] apalis_finished_job_cleanup_interval_secs: u64,
         #[builder(default = 0)] server_port: u16,
+        #[builder(default = 0)] board_port: u16,
         execution_threshold_override: Option<ExecutionThreshold>,
         travel_rule: Option<TravelRuleConfig>,
         rest_api: Option<RestApiCtx>,
@@ -966,6 +973,7 @@ impl Ctx {
             log_level: LogLevel::Debug,
             log_dir: None,
             server_port,
+            board_port,
             evm: EvmCtx {
                 ws_rpc_url,
                 orderbook,
@@ -1176,6 +1184,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: alloy::primitives::Address)
         log_level: LogLevel::Debug,
         log_dir: None,
         server_port: 8080,
+        board_port: 8081,
         evm: EvmCtx {
             ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
             orderbook: alloy::primitives::address!("0x1111111111111111111111111111111111111111"),
@@ -1228,6 +1237,7 @@ mod tests {
         file.write_all(
             br#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
@@ -1253,6 +1263,7 @@ mod tests {
         toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
@@ -1280,6 +1291,7 @@ mod tests {
         toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
@@ -1408,6 +1420,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
@@ -1446,6 +1459,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
@@ -1489,6 +1503,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
@@ -1529,6 +1544,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
@@ -1598,6 +1614,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
 
             [assets.equities]
 
@@ -1631,6 +1648,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 0
 
             [assets.equities]
@@ -1686,6 +1704,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
@@ -1741,6 +1760,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             log_level = "warn"
             server_port = 9090
@@ -1798,6 +1818,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
@@ -1884,6 +1905,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
@@ -1934,6 +1956,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
@@ -1995,6 +2018,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
@@ -2049,6 +2073,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
@@ -2107,6 +2132,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
@@ -2171,6 +2197,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
@@ -2219,6 +2246,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
@@ -2314,6 +2342,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
@@ -2451,6 +2480,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
@@ -2644,6 +2674,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             bogus_field = "should fail"
 
@@ -2670,6 +2701,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets]
@@ -2700,6 +2732,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities.AAPL]
@@ -2732,6 +2765,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.cash]
@@ -2817,6 +2851,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             bogus_field = "should fail"
 
@@ -3535,6 +3570,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             bogus_field = "should fail"
 
             [raindex]
@@ -3579,6 +3615,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
@@ -3611,6 +3648,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
@@ -3658,6 +3696,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
@@ -3741,6 +3780,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
 
             [assets.equities]
@@ -3779,6 +3819,7 @@ mod tests {
         let config = toml_file(
             r#"
             database_url = ":memory:"
+            board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
             position_check_interval = 0
 

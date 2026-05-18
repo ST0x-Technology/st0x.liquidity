@@ -1,4 +1,5 @@
 server_port = 8080
+board_port = 8081
 log_level = "debug"
 database_url = ":memory:"
 apalis_finished_job_cleanup_interval_secs = 3600

@@ -1,4 +1,5 @@
 server_port = 8001
+board_port = 8002
 log_level = "trace"
 database_url = ":memory:"
 apalis_finished_job_cleanup_interval_secs = 3600
