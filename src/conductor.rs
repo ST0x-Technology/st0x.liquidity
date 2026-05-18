@@ -60,6 +60,7 @@ use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::position_check::{CheckPositionsJobQueue, bootstrap_check_positions};
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
+use crate::rebalancing::usdc::TransferUsdcToHedgingCtx;
 use crate::rebalancing::{
     RebalancerServices, RebalancingCqrsFrameworks, RebalancingSchedulers, RebalancingService,
     RebalancingServiceConfig,
@@ -207,6 +208,7 @@ impl Conductor {
             wrapped_equity_recovery_store,
             mint_store,
             redemption_store,
+            transfer_usdc_to_hedging_ctx,
         } = PositionAndRebalancing::setup(
             rebalancing,
             &ctx,
@@ -218,6 +220,34 @@ impl Conductor {
             schedulers.clone(),
         )
         .await?;
+
+        // A previous process may have died mid-transfer, leaving an apalis
+        // `Running` row that no live worker owns. apalis cannot rescue such an
+        // orphan on a quick restart -- the deterministic worker name keeps its
+        // heartbeat fresh, so the row never ages out -- and the enqueue dedup
+        // keys off that row, wedging every future Base->Alpaca transfer. Reset
+        // orphans here, before the monitor spawns (so any `Running` row is by
+        // definition orphaned), letting the worker re-drive them through the
+        // crash-safe resume path. Only meaningful when the transfer worker is
+        // wired, i.e. rebalancing is enabled.
+        if transfer_usdc_to_hedging_ctx.is_some() {
+            // Fail startup fast if the reset fails: a stale `Running` row left
+            // wedged silently suppresses every future Base->Alpaca transfer, so
+            // the bot must not come up looking healthy with recovery disabled.
+            let count = schedulers
+                .transfer_usdc_to_hedging
+                .requeue_orphaned()
+                .await
+                .context("failed to re-queue orphaned Base->Alpaca transfer jobs at startup")?;
+
+            if count > 0 {
+                info!(
+                    target: "rebalance",
+                    count,
+                    "Re-queued orphaned Base->Alpaca transfer job(s) for crash-safe resume",
+                );
+            }
+        }
 
         // Hydrate the in-memory InventoryView from persisted snapshot
         // state so the runtime projection has the same data as the
@@ -320,6 +350,8 @@ impl Conductor {
             .maybe_wrapped_equity_recovery_ctx(wrapped_equity_recovery_ctx)
             .equity_check_scheduler(schedulers.equity)
             .usdc_check_scheduler(schedulers.usdc)
+            .transfer_usdc_to_hedging_queue(schedulers.transfer_usdc_to_hedging)
+            .maybe_transfer_usdc_to_hedging_ctx(transfer_usdc_to_hedging_ctx)
             .maybe_rebalancing_service(rebalancing_service)
             .seed_vault_registry_queue(seed_vault_registry_queue)
             .seed_vault_registry_ctx(seed_vault_registry_ctx)
@@ -610,6 +642,7 @@ struct RebalancingInfrastructure {
     wrapped_equity_recovery_store: Arc<Store<WrappedEquityRecovery>>,
     mint_store: Arc<Store<TokenizedEquityMint>>,
     redemption_store: Arc<Store<EquityRedemption>>,
+    transfer_usdc_to_hedging_ctx: Arc<TransferUsdcToHedgingCtx>,
 }
 
 /// Shared infrastructure dependencies needed to spawn rebalancing.
@@ -641,6 +674,7 @@ struct PositionAndRebalancing {
     wrapped_equity_recovery_store: Option<Arc<Store<WrappedEquityRecovery>>>,
     mint_store: Option<Arc<Store<TokenizedEquityMint>>>,
     redemption_store: Option<Arc<Store<EquityRedemption>>>,
+    transfer_usdc_to_hedging_ctx: Option<Arc<TransferUsdcToHedgingCtx>>,
 }
 
 impl PositionAndRebalancing {
@@ -696,6 +730,7 @@ impl PositionAndRebalancing {
                 wrapped_equity_recovery_store: Some(infra.wrapped_equity_recovery_store),
                 mint_store: Some(infra.mint_store),
                 redemption_store: Some(infra.redemption_store),
+                transfer_usdc_to_hedging_ctx: Some(infra.transfer_usdc_to_hedging_ctx),
             })
         } else {
             let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
@@ -722,6 +757,7 @@ impl PositionAndRebalancing {
                 wrapped_equity_recovery_store: None,
                 mint_store: None,
                 redemption_store: None,
+                transfer_usdc_to_hedging_ctx: None,
             })
         }
     }
@@ -889,27 +925,33 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         let mint_store = frameworks.mint.clone();
         let redemption_store = frameworks.redemption.clone();
 
-        let (handle, rebalancer_shutdown_token) = services.spawn(
+        let spawned = services.spawn(
             market_maker_wallet,
             RaindexVaultId(usdc_vault_id),
             operation_receiver,
             frameworks,
             equity_in_progress,
-            usdc_in_progress,
+            Arc::clone(&usdc_in_progress),
         );
+
+        let transfer_usdc_to_hedging_ctx = Arc::new(TransferUsdcToHedgingCtx {
+            transfer: spawned.resume_base_to_alpaca,
+            timeout: rebalancing_ctx.transfer_attempt_timeout,
+        });
 
         Ok(RebalancingInfrastructure {
             position: built.position,
             position_projection: built.position_projection,
             snapshot: built.snapshot,
-            rebalancer: handle,
-            rebalancer_shutdown_token,
+            rebalancer: spawned.handle,
+            rebalancer_shutdown_token: spawned.shutdown_token,
             tokenizer,
             service: rebalancing_service,
             recovery_transfer,
             wrapped_equity_recovery_store,
             mint_store,
             redemption_store,
+            transfer_usdc_to_hedging_ctx,
         })
     })
 }

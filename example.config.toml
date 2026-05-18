@@ -53,6 +53,12 @@ redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 # Transfer timeout in seconds before stuck inflight state is tombstoned and cleared.
 # 1800 = 30 minutes.
 transfer_timeout_secs = 1800
+# Per-attempt wall-clock bound for a single Base->Alpaca transfer job attempt.
+# A hung RPC inside the transfer is aborted after this so the attempt fails and
+# retries instead of wedging forever. Must exceed the worst-case single resume
+# (CCTP attestation + Alpaca deposit polling); only trips on a true hang.
+# 3600 = 60 minutes.
+transfer_attempt_timeout_secs = 3600
 equity = { target = 0.5, deviation = 0.2 }
 usdc = { mode = "enabled", target = 0.5, deviation = 0.3 }
 

@@ -69,6 +69,19 @@ Discrete units of work that are serialized to SQLite before processing and have
 a defined point of completion. If the worker crashes or the process restarts,
 unprocessed jobs are still in the database.
 
+**Gotcha -- a job that was _in flight_ (`Running`/`Queued`) when the process
+died is not auto-re-driven on a quick restart.** apalis's `fetch_next` only
+picks `Pending`/retryable-`Failed` rows; an orphaned in-flight row is reset to
+`Pending` only by apalis's `reenqueue_orphaned` sweep, which fires once the
+owning worker's heartbeat ages past `reenqueue_orphaned_after` (5 min default).
+Worker names are deterministic across restarts (`{WORKER_NAME}-{index}`), so a
+fresh process re-registers the same worker id and keeps its heartbeat current --
+the orphan never ages out, and any per-job enqueue dedup keyed off the in-flight
+row then suppresses new work indefinitely. Jobs that must survive a crash
+mid-execution reset their own orphaned rows at startup, before the monitor
+spawns (where every `Running` row is by definition orphaned): see
+`JobQueue::requeue_orphaned`, wired for the Base->Alpaca USDC transfer.
+
 ### Job trait
 
 Defined in `src/conductor/job.rs`. Wraps apalis's function-based handler API

@@ -73,6 +73,7 @@ use std::time::Duration;
 
 use alloy::primitives::{Address, Bytes, FixedBytes, TxHash, U256, address};
 use alloy::sol;
+use alloy::transports::{RpcError, TransportErrorKind};
 use async_trait::async_trait;
 use backon::Retryable;
 use rain_math_float::Float;
@@ -296,6 +297,10 @@ pub enum CctpError {
     Evm(#[from] EvmError),
     #[error("Contract view error: {0}")]
     Contract(#[from] alloy::contract::Error),
+    #[error("RPC transport error: {0}")]
+    RpcTransport(#[from] RpcError<TransportErrorKind>),
+    #[error("ABI decode error: {0}")]
+    SolType(#[from] alloy::sol_types::Error),
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("Attestation timeout after {attempts} attempts: {source}")]
@@ -663,6 +668,23 @@ where
             amount: internal.amount,
             fee: internal.fee_collected,
         })
+    }
+
+    /// Scans the burn source chain for an already-submitted burn matching
+    /// `amount` at or after `from_block`, for crash-safe resume. Delegates to
+    /// the source endpoint for the given direction.
+    async fn find_recent_burn(
+        &self,
+        direction: BridgeDirection,
+        amount: U256,
+        from_block: u64,
+    ) -> Result<Option<TxHash>, Self::Error> {
+        match direction {
+            BridgeDirection::EthereumToBase => {
+                self.ethereum.find_recent_burn(amount, from_block).await
+            }
+            BridgeDirection::BaseToEthereum => self.base.find_recent_burn(amount, from_block).await,
+        }
     }
 }
 

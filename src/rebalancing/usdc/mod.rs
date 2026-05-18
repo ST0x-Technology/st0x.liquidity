@@ -4,10 +4,15 @@
 //! directions for USDC, handling USD/USDC conversion, withdrawal, CCTP
 //! bridging, and deposit.
 
+mod job;
 mod manager;
 #[cfg(test)]
 pub(crate) mod mock;
 
+pub(crate) use job::{
+    ResumeBaseToAlpaca, TransferUsdcToHedging, TransferUsdcToHedgingCtx,
+    TransferUsdcToHedgingJobQueue,
+};
 pub(crate) use manager::{CrossVenueCashTransfer, u256_to_usdc};
 
 use rain_math_float::FloatError;
@@ -51,6 +56,42 @@ pub(crate) enum UsdcTransferError {
          filled_quantity is missing"
     )]
     MissingFilledQuantity { order_id: uuid::Uuid },
+    #[error(
+        "USDC rebalance {id} cannot resume from Converting state: \
+         broker order ID lost after crash; manual reconciliation required"
+    )]
+    ResumeIndeterminateConversion {
+        id: crate::usdc_rebalance::UsdcRebalanceId,
+    },
+    #[error("USDC rebalance {id} cannot resume: aggregate is in terminal failure state")]
+    PreviouslyFailedAggregate {
+        id: crate::usdc_rebalance::UsdcRebalanceId,
+    },
+    #[error(
+        "USDC rebalance {id} DepositInitiated has non-onchain deposit ref; \
+         BaseToAlpaca always records the mint tx as OnchainTx"
+    )]
+    DepositRefMustBeOnchain {
+        id: crate::usdc_rebalance::UsdcRebalanceId,
+    },
+    #[error(
+        "USDC rebalance {id} cannot resume via Base->Alpaca entrypoint: \
+         aggregate direction is {direction:?}"
+    )]
+    ResumeDirectionMismatch {
+        id: crate::usdc_rebalance::UsdcRebalanceId,
+        direction: crate::usdc_rebalance::RebalanceDirection,
+    },
+    #[error(
+        "USDC rebalance {id} adopted a withdrawal that realized {withdrawn} but \
+         {requested} was requested; failed for operator reconciliation rather \
+         than burning more than was withdrawn"
+    )]
+    AdoptedWithdrawalAmountMismatch {
+        id: crate::usdc_rebalance::UsdcRebalanceId,
+        withdrawn: alloy::primitives::U256,
+        requested: alloy::primitives::U256,
+    },
 }
 
 impl From<SendError<crate::usdc_rebalance::UsdcRebalance>> for UsdcTransferError {

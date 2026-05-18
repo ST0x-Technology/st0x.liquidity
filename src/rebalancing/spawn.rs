@@ -10,16 +10,15 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx, CctpError};
+use st0x_config::{EquityAssetConfig, RebalancingCtx};
 use st0x_event_sorcery::Store;
 use st0x_evm::Wallet;
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiError, EmptySymbolError, Executor, Symbol,
 };
 
-use st0x_config::RebalancingCtx;
-
 use super::equity::CrossVenueEquityTransfer;
-use super::usdc::CrossVenueCashTransfer;
+use super::usdc::{CrossVenueCashTransfer, ResumeBaseToAlpaca};
 use super::{Rebalancer, TriggeredOperation};
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::equity_redemption::EquityRedemption;
@@ -29,7 +28,18 @@ use crate::tokenization::Tokenizer;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
 use crate::wrapper::WrapperService;
-use st0x_config::EquityAssetConfig;
+
+/// Handles to the rebalancer task surfaced by [`RebalancerServices::spawn`].
+///
+/// Holds the spawned task's join handle, its shutdown token, and a
+/// trait-erased reference to the cash transfer so the conductor can build the
+/// `TransferUsdcToHedging` apalis job's ctx without leaking the wallet
+/// `Chain` generic upstream.
+pub(crate) struct SpawnedRebalancer {
+    pub(crate) handle: JoinHandle<()>,
+    pub(crate) shutdown_token: CancellationToken,
+    pub(crate) resume_base_to_alpaca: Arc<dyn ResumeBaseToAlpaca>,
+}
 
 /// Errors that can occur when spawning the rebalancer.
 #[derive(Debug, thiserror::Error)]
@@ -124,7 +134,7 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
         frameworks: RebalancingCqrsFrameworks,
         equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
         usdc_in_progress: Arc<AtomicBool>,
-    ) -> (JoinHandle<()>, CancellationToken) {
+    ) -> SpawnedRebalancer {
         let equity = Arc::new(CrossVenueEquityTransfer::new(
             self.raindex.clone(),
             self.tokenizer,
@@ -144,6 +154,8 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
             usdc_vault_id,
         ));
 
+        let resume_base_to_alpaca: Arc<dyn ResumeBaseToAlpaca> = usdc.clone();
+
         let shutdown_token = CancellationToken::new();
 
         let rebalancer = Rebalancer::new(
@@ -158,11 +170,16 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
         );
 
         info!(target: "rebalance", "Rebalancing infrastructure initialized");
+
         let handle = tokio::spawn(async move {
             rebalancer.run().await;
         });
 
-        (handle, shutdown_token)
+        SpawnedRebalancer {
+            handle,
+            shutdown_token,
+            resume_base_to_alpaca,
+        }
     }
 }
 
@@ -424,7 +441,7 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(10);
 
-        let (handle, _shutdown_token) = services.spawn(
+        let spawned = services.spawn(
             Address::random(),
             RaindexVaultId(B256::ZERO),
             rx,
@@ -432,6 +449,7 @@ mod tests {
             Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
+        let handle = spawned.handle;
 
         tx.send(TriggeredOperation::Mint {
             symbol: Symbol::new("AAPL").unwrap(),

@@ -2531,7 +2531,6 @@ async fn active_mint_in_tokens_wrapped_recovers_into_raindex_vault() -> anyhow::
 /// Base->Alpaca direction is durably handled by the TransferUsdcToHedging
 /// apalis job.
 #[test_log::test(tokio::test)]
-#[ignore = "un-ignored and made to pass by the immediate upstack #712 (feat/usdc-to-hedging-job)"]
 async fn interrupted_usdc_base_to_alpaca_resumes_after_restart() -> anyhow::Result<()> {
     let onchain_price = float!(158.39);
     let broker_fill_price = float!(155.00);

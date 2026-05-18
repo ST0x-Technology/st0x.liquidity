@@ -82,4 +82,13 @@ pub trait Bridge: Send + Sync + 'static {
         direction: BridgeDirection,
         attestation: &Self::Attestation,
     ) -> Result<MintReceipt, Self::Error>;
+
+    /// Scans the burn source chain for an already-submitted burn matching
+    /// `amount` at or after `from_block`, for crash-safe resume.
+    async fn find_recent_burn(
+        &self,
+        direction: BridgeDirection,
+        amount: U256,
+        from_block: u64,
+    ) -> Result<Option<TxHash>, Self::Error>;
 }

@@ -1033,8 +1033,10 @@ fn usdc_rebalance_expectations(
         },
         UsdcRebalanceType::BaseToAlpaca => UsdcRebalanceExpectations {
             event_sequence: &[
+                "UsdcRebalanceEvent::WithdrawalSubmitting",
                 "UsdcRebalanceEvent::Initiated",
                 "UsdcRebalanceEvent::WithdrawalConfirmed",
+                "UsdcRebalanceEvent::BridgingSubmitting",
                 "UsdcRebalanceEvent::BridgingInitiated",
                 "UsdcRebalanceEvent::BridgeAttestationReceived",
                 "UsdcRebalanceEvent::Bridged",
