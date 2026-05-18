@@ -58,6 +58,7 @@ use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::onchain::trade::{RaindexTradeEvent, extract_owned_vaults, extract_vaults_from_clear};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
 use crate::position::{Position, PositionCommand, TradeId};
+use crate::position_check::{CheckPositionsJobQueue, bootstrap_check_positions};
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
 use crate::rebalancing::{
     RebalancerServices, RebalancingCqrsFrameworks, RebalancingCtx, RebalancingSchedulers,
@@ -232,6 +233,7 @@ impl Conductor {
         let mut poll_status_queue = PollOrderStatusJobQueue::new(&pool);
         let reconcile_queue = ReconcileOrderFillJobQueue::new(&pool);
         let rejection_queue = HandleOrderRejectionJobQueue::new(&pool);
+        let check_positions_queue = CheckPositionsJobQueue::new(&pool);
 
         recover_submitted_offchain_orders(
             &frameworks.offchain_order_projection,
@@ -239,6 +241,8 @@ impl Conductor {
             executor.to_supported_executor(),
         )
         .await?;
+
+        bootstrap_check_positions(&pool, &check_positions_queue).await?;
 
         let job_cleanup = spawn_finished_job_cleanup(
             pool.clone(),
