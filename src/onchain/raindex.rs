@@ -12,6 +12,7 @@
 //! standard fixed-point amounts (U256) and the float format MUST use rain-math-float.
 
 use alloy::primitives::{Address, B256, TxHash, U256, address};
+use alloy::rpc::types::TransactionReceipt;
 use async_trait::async_trait;
 use rain_math_float::Float;
 use std::sync::Arc;
@@ -366,7 +367,13 @@ pub(crate) trait Raindex: Send + Sync {
     ) -> Result<TxHash, RaindexError>;
 
     /// Wait for a previously submitted transaction to be confirmed.
-    async fn confirm_tx(&self, tx_hash: TxHash) -> Result<(), RaindexError>;
+    async fn confirm_tx(&self, tx_hash: TxHash) -> Result<(), RaindexError> {
+        self.confirm_tx_receipt(tx_hash).await.map(|_| ())
+    }
+
+    /// Wait for a previously submitted transaction to be confirmed and return the receipt.
+    async fn confirm_tx_receipt(&self, tx_hash: TxHash)
+    -> Result<TransactionReceipt, RaindexError>;
 }
 
 #[async_trait]
@@ -473,11 +480,14 @@ impl<W: Wallet> Raindex for RaindexService<W> {
         Ok(tx_hash)
     }
 
-    async fn confirm_tx(&self, tx_hash: TxHash) -> Result<(), RaindexError> {
+    async fn confirm_tx_receipt(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<TransactionReceipt, RaindexError> {
         let receipt = self.evm.confirm::<OpenChainErrorRegistry>(tx_hash).await?;
 
         info!(target: "orderbook", tx_hash = %receipt.transaction_hash, "Transaction confirmed");
-        Ok(())
+        Ok(receipt)
     }
 }
 

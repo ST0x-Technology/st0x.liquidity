@@ -512,6 +512,7 @@ mod tests {
                 quantity: float!(20),
                 token: Address::ZERO,
                 wrapped_amount: alloy::primitives::U256::from(20),
+                actual_wrapped_amount: None,
                 raindex_withdraw_tx: TxHash::ZERO,
                 withdrawn_at: two_days_ago,
             })
@@ -546,6 +547,7 @@ mod tests {
                 quantity: float!(15),
                 token: Address::ZERO,
                 wrapped_amount: alloy::primitives::U256::from(15),
+                actual_wrapped_amount: None,
                 raindex_withdraw_tx: TxHash::ZERO,
                 withdrawn_at: now,
             })

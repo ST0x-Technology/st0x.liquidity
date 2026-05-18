@@ -12,6 +12,7 @@
 pub(crate) mod mock;
 
 use alloy::primitives::{Address, TxHash, U256};
+use alloy::rpc::types::TransactionReceipt;
 use async_trait::async_trait;
 use std::fmt;
 use std::sync::Arc;
@@ -134,7 +135,7 @@ impl Raindex for PanickingRaindex {
         unimplemented!("PanickingRaindex: not available in CLI context")
     }
 
-    async fn confirm_tx(&self, _: TxHash) -> Result<(), RaindexError> {
+    async fn confirm_tx_receipt(&self, _: TxHash) -> Result<TransactionReceipt, RaindexError> {
         unimplemented!("PanickingRaindex: not available in CLI context")
     }
 }

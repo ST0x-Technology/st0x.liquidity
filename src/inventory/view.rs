@@ -31,6 +31,8 @@ pub(crate) enum InventoryViewError {
     Equity(#[from] InventoryError<FractionalShares>),
     #[error(transparent)]
     Usdc(#[from] InventoryError<Usdc>),
+    #[error("float arithmetic error: {0}")]
+    Float(#[from] FloatError),
     #[error("failed to convert USD balance cents {0} to USDC")]
     UsdBalanceConversion(i64),
 }
@@ -743,6 +745,12 @@ pub(crate) struct InventoryView {
     /// Symbols that appeared in the most recent inflight redemption poll.
     #[serde(default)]
     previous_inflight_redemption_symbols: HashSet<Symbol>,
+    /// Latest absolute equity snapshot timestamp by symbol for the onchain venue.
+    #[serde(default)]
+    onchain_equity_snapshot_watermarks: HashMap<Symbol, DateTime<Utc>>,
+    /// Latest absolute equity snapshot timestamp by symbol for the offchain venue.
+    #[serde(default)]
+    offchain_equity_snapshot_watermarks: HashMap<Symbol, DateTime<Utc>>,
 }
 
 impl InventoryView {
@@ -879,6 +887,8 @@ impl Default for InventoryView {
             inflight_equity: HashMap::new(),
             previous_inflight_mint_symbols: HashSet::new(),
             previous_inflight_redemption_symbols: HashSet::new(),
+            onchain_equity_snapshot_watermarks: HashMap::new(),
+            offchain_equity_snapshot_watermarks: HashMap::new(),
         }
     }
 }
@@ -1007,6 +1017,8 @@ impl InventoryView {
             inflight_equity: self.inflight_equity,
             previous_inflight_mint_symbols: self.previous_inflight_mint_symbols,
             previous_inflight_redemption_symbols: self.previous_inflight_redemption_symbols,
+            onchain_equity_snapshot_watermarks: self.onchain_equity_snapshot_watermarks,
+            offchain_equity_snapshot_watermarks: self.offchain_equity_snapshot_watermarks,
         })
     }
 
@@ -1030,7 +1042,100 @@ impl InventoryView {
             inflight_equity: self.inflight_equity,
             previous_inflight_mint_symbols: self.previous_inflight_mint_symbols,
             previous_inflight_redemption_symbols: self.previous_inflight_redemption_symbols,
+            onchain_equity_snapshot_watermarks: self.onchain_equity_snapshot_watermarks,
+            offchain_equity_snapshot_watermarks: self.offchain_equity_snapshot_watermarks,
         })
+    }
+
+    pub(crate) fn record_equity_snapshot_watermarks<'a>(
+        mut self,
+        venue: Venue,
+        symbols: impl IntoIterator<Item = &'a Symbol>,
+        fetched_at: DateTime<Utc>,
+    ) -> Self {
+        let watermarks = match venue {
+            Venue::MarketMaking => &mut self.onchain_equity_snapshot_watermarks,
+            Venue::Hedging => &mut self.offchain_equity_snapshot_watermarks,
+        };
+
+        for symbol in symbols {
+            let watermark = watermarks.entry(symbol.clone()).or_insert(fetched_at);
+            if fetched_at > *watermark {
+                *watermark = fetched_at;
+            }
+        }
+
+        self
+    }
+
+    fn equity_snapshot_watermark(&self, symbol: &Symbol, venue: Venue) -> Option<DateTime<Utc>> {
+        let watermarks = match venue {
+            Venue::MarketMaking => &self.onchain_equity_snapshot_watermarks,
+            Venue::Hedging => &self.offchain_equity_snapshot_watermarks,
+        };
+
+        watermarks.get(symbol).copied()
+    }
+
+    fn equity_snapshot_would_apply(
+        &self,
+        symbol: &Symbol,
+        venue: Venue,
+        fetched_at: DateTime<Utc>,
+    ) -> Result<bool, InventoryViewError> {
+        if self
+            .equity_snapshot_watermark(symbol, venue)
+            .is_some_and(|watermark| fetched_at <= watermark)
+        {
+            return Ok(false);
+        }
+
+        let Some(inventory) = self.equities.get(symbol) else {
+            return Ok(true);
+        };
+
+        if inventory.has_inflight()? {
+            return Ok(false);
+        }
+
+        if let Some(last_rebalancing) = inventory.last_rebalancing()
+            && fetched_at < last_rebalancing
+        {
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
+    pub(crate) fn apply_equity_snapshot<'a>(
+        self,
+        venue: Venue,
+        balances: impl IntoIterator<Item = (&'a Symbol, &'a FractionalShares)>,
+        fetched_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<Self, InventoryViewError> {
+        let (view, applied_symbols) = balances.into_iter().try_fold(
+            (self, Vec::new()),
+            |(view, mut applied_symbols), (symbol, snapshot_balance)| {
+                let should_record_watermark =
+                    view.equity_snapshot_would_apply(symbol, venue, fetched_at)?;
+                if !should_record_watermark {
+                    return Ok::<_, InventoryViewError>((view, applied_symbols));
+                }
+
+                let view = view.update_equity(
+                    symbol,
+                    Inventory::on_snapshot(venue, *snapshot_balance, fetched_at),
+                    now,
+                )?;
+
+                applied_symbols.push(symbol.clone());
+
+                Ok::<_, InventoryViewError>((view, applied_symbols))
+            },
+        )?;
+
+        Ok(view.record_equity_snapshot_watermarks(venue, applied_symbols.iter(), fetched_at))
     }
 
     /// Record the latest wallet-read USDC balance at an intermediate location.
@@ -1151,6 +1256,8 @@ impl InventoryView {
             inflight_equity: self.inflight_equity,
             previous_inflight_mint_symbols: self.previous_inflight_mint_symbols,
             previous_inflight_redemption_symbols: self.previous_inflight_redemption_symbols,
+            onchain_equity_snapshot_watermarks: self.onchain_equity_snapshot_watermarks,
+            offchain_equity_snapshot_watermarks: self.offchain_equity_snapshot_watermarks,
         })
     }
 
@@ -1175,6 +1282,8 @@ impl InventoryView {
             inflight_equity: self.inflight_equity,
             previous_inflight_mint_symbols: self.previous_inflight_mint_symbols,
             previous_inflight_redemption_symbols: self.previous_inflight_redemption_symbols,
+            onchain_equity_snapshot_watermarks: self.onchain_equity_snapshot_watermarks,
+            offchain_equity_snapshot_watermarks: self.offchain_equity_snapshot_watermarks,
         })
     }
 
@@ -1414,19 +1523,7 @@ impl InventoryView {
         let fetched_at = event.timestamp();
         match event {
             OnchainEquity { balances, .. } => {
-                balances
-                    .iter()
-                    .try_fold(self, |view, (symbol, snapshot_balance)| {
-                        view.update_equity(
-                            symbol,
-                            Inventory::on_snapshot(
-                                Venue::MarketMaking,
-                                *snapshot_balance,
-                                fetched_at,
-                            ),
-                            now,
-                        )
-                    })
+                self.apply_equity_snapshot(Venue::MarketMaking, balances.iter(), fetched_at, now)
             }
 
             OnchainUsdc { usdc_balance, .. } => self.update_usdc(
@@ -1435,15 +1532,7 @@ impl InventoryView {
             ),
 
             OffchainEquity { positions, .. } => {
-                positions
-                    .iter()
-                    .try_fold(self, |view, (symbol, snapshot_balance)| {
-                        view.update_equity(
-                            symbol,
-                            Inventory::on_snapshot(Venue::Hedging, *snapshot_balance, fetched_at),
-                            now,
-                        )
-                    })
+                self.apply_equity_snapshot(Venue::Hedging, positions.iter(), fetched_at, now)
             }
 
             OffchainUsd {
@@ -1543,42 +1632,58 @@ impl InventoryView {
         use InventorySnapshotEvent::*;
 
         match event {
-            OnchainEquity { balances, .. } => {
-                balances
-                    .iter()
-                    .try_fold(self, |view, (symbol, snapshot_balance)| {
-                        view.update_equity(
-                            symbol,
-                            Inventory::force_on_snapshot(
-                                Venue::MarketMaking,
-                                *snapshot_balance,
-                                reason.clone(),
-                            ),
-                            now,
-                        )
-                    })
-            }
+            OnchainEquity {
+                balances,
+                fetched_at,
+            } => balances
+                .iter()
+                .try_fold(self, |view, (symbol, snapshot_balance)| {
+                    view.update_equity(
+                        symbol,
+                        Inventory::force_on_snapshot(
+                            Venue::MarketMaking,
+                            *snapshot_balance,
+                            reason.clone(),
+                        ),
+                        now,
+                    )
+                })
+                .map(|view| {
+                    view.record_equity_snapshot_watermarks(
+                        Venue::MarketMaking,
+                        balances.keys(),
+                        *fetched_at,
+                    )
+                }),
 
             OnchainUsdc { usdc_balance, .. } => self.update_usdc(
                 Inventory::force_on_snapshot(Venue::MarketMaking, *usdc_balance, reason),
                 now,
             ),
 
-            OffchainEquity { positions, .. } => {
-                positions
-                    .iter()
-                    .try_fold(self, |view, (symbol, snapshot_balance)| {
-                        view.update_equity(
-                            symbol,
-                            Inventory::force_on_snapshot(
-                                Venue::Hedging,
-                                *snapshot_balance,
-                                reason.clone(),
-                            ),
-                            now,
-                        )
-                    })
-            }
+            OffchainEquity {
+                positions,
+                fetched_at,
+            } => positions
+                .iter()
+                .try_fold(self, |view, (symbol, snapshot_balance)| {
+                    view.update_equity(
+                        symbol,
+                        Inventory::force_on_snapshot(
+                            Venue::Hedging,
+                            *snapshot_balance,
+                            reason.clone(),
+                        ),
+                        now,
+                    )
+                })
+                .map(|view| {
+                    view.record_equity_snapshot_watermarks(
+                        Venue::Hedging,
+                        positions.keys(),
+                        *fetched_at,
+                    )
+                }),
 
             OffchainUsd {
                 usd_balance_cents,
@@ -1916,6 +2021,8 @@ mod tests {
             inflight_equity: HashMap::new(),
             previous_inflight_mint_symbols: HashSet::new(),
             previous_inflight_redemption_symbols: HashSet::new(),
+            onchain_equity_snapshot_watermarks: HashMap::new(),
+            offchain_equity_snapshot_watermarks: HashMap::new(),
         }
     }
 
@@ -1943,6 +2050,8 @@ mod tests {
             inflight_equity: HashMap::new(),
             previous_inflight_mint_symbols: HashSet::new(),
             previous_inflight_redemption_symbols: HashSet::new(),
+            onchain_equity_snapshot_watermarks: HashMap::new(),
+            offchain_equity_snapshot_watermarks: HashMap::new(),
         }
     }
 
@@ -3176,6 +3285,8 @@ mod tests {
             inflight_equity: HashMap::new(),
             previous_inflight_mint_symbols: HashSet::new(),
             previous_inflight_redemption_symbols: HashSet::new(),
+            onchain_equity_snapshot_watermarks: HashMap::new(),
+            offchain_equity_snapshot_watermarks: HashMap::new(),
         };
 
         let dto = view.to_dto();
@@ -3225,6 +3336,8 @@ mod tests {
             inflight_equity: HashMap::new(),
             previous_inflight_mint_symbols: HashSet::new(),
             previous_inflight_redemption_symbols: HashSet::new(),
+            onchain_equity_snapshot_watermarks: HashMap::new(),
+            offchain_equity_snapshot_watermarks: HashMap::new(),
         };
 
         let dto = view.to_dto();

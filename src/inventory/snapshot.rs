@@ -67,12 +67,20 @@ impl FromStr for InventorySnapshotId {
 pub(crate) struct InventorySnapshot {
     /// Latest onchain equity balances by symbol
     pub(crate) onchain_equity: BTreeMap<Symbol, FractionalShares>,
+    #[serde(default)]
+    pub(crate) onchain_equity_fetched_at: Option<DateTime<Utc>>,
     /// Latest onchain USDC balance
     pub(crate) onchain_usdc: Option<Usdc>,
+    #[serde(default)]
+    pub(crate) onchain_usdc_fetched_at: Option<DateTime<Utc>>,
     /// Latest offchain equity positions by symbol
     pub(crate) offchain_equity: BTreeMap<Symbol, FractionalShares>,
+    #[serde(default)]
+    pub(crate) offchain_equity_fetched_at: Option<DateTime<Utc>>,
     /// Latest offchain USD balance in cents (post-reserve, available for trading)
     pub(crate) offchain_usd_cents: Option<i64>,
+    #[serde(default)]
+    pub(crate) offchain_usd_fetched_at: Option<DateTime<Utc>>,
     /// Latest offchain gross USD balance in cents (before reserve subtraction)
     #[serde(default)]
     pub(crate) offchain_gross_usd_cents: Option<i64>,
@@ -113,9 +121,13 @@ impl EventSourced for InventorySnapshot {
     fn originate(event: &Self::Event) -> Option<Self> {
         let mut snapshot = Self {
             onchain_equity: BTreeMap::new(),
+            onchain_equity_fetched_at: None,
             onchain_usdc: None,
+            onchain_usdc_fetched_at: None,
             offchain_equity: BTreeMap::new(),
+            offchain_equity_fetched_at: None,
             offchain_usd_cents: None,
+            offchain_usd_fetched_at: None,
             offchain_gross_usd_cents: None,
             offchain_margin_safe_buying_power_cents: None,
             ethereum_usdc: None,
@@ -322,28 +334,36 @@ impl InventorySnapshot {
         let fetched_at = self.last_updated;
         let mut events = Vec::new();
 
-        if !self.onchain_equity.is_empty() {
+        if let Some(fetched_at) = self.onchain_equity_fetched_at
+            && !self.onchain_equity.is_empty()
+        {
             events.push(InventorySnapshotEvent::OnchainEquity {
                 balances: self.onchain_equity.clone(),
                 fetched_at,
             });
         }
 
-        if let Some(usdc_balance) = self.onchain_usdc {
+        if let (Some(usdc_balance), Some(fetched_at)) =
+            (self.onchain_usdc, self.onchain_usdc_fetched_at)
+        {
             events.push(InventorySnapshotEvent::OnchainUsdc {
                 usdc_balance,
                 fetched_at,
             });
         }
 
-        if !self.offchain_equity.is_empty() {
+        if let Some(fetched_at) = self.offchain_equity_fetched_at
+            && !self.offchain_equity.is_empty()
+        {
             events.push(InventorySnapshotEvent::OffchainEquity {
                 positions: self.offchain_equity.clone(),
                 fetched_at,
             });
         }
 
-        if let Some(usd_balance_cents) = self.offchain_usd_cents {
+        if let (Some(usd_balance_cents), Some(fetched_at)) =
+            (self.offchain_usd_cents, self.offchain_usd_fetched_at)
+        {
             events.push(InventorySnapshotEvent::OffchainUsd {
                 usd_balance_cents,
                 gross_usd_cents: self.offchain_gross_usd_cents,
@@ -398,26 +418,58 @@ impl InventorySnapshot {
     }
 
     fn apply_event(&mut self, event: &InventorySnapshotEvent) {
-        self.last_updated = event.timestamp();
+        let event_timestamp = event.timestamp();
+        if event_timestamp > self.last_updated {
+            self.last_updated = event_timestamp;
+        }
 
         match event {
-            InventorySnapshotEvent::OnchainEquity { balances, .. } => {
+            InventorySnapshotEvent::OnchainEquity {
+                balances,
+                fetched_at,
+            } if self
+                .onchain_equity_fetched_at
+                .is_none_or(|current| *fetched_at >= current) =>
+            {
                 self.onchain_equity = balances.clone();
+                self.onchain_equity_fetched_at = Some(*fetched_at);
             }
-            InventorySnapshotEvent::OnchainUsdc { usdc_balance, .. } => {
+            InventorySnapshotEvent::OnchainUsdc {
+                usdc_balance,
+                fetched_at,
+            } if self
+                .onchain_usdc_fetched_at
+                .is_none_or(|current| *fetched_at >= current) =>
+            {
                 self.onchain_usdc = Some(*usdc_balance);
+                self.onchain_usdc_fetched_at = Some(*fetched_at);
             }
-            InventorySnapshotEvent::OffchainEquity { positions, .. } => {
+            InventorySnapshotEvent::OffchainEquity {
+                positions,
+                fetched_at,
+            } if self
+                .offchain_equity_fetched_at
+                .is_none_or(|current| *fetched_at >= current) =>
+            {
                 self.offchain_equity = positions.clone();
+                self.offchain_equity_fetched_at = Some(*fetched_at);
             }
             InventorySnapshotEvent::OffchainUsd {
                 usd_balance_cents,
                 gross_usd_cents,
-                ..
-            } => {
+                fetched_at,
+            } if self
+                .offchain_usd_fetched_at
+                .is_none_or(|current| *fetched_at >= current) =>
+            {
                 self.offchain_usd_cents = Some(*usd_balance_cents);
                 self.offchain_gross_usd_cents = *gross_usd_cents;
+                self.offchain_usd_fetched_at = Some(*fetched_at);
             }
+            InventorySnapshotEvent::OnchainEquity { .. }
+            | InventorySnapshotEvent::OnchainUsdc { .. }
+            | InventorySnapshotEvent::OffchainEquity { .. }
+            | InventorySnapshotEvent::OffchainUsd { .. } => {}
             InventorySnapshotEvent::OffchainMarginSafeBuyingPower {
                 margin_safe_buying_power_cents,
                 ..
@@ -893,6 +945,31 @@ mod tests {
 
         assert_eq!(snapshot.onchain_equity, second_balances);
         assert!(!snapshot.onchain_equity.contains_key(&test_symbol("AAPL")));
+    }
+
+    #[test]
+    fn older_equity_snapshot_event_does_not_replace_newer_persisted_value() {
+        let older_at = Utc::now();
+        let newer_at = older_at + chrono::Duration::seconds(1);
+        let mut older_balances = BTreeMap::new();
+        older_balances.insert(test_symbol("AAPL"), test_shares(100));
+        let mut newer_balances = BTreeMap::new();
+        newer_balances.insert(test_symbol("AAPL"), test_shares(75));
+
+        let snapshot = replay::<InventorySnapshot>(vec![
+            InventorySnapshotEvent::OnchainEquity {
+                balances: newer_balances.clone(),
+                fetched_at: newer_at,
+            },
+            InventorySnapshotEvent::OnchainEquity {
+                balances: older_balances,
+                fetched_at: older_at,
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(snapshot.onchain_equity, newer_balances);
     }
 
     #[tokio::test]
@@ -1514,9 +1591,13 @@ mod tests {
     fn hydration_events_empty_snapshot_produces_no_events() {
         let snapshot = InventorySnapshot {
             onchain_equity: BTreeMap::new(),
+            onchain_equity_fetched_at: None,
             onchain_usdc: None,
+            onchain_usdc_fetched_at: None,
             offchain_equity: BTreeMap::new(),
+            offchain_equity_fetched_at: None,
             offchain_usd_cents: None,
+            offchain_usd_fetched_at: None,
             offchain_gross_usd_cents: None,
             offchain_margin_safe_buying_power_cents: None,
             ethereum_usdc: None,
@@ -1541,9 +1622,13 @@ mod tests {
 
         let original = InventorySnapshot {
             onchain_equity: onchain_equity.clone(),
+            onchain_equity_fetched_at: Some(now),
             onchain_usdc: Some(Usdc::from_str("5000").unwrap()),
+            onchain_usdc_fetched_at: Some(now),
             offchain_equity: BTreeMap::new(),
+            offchain_equity_fetched_at: None,
             offchain_usd_cents: Some(42_00),
+            offchain_usd_fetched_at: Some(now),
             offchain_gross_usd_cents: Some(50_00),
             offchain_margin_safe_buying_power_cents: Some(10_000),
             ethereum_usdc: None,

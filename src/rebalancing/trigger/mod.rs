@@ -39,7 +39,7 @@ use tracing::{debug, error, trace, warn};
 
 use rain_math_float::Float;
 use st0x_event_sorcery::{AggregateError, EntityList, LifecycleError, Reactor, Store, deps};
-use st0x_execution::{FractionalShares, Positive, Symbol};
+use st0x_execution::{FractionalShares, Positive, SharesBlockchain, SharesConversionError, Symbol};
 use st0x_finance::Usdc;
 
 use crate::config::AssetsConfig;
@@ -73,6 +73,8 @@ pub(crate) enum RebalancingServiceError {
     EquityTrigger(#[from] equity::EquityTriggerError),
     #[error("float arithmetic error: {0}")]
     Float(#[from] rain_math_float::FloatError),
+    #[error(transparent)]
+    SharesConversion(#[from] SharesConversionError),
     #[error("missing USDC tracking context for rebalance {id} at {event}")]
     MissingUsdcTrackingContext {
         id: UsdcRebalanceId,
@@ -89,6 +91,14 @@ pub(crate) enum RebalancingServiceError {
         event: usdc::UsdcTrackingEvent,
         initiated_amount: Usdc,
         settled_amount: Usdc,
+    },
+    #[error(
+        "redemption {id} unwrapped {actual_quantity} shares, exceeding tracked quantity {tracked_quantity}"
+    )]
+    RedemptionUnwrappedExceedsTracked {
+        id: RedemptionAggregateId,
+        tracked_quantity: FractionalShares,
+        actual_quantity: FractionalShares,
     },
 }
 
@@ -448,7 +458,10 @@ impl RedemptionTracking {
         }
     }
 
-    fn track_progress(&mut self, event: &EquityRedemptionEvent) {
+    fn track_progress(
+        &mut self,
+        event: &EquityRedemptionEvent,
+    ) -> Result<(), SharesConversionError> {
         match event {
             EquityRedemptionEvent::VaultWithdrawSubmitted { submitted_at, .. } => {
                 self.stage = RedemptionTrackingStage::VaultWithdrawSubmitted;
@@ -466,7 +479,16 @@ impl RedemptionTracking {
                 self.stage = RedemptionTrackingStage::UnwrapSubmitted;
                 self.last_progress_at = *submitted_at;
             }
-            EquityRedemptionEvent::TokensUnwrapped { unwrapped_at, .. } => {
+            EquityRedemptionEvent::TokensUnwrapped {
+                quantity,
+                unwrapped_amount,
+                unwrapped_at,
+                ..
+            } => {
+                self.quantity = match quantity {
+                    Some(quantity) => FractionalShares::new(*quantity),
+                    None => FractionalShares::from_u256_18_decimals(*unwrapped_amount)?,
+                };
                 self.stage = RedemptionTrackingStage::TokensUnwrapped;
                 self.last_progress_at = *unwrapped_at;
             }
@@ -488,6 +510,8 @@ impl RedemptionTracking {
             | EquityRedemptionEvent::RedemptionRejected { .. }
             | EquityRedemptionEvent::Completed { .. } => {}
         }
+
+        Ok(())
     }
 }
 
@@ -1049,17 +1073,20 @@ impl RebalancingService {
         &self,
         id: &RedemptionAggregateId,
         event: &EquityRedemptionEvent,
-    ) {
+    ) -> Result<(), RebalancingServiceError> {
         let mut tracking = self.redemption_tracking.write().await;
 
         if let Some(existing) = tracking.get_mut(id) {
-            existing.track_progress(event);
-            return;
+            existing.track_progress(event)?;
+            return Ok(());
         }
 
         if let Some(created) = RedemptionTracking::from_genesis_event(event) {
             tracking.insert(id.clone(), created);
         }
+        drop(tracking);
+
+        Ok(())
     }
 
     /// Fold the snapshot event into the view, then enqueue any
@@ -1096,38 +1123,24 @@ impl RebalancingService {
         let mut inventory = self.inventory.write().await;
 
         let updated = match &event {
-            OnchainEquity { balances, .. } => {
-                balances
-                    .iter()
-                    .try_fold(inventory.clone(), |view, (symbol, snapshot_balance)| {
-                        view.update_equity(
-                            symbol,
-                            Inventory::on_snapshot(
-                                Venue::MarketMaking,
-                                *snapshot_balance,
-                                fetched_at,
-                            ),
-                            now,
-                        )
-                    })
-            }
+            OnchainEquity { balances, .. } => inventory.clone().apply_equity_snapshot(
+                Venue::MarketMaking,
+                balances.iter(),
+                fetched_at,
+                now,
+            ),
 
             OnchainUsdc { usdc_balance, .. } => inventory.clone().update_usdc(
                 Inventory::on_snapshot(Venue::MarketMaking, *usdc_balance, fetched_at),
                 now,
             ),
 
-            OffchainEquity { positions, .. } => {
-                positions
-                    .iter()
-                    .try_fold(inventory.clone(), |view, (symbol, snapshot_balance)| {
-                        view.update_equity(
-                            symbol,
-                            Inventory::on_snapshot(Venue::Hedging, *snapshot_balance, fetched_at),
-                            now,
-                        )
-                    })
-            }
+            OffchainEquity { positions, .. } => inventory.clone().apply_equity_snapshot(
+                Venue::Hedging,
+                positions.iter(),
+                fetched_at,
+                now,
+            ),
 
             OffchainUsd { .. }
             | OffchainMarginSafeBuyingPower { .. }
@@ -1169,7 +1182,7 @@ impl RebalancingService {
         use InventorySnapshotEvent::*;
         use RebalancingServiceError::{
             EquityTrigger, Float, MissingUsdcBridgedAmount, MissingUsdcTrackingContext, Projection,
-            SettledUsdcExceedsInitiatedAmount,
+            RedemptionUnwrappedExceedsTracked, SettledUsdcExceedsInitiatedAmount, SharesConversion,
         };
 
         self.expire_stuck_operations_with_logging().await;
@@ -1179,9 +1192,11 @@ impl RebalancingService {
             other @ (Projection(_)
             | EquityTrigger(_)
             | Float(_)
+            | SharesConversion(_)
             | MissingUsdcTrackingContext { .. }
             | MissingUsdcBridgedAmount { .. }
-            | SettledUsdcExceedsInitiatedAmount { .. }) => {
+            | SettledUsdcExceedsInitiatedAmount { .. }
+            | RedemptionUnwrappedExceedsTracked { .. }) => {
                 return Err(other);
             }
         };
@@ -1218,22 +1233,6 @@ impl RebalancingService {
         *inventory = InventoryView::default();
 
         let updated = match &event {
-            OnchainEquity { balances, .. } => {
-                balances
-                    .iter()
-                    .try_fold(inventory.clone(), |view, (symbol, snapshot_balance)| {
-                        view.update_equity(
-                            symbol,
-                            Inventory::force_on_snapshot(
-                                Venue::MarketMaking,
-                                *snapshot_balance,
-                                recovery_reason.clone(),
-                            ),
-                            now,
-                        )
-                    })
-            }
-
             OnchainUsdc { usdc_balance, .. } => inventory.clone().update_usdc(
                 Inventory::force_on_snapshot(
                     Venue::MarketMaking,
@@ -1243,23 +1242,9 @@ impl RebalancingService {
                 now,
             ),
 
-            OffchainEquity { positions, .. } => {
-                positions
-                    .iter()
-                    .try_fold(inventory.clone(), |view, (symbol, snapshot_balance)| {
-                        view.update_equity(
-                            symbol,
-                            Inventory::force_on_snapshot(
-                                Venue::Hedging,
-                                *snapshot_balance,
-                                recovery_reason.clone(),
-                            ),
-                            now,
-                        )
-                    })
-            }
-
-            OffchainUsd { .. }
+            OnchainEquity { .. }
+            | OffchainEquity { .. }
+            | OffchainUsd { .. }
             | OffchainMarginSafeBuyingPower { .. }
             | EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
@@ -1405,10 +1390,11 @@ impl Reactor for RebalancingService {
                 };
 
                 let mut inventory = self.inventory.write().await;
-                *inventory = inventory
+                let updated = inventory
                     .clone()
                     .update_equity(&symbol, equity_update, timestamp)?
                     .update_usdc(usdc_update, timestamp)?;
+                *inventory = updated;
                 drop(inventory);
 
                 self.equity_scheduler.enqueue_check(symbol).await;
@@ -1651,6 +1637,45 @@ impl RebalancingService {
         }
     }
 
+    fn redemption_actual_unwrapped_quantity(
+        event: &EquityRedemptionEvent,
+    ) -> Result<Option<FractionalShares>, SharesConversionError> {
+        match event {
+            EquityRedemptionEvent::TokensUnwrapped {
+                quantity,
+                unwrapped_amount,
+                ..
+            } => Ok(Some(match quantity {
+                Some(quantity) => FractionalShares::new(*quantity),
+                None => FractionalShares::from_u256_18_decimals(*unwrapped_amount)?,
+            })),
+            _ => Ok(None),
+        }
+    }
+
+    fn recovered_redemption_quantity(
+        entity: &EquityRedemption,
+    ) -> Result<FractionalShares, SharesConversionError> {
+        use EquityRedemption::*;
+
+        match entity {
+            VaultWithdrawPending { quantity, .. }
+            | VaultWithdrawSubmitted { quantity, .. }
+            | WithdrawnFromRaindex { quantity, .. }
+            | UnwrapPending { quantity, .. }
+            | UnwrapSubmitted { quantity, .. }
+            | TokensSent { quantity, .. }
+            | Pending { quantity, .. } => Ok(FractionalShares::new(*quantity)),
+            TokensUnwrapped {
+                unwrapped_amount, ..
+            }
+            | SendPending {
+                unwrapped_amount, ..
+            } => FractionalShares::from_u256_18_decimals(*unwrapped_amount),
+            Completed { .. } | Failed { .. } => Ok(FractionalShares::ZERO),
+        }
+    }
+
     /// Checks inventory for equity imbalance and triggers operation if needed.
     pub(crate) async fn check_and_trigger_equity(
         &self,
@@ -1858,35 +1883,16 @@ impl RebalancingService {
         use EquityRedemption::*;
 
         match entity {
-            VaultWithdrawPending {
-                symbol, quantity, ..
-            }
-            | VaultWithdrawSubmitted {
-                symbol, quantity, ..
-            }
-            | WithdrawnFromRaindex {
-                symbol, quantity, ..
-            }
-            | UnwrapPending {
-                symbol, quantity, ..
-            }
-            | UnwrapSubmitted {
-                symbol, quantity, ..
-            }
-            | TokensUnwrapped {
-                symbol, quantity, ..
-            }
-            | SendPending {
-                symbol, quantity, ..
-            }
-            | TokensSent {
-                symbol, quantity, ..
-            }
-            | Pending {
-                symbol, quantity, ..
-            } => {
-                let quantity = FractionalShares::new(*quantity);
-
+            VaultWithdrawPending { symbol, .. }
+            | VaultWithdrawSubmitted { symbol, .. }
+            | WithdrawnFromRaindex { symbol, .. }
+            | UnwrapPending { symbol, .. }
+            | UnwrapSubmitted { symbol, .. }
+            | TokensUnwrapped { symbol, .. }
+            | SendPending { symbol, .. }
+            | TokensSent { symbol, .. }
+            | Pending { symbol, .. } => {
+                let quantity = Self::recovered_redemption_quantity(entity)?;
                 let (stage, last_progress_at) = match entity {
                     VaultWithdrawPending { pending_at, .. } => {
                         (RedemptionTrackingStage::VaultWithdrawPending, *pending_at)
@@ -2013,7 +2019,33 @@ impl RebalancingService {
             return Ok(());
         }
 
-        self.track_redemption_progress(&id, &event).await;
+        if let Some(actual_quantity) = Self::redemption_actual_unwrapped_quantity(&event)?
+            && let Some(existing) = self.load_redemption_tracking(&id).await
+        {
+            if actual_quantity.inner().lt(existing.quantity.inner())? {
+                let shortfall = (existing.quantity - actual_quantity)?;
+                self.apply_equity_update(
+                    &existing.symbol,
+                    Self::cancel_equity_transfer_update(Venue::MarketMaking, shortfall),
+                )
+                .await?;
+            } else if existing.quantity.inner().lt(actual_quantity.inner())? {
+                warn!(
+                    target: "rebalance",
+                    id = %id,
+                    expected_quantity = %existing.quantity,
+                    actual_quantity = %actual_quantity,
+                    "Redemption unwrapped more than tracked quantity"
+                );
+                return Err(RebalancingServiceError::RedemptionUnwrappedExceedsTracked {
+                    id,
+                    tracked_quantity: existing.quantity,
+                    actual_quantity,
+                });
+            }
+        }
+
+        self.track_redemption_progress(&id, &event).await?;
 
         let Some(tracking) = self.load_redemption_tracking(&id).await else {
             return Ok(());
@@ -2344,6 +2376,55 @@ mod tests {
         assert_eq!(inflight, Some(FractionalShares::new(float!(12))));
     }
 
+    #[tokio::test]
+    async fn recover_redemption_state_keeps_requested_quantity_until_unwrap_confirms() {
+        let (trigger, _receiver) = make_trigger().await;
+        let symbol = Symbol::new("COIN").unwrap();
+        let redemption_id = RedemptionAggregateId::new("partial-redemption-recovery");
+        let requested_quantity = float!(37.143292455);
+        let actual_wrapped_amount = U256::from(33_681_456_848_531_939_569_u128);
+        let requested_fractional = FractionalShares::new(requested_quantity);
+        let withdrawn_at = Utc::now();
+
+        trigger
+            .recover_redemption_state(
+                &redemption_id,
+                &EquityRedemption::WithdrawnFromRaindex {
+                    symbol: symbol.clone(),
+                    quantity: requested_quantity,
+                    token: Address::random(),
+                    wrapped_amount: actual_wrapped_amount,
+                    raindex_withdraw_tx: TxHash::random(),
+                    withdrawn_at,
+                },
+            )
+            .await
+            .unwrap();
+
+        let tracking = trigger
+            .redemption_tracking
+            .read()
+            .await
+            .get(&redemption_id)
+            .cloned()
+            .unwrap();
+        assert_eq!(tracking.quantity, requested_fractional);
+        assert_eq!(
+            tracking.stage,
+            RedemptionTrackingStage::WithdrawnFromRaindex
+        );
+
+        let inflight = {
+            let inventory = trigger.inventory.read().await;
+            inventory.equity_inflight(&symbol, Venue::MarketMaking)
+        };
+        assert_eq!(
+            inflight,
+            Some(requested_fractional),
+            "Recovery keeps requested underlying quantity until unwrap confirms actual underlying shares"
+        );
+    }
+
     /// Drives the production snapshot path end-to-end: applies the
     /// snapshot via the service (which enqueues follow-up checks
     /// internally). Skips the entity-list plumbing so tests can drive
@@ -2537,6 +2618,14 @@ mod tests {
     }
 
     fn make_onchain_fill(amount: FractionalShares, direction: Direction) -> PositionEvent {
+        make_onchain_fill_at(amount, direction, Utc::now())
+    }
+
+    fn make_onchain_fill_at(
+        amount: FractionalShares,
+        direction: Direction,
+        block_timestamp: DateTime<Utc>,
+    ) -> PositionEvent {
         PositionEvent::OnChainOrderFilled {
             trade_id: TradeId {
                 tx_hash: TxHash::random(),
@@ -2545,19 +2634,27 @@ mod tests {
             amount,
             direction,
             price_usdc: float!(150),
-            block_timestamp: Utc::now(),
+            block_timestamp,
             seen_at: Utc::now(),
         }
     }
 
     fn make_offchain_fill(shares_filled: FractionalShares, direction: Direction) -> PositionEvent {
+        make_offchain_fill_at(shares_filled, direction, Utc::now())
+    }
+
+    fn make_offchain_fill_at(
+        shares_filled: FractionalShares,
+        direction: Direction,
+        broker_timestamp: DateTime<Utc>,
+    ) -> PositionEvent {
         PositionEvent::OffChainOrderFilled {
             offchain_order_id: OffchainOrderId::new(),
             shares_filled: Positive::new(shares_filled).unwrap(),
             direction,
             executor_order_id: ExecutorOrderId::new("ORD1"),
             price: Usd::new(float!(150)),
-            broker_timestamp: Utc::now(),
+            broker_timestamp,
         }
     }
 
@@ -2818,6 +2915,304 @@ mod tests {
                 mpsc::error::TryRecvError::Empty
             ),
             "Expected channel to be empty (no message sent)"
+        );
+    }
+
+    #[tokio::test]
+    async fn fill_delta_before_snapshot_timestamp_is_still_applied() {
+        let symbol = Symbol::new("COIN").unwrap();
+        let snapshot_at = Utc::now();
+        let stale_fill_at = snapshot_at - chrono::Duration::seconds(1);
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+
+        let (reactor, _receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(reactor);
+
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::OnchainEquity {
+                balances: BTreeMap::from([(symbol.clone(), shares(50))]),
+                fetched_at: snapshot_at,
+            },
+        )
+        .await
+        .unwrap();
+
+        let event = make_onchain_fill_at(shares(10), Direction::Buy, stale_fill_at);
+        harness
+            .receive::<Position>(symbol.clone(), event)
+            .await
+            .unwrap();
+
+        let onchain_available = {
+            let inventory = trigger.inventory.read().await;
+            inventory.equity_available(&symbol, Venue::MarketMaking)
+        };
+        assert_eq!(
+            onchain_available,
+            Some(shares(60)),
+            "Fill deltas are applied because snapshot timestamps are not causal watermarks"
+        );
+    }
+
+    #[tokio::test]
+    async fn older_onchain_equity_snapshot_does_not_overwrite_newer_snapshot() {
+        let symbol = Symbol::new("COIN").unwrap();
+        let newer_snapshot_at = Utc::now();
+        let older_snapshot_at = newer_snapshot_at - chrono::Duration::seconds(1);
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+
+        let (reactor, _receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::OnchainEquity {
+                balances: BTreeMap::from([(symbol.clone(), shares(80))]),
+                fetched_at: newer_snapshot_at,
+            },
+        )
+        .await
+        .unwrap();
+
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::OnchainEquity {
+                balances: BTreeMap::from([(symbol.clone(), shares(10))]),
+                fetched_at: older_snapshot_at,
+            },
+        )
+        .await
+        .unwrap();
+
+        let onchain_available = {
+            let inventory = trigger.inventory.read().await;
+            inventory.equity_available(&symbol, Venue::MarketMaking)
+        };
+        assert_eq!(
+            onchain_available,
+            Some(shares(80)),
+            "Older onchain snapshot should not overwrite newer onchain balance"
+        );
+    }
+
+    #[tokio::test]
+    async fn older_offchain_equity_snapshot_does_not_overwrite_newer_snapshot() {
+        let symbol = Symbol::new("COIN").unwrap();
+        let newer_snapshot_at = Utc::now();
+        let older_snapshot_at = newer_snapshot_at - chrono::Duration::seconds(1);
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+
+        let (reactor, _receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::OffchainEquity {
+                positions: BTreeMap::from([(symbol.clone(), shares(80))]),
+                fetched_at: newer_snapshot_at,
+            },
+        )
+        .await
+        .unwrap();
+
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::OffchainEquity {
+                positions: BTreeMap::from([(symbol.clone(), shares(10))]),
+                fetched_at: older_snapshot_at,
+            },
+        )
+        .await
+        .unwrap();
+
+        let offchain_available = {
+            let inventory = trigger.inventory.read().await;
+            inventory.equity_available(&symbol, Venue::Hedging)
+        };
+        assert_eq!(
+            offchain_available,
+            Some(shares(80)),
+            "Older offchain snapshot should not overwrite newer offchain balance"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_onchain_fill_delta_after_snapshot_is_applied() {
+        let symbol = Symbol::new("COIN").unwrap();
+        let snapshot_at = Utc::now();
+        let fresh_fill_at = snapshot_at + chrono::Duration::seconds(1);
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+
+        let (reactor, _receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(reactor);
+
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::OnchainEquity {
+                balances: BTreeMap::from([(symbol.clone(), shares(50))]),
+                fetched_at: snapshot_at,
+            },
+        )
+        .await
+        .unwrap();
+
+        let event = make_onchain_fill_at(shares(10), Direction::Buy, fresh_fill_at);
+        harness
+            .receive::<Position>(symbol.clone(), event)
+            .await
+            .unwrap();
+
+        let onchain_available = {
+            let inventory = trigger.inventory.read().await;
+            inventory.equity_available(&symbol, Venue::MarketMaking)
+        };
+        assert_eq!(
+            onchain_available,
+            Some(shares(60)),
+            "Fresh fill newer than the snapshot should update onchain inventory"
+        );
+    }
+
+    #[tokio::test]
+    async fn offchain_fill_delta_before_snapshot_timestamp_updates_equity_and_cash() {
+        let symbol = Symbol::new("COIN").unwrap();
+        let snapshot_at = Utc::now();
+        let stale_fill_at = snapshot_at - chrono::Duration::seconds(1);
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+
+        let (reactor, _receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(reactor);
+
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::OffchainEquity {
+                positions: BTreeMap::from([(symbol.clone(), shares(50))]),
+                fetched_at: snapshot_at,
+            },
+        )
+        .await
+        .unwrap();
+
+        let event = make_offchain_fill_at(shares(10), Direction::Buy, stale_fill_at);
+        harness
+            .receive::<Position>(symbol.clone(), event)
+            .await
+            .unwrap();
+
+        let (offchain_available, hedging_usdc) = {
+            let inventory = trigger.inventory.read().await;
+            (
+                inventory.equity_available(&symbol, Venue::Hedging),
+                inventory.usdc_available(Venue::Hedging),
+            )
+        };
+        assert_eq!(
+            offchain_available,
+            Some(shares(60)),
+            "Offchain fill should update equity because snapshot timestamps are not causal watermarks"
+        );
+        assert_ne!(
+            hedging_usdc,
+            Some(usdc(1_000_000)),
+            "Cash leg applies atomically with equity"
+        );
+    }
+
+    #[tokio::test]
+    async fn skipped_snapshot_does_not_suppress_later_fill_delta() {
+        let symbol = Symbol::new("COIN").unwrap();
+        let snapshot_at = Utc::now();
+        let stale_fill_at = snapshot_at - chrono::Duration::seconds(1);
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000))
+            .update_equity(
+                &symbol,
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, shares(5)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let (reactor, _receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(reactor);
+
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::OnchainEquity {
+                balances: BTreeMap::from([(symbol.clone(), shares(100))]),
+                fetched_at: snapshot_at,
+            },
+        )
+        .await
+        .unwrap();
+
+        let event = make_onchain_fill_at(shares(10), Direction::Buy, stale_fill_at);
+        harness
+            .receive::<Position>(symbol.clone(), event)
+            .await
+            .unwrap();
+
+        let onchain_available = {
+            let inventory = trigger.inventory.read().await;
+            inventory.equity_available(&symbol, Venue::MarketMaking)
+        };
+        assert_eq!(
+            onchain_available,
+            Some(shares(55)),
+            "Fill must apply when the newer snapshot was skipped due to inflight inventory"
         );
     }
 

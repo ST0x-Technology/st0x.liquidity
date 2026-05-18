@@ -1,6 +1,9 @@
 //! Mock implementations for onchain services.
 
-use alloy::primitives::{Address, B256, TxHash, U256};
+use alloy::consensus::{Receipt, ReceiptEnvelope, ReceiptWithBloom};
+use alloy::primitives::{Address, B256, Bloom, Log as PrimitiveLog, TxHash, U256};
+use alloy::rpc::types::{Log, TransactionReceipt};
+use alloy::sol_types::SolEvent;
 use alloy::transports::RpcError;
 use async_trait::async_trait;
 use std::sync::Mutex;
@@ -9,6 +12,7 @@ use st0x_evm::EvmError;
 use st0x_execution::Symbol;
 
 use super::raindex::{Raindex, RaindexError, RaindexVaultId};
+use crate::bindings::IERC20;
 
 /// Whether `submit_deposit` should succeed, fail generically, or fail
 /// with an "execution reverted" RPC error (simulating a revert during
@@ -28,6 +32,55 @@ pub(crate) struct MockRaindex {
     deposit_tx: TxHash,
     deposit_behavior: DepositBehavior,
     deposited_token: Mutex<Option<Address>>,
+    withdraw_transfer: Mutex<Option<(Address, U256)>>,
+    withdraw_actual_amount: Option<U256>,
+}
+
+fn successful_receipt(tx_hash: TxHash, logs: Vec<Log>) -> TransactionReceipt {
+    TransactionReceipt {
+        inner: ReceiptEnvelope::Eip1559(ReceiptWithBloom {
+            receipt: Receipt {
+                status: true.into(),
+                cumulative_gas_used: 0,
+                logs,
+            },
+            logs_bloom: Bloom::default(),
+        }),
+        transaction_hash: tx_hash,
+        transaction_index: Some(0),
+        block_hash: None,
+        block_number: Some(0),
+        gas_used: 21000,
+        effective_gas_price: 1,
+        blob_gas_used: None,
+        blob_gas_price: None,
+        from: Address::ZERO,
+        to: Some(Address::ZERO),
+        contract_address: None,
+    }
+}
+
+fn transfer_log(token: Address, to: Address, amount: U256) -> Log {
+    let event = IERC20::Transfer {
+        from: Address::ZERO,
+        to,
+        value: amount,
+    };
+    let inner = PrimitiveLog {
+        address: token,
+        data: event.encode_log_data(),
+    };
+
+    Log {
+        inner,
+        transaction_hash: None,
+        transaction_index: None,
+        block_hash: None,
+        block_number: None,
+        block_timestamp: None,
+        log_index: None,
+        removed: false,
+    }
 }
 
 impl MockRaindex {
@@ -39,6 +92,8 @@ impl MockRaindex {
             deposit_tx: TxHash::random(),
             deposit_behavior: DepositBehavior::Succeed,
             deposited_token: Mutex::new(None),
+            withdraw_transfer: Mutex::new(None),
+            withdraw_actual_amount: None,
         }
     }
 
@@ -50,6 +105,8 @@ impl MockRaindex {
             deposit_tx: TxHash::random(),
             deposit_behavior: DepositBehavior::FailGeneric,
             deposited_token: Mutex::new(None),
+            withdraw_transfer: Mutex::new(None),
+            withdraw_actual_amount: None,
         }
     }
 
@@ -65,6 +122,8 @@ impl MockRaindex {
             deposit_tx: TxHash::random(),
             deposit_behavior: DepositBehavior::FailExecutionReverted,
             deposited_token: Mutex::new(None),
+            withdraw_transfer: Mutex::new(None),
+            withdraw_actual_amount: None,
         }
     }
 
@@ -75,6 +134,11 @@ impl MockRaindex {
 
     pub(crate) fn with_token(mut self, token: Address) -> Self {
         self.token = token;
+        self
+    }
+
+    pub(crate) fn with_withdraw_actual_amount(mut self, amount: U256) -> Self {
+        self.withdraw_actual_amount = Some(amount);
         self
     }
 }
@@ -141,15 +205,29 @@ impl Raindex for MockRaindex {
 
     async fn submit_withdraw(
         &self,
-        _token: Address,
+        token: Address,
         _vault_id: RaindexVaultId,
-        _target_amount: U256,
+        target_amount: U256,
         _decimals: u8,
     ) -> Result<TxHash, RaindexError> {
+        *self.withdraw_transfer.lock().unwrap() = Some((token, target_amount));
         Ok(self.withdraw_tx)
     }
 
-    async fn confirm_tx(&self, _tx_hash: TxHash) -> Result<(), RaindexError> {
-        Ok(())
+    async fn confirm_tx_receipt(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<TransactionReceipt, RaindexError> {
+        let logs = self
+            .withdraw_transfer
+            .lock()
+            .unwrap()
+            .map(|(token, amount)| {
+                let amount = self.withdraw_actual_amount.unwrap_or(amount);
+                vec![transfer_log(token, Address::ZERO, amount)]
+            })
+            .unwrap_or_default();
+
+        Ok(successful_receipt(tx_hash, logs))
     }
 }

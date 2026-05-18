@@ -35,7 +35,7 @@ pub(crate) struct MockWrapper {
 impl MockWrapper {
     pub(crate) fn new() -> Self {
         Self {
-            owner: Address::random(),
+            owner: Address::ZERO,
             unwrap_tx: TxHash::random(),
             tokenized_shares: Address::random(),
             wrapped_token: Address::random(),
@@ -48,7 +48,7 @@ impl MockWrapper {
     /// Creates a mock wrapper with a custom ratio.
     pub(crate) fn with_ratio(ratio: U256) -> Self {
         Self {
-            owner: Address::random(),
+            owner: Address::ZERO,
             unwrap_tx: TxHash::random(),
             tokenized_shares: Address::random(),
             wrapped_token: Address::random(),
