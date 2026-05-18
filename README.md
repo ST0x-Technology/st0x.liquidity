@@ -131,8 +131,8 @@ GitHub Actions (CI/CD)
   | deploy-rs over SSH
   v
 NixOS host (DigitalOcean droplet)
-  ├── server           (systemd, hedging bot)
-  ├── reporter         (systemd, P&L reporter)
+  ├── st0x-hedge       (systemd, hedging bot)
+  ├── datasette        (systemd, SQLite database explorer)
   ├── nginx            (dashboard + WebSocket proxy)
   └── grafana          (metrics visualization)
 ```
@@ -163,8 +163,8 @@ nix run .#deployAll
 nix run .#deployNixos
 
 # Deploy a specific service profile
-nix run .#deployService server
-nix run .#deployService reporter
+nix run .#deployService st0x-hedge
+nix run .#deployService datasette
 ```
 
 ### SSH Access
@@ -187,13 +187,13 @@ rollback` is **not compatible** — you must use `nix-env`.
 SSH into the host and run:
 
 ```bash
-# Roll back the server profile to previous deployment
-nix-env --profile /nix/var/nix/profiles/per-service/server --rollback
-systemctl restart server
+# Roll back the bot profile to previous deployment
+nix-env --profile /nix/var/nix/profiles/per-service/st0x-hedge --rollback
+systemctl restart st0x-hedge
 
-# Roll back the reporter profile
-nix-env --profile /nix/var/nix/profiles/per-service/reporter --rollback
-systemctl restart reporter
+# Roll back the Datasette profile
+nix-env --profile /nix/var/nix/profiles/per-service/datasette --rollback
+systemctl restart datasette
 ```
 
 ### Secrets Management
@@ -361,14 +361,14 @@ Pass `-i <path>` to use a different key.
 **Deployment** (requires SSH key for host access and terraform state
 decryption):
 
-| Command         | Usage                               | Notes                                          |
-| --------------- | ----------------------------------- | ---------------------------------------------- |
-| `deployAll`     | `nix run .#deployAll`               | Deploy system config + all services            |
-| `deployNixos`   | `nix run .#deployNixos`             | Deploy NixOS system config only                |
-| `deployService` | `nix run .#deployService <profile>` | Deploy a single service (`server`, `reporter`) |
-| `remote`        | `nix run .#remote [-- <cmd>]`       | SSH into production host                       |
-| `secret`        | `nix run .#secret <file.age>`       | Edit an encrypted config, then re-encrypt all  |
-| `bootstrap`     | `nix run .#bootstrap`               | One-time NixOS install on a new host           |
+| Command         | Usage                               | Notes                                               |
+| --------------- | ----------------------------------- | --------------------------------------------------- |
+| `deployAll`     | `nix run .#deployAll`               | Deploy system config + all services                 |
+| `deployNixos`   | `nix run .#deployNixos`             | Deploy NixOS system config only                     |
+| `deployService` | `nix run .#deployService <profile>` | Deploy a single service (`st0x-hedge`, `datasette`) |
+| `remote`        | `nix run .#remote [-- <cmd>]`       | SSH into production host                            |
+| `secret`        | `nix run .#secret <file.age>`       | Edit an encrypted config, then re-encrypt all       |
+| `bootstrap`     | `nix run .#bootstrap`               | One-time NixOS install on a new host                |
 
 **Infrastructure** (requires SSH key for terraform state decryption):
 

@@ -9,9 +9,6 @@ let
   inherit (deploy-rs.lib.${system}) activate;
   profileBase = "/nix/var/nix/profiles/per-service";
 
-  st0xPackage = self.packages.${system}.st0x-liquidity;
-  dashboardPackage = self.packages.${system}.st0x-dashboard;
-
   gitRev = self.rev or self.dirtyRev or "unknown";
 
   rage = "/run/current-system/sw/bin/rage";
@@ -23,32 +20,71 @@ let
       builtins.filter (n: !services.${n}.enabled) (builtins.attrNames services)
     )
   );
+  # Explicit ordering: sort enabledServices by each service's declared `order`
+  # field so adding a new entry forces choosing its slot rather than inheriting
+  # the alphabetical attribute order. Duplicate orders would produce a
+  # non-deterministic activation sequence, so assert uniqueness here.
+  enabledOrders = map (n: services.${n}.order) enabledServices;
+  uniqueOrders = builtins.foldl' (
+    acc: o: if builtins.elem o acc then acc else acc ++ [ o ]
+  ) [ ] enabledOrders;
+  orderedServices =
+    if (builtins.length enabledOrders) == (builtins.length uniqueOrders) then
+      builtins.sort (a: b: services.${a}.order < services.${b}.order) enabledServices
+    else
+      throw "services.nix: duplicate `order` values among enabled services: ${builtins.toJSON enabledOrders}";
 
-  # Links latest config, decrypts secrets, and restarts service atomically
+  # Builds the per-service activation command. Branches by service kind so we
+  # don't special-case each new service in this file -- new services land in
+  # services.nix and inherit the correct pipeline.
   mkServiceProfile =
     env: name:
     let
       cfg = services.${name};
-      configFile = ./config/${env}/${name}.toml;
-      secretsFile = ./secret/${cfg.encryptedSecret};
+      pkg = self.packages.${system}.${cfg.package};
     in
-    activate.custom st0xPackage (
-      builtins.concatStringsSep " && " [
-        "systemctl stop ${name} || true"
-        "rm -f ${cfg.markerFile}"
-        "mkdir -p /run/st0x"
-        "install -D -m 0640 -o root -g st0x ${configFile} ${cfg.configPath}"
-        "${rage} -d -i ${hostKey} ${secretsFile} | install -D -m 0640 -o root -g st0x /dev/stdin ${cfg.decryptedSecretPath}"
-        # Validate config + secrets before restarting. If validation fails,
-        # the activation script exits non-zero and deploy-rs rolls back.
-        "${cfg.profilePath}/bin/validate-config --config ${cfg.configPath} --secrets ${cfg.decryptedSecretPath}"
-        "(chown st0x:st0x /mnt/data/*.db /mnt/data/*.db-wal /mnt/data/*.db-shm /mnt/data/*.db-journal 2>/dev/null || true)"
-        "(chown -R st0x:st0x /mnt/data/logs 2>/dev/null || true)"
-        "echo '${gitRev}' > /run/st0x/${name}.git-rev"
-        "touch ${cfg.markerFile}"
-        "systemctl restart ${name}"
-      ]
-    );
+    if cfg.kind == "st0x" then
+      let
+        configFile = ./config/${env}/${name}.toml;
+        secretsFile = ./secret/${cfg.encryptedSecret};
+      in
+      activate.custom pkg (
+        builtins.concatStringsSep " && " [
+          "systemctl stop ${name} || true"
+          "rm -f ${cfg.markerFile}"
+          "mkdir -p /run/st0x"
+          "install -D -m 0640 -o root -g st0x ${configFile} ${cfg.configPath}"
+          "${rage} -d -i ${hostKey} ${secretsFile} | install -D -m 0640 -o root -g st0x /dev/stdin ${cfg.decryptedSecretPath}"
+          # Validate config + secrets before restarting. If validation fails,
+          # the activation script exits non-zero and deploy-rs rolls back.
+          "${cfg.profilePath}/bin/validate-config --config ${cfg.configPath} --secrets ${cfg.decryptedSecretPath}"
+          "(chown st0x:st0x /mnt/data/*.db /mnt/data/*.db-wal /mnt/data/*.db-shm /mnt/data/*.db-journal 2>/dev/null || true)"
+          "(chown -R st0x:st0x /mnt/data/logs 2>/dev/null || true)"
+          "echo '${gitRev}' > /run/st0x/${name}.git-rev"
+          "touch ${cfg.markerFile}"
+          "systemctl restart ${name}"
+        ]
+      )
+    else if cfg.kind == "plain" then
+      # Marker must exist BEFORE systemctl restart, because the unit's
+      # ConditionPathExists is evaluated when systemd processes the start
+      # request -- if the marker is absent, systemd silently skips the unit
+      # (returning exit 0 from `systemctl restart`) and the service never
+      # actually starts. Touch it first, then remove it on restart failure so
+      # a broken unit doesn't satisfy the condition on the next system
+      # activation.
+      activate.custom pkg (
+        builtins.concatStringsSep " && " [
+          "systemctl stop ${name} || true"
+          "mkdir -p /run/st0x"
+          "touch ${cfg.markerFile}"
+          "systemctl restart ${name} || { rm -f ${cfg.markerFile}; exit 1; }"
+        ]
+      )
+    else if cfg.kind == "static" then
+      activate.custom pkg cfg.activation
+    else
+      throw "services.${name}: unknown kind ${cfg.kind}";
 
   mkProfile = env: name: {
     path = mkServiceProfile env name;
@@ -62,25 +98,16 @@ let
       sshUser = "root";
       user = "root";
 
-      profilesOrder = [
-        "system"
-        "dashboard"
-      ]
-      ++ enabledServices;
+      profilesOrder = [ "system" ] ++ orderedServices;
 
       profiles = {
         system.path = activate.nixos nixosConfig;
-
-        dashboard = {
-          path = activate.custom dashboardPackage "systemctl reload nginx";
-          profilePath = "${profileBase}/dashboard";
-        };
       }
       // builtins.listToAttrs (
         map (name: {
           inherit name;
           value = mkProfile env name;
-        }) enabledServices
+        }) orderedServices
       );
     };
 

@@ -357,18 +357,36 @@ _System configuration_ (deploy-rs `activate.nixos`):
 
 _Per-service profiles_ (deploy-rs `activate.custom`, deployed independently):
 
-- `server` - hedging bot binary
+The set of deployed profiles is declared as a registry in `services.nix`. Each
+entry has a `kind` discriminating how it is activated and whether it has a
+systemd unit:
+
+- `st0x-hedge` (kind = `st0x`) - hedging bot binary. Full pipeline: decrypts
+  agenix secret, installs plaintext config, runs `validate-config`, chowns data
+  files, writes git-rev marker, touches readiness marker, restarts unit.
+- `dashboard` (kind = `static`) - frontend assets served by nginx; the deploy
+  step is `systemctl reload nginx` and there is no managed systemd unit.
+- `datasette` (kind = `plain`) - read-only SQLite explorer over the hedge DB.
+  Has a systemd unit but no secrets/config; activation just touches the
+  readiness marker and restarts. Bound to `127.0.0.1`; access via SSH tunnel.
+
+Activation order within `profilesOrder` is set explicitly by each entry's
+`order` field, so adding a new service forces declaring its slot rather than
+inheriting an alphabetical attribute order.
 
 Each profile is independently deployable and rollback-able without affecting
-other profiles. The dashboard is served as static files by nginx (part of the
-system configuration).
+others. Units use a `/run/st0x/<name>.ready` marker file gated by
+`ConditionPathExists` so they only start after the per-service profile has
+finished activation, never on a bare `nixos-rebuild switch`.
 
 _Configuration management_:
 
-- Plaintext config per service (`config/*.toml`) baked into Nix closure
-- Encrypted secrets per service (`secret/*.toml.age`) decrypted at activation to
-  `/run/agenix/`
-- Server uses `--config` + `--secrets` flags
+- Plaintext config per `st0x`-kind service (`config/*.toml`) baked into Nix
+  closure
+- Encrypted secrets per `st0x`-kind service (`secret/*.toml.age`) decrypted at
+  activation to `/run/agenix/`
+- `st0x`-kind binaries use `--config` + `--secrets` flags; `plain`-kind units
+  invoke their package binary with declared `args`
 
 _Infrastructure_:
 

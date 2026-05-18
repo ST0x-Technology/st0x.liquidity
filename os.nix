@@ -22,6 +22,8 @@ let
 
   services = import ./services.nix;
   enabledServices = lib.filterAttrs (_: v: v.enabled) services;
+  # Services with a systemd unit (everything except kind = "static").
+  unitServices = lib.filterAttrs (_: v: v.kind != "static") enabledServices;
 
   cli = pkgs.writeShellApplication {
     name = "stox";
@@ -34,40 +36,52 @@ let
     '';
   };
 
-  mkService = name: cfg: {
-    description = "st0x ${cfg.bin} (${name})";
+  mkService =
+    name: cfg:
+    let
+      execStartArgs =
+        if cfg.kind == "st0x" then
+          [
+            "--config"
+            cfg.configPath
+            "--secrets"
+            cfg.decryptedSecretPath
+          ]
+        else if cfg.kind == "plain" then
+          cfg.args
+        else
+          throw "services.${name}: kind '${cfg.kind}' has no systemd unit";
+    in
+    {
+      description = if cfg.kind == "st0x" then "st0x ${cfg.bin} (${name})" else cfg.description;
 
-    # Service is started by deploy.nix profile, not by systemd on boot.
-    # This avoids coordination issues during deployments.
-    wantedBy = [ ];
+      # Service is started by deploy.nix profile, not by systemd on boot.
+      # This avoids coordination issues during deployments.
+      wantedBy = [ ];
 
-    restartIfChanged = false;
-    stopIfChanged = false;
+      restartIfChanged = false;
+      stopIfChanged = false;
 
-    unitConfig = {
-      "X-OnlyManualStart" = true;
-      StartLimitBurst = 10;
-      StartLimitIntervalSec = 300;
+      unitConfig = {
+        "X-OnlyManualStart" = true;
+        StartLimitBurst = 10;
+        StartLimitIntervalSec = 300;
 
-      # Marker file created ONLY by service profile activation.
-      # Guarantees service is SKIPPED (not failed) during system activation.
-      ConditionPathExists = cfg.markerFile;
+        # Marker file created ONLY by service profile activation.
+        # Guarantees service is SKIPPED (not failed) during system activation.
+        ConditionPathExists = cfg.markerFile;
+      };
+
+      serviceConfig = {
+        User = "st0x";
+        Group = "st0x";
+        ExecStart = builtins.concatStringsSep " " (
+          [ "${cfg.profilePath}/bin/${cfg.bin}" ] ++ execStartArgs
+        );
+        Restart = "always";
+        RestartSec = 30;
+      };
     };
-
-    serviceConfig = {
-      User = "st0x";
-      Group = "st0x";
-      ExecStart = builtins.concatStringsSep " " [
-        "${cfg.profilePath}/bin/${cfg.bin}"
-        "--config"
-        cfg.configPath
-        "--secrets"
-        cfg.decryptedSecretPath
-      ];
-      Restart = "always";
-      RestartSec = 30;
-    };
-  };
 
 in
 {
@@ -266,7 +280,7 @@ in
       "d ${certDir} 0750 nginx nginx -"
     ];
 
-    services = lib.recursiveUpdate (lib.mapAttrs mkService enabledServices) {
+    services = lib.recursiveUpdate (lib.mapAttrs mkService unitServices) {
       # Clean up stale TUN device before tailscaled starts. During NixOS
       # activation the old tailscaled may still hold /dev/net/tun when the
       # new unit starts, causing a crash-loop.
@@ -349,7 +363,7 @@ in
     # before it ever reaches the per-service profile that would install the
     # fix. Stop + reset-failed any managed service that is currently broken
     # so activation can complete; the service profile restarts it afterwards.
-    for svc in ${builtins.concatStringsSep " " (builtins.attrNames enabledServices)}; do
+    for svc in ${builtins.concatStringsSep " " (builtins.attrNames unitServices)}; do
       state=$(${pkgs.systemd}/bin/systemctl show -p ActiveState --value "$svc.service" 2>/dev/null || echo "")
       if [ "$state" = "failed" ] || [ "$state" = "activating" ]; then
         ${pkgs.systemd}/bin/systemctl stop "$svc.service" 2>/dev/null || true
