@@ -697,6 +697,88 @@ pub async fn recheck_transfer_for_test(
     rebalancing::recheck_transfer_command(&mut stdout, transfer_type, id, ctx).await
 }
 
+/// Seeds a `TokenizedEquityMint` aggregate into the pool's event store at
+/// `TokensWrapped` state by inserting the canonical event sequence directly.
+/// Bypasses the command handlers so no broker/tokenization services are
+/// invoked.
+///
+/// Used by the active-mint wrapped-equity recovery e2e to set up an active
+/// mint stuck after wrapping but before the Raindex deposit. Once the bot
+/// starts, its startup recovery detects the interrupted mint and drives it
+/// through `resume_mint`.
+#[cfg(feature = "test-support")]
+pub async fn seed_mint_at_tokens_wrapped_for_test(
+    pool: &SqlitePool,
+    mint_id_str: &str,
+    symbol_str: &str,
+    wallet: Address,
+    wrap_tx_hash: TxHash,
+    wrapped_shares: alloy::primitives::U256,
+    quantity: Float,
+) -> anyhow::Result<()> {
+    use chrono::Utc;
+    use st0x_event_sorcery::DomainEvent;
+
+    use crate::tokenized_equity_mint::{
+        IssuerRequestId, TokenizationRequestId, TokenizedEquityMintEvent,
+    };
+
+    let symbol = Symbol::new(symbol_str.to_string())?;
+    let mint_id = IssuerRequestId::new(mint_id_str);
+    let now = Utc::now();
+
+    let events = vec![
+        TokenizedEquityMintEvent::MintRequested {
+            symbol: symbol.clone(),
+            quantity,
+            wallet,
+            requested_at: now,
+        },
+        TokenizedEquityMintEvent::MintAccepted {
+            issuer_request_id: mint_id.clone(),
+            tokenization_request_id: TokenizationRequestId(
+                "seeded-tokenization-request-id".to_string(),
+            ),
+            accepted_at: now,
+        },
+        TokenizedEquityMintEvent::TokensReceived {
+            tx_hash: TxHash::random(),
+            shares_minted: wrapped_shares,
+            fees: None,
+            received_at: now,
+        },
+        TokenizedEquityMintEvent::WrapSubmitted {
+            wrap_tx_hash,
+            submitted_at: now,
+        },
+        TokenizedEquityMintEvent::TokensWrapped {
+            wrap_tx_hash,
+            wrapped_shares,
+            wrapped_at: now,
+        },
+    ];
+
+    let IssuerRequestId(raw_id) = &mint_id;
+    for (index, event) in events.iter().enumerate() {
+        let payload = serde_json::to_string(event)?;
+        let sequence = i64::try_from(index + 1)?;
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+             VALUES ('TokenizedEquityMint', ?, ?, ?, ?, ?, '{}')",
+        )
+        .bind(raw_id)
+        .bind(sequence)
+        .bind(event.event_type())
+        .bind(event.event_version())
+        .bind(payload)
+        .execute(pool)
+        .await?;
+    }
+
+    Ok(())
+}
+
 /// Commands that require a WebSocket provider.
 enum ProviderCommand {
     ProcessTx {

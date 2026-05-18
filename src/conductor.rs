@@ -71,6 +71,9 @@ use crate::tokenized_equity_mint::{TokenizedEquityMint, interrupted_mint_ids};
 use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::trade_accountant::{DexTradeAccountingJobQueue, TradeAccountingError};
 use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryId};
+use crate::wrapped_equity_recovery::{
+    WrappedEquityRecovery, WrappedEquityRecoveryCtx, WrappedEquityRecoveryJobQueue,
+};
 use crate::wrapper::WrapperService;
 
 pub(crate) use builder::CqrsFrameworks;
@@ -233,8 +236,7 @@ impl Conductor {
         let mut poll_status_queue = PollOrderStatusJobQueue::new(&pool);
         let reconcile_queue = ReconcileOrderFillJobQueue::new(&pool);
         let rejection_queue = HandleOrderRejectionJobQueue::new(&pool);
-        let wrapped_equity_recovery_queue =
-            crate::wrapped_equity_recovery::WrappedEquityRecoveryJobQueue::new(&pool);
+        let wrapped_equity_recovery_queue = WrappedEquityRecoveryJobQueue::new(&pool);
 
         let wrapped_equity_recovery_ctx = match (
             wrapped_equity_recovery_store,
@@ -244,16 +246,14 @@ impl Conductor {
             (Some(store), Some(transfer), Some(service)) => {
                 let raindex = transfer.raindex();
                 let wrapper = transfer.wrapper();
-                Some(Arc::new(
-                    crate::wrapped_equity_recovery::WrappedEquityRecoveryCtx {
-                        inventory: inventory.clone(),
-                        store,
-                        transfer,
-                        equity_in_progress: service.equity_in_progress.clone(),
-                        raindex,
-                        wrapper,
-                    },
-                ))
+                Some(Arc::new(WrappedEquityRecoveryCtx {
+                    inventory: inventory.clone(),
+                    store,
+                    transfer,
+                    equity_in_progress: service.equity_in_progress.clone(),
+                    raindex,
+                    wrapper,
+                }))
             }
             _ => None,
         };
@@ -590,8 +590,7 @@ struct RebalancingInfrastructure {
     tokenizer: Arc<dyn Tokenizer>,
     service: Arc<RebalancingService>,
     recovery_transfer: Arc<CrossVenueEquityTransfer>,
-    wrapped_equity_recovery_store:
-        Arc<Store<crate::wrapped_equity_recovery::WrappedEquityRecovery>>,
+    wrapped_equity_recovery_store: Arc<Store<WrappedEquityRecovery>>,
 }
 
 /// Shared infrastructure dependencies needed to spawn rebalancing.
@@ -620,8 +619,7 @@ struct PositionAndRebalancing {
     tokenizer: Option<Arc<dyn Tokenizer>>,
     service: Option<Arc<RebalancingService>>,
     recovery_transfer: Option<Arc<CrossVenueEquityTransfer>>,
-    wrapped_equity_recovery_store:
-        Option<Arc<Store<crate::wrapped_equity_recovery::WrappedEquityRecovery>>>,
+    wrapped_equity_recovery_store: Option<Arc<Store<WrappedEquityRecovery>>>,
 }
 
 impl PositionAndRebalancing {

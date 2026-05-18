@@ -52,6 +52,9 @@ use crate::trading::onchain::trade_accountant::{
     AccountForDexTrade, AccountantCtx, DexTradeAccountingJobQueue, TradeAccountingError,
 };
 use crate::vault_registry::VaultRegistry;
+use crate::wrapped_equity_recovery::{
+    WrappedEquityRecoveryCtx, WrappedEquityRecoveryJob, WrappedEquityRecoveryJobQueue,
+};
 
 pub(crate) struct CqrsFrameworks {
     pub(crate) onchain_trade: Arc<Store<OnChainTrade>>,
@@ -90,10 +93,8 @@ pub(crate) fn spawn<Prov, Exec>(
     poll_status_queue: PollOrderStatusJobQueue,
     reconcile_queue: ReconcileOrderFillJobQueue,
     rejection_queue: HandleOrderRejectionJobQueue,
-    wrapped_equity_recovery_queue: crate::wrapped_equity_recovery::WrappedEquityRecoveryJobQueue,
-    wrapped_equity_recovery_ctx: Option<
-        Arc<crate::wrapped_equity_recovery::WrappedEquityRecoveryCtx>,
-    >,
+    wrapped_equity_recovery_queue: WrappedEquityRecoveryJobQueue,
+    wrapped_equity_recovery_ctx: Option<Arc<WrappedEquityRecoveryCtx>>,
     equity_check_scheduler: EquityRebalancingCheckScheduler,
     usdc_check_scheduler: UsdcRebalancingCheckScheduler,
     rebalancing_service: Option<Arc<RebalancingService>>,
@@ -317,9 +318,8 @@ where
     poll_status_queue: PollOrderStatusJobQueue,
     reconcile_queue: ReconcileOrderFillJobQueue,
     rejection_queue: HandleOrderRejectionJobQueue,
-    wrapped_equity_recovery_queue: crate::wrapped_equity_recovery::WrappedEquityRecoveryJobQueue,
-    wrapped_equity_recovery_ctx:
-        Option<Arc<crate::wrapped_equity_recovery::WrappedEquityRecoveryCtx>>,
+    wrapped_equity_recovery_queue: WrappedEquityRecoveryJobQueue,
+    wrapped_equity_recovery_ctx: Option<Arc<WrappedEquityRecoveryCtx>>,
     equity_check_scheduler: EquityRebalancingCheckScheduler,
     usdc_check_scheduler: UsdcRebalancingCheckScheduler,
     apalis_shutdown_token: CancellationToken,
@@ -508,23 +508,15 @@ where
                 monitor
             };
 
-            let apalis_monitor = if let Some(recovery_ctx) = wrapped_equity_recovery_ctx {
-                apalis_monitor.register(move |index| {
-                    build_supervised_worker!(
-                        ::<crate::wrapped_equity_recovery::WrappedEquityRecoveryCtx,
-                          crate::wrapped_equity_recovery::WrappedEquityRecoveryJob>,
-                        index,
-                        wrapped_equity_recovery_queue.clone(),
-                        recovery_ctx.clone(),
-                        fail_stop_for_wrapped_equity_recovery.clone(),
-                        failure_notify_for_wrapped_equity_recovery.clone(),
-                        #[cfg(any(test, feature = "test-support"))]
-                        failure_injector_for_wrapped_equity_recovery.clone(),
-                    )
-                })
-            } else {
-                apalis_monitor
-            };
+            let apalis_monitor = register_wrapped_equity_recovery_worker(
+                apalis_monitor,
+                wrapped_equity_recovery_ctx,
+                wrapped_equity_recovery_queue,
+                fail_stop_for_wrapped_equity_recovery,
+                failure_notify_for_wrapped_equity_recovery,
+                #[cfg(any(test, feature = "test-support"))]
+                failure_injector_for_wrapped_equity_recovery,
+            );
 
             let is_draining = apalis_shutdown_token.clone();
 
@@ -562,4 +554,33 @@ fn log_optional_task_status(task_name: &str, is_configured: bool) {
     } else {
         debug!("{task_name} not configured", task_name = task_name);
     }
+}
+
+/// Registers the wrapped-equity recovery worker against the apalis monitor when
+/// a recovery ctx is available. Extracted from [`MonitorWiring::spawn_apalis_monitor`]
+/// to keep that function under the cognitive-complexity limit.
+fn register_wrapped_equity_recovery_worker(
+    monitor: Monitor,
+    recovery_ctx: Option<Arc<WrappedEquityRecoveryCtx>>,
+    recovery_queue: WrappedEquityRecoveryJobQueue,
+    fail_stop: CircuitBreakerConfig,
+    failure_notify: Arc<tokio::sync::Notify>,
+    #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
+) -> Monitor {
+    let Some(recovery_ctx) = recovery_ctx else {
+        return monitor;
+    };
+
+    monitor.register(move |index| {
+        build_supervised_worker!(
+            ::<WrappedEquityRecoveryCtx, WrappedEquityRecoveryJob>,
+            index,
+            recovery_queue.clone(),
+            recovery_ctx.clone(),
+            fail_stop.clone(),
+            failure_notify.clone(),
+            #[cfg(any(test, feature = "test-support"))]
+            failure_injector.clone(),
+        )
+    })
 }

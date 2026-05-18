@@ -7,11 +7,11 @@
 //! # State Flow
 //!
 //! ```text
-//!                  Detect
-//!                     v
-//!                Detected ----+
-//!                /  |  \      |
-//!  DispatchToMint  | DispatchToRedemption
+//!                Detect
+//!                  v
+//!               Detected ----+
+//!               /  |   \     |
+//!  DispatchToMint  |   DispatchToRedemption
 //!                  |
 //!         SubmitOrphanDeposit
 //!                  v
@@ -32,12 +32,11 @@
 //! EquityRedemption) has driven its own state machine forward; this
 //! aggregate only records the dispatch decision, not the downstream work.
 
-use std::str::FromStr;
-
 use alloy::primitives::TxHash;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -81,13 +80,19 @@ pub(crate) enum RecoveryOutcome {
     },
 }
 
+/// Domain errors returned from the aggregate's `initialize`/`transition`
+/// handlers. Surface to the job, which logs them and emits a `FailRecovery`
+/// command so the audit trail records the failure.
 #[derive(Debug, Clone, Serialize, Deserialize, Error, PartialEq, Eq)]
 pub(crate) enum WrappedEquityRecoveryError {
     #[error("recovery already initialized")]
     AlreadyInitialized,
 
-    #[error("command not valid from current state {state}")]
-    InvalidTransition { state: String },
+    #[error("recovery not yet initialized; only Detect is valid")]
+    Uninitialized,
+
+    #[error("command not valid from state {state:?}")]
+    InvalidTransition { state: Box<WrappedEquityRecovery> },
 
     #[error("recovery is already in terminal state")]
     Terminal,
@@ -103,10 +108,12 @@ pub(crate) enum WrappedEquityRecoveryCommand {
         symbol: Symbol,
         shares: FractionalShares,
     },
+
     /// Recovery has an active mint to resume. Records the dispatch decision;
     /// the actual deposit is driven by the existing `TokenizedEquityMint`
     /// aggregate via `CrossVenueEquityTransfer::resume_mint`.
     DispatchToMint { mint_id: IssuerRequestId },
+
     /// Recovery has an active redemption to resume. Records the dispatch
     /// decision; the actual unwrap is driven by the existing
     /// `EquityRedemption` aggregate via
@@ -114,14 +121,18 @@ pub(crate) enum WrappedEquityRecoveryCommand {
     DispatchToRedemption {
         redemption_id: RedemptionAggregateId,
     },
+
     /// Orphan path. Records that the job submitted a Raindex deposit and
     /// captures the tx hash. The job submits the tx onchain before
     /// emitting this command -- the aggregate is a pure event recorder.
     SubmitOrphanDeposit { vault_deposit_tx_hash: TxHash },
+
     /// Orphan path. Records that the deposit tx confirmed.
     ConfirmOrphanDeposit { vault_deposit_tx_hash: TxHash },
+
     /// Closes the recovery with the dispatched-or-deposited outcome.
     CompleteRecovery { outcome: RecoveryOutcome },
+
     /// Marks the recovery as failed with the supplied reason.
     FailRecovery { reason: String },
 }
@@ -133,26 +144,32 @@ pub(crate) enum WrappedEquityRecoveryEvent {
         shares: FractionalShares,
         detected_at: DateTime<Utc>,
     },
+
     DispatchedToMint {
         mint_id: IssuerRequestId,
         dispatched_at: DateTime<Utc>,
     },
+
     DispatchedToRedemption {
         redemption_id: RedemptionAggregateId,
         dispatched_at: DateTime<Utc>,
     },
+
     OrphanDepositSubmitted {
         vault_deposit_tx_hash: TxHash,
         submitted_at: DateTime<Utc>,
     },
+
     OrphanDeposited {
         vault_deposit_tx_hash: TxHash,
         deposited_at: DateTime<Utc>,
     },
+
     RecoveryCompleted {
         outcome: RecoveryOutcome,
         completed_at: DateTime<Utc>,
     },
+
     RecoveryFailed {
         reason: String,
         failed_at: DateTime<Utc>,
@@ -189,6 +206,7 @@ pub(crate) enum WrappedEquityRecovery {
         shares: FractionalShares,
         detected_at: DateTime<Utc>,
     },
+
     DispatchedToMint {
         symbol: Symbol,
         shares: FractionalShares,
@@ -196,6 +214,7 @@ pub(crate) enum WrappedEquityRecovery {
         mint_id: IssuerRequestId,
         dispatched_at: DateTime<Utc>,
     },
+
     DispatchedToRedemption {
         symbol: Symbol,
         shares: FractionalShares,
@@ -203,6 +222,7 @@ pub(crate) enum WrappedEquityRecovery {
         redemption_id: RedemptionAggregateId,
         dispatched_at: DateTime<Utc>,
     },
+
     OrphanDepositSubmitted {
         symbol: Symbol,
         shares: FractionalShares,
@@ -210,6 +230,7 @@ pub(crate) enum WrappedEquityRecovery {
         vault_deposit_tx_hash: TxHash,
         submitted_at: DateTime<Utc>,
     },
+
     OrphanDeposited {
         symbol: Symbol,
         shares: FractionalShares,
@@ -218,12 +239,14 @@ pub(crate) enum WrappedEquityRecovery {
         submitted_at: DateTime<Utc>,
         deposited_at: DateTime<Utc>,
     },
+
     Completed {
         symbol: Symbol,
         shares: FractionalShares,
         outcome: RecoveryOutcome,
         completed_at: DateTime<Utc>,
     },
+
     Failed {
         symbol: Symbol,
         shares: FractionalShares,
@@ -282,6 +305,7 @@ impl EventSourced for WrappedEquityRecovery {
                 mint_id: mint_id.clone(),
                 dispatched_at: *dispatched_at,
             }),
+
             (
                 Self::Detected {
                     symbol,
@@ -299,6 +323,7 @@ impl EventSourced for WrappedEquityRecovery {
                 redemption_id: redemption_id.clone(),
                 dispatched_at: *dispatched_at,
             }),
+
             (
                 Self::Detected {
                     symbol,
@@ -316,6 +341,7 @@ impl EventSourced for WrappedEquityRecovery {
                 vault_deposit_tx_hash: *vault_deposit_tx_hash,
                 submitted_at: *submitted_at,
             }),
+
             (
                 Self::OrphanDepositSubmitted {
                     symbol,
@@ -336,6 +362,7 @@ impl EventSourced for WrappedEquityRecovery {
                 submitted_at: *submitted_at,
                 deposited_at: *deposited_at,
             }),
+
             (
                 Self::DispatchedToMint { symbol, shares, .. }
                 | Self::DispatchedToRedemption { symbol, shares, .. }
@@ -350,6 +377,7 @@ impl EventSourced for WrappedEquityRecovery {
                 outcome: outcome.clone(),
                 completed_at: *completed_at,
             }),
+
             (
                 Self::Detected { symbol, shares, .. }
                 | Self::DispatchedToMint { symbol, shares, .. }
@@ -363,6 +391,7 @@ impl EventSourced for WrappedEquityRecovery {
                 reason: reason.clone(),
                 failed_at: *failed_at,
             }),
+
             _ => None,
         })
     }
@@ -385,9 +414,7 @@ impl EventSourced for WrappedEquityRecovery {
             | WrappedEquityRecoveryCommand::ConfirmOrphanDeposit { .. }
             | WrappedEquityRecoveryCommand::CompleteRecovery { .. }
             | WrappedEquityRecoveryCommand::FailRecovery { .. } => {
-                Err(WrappedEquityRecoveryError::InvalidTransition {
-                    state: "Uninitialized".to_string(),
-                })
+                Err(WrappedEquityRecoveryError::Uninitialized)
             }
         }
     }
@@ -404,19 +431,23 @@ impl EventSourced for WrappedEquityRecovery {
             (Self::Completed { .. } | Self::Failed { .. }, _) => {
                 Err(WrappedEquityRecoveryError::Terminal)
             }
+
             (_, Detect { .. }) => Err(WrappedEquityRecoveryError::AlreadyInitialized),
+
             (Self::Detected { .. }, DispatchToMint { mint_id }) => {
                 Ok(vec![WrappedEquityRecoveryEvent::DispatchedToMint {
                     mint_id,
                     dispatched_at: now,
                 }])
             }
+
             (Self::Detected { .. }, DispatchToRedemption { redemption_id }) => {
                 Ok(vec![WrappedEquityRecoveryEvent::DispatchedToRedemption {
                     redemption_id,
                     dispatched_at: now,
                 }])
             }
+
             (
                 Self::Detected { .. },
                 SubmitOrphanDeposit {
@@ -426,6 +457,7 @@ impl EventSourced for WrappedEquityRecovery {
                 vault_deposit_tx_hash,
                 submitted_at: now,
             }]),
+
             (
                 Self::OrphanDepositSubmitted { .. },
                 ConfirmOrphanDeposit {
@@ -435,6 +467,7 @@ impl EventSourced for WrappedEquityRecovery {
                 vault_deposit_tx_hash,
                 deposited_at: now,
             }]),
+
             (
                 Self::DispatchedToMint { .. }
                 | Self::DispatchedToRedemption { .. }
@@ -444,6 +477,7 @@ impl EventSourced for WrappedEquityRecovery {
                 outcome,
                 completed_at: now,
             }]),
+
             (
                 Self::Detected { .. }
                 | Self::DispatchedToMint { .. }
@@ -455,8 +489,9 @@ impl EventSourced for WrappedEquityRecovery {
                 reason,
                 failed_at: now,
             }]),
+
             (state, _) => Err(WrappedEquityRecoveryError::InvalidTransition {
-                state: format!("{state:?}"),
+                state: Box::new(state.clone()),
             }),
         }
     }
@@ -473,7 +508,7 @@ mod tests {
 
     use super::*;
 
-    fn services() -> () {}
+    const SERVICES: () = ();
 
     fn aapl() -> Symbol {
         Symbol::new("AAPL").unwrap()
@@ -504,7 +539,7 @@ mod tests {
                 symbol: aapl(),
                 shares: one_share(),
             },
-            &services(),
+            &SERVICES,
         )
         .await
         .expect("Detect should initialize");
@@ -532,7 +567,7 @@ mod tests {
                 WrappedEquityRecoveryCommand::DispatchToMint {
                     mint_id: mint_id.clone(),
                 },
-                &services(),
+                &SERVICES,
             )
             .await
             .expect("Dispatch should succeed from Detected");
@@ -557,7 +592,7 @@ mod tests {
                 WrappedEquityRecoveryCommand::DispatchToRedemption {
                     redemption_id: redemption_id.clone(),
                 },
-                &services(),
+                &SERVICES,
             )
             .await
             .expect("Dispatch should succeed from Detected");
@@ -577,14 +612,13 @@ mod tests {
     #[tokio::test]
     async fn submit_orphan_deposit_emits_event_with_returned_tx_hash() {
         let detected = detected_state();
-        let services = services();
 
         let events = detected
             .transition(
                 WrappedEquityRecoveryCommand::SubmitOrphanDeposit {
                     vault_deposit_tx_hash: fake_tx_hash(),
                 },
-                &services,
+                &SERVICES,
             )
             .await
             .expect("SubmitOrphanDeposit should succeed from Detected");
@@ -613,7 +647,7 @@ mod tests {
                 WrappedEquityRecoveryCommand::ConfirmOrphanDeposit {
                     vault_deposit_tx_hash: fake_tx_hash(),
                 },
-                &services(),
+                &SERVICES,
             )
             .await
             .expect("ConfirmOrphanDeposit should succeed from OrphanDepositSubmitted");
@@ -645,7 +679,7 @@ mod tests {
                         vault_deposit_tx_hash: fake_tx_hash(),
                     },
                 },
-                &services(),
+                &SERVICES,
             )
             .await
             .expect("CompleteRecovery should succeed from OrphanDeposited");
@@ -675,7 +709,7 @@ mod tests {
                 WrappedEquityRecoveryCommand::FailRecovery {
                     reason: "should be rejected".to_string(),
                 },
-                &services(),
+                &SERVICES,
             )
             .await
             .expect_err("FailRecovery on Completed should error");

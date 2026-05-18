@@ -14,8 +14,7 @@ pub(crate) use usdc::{
 pub(crate) struct RebalancingSchedulers {
     pub(crate) equity: EquityRebalancingCheckScheduler,
     pub(crate) usdc: UsdcRebalancingCheckScheduler,
-    pub(crate) wrapped_equity_recovery:
-        crate::wrapped_equity_recovery::WrappedEquityRecoveryJobQueue,
+    pub(crate) wrapped_equity_recovery: WrappedEquityRecoveryJobQueue,
 }
 
 impl RebalancingSchedulers {
@@ -23,8 +22,7 @@ impl RebalancingSchedulers {
         Self {
             equity: EquityRebalancingCheckScheduler::new(pool),
             usdc: UsdcRebalancingCheckScheduler::new(pool),
-            wrapped_equity_recovery:
-                crate::wrapped_equity_recovery::WrappedEquityRecoveryJobQueue::new(pool),
+            wrapped_equity_recovery: WrappedEquityRecoveryJobQueue::new(pool),
         }
     }
 }
@@ -66,6 +64,7 @@ use crate::usdc_rebalance::{
     RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent, UsdcRebalanceId,
 };
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
+use crate::wrapped_equity_recovery::{WrappedEquityRecoveryJob, WrappedEquityRecoveryJobQueue};
 use crate::wrapper::{Wrapper, WrapperError};
 
 /// Why the rebalancing trigger reactor failed.
@@ -613,8 +612,7 @@ pub(crate) struct RebalancingService {
     wrapper: Arc<dyn Wrapper>,
     pub(super) equity_scheduler: EquityRebalancingCheckScheduler,
     pub(super) usdc_scheduler: UsdcRebalancingCheckScheduler,
-    pub(super) wrapped_equity_recovery_queue:
-        crate::wrapped_equity_recovery::WrappedEquityRecoveryJobQueue,
+    pub(super) wrapped_equity_recovery_queue: WrappedEquityRecoveryJobQueue,
     /// Tracks symbol/quantity for in-flight mints. The initial `MintRequested`
     /// event carries this data; follow-up events don't.
     mint_tracking: Arc<RwLock<HashMap<IssuerRequestId, MintTracking>>>,
@@ -1405,7 +1403,6 @@ impl RebalancingService {
             }
             // Wrapped equity in the bot wallet (outside Raindex) triggers
             // a recovery dispatch job per symbol with a positive balance.
-            // RAI-87.
             BaseWalletWrappedEquity { balances, .. } => {
                 for (symbol, amount) in balances {
                     if *amount == FractionalShares::ZERO {
@@ -1413,7 +1410,7 @@ impl RebalancingService {
                     }
                     let mut queue = self.wrapped_equity_recovery_queue.clone();
                     if let Err(error) = queue
-                        .push(crate::wrapped_equity_recovery::WrappedEquityRecoveryJob {
+                        .push(WrappedEquityRecoveryJob {
                             symbol: symbol.clone(),
                         })
                         .await
