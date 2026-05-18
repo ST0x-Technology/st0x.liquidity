@@ -473,7 +473,7 @@ mod tests {
 
     use super::*;
 
-    fn services() -> () {}
+    const SERVICES: () = ();
 
     fn aapl() -> Symbol {
         Symbol::new("AAPL").unwrap()
@@ -504,7 +504,7 @@ mod tests {
                 symbol: aapl(),
                 shares: one_share(),
             },
-            &services(),
+            &SERVICES,
         )
         .await
         .expect("Detect should initialize");
@@ -532,7 +532,7 @@ mod tests {
                 WrappedEquityRecoveryCommand::DispatchToMint {
                     mint_id: mint_id.clone(),
                 },
-                &services(),
+                &SERVICES,
             )
             .await
             .expect("Dispatch should succeed from Detected");
@@ -557,7 +557,7 @@ mod tests {
                 WrappedEquityRecoveryCommand::DispatchToRedemption {
                     redemption_id: redemption_id.clone(),
                 },
-                &services(),
+                &SERVICES,
             )
             .await
             .expect("Dispatch should succeed from Detected");
@@ -577,14 +577,13 @@ mod tests {
     #[tokio::test]
     async fn submit_orphan_deposit_emits_event_with_returned_tx_hash() {
         let detected = detected_state();
-        let services = services();
 
         let events = detected
             .transition(
                 WrappedEquityRecoveryCommand::SubmitOrphanDeposit {
                     vault_deposit_tx_hash: fake_tx_hash(),
                 },
-                &services,
+                &SERVICES,
             )
             .await
             .expect("SubmitOrphanDeposit should succeed from Detected");
@@ -613,7 +612,7 @@ mod tests {
                 WrappedEquityRecoveryCommand::ConfirmOrphanDeposit {
                     vault_deposit_tx_hash: fake_tx_hash(),
                 },
-                &services(),
+                &SERVICES,
             )
             .await
             .expect("ConfirmOrphanDeposit should succeed from OrphanDepositSubmitted");
@@ -645,7 +644,7 @@ mod tests {
                         vault_deposit_tx_hash: fake_tx_hash(),
                     },
                 },
-                &services(),
+                &SERVICES,
             )
             .await
             .expect("CompleteRecovery should succeed from OrphanDeposited");
@@ -675,7 +674,7 @@ mod tests {
                 WrappedEquityRecoveryCommand::FailRecovery {
                     reason: "should be rejected".to_string(),
                 },
-                &services(),
+                &SERVICES,
             )
             .await
             .expect_err("FailRecovery on Completed should error");

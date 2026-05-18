@@ -98,16 +98,13 @@ impl Job<WrappedEquityRecoveryCtx> for WrappedEquityRecoveryJob {
     async fn perform(&self, ctx: &WrappedEquityRecoveryCtx) -> Result<Self::Output, Self::Error> {
         let symbol = self.symbol.clone();
 
-        let guard = match claim_guard(&ctx.equity_in_progress, &symbol) {
-            Some(guard) => guard,
-            None => {
-                debug!(
-                    target: "rebalance",
-                    %symbol,
-                    "Skipping wrapped equity recovery: equity_in_progress already held",
-                );
-                return Ok(());
-            }
+        let Some(guard) = claim_guard(&ctx.equity_in_progress, &symbol) else {
+            debug!(
+                target: "rebalance",
+                %symbol,
+                "Skipping wrapped equity recovery: equity_in_progress already held",
+            );
+            return Ok(());
         };
 
         let snapshot = read_recovery_snapshot(&ctx.inventory, &symbol).await;
@@ -205,16 +202,24 @@ async fn read_recovery_snapshot(
     if shares == st0x_execution::FractionalShares::ZERO {
         return None;
     }
-
-    let dispatch = if let Some(mint_id) = view.active_mint(symbol) {
-        DispatchDecision::ActiveMint(mint_id.clone())
-    } else if let Some(redemption_id) = view.active_redemption(symbol) {
-        DispatchDecision::ActiveRedemption(redemption_id.clone())
-    } else {
-        DispatchDecision::Orphan
-    };
-
+    let dispatch = decide_dispatch(&view, symbol);
+    drop(view);
     Some(RecoverySnapshot { shares, dispatch })
+}
+
+fn decide_dispatch(
+    view: &crate::inventory::view::InventoryView,
+    symbol: &Symbol,
+) -> DispatchDecision {
+    view.active_mint(symbol).map_or_else(
+        || {
+            view.active_redemption(symbol)
+                .map_or(DispatchDecision::Orphan, |redemption_id| {
+                    DispatchDecision::ActiveRedemption(redemption_id.clone())
+                })
+        },
+        |mint_id| DispatchDecision::ActiveMint(mint_id.clone()),
+    )
 }
 
 /// RAII helper that inserts `symbol` into `equity_in_progress` and removes it
