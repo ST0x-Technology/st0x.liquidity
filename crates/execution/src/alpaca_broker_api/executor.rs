@@ -16,9 +16,10 @@ use super::journal::JournalResponse;
 use super::order::{AlpacaLimitOrder, ConversionDirection, CryptoOrderResponse};
 use super::{AlpacaBrokerApiError, AssetStatus, TimeInForce};
 use crate::{
-    CounterTradePreflight, Direction, Executor, FractionalShares, InventoryResult, MarketOrder,
-    OrderPlacement, OrderState, OrderStatus, Positive, SupportedExecutor, Symbol, TryIntoExecutor,
-    buying_power_counter_trade_preflight, estimate_buffered_cost_cents,
+    CounterTradePreflight, Direction, Executor, FractionalShares, InventoryResult, LimitOrder,
+    MarketOrder, MarketSession, OrderPlacement, OrderState, OrderStatus, Positive,
+    SupportedExecutor, Symbol, TryIntoExecutor, buying_power_counter_trade_preflight,
+    estimate_buffered_cost_cents,
 };
 
 /// Response from the asset endpoint
@@ -140,6 +141,21 @@ impl Executor for AlpacaBrokerApi {
             OrderStatus::Pending | OrderStatus::Submitted => Ok(OrderState::Submitted {
                 order_id: order_id.clone(),
             }),
+            OrderStatus::PartiallyFilled => {
+                let shares_filled = order_update.shares_filled.ok_or_else(|| {
+                    AlpacaBrokerApiError::IncompleteFilledOrder {
+                        order_id: order_id.clone(),
+                        field: "filled_qty".to_string(),
+                    }
+                })?;
+
+                Ok(OrderState::PartiallyFilled {
+                    order_id: order_id.clone(),
+                    shares_filled,
+                    avg_price: order_update.price,
+                    partially_filled_at: order_update.updated_at,
+                })
+            }
             OrderStatus::Filled => {
                 let price = order_update.price.ok_or_else(|| {
                     AlpacaBrokerApiError::IncompleteFilledOrder {
@@ -154,9 +170,17 @@ impl Executor for AlpacaBrokerApi {
                     price,
                 })
             }
+            OrderStatus::Cancelled => Ok(OrderState::Cancelled {
+                cancelled_at: order_update.updated_at,
+                order_id: order_id.clone(),
+                shares_filled: order_update.shares_filled,
+                avg_price: order_update.price,
+            }),
             OrderStatus::Failed => Ok(OrderState::Failed {
                 failed_at: order_update.updated_at,
                 error_reason: None,
+                shares_filled: order_update.shares_filled,
+                avg_price: order_update.price,
             }),
         }
     }
@@ -229,6 +253,48 @@ impl Executor for AlpacaBrokerApi {
             }
         }
     }
+
+    async fn fetch_latest_trade_price(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<Option<Positive<rain_math_float::Float>>, Self::Error> {
+        let price = crate::alpaca_market_data::fetch_latest_trade_price(
+            self.client.market_data_http_client(),
+            self.client.market_data_base_url(),
+            symbol,
+        )
+        .await?;
+        Ok(Some(price))
+    }
+
+    async fn market_session(&self) -> Result<MarketSession, Self::Error> {
+        super::market_hours::market_session(&self.client).await
+    }
+
+    async fn place_limit_order(
+        &self,
+        order: LimitOrder,
+    ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
+        let asset = self.get_asset_cached(&order.symbol).await?;
+        Self::validate_asset(&order.symbol, &asset)?;
+
+        let alpaca_limit_price = super::order::AlpacaLimitPrice::try_new(order.limit_price)?;
+
+        let alpaca_order = AlpacaLimitOrder {
+            symbol: order.symbol,
+            shares: order.shares,
+            direction: order.direction,
+            limit_price: alpaca_limit_price,
+            extended_hours: order.extended_hours,
+        };
+
+        super::order::place_limit_order(&self.client, alpaca_order).await
+    }
+
+    async fn cancel_order(&self, order_id: &Self::OrderId) -> Result<(), Self::Error> {
+        let order_uuid = Uuid::parse_str(order_id)?;
+        self.client.cancel_order(order_uuid).await
+    }
 }
 
 #[async_trait]
@@ -280,12 +346,12 @@ impl AlpacaBrokerApi {
             .await
     }
 
-    /// Place a manual Alpaca Broker API limit order for operator intervention.
+    /// Place a manual Alpaca-specific limit order for operator intervention.
     ///
-    /// This stays outside the generic `Executor` trait because automated hedging
-    /// uses market orders only; manual CLI limit orders are an Alpaca-specific
-    /// workflow.
-    pub async fn place_limit_order(
+    /// Accepts `AlpacaLimitOrder` directly (pre-validated Alpaca price type).
+    /// For automated counter-trading, use the `Executor::place_limit_order`
+    /// trait method which accepts the broker-agnostic `LimitOrder` type.
+    pub async fn place_alpaca_limit_order(
         &self,
         order: AlpacaLimitOrder,
     ) -> Result<OrderPlacement<String>, AlpacaBrokerApiError> {
@@ -293,6 +359,25 @@ impl AlpacaBrokerApi {
         Self::validate_asset(&order.symbol, &asset)?;
 
         super::order::place_limit_order(&self.client, order).await
+    }
+
+    /// Fetches the latest trade price for a symbol from Alpaca market data.
+    pub async fn fetch_latest_trade_price(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<Positive<rain_math_float::Float>, AlpacaBrokerApiError> {
+        crate::alpaca_market_data::fetch_latest_trade_price(
+            self.client.market_data_http_client(),
+            self.client.market_data_base_url(),
+            symbol,
+        )
+        .await
+        .map_err(AlpacaBrokerApiError::from)
+    }
+
+    /// Returns the configured counter-trade slippage in basis points.
+    pub fn counter_trade_slippage_bps(&self) -> u16 {
+        self.counter_trade_slippage_bps
     }
 
     async fn get_asset_cached(&self, symbol: &Symbol) -> Result<CachedAsset, AlpacaBrokerApiError> {
@@ -1045,7 +1130,7 @@ mod tests {
             extended_hours: true,
         };
 
-        let result = executor.place_limit_order(order).await.unwrap();
+        let result = executor.place_alpaca_limit_order(order).await.unwrap();
 
         asset_mock.assert();
         order_mock.assert();
@@ -1079,7 +1164,7 @@ mod tests {
             extended_hours: true,
         };
 
-        let result = executor.place_limit_order(order).await;
+        let result = executor.place_alpaca_limit_order(order).await;
 
         asset_mock.assert();
         order_mock.assert_calls(0);
@@ -1120,7 +1205,7 @@ mod tests {
             extended_hours: true,
         };
 
-        let result = executor.place_limit_order(order).await;
+        let result = executor.place_alpaca_limit_order(order).await;
 
         asset_mock.assert();
         order_mock.assert_calls(0);

@@ -166,6 +166,31 @@ impl AlpacaBrokerApiClient {
         self.get(&url).await
     }
 
+    /// Cancel an order by ID.
+    ///
+    /// Idempotent: a 404 from the broker (order not found because it was
+    /// already cancelled, never existed, or already terminal) is treated as
+    /// success so retries after lost ACKs converge.
+    pub(super) async fn cancel_order(&self, order_id: Uuid) -> Result<(), AlpacaBrokerApiError> {
+        let url = format!(
+            "{}/v1/trading/accounts/{}/orders/{}",
+            self.base_url, self.account_id, order_id
+        );
+
+        debug!("Cancelling order {} at {}", order_id, url);
+
+        match self.delete(&url).await {
+            Ok(()) => Ok(()),
+            Err(AlpacaBrokerApiError::ApiError { status, .. })
+                if status == reqwest::StatusCode::NOT_FOUND =>
+            {
+                debug!(%order_id, "Cancel returned 404; treating as already-cancelled");
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Get asset information by symbol
     pub(super) async fn get_asset(
         &self,
@@ -237,6 +262,29 @@ impl AlpacaBrokerApiClient {
         self.handle_response(response).await
     }
 
+    /// Perform a DELETE request, expecting no response body.
+    pub(super) async fn delete(&self, url: &str) -> Result<(), AlpacaBrokerApiError> {
+        let response = self.http_client.delete(url).send().await?;
+        let status = response.status();
+
+        if status.is_success() {
+            return Ok(());
+        }
+
+        let error_body = response.text().await?;
+
+        let (alpaca_code, message) = match serde_json::from_str::<AlpacaApiErrorBody>(&error_body) {
+            Ok(parsed) => (parsed.code, parsed.message),
+            Err(_) => (None, error_body),
+        };
+
+        Err(AlpacaBrokerApiError::ApiError {
+            status,
+            alpaca_code,
+            message,
+        })
+    }
+
     /// Perform a POST request with JSON body
     pub(super) async fn post<T: serde::de::DeserializeOwned + Send, B: Serialize + Sync>(
         &self,
@@ -258,7 +306,7 @@ impl AlpacaBrokerApiClient {
             return Ok(response.json().await?);
         }
 
-        let error_body = response.text().await.unwrap_or_default();
+        let error_body = response.text().await?;
 
         let (alpaca_code, message) = match serde_json::from_str::<AlpacaApiErrorBody>(&error_body) {
             Ok(parsed) => (parsed.code, parsed.message),

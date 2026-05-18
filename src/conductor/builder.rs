@@ -152,6 +152,7 @@ where
     let poll_status_ctx = Arc::new(PollOrderStatusCtx {
         executor: context.executor.clone(),
         offchain_order_projection: context.frameworks.offchain_order_projection.clone(),
+        offchain_order_store: context.frameworks.offchain_order.clone(),
         poll_status_queue: poll_status_queue.clone(),
         reconcile_queue: reconcile_queue.clone(),
         rejection_queue: rejection_queue.clone(),
@@ -170,10 +171,29 @@ where
 
     let counter_trade_submission_lock = Arc::new(tokio::sync::Mutex::new(()));
 
+    let hedge_order_placer: Option<Arc<dyn crate::offchain::order::OrderPlacer>> =
+        if context.ctx.extended_hours_counter_trading {
+            Some(Arc::new(crate::offchain::order::ExecutorOrderPlacer(
+                context.executor.clone(),
+            )))
+        } else {
+            None
+        };
+
     let hedge_ctx = Arc::new(HedgeCtx {
         position: context.frameworks.position.clone(),
         offchain_order: context.frameworks.offchain_order.clone(),
         poll_status_queue: poll_status_queue.clone(),
+        order_placer: hedge_order_placer,
+        counter_trade_submission_lock: counter_trade_submission_lock.clone(),
+        counter_trade_slippage_bps: match &context.ctx.broker {
+            crate::config::BrokerCtx::AlpacaBrokerApi(alpaca_ctx) => {
+                alpaca_ctx.counter_trade_slippage_bps
+            }
+            crate::config::BrokerCtx::DryRun => {
+                st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS
+            }
+        },
     });
 
     let position_monitor = PositionMonitor::new(
@@ -183,6 +203,8 @@ where
         std::time::Duration::from_secs(context.ctx.position_check_interval),
         context.ctx.clone(),
         context.pool.clone(),
+        context.frameworks.offchain_order.clone(),
+        context.frameworks.position.clone(),
     );
 
     let trade_cqrs = super::TradeProcessingCqrs {
@@ -194,6 +216,7 @@ where
         assets: context.ctx.assets.clone(),
         counter_trade_submission_lock,
         poll_status_queue: poll_status_queue.clone(),
+        extended_hours_counter_trading: context.ctx.extended_hours_counter_trading,
     };
 
     let accountant_ctx = Arc::new(AccountantCtx {

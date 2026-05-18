@@ -28,7 +28,7 @@ pub use alpaca_broker_api::{
 };
 pub use error::PersistenceError;
 pub use mock::{MockExecutor, MockExecutorCtx};
-pub use order::{MarketOrder, OrderPlacement, OrderState, OrderStatus, OrderUpdate};
+pub use order::{LimitOrder, MarketOrder, OrderPlacement, OrderState, OrderStatus, OrderUpdate};
 
 pub use st0x_finance::{
     EmptySymbolError, FractionalShares, HasZero, NotPositive, Positive, Symbol, ToWholeSharesError,
@@ -125,6 +125,19 @@ pub(crate) fn truncate_to_decimal_places(
     Float::from_fixed_decimal(fixed, max_decimals).map(Some)
 }
 
+/// Describes the current trading session, driving order-type selection.
+///
+/// - `Regular` -- standard market hours; market orders are used.
+/// - `Extended` -- pre-market or after-hours; only limit orders with
+///   `extended_hours: true` are allowed by the broker.
+/// - `Closed` -- outside all trading sessions (weekends, holidays, overnight).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MarketSession {
+    Regular,
+    Extended,
+    Closed,
+}
+
 #[async_trait]
 pub trait Executor: Send + Sync + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
@@ -187,6 +200,41 @@ pub trait Executor: Send + Sync + 'static {
     ) -> Result<CounterTradePreflight, Self::Error> {
         Ok(CounterTradePreflight::Allowed { reservation: None })
     }
+
+    /// Returns the current market session (regular, extended, or closed).
+    ///
+    /// Default implementation delegates to `is_market_open()`, mapping
+    /// `true -> Regular` and `false -> Closed`. Executors with extended-hours
+    /// support (e.g. Alpaca) override this to distinguish `Extended` sessions.
+    async fn market_session(&self) -> Result<MarketSession, Self::Error> {
+        if self.is_market_open().await? {
+            Ok(MarketSession::Regular)
+        } else {
+            Ok(MarketSession::Closed)
+        }
+    }
+
+    /// Fetches the latest trade price for a symbol from the broker's market
+    /// data feed. Used to determine limit prices for extended-hours
+    /// counter-trades. Returns `None` when not supported by the executor.
+    async fn fetch_latest_trade_price(
+        &self,
+        _symbol: &Symbol,
+    ) -> Result<Option<Positive<Float>>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Place a limit order for the specified symbol, quantity, and price.
+    ///
+    /// Used for counter-trading during extended hours when market orders
+    /// are not accepted.
+    async fn place_limit_order(
+        &self,
+        order: LimitOrder,
+    ) -> Result<OrderPlacement<Self::OrderId>, Self::Error>;
+
+    /// Cancel a previously placed order by its executor-assigned ID.
+    async fn cancel_order(&self, order_id: &Self::OrderId) -> Result<(), Self::Error>;
 }
 
 #[derive(Debug, thiserror::Error)]

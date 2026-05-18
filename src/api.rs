@@ -376,12 +376,12 @@ fn extract_log_file_date(entry: &std::fs::DirEntry) -> Option<chrono::NaiveDate>
     chrono::NaiveDate::parse_from_str(date_suffix, "%Y-%m-%d").ok()
 }
 
-/// Returns non-terminal offchain orders (Pending, Submitted, PartiallyFilled).
+/// Returns non-terminal offchain orders (Pending, Submitted, PartiallyFilled, Cancelling).
 #[get("/orders/pending")]
 async fn pending_orders(pool: &State<SqlitePool>) -> Json<Vec<PendingOrderResponse>> {
     let rows: Vec<(String, String, String)> = match sqlx::query_as(
         "SELECT view_id, status, payload FROM offchain_order_view \
-         WHERE status IN ('Pending', 'Submitted', 'PartiallyFilled') \
+         WHERE status IN ('Pending', 'Submitted', 'PartiallyFilled', 'Cancelling') \
          ORDER BY rowid DESC LIMIT 100",
     )
     .fetch_all(pool.inner())

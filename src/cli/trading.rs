@@ -51,6 +51,27 @@ impl OrderPlacer for CliOrderPlacer {
             placed_shares: placement.shares,
         })
     }
+
+    async fn place_limit_order(
+        &self,
+        _order: st0x_execution::LimitOrder,
+    ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+        Err("CLI does not support automated limit order placement".into())
+    }
+
+    async fn cancel_order(
+        &self,
+        _executor_order_id: &ExecutorOrderId,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err("CLI does not support order cancellation".into())
+    }
+
+    async fn get_order_status(
+        &self,
+        _executor_order_id: &ExecutorOrderId,
+    ) -> Result<OrderState, Box<dyn std::error::Error + Send + Sync>> {
+        Err("CLI does not support reading order status via OrderPlacer".into())
+    }
 }
 
 pub(super) fn create_order_placer(ctx: &Ctx, pool: &SqlitePool) -> Arc<dyn OrderPlacer> {
@@ -152,6 +173,28 @@ pub(super) async fn order_status_command<W: Write>(
                 "   The order has been submitted and is waiting to be filled."
             )?;
         }
+        OrderState::PartiallyFilled {
+            order_id,
+            shares_filled,
+            avg_price,
+            partially_filled_at,
+        } => {
+            writeln!(stdout, "🟡 Order Status: PARTIALLY FILLED")?;
+            writeln!(stdout, "   Order ID: {order_id}")?;
+            writeln!(stdout, "   Partially Filled At: {partially_filled_at}")?;
+            writeln!(
+                stdout,
+                "   Shares Filled: {}",
+                format_float_with_fallback(&shares_filled)
+            )?;
+            if let Some(price) = avg_price {
+                writeln!(
+                    stdout,
+                    "   Avg Fill Price: ${}",
+                    format_float_with_fallback(&price)
+                )?;
+            }
+        }
         OrderState::Filled {
             executed_at,
             order_id,
@@ -166,14 +209,54 @@ pub(super) async fn order_status_command<W: Write>(
                 format_float_with_fallback(&price)
             )?;
         }
+        OrderState::Cancelled {
+            cancelled_at,
+            order_id,
+            shares_filled,
+            avg_price,
+        } => {
+            writeln!(stdout, "🚫 Order Status: CANCELLED")?;
+            writeln!(stdout, "   Order ID: {order_id}")?;
+            writeln!(stdout, "   Cancelled At: {cancelled_at}")?;
+            if let Some(shares_filled) = shares_filled {
+                writeln!(
+                    stdout,
+                    "   Shares Filled: {}",
+                    format_float_with_fallback(&shares_filled)
+                )?;
+            }
+            if let Some(avg_price) = avg_price {
+                writeln!(
+                    stdout,
+                    "   Avg Fill Price: ${}",
+                    format_float_with_fallback(&avg_price)
+                )?;
+            }
+        }
         OrderState::Failed {
             failed_at,
             error_reason,
+            shares_filled,
+            avg_price,
         } => {
             writeln!(stdout, "❌ Order Status: FAILED")?;
             writeln!(stdout, "   Failed At: {failed_at}")?;
             if let Some(reason) = error_reason {
                 writeln!(stdout, "   Reason: {reason}")?;
+            }
+            if let Some(shares_filled) = shares_filled {
+                writeln!(
+                    stdout,
+                    "   Shares Filled: {}",
+                    format_float_with_fallback(&shares_filled)
+                )?;
+            }
+            if let Some(avg_price) = avg_price {
+                writeln!(
+                    stdout,
+                    "   Avg Fill Price: ${}",
+                    format_float_with_fallback(&avg_price)
+                )?;
             }
         }
     }
@@ -292,7 +375,7 @@ async fn execute_alpaca_limit_order<W: Write>(
 
     let broker = alpaca_auth.clone().try_into_executor().await?;
     let placement = broker
-        .place_limit_order(AlpacaLimitOrder {
+        .place_alpaca_limit_order(AlpacaLimitOrder {
             symbol: request.symbol.clone(),
             shares: request.shares,
             direction: request.direction,
@@ -483,6 +566,7 @@ pub(super) async fn process_found_trade<W: Write>(
         executor_type,
         &ctx.assets,
         trading_enabled,
+        false,
     )
     .await?
     else {
@@ -528,6 +612,7 @@ pub(super) async fn process_found_trade<W: Write>(
                 shares: params.shares,
                 direction: params.direction,
                 executor: params.executor,
+                kind: crate::offchain::order::CounterTradeOrderKind::Market,
             },
         )
         .await
@@ -683,6 +768,7 @@ mod tests {
             },
             travel_rule: None,
             rest_api: None,
+            extended_hours_counter_trading: false,
             redemption_wallet: None,
             #[cfg(feature = "test-support")]
             failure_injector: crate::conductor::job::FailureInjector::new(),

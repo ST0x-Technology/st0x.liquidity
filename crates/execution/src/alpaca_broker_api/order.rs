@@ -378,13 +378,14 @@ pub(super) async fn get_order_status(
 
     let status = map_broker_status_to_order_status(response.status);
     let price = response.filled_average_price;
+    let shares_filled = response.filled_quantity;
 
     if response.status == BrokerOrderStatus::PartiallyFilled {
         debug!(
             order_id,
             symbol = %response.symbol,
             ordered_qty = %response.quantity.inner(),
-            filled_qty = ?response.filled_quantity,
+            filled_qty = ?shares_filled,
             "Order is partially filled"
         );
     }
@@ -397,6 +398,7 @@ pub(super) async fn get_order_status(
         status,
         updated_at: Utc::now(),
         price,
+        shares_filled,
     })
 }
 
@@ -406,18 +408,23 @@ fn map_broker_status_to_order_status(status: BrokerOrderStatus) -> OrderStatus {
         BrokerOrderStatus::New
         | BrokerOrderStatus::Accepted
         | BrokerOrderStatus::PendingNew
-        | BrokerOrderStatus::PartiallyFilled
         | BrokerOrderStatus::AcceptedForBidding
         | BrokerOrderStatus::PendingCancel
         | BrokerOrderStatus::PendingReplace
         | BrokerOrderStatus::Stopped => OrderStatus::Submitted,
 
+        // Partially filled -- distinct from Submitted so the poll loop can
+        // drive `UpdatePartialFill` on the aggregate before any cancel.
+        BrokerOrderStatus::PartiallyFilled => OrderStatus::PartiallyFilled,
+
         // Successfully filled
         BrokerOrderStatus::Filled => OrderStatus::Filled,
 
+        // Cancelled by the broker after a cancel request was accepted.
+        BrokerOrderStatus::Canceled => OrderStatus::Cancelled,
+
         // Failed/terminal statuses
-        BrokerOrderStatus::Canceled
-        | BrokerOrderStatus::Expired
+        BrokerOrderStatus::Expired
         | BrokerOrderStatus::DoneForDay
         | BrokerOrderStatus::Rejected
         | BrokerOrderStatus::Replaced
