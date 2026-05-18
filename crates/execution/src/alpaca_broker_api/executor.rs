@@ -170,11 +170,6 @@ impl Executor for AlpacaBrokerApi {
         Ok(order_id_str.to_string())
     }
 
-    async fn run_executor_maintenance(&self) -> Option<tokio::task::JoinHandle<()>> {
-        // Alpaca uses API keys, no token refresh needed
-        None
-    }
-
     async fn get_inventory(&self) -> Result<crate::InventoryResult, Self::Error> {
         let inventory = super::positions::fetch_inventory(&self.client).await?;
         Ok(InventoryResult::Fetched(inventory))
@@ -603,7 +598,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_run_executor_maintenance_returns_none() {
+    async fn test_maintenance_interval_returns_none() {
         let server = MockServer::start();
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
@@ -613,7 +608,7 @@ mod tests {
 
         account_mock.assert();
 
-        assert!(executor.run_executor_maintenance().await.is_none());
+        assert!(executor.maintenance_interval().is_none());
     }
 
     #[tokio::test]
