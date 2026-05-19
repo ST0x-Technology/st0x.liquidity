@@ -47,21 +47,23 @@ builtins.mapAttrs withPaths {
     enabled = true;
     # Deploy after st0x-hedge so the DB file exists and is chowned to st0x:st0x
     # before datasette opens it. (--immutable would close the WAL out and serve
-    # stale reads, so we open the DB normally and rely on loopback binding for
-    # access control.)
+    # stale reads, so we open the DB normally and rely on the host firewall +
+    # Tailscale for access control.)
     order = 40;
     kind = "plain";
     package = "datasette";
     bin = "datasette";
     description = "Datasette SQLite explorer";
-    # Bind to loopback; access via SSH tunnel or `tailscale ssh -L 8081:127.0.0.1:8081 <host>`.
+    # Bind to all interfaces so the service is reachable over the tailnet
+    # (e.g. http://<host>.taile5cf8a.ts.net:8081). Public access is blocked
+    # by the host firewall.
     args = [
       "serve"
       "/mnt/data/st0x-hedge.db"
       "-p"
       "8081"
       "-h"
-      "127.0.0.1"
+      "0.0.0.0"
     ];
   };
 }
