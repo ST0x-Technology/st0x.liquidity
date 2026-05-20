@@ -130,7 +130,7 @@ where
         owner: order_owner,
     };
 
-    let polling_service = Arc::new(InventoryPollingService::new(
+    let mut polling_service = InventoryPollingService::new(
         raindex_service,
         context.executor.clone(),
         context.frameworks.vault_registry.clone(),
@@ -139,7 +139,14 @@ where
         context.wallet_polling,
         context.tokenizer,
         reserved_cash,
-    ));
+    );
+
+    if let Some(rebalancing_service) = &rebalancing_service {
+        polling_service =
+            polling_service.with_pending_request_ownership(rebalancing_service.clone());
+    }
+
+    let polling_service = Arc::new(polling_service);
 
     let inventory_monitor = InventoryMonitor {
         poller: polling_service,

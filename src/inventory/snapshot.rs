@@ -106,6 +106,9 @@ pub(crate) struct InventorySnapshot {
     pub(crate) inflight_mints: BTreeMap<Symbol, FractionalShares>,
     /// Equity currently in-flight via redemptions (tokens sent to Alpaca)
     pub(crate) inflight_redemptions: BTreeMap<Symbol, FractionalShares>,
+    /// Time the current inflight equity provider snapshot was fetched.
+    #[serde(default)]
+    pub(crate) inflight_equity_fetched_at: Option<DateTime<Utc>>,
     /// When this snapshot was last updated
     pub(crate) last_updated: DateTime<Utc>,
 }
@@ -142,6 +145,7 @@ impl EventSourced for InventorySnapshot {
             base_wallet_usdc: None,
             inflight_mints: BTreeMap::new(),
             inflight_redemptions: BTreeMap::new(),
+            inflight_equity_fetched_at: None,
             base_wallet_unwrapped_equity: BTreeMap::new(),
             base_wallet_wrapped_equity: BTreeMap::new(),
             last_updated: event.timestamp(),
@@ -203,10 +207,14 @@ impl EventSourced for InventorySnapshot {
                 usdc_balance,
                 fetched_at: now,
             },
-            InflightEquity { mints, redemptions } => InventorySnapshotEvent::InflightEquity {
+            InflightEquity {
                 mints,
                 redemptions,
-                fetched_at: now,
+                fetched_at,
+            } => InventorySnapshotEvent::InflightEquity {
+                mints,
+                redemptions,
+                fetched_at,
             },
             BaseWalletUnwrappedEquity { balances } => {
                 InventorySnapshotEvent::BaseWalletUnwrappedEquity {
@@ -314,14 +322,31 @@ impl EventSourced for InventorySnapshot {
                     fetched_at: now,
                 }])
             }
-            InflightEquity { mints, redemptions } => {
-                if self.inflight_mints == mints && self.inflight_redemptions == redemptions {
+            InflightEquity {
+                mints,
+                redemptions,
+                fetched_at,
+            } => {
+                // Suppress when the inflight maps are unchanged and either there
+                // is nothing inflight (empty maps carry no signal worth a per-poll
+                // event) or the new fetch is not newer than the stored one. When
+                // something IS inflight, a strictly newer `fetched_at` still emits
+                // even with identical maps so observers know the provider was
+                // re-polled and the in-transit balance is still confirmed.
+                let maps_unchanged =
+                    self.inflight_mints == mints && self.inflight_redemptions == redemptions;
+                let nothing_inflight = mints.is_empty() && redemptions.is_empty();
+                let fetch_not_newer = self
+                    .inflight_equity_fetched_at
+                    .is_some_and(|current| fetched_at <= current);
+
+                if maps_unchanged && (nothing_inflight || fetch_not_newer) {
                     return Ok(vec![]);
                 }
                 Ok(vec![InventorySnapshotEvent::InflightEquity {
                     mints,
                     redemptions,
-                    fetched_at: now,
+                    fetched_at,
                 }])
             }
             BaseWalletUnwrappedEquity { balances } => {
@@ -436,7 +461,9 @@ impl InventorySnapshot {
             });
         }
 
-        if !self.inflight_mints.is_empty() || !self.inflight_redemptions.is_empty() {
+        if let Some(fetched_at) = self.inflight_equity_fetched_at
+            && (!self.inflight_mints.is_empty() || !self.inflight_redemptions.is_empty())
+        {
             events.push(InventorySnapshotEvent::InflightEquity {
                 mints: self.inflight_mints.clone(),
                 redemptions: self.inflight_redemptions.clone(),
@@ -519,10 +546,13 @@ impl InventorySnapshot {
                 self.base_wallet_usdc = Some(*usdc_balance);
             }
             InventorySnapshotEvent::InflightEquity {
-                mints, redemptions, ..
+                mints,
+                redemptions,
+                fetched_at,
             } => {
                 self.inflight_mints = mints.clone();
                 self.inflight_redemptions = redemptions.clone();
+                self.inflight_equity_fetched_at = Some(*fetched_at);
             }
             InventorySnapshotEvent::BaseWalletUnwrappedEquity { balances, .. } => {
                 self.base_wallet_unwrapped_equity = balances.clone();
@@ -576,6 +606,8 @@ pub(crate) enum InventorySnapshotCommand {
         mints: BTreeMap<Symbol, FractionalShares>,
         /// Pending redemptions by symbol (tokens sent to Alpaca).
         redemptions: BTreeMap<Symbol, FractionalShares>,
+        /// Time the provider pending-request response was observed.
+        fetched_at: DateTime<Utc>,
     },
 }
 
@@ -1409,6 +1441,7 @@ mod tests {
             .when(InventorySnapshotCommand::InflightEquity {
                 mints: mints.clone(),
                 redemptions: redemptions.clone(),
+                fetched_at: Utc::now(),
             })
             .await
             .events();
@@ -1445,6 +1478,7 @@ mod tests {
             .when(InventorySnapshotCommand::InflightEquity {
                 mints: mints.clone(),
                 redemptions: updated_redemptions.clone(),
+                fetched_at: Utc::now(),
             })
             .await
             .events();
@@ -1464,16 +1498,18 @@ mod tests {
     async fn inflight_equity_skips_when_unchanged() {
         let mut mints = BTreeMap::new();
         mints.insert(test_symbol("AAPL"), test_shares(10));
+        let fetched_at = Utc::now();
 
         let events = TestHarness::<InventorySnapshot>::with(())
             .given(vec![InventorySnapshotEvent::InflightEquity {
                 mints: mints.clone(),
                 redemptions: BTreeMap::new(),
-                fetched_at: Utc::now(),
+                fetched_at,
             }])
             .when(InventorySnapshotCommand::InflightEquity {
                 mints,
                 redemptions: BTreeMap::new(),
+                fetched_at,
             })
             .await
             .events();
@@ -1482,6 +1518,124 @@ mod tests {
             events.is_empty(),
             "Should not emit event when inflight unchanged"
         );
+    }
+
+    #[tokio::test]
+    async fn inflight_equity_emits_when_only_fetched_at_advances() {
+        let mut mints = BTreeMap::new();
+        mints.insert(test_symbol("AAPL"), test_shares(10));
+        let first_fetched_at = Utc::now();
+        let second_fetched_at = first_fetched_at + chrono::Duration::seconds(30);
+
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![InventorySnapshotEvent::InflightEquity {
+                mints: mints.clone(),
+                redemptions: BTreeMap::new(),
+                fetched_at: first_fetched_at,
+            }])
+            .when(InventorySnapshotCommand::InflightEquity {
+                mints,
+                redemptions: BTreeMap::new(),
+                fetched_at: second_fetched_at,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let InventorySnapshotEvent::InflightEquity { fetched_at, .. } = &events[0] else {
+            panic!("Expected InflightEquity event, got {:?}", events[0]);
+        };
+        assert_eq!(*fetched_at, second_fetched_at);
+    }
+
+    #[tokio::test]
+    async fn inflight_equity_skips_empty_unchanged_even_when_fetched_at_advances() {
+        let first_fetched_at = Utc::now();
+        let second_fetched_at = first_fetched_at + chrono::Duration::seconds(30);
+
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![InventorySnapshotEvent::InflightEquity {
+                mints: BTreeMap::new(),
+                redemptions: BTreeMap::new(),
+                fetched_at: first_fetched_at,
+            }])
+            .when(InventorySnapshotCommand::InflightEquity {
+                mints: BTreeMap::new(),
+                redemptions: BTreeMap::new(),
+                fetched_at: second_fetched_at,
+            })
+            .await
+            .events();
+
+        assert!(
+            events.is_empty(),
+            "Empty unchanged inflight must not emit a per-poll event even on a newer fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn inflight_equity_skips_stale_fetch_when_unchanged() {
+        let mut mints = BTreeMap::new();
+        mints.insert(test_symbol("AAPL"), test_shares(10));
+        let current_fetched_at = Utc::now();
+        let stale_fetched_at = current_fetched_at - chrono::Duration::seconds(30);
+
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![InventorySnapshotEvent::InflightEquity {
+                mints: mints.clone(),
+                redemptions: BTreeMap::new(),
+                fetched_at: current_fetched_at,
+            }])
+            .when(InventorySnapshotCommand::InflightEquity {
+                mints,
+                redemptions: BTreeMap::new(),
+                fetched_at: stale_fetched_at,
+            })
+            .await
+            .events();
+
+        assert!(
+            events.is_empty(),
+            "An out-of-order (older) fetch with unchanged inflight must not emit"
+        );
+    }
+
+    #[tokio::test]
+    async fn inflight_equity_emits_on_change_even_with_stale_fetch() {
+        let mut initial_mints = BTreeMap::new();
+        initial_mints.insert(test_symbol("AAPL"), test_shares(10));
+
+        let mut updated_mints = BTreeMap::new();
+        updated_mints.insert(test_symbol("AAPL"), test_shares(5));
+
+        let current_fetched_at = Utc::now();
+        let stale_fetched_at = current_fetched_at - chrono::Duration::seconds(30);
+
+        let events = TestHarness::<InventorySnapshot>::with(())
+            .given(vec![InventorySnapshotEvent::InflightEquity {
+                mints: initial_mints,
+                redemptions: BTreeMap::new(),
+                fetched_at: current_fetched_at,
+            }])
+            .when(InventorySnapshotCommand::InflightEquity {
+                mints: updated_mints.clone(),
+                redemptions: BTreeMap::new(),
+                fetched_at: stale_fetched_at,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let InventorySnapshotEvent::InflightEquity {
+            mints: event_mints,
+            fetched_at,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected InflightEquity event, got {:?}", events[0]);
+        };
+        assert_eq!(event_mints, &updated_mints);
+        assert_eq!(*fetched_at, stale_fetched_at);
     }
 
     #[tokio::test]
@@ -1501,6 +1655,7 @@ mod tests {
             .when(InventorySnapshotCommand::InflightEquity {
                 mints: updated_mints.clone(),
                 redemptions: BTreeMap::new(),
+                fetched_at: Utc::now(),
             })
             .await
             .events();
@@ -1537,44 +1692,36 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_inflight_equity_preserves_fetched_at() {
-        // The aggregate's initialize() generates fetched_at from Utc::now().
-        // This test pins that the emitted event carries a fetched_at close to
-        // the wall-clock time at command submission -- proving the aggregate
-        // threads a real timestamp rather than e.g. a stale default.
-        let before = Utc::now();
+        let fetched_at = Utc::now();
 
         let events = TestHarness::<InventorySnapshot>::with(())
             .given_no_previous_events()
             .when(InventorySnapshotCommand::InflightEquity {
                 mints: BTreeMap::new(),
                 redemptions: BTreeMap::new(),
+                fetched_at,
             })
             .await
             .events();
 
-        let after = Utc::now();
-
         assert_eq!(events.len(), 1);
-        let InventorySnapshotEvent::InflightEquity { fetched_at, .. } = &events[0] else {
+        let InventorySnapshotEvent::InflightEquity {
+            fetched_at: event_fetched_at,
+            ..
+        } = &events[0]
+        else {
             panic!("Expected InflightEquity event, got {:?}", events[0]);
         };
 
-        assert!(
-            *fetched_at >= before && *fetched_at <= after,
-            "fetched_at ({fetched_at:?}) should be between \
-             before ({before:?}) and after ({after:?})"
-        );
+        assert_eq!(*event_fetched_at, fetched_at);
     }
 
     #[tokio::test]
     async fn transition_inflight_equity_preserves_fetched_at() {
-        // Same as above but for the transition path (existing aggregate).
-        // The aggregate deduplicates unchanged inflight, so we must provide
-        // data different from the prior state to get an emitted event.
         let mut mints = BTreeMap::new();
         mints.insert(test_symbol("AAPL"), test_shares(10));
 
-        let before = Utc::now();
+        let fetched_at = Utc::now();
 
         let events = TestHarness::<InventorySnapshot>::with(())
             .given(vec![InventorySnapshotEvent::OnchainUsdc {
@@ -1584,22 +1731,21 @@ mod tests {
             .when(InventorySnapshotCommand::InflightEquity {
                 mints,
                 redemptions: BTreeMap::new(),
+                fetched_at,
             })
             .await
             .events();
 
-        let after = Utc::now();
-
         assert_eq!(events.len(), 1);
-        let InventorySnapshotEvent::InflightEquity { fetched_at, .. } = &events[0] else {
+        let InventorySnapshotEvent::InflightEquity {
+            fetched_at: event_fetched_at,
+            ..
+        } = &events[0]
+        else {
             panic!("Expected InflightEquity event, got {:?}", events[0]);
         };
 
-        assert!(
-            *fetched_at >= before && *fetched_at <= after,
-            "transition fetched_at ({fetched_at:?}) should be between \
-             before ({before:?}) and after ({after:?})"
-        );
+        assert_eq!(*event_fetched_at, fetched_at);
     }
 
     #[test]
@@ -1652,6 +1798,7 @@ mod tests {
             base_wallet_wrapped_equity: BTreeMap::new(),
             inflight_mints: BTreeMap::new(),
             inflight_redemptions: BTreeMap::new(),
+            inflight_equity_fetched_at: None,
             last_updated: Utc::now(),
         };
 
@@ -1684,6 +1831,7 @@ mod tests {
             base_wallet_wrapped_equity: BTreeMap::new(),
             inflight_mints: inflight_mints.clone(),
             inflight_redemptions: BTreeMap::new(),
+            inflight_equity_fetched_at: Some(now),
             last_updated: now,
         };
 
@@ -1704,5 +1852,36 @@ mod tests {
             original.offchain_cash_buying_power_cents
         );
         assert_eq!(reconstructed.inflight_mints, original.inflight_mints);
+    }
+
+    #[test]
+    fn hydration_events_preserve_inflight_provider_fetch_time() {
+        let inflight_fetched_at = Utc::now();
+        let later_balance_fetched_at = inflight_fetched_at + chrono::Duration::seconds(30);
+
+        let mut snapshot =
+            replay::<InventorySnapshot>(vec![InventorySnapshotEvent::InflightEquity {
+                mints: BTreeMap::from([(test_symbol("AAPL"), test_shares(10))]),
+                redemptions: BTreeMap::new(),
+                fetched_at: inflight_fetched_at,
+            }])
+            .unwrap()
+            .unwrap();
+        snapshot.apply_event(&InventorySnapshotEvent::OnchainUsdc {
+            usdc_balance: Usdc::from_str("1000").unwrap(),
+            fetched_at: later_balance_fetched_at,
+        });
+
+        let inflight_event = snapshot
+            .hydration_events()
+            .into_iter()
+            .find(|event| matches!(event, InventorySnapshotEvent::InflightEquity { .. }))
+            .expect("expected inflight hydration event");
+
+        let InventorySnapshotEvent::InflightEquity { fetched_at, .. } = inflight_event else {
+            panic!("Expected InflightEquity event");
+        };
+
+        assert_eq!(fetched_at, inflight_fetched_at);
     }
 }

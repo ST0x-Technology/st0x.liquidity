@@ -95,6 +95,101 @@ fn snapshot_has_inflight_mint(snapshot: &StoredSnapshot, symbol: &str) -> anyhow
     Ok(has_symbol)
 }
 
+fn snapshot_inflight_mint(
+    snapshot: &StoredSnapshot,
+    symbol: &str,
+) -> anyhow::Result<Option<FractionalShares>> {
+    let payload: serde_json::Value = serde_json::from_str(&snapshot.payload)?;
+    let live = payload.get("Live").unwrap_or(&payload);
+    let quantity = live
+        .get("inflight_mints")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|mints| mints.get(symbol))
+        .and_then(serde_json::Value::as_str)
+        .map(str::parse::<FractionalShares>)
+        .transpose()?;
+
+    Ok(quantity)
+}
+
+fn single_pending_request_quantity(
+    requests: &[st0x_hedge::mock_api::MockTokenizationRequestSnapshot],
+    request_type: TokenizationRequestType,
+    symbol: &str,
+) -> FractionalShares {
+    let quantities: Vec<_> = requests
+        .iter()
+        .filter(|request| {
+            request.request_type == request_type
+                && request.symbol == symbol
+                && request.status == st0x_hedge::mock_api::TokenizationStatus::Pending
+        })
+        .map(|request| FractionalShares::new(request.quantity))
+        .collect();
+
+    assert_eq!(
+        quantities.len(),
+        1,
+        "Expected exactly one pending {request_type:?} request for {symbol}, got {quantities:?}",
+    );
+
+    quantities[0]
+}
+
+fn inflight_mint_quantities(
+    events: &[crate::assert::StoredEvent],
+    symbol: &str,
+) -> anyhow::Result<Vec<FractionalShares>> {
+    events
+        .iter()
+        .filter(|event| event.event_type == "InventorySnapshotEvent::InflightEquity")
+        .filter_map(|event| {
+            event
+                .payload
+                .get("InflightEquity")?
+                .get("mints")?
+                .get(symbol)?
+                .as_str()
+        })
+        .map(|quantity| quantity.parse::<FractionalShares>().map_err(Into::into))
+        .collect()
+}
+
+async fn poll_for_inflight_mint_event_count_after(
+    bot: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+    db_path: &std::path::Path,
+    symbol: &str,
+    expected_quantity: FractionalShares,
+    previous_count: usize,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let context = format!("new InflightEquity event for {symbol} quantity {expected_quantity}");
+
+    loop {
+        sleep_or_crash(bot, &context).await;
+
+        if let Ok(pool) = connect_db(db_path).await {
+            let events = fetch_events_by_type(&pool, "InventorySnapshot").await?;
+            pool.close().await;
+
+            let matching_count = inflight_mint_quantities(&events, symbol)?
+                .into_iter()
+                .filter(|quantity| *quantity == expected_quantity)
+                .count();
+
+            if matching_count > previous_count {
+                return Ok(());
+            }
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Timed out after {timeout:?} waiting for {context}",
+        );
+    }
+}
+
 async fn poll_for_inflight_mint_snapshot(
     bot: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
     db_path: &std::path::Path,
@@ -1389,30 +1484,22 @@ async fn pending_requests_filtered_by_wallet() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Inflight polling picks up pending tokenization requests end-to-end.
+/// Inflight polling picks up bot-owned pending tokenization requests end-to-end.
 ///
 /// The conductor's inventory poller calls `list_pending_requests()` on
-/// every poll cycle. When pending requests exist (matching the conductor's
-/// wallet), the poller aggregates them into an `InflightEquity` snapshot
-/// command, which the CQRS aggregate turns into an `InflightEquity` event.
-///
-/// This test injects a pending mint request into the tokenization mock,
-/// starts the bot, and verifies that `InflightEquity` events are emitted
-/// with non-empty mint data -- proving the full pipeline from HTTP poll
-/// through CQRS event emission works end-to-end.
+/// every poll cycle. When pending requests match an active mint aggregate,
+/// the poller aggregates them into an `InflightEquity` snapshot command,
+/// which the CQRS aggregate turns into an `InflightEquity` event.
 #[test_log::test(tokio::test)]
 async fn inflight_polling_emits_events_for_pending_requests() -> anyhow::Result<()> {
     let broker_fill_price = float!("150.00");
     let onchain_price = float!("150.00");
+    let amount_per_trade = float!("5");
 
-    let infra = TestInfra::start(
-        vec![("AAPL", broker_fill_price)],
-        // No offchain positions — avoids rebalancing triggering a real
-        // mint that could satisfy the assertion instead of the injected
-        // pending request.
-        vec![],
-    )
-    .await?;
+    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
+    infra
+        .tokenization_service
+        .set_polls_until_complete(usize::MAX);
 
     // We need at least one order set up so the vault registry gets seeded
     // and the inventory poller has valid vault IDs to query.
@@ -1420,20 +1507,11 @@ async fn inflight_polling_emits_events_for_pending_requests() -> anyhow::Result<
         .base_chain
         .setup_order()
         .symbol("AAPL")
-        .amount(float!("5"))
+        .amount(amount_per_trade)
         .price(onchain_price)
         .direction(TakeDirection::SellEquity)
         .call()
         .await?;
-
-    // Inject a pending mint request with the bot's wallet address BEFORE
-    // starting the bot. The first inventory poll should pick this up.
-    infra.tokenization_service.inject_pending_request(
-        "AAPL",
-        float!("25"),
-        infra.base_chain.owner,
-        TokenizationRequestType::Mint,
-    );
 
     let current_block = infra.base_chain.provider.get_block_number().await?;
     let cash_vault_id = prepared.input_vault_id;
@@ -1453,9 +1531,33 @@ async fn inflight_polling_emits_events_for_pending_requests() -> anyhow::Result<
 
     let mut bot = spawn_bot(ctx);
 
-    // Poll the snapshot table for inflight data instead of the events
-    // table, because compaction may delete the event before we observe
-    // it. The snapshot is the durable record.
+    infra.base_chain.take_prepared_order(&prepared).await?;
+
+    poll_for_events_with_timeout(
+        &mut bot,
+        &infra.db_path,
+        "TokenizedEquityMintEvent::MintAccepted",
+        1,
+        Duration::from_secs(120),
+    )
+    .await;
+
+    let expected_quantity = single_pending_request_quantity(
+        &infra.tokenization_service.tokenization_requests(),
+        TokenizationRequestType::Mint,
+        "AAPL",
+    );
+
+    poll_for_inflight_mint_event_count_after(
+        &mut bot,
+        &infra.db_path,
+        "AAPL",
+        expected_quantity,
+        0,
+        Duration::from_secs(30),
+    )
+    .await?;
+
     poll_for_snapshot_field(
         &mut bot,
         &infra.db_path,
@@ -1467,8 +1569,7 @@ async fn inflight_polling_emits_events_for_pending_requests() -> anyhow::Result<
 
     let pool = connect_db(&infra.db_path).await?;
 
-    // Verify the snapshot contains the injected pending mint for AAPL
-    // with the exact quantity we injected (25 shares).
+    // Verify the snapshot contains the bot-owned pending mint for AAPL.
     let snapshot_payload: (String,) = sqlx::query_as(
         "SELECT payload FROM snapshots \
          WHERE aggregate_type = 'InventorySnapshot' LIMIT 1",
@@ -1485,12 +1586,15 @@ async fn inflight_polling_emits_events_for_pending_requests() -> anyhow::Result<
         .expect("Snapshot should contain inflight_mints");
     let aapl_quantity = mints
         .get("AAPL")
-        .expect("inflight_mints should contain AAPL from the injected pending request");
+        .expect("inflight_mints should contain AAPL from the bot-owned pending request");
+    let aapl_quantity = aapl_quantity
+        .as_str()
+        .expect("AAPL inflight mint quantity should be serialized as a string")
+        .parse::<FractionalShares>()?;
     assert_eq!(
-        aapl_quantity.as_str().unwrap(),
-        "25",
-        "inflight_mints quantity for AAPL should match the injected \
-         pending request (25 shares), got: {aapl_quantity}"
+        aapl_quantity, expected_quantity,
+        "inflight_mints quantity for AAPL should match the bot-owned \
+         pending request"
     );
 
     pool.close().await;
@@ -1917,33 +2021,22 @@ async fn interrupted_redemption_resumes_after_restart() -> anyhow::Result<()> {
 async fn inflight_state_survives_restart() -> anyhow::Result<()> {
     let broker_fill_price = float!("150.00");
     let onchain_price = float!("150.00");
+    let amount_per_trade = float!("5");
 
-    let infra = TestInfra::start(
-        vec![("AAPL", broker_fill_price)],
-        // No offchain positions: the test focuses on inflight polling
-        // and restart behavior, not rebalancing decisions.
-        vec![],
-    )
-    .await?;
+    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
+    infra
+        .tokenization_service
+        .set_polls_until_complete(usize::MAX);
 
     let prepared = infra
         .base_chain
         .setup_order()
         .symbol("AAPL")
-        .amount(float!("5"))
+        .amount(amount_per_trade)
         .price(onchain_price)
         .direction(TakeDirection::SellEquity)
         .call()
         .await?;
-
-    // Inject a pending mint request that will persist across restarts
-    // (the mock server stays alive).
-    infra.tokenization_service.inject_pending_request(
-        "AAPL",
-        float!("25"),
-        infra.base_chain.owner,
-        TokenizationRequestType::Mint,
-    );
 
     let current_block = infra.base_chain.provider.get_block_number().await?;
     let cash_vault_id = prepared.input_vault_id;
@@ -1965,11 +2058,47 @@ async fn inflight_state_survives_restart() -> anyhow::Result<()> {
 
     let mut bot1 = spawn_bot(ctx1);
 
+    infra.base_chain.take_prepared_order(&prepared).await?;
+
+    poll_for_events_with_timeout(
+        &mut bot1,
+        &infra.db_path,
+        "TokenizedEquityMintEvent::MintAccepted",
+        1,
+        Duration::from_secs(120),
+    )
+    .await;
+
+    let expected_quantity = single_pending_request_quantity(
+        &infra.tokenization_service.tokenization_requests(),
+        TokenizationRequestType::Mint,
+        "AAPL",
+    );
+
+    poll_for_inflight_mint_event_count_after(
+        &mut bot1,
+        &infra.db_path,
+        "AAPL",
+        expected_quantity,
+        0,
+        Duration::from_secs(30),
+    )
+    .await?;
+
     // Wait for the first bot to persist inflight state. InventorySnapshot
     // events are compactable, so the durable assertion is the snapshot row.
     let snapshot_before_restart =
         poll_for_inflight_mint_snapshot(&mut bot1, &infra.db_path, "AAPL", Duration::from_secs(30))
             .await?;
+    let pool = connect_db(&infra.db_path).await?;
+    let events_before_restart = fetch_events_by_type(&pool, "InventorySnapshot").await?;
+    pool.close().await;
+    let observed_before_restart = inflight_mint_quantities(&events_before_restart, "AAPL")?;
+    assert!(
+        observed_before_restart.contains(&expected_quantity),
+        "First bot should persist exact inflight mint quantity before restart: \
+         {observed_before_restart:?}",
+    );
 
     // Stop the first bot.
     bot1.abort();
@@ -1992,8 +2121,9 @@ async fn inflight_state_survives_restart() -> anyhow::Result<()> {
 
     let bot2 = spawn_bot(ctx2);
 
-    // Wait for the second bot to start polling. This proves snapshot
-    // restoration succeeded and the bot is functional after restart.
+    // Recovery resumes the accepted mint before the inventory monitor starts.
+    // Keep the provider request pending and assert the compacted snapshot is
+    // still present while startup is in that recovery phase.
     tokio::time::sleep(Duration::from_secs(15)).await;
 
     // Verify the second bot is still alive (didn't crash on replay).
@@ -2014,8 +2144,9 @@ async fn inflight_state_survives_restart() -> anyhow::Result<()> {
         snapshot_before_restart.last_sequence,
         snapshot_after_restart.last_sequence
     );
-    assert!(
-        snapshot_has_inflight_mint(&snapshot_after_restart, "AAPL")?,
+    assert_eq!(
+        snapshot_inflight_mint(&snapshot_after_restart, "AAPL")?,
+        Some(expected_quantity),
         "Inflight mint state should survive restart via the compacted snapshot"
     );
 

@@ -6,13 +6,14 @@
 //! the fetched values. The InventoryView reacts to these events to reconcile
 //! tracked inventory.
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, TxHash};
 use alloy::providers::RootProvider;
 use async_trait::async_trait;
+use chrono::Utc;
 use futures_util::future::try_join_all;
 use rain_math_float::FloatError;
-use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, Mutex, MutexGuard};
 use tracing::{debug, warn};
 
 use st0x_event_sorcery::{SendError, Store};
@@ -31,12 +32,27 @@ use crate::onchain::raindex::{RaindexError, RaindexService, RaindexVaultId};
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::rebalancing::usdc::{UsdcTransferError, u256_to_usdc};
 use crate::tokenization::{TokenizationRequestType, Tokenizer, TokenizerError};
+use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 
 /// Pending mints and redemptions aggregated by symbol.
 struct PendingRequests {
     mints: BTreeMap<Symbol, FractionalShares>,
     redemptions: BTreeMap<Symbol, FractionalShares>,
+}
+
+/// Active bot-owned tokenization provider request identifiers.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PendingRequestOwnershipSnapshot {
+    pub(crate) mint_issuers: HashSet<IssuerRequestId>,
+    pub(crate) mint_tokenizations: HashSet<TokenizationRequestId>,
+    pub(crate) redemption_tokenizations: HashSet<TokenizationRequestId>,
+    pub(crate) redemption_txs: HashSet<TxHash>,
+}
+
+#[async_trait]
+pub(crate) trait PendingRequestOwnership: Send + Sync {
+    async fn pending_request_ownership(&self) -> PendingRequestOwnershipSnapshot;
 }
 
 /// Error type for inventory polling operations.
@@ -104,6 +120,8 @@ where
     snapshot: Arc<Store<InventorySnapshot>>,
     wallet_polling: Option<WalletPollingCtx>,
     tokenizer: Option<Arc<dyn Tokenizer>>,
+    pending_request_ownership: Option<Arc<dyn PendingRequestOwnership>>,
+    external_pending_warnings: Mutex<HashSet<TokenizationRequestId>>,
     reserved_cash: Usd,
 }
 
@@ -131,8 +149,18 @@ where
             snapshot,
             wallet_polling,
             tokenizer,
+            pending_request_ownership: None,
+            external_pending_warnings: Mutex::new(HashSet::new()),
             reserved_cash,
         }
+    }
+
+    pub(crate) fn with_pending_request_ownership(
+        mut self,
+        pending_request_ownership: Arc<dyn PendingRequestOwnership>,
+    ) -> Self {
+        self.pending_request_ownership = Some(pending_request_ownership);
+        self
     }
 
     /// Polls actual inventory from all venues and emits snapshot commands.
@@ -479,15 +507,26 @@ where
     ) -> Result<PendingRequests, FloatError> {
         let mut mints: BTreeMap<Symbol, FractionalShares> = BTreeMap::new();
         let mut redemptions: BTreeMap<Symbol, FractionalShares> = BTreeMap::new();
+        let mut seen = HashSet::new();
 
         for request in requests {
+            if !seen.insert(request.id.clone()) {
+                warn!(
+                    target: "inventory",
+                    request_id = %request.id,
+                    symbol = %request.underlying_symbol,
+                    "Duplicate pending tokenization request from provider, skipping"
+                );
+                continue;
+            }
+
             let target = match request.r#type {
                 Some(TokenizationRequestType::Mint) => &mut mints,
                 Some(TokenizationRequestType::Redeem) => &mut redemptions,
                 None => {
                     warn!(
                         target: "inventory",
-                        request_id = %request.id.0,
+                        request_id = %request.id,
                         symbol = %request.underlying_symbol,
                         "Pending tokenization request has no type, skipping"
                     );
@@ -505,20 +544,84 @@ where
         Ok(PendingRequests { mints, redemptions })
     }
 
-    fn is_own_request(&self, request: &crate::tokenization::TokenizationRequest) -> bool {
-        match request.wallet {
-            Some(wallet) if wallet != self.snapshot_id.owner => {
+    fn lock_external_pending_warnings(&self) -> MutexGuard<'_, HashSet<TokenizationRequestId>> {
+        self.external_pending_warnings
+            .lock()
+            .unwrap_or_else(|poisoned| {
                 warn!(
                     target: "inventory",
-                    request_id = %request.id.0,
-                    ?wallet,
-                    expected = ?self.snapshot_id.owner,
-                    "Skipping pending request from different wallet"
+                    "External pending warning tracker was poisoned; recovering state"
                 );
-                false
+                poisoned.into_inner()
+            })
+    }
+
+    fn is_own_request(
+        &self,
+        request: &crate::tokenization::TokenizationRequest,
+        ownership: &PendingRequestOwnershipSnapshot,
+    ) -> bool {
+        let is_owned = match request.r#type {
+            Some(TokenizationRequestType::Mint) => {
+                request
+                    .issuer_request_id
+                    .as_ref()
+                    .is_some_and(|id| ownership.mint_issuers.contains(id))
+                    || ownership.mint_tokenizations.contains(&request.id)
             }
-            _ => true,
+            Some(TokenizationRequestType::Redeem) => {
+                ownership.redemption_tokenizations.contains(&request.id)
+                    || request
+                        .tx_hash
+                        .is_some_and(|tx_hash| ownership.redemption_txs.contains(&tx_hash))
+            }
+            None => {
+                // Dedup through the same warn-once set as external requests so a
+                // persistently typeless provider row does not warn on every poll.
+                if self
+                    .lock_external_pending_warnings()
+                    .insert(request.id.clone())
+                {
+                    warn!(
+                        target: "inventory",
+                        request_id = %request.id,
+                        symbol = %request.underlying_symbol,
+                        "Pending tokenization request has no type, skipping"
+                    );
+                }
+
+                return false;
+            }
+        };
+
+        if is_owned {
+            return true;
         }
+
+        if request
+            .wallet
+            .is_none_or(|wallet| wallet == self.snapshot_id.owner)
+        {
+            let should_warn = self
+                .lock_external_pending_warnings()
+                .insert(request.id.clone());
+
+            if should_warn {
+                warn!(
+                    target: "inventory",
+                    request_id = %request.id,
+                    issuer_request_id = ?request.issuer_request_id,
+                    request_type = ?request.r#type,
+                    symbol = %request.underlying_symbol,
+                    quantity = %request.quantity,
+                    wallet = ?request.wallet,
+                    expected_wallet = ?self.snapshot_id.owner,
+                    "Ignoring external pending tokenization request"
+                );
+            }
+        }
+
+        false
     }
 
     async fn poll_inflight_equity(
@@ -530,12 +633,31 @@ where
             return Ok(());
         };
 
+        let fetched_at = Utc::now();
         let pending = tokenizer.list_pending_requests().await?;
+        let ownership = if let Some(pending_request_ownership) = &self.pending_request_ownership {
+            pending_request_ownership.pending_request_ownership().await
+        } else {
+            warn!(
+                target: "inventory",
+                "No pending request ownership source configured; treating provider pending requests as external"
+            );
+            PendingRequestOwnershipSnapshot::default()
+        };
+
+        let current_request_ids: HashSet<TokenizationRequestId> =
+            pending.iter().map(|request| request.id.clone()).collect();
+
         let PendingRequests { mints, redemptions } = Self::aggregate_pending_requests(
             pending
                 .into_iter()
-                .filter(|request| self.is_own_request(request)),
+                .filter(|request| self.is_own_request(request, &ownership)),
         )?;
+
+        // Bound the warn-once dedup set to requests still present this poll so it
+        // cannot grow without bound as external requests appear and complete.
+        self.lock_external_pending_warnings()
+            .retain(|id| current_request_ids.contains(id));
 
         debug!(
             target: "inventory",
@@ -547,7 +669,11 @@ where
         self.snapshot
             .send(
                 snapshot_id,
-                InventorySnapshotCommand::InflightEquity { mints, redemptions },
+                InventorySnapshotCommand::InflightEquity {
+                    mints,
+                    redemptions,
+                    fetched_at,
+                },
             )
             .await?;
 
@@ -629,8 +755,42 @@ mod tests {
     use super::*;
     use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::test_utils::setup_test_db;
-    use crate::tokenized_equity_mint::TokenizationRequestId;
     use crate::vault_registry::{VaultRegistry, VaultRegistryCommand};
+
+    #[derive(Clone, Default)]
+    struct TestPendingRequestOwnership(PendingRequestOwnershipSnapshot);
+
+    #[async_trait]
+    impl PendingRequestOwnership for TestPendingRequestOwnership {
+        async fn pending_request_ownership(&self) -> PendingRequestOwnershipSnapshot {
+            self.0.clone()
+        }
+    }
+
+    fn ownership(
+        mint_issuer_request_ids: impl IntoIterator<Item = &'static str>,
+        mint_tokenization_request_ids: impl IntoIterator<Item = &'static str>,
+        redemption_tokenization_request_ids: impl IntoIterator<Item = &'static str>,
+        redemption_txs: impl IntoIterator<Item = TxHash>,
+    ) -> Arc<dyn PendingRequestOwnership> {
+        Arc::new(TestPendingRequestOwnership(
+            PendingRequestOwnershipSnapshot {
+                mint_issuers: mint_issuer_request_ids
+                    .into_iter()
+                    .map(IssuerRequestId::new)
+                    .collect(),
+                mint_tokenizations: mint_tokenization_request_ids
+                    .into_iter()
+                    .map(|id| TokenizationRequestId(id.to_string()))
+                    .collect(),
+                redemption_tokenizations: redemption_tokenization_request_ids
+                    .into_iter()
+                    .map(|id| TokenizationRequestId(id.to_string()))
+                    .collect(),
+                redemption_txs: redemption_txs.into_iter().collect(),
+            },
+        ))
+    }
 
     struct MockEthereumWallet {
         address: Address,
@@ -2474,6 +2634,32 @@ mod tests {
         }
     }
 
+    fn mock_pending_request_with_issuer_id(
+        request_type: crate::tokenization::TokenizationRequestType,
+        symbol: &str,
+        quantity: i64,
+        issuer_request_id: &str,
+        wallet: Option<Address>,
+    ) -> crate::tokenization::TokenizationRequest {
+        crate::tokenization::TokenizationRequest {
+            issuer_request_id: Some(IssuerRequestId::new(issuer_request_id)),
+            ..mock_pending_request_with_wallet(request_type, symbol, quantity, wallet)
+        }
+    }
+
+    fn mock_pending_request_with_tx_hash(
+        request_type: crate::tokenization::TokenizationRequestType,
+        symbol: &str,
+        quantity: i64,
+        tx_hash: TxHash,
+        wallet: Option<Address>,
+    ) -> crate::tokenization::TokenizationRequest {
+        crate::tokenization::TokenizationRequest {
+            tx_hash: Some(tx_hash),
+            ..mock_pending_request_with_wallet(request_type, symbol, quantity, wallet)
+        }
+    }
+
     #[tokio::test]
     async fn poll_inflight_equity_emits_mints_and_redemptions() {
         let pool = setup_test_db().await;
@@ -2510,7 +2696,8 @@ mod tests {
             None,
             Some(tokenizer),
             Usd::ZERO,
-        );
+        )
+        .with_pending_request_ownership(ownership([], ["REQ_AAPL_10"], ["REQ_MSFT_5"], []));
 
         service.poll_and_record().await.unwrap();
 
@@ -2569,7 +2756,13 @@ mod tests {
             None,
             Some(tokenizer),
             Usd::ZERO,
-        );
+        )
+        .with_pending_request_ownership(ownership(
+            [],
+            ["REQ_AAPL_10", "REQ_AAPL_25"],
+            [],
+            [],
+        ));
 
         service.poll_and_record().await.unwrap();
 
@@ -2669,7 +2862,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_inflight_equity_filters_by_wallet() {
+    async fn poll_inflight_equity_treats_requests_as_external_without_ownership_source() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let (orderbook, order_owner) = test_addresses();
+
+        let tokenizer = Arc::new(
+            crate::tokenization::mock::MockTokenizer::new().with_pending_requests(vec![
+                mock_pending_request_with_wallet(
+                    crate::tokenization::TokenizationRequestType::Mint,
+                    "AAPL",
+                    10,
+                    Some(order_owner),
+                ),
+                mock_pending_request_with_wallet(
+                    crate::tokenization::TokenizationRequestType::Redeem,
+                    "TSLA",
+                    5,
+                    Some(order_owner),
+                ),
+            ]),
+        );
+
+        let executor = MockExecutor::new();
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            executor,
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            Some(tokenizer),
+            Usd::ZERO,
+        );
+
+        service.poll_and_record().await.unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        let inflight_event = events
+            .iter()
+            .find(|event| matches!(event, InventorySnapshotEvent::InflightEquity { .. }))
+            .expect("Expected InflightEquity event");
+
+        let InventorySnapshotEvent::InflightEquity {
+            mints, redemptions, ..
+        } = inflight_event
+        else {
+            panic!("Expected InflightEquity event");
+        };
+
+        assert!(mints.is_empty(), "No pending mints expected");
+        assert!(redemptions.is_empty(), "No pending redemptions expected");
+    }
+
+    #[tokio::test]
+    async fn poll_inflight_equity_ignores_external_requests_even_for_matching_wallet() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
         let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
@@ -2713,7 +2965,8 @@ mod tests {
             None,
             Some(tokenizer),
             Usd::ZERO,
-        );
+        )
+        .with_pending_request_ownership(ownership([], [], [], []));
 
         service.poll_and_record().await.unwrap();
 
@@ -2730,15 +2983,137 @@ mod tests {
             panic!("Expected InflightEquity event");
         };
 
-        assert_eq!(mints.len(), 1, "Only matching wallet should be included");
-        assert_eq!(mints.get(&test_symbol("AAPL")), Some(&test_shares(10)));
-
-        assert_eq!(
-            redemptions.len(),
-            1,
-            "No-wallet requests should be included"
+        assert!(
+            mints.is_empty(),
+            "Matching wallet must not imply bot ownership"
         );
-        assert_eq!(redemptions.get(&test_symbol("TSLA")), Some(&test_shares(5)));
+        assert!(
+            redemptions.is_empty(),
+            "Absent wallet must not imply bot ownership"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_inflight_equity_includes_owned_mint_by_issuer_request_id() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let (orderbook, order_owner) = test_addresses();
+
+        let tokenizer = Arc::new(
+            crate::tokenization::mock::MockTokenizer::new().with_pending_requests(vec![
+                mock_pending_request_with_issuer_id(
+                    crate::tokenization::TokenizationRequestType::Mint,
+                    "AAPL",
+                    10,
+                    "owned-issuer-request",
+                    Some(order_owner),
+                ),
+                mock_pending_request_with_wallet(
+                    crate::tokenization::TokenizationRequestType::Mint,
+                    "AAPL",
+                    20,
+                    Some(order_owner),
+                ),
+            ]),
+        );
+
+        let executor = MockExecutor::new();
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            executor,
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            Some(tokenizer),
+            Usd::ZERO,
+        )
+        .with_pending_request_ownership(ownership(["owned-issuer-request"], [], [], []));
+
+        service.poll_and_record().await.unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        let inflight_event = events
+            .iter()
+            .find(|event| matches!(event, InventorySnapshotEvent::InflightEquity { .. }))
+            .expect("Expected InflightEquity event");
+
+        let InventorySnapshotEvent::InflightEquity { mints, .. } = inflight_event else {
+            panic!("Expected InflightEquity event");
+        };
+
+        assert_eq!(mints.len(), 1);
+        assert_eq!(mints.get(&test_symbol("AAPL")), Some(&test_shares(10)));
+    }
+
+    #[tokio::test]
+    async fn poll_inflight_equity_includes_pending_redemption_intent_before_detection() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let (orderbook, order_owner) = test_addresses();
+        let redemption_tx = TxHash::random();
+        let external_tx = TxHash::random();
+
+        let tokenizer = Arc::new(
+            crate::tokenization::mock::MockTokenizer::new().with_pending_requests(vec![
+                mock_pending_request_with_tx_hash(
+                    crate::tokenization::TokenizationRequestType::Redeem,
+                    "AAPL",
+                    5,
+                    redemption_tx,
+                    Some(order_owner),
+                ),
+                // Distinct quantity so the external row gets a distinct provider
+                // id (REQ_AAPL_7); otherwise dedup-by-id would mask a leaked
+                // external request and the assertion could pass even on regression.
+                mock_pending_request_with_tx_hash(
+                    crate::tokenization::TokenizationRequestType::Redeem,
+                    "AAPL",
+                    7,
+                    external_tx,
+                    Some(order_owner),
+                ),
+            ]),
+        );
+
+        let executor = MockExecutor::new();
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            executor,
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            Some(tokenizer),
+            Usd::ZERO,
+        )
+        .with_pending_request_ownership(ownership([], [], [], [redemption_tx]));
+
+        service.poll_and_record().await.unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        let inflight_event = events
+            .iter()
+            .find(|event| matches!(event, InventorySnapshotEvent::InflightEquity { .. }))
+            .expect("Expected InflightEquity event");
+
+        let InventorySnapshotEvent::InflightEquity { redemptions, .. } = inflight_event else {
+            panic!("Expected InflightEquity event");
+        };
+
+        // Only the owned redemption (5 shares) is counted; the external 7-share
+        // request must be excluded. If it leaked through, AAPL would total 12.
+        assert_eq!(redemptions.get(&test_symbol("AAPL")), Some(&test_shares(5)));
     }
 
     #[test]
@@ -2784,5 +3159,36 @@ mod tests {
 
         assert_eq!(mints.len(), 1);
         assert_eq!(redemptions.len(), 1);
+    }
+
+    #[test]
+    fn aggregate_pending_requests_deduplicates_provider_request_ids() {
+        let requests = vec![
+            mock_pending_request(
+                crate::tokenization::TokenizationRequestType::Mint,
+                "AAPL",
+                10,
+            ),
+            mock_pending_request(
+                crate::tokenization::TokenizationRequestType::Mint,
+                "AAPL",
+                10,
+            ),
+        ];
+
+        let PendingRequests { mints, redemptions } = InventoryPollingService::<
+            ReadOnlyEvm<RootProvider>,
+            MockExecutor,
+        >::aggregate_pending_requests(
+            requests.into_iter()
+        )
+        .unwrap();
+
+        assert_eq!(
+            mints.get(&test_symbol("AAPL")),
+            Some(&test_shares(10)),
+            "Duplicate provider rows should only count once"
+        );
+        assert!(redemptions.is_empty());
     }
 }

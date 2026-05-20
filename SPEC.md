@@ -2000,10 +2000,18 @@ know about cross-venue inventory.
   available (tokens never left our wallet)
 - `EquityRedemptionEvent::TokensSent` - Tokens sent to Alpaca (still inflight)
 - `EquityRedemptionEvent::Completed` - Moves from inflight to Alpaca available
-- `EquityRedemptionEvent::DetectionFailed` - Tokens stranded (manual recovery)
-- `EquityRedemptionEvent::RedemptionRejected` - Token disposition uncertain
-  after rejection; keep inflight until an operator manually resolves the asset
-  location and a subsequent snapshot captures the corrected state
+- `EquityRedemptionEvent::DetectionFailed` - Terminal: tokens may be stranded
+  mid-redemption (sent to the issuance bot's redemption wallet but not yet
+  settled back as broker shares; manual recovery). Inflight is not held
+  indefinitely -- the redemption is dropped from active ownership, so
+  inflight-equity polls stop counting its still-pending provider request as
+  bot-owned and the inflight clears, letting rebalancing resume; the
+  transfer-timeout path also clears inflight explicitly
+- `EquityRedemptionEvent::RedemptionRejected` - Terminal: token disposition
+  uncertain after rejection. Inflight is released the same way as
+  `DetectionFailed` (ownership dropped so polls stop counting the stranded
+  request and rebalancing resumes), while operators resolve the actual asset
+  location manually
 - `UsdcRebalanceEvent::WithdrawalConfirmed` - Moves USDC to inflight (leaving
   source)
 - `UsdcRebalanceEvent::DepositConfirmed` - Terminal success for AlpacaToBase;
@@ -2020,10 +2028,20 @@ know about cross-venue inventory.
   from broker
 - `InventorySnapshotEvent::OffchainCash` - Offchain cash balance fetched from
   broker
-- `InventorySnapshotEvent::InflightEquity` - Pending tokenization requests
-  polled from Alpaca; sets inflight at Hedging (mints) and MarketMaking
-  (redemptions). Available balances are unchanged -- they are set by separate
-  available-balance snapshots
+- `InventorySnapshotEvent::InflightEquity` - Bot-owned pending tokenization
+  requests polled from Alpaca; sets inflight at Hedging (mints) and MarketMaking
+  (redemptions)
+  - **Ownership**: determined by active rebalancing aggregate IDs --
+    `issuer_request_id` / `tokenization_request_id` for mints,
+    `tokenization_request_id` / `redemption_tx` for redemptions -- not by
+    destination wallet alone
+  - **Pre-detection redemptions**: redemptions that sent tokens before Alpaca
+    assigned a `tokenization_request_id` are owned via `redemption_tx` until
+    detection records the provider ID
+  - **External requests**: unknown pending requests targeting the bot wallet are
+    logged for operators but do not count as inflight or block rebalancing
+  - **Available balances**: unchanged -- set by separate available-balance
+    snapshots
 
 ##### Separation of concerns
 

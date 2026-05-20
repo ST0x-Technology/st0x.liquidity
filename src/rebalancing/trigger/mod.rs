@@ -25,7 +25,7 @@ impl RebalancingSchedulers {
     }
 }
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, TxHash};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -50,7 +50,7 @@ use crate::inventory::projection::InventoryProjectionError;
 use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::{
     BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, InventoryViewError,
-    Operator, TransferOp, Venue,
+    Operator, PendingRequestOwnership, PendingRequestOwnershipSnapshot, TransferOp, Venue,
 };
 use crate::position::{Position, PositionEvent};
 use crate::tokenized_equity_mint::{
@@ -325,6 +325,7 @@ impl std::fmt::Display for MintTrackingStage {
 struct MintTracking {
     symbol: Symbol,
     quantity: FractionalShares,
+    tokenization_request_id: Option<crate::tokenized_equity_mint::TokenizationRequestId>,
     stage: MintTrackingStage,
     last_progress_at: DateTime<Utc>,
 }
@@ -344,12 +345,17 @@ impl MintTracking {
         Some(Self {
             symbol: symbol.clone(),
             quantity: FractionalShares::new(*quantity),
+            tokenization_request_id: None,
             stage: MintTrackingStage::Requested,
             last_progress_at: *requested_at,
         })
     }
 
     fn track_progress(&mut self, event: &TokenizedEquityMintEvent) {
+        if let Some(tokenization_request_id) = mint_event_tokenization_request_id(event) {
+            self.tokenization_request_id = Some(tokenization_request_id.clone());
+        }
+
         match event {
             TokenizedEquityMintEvent::MintAccepted { accepted_at, .. } => {
                 self.stage = MintTrackingStage::Accepted;
@@ -414,6 +420,8 @@ impl std::fmt::Display for RedemptionTrackingStage {
 struct RedemptionTracking {
     symbol: Symbol,
     quantity: FractionalShares,
+    tokenization_request_id: Option<crate::tokenized_equity_mint::TokenizationRequestId>,
+    redemption_tx: Option<TxHash>,
     stage: RedemptionTrackingStage,
     last_progress_at: DateTime<Utc>,
 }
@@ -429,6 +437,8 @@ impl RedemptionTracking {
             } => Some(Self {
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
+                tokenization_request_id: None,
+                redemption_tx: None,
                 stage: RedemptionTrackingStage::VaultWithdrawPending,
                 last_progress_at: *pending_at,
             }),
@@ -440,6 +450,8 @@ impl RedemptionTracking {
             } => Some(Self {
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
+                tokenization_request_id: None,
+                redemption_tx: None,
                 stage: RedemptionTrackingStage::VaultWithdrawSubmitted,
                 last_progress_at: *submitted_at,
             }),
@@ -451,6 +463,8 @@ impl RedemptionTracking {
             } => Some(Self {
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
+                tokenization_request_id: None,
+                redemption_tx: None,
                 stage: RedemptionTrackingStage::WithdrawnFromRaindex,
                 last_progress_at: *withdrawn_at,
             }),
@@ -496,11 +510,20 @@ impl RedemptionTracking {
                 self.stage = RedemptionTrackingStage::SendPending;
                 self.last_progress_at = *pending_at;
             }
-            EquityRedemptionEvent::TokensSent { sent_at, .. } => {
+            EquityRedemptionEvent::TokensSent {
+                redemption_tx,
+                sent_at,
+                ..
+            } => {
+                self.redemption_tx = Some(*redemption_tx);
                 self.stage = RedemptionTrackingStage::TokensSent;
                 self.last_progress_at = *sent_at;
             }
-            EquityRedemptionEvent::Detected { detected_at, .. } => {
+            EquityRedemptionEvent::Detected {
+                tokenization_request_id,
+                detected_at,
+            } => {
+                self.tokenization_request_id = Some(tokenization_request_id.clone());
                 self.stage = RedemptionTrackingStage::Detected;
                 self.last_progress_at = *detected_at;
             }
@@ -512,6 +535,27 @@ impl RedemptionTracking {
         }
 
         Ok(())
+    }
+}
+
+fn mint_event_tokenization_request_id(
+    event: &TokenizedEquityMintEvent,
+) -> Option<&crate::tokenized_equity_mint::TokenizationRequestId> {
+    match event {
+        TokenizedEquityMintEvent::MintAccepted {
+            tokenization_request_id,
+            ..
+        } => Some(tokenization_request_id),
+        TokenizedEquityMintEvent::MintRequested { .. }
+        | TokenizedEquityMintEvent::MintRejected { .. }
+        | TokenizedEquityMintEvent::MintAcceptanceFailed { .. }
+        | TokenizedEquityMintEvent::TokensReceived { .. }
+        | TokenizedEquityMintEvent::WrapSubmitted { .. }
+        | TokenizedEquityMintEvent::TokensWrapped { .. }
+        | TokenizedEquityMintEvent::WrappingFailed { .. }
+        | TokenizedEquityMintEvent::VaultDepositSubmitted { .. }
+        | TokenizedEquityMintEvent::DepositedIntoRaindex { .. }
+        | TokenizedEquityMintEvent::RaindexDepositFailed { .. } => None,
     }
 }
 
@@ -1419,6 +1463,30 @@ impl Reactor for RebalancingService {
     }
 }
 
+#[async_trait]
+impl PendingRequestOwnership for RebalancingService {
+    async fn pending_request_ownership(&self) -> PendingRequestOwnershipSnapshot {
+        let mint_tracking = self.mint_tracking.read().await;
+        let redemption_tracking = self.redemption_tracking.read().await;
+
+        PendingRequestOwnershipSnapshot {
+            mint_issuers: mint_tracking.keys().cloned().collect(),
+            mint_tokenizations: mint_tracking
+                .values()
+                .filter_map(|tracking| tracking.tokenization_request_id.clone())
+                .collect(),
+            redemption_tokenizations: redemption_tracking
+                .values()
+                .filter_map(|tracking| tracking.tokenization_request_id.clone())
+                .collect(),
+            redemption_txs: redemption_tracking
+                .values()
+                .filter_map(|tracking| tracking.redemption_tx)
+                .collect(),
+        }
+    }
+}
+
 impl RebalancingService {
     async fn expire_stuck_operations_with_logging(&self) {
         if let Err(error) = self.expire_stuck_operations(Utc::now()).await {
@@ -1830,23 +1898,55 @@ impl RebalancingService {
             } => {
                 let quantity = FractionalShares::new(*quantity);
 
-                let (stage, last_progress_at) = match entity {
+                let (stage, last_progress_at, tokenization_request_id) = match entity {
                     MintRequested { requested_at, .. } => {
-                        (MintTrackingStage::Requested, *requested_at)
+                        (MintTrackingStage::Requested, *requested_at, None)
                     }
-                    MintAccepted { accepted_at, .. } => (MintTrackingStage::Accepted, *accepted_at),
-                    TokensReceived { received_at, .. } => {
-                        (MintTrackingStage::TokensReceived, *received_at)
-                    }
-                    WrapSubmitted { received_at, .. } => {
-                        (MintTrackingStage::WrapSubmitted, *received_at)
-                    }
-                    TokensWrapped { wrapped_at, .. } => {
-                        (MintTrackingStage::TokensWrapped, *wrapped_at)
-                    }
-                    VaultDepositSubmitted { wrapped_at, .. } => {
-                        (MintTrackingStage::VaultDepositSubmitted, *wrapped_at)
-                    }
+                    MintAccepted {
+                        accepted_at,
+                        tokenization_request_id,
+                        ..
+                    } => (
+                        MintTrackingStage::Accepted,
+                        *accepted_at,
+                        Some(tokenization_request_id.clone()),
+                    ),
+                    TokensReceived {
+                        received_at,
+                        tokenization_request_id,
+                        ..
+                    } => (
+                        MintTrackingStage::TokensReceived,
+                        *received_at,
+                        Some(tokenization_request_id.clone()),
+                    ),
+                    WrapSubmitted {
+                        received_at,
+                        tokenization_request_id,
+                        ..
+                    } => (
+                        MintTrackingStage::WrapSubmitted,
+                        *received_at,
+                        Some(tokenization_request_id.clone()),
+                    ),
+                    TokensWrapped {
+                        wrapped_at,
+                        tokenization_request_id,
+                        ..
+                    } => (
+                        MintTrackingStage::TokensWrapped,
+                        *wrapped_at,
+                        Some(tokenization_request_id.clone()),
+                    ),
+                    VaultDepositSubmitted {
+                        wrapped_at,
+                        tokenization_request_id,
+                        ..
+                    } => (
+                        MintTrackingStage::VaultDepositSubmitted,
+                        *wrapped_at,
+                        Some(tokenization_request_id.clone()),
+                    ),
                     _ => unreachable!(),
                 };
 
@@ -1855,6 +1955,7 @@ impl RebalancingService {
                     MintTracking {
                         symbol: symbol.clone(),
                         quantity,
+                        tokenization_request_id,
                         stage,
                         last_progress_at,
                     },
@@ -1896,33 +1997,71 @@ impl RebalancingService {
             | TokensSent { symbol, .. }
             | Pending { symbol, .. } => {
                 let quantity = Self::recovered_redemption_quantity(entity)?;
-                let (stage, last_progress_at) = match entity {
-                    VaultWithdrawPending { pending_at, .. } => {
-                        (RedemptionTrackingStage::VaultWithdrawPending, *pending_at)
-                    }
+                let (stage, last_progress_at, tokenization_request_id, redemption_tx) = match entity
+                {
+                    VaultWithdrawPending { pending_at, .. } => (
+                        RedemptionTrackingStage::VaultWithdrawPending,
+                        *pending_at,
+                        None,
+                        None,
+                    ),
                     VaultWithdrawSubmitted { submitted_at, .. } => (
                         RedemptionTrackingStage::VaultWithdrawSubmitted,
                         *submitted_at,
+                        None,
+                        None,
                     ),
-                    WithdrawnFromRaindex { withdrawn_at, .. } => {
-                        (RedemptionTrackingStage::WithdrawnFromRaindex, *withdrawn_at)
-                    }
-                    UnwrapPending { withdrawn_at, .. } => {
-                        (RedemptionTrackingStage::UnwrapPending, *withdrawn_at)
-                    }
-                    UnwrapSubmitted { withdrawn_at, .. } => {
-                        (RedemptionTrackingStage::UnwrapSubmitted, *withdrawn_at)
-                    }
-                    TokensUnwrapped { unwrapped_at, .. } => {
-                        (RedemptionTrackingStage::TokensUnwrapped, *unwrapped_at)
-                    }
-                    SendPending { unwrapped_at, .. } => {
-                        (RedemptionTrackingStage::SendPending, *unwrapped_at)
-                    }
-                    TokensSent { sent_at, .. } => (RedemptionTrackingStage::TokensSent, *sent_at),
-                    Pending { detected_at, .. } => {
-                        (RedemptionTrackingStage::Detected, *detected_at)
-                    }
+                    WithdrawnFromRaindex { withdrawn_at, .. } => (
+                        RedemptionTrackingStage::WithdrawnFromRaindex,
+                        *withdrawn_at,
+                        None,
+                        None,
+                    ),
+                    UnwrapPending { withdrawn_at, .. } => (
+                        RedemptionTrackingStage::UnwrapPending,
+                        *withdrawn_at,
+                        None,
+                        None,
+                    ),
+                    UnwrapSubmitted { withdrawn_at, .. } => (
+                        RedemptionTrackingStage::UnwrapSubmitted,
+                        *withdrawn_at,
+                        None,
+                        None,
+                    ),
+                    TokensUnwrapped { unwrapped_at, .. } => (
+                        RedemptionTrackingStage::TokensUnwrapped,
+                        *unwrapped_at,
+                        None,
+                        None,
+                    ),
+                    SendPending { unwrapped_at, .. } => (
+                        RedemptionTrackingStage::SendPending,
+                        *unwrapped_at,
+                        None,
+                        None,
+                    ),
+                    TokensSent {
+                        sent_at,
+                        redemption_tx,
+                        ..
+                    } => (
+                        RedemptionTrackingStage::TokensSent,
+                        *sent_at,
+                        None,
+                        Some(*redemption_tx),
+                    ),
+                    Pending {
+                        detected_at,
+                        tokenization_request_id,
+                        redemption_tx,
+                        ..
+                    } => (
+                        RedemptionTrackingStage::Detected,
+                        *detected_at,
+                        Some(tokenization_request_id.clone()),
+                        Some(*redemption_tx),
+                    ),
                     _ => unreachable!(),
                 };
 
@@ -1931,6 +2070,8 @@ impl RebalancingService {
                     RedemptionTracking {
                         symbol: symbol.clone(),
                         quantity,
+                        tokenization_request_id,
+                        redemption_tx,
                         stage,
                         last_progress_at,
                     },
@@ -2326,8 +2467,20 @@ mod tests {
             .unwrap();
         assert_eq!(tracking.symbol, symbol);
         assert_eq!(tracking.quantity, FractionalShares::new(float!(10)));
+        assert_eq!(
+            tracking.tokenization_request_id,
+            Some(TokenizationRequestId("TOK-1".to_string()))
+        );
         assert_eq!(tracking.stage, MintTrackingStage::Accepted);
         assert_eq!(tracking.last_progress_at, accepted_at);
+
+        let ownership = trigger.pending_request_ownership().await;
+        assert!(ownership.mint_issuers.contains(&mint_id));
+        assert!(
+            ownership
+                .mint_tokenizations
+                .contains(&TokenizationRequestId("TOK-1".to_string()))
+        );
 
         let inflight = {
             let inventory = trigger.inventory.read().await;
@@ -2342,6 +2495,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let redemption_id = RedemptionAggregateId::new("redemption-recovery");
         let detected_at = Utc::now();
+        let redemption_tx = TxHash::random();
 
         trigger
             .recover_redemption_state(
@@ -2349,7 +2503,7 @@ mod tests {
                 &EquityRedemption::Pending {
                     symbol: symbol.clone(),
                     quantity: float!(12),
-                    redemption_tx: TxHash::random(),
+                    redemption_tx,
                     tokenization_request_id: TokenizationRequestId("TOK-2".to_string()),
                     sent_at: Utc::now(),
                     detected_at,
@@ -2369,14 +2523,308 @@ mod tests {
             .unwrap();
         assert_eq!(tracking.symbol, symbol);
         assert_eq!(tracking.quantity, FractionalShares::new(float!(12)));
+        assert_eq!(
+            tracking.tokenization_request_id,
+            Some(TokenizationRequestId("TOK-2".to_string()))
+        );
         assert_eq!(tracking.stage, RedemptionTrackingStage::Detected);
         assert_eq!(tracking.last_progress_at, detected_at);
+
+        let ownership = trigger.pending_request_ownership().await;
+        assert!(
+            ownership
+                .redemption_tokenizations
+                .contains(&TokenizationRequestId("TOK-2".to_string()))
+        );
+        assert!(ownership.redemption_txs.contains(&redemption_tx));
 
         let inflight = {
             let inventory = trigger.inventory.read().await;
             inventory.equity_inflight(&symbol, Venue::MarketMaking)
         };
         assert_eq!(inflight, Some(FractionalShares::new(float!(12))));
+    }
+
+    #[tokio::test]
+    async fn pending_request_ownership_exposes_active_mint_ids() {
+        let (trigger, _receiver) = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mint_id = IssuerRequestId::new("owned-mint");
+        let tokenization_request_id = TokenizationRequestId("owned-tokenization".to_string());
+
+        *trigger.inventory.write().await =
+            InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50));
+
+        trigger
+            .on_mint(
+                mint_id.clone(),
+                TokenizedEquityMintEvent::MintRequested {
+                    symbol: symbol.clone(),
+                    quantity: float!(10),
+                    wallet: Address::ZERO,
+                    requested_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        trigger
+            .on_mint(
+                mint_id.clone(),
+                TokenizedEquityMintEvent::MintAccepted {
+                    issuer_request_id: mint_id.clone(),
+                    tokenization_request_id: tokenization_request_id.clone(),
+                    accepted_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let ownership = trigger.pending_request_ownership().await;
+
+        assert!(ownership.mint_issuers.contains(&mint_id));
+        assert!(
+            ownership
+                .mint_tokenizations
+                .contains(&tokenization_request_id)
+        );
+
+        trigger
+            .on_mint(
+                mint_id.clone(),
+                TokenizedEquityMintEvent::MintAcceptanceFailed {
+                    reason: "test terminal".to_string(),
+                    failed_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let ownership = trigger.pending_request_ownership().await;
+        assert!(!ownership.mint_issuers.contains(&mint_id));
+        assert!(
+            !ownership
+                .mint_tokenizations
+                .contains(&tokenization_request_id)
+        );
+
+        let success_mint_id = IssuerRequestId::new("owned-success-mint");
+        let success_tokenization_request_id =
+            TokenizationRequestId("owned-success-tokenization".to_string());
+
+        trigger
+            .on_mint(
+                success_mint_id.clone(),
+                TokenizedEquityMintEvent::MintRequested {
+                    symbol: symbol.clone(),
+                    quantity: float!(2),
+                    wallet: Address::ZERO,
+                    requested_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        trigger
+            .on_mint(
+                success_mint_id.clone(),
+                TokenizedEquityMintEvent::MintAccepted {
+                    issuer_request_id: success_mint_id.clone(),
+                    tokenization_request_id: success_tokenization_request_id.clone(),
+                    accepted_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        trigger
+            .on_mint(
+                success_mint_id.clone(),
+                TokenizedEquityMintEvent::DepositedIntoRaindex {
+                    vault_deposit_tx_hash: TxHash::random(),
+                    deposited_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let ownership = trigger.pending_request_ownership().await;
+        assert!(!ownership.mint_issuers.contains(&success_mint_id));
+        assert!(
+            !ownership
+                .mint_tokenizations
+                .contains(&success_tokenization_request_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_request_ownership_exposes_active_redemption_request_id() {
+        let (trigger, _receiver) = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let redemption_id = RedemptionAggregateId::new("owned-redemption");
+        let tokenization_request_id = TokenizationRequestId("owned-redemption-request".to_string());
+        let redemption_tx = TxHash::random();
+
+        *trigger.inventory.write().await =
+            InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50));
+
+        trigger
+            .on_redemption(
+                redemption_id.clone(),
+                EquityRedemptionEvent::VaultWithdrawPending {
+                    symbol: symbol.clone(),
+                    quantity: float!(10),
+                    token: Address::ZERO,
+                    wrapped_amount: U256::from(10),
+                    pending_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let ownership = trigger.pending_request_ownership().await;
+        assert!(ownership.redemption_txs.is_empty());
+
+        trigger
+            .on_redemption(
+                redemption_id.clone(),
+                EquityRedemptionEvent::TokensSent {
+                    redemption_wallet: Address::ZERO,
+                    redemption_tx,
+                    sent_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let ownership = trigger.pending_request_ownership().await;
+        assert!(ownership.redemption_txs.contains(&redemption_tx));
+
+        trigger
+            .on_redemption(
+                redemption_id.clone(),
+                EquityRedemptionEvent::Detected {
+                    tokenization_request_id: tokenization_request_id.clone(),
+                    detected_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let ownership = trigger.pending_request_ownership().await;
+
+        assert!(
+            ownership
+                .redemption_tokenizations
+                .contains(&tokenization_request_id)
+        );
+        assert!(ownership.redemption_txs.contains(&redemption_tx));
+
+        trigger
+            .on_redemption(
+                redemption_id,
+                EquityRedemptionEvent::Completed {
+                    completed_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let ownership = trigger.pending_request_ownership().await;
+        assert!(
+            !ownership
+                .redemption_tokenizations
+                .contains(&tokenization_request_id)
+        );
+        assert!(!ownership.redemption_txs.contains(&redemption_tx));
+    }
+
+    #[tokio::test]
+    async fn pending_request_ownership_drops_on_redemption_failure_terminals() {
+        let terminal_events = [
+            EquityRedemptionEvent::RedemptionRejected {
+                reason: "test rejection".to_string(),
+                rejected_at: Utc::now(),
+            },
+            EquityRedemptionEvent::TransferFailed {
+                tx_hash: Some(TxHash::random()),
+                reason: None,
+                failed_at: Utc::now(),
+            },
+            EquityRedemptionEvent::DetectionFailed {
+                failure: DetectionFailure::Timeout,
+                failed_at: Utc::now(),
+            },
+        ];
+
+        for terminal_event in terminal_events {
+            let (trigger, _receiver) = make_trigger().await;
+            let symbol = Symbol::new("AAPL").unwrap();
+            let redemption_id = RedemptionAggregateId::new("failing-redemption");
+            let tokenization_request_id =
+                TokenizationRequestId("failing-redemption-request".to_string());
+            let redemption_tx = TxHash::random();
+
+            *trigger.inventory.write().await =
+                InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50));
+
+            trigger
+                .on_redemption(
+                    redemption_id.clone(),
+                    EquityRedemptionEvent::VaultWithdrawPending {
+                        symbol: symbol.clone(),
+                        quantity: float!(10),
+                        token: Address::ZERO,
+                        wrapped_amount: U256::from(10),
+                        pending_at: Utc::now(),
+                    },
+                )
+                .await
+                .unwrap();
+            trigger
+                .on_redemption(
+                    redemption_id.clone(),
+                    EquityRedemptionEvent::TokensSent {
+                        redemption_wallet: Address::ZERO,
+                        redemption_tx,
+                        sent_at: Utc::now(),
+                    },
+                )
+                .await
+                .unwrap();
+            trigger
+                .on_redemption(
+                    redemption_id.clone(),
+                    EquityRedemptionEvent::Detected {
+                        tokenization_request_id: tokenization_request_id.clone(),
+                        detected_at: Utc::now(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            let ownership = trigger.pending_request_ownership().await;
+            assert!(ownership.redemption_txs.contains(&redemption_tx));
+            assert!(
+                ownership
+                    .redemption_tokenizations
+                    .contains(&tokenization_request_id)
+            );
+
+            trigger
+                .on_redemption(redemption_id, terminal_event.clone())
+                .await
+                .unwrap();
+
+            let ownership = trigger.pending_request_ownership().await;
+            assert!(
+                !ownership.redemption_txs.contains(&redemption_tx),
+                "redemption_tx must drop after terminal event {terminal_event:?}"
+            );
+            assert!(
+                !ownership
+                    .redemption_tokenizations
+                    .contains(&tokenization_request_id),
+                "redemption tokenization id must drop after terminal event {terminal_event:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2416,6 +2864,9 @@ mod tests {
             tracking.stage,
             RedemptionTrackingStage::WithdrawnFromRaindex
         );
+
+        let ownership = trigger.pending_request_ownership().await;
+        assert!(ownership.redemption_txs.is_empty());
 
         let inflight = {
             let inventory = trigger.inventory.read().await;
@@ -7951,6 +8402,8 @@ mod tests {
             RedemptionTracking {
                 symbol: symbol.clone(),
                 quantity: shares(10),
+                tokenization_request_id: None,
+                redemption_tx: Some(TxHash::random()),
                 stage: RedemptionTrackingStage::TokensSent,
                 last_progress_at: Utc::now() - ChronoDuration::minutes(31),
             },
@@ -8100,6 +8553,8 @@ mod tests {
             RedemptionTracking {
                 symbol: symbol.clone(),
                 quantity: shares(10),
+                tokenization_request_id: None,
+                redemption_tx: Some(TxHash::random()),
                 stage: RedemptionTrackingStage::TokensSent,
                 last_progress_at: Utc::now() - ChronoDuration::minutes(31),
             },
@@ -8161,6 +8616,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timed_out_redemption_drops_ownership_so_stuck_provider_request_is_external() {
+        // Core lifecycle of this PR: when a redemption times out, cleanup clears
+        // its inflight AND removes it from tracking. Because ownership is derived
+        // from live tracking, the still-pending provider request is no longer
+        // recognized as the bot's own -- the next poll classifies it as external
+        // and excludes it, so a stuck Alpaca request can no longer block
+        // rebalancing (which the old wallet-based matching would have done).
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(80), shares(20))
+            .update_equity(
+                &symbol,
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, shares(10)),
+                Utc::now(),
+            )
+            .unwrap();
+        let (reactor, _receiver) = make_trigger_with_inventory_and_registry_config(
+            inventory,
+            &symbol,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+        let trigger = reactor.clone();
+        let id = RedemptionAggregateId::new("timed-out-still-pending");
+        let redemption_tx = TxHash::random();
+        let tokenization_request_id = TokenizationRequestId("stuck-at-alpaca".to_string());
+
+        trigger.redemption_tracking.write().await.insert(
+            id.clone(),
+            RedemptionTracking {
+                symbol: symbol.clone(),
+                quantity: shares(10),
+                tokenization_request_id: Some(tokenization_request_id.clone()),
+                redemption_tx: Some(redemption_tx),
+                stage: RedemptionTrackingStage::Detected,
+                last_progress_at: Utc::now() - ChronoDuration::minutes(31),
+            },
+        );
+
+        // Before timeout the redemption is owned, so a poll would count it.
+        let ownership = trigger.pending_request_ownership().await;
+        assert!(ownership.redemption_txs.contains(&redemption_tx));
+        assert!(
+            ownership
+                .redemption_tokenizations
+                .contains(&tokenization_request_id)
+        );
+
+        trigger.expire_stuck_operations(Utc::now()).await.unwrap();
+
+        // After timeout it is no longer owned: a provider poll that STILL lists
+        // this request treats it as external and does not re-introduce inflight.
+        let ownership = trigger.pending_request_ownership().await;
+        assert!(!ownership.redemption_txs.contains(&redemption_tx));
+        assert!(
+            !ownership
+                .redemption_tokenizations
+                .contains(&tokenization_request_id)
+        );
+
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_inflight(&symbol, Venue::MarketMaking),
+            Some(FractionalShares::ZERO),
+            "timeout cleanup should clear the stuck redemption's inflight so rebalancing can resume"
+        );
+    }
+
+    #[tokio::test]
     async fn timed_out_mint_cleanup_rechecks_progress_before_clearing() {
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
@@ -8186,6 +8713,7 @@ mod tests {
             MintTracking {
                 symbol: symbol.clone(),
                 quantity: shares(10),
+                tokenization_request_id: None,
                 stage: MintTrackingStage::Accepted,
                 last_progress_at: now - ChronoDuration::minutes(5),
             },
@@ -8251,6 +8779,7 @@ mod tests {
             MintTracking {
                 symbol: symbol.clone(),
                 quantity: shares(10),
+                tokenization_request_id: None,
                 stage: MintTrackingStage::Accepted,
                 last_progress_at: now - ChronoDuration::minutes(5),
             },
@@ -8326,6 +8855,7 @@ mod tests {
             MintTracking {
                 symbol: symbol.clone(),
                 quantity: shares(10),
+                tokenization_request_id: None,
                 stage: MintTrackingStage::Accepted,
                 last_progress_at: now - ChronoDuration::minutes(5),
             },
@@ -8411,6 +8941,8 @@ mod tests {
             RedemptionTracking {
                 symbol: symbol.clone(),
                 quantity: shares(10),
+                tokenization_request_id: None,
+                redemption_tx: Some(TxHash::random()),
                 stage: RedemptionTrackingStage::TokensSent,
                 last_progress_at: now - ChronoDuration::minutes(5),
             },
@@ -8489,6 +9021,8 @@ mod tests {
             RedemptionTracking {
                 symbol: symbol.clone(),
                 quantity: shares(10),
+                tokenization_request_id: None,
+                redemption_tx: Some(TxHash::random()),
                 stage: RedemptionTrackingStage::TokensSent,
                 last_progress_at: now - ChronoDuration::minutes(5),
             },
@@ -8790,6 +9324,7 @@ mod tests {
             MintTracking {
                 symbol: symbol.clone(),
                 quantity: shares(10),
+                tokenization_request_id: None,
                 stage: MintTrackingStage::Accepted,
                 last_progress_at: fetched_at - ChronoDuration::minutes(5),
             },
