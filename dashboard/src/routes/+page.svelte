@@ -4,7 +4,6 @@
   import HeaderBar from '$lib/components/header-bar.svelte'
   import SettingsBar from '$lib/components/settings-bar.svelte'
   import InventoryPanel from '$lib/components/inventory-panel.svelte'
-  import PendingOrders from '$lib/components/pending-orders.svelte'
   import TradeHistoryPanel from '$lib/components/trade-history-panel.svelte'
   import TransferPanel from '$lib/components/transfer-panel.svelte'
   import LogPanel from '$lib/components/log-panel.svelte'
@@ -45,7 +44,7 @@
   })
 
   type Tab = 'dashboard' | 'orders' | 'logs'
-  type MobilePanel = 'inventory' | 'pending' | 'trades' | 'transfers'
+  type MobilePanel = 'inventory' | 'trades' | 'transfers'
 
   const activeTab = reactive<Tab>('dashboard')
   const mobilePanel = reactive<MobilePanel>('inventory')
@@ -76,7 +75,6 @@
   <nav class="flex shrink-0 gap-1 overflow-x-auto border-b bg-card/50 px-2 md:hidden">
     {#if activeTab.current === 'dashboard'}
       <button class={mobilePanelClass('inventory')} onclick={() => { mobilePanel.update(() => 'inventory'); }}>Inventory</button>
-      <button class={mobilePanelClass('pending')} onclick={() => { mobilePanel.update(() => 'pending'); }}>Pending</button>
       <button class={mobilePanelClass('trades')} onclick={() => { mobilePanel.update(() => 'trades'); }}>Trades</button>
       <button class={mobilePanelClass('transfers')} onclick={() => { mobilePanel.update(() => 'transfers'); }}>Transfers</button>
     {/if}
@@ -125,8 +123,6 @@
     <main class="flex-1 overflow-hidden p-2 md:hidden">
       {#if mobilePanel.current === 'inventory'}
         <InventoryPanel />
-      {:else if mobilePanel.current === 'pending'}
-        <PendingOrders />
       {:else if mobilePanel.current === 'trades'}
         <TradeHistoryPanel />
       {:else}
@@ -135,13 +131,10 @@
     </main>
 
     <!-- Desktop: all panels, fixed proportions, internal scrolling -->
-    <main class="hidden min-h-0 flex-1 flex-col gap-4 overflow-hidden p-4 md:flex">
-      <div class="grid h-[40%] min-h-0 grid-cols-[2fr_1fr] gap-4">
-        <InventoryPanel />
-        <PendingOrders />
-      </div>
+    <main class="hidden min-h-0 flex-1 grid-cols-[11fr_9fr] gap-4 overflow-hidden p-4 md:grid">
+      <InventoryPanel />
 
-      <div class="grid min-h-0 flex-1 grid-cols-2 gap-4">
+      <div class="grid min-h-0 grid-rows-2 gap-4">
         <TradeHistoryPanel />
         <TransferPanel />
       </div>

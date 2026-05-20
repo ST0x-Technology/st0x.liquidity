@@ -1144,6 +1144,7 @@ impl RebalancingService {
 
             OffchainUsd { .. }
             | OffchainCashBuyingPower { .. }
+            | OffchainCashWithdrawable { .. }
             | EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
@@ -1246,6 +1247,7 @@ impl RebalancingService {
             | OffchainEquity { .. }
             | OffchainUsd { .. }
             | OffchainCashBuyingPower { .. }
+            | OffchainCashWithdrawable { .. }
             | EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
@@ -1310,9 +1312,10 @@ impl RebalancingService {
             | BaseWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
             | BaseWalletWrappedEquity { .. }
-            // Buying power is display-only and doesn't feed venue
-            // balances, so it never drives a rebalance.
+            // Buying power and withdrawable cash are display-only and
+            // don't feed venue balances, so they never drive a rebalance.
             | OffchainCashBuyingPower { .. }
+            | OffchainCashWithdrawable { .. }
             // Inflight snapshots don't trigger rebalancing -- they
             // indicate transfers already in progress, not new balances
             // to rebalance.

@@ -671,6 +671,7 @@ fn register_account_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>)
                     "id": TEST_ACCOUNT_ID,
                     "status": "ACTIVE",
                     "cash": cash,
+                    "cash_withdrawable": cash,
                     "buying_power": buying_power,
                     "non_marginable_buying_power": buying_power,
                 }),

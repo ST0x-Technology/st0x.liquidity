@@ -2766,6 +2766,7 @@ mod tests {
             positions: vec![],
             usd_balance_cents: 100_000,
             cash_buying_power_cents: Some(100_000),
+            cash_withdrawable_cents: None,
         });
 
         let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, true)
@@ -2823,6 +2824,7 @@ mod tests {
             }],
             usd_balance_cents: 100_000,
             cash_buying_power_cents: Some(100_000),
+            cash_withdrawable_cents: None,
         });
 
         let offchain_order_id = process_queued_trade(&executor, &trade_event, trade, &cqrs, true)
@@ -2885,6 +2887,7 @@ mod tests {
             }],
             usd_balance_cents: 100_000,
             cash_buying_power_cents: Some(100_000),
+            cash_withdrawable_cents: None,
         });
 
         let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, true)
@@ -3121,6 +3124,7 @@ mod tests {
                 positions: vec![],
                 usd_balance_cents: 10_000,
                 cash_buying_power_cents: Some(1_000_000),
+                cash_withdrawable_cents: None,
             })
             .with_preflight_price(float!(100));
 
@@ -3184,6 +3188,7 @@ mod tests {
                 }],
                 usd_balance_cents: 15_000,
                 cash_buying_power_cents: Some(15_000),
+                cash_withdrawable_cents: None,
             })
             .with_preflight_price(float!(100));
 
@@ -3247,6 +3252,7 @@ mod tests {
             }],
             usd_balance_cents: 100_000,
             cash_buying_power_cents: Some(100_000),
+            cash_withdrawable_cents: None,
         });
 
         check_and_execute_accumulated_positions(
@@ -3341,6 +3347,7 @@ mod tests {
                 positions: vec![],
                 usd_balance_cents: 15_000,
                 cash_buying_power_cents: Some(15_000),
+                cash_withdrawable_cents: None,
             })
             .with_preflight_price(float!(100));
 

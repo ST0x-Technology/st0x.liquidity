@@ -197,7 +197,7 @@ describe('createWebSocket', () => {
               offchainAvailable: '0',
               offchainInflight: '0',
               offchainGross: null,
-              buyingPower: null,
+              withdrawableCash: null,
               inflightCash: { ethereumWallet: null, baseWallet: null }
             }
           },
@@ -297,7 +297,11 @@ describe('createWebSocket', () => {
           onchainAvailable: '10',
           onchainInflight: '0',
           offchainAvailable: '5',
-          offchainInflight: '0'
+          offchainInflight: '0',
+          inflightEquity: {
+            baseWalletUnwrapped: '0',
+            baseWalletWrapped: '0'
+          }
         }],
         usdc: {
           onchainAvailable: '1000',
@@ -305,7 +309,7 @@ describe('createWebSocket', () => {
           offchainAvailable: '500',
           offchainInflight: '0',
           offchainGross: null,
-          buyingPower: null,
+          withdrawableCash: null,
           inflightCash: { ethereumWallet: null, baseWallet: null }
         }
       }

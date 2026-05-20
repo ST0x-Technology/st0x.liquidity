@@ -10,7 +10,7 @@ use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use st0x_dto::{InFlightCash, SymbolInventory, UsdcInventory};
+use st0x_dto::{InFlightCash, InFlightEquity, SymbolInventory, UsdcInventory};
 use st0x_execution::{Direction, FractionalShares, HasZero, Symbol};
 use st0x_finance::Usdc;
 use st0x_float_macro::float;
@@ -697,6 +697,11 @@ pub(crate) struct InventoryView {
     /// Margin-safe buying power in cents from the offchain broker.
     #[serde(default)]
     buying_power_cents: Option<i64>,
+    /// Settled (withdrawable) cash in cents from the offchain broker.
+    /// Excludes T+1 unsettled equity-sale proceeds; this is the amount
+    /// actually movable to Raindex during rebalancing.
+    #[serde(default)]
+    withdrawable_cash_cents: Option<i64>,
     /// Gross offchain USD balance in cents (before cash reserve subtraction).
     #[serde(default)]
     offchain_gross_usd_cents: Option<i64>,
@@ -802,11 +807,32 @@ impl InventoryView {
     pub(crate) fn to_dto(&self) -> st0x_dto::Inventory {
         let per_symbol = self
             .equities
-            .iter()
-            .map(|(symbol, inventory)| {
-                let (onchain_available, onchain_inflight) = venue_balances(inventory.onchain);
+            .keys()
+            .chain(self.inflight_equity.keys().map(|(symbol, _)| symbol))
+            .unique()
+            .sorted()
+            .map(|symbol| {
+                let inventory = self.equities.get(symbol);
+                let (onchain_available, onchain_inflight) = inventory
+                    .map_or((FractionalShares::ZERO, FractionalShares::ZERO), |item| {
+                        venue_balances(item.onchain)
+                    });
 
-                let (offchain_available, offchain_inflight) = venue_balances(inventory.offchain);
+                let (offchain_available, offchain_inflight) = inventory
+                    .map_or((FractionalShares::ZERO, FractionalShares::ZERO), |item| {
+                        venue_balances(item.offchain)
+                    });
+
+                let inflight_equity = InFlightEquity {
+                    base_wallet_unwrapped: self
+                        .inflight_equity
+                        .get(&(symbol.clone(), InFlightEquityLocation::BaseWalletUnwrapped))
+                        .map_or(FractionalShares::ZERO, |entry| entry.amount),
+                    base_wallet_wrapped: self
+                        .inflight_equity
+                        .get(&(symbol.clone(), InFlightEquityLocation::BaseWalletWrapped))
+                        .map_or(FractionalShares::ZERO, |entry| entry.amount),
+                };
 
                 SymbolInventory {
                     symbol: symbol.clone(),
@@ -814,22 +840,16 @@ impl InventoryView {
                     onchain_inflight,
                     offchain_available,
                     offchain_inflight,
+                    inflight_equity,
                 }
             })
-            .sorted_by(|left, right| left.symbol.cmp(&right.symbol))
             .collect();
 
         let (usdc_onchain_available, usdc_onchain_inflight) = venue_balances(self.usdc.onchain);
 
         let (usdc_offchain_available, usdc_offchain_inflight) = venue_balances(self.usdc.offchain);
 
-        let buying_power = self.buying_power_cents.map(|cents| {
-            let sign = if cents < 0 { "-" } else { "" };
-            let abs = cents.unsigned_abs();
-            let whole = abs / 100;
-            let frac = abs % 100;
-            format!("{sign}${whole}.{frac:02}")
-        });
+        let withdrawable_cash = self.withdrawable_cash_cents.and_then(Usdc::from_cents);
 
         let offchain_gross = self.offchain_gross_usd_cents.and_then(Usdc::from_cents);
 
@@ -852,7 +872,7 @@ impl InventoryView {
                 offchain_available: usdc_offchain_available,
                 offchain_inflight: usdc_offchain_inflight,
                 offchain_gross,
-                buying_power,
+                withdrawable_cash,
                 inflight_cash,
             },
         }
@@ -879,6 +899,7 @@ impl Default for InventoryView {
             equities: HashMap::new(),
             last_updated: Utc::now(),
             buying_power_cents: None,
+            withdrawable_cash_cents: None,
             offchain_gross_usd_cents: None,
             inflight_cash: HashMap::new(),
             active_usdc_rebalance: None,
@@ -1009,6 +1030,7 @@ impl InventoryView {
             last_updated: now,
             usdc: self.usdc,
             buying_power_cents: self.buying_power_cents,
+            withdrawable_cash_cents: self.withdrawable_cash_cents,
             offchain_gross_usd_cents: self.offchain_gross_usd_cents,
             inflight_cash: self.inflight_cash,
             active_usdc_rebalance: self.active_usdc_rebalance,
@@ -1034,6 +1056,7 @@ impl InventoryView {
             last_updated: now,
             equities: self.equities,
             buying_power_cents: self.buying_power_cents,
+            withdrawable_cash_cents: self.withdrawable_cash_cents,
             offchain_gross_usd_cents: self.offchain_gross_usd_cents,
             inflight_cash: self.inflight_cash,
             active_usdc_rebalance: self.active_usdc_rebalance,
@@ -1248,6 +1271,7 @@ impl InventoryView {
             last_updated: now,
             usdc: self.usdc,
             buying_power_cents: self.buying_power_cents,
+            withdrawable_cash_cents: self.withdrawable_cash_cents,
             offchain_gross_usd_cents: self.offchain_gross_usd_cents,
             inflight_cash: self.inflight_cash,
             active_usdc_rebalance: self.active_usdc_rebalance,
@@ -1274,6 +1298,7 @@ impl InventoryView {
             last_updated: now,
             equities: self.equities,
             buying_power_cents: self.buying_power_cents,
+            withdrawable_cash_cents: self.withdrawable_cash_cents,
             offchain_gross_usd_cents: self.offchain_gross_usd_cents,
             inflight_cash: self.inflight_cash,
             active_usdc_rebalance: self.active_usdc_rebalance,
@@ -1567,6 +1592,21 @@ impl InventoryView {
                 })
             }
 
+            OffchainCashWithdrawable {
+                cash_withdrawable_cents,
+                ..
+            } => {
+                debug!(
+                    target: "inventory",
+                    ?cash_withdrawable_cents,
+                    "apply_snapshot_event: OffchainCashWithdrawable"
+                );
+                Ok(Self {
+                    withdrawable_cash_cents: *cash_withdrawable_cents,
+                    ..self
+                })
+            }
+
             EthereumUsdc {
                 usdc_balance,
                 fetched_at,
@@ -1707,6 +1747,14 @@ impl InventoryView {
                 ..
             } => Ok(Self {
                 buying_power_cents: *cash_buying_power_cents,
+                ..self
+            }),
+
+            OffchainCashWithdrawable {
+                cash_withdrawable_cents,
+                ..
+            } => Ok(Self {
+                withdrawable_cash_cents: *cash_withdrawable_cents,
                 ..self
             }),
 
@@ -2013,6 +2061,7 @@ mod tests {
             equities: equities.into_iter().collect(),
             last_updated: Utc::now(),
             buying_power_cents: None,
+            withdrawable_cash_cents: None,
             offchain_gross_usd_cents: None,
             inflight_cash: HashMap::new(),
             active_usdc_rebalance: None,
@@ -2042,6 +2091,7 @@ mod tests {
             equities: HashMap::new(),
             last_updated: Utc::now(),
             buying_power_cents: None,
+            withdrawable_cash_cents: None,
             offchain_gross_usd_cents: None,
             inflight_cash: HashMap::new(),
             active_usdc_rebalance: None,
@@ -3277,6 +3327,7 @@ mod tests {
             usdc: usdc_make_inventory(5000, 1000, 3000, 500),
             last_updated: Utc::now(),
             buying_power_cents: None,
+            withdrawable_cash_cents: None,
             offchain_gross_usd_cents: None,
             inflight_cash: HashMap::new(),
             active_usdc_rebalance: None,
@@ -3328,6 +3379,7 @@ mod tests {
             usdc: Inventory::default(),
             last_updated: Utc::now(),
             buying_power_cents: None,
+            withdrawable_cash_cents: None,
             offchain_gross_usd_cents: None,
             inflight_cash: HashMap::new(),
             active_usdc_rebalance: None,
@@ -3380,6 +3432,25 @@ mod tests {
         assert_eq!(dto.usdc.inflight_cash.base_wallet, Some(Usdc::ZERO));
     }
 
+    #[test]
+    fn to_dto_includes_withdrawable_cash() {
+        let view = InventoryView {
+            withdrawable_cash_cents: Some(3_200_000),
+            ..InventoryView::default()
+        };
+
+        let dto = view.to_dto();
+
+        assert_eq!(dto.usdc.withdrawable_cash, Some(Usdc::new(float!(32000))));
+    }
+
+    #[test]
+    fn to_dto_withdrawable_cash_is_none_when_broker_omitted_field() {
+        let dto = InventoryView::default().to_dto();
+
+        assert_eq!(dto.usdc.withdrawable_cash, None);
+    }
+
     /// Locations that have never been observed must surface as `None` in
     /// the DTO so the dashboard can distinguish "not polled yet" from
     /// "observed as zero".
@@ -3389,6 +3460,65 @@ mod tests {
 
         assert_eq!(dto.usdc.inflight_cash.ethereum_wallet, None);
         assert_eq!(dto.usdc.inflight_cash.base_wallet, None);
+    }
+
+    #[test]
+    fn to_dto_includes_inflight_equity() {
+        let fetched_at = Utc::now();
+        let aapl = Symbol::new("AAPL").unwrap();
+        let mut unwrapped = BTreeMap::new();
+        unwrapped.insert(aapl.clone(), shares(3));
+        let mut wrapped = BTreeMap::new();
+        wrapped.insert(aapl.clone(), shares(2));
+
+        let view = InventoryView::default()
+            .with_equity(aapl.clone(), shares(100), shares(50))
+            .set_inflight_equity_at_location(
+                InFlightEquityLocation::BaseWalletUnwrapped,
+                &unwrapped,
+                fetched_at,
+                fetched_at,
+            )
+            .set_inflight_equity_at_location(
+                InFlightEquityLocation::BaseWalletWrapped,
+                &wrapped,
+                fetched_at,
+                fetched_at,
+            );
+
+        let dto = view.to_dto();
+        let aapl_dto = &dto.per_symbol[0];
+
+        assert_eq!(aapl_dto.symbol, aapl);
+        assert_eq!(aapl_dto.inflight_equity.base_wallet_unwrapped, shares(3));
+        assert_eq!(aapl_dto.inflight_equity.base_wallet_wrapped, shares(2));
+    }
+
+    #[test]
+    fn to_dto_includes_wallet_only_equity_symbols() {
+        let fetched_at = Utc::now();
+        let aapl = Symbol::new("AAPL").unwrap();
+        let mut wrapped = BTreeMap::new();
+        wrapped.insert(aapl.clone(), shares(2));
+
+        let view = InventoryView::default().set_inflight_equity_at_location(
+            InFlightEquityLocation::BaseWalletWrapped,
+            &wrapped,
+            fetched_at,
+            fetched_at,
+        );
+
+        let dto = view.to_dto();
+        let aapl_dto = &dto.per_symbol[0];
+
+        assert_eq!(aapl_dto.symbol, aapl);
+        assert_eq!(aapl_dto.onchain_available, FractionalShares::ZERO);
+        assert_eq!(aapl_dto.offchain_available, FractionalShares::ZERO);
+        assert_eq!(
+            aapl_dto.inflight_equity.base_wallet_unwrapped,
+            FractionalShares::ZERO
+        );
+        assert_eq!(aapl_dto.inflight_equity.base_wallet_wrapped, shares(2));
     }
 
     #[test]

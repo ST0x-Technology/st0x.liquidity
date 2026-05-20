@@ -462,6 +462,15 @@ where
             )
             .await?;
 
+        self.snapshot
+            .send(
+                snapshot_id,
+                InventorySnapshotCommand::OffchainCashWithdrawable {
+                    cash_withdrawable_cents: inventory.cash_withdrawable_cents,
+                },
+            )
+            .await?;
+
         Ok(())
     }
 
@@ -817,6 +826,7 @@ mod tests {
             ],
             usd_balance_cents: 10_000_000,
             cash_buying_power_cents: Some(10_000_000),
+            cash_withdrawable_cents: None,
         };
         let executor = MockExecutor::new().with_inventory(inventory.clone());
 
@@ -869,6 +879,7 @@ mod tests {
             positions: vec![],
             usd_balance_cents: 25_000_000, // $250,000.00
             cash_buying_power_cents: Some(25_000_000),
+            cash_withdrawable_cents: None,
         };
         let executor = MockExecutor::new().with_inventory(inventory);
 
@@ -917,6 +928,7 @@ mod tests {
             positions: vec![],
             usd_balance_cents: 10_000_000, // $100,000
             cash_buying_power_cents: Some(10_000_000),
+            cash_withdrawable_cents: None,
         };
         let executor = MockExecutor::new().with_inventory(inventory);
 
@@ -975,6 +987,7 @@ mod tests {
             positions: vec![],
             usd_balance_cents: 3_000_000, // $30,000
             cash_buying_power_cents: Some(3_000_000),
+            cash_withdrawable_cents: None,
         };
         let executor = MockExecutor::new().with_inventory(inventory);
 
@@ -1013,6 +1026,7 @@ mod tests {
             positions: vec![],
             usd_balance_cents: 10_000_000,
             cash_buying_power_cents: Some(10_000_000),
+            cash_withdrawable_cents: None,
         };
         let executor = MockExecutor::new().with_inventory(inventory);
 
@@ -1068,6 +1082,7 @@ mod tests {
             positions: vec![],
             usd_balance_cents: 5_000_000,
             cash_buying_power_cents: Some(5_000_000),
+            cash_withdrawable_cents: None,
         };
         let executor = MockExecutor::new().with_inventory(inventory);
 
@@ -1168,6 +1183,7 @@ mod tests {
             }],
             usd_balance_cents: -5_000_000, // -$50,000 (margin debt)
             cash_buying_power_cents: Some(0),
+            cash_withdrawable_cents: None,
         };
         let executor = MockExecutor::new().with_inventory(inventory);
 
@@ -1209,6 +1225,7 @@ mod tests {
             }],
             usd_balance_cents: 1_000_000,
             cash_buying_power_cents: Some(1_000_000),
+            cash_withdrawable_cents: None,
         };
         let executor = MockExecutor::new().with_inventory(inventory);
 
@@ -1256,6 +1273,7 @@ mod tests {
             positions: vec![],
             usd_balance_cents: 10_000,
             cash_buying_power_cents: Some(10_000),
+            cash_withdrawable_cents: None,
         };
         let executor = MockExecutor::new().with_inventory(inventory);
 

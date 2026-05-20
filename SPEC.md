@@ -2583,8 +2583,10 @@ multiple broker-specific contexts.
    1w, 1m, all-time).
 
 2. **Inventory**: Per-symbol equity holdings and cash balances across venues,
-   with available/inflight breakdowns. Includes an "Inventory Transfers" section
-   showing active and recent transfer operations with status.
+   with available/inflight breakdowns. It also shows wallet-observed inventory
+   outside the venues: Ethereum/Base wallet USDC and Base wallet unwrapped
+   (`tSTOCK`) vs wrapped (`wtSTOCK`) equity tokens. Includes an "Inventory
+   Transfers" section showing active and recent transfer operations with status.
 
 3. **Spreads**: Last realized spreads per asset (buy/sell prices, Pyth
    reference, spread bps) and per-symbol price charts over time.

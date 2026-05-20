@@ -26,18 +26,54 @@
   const usdc = $derived(inventory?.usdc)
   const positions = $derived(positionsQuery.data ?? [])
   const settings = $derived(settingsQuery.data)
+
+  let glossaryDialogEl: HTMLDialogElement | undefined = $state()
+
+  const openGlossary = () => {
+    glossaryDialogEl?.showModal()
+  }
+
+  type GlossaryEntry = { name: string; def: string }
+
+  const cashEntries: GlossaryEntry[] = [
+    { name: 'Asset', def: 'Always "Cash" for the USDC row.' },
+    { name: 'Raindex', def: 'USDC available in the Raindex vaults to settle takers.' },
+    { name: 'Inflight', def: 'USDC the books track as in motion between venues (pending CCTP transfers, pending settlements). Already accounted for in imbalance math.' },
+    { name: 'Alpaca Available', def: 'USDC available to trade on Alpaca after subtracting the configured cash reserve. This is what the bot can spend on equity buys.' },
+    { name: 'Total', def: 'Raindex + Inflight + Alpaca Available. Excludes wallet-observed amounts.' },
+    { name: 'Ratio', def: 'Proportion of total cash sitting on Raindex (onchain / total). The bar and percent reflect the current split; the colored offset is the deviation from the configured target.' },
+    { name: 'Gross', def: 'Full broker USDC balance before subtracting the configured cash reserve. Hidden when no reserve is configured. (Reserved = Gross − Alpaca Available.)' },
+    { name: 'Withdrawable', def: 'Settled cash that can actually be withdrawn or transferred to Raindex. Excludes T+1 unsettled equity-sale proceeds. This is what the bot can rebalance.' },
+    { name: 'Eth Wallet', def: 'Wallet-observed USDC sitting on the Ethereum wallet between Alpaca and CCTP. Out-of-band sanity check — NOT part of imbalance math.' },
+    { name: 'Base Wallet', def: 'Wallet-observed USDC sitting on the Base wallet between CCTP and the Raindex vaults. Out-of-band sanity check — NOT part of imbalance math.' },
+  ]
+
+  const equityEntries: GlossaryEntry[] = [
+    { name: 'Asset', def: 'Equity symbol with the t/wt prefix stripped (e.g. AAPL for tAAPL / wtAAPL). Non-trading assets are dimmed.' },
+    { name: 'Raindex', def: 'tSTOCK tokens available in the Raindex vault to settle takers.' },
+    { name: 'Inflight', def: 'Shares the books track as in motion between venues (pending mints, redeems, transfers). Part of imbalance math.' },
+    { name: 'Alpaca', def: 'Shares held at Alpaca (offchain available).' },
+    { name: 'Total', def: 'Raindex + Inflight + Alpaca. Excludes wallet-observed amounts (Unwrapped / Wrapped).' },
+    { name: 'Ratio', def: 'Proportion of total shares sitting on Raindex (onchain / total). Bar and percent reflect the current split; colored offset is deviation from target.' },
+    { name: 'Exposure', def: 'Net directional dollar exposure from counterparty fills (Alpaca-reported net position × last price). ▲ green = long, ▼ red = short. Values under $0.01 render as ~$0.' },
+    { name: 'Unwrapped', def: 'Wallet-observed tSTOCK parked on the Base wallet between a Raindex withdrawal and an Alpaca redemption transfer (or post-mint, pre-vault deposit). Out-of-band — NOT part of imbalance math.' },
+    { name: 'Wrapped', def: 'Wallet-observed wtSTOCK vault shares on the Base wallet (post vault-withdraw, pre-unwrap). Out-of-band — NOT part of imbalance math.' },
+  ]
 </script>
 
 <Card.Root class="flex h-full flex-col overflow-hidden border-l-4 border-l-blue-500/50">
   <Card.Header class="shrink-0 pb-3">
     <Card.Title class="flex items-center gap-1.5">
       Inventory
-      <span class="group relative cursor-help text-muted-foreground">
+      <button
+        type="button"
+        class="cursor-pointer text-muted-foreground hover:text-foreground"
+        onclick={openGlossary}
+        title="Column reference"
+        aria-label="Open inventory column reference"
+      >
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="h-3.5 w-3.5"><path fill-rule="evenodd" d="M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Zm-7-4a1 1 0 1 1-2 0 1 1 0 0 1 2 0ZM9 9a.75.75 0 0 0 0 1.5h.253a.25.25 0 0 1 .244.304l-.459 2.066A1.75 1.75 0 0 0 10.747 15H11a.75.75 0 0 0 0-1.5h-.253a.25.25 0 0 1-.244-.304l.459-2.066A1.75 1.75 0 0 0 9.253 9H9Z" clip-rule="evenodd" /></svg>
-        <span class="pointer-events-none absolute left-0 top-full z-50 mt-1 hidden w-56 rounded bg-popover px-3 py-2 text-xs font-normal text-popover-foreground shadow-lg group-hover:block">
-          Asset balances across Alpaca (offchain) and Raindex (onchain), with allocation ratios and directional exposure.
-        </span>
-      </span>
+      </button>
     </Card.Title>
   </Card.Header>
   <Card.Content class="relative min-h-0 flex-1 overflow-auto px-6 pt-0">
@@ -50,3 +86,51 @@
     {/if}
   </Card.Content>
 </Card.Root>
+
+<dialog
+  bind:this={glossaryDialogEl}
+  class="w-full max-w-2xl rounded-lg border bg-card p-0 text-foreground shadow-lg backdrop:bg-black/50"
+  onclick={(event) => { if (event.target === glossaryDialogEl) glossaryDialogEl.close() }}
+>
+  <div class="flex items-center justify-between border-b px-5 py-3">
+    <div class="text-sm font-semibold">Inventory column reference</div>
+    <button
+      type="button"
+      class="text-lg leading-none text-muted-foreground hover:text-foreground"
+      onclick={() => glossaryDialogEl?.close()}
+      aria-label="Close"
+    >
+      &times;
+    </button>
+  </div>
+
+  <div class="max-h-[70vh] space-y-6 overflow-y-auto px-5 py-4 text-sm">
+    <section>
+      <h3 class="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">Cash row</h3>
+      <dl class="space-y-2">
+        {#each cashEntries as entry (entry.name)}
+          <div class="grid grid-cols-[8rem_1fr] gap-3">
+            <dt class="font-mono text-sm font-medium">{entry.name}</dt>
+            <dd class="text-sm text-muted-foreground">{entry.def}</dd>
+          </div>
+        {/each}
+      </dl>
+    </section>
+
+    <section>
+      <h3 class="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">Equity rows</h3>
+      <dl class="space-y-2">
+        {#each equityEntries as entry (entry.name)}
+          <div class="grid grid-cols-[8rem_1fr] gap-3">
+            <dt class="font-mono text-sm font-medium">{entry.name}</dt>
+            <dd class="text-sm text-muted-foreground">{entry.def}</dd>
+          </div>
+        {/each}
+      </dl>
+    </section>
+
+    <section class="rounded border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-muted-foreground">
+      <strong class="text-foreground">Wallet-observed</strong> columns (Eth Wallet, Base Wallet, Unwrapped, Wrapped) come from polling the on-chain wallets directly. They are a sanity check for funds in transit between venues and are <strong>NOT</strong> included in Total, Ratio, or imbalance / rebalancing decisions.
+    </section>
+  </div>
+</dialog>

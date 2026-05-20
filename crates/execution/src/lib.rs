@@ -302,10 +302,15 @@ pub struct Inventory {
     pub usd_balance_cents: i64,
     /// Cash buying power available for equity hedges -- Alpaca's `cash`
     /// field, which includes unsettled T+1 equity-sale proceeds and excludes
-    /// margin. Used for counter-trade preflight and display. `None` when the
-    /// broker omits the field or the value cannot be converted. See
+    /// margin. Used for counter-trade preflight. `None` when the broker
+    /// omits the field or the value cannot be converted. See
     /// adrs/1-cash-bp-for-equity-hedges.md.
     pub cash_buying_power_cents: Option<i64>,
+    /// Settled cash that can be withdrawn or transferred out -- Alpaca's
+    /// `cash_withdrawable` field, excluding T+1 unsettled equity-sale
+    /// proceeds. This is the amount actually movable to Raindex during
+    /// rebalancing. `None` when the broker omits the field.
+    pub cash_withdrawable_cents: Option<i64>,
 }
 
 /// Result of fetching inventory from an executor.

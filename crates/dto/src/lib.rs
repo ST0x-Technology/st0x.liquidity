@@ -54,6 +54,7 @@ pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
     Trade::export_all_to(out_dir)?;
     Position::export_all_to(out_dir)?;
     SymbolInventory::export_all_to(out_dir)?;
+    InFlightEquity::export_all_to(out_dir)?;
     Inventory::export_all_to(out_dir)?;
     InventorySnapshot::export_all_to(out_dir)?;
     UsdcInventory::export_all_to(out_dir)?;

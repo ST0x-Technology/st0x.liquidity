@@ -51,6 +51,8 @@ impl<'v> FromFormField<'v> for TransferKindFilter {
 }
 
 static STARTED_AT: LazyLock<DateTime<Utc>> = LazyLock::new(Utc::now);
+const DEFAULT_RAINDEX_ORDERS_PAGE_SIZE: u32 = 50;
+const MAX_RAINDEX_ORDERS_PAGE_SIZE: u32 = 100;
 
 const GIT_COMMIT: &str = match option_env!("ST0X_GIT_COMMIT") {
     Some(val) => val,
@@ -858,9 +860,13 @@ fn unavailable_json(reason: &str) -> RawJson<String> {
 /// Proxies the bot's active Raindex orders from the st0x REST API.
 /// When `[rest_api]` is not configured, returns an unavailable indicator
 /// so the dashboard can show a friendly message instead of an error.
-#[get("/orders/raindex")]
+#[get("/orders/raindex?<page>&<page_size>")]
 #[allow(clippy::cognitive_complexity)]
-async fn raindex_orders(ctx: &State<Ctx>) -> RawJson<String> {
+async fn raindex_orders(
+    ctx: &State<Ctx>,
+    page: Option<u32>,
+    page_size: Option<u32>,
+) -> RawJson<String> {
     let Some(rest_api) = &ctx.rest_api else {
         return unavailable_json("REST API not configured (simulate mode)");
     };
@@ -872,7 +878,15 @@ async fn raindex_orders(ctx: &State<Ctx>) -> RawJson<String> {
         owner
     );
 
-    let mut request = rest_api.http_client.get(&url);
+    let page = page.unwrap_or(1).max(1);
+    let page_size = page_size
+        .unwrap_or(DEFAULT_RAINDEX_ORDERS_PAGE_SIZE)
+        .clamp(1, MAX_RAINDEX_ORDERS_PAGE_SIZE);
+
+    let mut request = rest_api
+        .http_client
+        .get(&url)
+        .query(&[("page", page), ("pageSize", page_size)]);
 
     if let (Some(key_id), Some(key_secret)) = (&rest_api.key_id, &rest_api.key_secret) {
         request = request.basic_auth(key_id, Some(key_secret));
@@ -1398,7 +1412,10 @@ mod tests {
         let expected_path = format!("/v1/orders/owner/{owner:#x}");
 
         mock_server.mock(|when, then| {
-            when.method(httpmock::Method::GET).path(&expected_path);
+            when.method(httpmock::Method::GET)
+                .path(&expected_path)
+                .query_param("page", "1")
+                .query_param("pageSize", "50");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(upstream_body.clone());
@@ -1424,6 +1441,110 @@ mod tests {
 
         assert_eq!(parsed["orders"][0]["orderHash"], "0xabcd");
         assert_eq!(parsed["pagination"]["totalOrders"], 1);
+    }
+
+    #[tokio::test]
+    async fn raindex_orders_forwards_clamped_pagination_to_upstream() {
+        let mock_server = httpmock::MockServer::start();
+        let upstream_body = serde_json::json!({
+            "orders": [],
+            "pagination": {
+                "page": 3,
+                "pageSize": 100,
+                "totalOrders": 0,
+                "totalPages": 0,
+                "hasMore": false
+            }
+        });
+
+        let owner = alloy::primitives::Address::ZERO;
+        let expected_path = format!("/v1/orders/owner/{owner:#x}");
+
+        mock_server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(&expected_path)
+                .query_param("page", "3")
+                .query_param("pageSize", "100");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(upstream_body.clone());
+        });
+
+        let mut ctx = create_test_ctx_with_order_owner(owner);
+        ctx.rest_api = Some(crate::config::RestApiCtx::unauthenticated(
+            mock_server.base_url(),
+        ));
+
+        let rocket = rocket::build()
+            .mount("/", routes![raindex_orders])
+            .manage(ctx);
+        let client = Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let response = client
+            .get("/orders/raindex?page=3&page_size=500")
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+
+        let body = response.into_string().await.expect("response body");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON response");
+
+        assert_eq!(parsed["pagination"]["page"], 3);
+        assert_eq!(parsed["pagination"]["pageSize"], 100);
+    }
+
+    #[tokio::test]
+    async fn raindex_orders_clamps_zero_pagination_inputs_to_one() {
+        let mock_server = httpmock::MockServer::start();
+        let upstream_body = serde_json::json!({
+            "orders": [],
+            "pagination": {
+                "page": 1,
+                "pageSize": 1,
+                "totalOrders": 0,
+                "totalPages": 0,
+                "hasMore": false
+            }
+        });
+
+        let owner = alloy::primitives::Address::ZERO;
+        let expected_path = format!("/v1/orders/owner/{owner:#x}");
+
+        mock_server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(&expected_path)
+                .query_param("page", "1")
+                .query_param("pageSize", "1");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(upstream_body.clone());
+        });
+
+        let mut ctx = create_test_ctx_with_order_owner(owner);
+        ctx.rest_api = Some(crate::config::RestApiCtx::unauthenticated(
+            mock_server.base_url(),
+        ));
+
+        let rocket = rocket::build()
+            .mount("/", routes![raindex_orders])
+            .manage(ctx);
+        let client = Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let response = client
+            .get("/orders/raindex?page=0&page_size=0")
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+
+        let body = response.into_string().await.expect("response body");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON response");
+
+        assert_eq!(parsed["pagination"]["page"], 1);
+        assert_eq!(parsed["pagination"]["pageSize"], 1);
     }
 
     #[tokio::test]

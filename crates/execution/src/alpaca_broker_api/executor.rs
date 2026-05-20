@@ -209,7 +209,7 @@ impl Executor for AlpacaBrokerApi {
                     self.counter_trade_slippage_bps,
                 )?;
 
-                let available_buying_power_cents = account_funds.cash_buying_power_cents;
+                let available_buying_power_cents = account_funds.buying_power;
                 let preflight = buying_power_counter_trade_preflight(
                     estimated_cost_cents,
                     available_buying_power_cents,

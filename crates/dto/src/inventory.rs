@@ -23,6 +23,20 @@ pub struct SymbolInventory {
     pub offchain_available: FractionalShares,
     #[ts(type = "string")]
     pub offchain_inflight: FractionalShares,
+    /// Equity tokens observed in the Base wallet between venues.
+    pub inflight_equity: InFlightEquity,
+}
+
+/// Equity tokens sitting in wallets between venues, observed by polling.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct InFlightEquity {
+    /// Unwrapped tokenized equity (`tSTOCK`) parked on the Base wallet.
+    #[ts(type = "string")]
+    pub base_wallet_unwrapped: FractionalShares,
+    /// Wrapped equity vault shares (`wtSTOCK`) parked on the Base wallet.
+    #[ts(type = "string")]
+    pub base_wallet_wrapped: FractionalShares,
 }
 
 /// Onchain and offchain USDC balances split by availability.
@@ -40,10 +54,12 @@ pub struct UsdcInventory {
     /// Gross offchain USD balance before cash reserve subtraction.
     #[ts(type = "string | null")]
     pub offchain_gross: Option<Usdc>,
-    /// Cash buying power from the offchain broker (Alpaca's `cash` field --
-    /// includes unsettled T+1 equity-sale proceeds, excludes margin),
-    /// formatted as USD string.
-    pub buying_power: Option<String>,
+    /// Settled cash that can be withdrawn/transferred out of the offchain
+    /// broker (Alpaca's `cash_withdrawable` field -- excludes T+1 unsettled
+    /// equity-sale proceeds). This is what can actually be rebalanced to
+    /// Raindex.
+    #[ts(type = "string | null")]
+    pub withdrawable_cash: Option<Usdc>,
     /// USDC observed at intermediate wallet locations between venues.
     pub inflight_cash: InFlightCash,
 }
@@ -93,7 +109,7 @@ impl Inventory {
                 offchain_available: Usdc::ZERO,
                 offchain_inflight: Usdc::ZERO,
                 offchain_gross: None,
-                buying_power: None,
+                withdrawable_cash: None,
                 inflight_cash: InFlightCash::empty(),
             },
         }
@@ -124,6 +140,10 @@ mod tests {
                 onchain_inflight: FractionalShares::new(float!(5)),
                 offchain_available: FractionalShares::new(float!(45)),
                 offchain_inflight: FractionalShares::ZERO,
+                inflight_equity: InFlightEquity {
+                    base_wallet_unwrapped: FractionalShares::new(float!(3)),
+                    base_wallet_wrapped: FractionalShares::new(float!(2)),
+                },
             }],
             usdc: UsdcInventory {
                 onchain_available: Usdc::new(float!(10000)),
@@ -131,7 +151,7 @@ mod tests {
                 offchain_available: Usdc::new(float!(5000)),
                 offchain_inflight: Usdc::new(float!(500)),
                 offchain_gross: Some(Usdc::new(float!(6000))),
-                buying_power: Some("$4,500.00".to_string()),
+                withdrawable_cash: Some(Usdc::new(float!(4500))),
                 inflight_cash: InFlightCash {
                     ethereum_wallet: Some(Usdc::new(float!(250))),
                     base_wallet: Some(Usdc::ZERO),
@@ -147,6 +167,8 @@ mod tests {
         assert_eq!(symbol["onchainInflight"], json!("5"));
         assert_eq!(symbol["offchainAvailable"], json!("45"));
         assert_eq!(symbol["offchainInflight"], json!("0"));
+        assert_eq!(symbol["inflightEquity"]["baseWalletUnwrapped"], json!("3"));
+        assert_eq!(symbol["inflightEquity"]["baseWalletWrapped"], json!("2"));
 
         let usdc = &json["usdc"];
         assert_eq!(usdc["onchainAvailable"], json!("10000"));
@@ -154,7 +176,7 @@ mod tests {
         assert_eq!(usdc["offchainAvailable"], json!("5000"));
         assert_eq!(usdc["offchainInflight"], json!("500"));
         assert_eq!(usdc["offchainGross"], json!("6000"));
-        assert_eq!(usdc["buyingPower"], json!("$4,500.00"));
+        assert_eq!(usdc["withdrawableCash"], json!("4500"));
         assert_eq!(usdc["inflightCash"]["ethereumWallet"], json!("250"));
         assert_eq!(usdc["inflightCash"]["baseWallet"], json!("0"));
     }

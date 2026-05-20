@@ -13,10 +13,12 @@ use crate::{
     deserialize_option_float_from_number_or_string,
 };
 
+/// Account-level USD figures from the broker, all denominated in cents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct AccountFunds {
-    pub(super) cash_balance_cents: i64,
-    pub(super) cash_buying_power_cents: i64,
+    pub(super) balance: i64,
+    pub(super) buying_power: i64,
+    pub(super) withdrawable: Option<i64>,
 }
 
 /// Position response from Alpaca Broker API.
@@ -50,12 +52,23 @@ impl std::fmt::Debug for PositionResponse {
 struct AccountDetailsResponse {
     #[serde(deserialize_with = "deserialize_float_from_number_or_string")]
     cash: Float,
+    /// Settled cash that can be withdrawn -- excludes T+1 unsettled
+    /// equity-sale proceeds. `None` if the broker omits the field.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_option_float_from_number_or_string"
+    )]
+    cash_withdrawable: Option<Float>,
 }
 
 impl std::fmt::Debug for AccountDetailsResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AccountDetailsResponse")
             .field("cash", &DebugFloat(&self.cash))
+            .field(
+                "cash_withdrawable",
+                &DebugOptionFloat(&self.cash_withdrawable),
+            )
             .finish()
     }
 }
@@ -108,8 +121,9 @@ pub(super) async fn fetch_inventory(
 
     Ok(Inventory {
         positions: broker_positions,
-        usd_balance_cents: account_funds.cash_balance_cents,
-        cash_buying_power_cents: Some(account_funds.cash_buying_power_cents),
+        usd_balance_cents: account_funds.balance,
+        cash_buying_power_cents: Some(account_funds.buying_power),
+        cash_withdrawable_cents: account_funds.withdrawable,
     })
 }
 
@@ -117,11 +131,16 @@ pub(super) async fn get_account_funds(
     client: &AlpacaBrokerApiClient,
 ) -> Result<AccountFunds, AlpacaBrokerApiError> {
     let account = get_account_details(client).await?;
-    let cash_balance_cents = to_cash_value_cents(account.cash)?;
+    let balance = to_cash_value_cents(account.cash)?;
+    let withdrawable = account
+        .cash_withdrawable
+        .map(to_cash_value_cents)
+        .transpose()?;
 
     Ok(AccountFunds {
-        cash_balance_cents,
-        cash_buying_power_cents: cash_balance_cents,
+        balance,
+        buying_power: balance,
+        withdrawable,
     })
 }
 
@@ -272,6 +291,72 @@ mod tests {
             aapl.market_value,
             Some(Float::parse("1575.00".to_string()).unwrap())
         ));
+    }
+
+    #[tokio::test]
+    async fn fetch_inventory_extracts_cash_withdrawable_when_present() {
+        // Alpaca returns `cash_withdrawable` separately from `cash`. The
+        // dashboard displays it as settled cash available to rebalance to
+        // Raindex, distinct from `cash` which includes T+1 unsettled
+        // equity-sale proceeds.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([]));
+        });
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "cash": "50000.00",
+                    "cash_withdrawable": "32000.00"
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let state = fetch_inventory(&client).await.unwrap();
+
+        assert_eq!(state.usd_balance_cents, 5_000_000);
+        assert_eq!(state.cash_buying_power_cents, Some(5_000_000));
+        assert_eq!(state.cash_withdrawable_cents, Some(3_200_000));
+    }
+
+    #[tokio::test]
+    async fn fetch_inventory_leaves_cash_withdrawable_none_when_broker_omits_field() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([]));
+        });
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "cash": "50000.00"
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let state = fetch_inventory(&client).await.unwrap();
+
+        assert_eq!(state.usd_balance_cents, 5_000_000);
+        assert_eq!(state.cash_withdrawable_cents, None);
     }
 
     #[tokio::test]

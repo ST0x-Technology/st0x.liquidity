@@ -8,6 +8,8 @@
   import { formatDecimal } from '$lib/decimal'
   import { formatTimestamp } from '$lib/format'
 
+  const PAGE_SIZE = 50
+
   type TokenRef = {
     address: string
     symbol: string
@@ -46,35 +48,40 @@
   const isUnavailable = (response: ApiResponse): response is UnavailableResponse =>
     'unavailable' in response && response.unavailable
 
-  const CACHE_KEY = 'orders-panel-cache'
+  const cacheKey = (page: number): string => `orders-panel-cache:${String(page)}`
 
-  const loadCache = (): ApiResponse | null => {
+  const loadCache = (page: number): ApiResponse | null => {
     try {
-      const raw = sessionStorage.getItem(CACHE_KEY)
+      const raw = sessionStorage.getItem(cacheKey(page))
       return raw ? (JSON.parse(raw) as ApiResponse) : null
     } catch {
       return null
     }
   }
 
-  const saveCache = (response: ApiResponse) => {
+  const saveCache = (page: number, response: ApiResponse) => {
     try {
-      sessionStorage.setItem(CACHE_KEY, JSON.stringify(response))
+      sessionStorage.setItem(cacheKey(page), JSON.stringify(response))
     } catch { /* quota exceeded — not critical */ }
   }
 
-  const data = reactive<ApiResponse | null>(loadCache())
+  const currentPage = reactive(1)
+  const data = reactive<ApiResponse | null>(loadCache(currentPage.current))
   const loading = reactive(false)
   const error = reactive<string | null>(null)
 
-  const fetchOrders = async () => {
+  const fetchOrders = async (page = currentPage.current) => {
     loading.update(() => true)
     error.update(() => null)
 
     try {
       const baseUrl = getApiBaseUrl()
+      const params = new URLSearchParams({
+        page: String(page),
+        page_size: String(PAGE_SIZE),
+      })
       const response = await fetch(
-        `${baseUrl}/orders/raindex`,
+        `${baseUrl}/orders/raindex?${params.toString()}`,
         { signal: AbortSignal.timeout(ORDERS_TIMEOUT_MS) },
       )
 
@@ -102,7 +109,7 @@
 
       const orders = result as OrdersListResponse
       data.update(() => orders)
-      saveCache(orders)
+      saveCache(page, orders)
     } catch (fetchError) {
       error.update(() =>
         fetchError instanceof Error ? fetchError.message : 'Unknown error',
@@ -111,6 +118,16 @@
       loading.update(() => false)
     }
   }
+
+  const goToPage = (page: number) => {
+    const nextPage = Math.max(1, page)
+    currentPage.update(() => nextPage)
+    data.update(() => loadCache(nextPage))
+    void fetchOrders(nextPage)
+  }
+
+  const shortHash = (hash: string): string =>
+    hash.length <= 18 ? hash : `${hash.slice(0, 10)}...${hash.slice(-6)}`
 
   onMount(() => {
     void fetchOrders()
@@ -174,51 +191,79 @@
         {data.current.reason}
       </div>
     {:else if data.current && !isUnavailable(data.current)}
-      {#if data.current.orders.length === 0}
+      {#if data.current.orders.length === 0 && data.current.pagination.totalOrders === 0}
         <div class="flex h-full items-center justify-center text-muted-foreground">
           No active orders found for this owner.
         </div>
       {:else}
-        <table class="w-full text-sm">
-          <thead>
-            <tr class="border-b text-left text-xs text-muted-foreground">
-              <th class="pb-2 pr-4 font-medium">Output</th>
-              <th class="pb-2 pr-4 font-medium">Input</th>
-              <th class="pb-2 pr-4 text-right font-medium">Vault Balance</th>
-              <th class="pb-2 pr-4 text-right font-medium">IO Ratio</th>
-              <th class="pb-2 pr-4 font-medium">Order Hash</th>
-              <th class="pb-2 font-medium">Created</th>
-            </tr>
-          </thead>
-
-          <tbody>
-            {#each data.current.orders as order (order.orderHash)}
-              <tr class="border-b border-border/30 hover:bg-accent/30">
-                <td class="py-2 pr-4 font-medium">{order.outputToken.symbol}</td>
-
-                <td class="py-2 pr-4 font-medium">{order.inputToken.symbol}</td>
-
-                <td class="py-2 pr-4 text-right font-mono">
-                  {formatDecimal(order.outputVaultBalance, 3)}
-                </td>
-
-                <td class="py-2 pr-4 text-right font-mono">
-                  {formatDecimal(order.ioRatio, 3)}
-                </td>
-
-                <td class="py-2 pr-4">
-                  <span class="font-mono text-xs text-muted-foreground break-all">
-                    {order.orderHash}
-                  </span>
-                </td>
-
-                <td class="py-2 text-xs text-muted-foreground">
-                  {formatTimestamp(order.createdAt)}
-                </td>
+        {#if data.current.orders.length === 0}
+          <div class="flex h-32 items-center justify-center text-muted-foreground">
+            No orders on this page.
+          </div>
+        {:else}
+          <table class="w-full table-fixed text-sm">
+            <thead>
+              <tr class="border-b text-left text-xs text-muted-foreground">
+                <th class="w-24 pb-2 pr-4 font-medium">Output</th>
+                <th class="w-24 pb-2 pr-4 font-medium">Input</th>
+                <th class="w-32 pb-2 pr-4 text-right font-medium">Vault Balance</th>
+                <th class="w-28 pb-2 pr-4 text-right font-medium">IO Ratio</th>
+                <th class="w-44 pb-2 pr-4 font-medium">Order Hash</th>
+                <th class="w-32 pb-2 font-medium">Created</th>
               </tr>
-            {/each}
-          </tbody>
-        </table>
+            </thead>
+
+            <tbody>
+              {#each data.current.orders as order (order.orderHash)}
+                <tr class="border-b border-border/30 hover:bg-accent/30">
+                  <td class="py-2 pr-4 font-medium">{order.outputToken.symbol}</td>
+
+                  <td class="py-2 pr-4 font-medium">{order.inputToken.symbol}</td>
+
+                  <td class="py-2 pr-4 text-right font-mono">
+                    {formatDecimal(order.outputVaultBalance, 3)}
+                  </td>
+
+                  <td class="py-2 pr-4 text-right font-mono">
+                    {formatDecimal(order.ioRatio, 3)}
+                  </td>
+
+                  <td class="py-2 pr-4">
+                    <span class="font-mono text-xs text-muted-foreground" title={order.orderHash}>
+                      {shortHash(order.orderHash)}
+                    </span>
+                  </td>
+
+                  <td class="py-2 text-xs text-muted-foreground">
+                    {formatTimestamp(order.createdAt)}
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        {/if}
+
+        <div class="sticky bottom-0 mt-3 flex items-center justify-between border-t bg-card/95 py-2 text-xs text-muted-foreground">
+          <button
+            class="rounded border bg-background px-2 py-1 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+            onclick={() => { goToPage(currentPage.current - 1); }}
+            disabled={loading.current || currentPage.current <= 1}
+          >
+            Previous
+          </button>
+
+          <span>
+            Page {data.current.pagination.page} of {data.current.pagination.totalPages}
+          </span>
+
+          <button
+            class="rounded border bg-background px-2 py-1 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+            onclick={() => { goToPage(currentPage.current + 1); }}
+            disabled={loading.current || !data.current.pagination.hasMore}
+          >
+            Next
+          </button>
+        </div>
       {/if}
     {:else}
       <div class="flex h-full items-center justify-center text-muted-foreground">

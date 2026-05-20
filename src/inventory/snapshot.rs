@@ -89,6 +89,11 @@ pub(crate) struct InventorySnapshot {
     /// value used for counter-trade preflight checks.) See
     /// adrs/1-cash-bp-for-equity-hedges.md.
     pub(crate) offchain_cash_buying_power_cents: Option<i64>,
+    /// Latest offchain settled (withdrawable) cash in cents (Alpaca's
+    /// `cash_withdrawable` field -- excludes T+1 unsettled equity-sale
+    /// proceeds). What's actually movable to Raindex during rebalancing.
+    #[serde(default)]
+    pub(crate) offchain_cash_withdrawable_cents: Option<i64>,
     /// Latest Ethereum wallet USDC balance
     pub(crate) ethereum_usdc: Option<Usdc>,
     /// Latest Base wallet USDC balance (outside Raindex vaults)
@@ -132,6 +137,7 @@ impl EventSourced for InventorySnapshot {
             offchain_usd_fetched_at: None,
             offchain_gross_usd_cents: None,
             offchain_cash_buying_power_cents: None,
+            offchain_cash_withdrawable_cents: None,
             ethereum_usdc: None,
             base_wallet_usdc: None,
             inflight_mints: BTreeMap::new(),
@@ -181,6 +187,12 @@ impl EventSourced for InventorySnapshot {
                 cash_buying_power_cents,
             } => InventorySnapshotEvent::OffchainCashBuyingPower {
                 cash_buying_power_cents,
+                fetched_at: now,
+            },
+            OffchainCashWithdrawable {
+                cash_withdrawable_cents,
+            } => InventorySnapshotEvent::OffchainCashWithdrawable {
+                cash_withdrawable_cents,
                 fetched_at: now,
             },
             EthereumUsdc { usdc_balance } => InventorySnapshotEvent::EthereumUsdc {
@@ -270,6 +282,17 @@ impl EventSourced for InventorySnapshot {
                 }
                 Ok(vec![InventorySnapshotEvent::OffchainCashBuyingPower {
                     cash_buying_power_cents,
+                    fetched_at: now,
+                }])
+            }
+            OffchainCashWithdrawable {
+                cash_withdrawable_cents,
+            } => {
+                if self.offchain_cash_withdrawable_cents == cash_withdrawable_cents {
+                    return Ok(vec![]);
+                }
+                Ok(vec![InventorySnapshotEvent::OffchainCashWithdrawable {
+                    cash_withdrawable_cents,
                     fetched_at: now,
                 }])
             }
@@ -378,6 +401,13 @@ impl InventorySnapshot {
             });
         }
 
+        if self.offchain_cash_withdrawable_cents.is_some() {
+            events.push(InventorySnapshotEvent::OffchainCashWithdrawable {
+                cash_withdrawable_cents: self.offchain_cash_withdrawable_cents,
+                fetched_at,
+            });
+        }
+
         if let Some(usdc_balance) = self.ethereum_usdc {
             events.push(InventorySnapshotEvent::EthereumUsdc {
                 usdc_balance,
@@ -476,6 +506,12 @@ impl InventorySnapshot {
             } => {
                 self.offchain_cash_buying_power_cents = *cash_buying_power_cents;
             }
+            InventorySnapshotEvent::OffchainCashWithdrawable {
+                cash_withdrawable_cents,
+                ..
+            } => {
+                self.offchain_cash_withdrawable_cents = *cash_withdrawable_cents;
+            }
             InventorySnapshotEvent::EthereumUsdc { usdc_balance, .. } => {
                 self.ethereum_usdc = Some(*usdc_balance);
             }
@@ -517,6 +553,9 @@ pub(crate) enum InventorySnapshotCommand {
     },
     OffchainCashBuyingPower {
         cash_buying_power_cents: Option<i64>,
+    },
+    OffchainCashWithdrawable {
+        cash_withdrawable_cents: Option<i64>,
     },
     EthereumUsdc {
         usdc_balance: Usdc,
@@ -567,6 +606,10 @@ pub(crate) enum InventorySnapshotEvent {
         cash_buying_power_cents: Option<i64>,
         fetched_at: DateTime<Utc>,
     },
+    OffchainCashWithdrawable {
+        cash_withdrawable_cents: Option<i64>,
+        fetched_at: DateTime<Utc>,
+    },
     #[serde(alias = "EthereumCash")]
     EthereumUsdc {
         usdc_balance: Usdc,
@@ -602,6 +645,7 @@ impl InventorySnapshotEvent {
             | Self::OffchainEquity { fetched_at, .. }
             | Self::OffchainUsd { fetched_at, .. }
             | Self::OffchainCashBuyingPower { fetched_at, .. }
+            | Self::OffchainCashWithdrawable { fetched_at, .. }
             | Self::EthereumUsdc { fetched_at, .. }
             | Self::BaseWalletUsdc { fetched_at, .. }
             | Self::BaseWalletUnwrappedEquity { fetched_at, .. }
@@ -620,6 +664,9 @@ impl DomainEvent for InventorySnapshotEvent {
             Self::OffchainUsd { .. } => "InventorySnapshotEvent::OffchainUsd".to_string(),
             Self::OffchainCashBuyingPower { .. } => {
                 "InventorySnapshotEvent::OffchainCashBuyingPower".to_string()
+            }
+            Self::OffchainCashWithdrawable { .. } => {
+                "InventorySnapshotEvent::OffchainCashWithdrawable".to_string()
             }
             Self::EthereumUsdc { .. } => "InventorySnapshotEvent::EthereumUsdc".to_string(),
             Self::BaseWalletUsdc { .. } => "InventorySnapshotEvent::BaseWalletUsdc".to_string(),
@@ -1598,6 +1645,7 @@ mod tests {
             offchain_usd_fetched_at: None,
             offchain_gross_usd_cents: None,
             offchain_cash_buying_power_cents: None,
+            offchain_cash_withdrawable_cents: None,
             ethereum_usdc: None,
             base_wallet_usdc: None,
             base_wallet_unwrapped_equity: BTreeMap::new(),
@@ -1629,6 +1677,7 @@ mod tests {
             offchain_usd_fetched_at: Some(now),
             offchain_gross_usd_cents: Some(50_00),
             offchain_cash_buying_power_cents: Some(10_000),
+            offchain_cash_withdrawable_cents: Some(38_00),
             ethereum_usdc: None,
             base_wallet_usdc: None,
             base_wallet_unwrapped_equity: BTreeMap::new(),

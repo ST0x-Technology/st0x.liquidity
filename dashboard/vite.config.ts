@@ -2,6 +2,10 @@ import tailwindcss from '@tailwindcss/vite'
 import { sveltekit } from '@sveltejs/kit/vite'
 import { defineConfig } from 'vite'
 
+declare const process: {
+  env: Record<string, string | undefined>
+}
+
 const backendPort = process.env['BACKEND_PORT'] ?? '8001'
 const backendUrl = `http://localhost:${backendPort}`
 
