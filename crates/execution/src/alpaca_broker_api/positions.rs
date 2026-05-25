@@ -628,7 +628,7 @@ mod tests {
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let error = fetch_inventory(&client).await.unwrap_err();
 
-        assert!(matches!(error, AlpacaBrokerApiError::HttpClient(_)));
+        assert!(matches!(error, AlpacaBrokerApiError::JsonParse(_)));
     }
 
     #[tokio::test]

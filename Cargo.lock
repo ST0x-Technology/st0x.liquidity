@@ -726,22 +726,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "alloy-signer-turnkey"
-version = "1.0.41"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee3528e3fc1294e1706e44e44c855956681b26861758216ad63eb81221223b18"
-dependencies = [
- "alloy-consensus",
- "alloy-network",
- "alloy-primitives",
- "alloy-signer",
- "async-trait",
- "thiserror 2.0.18",
- "tracing",
- "turnkey_client",
-]
-
-[[package]]
 name = "alloy-sol-macro"
 version = "1.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6842,19 +6826,23 @@ name = "st0x-evm"
 version = "0.1.0"
 dependencies = [
  "alloy",
- "alloy-signer-turnkey",
  "anyhow",
  "async-trait",
  "dashmap",
  "futures",
  "httpmock",
+ "mime",
  "rain-error-decoding",
  "rand 0.8.6",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-test",
+ "turnkey_api_key_stamper",
+ "turnkey_client",
  "url",
 ]
 
@@ -6894,6 +6882,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-test",
  "url",
  "urlencoding",
  "uuid",

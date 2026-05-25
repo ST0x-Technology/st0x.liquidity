@@ -50,6 +50,7 @@ httpmock.workspace = true
 proptest.workspace = true
 serde_json.workspace = true
 serial_test.workspace = true
+tracing-test.workspace = true
 
 [lints]
 workspace = true

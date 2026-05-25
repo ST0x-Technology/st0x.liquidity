@@ -35,10 +35,9 @@ impl AlpacaWalletClient {
             network.as_ref()
         );
 
-        let response = self.get(&path).await?;
-        let text = response.text().await?;
+        let body = self.get(&path).await?;
 
-        Ok(serde_json::from_str::<WalletAddressResponse>(&text)?.address)
+        Ok(serde_json::from_str::<WalletAddressResponse>(&body)?.address)
     }
 }
 

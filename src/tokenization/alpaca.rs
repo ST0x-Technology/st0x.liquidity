@@ -403,6 +403,9 @@ pub(crate) enum AlpacaTokenizationError {
     #[error("Failed to parse API response: {0}")]
     JsonParse(#[from] serde_json::Error),
 
+    #[error("response body was not valid UTF-8: {0}")]
+    Utf8(#[from] std::string::FromUtf8Error),
+
     #[error("API error (status {status}): {message}")]
     ApiError { status: StatusCode, message: String },
 
@@ -528,12 +531,22 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         let status = response.status();
 
         if status.is_success() {
-            let body = response.text().await?;
-            let tokenization_request: TokenizationRequest = serde_json::from_str(&body)
+            // Read raw bytes and parse with `from_slice` so invalid UTF-8 fails
+            // fast (matching the other Alpaca clients) instead of being lossily
+            // replaced. Lossy decoding is used only for the trace line.
+            let bytes = response.bytes().await?;
+            trace!(
+                target: "tokenization",
+                status = %status,
+                body = %String::from_utf8_lossy(&bytes),
+                "Alpaca tokenization mint response body received"
+            );
+
+            let tokenization_request: TokenizationRequest = serde_json::from_slice(&bytes)
                 .inspect_err(|error| {
                     error!(
                         target: "tokenization",
-                        body_len = body.len(),
+                        body_len = bytes.len(),
                         error = %error,
                         symbol = %request.underlying_symbol,
                         issuer_request_id = %request.issuer_request_id.0,
@@ -545,7 +558,13 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
             return Ok(tokenization_request);
         }
 
-        let message = response.text().await?;
+        let message = String::from_utf8_lossy(&response.bytes().await?).into_owned();
+        trace!(
+            target: "tokenization",
+            status = %status,
+            body = %message,
+            "Alpaca tokenization mint error response body received"
+        );
         warn!(target: "tokenization", status = %status, message = %message, "Tokenization request failed");
         Err(map_mint_error(status, message, request.underlying_symbol))
     }
@@ -561,11 +580,6 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         params: ListRequestsParams,
     ) -> Result<Vec<TokenizationRequest>, AlpacaTokenizationError> {
         let body = self.fetch_requests_body(&params).await?;
-        trace!(
-            target: "tokenization",
-            body_len = body.len(),
-            "List requests response body received"
-        );
 
         let requests = parse_request_list(&body).inspect_err(|error| {
             error!(
@@ -815,15 +829,27 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         let response = request.send().await?;
 
         let status = response.status();
-        let body = response.text().await?;
+        // Read raw bytes; convert the success body with strict `String::from_utf8`
+        // so invalid UTF-8 fails fast for the caller's parse. Lossy decoding is
+        // used only for the trace line and the error-body message.
+        let bytes = response.bytes().await?;
+        trace!(
+            target: "tokenization",
+            status = %status,
+            request_type = ?params.request_type,
+            request_status = ?params.status,
+            underlying_symbol = ?params.underlying_symbol,
+            body = %String::from_utf8_lossy(&bytes),
+            "Alpaca tokenization requests response body received"
+        );
 
         if status.is_success() {
-            return Ok(body);
+            return Ok(String::from_utf8(bytes.into())?);
         }
 
         Err(AlpacaTokenizationError::ApiError {
             status,
-            message: body,
+            message: String::from_utf8_lossy(&bytes).into_owned(),
         })
     }
 }
@@ -1063,6 +1089,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[tracing_test::traced_test]
     #[tokio::test]
     async fn test_request_mint_success() {
         let server = MockServer::start();
@@ -1115,10 +1142,16 @@ pub(crate) mod tests {
             result.issuer_request_id,
             Some(IssuerRequestId("iss_req_456".to_string()))
         );
+        assert!(logs_contain(
+            "Alpaca tokenization mint response body received"
+        ));
+        assert!(logs_contain("tok_req_123"));
+        assert!(logs_contain("pending"));
 
         mint_mock.assert();
     }
 
+    #[tracing_test::traced_test]
     #[tokio::test]
     async fn test_request_mint_insufficient_position() {
         let server = MockServer::start();
@@ -1131,7 +1164,8 @@ pub(crate) mod tests {
                 .header("content-type", "application/json")
                 .json_body(json!({
                     "code": 40_310_000,
-                    "message": "insufficient position for AAPL"
+                    "message": "insufficient position for AAPL",
+                    "tokenization_marker": "mint-error-body"
                 }));
         });
 
@@ -1142,6 +1176,11 @@ pub(crate) mod tests {
             matches!(&err, AlpacaTokenizationError::InsufficientPosition { symbol } if symbol.to_string() == "AAPL"),
             "expected InsufficientPosition for AAPL, got: {err:?}"
         );
+        assert!(logs_contain(
+            "Alpaca tokenization mint error response body received"
+        ));
+        assert!(logs_contain("tokenization_marker"));
+        assert!(logs_contain("mint-error-body"));
 
         mint_mock.assert();
     }
@@ -1238,6 +1277,32 @@ pub(crate) mod tests {
         assert_eq!(result[1].r#type, Some(TokenizationRequestType::Redeem));
 
         list_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn fetch_requests_body_returns_utf8_error_for_non_utf8_success_body() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+
+        // A successful (2xx) response whose body is not valid UTF-8 must fail
+        // fast via the dedicated `Utf8` path, not be conflated with JSON parse
+        // failures or silently lossy-decoded.
+        let body_mock = server.mock(|when, then| {
+            when.method(GET).path(tokenization_requests_path());
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(b"\xFF\xFE not valid utf-8");
+        });
+
+        let error = client
+            .fetch_requests_body(&ListRequestsParams::default())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, AlpacaTokenizationError::Utf8(_)));
+
+        body_mock.assert();
     }
 
     #[tokio::test]
@@ -1730,6 +1795,7 @@ pub(crate) mod tests {
         list_mock.assert();
     }
 
+    #[tracing_test::traced_test]
     #[tokio::test]
     async fn test_poll_until_terminal_rejected() {
         let server = MockServer::start();
@@ -1755,6 +1821,11 @@ pub(crate) mod tests {
         let result = client.poll_until_terminal(&id, &config).await.unwrap();
 
         assert_eq!(result.status, TokenizationRequestStatus::Rejected);
+        assert!(logs_contain(
+            "Alpaca tokenization requests response body received"
+        ));
+        assert!(logs_contain("req_1"));
+        assert!(logs_contain("rejected"));
         list_mock.assert();
     }
 

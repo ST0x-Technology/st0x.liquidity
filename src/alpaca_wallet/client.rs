@@ -1,9 +1,11 @@
 //! Authenticated HTTP transport for Alpaca Broker API wallet modules.
 
+use std::borrow::Cow;
+
 use alloy::primitives::{Address, TxHash, hex::FromHexError};
-use reqwest::{Client, Response, StatusCode};
+use reqwest::{Client, Method, Response, StatusCode};
 use thiserror::Error;
-use tracing::trace;
+use tracing::{trace, warn};
 
 use st0x_execution::AlpacaAccountId;
 
@@ -18,6 +20,8 @@ pub enum AlpacaWalletError {
     ApiError { status: StatusCode, message: String },
     #[error("Failed to parse response")]
     ParseError(#[from] serde_json::Error),
+    #[error("response body was not valid UTF-8: {0}")]
+    Utf8(#[from] std::string::FromUtf8Error),
     #[error(transparent)]
     FromHex(#[from] FromHexError),
     #[error("Transfer not found: {transfer_id}")]
@@ -81,7 +85,7 @@ impl AlpacaWalletClient {
         }
     }
 
-    pub(super) async fn get(&self, path: &str) -> Result<Response, AlpacaWalletError> {
+    pub(super) async fn get(&self, path: &str) -> Result<String, AlpacaWalletError> {
         let url = format!("{}{}", self.base_url, path);
         trace!(target: "wallet", "GET {url}");
 
@@ -94,24 +98,14 @@ impl AlpacaWalletClient {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let message = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-
-            return Err(AlpacaWalletError::ApiError { status, message });
-        }
-
-        Ok(response)
+        read_response_body(Method::GET, response).await
     }
 
     pub(super) async fn post<T: serde::Serialize + Sync>(
         &self,
         path: &str,
         body: &T,
-    ) -> Result<Response, AlpacaWalletError> {
+    ) -> Result<String, AlpacaWalletError> {
         let url = format!("{}{}", self.base_url, path);
         trace!(target: "wallet", "POST {url}");
 
@@ -126,20 +120,10 @@ impl AlpacaWalletClient {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let message = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-
-            return Err(AlpacaWalletError::ApiError { status, message });
-        }
-
-        Ok(response)
+        read_response_body(Method::POST, response).await
     }
 
-    pub(super) async fn delete(&self, path: &str) -> Result<Response, AlpacaWalletError> {
+    pub(super) async fn delete(&self, path: &str) -> Result<String, AlpacaWalletError> {
         let url = format!("{}{}", self.base_url, path);
         trace!(target: "wallet", "DELETE {url}");
 
@@ -152,24 +136,14 @@ impl AlpacaWalletClient {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let message = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-
-            return Err(AlpacaWalletError::ApiError { status, message });
-        }
-
-        Ok(response)
+        read_response_body(Method::DELETE, response).await
     }
 
     pub(super) async fn patch<T: serde::Serialize + Sync>(
         &self,
         path: &str,
         body: &T,
-    ) -> Result<Response, AlpacaWalletError> {
+    ) -> Result<String, AlpacaWalletError> {
         let url = format!("{}{}", self.base_url, path);
         trace!(target: "wallet", "PATCH {url}");
 
@@ -183,17 +157,7 @@ impl AlpacaWalletClient {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let message = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-
-            return Err(AlpacaWalletError::ApiError { status, message });
-        }
-
-        Ok(response)
+        read_response_body(Method::PATCH, response).await
     }
 
     pub(super) fn account_id(&self) -> &AlpacaAccountId {
@@ -205,8 +169,8 @@ impl AlpacaWalletClient {
     ) -> Result<Vec<WhitelistEntry>, AlpacaWalletError> {
         let path = format!("/v1/accounts/{}/wallets/whitelists", self.account_id);
 
-        let response = self.get(&path).await?;
-        let entries: Vec<WhitelistEntry> = response.json().await?;
+        let body = self.get(&path).await?;
+        let entries: Vec<WhitelistEntry> = serde_json::from_str(&body)?;
 
         Ok(entries)
     }
@@ -259,16 +223,9 @@ impl AlpacaWalletClient {
             travel_rule_info,
         };
 
-        let response = self.post(&path, &request).await?;
-        let text = response.text().await?;
+        let body = self.post(&path, &request).await?;
 
-        trace!(
-            target: "wallet",
-            response_bytes = text.len(),
-            "Whitelist creation response received"
-        );
-
-        Ok(serde_json::from_str::<WhitelistEntry>(&text)?)
+        Ok(serde_json::from_str::<WhitelistEntry>(&body)?)
     }
 
     pub(super) async fn delete_whitelist_entry(
@@ -307,6 +264,114 @@ impl AlpacaWalletClient {
 
         self.patch(&path, &Request { travel_rule_info }).await?;
         Ok(())
+    }
+}
+
+async fn read_response_body(
+    method: Method,
+    response: Response,
+) -> Result<String, AlpacaWalletError> {
+    let status = response.status();
+    let url = response.url().clone();
+    // Read raw bytes and convert the success body with `String::from_utf8` so
+    // invalid UTF-8 fails fast (matching the prior `response.json()` at the call
+    // sites) instead of being silently replaced by `response.text()`'s lossy
+    // decoding. Lossy decoding is used only for the trace line and error body.
+    let bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        // Preserve the HTTP status on a non-success response even if the body
+        // stream fails to read, so the poll retry predicate (which only retries
+        // `ApiError { status }` with `status.is_server_error()`) still fires on
+        // a transient 5xx. Mirrors the pre-refactor `.text().unwrap_or_else(..)`.
+        Err(_) if !status.is_success() => {
+            return Err(AlpacaWalletError::ApiError {
+                status,
+                message: "Unknown error".to_string(),
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    trace!(
+        target: "wallet",
+        %method,
+        status = %status,
+        url = %url,
+        body = %redact_beneficiary_for_logging(&String::from_utf8_lossy(&bytes)),
+        "Alpaca wallet API response body received"
+    );
+
+    if !status.is_success() {
+        // Redact the stored body too: `ApiError.message` is surfaced via
+        // Display/Debug and propagated to other log sites, so it must honour the
+        // same beneficiary-redaction boundary as the trace line above.
+        return Err(AlpacaWalletError::ApiError {
+            status,
+            message: redact_beneficiary_for_logging(&String::from_utf8_lossy(&bytes)).into_owned(),
+        });
+    }
+
+    // `bytes` is no longer borrowed here, so consume it without copying.
+    Ok(String::from_utf8(bytes.into())?)
+}
+
+/// Redacts `beneficiary_entity_name` values from a JSON response body for
+/// logging, mirroring the redaction `TravelRuleConfig`'s `Debug` impl applies.
+/// Whitelist responses echo back the Travel Rule beneficiary identity, which
+/// the project deliberately keeps out of logs. The full body is still returned
+/// to callers; only the logged representation is scrubbed.
+fn redact_beneficiary_for_logging(body: &str) -> Cow<'_, str> {
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(mut value) => {
+            redact_beneficiary_in_place(&mut value);
+            match serde_json::to_string(&value) {
+                Ok(redacted) => Cow::Owned(redacted),
+                // Fail closed: never fall back to the raw (unredacted) body, or
+                // a re-serialization failure would leak the beneficiary name.
+                Err(error) => {
+                    warn!(
+                        ?error,
+                        "failed to re-serialize redacted wallet body; omitting body from log"
+                    );
+                    Cow::Owned(format!("<redaction failed, body {} bytes>", body.len()))
+                }
+            }
+        }
+        // Non-JSON bodies (e.g. plain-text gateway errors) carry no structured
+        // travel-rule data, so they are normally safe to log verbatim. Fail
+        // closed if such a body nonetheless references the sensitive field by
+        // name (e.g. a proxy echoing the request), rather than leaking it.
+        Err(_) if body.contains("beneficiary_entity_name") => {
+            warn!("non-JSON wallet body references beneficiary identity; omitting body from log");
+            Cow::Owned(format!(
+                "<redaction failed, non-JSON body {} bytes>",
+                body.len()
+            ))
+        }
+        Err(_) => Cow::Borrowed(body),
+    }
+}
+
+fn redact_beneficiary_in_place(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if key == "beneficiary_entity_name" {
+                    *child = serde_json::Value::String("<redacted>".to_string());
+                } else {
+                    redact_beneficiary_in_place(child);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                redact_beneficiary_in_place(item);
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
     }
 }
 
@@ -365,7 +430,7 @@ mod tests {
 
         let response = client.get("/v1/test").await.unwrap();
 
-        assert!(response.status().is_success());
+        assert_eq!(response, r#"{"success":true}"#);
         test_mock.assert();
     }
 
@@ -444,8 +509,243 @@ mod tests {
         let body = json!({"amount": "10.5", "asset": "USDC"});
         let response = client.post("/v1/test", &body).await.unwrap();
 
-        assert!(response.status().is_success());
+        assert_eq!(response, r#"{"success":true}"#);
         test_mock.assert();
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn get_logs_success_response_body_at_trace_level() {
+        let server = MockServer::start();
+
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/test");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({"wallet_marker": "success-body"}));
+        });
+
+        let client = AlpacaWalletClient::new(
+            server.base_url(),
+            TEST_ACCOUNT_ID,
+            "test_key_id".to_string(),
+            "test_secret_key".to_string(),
+        );
+
+        client.get("/v1/test").await.unwrap();
+
+        assert!(logs_contain("Alpaca wallet API response body received"));
+        assert!(logs_contain("wallet_marker"));
+        assert!(logs_contain("success-body"));
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn get_logs_error_response_body_at_trace_level() {
+        let server = MockServer::start();
+
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/error");
+            then.status(400)
+                .header("content-type", "application/json")
+                .json_body(json!({"wallet_marker": "error-body"}));
+        });
+
+        let client = AlpacaWalletClient::new(
+            server.base_url(),
+            TEST_ACCOUNT_ID,
+            "test_key_id".to_string(),
+            "test_secret_key".to_string(),
+        );
+
+        let error = client.get("/v1/error").await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            AlpacaWalletError::ApiError { status, .. } if status == StatusCode::BAD_REQUEST
+        ));
+        assert!(logs_contain("Alpaca wallet API response body received"));
+        assert!(logs_contain("wallet_marker"));
+        assert!(logs_contain("error-body"));
+    }
+
+    #[test]
+    fn redact_for_logging_passes_through_non_json_bodies() {
+        // Gateway/plain-text error bodies (common during incidents) carry no
+        // structured travel-rule data and are returned verbatim, borrowed.
+        let body = "502 Bad Gateway";
+
+        let redacted = redact_beneficiary_for_logging(body);
+
+        assert!(matches!(redacted, Cow::Borrowed(_)));
+        assert_eq!(redacted, "502 Bad Gateway");
+    }
+
+    #[test]
+    fn redact_for_logging_scrubs_beneficiary_name_nested_in_arrays() {
+        let body = json!({
+            "entries": [
+                {
+                    "travel_rule_info": {
+                        "beneficiary_entity_name": "T0 TRADE (BVI) LTD",
+                        "beneficiary_is_self_hosted": true
+                    }
+                }
+            ]
+        })
+        .to_string();
+
+        let redacted = redact_beneficiary_for_logging(&body);
+
+        assert!(matches!(redacted, Cow::Owned(_)));
+        let parsed: serde_json::Value = serde_json::from_str(&redacted).unwrap();
+        // The key must be present with the redacted value (not deleted), the
+        // non-sensitive sibling preserved, and the original value gone.
+        assert_eq!(
+            parsed["entries"][0]["travel_rule_info"]["beneficiary_entity_name"],
+            "<redacted>"
+        );
+        assert_eq!(
+            parsed["entries"][0]["travel_rule_info"]["beneficiary_is_self_hosted"],
+            true
+        );
+        assert!(!redacted.contains("T0 TRADE (BVI) LTD"));
+    }
+
+    #[test]
+    fn redact_for_logging_fails_closed_on_non_json_body_referencing_beneficiary() {
+        // A non-JSON body that echoes the sensitive field (e.g. a proxy
+        // reflecting the request) must not be logged verbatim.
+        let body = "error: beneficiary_entity_name 'T0 TRADE (BVI) LTD' rejected";
+
+        let redacted = redact_beneficiary_for_logging(body);
+
+        assert!(matches!(redacted, Cow::Owned(_)));
+        assert!(!redacted.contains("T0 TRADE (BVI) LTD"));
+    }
+
+    #[test]
+    fn redact_for_logging_leaves_json_without_beneficiary_field_unchanged() {
+        let body = json!({ "id": "wl-1", "status": "approved" }).to_string();
+
+        let redacted = redact_beneficiary_for_logging(&body);
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&redacted).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn trace_log_redacts_beneficiary_entity_name_but_caller_keeps_full_body() {
+        let server = MockServer::start();
+
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/whitelists");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([{
+                    "id": "wl-1",
+                    "travel_rule_info": {
+                        "beneficiary_is_self_hosted": true,
+                        "beneficiary_entity_name": "T0 TRADE (BVI) LTD"
+                    }
+                }]));
+        });
+
+        let client = AlpacaWalletClient::new(
+            server.base_url(),
+            TEST_ACCOUNT_ID,
+            "test_key_id".to_string(),
+            "test_secret_key".to_string(),
+        );
+
+        let body = client.get("/v1/whitelists").await.unwrap();
+
+        // The caller still receives the full, unredacted body for parsing.
+        assert!(body.contains("T0 TRADE (BVI) LTD"));
+
+        // The trace log must scrub the beneficiary identity while keeping the
+        // non-sensitive travel-rule fields for debugging.
+        assert!(logs_contain("Alpaca wallet API response body received"));
+        assert!(logs_contain("<redacted>"));
+        assert!(logs_contain("beneficiary_is_self_hosted"));
+        assert!(!logs_contain("T0 TRADE (BVI) LTD"));
+    }
+
+    #[tokio::test]
+    async fn api_error_message_redacts_beneficiary_entity_name() {
+        let server = MockServer::start();
+
+        // A non-2xx body echoing the Travel Rule beneficiary identity must have
+        // that identity scrubbed from `ApiError.message`, which is surfaced via
+        // Display/Debug and re-logged downstream.
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/whitelists");
+            then.status(400)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "message": "invalid travel rule info",
+                    "travel_rule_info": {
+                        "beneficiary_is_self_hosted": true,
+                        "beneficiary_entity_name": "T0 TRADE (BVI) LTD"
+                    }
+                }));
+        });
+
+        let client = AlpacaWalletClient::new(
+            server.base_url(),
+            TEST_ACCOUNT_ID,
+            "test_key_id".to_string(),
+            "test_secret_key".to_string(),
+        );
+
+        let AlpacaWalletError::ApiError { status, message } = client
+            .post("/v1/whitelists", &json!({"any": "body"}))
+            .await
+            .unwrap_err()
+        else {
+            panic!("expected AlpacaWalletError::ApiError");
+        };
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!message.contains("T0 TRADE (BVI) LTD"));
+        let parsed: serde_json::Value = serde_json::from_str(&message).unwrap();
+        assert_eq!(
+            parsed["travel_rule_info"]["beneficiary_entity_name"],
+            "<redacted>"
+        );
+        // Non-sensitive fields must survive redaction for debuggability.
+        assert_eq!(parsed["message"], "invalid travel rule info");
+        assert_eq!(
+            parsed["travel_rule_info"]["beneficiary_is_self_hosted"],
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn get_returns_utf8_error_for_non_utf8_success_body() {
+        let server = MockServer::start();
+
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/test");
+            then.status(200)
+                .header("content-type", "application/octet-stream")
+                .body(b"\xFF\xFE not valid utf-8");
+        });
+
+        let client = AlpacaWalletClient::new(
+            server.base_url(),
+            TEST_ACCOUNT_ID,
+            "test_key_id".to_string(),
+            "test_secret_key".to_string(),
+        );
+
+        assert!(matches!(
+            client.get("/v1/test").await.unwrap_err(),
+            AlpacaWalletError::Utf8(_)
+        ));
     }
 
     #[tokio::test]

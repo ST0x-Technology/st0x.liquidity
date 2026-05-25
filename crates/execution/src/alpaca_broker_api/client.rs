@@ -2,9 +2,10 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use reqwest::Method;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use tracing::{debug, info, trace};
 use uuid::Uuid;
 
 use super::AlpacaBrokerApiError;
@@ -234,7 +235,7 @@ impl AlpacaBrokerApiClient {
     ) -> Result<T, AlpacaBrokerApiError> {
         let response = self.http_client.get(url).send().await?;
 
-        self.handle_response(response).await
+        self.handle_response(Method::GET, response).await
     }
 
     /// Perform a POST request with JSON body
@@ -245,24 +246,38 @@ impl AlpacaBrokerApiClient {
     ) -> Result<T, AlpacaBrokerApiError> {
         let response = self.http_client.post(url).json(body).send().await?;
 
-        self.handle_response(response).await
+        self.handle_response(Method::POST, response).await
     }
 
     async fn handle_response<T: serde::de::DeserializeOwned + Send>(
         &self,
+        method: Method,
         response: reqwest::Response,
     ) -> Result<T, AlpacaBrokerApiError> {
         let status = response.status();
+        let url = response.url().clone();
+        // Read raw bytes and parse successful responses with `from_slice` so
+        // invalid UTF-8 fails fast (matching the prior `response.json()`),
+        // rather than being silently replaced by `response.text()`'s lossy
+        // decoding before parse. Lossy decoding is fine for the log line only.
+        let bytes = response.bytes().await?;
+
+        trace!(
+            target: "broker",
+            %method,
+            status = %status,
+            url = %url,
+            body = %String::from_utf8_lossy(&bytes),
+            "Alpaca Broker API response body received"
+        );
 
         if status.is_success() {
-            return Ok(response.json().await?);
+            return Ok(serde_json::from_slice(&bytes)?);
         }
 
-        let error_body = response.text().await.unwrap_or_default();
-
-        let (alpaca_code, message) = match serde_json::from_str::<AlpacaApiErrorBody>(&error_body) {
+        let (alpaca_code, message) = match serde_json::from_slice::<AlpacaApiErrorBody>(&bytes) {
             Ok(parsed) => (parsed.code, parsed.message),
-            Err(_) => (None, error_body),
+            Err(_) => (None, String::from_utf8_lossy(&bytes).into_owned()),
         };
 
         Err(AlpacaBrokerApiError::ApiError {
@@ -382,6 +397,34 @@ mod tests {
         assert_eq!(account.status, super::super::auth::AccountStatus::Active);
     }
 
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn verify_account_logs_success_response_body_at_trace_level() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "status": "ACTIVE",
+                    "currency": "USD",
+                    "buying_power": "100000.00",
+                    "broker_marker": "success-body"
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        client.verify_account().await.unwrap();
+
+        assert!(logs_contain("Alpaca Broker API response body received"));
+        assert!(logs_contain("broker_marker"));
+        assert!(logs_contain("success-body"));
+    }
+
     #[tokio::test]
     async fn test_verify_account_unauthorized() {
         let server = MockServer::start();
@@ -405,6 +448,35 @@ mod tests {
         assert!(
             matches!(err, AlpacaBrokerApiError::ApiError { status, .. } if status.as_u16() == 401)
         );
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn verify_account_logs_api_error_response_body_at_trace_level() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(401)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "code": 40_110_000,
+                    "message": "Invalid credentials",
+                    "broker_marker": "error-body"
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let error = client.verify_account().await.unwrap_err();
+
+        assert!(
+            matches!(error, AlpacaBrokerApiError::ApiError { status, .. } if status.as_u16() == 401)
+        );
+        assert!(logs_contain("Alpaca Broker API response body received"));
+        assert!(logs_contain("broker_marker"));
+        assert!(logs_contain("error-body"));
     }
 
     #[tokio::test]

@@ -189,9 +189,8 @@ pub(super) async fn initiate_withdrawal(
 
     let path = format!("/v1/accounts/{}/wallets/transfers", client.account_id());
 
-    let response = client.post(&path, &request).await?;
-
-    let transfer: Transfer = response.json().await?;
+    let body = client.post(&path, &request).await?;
+    let transfer: Transfer = serde_json::from_str(&body)?;
 
     Ok(transfer)
 }
@@ -204,9 +203,8 @@ pub(super) async fn get_transfer_status(
     // The API's transfer_id query param appears to be unreliable.
     let path = format!("/v1/accounts/{}/wallets/transfers", client.account_id());
 
-    let response = client.get(&path).await?;
-
-    let transfers: Vec<Transfer> = response.json().await?;
+    let body = client.get(&path).await?;
+    let transfers: Vec<Transfer> = serde_json::from_str(&body)?;
 
     transfers
         .into_iter()
@@ -222,9 +220,9 @@ pub(super) async fn list_all_transfers(
 ) -> Result<Vec<Transfer>, AlpacaWalletError> {
     let path = format!("/v1/accounts/{}/wallets/transfers", client.account_id());
 
-    let response = client.get(&path).await?;
+    let body = client.get(&path).await?;
 
-    Ok(response.json().await?)
+    Ok(serde_json::from_str(&body)?)
 }
 
 /// Finds a transfer by its transaction hash.
@@ -237,9 +235,8 @@ pub(super) async fn find_transfer_by_tx_hash(
 ) -> Result<Option<Transfer>, AlpacaWalletError> {
     let path = format!("/v1/accounts/{}/wallets/transfers", client.account_id());
 
-    let response = client.get(&path).await?;
-
-    let transfers: Vec<Transfer> = response.json().await?;
+    let body = client.get(&path).await?;
+    let transfers: Vec<Transfer> = serde_json::from_str(&body)?;
 
     Ok(transfers
         .into_iter()
@@ -743,7 +740,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(error, AlpacaWalletError::Reqwest(_)));
+        assert!(matches!(error, AlpacaWalletError::ParseError(_)));
 
         status_mock.assert();
     }

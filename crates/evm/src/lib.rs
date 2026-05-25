@@ -201,13 +201,6 @@ impl From<std::convert::Infallible> for EvmError {
     }
 }
 
-#[cfg(feature = "turnkey")]
-impl From<alloy_signer_turnkey::TurnkeySignerError> for EvmError {
-    fn from(error: alloy_signer_turnkey::TurnkeySignerError) -> Self {
-        Self::Turnkey(turnkey::TurnkeyError::from(error))
-    }
-}
-
 /// Read-only EVM chain access with error-decoded view calls.
 ///
 /// Provides the underlying provider for direct chain queries (balance

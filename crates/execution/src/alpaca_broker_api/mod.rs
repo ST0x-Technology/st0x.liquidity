@@ -109,6 +109,9 @@ pub enum AlpacaBrokerApiError {
     #[error("HTTP client error: {0}")]
     HttpClient(#[from] reqwest::Error),
 
+    #[error("Failed to parse Alpaca API response: {0}")]
+    JsonParse(#[from] serde_json::Error),
+
     #[error("Invalid header value: {0}")]
     InvalidHeader(#[from] reqwest::header::InvalidHeaderValue),
 
