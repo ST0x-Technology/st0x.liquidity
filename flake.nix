@@ -50,14 +50,13 @@
   };
 
   outputs =
-    {
+    inputs@{
       self,
       flake-utils,
       rainix,
       rain-math-float,
       rain-orderbook,
       forge-std,
-      bun2nix,
       ragenix,
       deploy-rs,
       disko,
@@ -67,16 +66,19 @@
     }:
     let
       inherit (import ./keys.nix) keys;
+      inherit (rainix.inputs.nixpkgs) lib;
       environments = {
         prod = {
           nodeName = "st0x-liquidity";
           volumeName = "st0x-liquidity-data";
           hostKey = keys.host-prod;
+          tailscaleMagicDnsName = "st0x-liquidity-nixos.taile5cf8a.ts.net";
         };
         staging = {
           nodeName = "st0x-liquidity-staging";
           volumeName = "st0x-liquidity-staging-data";
           hostKey = keys.host-staging;
+          tailscaleMagicDnsName = "st0x-liquidity-staging.taile5cf8a.ts.net";
         };
       };
       envNames = builtins.attrNames environments;
@@ -86,11 +88,11 @@
         let
           mkNixos =
             { environment, modules }:
-            rainix.inputs.nixpkgs.lib.nixosSystem {
+            lib.nixosSystem {
               system = "x86_64-linux";
               specialArgs = {
                 inherit environment;
-                inherit (environments.${environment}) volumeName;
+                inherit (environments.${environment}) volumeName tailscaleMagicDnsName;
                 inherit (self.packages.x86_64-linux) st0x-cli;
               };
               modules = [ disko.nixosModules.disko ] ++ modules;
@@ -127,7 +129,15 @@
           ]) envNames
         );
 
-      deploy = (import ./deploy.nix { inherit deploy-rs self environments; }).config;
+      deploy =
+        (import ./deploy.nix {
+          inherit
+            lib
+            deploy-rs
+            self
+            environments
+            ;
+        }).config;
     }
     // flake-utils.lib.eachDefaultSystem (
       system:
@@ -137,14 +147,20 @@
           config.allowUnfreePredicate = pkg: builtins.elem (pkgs.lib.getName pkg) [ "terraform" ];
         };
 
-        craneLib = (crane.mkLib pkgs).overrideToolchain rainix.rust-toolchain.${system};
+        rustToolchain = rainix.rust-toolchain.${system};
+        rustShell = rainix.devShells.${system}.rust-shell;
+        foundryBin = rainix.pkgs.${system}.foundry-bin;
+        bun2nix = inputs.bun2nix.packages.${system}.default;
+        ragenixPkg = ragenix.packages.${system}.default;
+        nixosAnywherePkg = nixos-anywhere.packages.${system}.default;
+
+        craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
         rainixPkgs = rainix.packages.${system};
         infraPkgs = import ./infra {
           inherit
             pkgs
             ragenix
-            rainix
             system
             ;
           environments = envNames;
@@ -153,7 +169,12 @@
 
         deployScripts =
           (import ./deploy.nix {
-            inherit deploy-rs self environments;
+            inherit
+              lib
+              deploy-rs
+              self
+              environments
+              ;
           }).mkDeployScripts
             {
               inherit pkgs infraPkgs;
@@ -180,7 +201,7 @@
         inherit
           (import ./nix/mk-abi.nix {
             inherit pkgs;
-            foundry = rainix.pkgs.${system}.foundry-bin;
+            foundry = foundryBin;
             solc = rainix.pkgs.${system}.solc_0_8_25;
           })
           mkAbi
@@ -198,308 +219,302 @@
           abiEnv
           ;
 
-        st0xRust = pkgs.callPackage ./rust.nix {
+        rust = pkgs.callPackage ./rust.nix {
           inherit craneLib rainMathFloatSrc abiEnv;
         };
-
       in
+
       rec {
         packages =
-          rainixPkgs
-          // infraPkgs.packages
-          // deployScripts
-          // abis
-          // {
-            st0x-dto = st0xRust.dto;
-            st0x-liquidity = st0xRust.package;
-            st0x-cli = st0xRust.cli;
-            decode-floats = st0xRust.decodeFloats;
-            inherit (pkgs) datasette;
+          let
+            simulationRuntimeInputs = [
+              pkgs.mprocs
+              pkgs.bun
+              pkgs.cargo-nextest
+              pkgs.openssl
+              pkgs.sqlite
+              pkgs.pkg-config
+              rustToolchain
+            ];
 
-            st0x-dashboard = pkgs.callPackage ./dashboard {
-              bun2nix = bun2nix.packages.${system}.default;
-              st0x-dto = st0xRust.dto;
-            };
+            others = {
+              inherit (rust)
+                st0x-dto
+                st0x-liquidity
+                st0x-cli
+                decodeFloats
+                ;
+              inherit (pkgs) datasette;
 
-            ci = pkgs.writeShellApplication {
-              name = "ci";
-              text = ''
-                set -euxo pipefail
+              st0x-dashboard = pkgs.callPackage ./dashboard {
+                inherit bun2nix;
+                inherit (rust) st0x-dto;
+              };
 
-                # Backend: cargo check, test, clippy, fmt
-                nix develop .#ci-backend -c bash -c '
+              ci = pkgs.writeShellApplication {
+                name = "ci";
+                text = ''
                   set -euxo pipefail
-                  cargo check --workspace
-                  cargo check --workspace --all-features
-                  cargo nextest run --workspace --all-features
-                  cargo clippy --workspace --all-targets --all-features
-                  cargo fmt -- --check
-                '
 
-                # Dashboard: bun.nix freshness, DTO generation, lint, svelte-check
-                nix run .#genBunNix
-                nix fmt -- dashboard/bun.nix
-                nix run .#st0x-dto -- dashboard/src/lib/api
-                nix develop .#ci-dashboard -c bash -c '
-                  set -euxo pipefail
-                  cd dashboard
-                  bun install --frozen-lockfile
-                  bun run lint
-                  bun run check
-                '
-              '';
-            };
+                  # Backend: cargo check, test, clippy, fmt
+                  nix develop .#ci-backend -c bash -c '
+                    set -euxo pipefail
+                    cargo check --workspace
+                    cargo check --workspace --all-features
+                    cargo nextest run --workspace --all-features
+                    cargo clippy --workspace --all-targets --all-features
+                    cargo fmt -- --check
+                  '
 
-            # Mock infra + bot + dashboard + continuous user trades.
-            #
-            # Run with `nix run .#simulate`, press `q` to exit. Picks the
-            # lowest port offset whose bot/vite/mock-api ports are all
-            # free, so multiple instances can run side-by-side without
-            # collisions. The dashboard auto-opens in the browser on
-            # start.
-            simulate = pkgs.writeShellApplication {
-              name = "simulate";
-              runtimeInputs = [
-                pkgs.mprocs
-                pkgs.bun
-                pkgs.cargo-nextest
-                rainix.rust-toolchain.${system}
-              ];
-              text = ''
-                                port_free() {
-                                  ! (echo >"/dev/tcp/127.0.0.1/$1") 2>/dev/null
-                                }
-
-                                offset=0
-                                max_offset=9
-                                while (( offset <= max_offset )); do
-                                  bot_port=$((8001 + offset))
-                                  vite_port=$((5173 + offset))
-                                  mock_api_port=$((8099 + offset))
-                                  if port_free "$bot_port" \
-                                    && port_free "$vite_port" \
-                                    && port_free "$mock_api_port"; then
-                                    break
-                                  fi
-                                  offset=$((offset + 1))
-                                done
-
-                                if (( offset > max_offset )); then
-                                  echo "simulate: no free port offset in [0..$max_offset]" >&2
-                                  exit 1
-                                fi
-
-                                echo "simulate: offset=$offset (bot=$bot_port \
-                vite=$vite_port mock_api=$mock_api_port)"
-
-                                backend="SIMULATE_BOT_PORT=$bot_port \
-                                  cargo nextest run --test e2e \
-                                  -E 'test(=full_system::simulate)' \
-                                  --run-ignored ignored-only --no-capture"
-
-                                dashboard="cd dashboard && \
-                                  BACKEND_PORT=$bot_port \
-                                  PUBLIC_BACKEND_PORT=$bot_port \
-                                  PUBLIC_SIMULATE_REV=${self.shortRev or self.dirtyShortRev or "unknown"} \
-                                  PUBLIC_SIMULATE_SOURCE_ID=${builtins.substring 0 8 (baseNameOf self.outPath)} \
-                                  bun run dev --port=$vite_port --strictPort --open"
-
-                                mockApi="MOCK_REST_API_PORT=$mock_api_port \
-                                  bun run e2e/mock-rest-api.ts"
-
-                                exec mprocs "$backend" "$dashboard" "$mockApi"
-              '';
-            };
-
-            # Mock infra + bot + dashboard + recoverable failure injection.
-            #
-            # Run with `nix run .#simulate-failures`, press `q` to exit.
-            # Starts the same live dashboard stack as simulate, but first
-            # creates stuck mint and redemption rebalances whose Alpaca mock
-            # provider later completes. The backend logs the recheck-transfer
-            # commands needed to recover them.
-            "simulate-failures" = pkgs.writeShellApplication {
-              name = "simulate-failures";
-              runtimeInputs = [
-                pkgs.mprocs
-                pkgs.bun
-                pkgs.cargo-nextest
-                rainix.rust-toolchain.${system}
-              ];
-              text = ''
-                                port_free() {
-                                  ! (echo >"/dev/tcp/127.0.0.1/$1") 2>/dev/null
-                                }
-
-                                offset=0
-                                max_offset=9
-                                while (( offset <= max_offset )); do
-                                  bot_port=$((8001 + offset))
-                                  vite_port=$((5173 + offset))
-                                  mock_api_port=$((8099 + offset))
-                                  if port_free "$bot_port" \
-                                    && port_free "$vite_port" \
-                                    && port_free "$mock_api_port"; then
-                                    break
-                                  fi
-                                  offset=$((offset + 1))
-                                done
-
-                                if (( offset > max_offset )); then
-                                  echo "simulate-failures: no free port offset in [0..$max_offset]" >&2
-                                  exit 1
-                                fi
-
-                                echo "simulate-failures: offset=$offset (bot=$bot_port \
-                vite=$vite_port mock_api=$mock_api_port)"
-
-                                backend="SIMULATE_BOT_PORT=$bot_port \
-                                  cargo nextest run --test e2e \
-                                  -E 'test(=full_system::simulate_failures)' \
-                                  --run-ignored ignored-only --no-capture"
-
-                                dashboard="cd dashboard && \
-                                  BACKEND_PORT=$bot_port \
-                                  PUBLIC_BACKEND_PORT=$bot_port \
-                                  PUBLIC_SIMULATE_REV=${self.shortRev or self.dirtyShortRev or "unknown"} \
-                                  PUBLIC_SIMULATE_SOURCE_ID=${builtins.substring 0 8 (baseNameOf self.outPath)} \
-                                  bun run dev --port=$vite_port --strictPort --open"
-
-                                mockApi="MOCK_REST_API_PORT=$mock_api_port \
-                                  bun run e2e/mock-rest-api.ts"
-
-                                exec mprocs "$backend" "$dashboard" "$mockApi"
-              '';
-            };
-
-            # Sandbox-runnable test for scripts/patch-rain-math-float.nu so
-            # the patch logic can't silently rot when upstream drifts.
-            test-patch-rain-math-float =
-              pkgs.runCommand "test-patch-rain-math-float"
-                {
-                  nativeBuildInputs = [ pkgs.nushell ];
-                }
-                ''
-                  cp -r ${./scripts} scripts
-                  chmod -R u+w scripts
-                  nu scripts/patch-rain-math-float.test.nu
-                  touch $out
+                  # Dashboard: bun.nix freshness, DTO generation, lint, svelte-check
+                  nix run .#genBunNix
+                  nix fmt -- dashboard/bun.nix
+                  nix run .#st0x-dto -- dashboard/src/lib/api
+                  nix develop .#ci-dashboard -c bash -c '
+                    set -euxo pipefail
+                    cd dashboard
+                    bun install --frozen-lockfile
+                    bun run lint
+                    bun run check
+                  '
                 '';
+              };
 
-            genBunNix = rainix.mkTask.${system} {
-              name = "gen-bun-nix";
-              additionalBuildInputs = [ bun2nix.packages.${system}.default ];
-              body = ''
-                exec bun2nix -o dashboard/bun.nix --lock-file dashboard/bun.lock
-              '';
-            };
+              # Mock infra + bot + dashboard + continuous user trades.
+              #
+              # Run with `nix run .#simulate`, press `q` to exit. Picks the
+              # lowest port offset whose bot/vite/mock-api ports are all
+              # free, so multiple instances can run side-by-side without
+              # collisions. The dashboard auto-opens in the browser on
+              # start.
+              simulate = pkgs.writeShellApplication {
+                name = "simulate";
+                runtimeInputs = simulationRuntimeInputs;
 
-            bootstrap = rainix.mkTask.${system} {
-              name = "bootstrap-nixos";
-              additionalBuildInputs = infraPkgs.buildInputs ++ [ nixos-anywhere.packages.${system}.default ];
-              body = ''
-                env="''${1:?usage: bootstrap <prod|staging>}"
-                shift
+                text = ''
+                  port_free() {
+                    ! (echo >"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+                  }
 
-                case "$env" in
-                  ${builtins.concatStringsSep "\n" (
-                    map (env: ''
-                      ${env})
-                        flake_config="${environments.${env}.nodeName}-bootstrap"
-                        host_key_field="host-${env}" ;;'') envNames
-                  )}
-                  *)
-                    echo "ERROR: unknown environment '$env'" >&2
-                    exit 1 ;;
-                esac
+                  offset=0
+                  max_offset=9
+                  while (( offset <= max_offset )); do
+                    bot_port=$((8001 + offset))
+                    vite_port=$((5173 + offset))
+                    mock_api_port=$((8099 + offset))
+                    if port_free "$bot_port" \
+                      && port_free "$vite_port" \
+                      && port_free "$mock_api_port"; then
+                      break
+                    fi
+                    offset=$((offset + 1))
+                  done
 
-                ${infraPkgs.parseIdentity}
-
-                # Resolve IP from terraform state
-                trap "rm -f infra/terraform.tfstate" EXIT
-                if [ -f "infra/terraform.tfstate.age" ]; then
-                  rage -d -i "$identity" infra/terraform.tfstate.age > infra/terraform.tfstate
-                fi
-                host_ip=$(jq -r ".outputs.''${env}_droplet_ipv4.value" infra/terraform.tfstate)
-                rm -f infra/terraform.tfstate
-                if [ -z "$host_ip" ] || [ "$host_ip" = "null" ]; then
-                  echo "ERROR: could not resolve IP from terraform output '''''${env}_droplet_ipv4'" >&2
-                  exit 1
-                fi
-
-                ssh_opts="-o StrictHostKeyChecking=no -o ConnectTimeout=5 -i $identity"
-
-                nixos-anywhere --flake ".#$flake_config" \
-                  --option pure-eval false \
-                  --ssh-option "IdentityFile=$identity" \
-                  --target-host "root@$host_ip" "$@"
-
-                echo "Waiting for host to come back up..."
-                retries=0
-                until ssh $ssh_opts "root@$host_ip" true 2>/dev/null; do
-                  retries=$((retries + 1))
-                  if [ "$retries" -ge 60 ]; then
-                    echo "Host did not come back up after 5 minutes" >&2
+                  if (( offset > max_offset )); then
+                    echo "simulate: no free port offset in [0..$max_offset]" >&2
                     exit 1
                   fi
-                  sleep 5
-                done
 
-                new_key=$(
-                  ssh $ssh_opts "root@$host_ip" \
-                    cat /etc/ssh/ssh_host_ed25519_key.pub \
-                    | awk '{print $1 " " $2}'
-                )
+                  echo "simulate: offset=$offset (bot=$bot_port \
+                    vite=$vite_port mock_api=$mock_api_port)"
 
-                valid_key='^ssh-ed25519 [A-Za-z0-9+/=]+$'
-                if [ -z "$new_key" ] || ! echo "$new_key" | grep -qE "$valid_key"; then
-                  echo "ERROR: SSH host key is empty or malformed: '$new_key'" >&2
-                  exit 1
-                fi
+                  backend="SIMULATE_BOT_PORT=$bot_port \
+                    cargo nextest run --test e2e \
+                    -E 'test(=full_system::simulate)' \
+                    --run-ignored ignored-only --no-capture"
 
-                ${pkgs.gnused}/bin/sed -i \
-                  "/$host_key_field =/{n;s|\"ssh-ed25519 [A-Za-z0-9+/=_]*\"|\"$new_key\"|;}" \
-                  keys.nix
+                  dashboard="cd dashboard && \
+                    BACKEND_PORT=$bot_port \
+                    PUBLIC_BACKEND_PORT=$bot_port \
+                    PUBLIC_SIMULATE_REV=${self.shortRev or self.dirtyShortRev or "unknown"} \
+                    PUBLIC_SIMULATE_SOURCE_ID=${builtins.substring 0 8 (baseNameOf self.outPath)} \
+                    bun run dev --port=$vite_port --strictPort --open"
 
-                echo "Updated $host_key_field in keys.nix, rekeying secrets..."
-                ${rekeySecrets}
-              '';
-            };
+                  mockApi="MOCK_REST_API_PORT=$mock_api_port \
+                    bun run e2e/mock-rest-api.ts"
 
-            secret = rainix.mkTask.${system} {
-              name = "secret";
-              additionalBuildInputs = [ ragenix.packages.${system}.default ];
-              body = ''
-                set -euo pipefail
-                ${infraPkgs.parseIdentity}
-                hash_before=$(sha256sum "$1")
-                ragenix --rules ./secret/secrets.nix -i "$identity" -e "$@"
-                hash_after=$(sha256sum "$1")
-                if [ "$hash_before" != "$hash_after" ]; then
+                  exec mprocs "$backend" "$dashboard" "$mockApi"
+                '';
+              };
+
+              # Mock infra + bot + dashboard + recoverable failure injection.
+              #
+              # Run with `nix run .#simulate-failures`, press `q` to exit.
+              # Starts the same live dashboard stack as simulate, but first
+              # creates stuck mint and redemption rebalances whose Alpaca
+              # mock provider later completes. The backend logs the
+              # recheck-transfer commands needed to recover them.
+              "simulate-failures" = pkgs.writeShellApplication {
+                name = "simulate-failures";
+                runtimeInputs = simulationRuntimeInputs;
+
+                text = ''
+                  port_free() {
+                    ! (echo >"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+                  }
+
+                  offset=0
+                  max_offset=9
+                  while (( offset <= max_offset )); do
+                    bot_port=$((8001 + offset))
+                    vite_port=$((5173 + offset))
+                    mock_api_port=$((8099 + offset))
+                    if port_free "$bot_port" \
+                      && port_free "$vite_port" \
+                      && port_free "$mock_api_port"; then
+                      break
+                    fi
+                    offset=$((offset + 1))
+                  done
+
+                  if (( offset > max_offset )); then
+                    echo "simulate-failures: no free port offset in [0..$max_offset]" >&2
+                    exit 1
+                  fi
+
+                  echo "simulate-failures: offset=$offset (bot=$bot_port \
+                    vite=$vite_port mock_api=$mock_api_port)"
+
+                  backend="SIMULATE_BOT_PORT=$bot_port \
+                    cargo nextest run --test e2e \
+                    -E 'test(=full_system::simulate_failures)' \
+                    --run-ignored ignored-only --no-capture"
+
+                  dashboard="cd dashboard && \
+                    BACKEND_PORT=$bot_port \
+                    PUBLIC_BACKEND_PORT=$bot_port \
+                    PUBLIC_SIMULATE_REV=${self.shortRev or self.dirtyShortRev or "unknown"} \
+                    PUBLIC_SIMULATE_SOURCE_ID=${builtins.substring 0 8 (baseNameOf self.outPath)} \
+                    bun run dev --port=$vite_port --strictPort --open"
+
+                  mockApi="MOCK_REST_API_PORT=$mock_api_port \
+                    bun run e2e/mock-rest-api.ts"
+
+                  exec mprocs "$backend" "$dashboard" "$mockApi"
+                '';
+              };
+
+              # Sandbox-runnable test for scripts/patch-rain-math-float.nu so
+              # the patch logic can't silently rot when upstream drifts.
+              test-patch-rain-math-float =
+                pkgs.runCommand "test-patch-rain-math-float"
+                  {
+                    nativeBuildInputs = [ pkgs.nushell ];
+                  }
+                  ''
+                    cp -r ${./scripts} scripts
+                    chmod -R u+w scripts
+                    nu scripts/patch-rain-math-float.test.nu
+                    touch $out
+                  '';
+
+              genBunNix = pkgs.writeShellApplication {
+                name = "gen-bun-nix";
+                runtimeInputs = [ bun2nix ];
+                text = ''
+                  exec bun2nix -o dashboard/bun.nix --lock-file dashboard/bun.lock
+                '';
+              };
+
+              bootstrap = pkgs.writeShellApplication {
+                name = "bootstrap-nixos";
+                runtimeInputs = infraPkgs.buildInputs ++ [ nixosAnywherePkg ];
+                text = ''
+                  env="''${1:?usage: bootstrap <prod|staging>}"
+                  shift
+
+                  case "$env" in
+                    ${builtins.concatStringsSep "\n" (
+                      map (env: ''
+                        ${env})
+                          flake_config="${environments.${env}.nodeName}-bootstrap"
+                          host_key_field="host-${env}" ;;'') envNames
+                    )}
+                    *)
+                      echo "ERROR: unknown environment '$env'" >&2
+                      exit 1 ;;
+                  esac
+
+                  ${infraPkgs.parseIdentity}
+
+                  # Resolve IP from terraform state
+                  trap "rm -f infra/terraform.tfstate" EXIT
+                  if [ -f "infra/terraform.tfstate.age" ]; then
+                    rage -d -i "$identity" infra/terraform.tfstate.age > infra/terraform.tfstate
+                  fi
+                  host_ip=$(jq -r ".outputs.''${env}_droplet_ipv4.value" infra/terraform.tfstate)
+                  rm -f infra/terraform.tfstate
+                  if [ -z "$host_ip" ] || [ "$host_ip" = "null" ]; then
+                    echo "ERROR: could not resolve IP from terraform output '''''${env}_droplet_ipv4'" >&2
+                    exit 1
+                  fi
+
+                  ssh_opts="-o StrictHostKeyChecking=no -o ConnectTimeout=5 -i $identity"
+
+                  nixos-anywhere --flake ".#$flake_config" \
+                    --option pure-eval false \
+                    --ssh-option "IdentityFile=$identity" \
+                    --target-host "root@$host_ip" "$@"
+
+                  echo "Waiting for host to come back up..."
+                  retries=0
+                  until ssh $ssh_opts "root@$host_ip" true 2>/dev/null; do
+                    retries=$((retries + 1))
+                    if [ "$retries" -ge 60 ]; then
+                      echo "Host did not come back up after 5 minutes" >&2
+                      exit 1
+                    fi
+                    sleep 5
+                  done
+
+                  new_key=$(
+                    ssh $ssh_opts "root@$host_ip" \
+                      cat /etc/ssh/ssh_host_ed25519_key.pub \
+                      | awk '{print $1 " " $2}'
+                  )
+
+                  valid_key='^ssh-ed25519 [A-Za-z0-9+/=]+$'
+                  if [ -z "$new_key" ] || ! echo "$new_key" | grep -qE "$valid_key"; then
+                    echo "ERROR: SSH host key is empty or malformed: '$new_key'" >&2
+                    exit 1
+                  fi
+
+                  ${pkgs.gnused}/bin/sed -i \
+                    "/$host_key_field =/{n;s|\"ssh-ed25519 [A-Za-z0-9+/=_]*\"|\"$new_key\"|;}" \
+                    keys.nix
+
+                  echo "Updated $host_key_field in keys.nix, rekeying secrets..."
                   ${rekeySecrets}
-                fi
-              '';
-            };
+                '';
+              };
 
-            rekey = rainix.mkTask.${system} {
-              name = "rekey";
-              additionalBuildInputs = [ ragenix.packages.${system}.default ];
-              body = ''
-                ${infraPkgs.parseIdentity}
-                exec ${rekeySecrets}
-              '';
-            };
+              secret = pkgs.writeShellApplication {
+                name = "secret";
+                runtimeInputs = [ ragenixPkg ];
+                text = ''
+                  ${infraPkgs.parseIdentity}
+                  hash_before=$(sha256sum "$1")
+                  ragenix --rules ./secret/secrets.nix -i "$identity" -e "$@"
+                  hash_after=$(sha256sum "$1")
+                  if [ "$hash_before" != "$hash_after" ]; then
+                    ${rekeySecrets}
+                  fi
+                '';
+              };
 
-            tfRekey = rainix.mkTask.${system} {
-              name = "tf-rekey";
-              additionalBuildInputs = infraPkgs.buildInputs;
-              body = infraPkgs.tfRekey;
+              rekey = pkgs.writeShellApplication {
+                name = "rekey";
+                runtimeInputs = [ ragenixPkg ];
+                text = ''
+                  ${infraPkgs.parseIdentity}
+                  exec ${rekeySecrets}
+                '';
+              };
             };
-
-          };
+          in
+          rainixPkgs // infraPkgs.packages // deployScripts // abis // others;
 
         checks = { inherit (packages) test-patch-rain-math-float; };
-
         formatter = pkgs.nixfmt-rfc-style;
 
         devShells =
@@ -519,7 +534,7 @@
             # deno that rainix's full devShell brings in -- CI doesn't run them
             # and they bloat the closure.
             backendInputs = [
-              rainix.rust-toolchain.${system}
+              rustToolchain
               pkgs.openssl
               pkgs.sqlite
               pkgs.pkg-config
@@ -528,10 +543,10 @@
           in
           {
             # Local development. Rust-only rainix shell + infra/deploy tooling,
-            # bacon, sqlx, bun. Not used by CI.
+            # sqlx, bun, sccache. Not used by CI.
             default = pkgs.mkShell (
               {
-                shellHook = rainix.devShells.${system}.rust-shell.shellHook + rainMathFloatLink;
+                shellHook = rustShell.shellHook + rainMathFloatLink;
 
                 SQLX_OFFLINE = true;
                 DATABASE_URL = "sqlite:dev.db";
@@ -544,20 +559,18 @@
                 buildInputs =
                   with pkgs;
                   [
-                    bacon
                     bun
                     sccache
                     sqlx-cli
-                    cargo-expand
                     cargo-nextest
-                    ragenix.packages.${system}.default
-                    packages.ci
+                    ragenixPkg
                     packages.secret
                     packages.rekey
+                    packages.ci
                   ]
                   ++ builtins.attrValues infraPkgs.packages
                   ++ builtins.attrValues deployScripts
-                  ++ rainix.devShells.${system}.rust-shell.buildInputs;
+                  ++ rustShell.buildInputs;
               }
               // abiEnv
             );
@@ -571,7 +584,7 @@
                 buildInputs = backendInputs ++ [
                   pkgs.sqlx-cli
                   pkgs.cargo-nextest
-                  rainix.pkgs.${system}.foundry-bin
+                  foundryBin
                 ];
 
                 shellHook = rainMathFloatLink;
@@ -593,8 +606,8 @@
             # taplo/yamlfmt/shellcheck/deno) without the heavy default closure.
             ci-hooks = pkgs.mkShell (
               {
-                shellHook = rainix.devShells.${system}.rust-shell.shellHook + rainMathFloatLink;
-                inherit (rainix.devShells.${system}.rust-shell) buildInputs;
+                shellHook = rustShell.shellHook + rainMathFloatLink;
+                inherit (rustShell) buildInputs;
               }
               // abiEnv
             );

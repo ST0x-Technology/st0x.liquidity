@@ -1,7 +1,6 @@
 {
   pkgs,
   ragenix,
-  rainix,
   system,
   environments,
 }:
@@ -162,17 +161,6 @@ let
   '';
 
   inherit (import ../keys.nix) tailscaleHost;
-
-  tfRekey = ''
-    ${parseIdentity}
-    on_exit() { ${cleanup}; _cleanup_identity; }
-    trap on_exit EXIT
-    ${state.decrypt}
-    ${state.encrypt}
-    ${syncRemotes}
-    ${vars.decrypt}
-    ${vars.encrypt}
-  '';
 
   mkEnv =
     env:
@@ -391,54 +379,53 @@ in
     buildInputs
     sshBuildInputs
     parseIdentity
-    tfRekey
     ;
   inherit perEnv;
 
   packages = {
-    tfInit = rainix.mkTask.${system} {
+    tfInit = pkgs.writeShellApplication {
       name = "tf-init";
-      additionalBuildInputs = buildInputs;
-      body = ''
+      runtimeInputs = buildInputs;
+      text = ''
         ${preamble}
         terraform -chdir=infra init "$@"
       '';
     };
 
-    tfPlan = rainix.mkTask.${system} {
+    tfPlan = pkgs.writeShellApplication {
       name = "tf-plan";
-      additionalBuildInputs = buildInputs;
-      body = ''
+      runtimeInputs = buildInputs;
+      text = ''
         ${preamble}
         ${state.decrypt}
         terraform -chdir=infra plan -out=tfplan "$@"
       '';
     };
 
-    tfApply = rainix.mkTask.${system} {
+    tfApply = pkgs.writeShellApplication {
       name = "tf-apply";
-      additionalBuildInputs = buildInputs;
-      body = ''
+      runtimeInputs = buildInputs;
+      text = ''
         ${preambleWithEncrypt}
         ${state.decrypt}
         terraform -chdir=infra apply "$@" tfplan
       '';
     };
 
-    tfDestroy = rainix.mkTask.${system} {
+    tfDestroy = pkgs.writeShellApplication {
       name = "tf-destroy";
-      additionalBuildInputs = buildInputs;
-      body = ''
+      runtimeInputs = buildInputs;
+      text = ''
         ${preambleWithEncrypt}
         ${state.decrypt}
         terraform -chdir=infra destroy "$@"
       '';
     };
 
-    tfEditVars = rainix.mkTask.${system} {
+    tfEditVars = pkgs.writeShellApplication {
       name = "tf-edit-vars";
-      additionalBuildInputs = buildInputs;
-      body = ''
+      runtimeInputs = buildInputs;
+      text = ''
         ${parseIdentity}
         on_exit() { rm -f ${vars.path}; _cleanup_identity; }
         trap on_exit EXIT

@@ -120,7 +120,7 @@ let
 in
 {
   # DTO crate for TypeScript codegen
-  dto = craneLib.buildPackage (
+  st0x-dto = craneLib.buildPackage (
     commonArgs
     // {
       pname = "st0x-dto";
@@ -136,7 +136,7 @@ in
   );
 
   # Server binary for deployment
-  package = craneLib.buildPackage (
+  st0x-liquidity = craneLib.buildPackage (
     commonArgs
     // {
       inherit cargoArtifacts;
@@ -152,7 +152,7 @@ in
   );
 
   # CLI binary for remote operations
-  cli = craneLib.buildPackage (
+  st0x-cli = craneLib.buildPackage (
     commonArgs
     // {
       pname = "st0x-cli";

@@ -5,6 +5,7 @@
   st0x-cli,
   environment,
   volumeName,
+  tailscaleMagicDnsName,
   ...
 }:
 
@@ -12,18 +13,11 @@ let
   inherit (import ./keys.nix) roles;
   envRoles = roles.${environment};
 
-  tailscaleFqdn =
-    {
-      prod = "st0x-liquidity-nixos.taile5cf8a.ts.net";
-      staging = "st0x-liquidity-staging.taile5cf8a.ts.net";
-    }
-    .${environment};
   certDir = "/var/lib/tailscale-cert";
 
-  services = import ./services.nix;
-  enabledServices = lib.filterAttrs (_: v: v.enabled) services;
+  inherit (import ./services.nix { inherit lib; }) enabled;
   # Services with a systemd unit (everything except kind = "static").
-  unitServices = lib.filterAttrs (_: v: v.kind != "static") enabledServices;
+  unitServices = lib.filterAttrs (_: v: v.kind != "static") enabled;
 
   cli = pkgs.writeShellApplication {
     name = "stox";
@@ -173,11 +167,11 @@ in
 
     nginx = {
       enable = true;
-      virtualHosts.${tailscaleFqdn} = {
+      virtualHosts.${tailscaleMagicDnsName} = {
         default = true;
         forceSSL = true;
-        sslCertificate = "${certDir}/${tailscaleFqdn}.crt";
-        sslCertificateKey = "${certDir}/${tailscaleFqdn}.key";
+        sslCertificate = "${certDir}/${tailscaleMagicDnsName}.crt";
+        sslCertificateKey = "${certDir}/${tailscaleMagicDnsName}.key";
         root = "/nix/var/nix/profiles/per-service/dashboard";
 
         locations =
@@ -289,7 +283,7 @@ in
       # Provision a Tailscale-issued TLS certificate so the dashboard is
       # served over HTTPS. Runs before nginx to guarantee cert files exist.
       tailscale-cert = {
-        description = "Provision Tailscale HTTPS certificate for ${tailscaleFqdn}";
+        description = "Provision Tailscale HTTPS certificate for ${tailscaleMagicDnsName}";
         after = [ "tailscaled.service" ];
         wants = [ "tailscaled.service" ];
         before = [ "nginx.service" ];
@@ -320,9 +314,9 @@ in
             sleep 2
           done
           tailscale cert \
-            --cert-file ${certDir}/${tailscaleFqdn}.crt \
-            --key-file ${certDir}/${tailscaleFqdn}.key \
-            ${tailscaleFqdn}
+            --cert-file ${certDir}/${tailscaleMagicDnsName}.crt \
+            --key-file ${certDir}/${tailscaleMagicDnsName}.key \
+            ${tailscaleMagicDnsName}
         '';
       };
 
