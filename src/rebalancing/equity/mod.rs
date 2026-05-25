@@ -11,20 +11,24 @@
 #[cfg(test)]
 pub(crate) mod mock;
 
+use alloy::hex::FromHexError;
 use alloy::primitives::{Address, TxHash, U256};
 use alloy::rpc::types::TransactionReceipt;
 use async_trait::async_trait;
+use sqlx::SqlitePool;
 use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
 use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::EvmError;
 use st0x_execution::{FractionalShares, SharesBlockchain, SharesConversionError, Symbol};
 
+use super::RebalancingService;
 use super::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
+use super::trigger::RecoveryClaim;
 use crate::equity_redemption::{
     DetectionFailure, EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId,
 };
@@ -59,6 +63,114 @@ struct TokensReceivedData {
     tx_hash: TxHash,
     symbol: Symbol,
     wallet: Address,
+}
+
+/// Result of re-checking a stuck transfer against the tokenization provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RecheckOutcome {
+    /// The provider had settled the request; the aggregate was un-failed and
+    /// the workflow resumed (or, for redemption, completed).
+    Recovered,
+    /// The aggregate was active (not failed); the normal workflow was resumed.
+    Resumed,
+    /// The aggregate was already in its terminal success state.
+    AlreadyCompleted,
+    /// The provider request is not yet completed; nothing changed.
+    LeftUnchanged,
+    /// The redemption tx has not been detected by the provider yet.
+    NotDetectedYet,
+    /// Another transfer for the same symbol is currently in progress, so
+    /// recovery was refused: rebuilding tracking would overwrite the live
+    /// transfer's in-flight balance. Retry once the symbol is free.
+    Conflict,
+    /// The failure happened past the recoverable stage (e.g. a mint that
+    /// already received tokens, or a redemption that never sent them).
+    /// Provider-completion recovery does not apply.
+    NotRecoverable,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum RecheckError {
+    #[error(transparent)]
+    Mint(#[from] MintError),
+    #[error(transparent)]
+    Redemption(#[from] RedemptionError),
+    #[error(transparent)]
+    Tokenizer(#[from] TokenizerError),
+    #[error(transparent)]
+    Rebalancing(#[from] super::trigger::RebalancingServiceError),
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+    #[error("completed provider request {0} is missing its onchain tx hash")]
+    MissingTxHash(TokenizationRequestId),
+    #[error("mint {0} has no accepted provider request to re-check")]
+    NoAcceptedRequest(IssuerRequestId),
+    #[error("mint {id} has an unparseable wallet address in its event history")]
+    MalformedWallet {
+        id: IssuerRequestId,
+        #[source]
+        source: FromHexError,
+    },
+}
+
+/// Context for re-checking a failed mint: the wallet and provider request
+/// from the aggregate's event history, plus whether the mint progressed past
+/// acceptance (in which case provider-completion recovery does not apply).
+struct MintRecheckContext {
+    wallet: Address,
+    tokenization_request_id: TokenizationRequestId,
+    received_tokens: bool,
+}
+
+async fn load_mint_recheck_context(
+    pool: &SqlitePool,
+    id: &IssuerRequestId,
+) -> Result<MintRecheckContext, RecheckError> {
+    let IssuerRequestId(raw_id) = id;
+
+    let row: Option<(String, String, bool)> = sqlx::query_as(
+        "SELECT \
+             json_extract(requested.payload, '$.MintRequested.wallet'), \
+             json_extract(accepted.payload, '$.MintAccepted.tokenization_request_id'), \
+             EXISTS( \
+                 SELECT 1 FROM events received \
+                 WHERE received.aggregate_type = 'TokenizedEquityMint' \
+                   AND received.aggregate_id = requested.aggregate_id \
+                   AND received.event_type IN ( \
+                       'TokenizedEquityMintEvent::TokensReceived', \
+                       'TokenizedEquityMintEvent::ProviderCompletionRecovered' \
+                   ) \
+             ) \
+         FROM events requested \
+         INNER JOIN events accepted \
+             ON accepted.aggregate_type = requested.aggregate_type \
+            AND accepted.aggregate_id = requested.aggregate_id \
+            AND accepted.event_type = 'TokenizedEquityMintEvent::MintAccepted' \
+         WHERE requested.aggregate_type = 'TokenizedEquityMint' \
+           AND requested.aggregate_id = ?1 \
+           AND requested.event_type = 'TokenizedEquityMintEvent::MintRequested' \
+         ORDER BY accepted.sequence DESC \
+         LIMIT 1",
+    )
+    .bind(raw_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some((raw_wallet, raw_tokenization_request_id, received_tokens)) = row else {
+        return Err(RecheckError::NoAcceptedRequest(id.clone()));
+    };
+
+    Ok(MintRecheckContext {
+        wallet: raw_wallet
+            .parse()
+            .map_err(|source| RecheckError::MalformedWallet {
+                id: id.clone(),
+                source,
+            })?,
+        tokenization_request_id: TokenizationRequestId(raw_tokenization_request_id),
+        received_tokens,
+    })
 }
 
 /// Services shared by both equity transfer aggregates.
@@ -162,6 +274,13 @@ impl Tokenizer for PanickingTokenizer {
         unimplemented!("PanickingTokenizer: not available in CLI context")
     }
 
+    async fn get_request(
+        &self,
+        _: &TokenizationRequestId,
+    ) -> Result<TokenizationRequest, TokenizerError> {
+        unimplemented!("PanickingTokenizer: not available in CLI context")
+    }
+
     fn redemption_wallet(&self) -> Option<Address> {
         unimplemented!("PanickingTokenizer: not available in CLI context")
     }
@@ -171,6 +290,13 @@ impl Tokenizer for PanickingTokenizer {
     }
 
     async fn poll_for_redemption(&self, _: &TxHash) -> Result<TokenizationRequest, TokenizerError> {
+        unimplemented!("PanickingTokenizer: not available in CLI context")
+    }
+
+    async fn find_redemption_by_tx(
+        &self,
+        _: &TxHash,
+    ) -> Result<Option<TokenizationRequest>, TokenizerError> {
         unimplemented!("PanickingTokenizer: not available in CLI context")
     }
 
@@ -1060,6 +1186,263 @@ impl CrossVenueEquityTransfer {
             EquityRedemption::Completed { .. } | EquityRedemption::Failed { .. }
         ))
     }
+
+    /// Re-checks a stuck mint against the tokenization provider and, if the
+    /// provider has settled it, un-fails the aggregate and resumes the
+    /// wrap/deposit workflow. Active (non-failed) mints simply resume.
+    ///
+    /// Dispatches `RecoverProviderCompletion` through the reactor-wired mint
+    /// store after rebuilding tracking, so the live inventory view is
+    /// corrected. Must run inside the bot process for the reactor to fire.
+    pub(crate) async fn recover_mint(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+        pool: &SqlitePool,
+        rebalancing: &RebalancingService,
+    ) -> Result<RecheckOutcome, RecheckError> {
+        let entity = self.load_mint_entity(issuer_request_id).await?;
+
+        let (symbol, quantity) = match &entity {
+            TokenizedEquityMint::DepositedIntoRaindex { .. } => {
+                return Ok(RecheckOutcome::AlreadyCompleted);
+            }
+            TokenizedEquityMint::Failed {
+                symbol, quantity, ..
+            } => (symbol.clone(), FractionalShares::new(*quantity)),
+            _ => {
+                self.resume_mint(issuer_request_id).await?;
+                return Ok(RecheckOutcome::Resumed);
+            }
+        };
+
+        let context = load_mint_recheck_context(pool, issuer_request_id).await?;
+
+        // Provider-completion recovery only applies to mints that failed at
+        // acceptance (tokens never received). A mint that already received
+        // tokens and then failed while wrapping/depositing must not be reset
+        // to TokensReceived and re-wrapped against tokens that already moved.
+        if context.received_tokens {
+            warn!(
+                target: "rebalance",
+                %issuer_request_id,
+                "Mint failed after receiving tokens; provider-completion recovery does not apply"
+            );
+            return Ok(RecheckOutcome::NotRecoverable);
+        }
+
+        let request = match self
+            .tokenizer
+            .get_request(&context.tokenization_request_id)
+            .await
+        {
+            Ok(request) => request,
+            // A missing provider request is "left unchanged", not a hard error:
+            // the request may not exist or may not be visible yet. Other tokenizer
+            // failures (transient, verification) still propagate.
+            Err(TokenizerError::Alpaca(AlpacaTokenizationError::RequestNotFound { id })) => {
+                warn!(
+                    target: "rebalance",
+                    %issuer_request_id,
+                    %id,
+                    "Provider request not found; leaving mint unchanged"
+                );
+                return Ok(RecheckOutcome::LeftUnchanged);
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        if request.status != TokenizationRequestStatus::Completed {
+            return Ok(RecheckOutcome::LeftUnchanged);
+        }
+
+        let tx_hash = request
+            .tx_hash
+            .ok_or_else(|| RecheckError::MissingTxHash(request.id.clone()))?;
+
+        // Rebuild tracking (and restore the canonical in-flight inventory shape,
+        // clearing any timeout tombstone) before dispatching so the reactor
+        // applies the ProviderCompletionRecovered inventory effect when it
+        // processes the event below.
+        //
+        // The rollback below covers a *persistence* failure (store.send returns
+        // Err -> the event was never committed and the reactor never ran). It
+        // does NOT cover a reactor-application failure: cqrs-es dispatches the
+        // reactor after persisting, and the bridge logs reactor errors without
+        // propagating them, so send still returns Ok. A reactor failure here
+        // would leave the event persisted but inventory un-completed until the
+        // next inventory poll/restart reconciles it.
+        // Compare-and-claim: refuse recovery while a *different* mint for this
+        // symbol is live (rebuilding would overwrite its in-flight balance, since
+        // `set_inflight` replaces rather than adds). A slot still owned by this
+        // same mint -- e.g. the live process never observed its failure, as with
+        // a reactor-less failure injection -- is not a conflict; that is exactly
+        // the stale state recovery reconciles. The check is atomic with the
+        // in-flight restore so a concurrent mint cannot claim the slot in between.
+        let rollback = match rebalancing
+            .rebuild_mint_tracking_for_recovery(issuer_request_id, &entity, request.id.clone())
+            .await?
+        {
+            RecoveryClaim::Conflict => return Ok(RecheckOutcome::Conflict),
+            RecoveryClaim::Claimed(rollback) => rollback,
+        };
+
+        if let Err(error) = self
+            .mint_store
+            .send(
+                issuer_request_id,
+                TokenizedEquityMintCommand::RecoverProviderCompletion {
+                    issuer_request_id: issuer_request_id.clone(),
+                    wallet: context.wallet,
+                    tokenization_request_id: request.id,
+                    tx_hash,
+                    fees: request.fees,
+                },
+            )
+            .await
+        {
+            // The recovery event was not persisted, so the reactor never ran to
+            // complete the in-flight that the rebuild restored. Undo the rebuild
+            // so the live inventory does not show a phantom in-flight transfer or
+            // a symbol locked in-progress until the next restart.
+            if let Err(rollback_error) = rebalancing
+                .rollback_mint_tracking_for_recovery(issuer_request_id, &symbol, quantity, rollback)
+                .await
+            {
+                error!(
+                    target: "rebalance",
+                    %issuer_request_id,
+                    ?rollback_error,
+                    "Failed to roll back mint recovery state after dispatch failure"
+                );
+            }
+
+            return Err(MintError::from(error).into());
+        }
+
+        // The recovery event is committed and the reactor has corrected
+        // inventory. A resume failure now (e.g. a transient RPC error during
+        // wrapping) must not be fatal: the aggregate is recovered and startup
+        // recovery will finish the workflow. Clear the in-progress guard so the
+        // symbol is not locked out of rebalancing until the next restart.
+        if let Err(error) = self.resume_mint(issuer_request_id).await {
+            warn!(
+                target: "rebalance",
+                %issuer_request_id,
+                ?error,
+                "Mint recovered but resume failed; cleared in-progress guard, workflow resumes on next startup"
+            );
+            rebalancing
+                .abandon_mint_recovery_guard(issuer_request_id, &symbol)
+                .await;
+        }
+
+        Ok(RecheckOutcome::Recovered)
+    }
+
+    /// Re-checks a stuck redemption against the tokenization provider and, if
+    /// the provider has settled it, un-fails the aggregate to `Completed`.
+    /// Active (non-failed) redemptions simply resume.
+    ///
+    /// Dispatches `RecoverProviderCompletion` through the reactor-wired
+    /// redemption store after rebuilding tracking, so the in-flight transfer
+    /// is completed in the live inventory view.
+    pub(crate) async fn recover_redemption(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+        rebalancing: &RebalancingService,
+    ) -> Result<RecheckOutcome, RecheckError> {
+        let entity = self.load_redemption_entity(aggregate_id).await?;
+
+        let (symbol, tokenization_request_id, redemption_tx) = match &entity {
+            EquityRedemption::Completed { .. } => return Ok(RecheckOutcome::AlreadyCompleted),
+            EquityRedemption::Failed {
+                symbol,
+                redemption_tx: Some(redemption_tx),
+                tokenization_request_id,
+                ..
+            } => (
+                symbol.clone(),
+                tokenization_request_id.clone(),
+                *redemption_tx,
+            ),
+            // A redemption that failed before sending tokens has nothing for
+            // the provider to have settled.
+            EquityRedemption::Failed { .. } => return Ok(RecheckOutcome::NotRecoverable),
+            _ => {
+                self.resume_redemption(aggregate_id).await?;
+                return Ok(RecheckOutcome::Resumed);
+            }
+        };
+
+        let request = match &tokenization_request_id {
+            // A missing provider request leaves the redemption unchanged rather
+            // than failing the operator command; transient/other errors propagate.
+            Some(request_id) => match self.tokenizer.get_request(request_id).await {
+                Ok(request) => request,
+                Err(TokenizerError::Alpaca(AlpacaTokenizationError::RequestNotFound { id })) => {
+                    warn!(
+                        target: "rebalance",
+                        %aggregate_id,
+                        %id,
+                        "Provider request not found; leaving redemption unchanged"
+                    );
+                    return Ok(RecheckOutcome::LeftUnchanged);
+                }
+                Err(error) => return Err(error.into()),
+            },
+            None => match self.tokenizer.find_redemption_by_tx(&redemption_tx).await? {
+                Some(request) => request,
+                None => return Ok(RecheckOutcome::NotDetectedYet),
+            },
+        };
+
+        if request.status != TokenizationRequestStatus::Completed {
+            return Ok(RecheckOutcome::LeftUnchanged);
+        }
+
+        // Compare-and-claim: refuse recovery while a *different* redemption for
+        // this symbol is live (see recover_mint for the rationale). A slot still
+        // owned by this same redemption is not a conflict. The check is atomic
+        // with the in-flight restore.
+        let rollback = match rebalancing
+            .rebuild_redemption_tracking_for_recovery(aggregate_id, &entity)
+            .await?
+        {
+            RecoveryClaim::Conflict => return Ok(RecheckOutcome::Conflict),
+            RecoveryClaim::Claimed(rollback) => rollback,
+        };
+
+        if let Err(error) = self
+            .redemption_store
+            .send(
+                aggregate_id,
+                EquityRedemptionCommand::RecoverProviderCompletion {
+                    tokenization_request_id: request.id,
+                },
+            )
+            .await
+        {
+            // The recovery event was not persisted, so the reactor never ran to
+            // complete the in-flight that the rebuild restored. Undo the rebuild
+            // so the live inventory does not show a phantom in-flight transfer or
+            // a symbol locked in-progress until the next restart.
+            if let Err(rollback_error) = rebalancing
+                .rollback_redemption_tracking_for_recovery(aggregate_id, &symbol, rollback)
+                .await
+            {
+                error!(
+                    target: "rebalance",
+                    %aggregate_id,
+                    ?rollback_error,
+                    "Failed to roll back redemption recovery state after dispatch failure"
+                );
+            }
+
+            return Err(RedemptionError::from(error).into());
+        }
+
+        Ok(RecheckOutcome::Recovered)
+    }
 }
 
 /// Hedging -> Market-Making: tokenize equity on Alpaca and deposit into
@@ -1146,20 +1529,31 @@ impl CrossVenueTransfer<MarketMakingVenue, HedgingVenue> for CrossVenueEquityTra
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::Address;
+    use alloy::primitives::{Address, address};
+    use chrono::Utc;
     use sqlx::SqlitePool;
+    use std::collections::HashSet;
     use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::{broadcast, mpsc};
 
-    use st0x_event_sorcery::test_store;
+    use st0x_dto::Statement;
+    use st0x_event_sorcery::{StoreBuilder, test_store};
     use st0x_execution::{FractionalShares, Symbol};
+    use st0x_float_macro::float;
 
     use super::*;
+    use crate::config::{AssetsConfig, EquitiesConfig};
+    use crate::inventory::{
+        BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, Venue,
+    };
     use crate::onchain::mock::MockRaindex;
+    use crate::rebalancing::{RebalancingSchedulers, RebalancingServiceConfig};
     use crate::tokenization::mock::{
         MockCompletionOutcome, MockDetectionOutcome, MockTokenizer, MockVerificationOutcome,
     };
+    use crate::vault_registry::VaultRegistry;
     use crate::wrapper::mock::MockWrapper;
-    use st0x_float_macro::float;
 
     fn mock_services() -> EquityTransferServices {
         EquityTransferServices {
@@ -1167,6 +1561,342 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
         }
+    }
+
+    async fn insert_mint_event(
+        pool: &SqlitePool,
+        id: &IssuerRequestId,
+        sequence: i64,
+        event_type: &str,
+        payload: &str,
+    ) {
+        let IssuerRequestId(raw) = id;
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+             VALUES ('TokenizedEquityMint', ?, ?, ?, '1.0', ?, '{}')",
+        )
+        .bind(raw)
+        .bind(sequence)
+        .bind(event_type)
+        .bind(payload)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn recheck_context_treats_recovered_mint_as_having_received_tokens() {
+        // A mint recovered once via ProviderCompletionRecovered evolves into the
+        // TokensReceived state without writing a literal TokensReceived event. If
+        // it then re-fails at wrapping, a second recheck must NOT recover it again
+        // (which would re-wrap already-moved tokens), so received_tokens must be
+        // true even though no TokensReceived event exists.
+        let pool = crate::test_utils::setup_test_db().await;
+        let id = IssuerRequestId::new("mint-rerecover");
+
+        insert_mint_event(
+            &pool,
+            &id,
+            0,
+            "TokenizedEquityMintEvent::MintRequested",
+            r#"{"MintRequested":{"symbol":"AAPL","quantity":"10","wallet":"0x0000000000000000000000000000000000000001","requested_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .await;
+        insert_mint_event(
+            &pool,
+            &id,
+            1,
+            "TokenizedEquityMintEvent::MintAccepted",
+            r#"{"MintAccepted":{"issuer_request_id":"mint-rerecover","tokenization_request_id":"tok-1","accepted_at":"2026-01-01T00:00:01Z"}}"#,
+        )
+        .await;
+        insert_mint_event(
+            &pool,
+            &id,
+            2,
+            "TokenizedEquityMintEvent::ProviderCompletionRecovered",
+            r#"{"ProviderCompletionRecovered":{"issuer_request_id":"mint-rerecover","wallet":"0x0000000000000000000000000000000000000001","tokenization_request_id":"tok-1","tx_hash":"0x1111111111111111111111111111111111111111111111111111111111111111","shares_minted":"10000000000000000000","fees":null,"recovered_at":"2026-01-01T00:02:00Z"}}"#,
+        )
+        .await;
+
+        let context = load_mint_recheck_context(&pool, &id).await.unwrap();
+
+        assert!(
+            context.received_tokens,
+            "a mint already recovered via ProviderCompletionRecovered must count as having received tokens"
+        );
+    }
+
+    /// Reproduces the production recovery path end to end: a mint that failed
+    /// at acceptance (injected reactor-less, exactly as the simulate-failures
+    /// harness does) is recovered by dispatching `RecoverProviderCompletion`
+    /// through the reactor-wired store. The recovered quantity must leave the
+    /// Hedging in-flight balance (the dashboard's "Inflight" column) and land in
+    /// MarketMaking available -- not stay stuck in-flight forever.
+    #[tokio::test]
+    async fn recover_mint_clears_hedging_inflight() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let id = IssuerRequestId::new("mint-recover-inflight");
+
+        // Reactor-less failure injection: the live reactor never observes these
+        // events, so its inventory holds the full Hedging balance with nothing
+        // in-flight -- the stale state recovery must reconcile.
+        insert_mint_event(
+            &pool,
+            &id,
+            1,
+            "TokenizedEquityMintEvent::MintRequested",
+            r#"{"MintRequested":{"symbol":"AAPL","quantity":"10","wallet":"0x0000000000000000000000000000000000000001","requested_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .await;
+        insert_mint_event(
+            &pool,
+            &id,
+            2,
+            "TokenizedEquityMintEvent::MintAccepted",
+            r#"{"MintAccepted":{"issuer_request_id":"mint-recover-inflight","tokenization_request_id":"tok-1","accepted_at":"2026-01-01T00:00:01Z"}}"#,
+        )
+        .await;
+        insert_mint_event(
+            &pool,
+            &id,
+            3,
+            "TokenizedEquityMintEvent::MintAcceptanceFailed",
+            r#"{"MintAcceptanceFailed":{"reason":"simulate: timeout","failed_at":"2026-01-01T00:00:02Z"}}"#,
+        )
+        .await;
+
+        let (operation_sender, _operation_receiver) = mpsc::channel(10);
+        let (event_sender, _event_receiver) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default().with_equity(
+                symbol.clone(),
+                FractionalShares::ZERO,
+                FractionalShares::new(float!(100)),
+            ),
+            event_sender,
+        ));
+
+        let service = Arc::new(RebalancingService::new(
+            RebalancingServiceConfig {
+                equity: ImbalanceThreshold {
+                    target: float!(0.5),
+                    deviation: float!(0.2),
+                },
+                usdc: None,
+                transfer_timeout: Duration::from_secs(1800),
+                assets: AssetsConfig {
+                    equities: EquitiesConfig::default(),
+                    cash: None,
+                },
+                disabled_assets: HashSet::new(),
+            },
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            address!("0x0000000000000000000000000000000000000001"),
+            address!("0x0000000000000000000000000000000000000002"),
+            inventory.clone(),
+            operation_sender,
+            Arc::new(MockWrapper::new()),
+            RebalancingSchedulers::new(&pool),
+        ));
+
+        // Reactor-wired stores -- the production wiring that dispatches committed
+        // events to the reactor's `on_mint`.
+        let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+            .with(service.clone())
+            .build(mock_services())
+            .await
+            .unwrap();
+        let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .with(service.clone())
+            .build(mock_services())
+            .await
+            .unwrap();
+        service
+            .set_stores(mint_store.clone(), redemption_store.clone())
+            .await;
+
+        // The provider reports the request settled: get_request must find a
+        // Completed request (with a tx_hash) under the aggregate's
+        // tokenization_request_id ("tok-1").
+        let mut completed_request = TokenizationRequest::mock_completed();
+        completed_request.id = TokenizationRequestId("tok-1".to_string());
+        let tokenizer =
+            Arc::new(MockTokenizer::new().with_pending_requests(vec![completed_request]));
+
+        let transfer = CrossVenueEquityTransfer::new(
+            Arc::new(MockRaindex::new()),
+            tokenizer,
+            Arc::new(MockWrapper::new()),
+            address!("0x0000000000000000000000000000000000000001"),
+            mint_store,
+            redemption_store,
+        );
+
+        let outcome = transfer.recover_mint(&id, &pool, &service).await.unwrap();
+        assert!(
+            matches!(outcome, RecheckOutcome::Recovered),
+            "expected Recovered, got {outcome:?}"
+        );
+
+        let (hedging_inflight, market_making_available) = {
+            let view = inventory.read().await;
+
+            (
+                view.equity_inflight(&symbol, Venue::Hedging),
+                view.equity_available(&symbol, Venue::MarketMaking),
+            )
+        };
+        assert_eq!(
+            hedging_inflight,
+            Some(FractionalShares::ZERO),
+            "recovered mint left its quantity stuck in Hedging in-flight"
+        );
+        assert_eq!(
+            market_making_available,
+            Some(FractionalShares::new(float!(10))),
+            "recovered quantity should land in MarketMaking available"
+        );
+    }
+
+    /// Recovery must not double-count an in-flight that is ALREADY established.
+    ///
+    /// The realistic stuck state -- what the simulate-failures harness and the
+    /// CLI `fail-transfer` ops tool both produce -- is: `MintAccepted` ran
+    /// `start` so the quantity sits in Hedging in-flight, but the failure was
+    /// recorded out-of-process so the reactor never ran `cancel`. Recovery then
+    /// runs against an in-flight already at the mint quantity; re-establishing
+    /// it with a `Start` double-counts (qty -> 2*qty), and the completion
+    /// removes only one copy, leaving the quantity stuck in-flight. Recovery
+    /// must reconcile it to zero idempotently.
+    #[tokio::test]
+    async fn recover_mint_does_not_double_count_existing_inflight() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let id = IssuerRequestId::new("mint-double-count");
+
+        insert_mint_event(
+            &pool,
+            &id,
+            1,
+            "TokenizedEquityMintEvent::MintRequested",
+            r#"{"MintRequested":{"symbol":"AAPL","quantity":"10","wallet":"0x0000000000000000000000000000000000000001","requested_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .await;
+        insert_mint_event(
+            &pool,
+            &id,
+            2,
+            "TokenizedEquityMintEvent::MintAccepted",
+            r#"{"MintAccepted":{"issuer_request_id":"mint-double-count","tokenization_request_id":"tok-1","accepted_at":"2026-01-01T00:00:01Z"}}"#,
+        )
+        .await;
+        insert_mint_event(
+            &pool,
+            &id,
+            3,
+            "TokenizedEquityMintEvent::MintAcceptanceFailed",
+            r#"{"MintAcceptanceFailed":{"reason":"simulate: timeout","failed_at":"2026-01-01T00:00:02Z"}}"#,
+        )
+        .await;
+
+        let (operation_sender, _operation_receiver) = mpsc::channel(10);
+        let (event_sender, _event_receiver) = broadcast::channel::<Statement>(16);
+
+        // MintAccepted's `start` already moved the quantity into Hedging
+        // in-flight (available 100 -> 90, in-flight 10); the out-of-process
+        // failure never ran `cancel`, so the in-flight is still established.
+        let seeded = InventoryView::default()
+            .with_equity(
+                symbol.clone(),
+                FractionalShares::ZERO,
+                FractionalShares::new(float!(90)),
+            )
+            .update_equity(
+                &symbol,
+                Inventory::set_inflight(Venue::Hedging, FractionalShares::new(float!(10))),
+                Utc::now(),
+            )
+            .unwrap();
+        let inventory = Arc::new(BroadcastingInventory::new(seeded, event_sender));
+
+        let service = Arc::new(RebalancingService::new(
+            RebalancingServiceConfig {
+                equity: ImbalanceThreshold {
+                    target: float!(0.5),
+                    deviation: float!(0.2),
+                },
+                usdc: None,
+                transfer_timeout: Duration::from_secs(1800),
+                assets: AssetsConfig {
+                    equities: EquitiesConfig::default(),
+                    cash: None,
+                },
+                disabled_assets: HashSet::new(),
+            },
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            address!("0x0000000000000000000000000000000000000001"),
+            address!("0x0000000000000000000000000000000000000002"),
+            inventory.clone(),
+            operation_sender,
+            Arc::new(MockWrapper::new()),
+            RebalancingSchedulers::new(&pool),
+        ));
+
+        let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+            .with(service.clone())
+            .build(mock_services())
+            .await
+            .unwrap();
+        let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .with(service.clone())
+            .build(mock_services())
+            .await
+            .unwrap();
+        service
+            .set_stores(mint_store.clone(), redemption_store.clone())
+            .await;
+
+        let mut completed_request = TokenizationRequest::mock_completed();
+        completed_request.id = TokenizationRequestId("tok-1".to_string());
+        let tokenizer =
+            Arc::new(MockTokenizer::new().with_pending_requests(vec![completed_request]));
+
+        let transfer = CrossVenueEquityTransfer::new(
+            Arc::new(MockRaindex::new()),
+            tokenizer,
+            Arc::new(MockWrapper::new()),
+            address!("0x0000000000000000000000000000000000000001"),
+            mint_store,
+            redemption_store,
+        );
+
+        let outcome = transfer.recover_mint(&id, &pool, &service).await.unwrap();
+        assert!(
+            matches!(outcome, RecheckOutcome::Recovered),
+            "expected Recovered, got {outcome:?}"
+        );
+
+        let (hedging_inflight, market_making_available) = {
+            let view = inventory.read().await;
+
+            (
+                view.equity_inflight(&symbol, Venue::Hedging),
+                view.equity_available(&symbol, Venue::MarketMaking),
+            )
+        };
+        assert_eq!(
+            hedging_inflight,
+            Some(FractionalShares::ZERO),
+            "recovery double-counted the already-established in-flight, leaving it stuck"
+        );
+        assert_eq!(
+            market_making_available,
+            Some(FractionalShares::new(float!(10))),
+            "recovered quantity should land in MarketMaking available"
+        );
     }
 
     async fn create_equity_transfer(

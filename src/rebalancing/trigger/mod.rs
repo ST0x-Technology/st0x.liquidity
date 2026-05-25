@@ -40,7 +40,7 @@ use tracing::{debug, error, trace, warn};
 use rain_math_float::Float;
 use st0x_event_sorcery::{AggregateError, EntityList, LifecycleError, Reactor, Store, deps};
 use st0x_execution::{FractionalShares, Positive, SharesBlockchain, SharesConversionError, Symbol};
-use st0x_finance::Usdc;
+use st0x_finance::{HasZero, Usdc};
 
 use crate::config::AssetsConfig;
 use crate::equity_redemption::{
@@ -365,6 +365,10 @@ impl MintTracking {
                 self.stage = MintTrackingStage::TokensReceived;
                 self.last_progress_at = *received_at;
             }
+            TokenizedEquityMintEvent::ProviderCompletionRecovered { recovered_at, .. } => {
+                self.stage = MintTrackingStage::TokensReceived;
+                self.last_progress_at = *recovered_at;
+            }
             TokenizedEquityMintEvent::WrapSubmitted { submitted_at, .. } => {
                 self.stage = MintTrackingStage::WrapSubmitted;
                 self.last_progress_at = *submitted_at;
@@ -531,6 +535,7 @@ impl RedemptionTracking {
             | EquityRedemptionEvent::TransferFailed { .. }
             | EquityRedemptionEvent::DetectionFailed { .. }
             | EquityRedemptionEvent::RedemptionRejected { .. }
+            | EquityRedemptionEvent::ProviderCompletionRecovered { .. }
             | EquityRedemptionEvent::Completed { .. } => {}
         }
 
@@ -543,6 +548,10 @@ fn mint_event_tokenization_request_id(
 ) -> Option<&crate::tokenized_equity_mint::TokenizationRequestId> {
     match event {
         TokenizedEquityMintEvent::MintAccepted {
+            tokenization_request_id,
+            ..
+        }
+        | TokenizedEquityMintEvent::ProviderCompletionRecovered {
             tokenization_request_id,
             ..
         } => Some(tokenization_request_id),
@@ -1487,6 +1496,54 @@ impl PendingRequestOwnership for RebalancingService {
     }
 }
 
+/// Describes the inventory/tombstone mutation a `rebuild_*_tracking_for_recovery`
+/// call applied, so the caller can undo it precisely if the recovery dispatch
+/// fails before the reactor completes the restored in-flight transfer. Without
+/// this the live inventory would be left showing a phantom in-flight transfer
+/// (and a symbol locked in-progress) for an aggregate whose recovery event was
+/// never persisted.
+pub(crate) enum RecoveryRollback {
+    /// The rebuild touched no inventory balances (called on a non-failed
+    /// aggregate, or an explicitly-failed redemption whose in-flight was never
+    /// cancelled). Rollback only drops the tracking + in-progress guard.
+    TrackingOnly,
+    /// The rebuild moved available -> in-flight via `Start` (an explicitly
+    /// failed transfer that had cancelled its in-flight back to available).
+    /// Rollback cancels the in-flight back to available.
+    CancelInflight,
+    /// The rebuild re-set the in-flight and dropped the timeout tombstone
+    /// (a timed-out transfer). Rollback clears the in-flight again and restores
+    /// the tombstone + suppressed-inflight markers it removed.
+    RestoreTombstone {
+        timed_out_at: DateTime<Utc>,
+        suppressed_at: Option<DateTime<Utc>>,
+    },
+}
+
+/// Outcome of an atomic recovery claim. `rebuild_*_tracking_for_recovery`
+/// checks symbol ownership and restores the in-flight under a single inventory
+/// write lock, so a concurrent live mint/redemption cannot claim the slot
+/// between the check and the restore (which would silently clobber its
+/// in-flight, since recovery's `set_inflight` *replaces* rather than adds).
+pub(crate) enum RecoveryClaim {
+    /// The recovery claimed the symbol's slot. Carries the rollback needed if
+    /// the recovery dispatch later fails before the reactor runs.
+    Claimed(RecoveryRollback),
+    /// A *different* live mint/redemption for the symbol already owns the slot,
+    /// so recovery must abort without mutating inventory.
+    Conflict,
+}
+
+#[cfg(test)]
+impl RecoveryClaim {
+    fn expect_claimed(self) -> RecoveryRollback {
+        match self {
+            Self::Claimed(rollback) => rollback,
+            Self::Conflict => panic!("expected recovery to claim the slot, got Conflict"),
+        }
+    }
+}
+
 impl RebalancingService {
     async fn expire_stuck_operations_with_logging(&self) {
         if let Err(error) = self.expire_stuck_operations(Utc::now()).await {
@@ -1599,10 +1656,16 @@ impl RebalancingService {
                 Venue::Hedging,
                 quantity,
             )),
-            TokensReceived { .. } => Some(Self::complete_equity_transfer_update(
-                Venue::Hedging,
-                quantity,
-            )),
+            // TokensReceived completes the normal mint; ProviderCompletionRecovered
+            // completes a recovered one. rebuild_mint_tracking_for_recovery restores
+            // the canonical in-flight shape (Hedging in-flight = quantity, available
+            // already debited) before dispatch, so recovery confirms the in-flight
+            // the same way the success path does -- in-flight -> MarketMaking
+            // available, plus last_rebalancing to suppress a redundant rebalance --
+            // regardless of how the mint originally failed.
+            TokensReceived { .. } | ProviderCompletionRecovered { .. } => Some(
+                Self::complete_equity_transfer_update(Venue::Hedging, quantity),
+            ),
             DepositedIntoRaindex { .. } => Some(Self::last_rebalancing_update()),
             MintRequested { .. }
             | MintRejected { .. }
@@ -1687,10 +1750,9 @@ impl RebalancingService {
                 Venue::MarketMaking,
                 quantity,
             )),
-            Completed { .. } => Some(Self::complete_equity_transfer_update(
-                Venue::MarketMaking,
-                quantity,
-            )),
+            Completed { .. } | ProviderCompletionRecovered { .. } => Some(
+                Self::complete_equity_transfer_update(Venue::MarketMaking, quantity),
+            ),
             TransferFailed { .. } => Some(Self::cancel_equity_transfer_update(
                 Venue::MarketMaking,
                 quantity,
@@ -1865,6 +1927,33 @@ impl RebalancingService {
         guard.insert(symbol.clone());
     }
 
+    /// Releases the in-progress guard and tracking for a mint whose recovery
+    /// event was committed (inventory already corrected by the reactor) but
+    /// whose in-process resume failed. The aggregate is left for startup
+    /// recovery to finish; dropping the tracking prevents the timeout sweeper
+    /// from later failing an already-recovered mint, and clearing the guard
+    /// unblocks rebalancing for the symbol.
+    pub(crate) async fn abandon_mint_recovery_guard(&self, id: &IssuerRequestId, symbol: &Symbol) {
+        self.mint_tracking.write().await.remove(id);
+        self.clear_equity_in_progress(symbol);
+
+        // `ProviderCompletionRecovered` is non-terminal for mints, so the
+        // reactor *set* the active-mint slot to this id when it processed the
+        // recovery event. Dropping tracking here means no future event can
+        // clear it (events for an untracked aggregate early-return), so clear
+        // it now to keep `active_mint` mirroring `mint_tracking`'s lifecycle --
+        // otherwise the dashboard shows a phantom active mint until restart.
+        // Clear only if this id still owns the slot: on the dispatch-failure
+        // rollback path the reactor never ran, so a concurrent mint may
+        // legitimately own it and must not be cleared. Re-check ownership under
+        // the write lock so a concurrent mint cannot claim the slot between the
+        // read and the clear.
+        let mut inventory = self.inventory.write().await;
+        if inventory.active_mint(symbol) == Some(id) {
+            *inventory = inventory.clone().clear_active_mint(symbol);
+        }
+    }
+
     /// Clears the in-progress flag for USDC rebalancing.
     pub(crate) fn clear_usdc_in_progress(&self) {
         self.usdc_in_progress.store(false, Ordering::SeqCst);
@@ -1976,6 +2065,347 @@ impl RebalancingService {
             DepositedIntoRaindex { .. } | Failed { .. } => {}
         }
 
+        Ok(())
+    }
+
+    /// Rebuilds in-memory tracking for a failed mint being recovered via
+    /// `recheck-transfer`, so the live reactor applies the
+    /// `ProviderCompletionRecovered` inventory effect and the terminal
+    /// cleanup once the recovery event is dispatched.
+    ///
+    /// Returns [`RecoveryClaim::Conflict`] when a *different* live mint already
+    /// owns the symbol's slot: the ownership check and the in-flight restore run
+    /// under one inventory write lock (compare-and-claim) so a concurrent mint
+    /// cannot claim the slot in between, which would let recovery's `set_inflight`
+    /// (a replace, not an add) clobber its in-flight. A slot still owned by `id`
+    /// itself is not a conflict -- that is the stale state recovery reconciles.
+    pub(crate) async fn rebuild_mint_tracking_for_recovery(
+        &self,
+        id: &IssuerRequestId,
+        entity: &TokenizedEquityMint,
+        tokenization_request_id: crate::tokenized_equity_mint::TokenizationRequestId,
+    ) -> Result<RecoveryClaim, RebalancingServiceError> {
+        let TokenizedEquityMint::Failed {
+            symbol, quantity, ..
+        } = entity
+        else {
+            warn!(target: "rebalance", id = %id, "rebuild_mint_tracking_for_recovery called on non-failed mint; skipping");
+            return Ok(RecoveryClaim::Claimed(RecoveryRollback::TrackingOnly));
+        };
+
+        let quantity = FractionalShares::new(*quantity);
+
+        // Restore a single canonical pre-recovery inventory shape -- the
+        // Hedging in-flight holding `quantity`, with available already debited
+        // -- so the ProviderCompletionRecovered reactor arm can complete it
+        // uniformly regardless of how the mint failed:
+        // - a timeout cleared the in-flight without crediting available and
+        //   tombstoned the aggregate (so the reactor ignores late events), so we
+        //   drop the tombstone and re-set the in-flight (available stays debited);
+        // - an explicit MintAcceptanceFailed cancelled the in-flight back to
+        //   available, so we move it back into the in-flight with a Start.
+        // Peek (don't yet remove) the timeout markers so a failure in the
+        // fallible inventory update below leaves them intact -- a failed rebuild
+        // does not run the caller's rollback, so consuming them up front would
+        // lose the tombstone permanently.
+        let timed_out_at = self.timed_out_mints.read().await.get(id).copied();
+
+        // A third shape the timeout/explicit branches below do not cover: the
+        // failure left the in-flight already established (a `Start` ran but the
+        // failure never cancelled it back to available -- e.g. an out-of-process
+        // `fail-transfer`, or a reactor that recorded the failure without
+        // running `cancel`). That is already the canonical pre-complete shape,
+        // so re-establishing it with another `Start` would double-count
+        // (quantity -> 2*quantity) and strand the quantity in-flight after the
+        // completion. Detect it and set the in-flight idempotently instead.
+        let inflight_already_established = self
+            .inventory
+            .read()
+            .await
+            .equity_inflight(symbol, Venue::Hedging)
+            .map(|amount| amount.is_zero())
+            .transpose()?
+            .is_some_and(|is_zero| !is_zero);
+
+        let (update, rollback): (EquityInventoryUpdate, RecoveryRollback) =
+            if let Some(timed_out_at) = timed_out_at {
+                let suppressed_at = self
+                    .suppressed_inflight_symbols
+                    .read()
+                    .await
+                    .get(symbol)
+                    .copied();
+                (
+                    Box::new(Inventory::set_inflight(Venue::Hedging, quantity)),
+                    RecoveryRollback::RestoreTombstone {
+                        timed_out_at,
+                        suppressed_at,
+                    },
+                )
+            } else if inflight_already_established {
+                (
+                    Box::new(Inventory::set_inflight(Venue::Hedging, quantity)),
+                    RecoveryRollback::TrackingOnly,
+                )
+            } else {
+                (
+                    Self::start_equity_transfer_update(Venue::Hedging, quantity),
+                    RecoveryRollback::CancelInflight,
+                )
+            };
+
+        // Compare-and-claim: refuse if a *different* mint owns the slot, else
+        // restore the in-flight -- both under one write lock so the check and the
+        // claim cannot be interleaved by a concurrent live mint.
+        {
+            let mut inventory = self.inventory.write().await;
+            if matches!(inventory.active_mint(symbol), Some(active) if active != id) {
+                warn!(
+                    target: "rebalance",
+                    id = %id,
+                    %symbol,
+                    "Refusing mint recovery: a different mint for this symbol is in progress"
+                );
+                return Ok(RecoveryClaim::Conflict);
+            }
+
+            *inventory = inventory
+                .clone()
+                .update_equity(symbol, update, Utc::now())?;
+        }
+
+        // The inventory update succeeded; now consume the timeout markers.
+        if timed_out_at.is_some() {
+            self.timed_out_mints.write().await.remove(id);
+            self.suppressed_inflight_symbols
+                .write()
+                .await
+                .remove(symbol);
+        }
+
+        self.mint_tracking.write().await.insert(
+            id.clone(),
+            MintTracking {
+                symbol: symbol.clone(),
+                quantity,
+                tokenization_request_id: Some(tokenization_request_id),
+                stage: MintTrackingStage::Accepted,
+                last_progress_at: Utc::now(),
+            },
+        );
+        self.mark_equity_in_progress(symbol);
+        Ok(RecoveryClaim::Claimed(rollback))
+    }
+
+    /// Reverses what [`Self::rebuild_mint_tracking_for_recovery`] mutated, for
+    /// when the recovery dispatch fails before the reactor completes the
+    /// restored in-flight transfer. Restores the pre-recovery failed-mint
+    /// state so the live inventory does not show a phantom in-flight transfer,
+    /// a missing timeout tombstone, or a symbol locked in-progress until the
+    /// next bot restart.
+    pub(crate) async fn rollback_mint_tracking_for_recovery(
+        &self,
+        id: &IssuerRequestId,
+        symbol: &Symbol,
+        quantity: FractionalShares,
+        rollback: RecoveryRollback,
+    ) -> Result<(), RebalancingServiceError> {
+        match rollback {
+            RecoveryRollback::TrackingOnly => {}
+            RecoveryRollback::CancelInflight => {
+                self.apply_equity_update(
+                    symbol,
+                    Self::cancel_equity_transfer_update(Venue::Hedging, quantity),
+                )
+                .await?;
+            }
+            RecoveryRollback::RestoreTombstone {
+                timed_out_at,
+                suppressed_at,
+            } => {
+                let mut inventory = self.inventory.write().await;
+                *inventory =
+                    inventory
+                        .clone()
+                        .clear_equity_inflight(symbol, Venue::Hedging, Utc::now())?;
+                drop(inventory);
+                self.timed_out_mints
+                    .write()
+                    .await
+                    .insert(id.clone(), timed_out_at);
+                if let Some(suppressed_at) = suppressed_at {
+                    self.suppressed_inflight_symbols
+                        .write()
+                        .await
+                        .insert(symbol.clone(), suppressed_at);
+                }
+            }
+        }
+
+        // Drops the tracking + in-progress guard (and clears active_mint, which
+        // a failed dispatch never set since the reactor did not run).
+        self.abandon_mint_recovery_guard(id, symbol).await;
+        Ok(())
+    }
+
+    /// Rebuilds in-memory tracking for a failed redemption being recovered
+    /// via `recheck-transfer`. See [`Self::rebuild_mint_tracking_for_recovery`]
+    /// for why inventory balances are left untouched on the explicit-failure
+    /// path: a failed redemption never cancelled its in-flight transfer, so the
+    /// recovery event's inventory arm completes that still-pending transfer.
+    ///
+    /// Returns [`RecoveryClaim::Conflict`] when a *different* live redemption
+    /// already owns the symbol's slot. The ownership check runs under the same
+    /// inventory write lock that restores a timed-out in-flight, so it cannot be
+    /// interleaved by a concurrent redemption.
+    pub(crate) async fn rebuild_redemption_tracking_for_recovery(
+        &self,
+        id: &RedemptionAggregateId,
+        entity: &EquityRedemption,
+    ) -> Result<RecoveryClaim, RebalancingServiceError> {
+        let EquityRedemption::Failed {
+            symbol,
+            quantity,
+            tokenization_request_id,
+            redemption_tx,
+            ..
+        } = entity
+        else {
+            warn!(target: "rebalance", id = %id, "rebuild_redemption_tracking_for_recovery called on non-failed redemption; skipping");
+            return Ok(RecoveryClaim::Claimed(RecoveryRollback::TrackingOnly));
+        };
+
+        let quantity = FractionalShares::new(*quantity);
+
+        // A timeout cleared the MarketMaking in-flight and tombstoned the
+        // aggregate; drop the tombstone and re-set the in-flight so the recovery
+        // arm's complete_equity_transfer_update can confirm it. An explicit
+        // DetectionFailed/RedemptionRejected left the in-flight in place (those
+        // events do not touch inventory), so there is nothing to restore.
+        //
+        // Peek (don't yet remove) the timeout markers so a failure in the
+        // fallible inventory update below leaves them intact -- a failed rebuild
+        // does not run the caller's rollback.
+        let timed_out_at = self.timed_out_redemptions.read().await.get(id).copied();
+        let suppressed_at = if timed_out_at.is_some() {
+            self.suppressed_inflight_symbols
+                .read()
+                .await
+                .get(symbol)
+                .copied()
+        } else {
+            None
+        };
+
+        // Compare-and-claim: refuse if a *different* redemption owns the slot.
+        // The check shares the write lock with the timed-out in-flight restore so
+        // a concurrent redemption cannot claim the slot between the two.
+        {
+            let mut inventory = self.inventory.write().await;
+            if matches!(inventory.active_redemption(symbol), Some(active) if active != id) {
+                warn!(
+                    target: "rebalance",
+                    id = %id,
+                    %symbol,
+                    "Refusing redemption recovery: a different redemption for this symbol is in progress"
+                );
+                return Ok(RecoveryClaim::Conflict);
+            }
+
+            if timed_out_at.is_some() {
+                *inventory = inventory.clone().update_equity(
+                    symbol,
+                    Box::new(Inventory::set_inflight(Venue::MarketMaking, quantity)),
+                    Utc::now(),
+                )?;
+            }
+        }
+
+        let rollback = if let Some(timed_out_at) = timed_out_at {
+            // The inventory update succeeded; now consume the timeout markers.
+            self.timed_out_redemptions.write().await.remove(id);
+            self.suppressed_inflight_symbols
+                .write()
+                .await
+                .remove(symbol);
+
+            RecoveryRollback::RestoreTombstone {
+                timed_out_at,
+                suppressed_at,
+            }
+        } else {
+            RecoveryRollback::TrackingOnly
+        };
+
+        self.redemption_tracking.write().await.insert(
+            id.clone(),
+            RedemptionTracking {
+                symbol: symbol.clone(),
+                quantity,
+                tokenization_request_id: tokenization_request_id.clone(),
+                redemption_tx: *redemption_tx,
+                stage: RedemptionTrackingStage::TokensSent,
+                last_progress_at: Utc::now(),
+            },
+        );
+        self.mark_equity_in_progress(symbol);
+        Ok(RecoveryClaim::Claimed(rollback))
+    }
+
+    /// Reverses what [`Self::rebuild_redemption_tracking_for_recovery`]
+    /// mutated, for when the recovery dispatch fails before the reactor
+    /// completes the restored in-flight transfer. See
+    /// [`Self::rollback_mint_tracking_for_recovery`].
+    pub(crate) async fn rollback_redemption_tracking_for_recovery(
+        &self,
+        id: &RedemptionAggregateId,
+        symbol: &Symbol,
+        rollback: RecoveryRollback,
+    ) -> Result<(), RebalancingServiceError> {
+        match rollback {
+            // Explicit redemption failures never restored an in-flight, and the
+            // `Start`-based variant is mint-only, so there is no balance to undo.
+            RecoveryRollback::TrackingOnly | RecoveryRollback::CancelInflight => {}
+            RecoveryRollback::RestoreTombstone {
+                timed_out_at,
+                suppressed_at,
+            } => {
+                let mut inventory = self.inventory.write().await;
+                *inventory = inventory.clone().clear_equity_inflight(
+                    symbol,
+                    Venue::MarketMaking,
+                    Utc::now(),
+                )?;
+                drop(inventory);
+                self.timed_out_redemptions
+                    .write()
+                    .await
+                    .insert(id.clone(), timed_out_at);
+                if let Some(suppressed_at) = suppressed_at {
+                    self.suppressed_inflight_symbols
+                        .write()
+                        .await
+                        .insert(symbol.clone(), suppressed_at);
+                }
+            }
+        }
+
+        self.redemption_tracking.write().await.remove(id);
+        self.clear_equity_in_progress(symbol);
+
+        // Mirror `abandon_mint_recovery_guard`: a recovery may proceed while the
+        // slot is still self-owned (a reactor-less failure the live process never
+        // observed -- the claim treats that as recoverable, not a conflict). If
+        // the dispatch then fails the reactor never runs to clear it, so dropping
+        // tracking here would strand a phantom `active_redemption` (visible to the
+        // dashboard and future conflict checks) until the next restart. Clear it
+        // now, but only while this id still owns it -- re-checking under the write
+        // lock so a concurrent redemption that claimed the slot is not cleared.
+        let mut inventory = self.inventory.write().await;
+        if inventory.active_redemption(symbol) == Some(id) {
+            *inventory = inventory.clone().clear_active_redemption(symbol);
+        }
+        drop(inventory);
         Ok(())
     }
 
@@ -2113,6 +2543,34 @@ impl RebalancingService {
 
         if let Some(update) = Self::mint_inventory_update(&event, tracking.quantity) {
             self.apply_equity_update(&symbol, update).await?;
+        }
+
+        // Defense-in-depth: a recovered mint must clear its Hedging in-flight via
+        // the completion above. A residual in-flight means recovery double-counted
+        // or otherwise failed to confirm it -- a financial accounting anomaly
+        // worth surfacing rather than stranding silently.
+        if matches!(
+            event,
+            TokenizedEquityMintEvent::ProviderCompletionRecovered { .. }
+        ) {
+            let residual = self
+                .inventory
+                .read()
+                .await
+                .equity_inflight(&symbol, Venue::Hedging);
+            if residual
+                .map(|amount| amount.is_zero())
+                .transpose()?
+                .is_some_and(|is_zero| !is_zero)
+            {
+                warn!(
+                    target: "rebalance",
+                    id = %id,
+                    %symbol,
+                    ?residual,
+                    "Recovered mint left a non-zero Hedging in-flight; inventory may be inconsistent"
+                );
+            }
         }
 
         // When a new mint transfer starts, clear the previous poll marker
@@ -2258,6 +2716,7 @@ impl RebalancingService {
             MintRequested { .. }
             | MintAccepted { .. }
             | TokensReceived { .. }
+            | ProviderCompletionRecovered { .. }
             | WrapSubmitted { .. }
             | TokensWrapped { .. }
             | VaultDepositSubmitted { .. } => false,
@@ -2277,6 +2736,7 @@ impl RebalancingService {
 
         match event {
             Completed { .. }
+            | ProviderCompletionRecovered { .. }
             | TransferFailed { .. }
             | DetectionFailed { .. }
             | RedemptionRejected { .. } => true,
@@ -2370,7 +2830,7 @@ mod tests {
     use crate::offchain::order::OffchainOrderId;
     use crate::position::{Position, PositionEvent, TradeId};
     use crate::threshold::ExecutionThreshold;
-    use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
+    use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
     use crate::usdc_rebalance::{
         TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
     };
@@ -2543,6 +3003,904 @@ mod tests {
             inventory.equity_inflight(&symbol, Venue::MarketMaking)
         };
         assert_eq!(inflight, Some(FractionalShares::new(float!(12))));
+    }
+
+    #[tokio::test]
+    async fn recovery_after_explicit_mint_failure_moves_equity_to_market_making() {
+        let (trigger, _receiver) = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mint_id = IssuerRequestId::new("mint-explicit-recovery");
+        let tok = TokenizationRequestId("TOK-1".to_string());
+
+        // An explicit MintAcceptanceFailed cancelled the in-flight back to
+        // Hedging (offchain) available, so available holds the full 100 and
+        // inflight is 0.
+        *trigger.inventory.write().await =
+            InventoryView::default().with_equity(symbol.clone(), shares(0), shares(100));
+
+        let failed = TokenizedEquityMint::Failed {
+            symbol: symbol.clone(),
+            quantity: float!(10),
+            reason: "rejected".to_string(),
+            requested_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+
+        trigger
+            .rebuild_mint_tracking_for_recovery(&mint_id, &failed, tok.clone())
+            .await
+            .unwrap();
+
+        trigger
+            .on_mint(
+                mint_id.clone(),
+                TokenizedEquityMintEvent::ProviderCompletionRecovered {
+                    issuer_request_id: mint_id.clone(),
+                    wallet: Address::ZERO,
+                    tokenization_request_id: tok,
+                    tx_hash: TxHash::random(),
+                    shares_minted: U256::from(10u64),
+                    fees: None,
+                    recovered_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let (hedging, market_making) = {
+            let inventory = trigger.inventory.read().await;
+            (
+                inventory.equity_available(&symbol, Venue::Hedging),
+                inventory.equity_available(&symbol, Venue::MarketMaking),
+            )
+        };
+        assert_eq!(hedging, Some(shares(90)));
+        assert_eq!(market_making, Some(shares(10)));
+    }
+
+    #[tokio::test]
+    async fn recovery_after_timeout_mint_failure_clears_tombstone_and_moves_equity() {
+        let (trigger, _receiver) = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mint_id = IssuerRequestId::new("mint-timeout-recovery");
+        let tok = TokenizationRequestId("TOK-1".to_string());
+
+        // A timeout cleared the in-flight without crediting available (Hedging
+        // (offchain) available stays debited at 90) and tombstoned the aggregate
+        // so the reactor ignores late events.
+        *trigger.inventory.write().await =
+            InventoryView::default().with_equity(symbol.clone(), shares(0), shares(90));
+        trigger
+            .timed_out_mints
+            .write()
+            .await
+            .insert(mint_id.clone(), Utc::now());
+
+        let failed = TokenizedEquityMint::Failed {
+            symbol: symbol.clone(),
+            quantity: float!(10),
+            reason: "timeout".to_string(),
+            requested_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+
+        trigger
+            .rebuild_mint_tracking_for_recovery(&mint_id, &failed, tok.clone())
+            .await
+            .unwrap();
+
+        // The tombstone must be cleared so the reactor stops ignoring events.
+        assert!(!trigger.timed_out_mints.read().await.contains_key(&mint_id));
+
+        trigger
+            .on_mint(
+                mint_id.clone(),
+                TokenizedEquityMintEvent::ProviderCompletionRecovered {
+                    issuer_request_id: mint_id.clone(),
+                    wallet: Address::ZERO,
+                    tokenization_request_id: tok,
+                    tx_hash: TxHash::random(),
+                    shares_minted: U256::from(10u64),
+                    fees: None,
+                    recovered_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Same end state as the explicit case: the 10 that left Hedging now
+        // sits in MarketMaking. Hedging available is NOT double-debited.
+        let (hedging, market_making) = {
+            let inventory = trigger.inventory.read().await;
+            (
+                inventory.equity_available(&symbol, Venue::Hedging),
+                inventory.equity_available(&symbol, Venue::MarketMaking),
+            )
+        };
+        assert_eq!(hedging, Some(shares(90)));
+        assert_eq!(market_making, Some(shares(10)));
+    }
+
+    #[tokio::test]
+    async fn recovery_after_explicit_redemption_failure_moves_equity_to_hedging() {
+        let (trigger, _receiver) = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let redemption_id = RedemptionAggregateId::new("redemption-explicit-recovery");
+
+        // An explicit DetectionFailed/RedemptionRejected does not touch
+        // inventory, so the in-flight is still held at MarketMaking (onchain):
+        // available 90, inflight 10.
+        *trigger.inventory.write().await = InventoryView::default()
+            .with_equity(symbol.clone(), shares(90), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::set_inflight(Venue::MarketMaking, shares(10)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let failed = EquityRedemption::Failed {
+            symbol: symbol.clone(),
+            quantity: float!(10),
+            raindex_withdraw_tx: None,
+            redemption_tx: Some(TxHash::random()),
+            tokenization_request_id: Some(TokenizationRequestId("TOK-2".to_string())),
+            reason: Some("rejected".to_string()),
+            started_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+
+        trigger
+            .rebuild_redemption_tracking_for_recovery(&redemption_id, &failed)
+            .await
+            .unwrap();
+
+        trigger
+            .on_redemption(
+                redemption_id.clone(),
+                EquityRedemptionEvent::ProviderCompletionRecovered {
+                    tokenization_request_id: TokenizationRequestId("TOK-2".to_string()),
+                    recovered_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let (market_making, hedging) = {
+            let inventory = trigger.inventory.read().await;
+            (
+                inventory.equity_available(&symbol, Venue::MarketMaking),
+                inventory.equity_available(&symbol, Venue::Hedging),
+            )
+        };
+        assert_eq!(market_making, Some(shares(90)));
+        assert_eq!(hedging, Some(shares(10)));
+    }
+
+    #[tokio::test]
+    async fn recovery_after_timeout_redemption_failure_clears_tombstone_and_moves_equity() {
+        let (trigger, _receiver) = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let redemption_id = RedemptionAggregateId::new("redemption-timeout-recovery");
+
+        // A timeout cleared the MarketMaking in-flight and tombstoned the
+        // aggregate; available stays debited at 90.
+        *trigger.inventory.write().await =
+            InventoryView::default().with_equity(symbol.clone(), shares(90), shares(0));
+        trigger
+            .timed_out_redemptions
+            .write()
+            .await
+            .insert(redemption_id.clone(), Utc::now());
+
+        let failed = EquityRedemption::Failed {
+            symbol: symbol.clone(),
+            quantity: float!(10),
+            raindex_withdraw_tx: None,
+            redemption_tx: Some(TxHash::random()),
+            tokenization_request_id: Some(TokenizationRequestId("TOK-2".to_string())),
+            reason: Some("timeout".to_string()),
+            started_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+
+        trigger
+            .rebuild_redemption_tracking_for_recovery(&redemption_id, &failed)
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger
+                .timed_out_redemptions
+                .read()
+                .await
+                .contains_key(&redemption_id)
+        );
+
+        trigger
+            .on_redemption(
+                redemption_id.clone(),
+                EquityRedemptionEvent::ProviderCompletionRecovered {
+                    tokenization_request_id: TokenizationRequestId("TOK-2".to_string()),
+                    recovered_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let (market_making, hedging) = {
+            let inventory = trigger.inventory.read().await;
+            (
+                inventory.equity_available(&symbol, Venue::MarketMaking),
+                inventory.equity_available(&symbol, Venue::Hedging),
+            )
+        };
+        assert_eq!(market_making, Some(shares(90)));
+        assert_eq!(hedging, Some(shares(10)));
+    }
+
+    #[tokio::test]
+    async fn abandon_mint_recovery_guard_clears_active_mint() {
+        let (trigger, _receiver) = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mint_id = IssuerRequestId::new("mint-resume-failure");
+        let tok = TokenizationRequestId("TOK-1".to_string());
+
+        *trigger.inventory.write().await =
+            InventoryView::default().with_equity(symbol.clone(), shares(0), shares(100));
+
+        let failed = TokenizedEquityMint::Failed {
+            symbol: symbol.clone(),
+            quantity: float!(10),
+            reason: "rejected".to_string(),
+            requested_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+
+        trigger
+            .rebuild_mint_tracking_for_recovery(&mint_id, &failed, tok.clone())
+            .await
+            .unwrap();
+
+        // The reactor processed ProviderCompletionRecovered (non-terminal for
+        // mints), which set the active-mint slot.
+        trigger
+            .on_mint(
+                mint_id.clone(),
+                TokenizedEquityMintEvent::ProviderCompletionRecovered {
+                    issuer_request_id: mint_id.clone(),
+                    wallet: Address::ZERO,
+                    tokenization_request_id: tok,
+                    tx_hash: TxHash::random(),
+                    shares_minted: U256::from(10u64),
+                    fees: None,
+                    recovered_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            trigger.inventory.read().await.active_mint(&symbol),
+            Some(&mint_id),
+            "recovery event should have set the active-mint slot"
+        );
+
+        // A failed in-process resume abandons the recovery guard; this must also
+        // clear the active-mint slot. Tracking is dropped here, so no later
+        // event can clear it -- otherwise the dashboard shows a phantom active
+        // mint until the next restart.
+        trigger.abandon_mint_recovery_guard(&mint_id, &symbol).await;
+
+        assert_eq!(trigger.inventory.read().await.active_mint(&symbol), None);
+        assert!(!trigger.mint_tracking.read().await.contains_key(&mint_id));
+        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+    }
+
+    #[tokio::test]
+    async fn mint_recovery_claim_refuses_a_different_mint_without_mutating() {
+        let (trigger, _receiver) = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let recovering = IssuerRequestId::new("recovering-mint");
+        let other = IssuerRequestId::new("other-mint");
+        let tok = TokenizationRequestId("TOK-1".to_string());
+
+        // Explicit-failure shape (available 100, in-flight 0) but a *different*
+        // mint owns the slot. The claim must refuse and touch nothing -- the
+        // other mint's in-flight stays intact and recovery installs no tracking.
+        *trigger.inventory.write().await = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(100))
+            .set_active_mint(symbol.clone(), other.clone());
+
+        let failed = TokenizedEquityMint::Failed {
+            symbol: symbol.clone(),
+            quantity: float!(10),
+            reason: "rejected".to_string(),
+            requested_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+
+        let claim = trigger
+            .rebuild_mint_tracking_for_recovery(&recovering, &failed, tok)
+            .await
+            .unwrap();
+        assert!(matches!(claim, RecoveryClaim::Conflict));
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(0)),
+            "a conflicting claim must not restore the in-flight"
+        );
+        assert_eq!(inventory.active_mint(&symbol), Some(&other));
+        drop(inventory);
+        assert!(!trigger.mint_tracking.read().await.contains_key(&recovering));
+        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+    }
+
+    #[tokio::test]
+    async fn mint_recovery_claim_succeeds_for_self_owned_slot() {
+        let (trigger, _receiver) = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let recovering = IssuerRequestId::new("recovering-mint");
+        let tok = TokenizationRequestId("TOK-1".to_string());
+
+        // The slot is still owned by the recovering mint itself (e.g. a
+        // reactor-less failure injection the live process never observed) -> NOT
+        // a conflict; recovery is what reconciles it.
+        *trigger.inventory.write().await = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(100))
+            .set_active_mint(symbol.clone(), recovering.clone());
+
+        let failed = TokenizedEquityMint::Failed {
+            symbol: symbol.clone(),
+            quantity: float!(10),
+            reason: "rejected".to_string(),
+            requested_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+
+        let claim = trigger
+            .rebuild_mint_tracking_for_recovery(&recovering, &failed, tok)
+            .await
+            .unwrap();
+        assert!(matches!(claim, RecoveryClaim::Claimed(_)));
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(10)),
+            "claiming a self-owned slot must restore the in-flight"
+        );
+    }
+
+    #[tokio::test]
+    async fn redemption_recovery_claim_refuses_a_different_redemption_without_mutating() {
+        let (trigger, _receiver) = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let recovering = RedemptionAggregateId::new("recovering-redemption");
+        let other = RedemptionAggregateId::new("other-redemption");
+        let tombstone_at = Utc::now();
+
+        // Timeout shape with a *different* redemption owning the slot. The claim
+        // must refuse without restoring the in-flight or consuming the tombstone.
+        *trigger.inventory.write().await = InventoryView::default()
+            .with_equity(symbol.clone(), shares(90), shares(0))
+            .set_active_redemption(symbol.clone(), other.clone());
+        trigger
+            .timed_out_redemptions
+            .write()
+            .await
+            .insert(recovering.clone(), tombstone_at);
+
+        let failed = EquityRedemption::Failed {
+            symbol: symbol.clone(),
+            quantity: float!(10),
+            raindex_withdraw_tx: None,
+            redemption_tx: Some(TxHash::random()),
+            tokenization_request_id: Some(TokenizationRequestId("TOK-2".to_string())),
+            reason: Some("timeout".to_string()),
+            started_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+
+        let claim = trigger
+            .rebuild_redemption_tracking_for_recovery(&recovering, &failed)
+            .await
+            .unwrap();
+        assert!(matches!(claim, RecoveryClaim::Conflict));
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::MarketMaking),
+            Some(shares(0)),
+            "a conflicting claim must not restore the in-flight"
+        );
+        assert_eq!(inventory.active_redemption(&symbol), Some(&other));
+        drop(inventory);
+        assert!(
+            trigger
+                .timed_out_redemptions
+                .read()
+                .await
+                .contains_key(&recovering),
+            "a conflicting claim must not consume the timeout tombstone"
+        );
+        assert!(
+            !trigger
+                .redemption_tracking
+                .read()
+                .await
+                .contains_key(&recovering)
+        );
+        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+    }
+
+    #[tokio::test]
+    async fn redemption_recovery_claim_succeeds_for_self_owned_slot() {
+        let (trigger, _receiver) = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let recovering = RedemptionAggregateId::new("recovering-redemption");
+        let tombstone_at = Utc::now();
+
+        *trigger.inventory.write().await = InventoryView::default()
+            .with_equity(symbol.clone(), shares(90), shares(0))
+            .set_active_redemption(symbol.clone(), recovering.clone());
+        trigger
+            .timed_out_redemptions
+            .write()
+            .await
+            .insert(recovering.clone(), tombstone_at);
+
+        let failed = EquityRedemption::Failed {
+            symbol: symbol.clone(),
+            quantity: float!(10),
+            raindex_withdraw_tx: None,
+            redemption_tx: Some(TxHash::random()),
+            tokenization_request_id: Some(TokenizationRequestId("TOK-2".to_string())),
+            reason: Some("timeout".to_string()),
+            started_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+
+        let claim = trigger
+            .rebuild_redemption_tracking_for_recovery(&recovering, &failed)
+            .await
+            .unwrap();
+        assert!(matches!(claim, RecoveryClaim::Claimed(_)));
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_inflight(&symbol, Venue::MarketMaking),
+            Some(shares(10)),
+            "claiming a self-owned slot must restore the in-flight"
+        );
+    }
+
+    #[tokio::test]
+    async fn abandon_mint_recovery_guard_keeps_active_mint_owned_by_other_id() {
+        let (trigger, _receiver) = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let recovering_id = IssuerRequestId::new("recovering-mint");
+        let other_id = IssuerRequestId::new("other-active-mint");
+
+        // A different aggregate owns the symbol's active-mint slot (e.g. a
+        // concurrent mint). Abandoning the recovering mint's guard must NOT clear
+        // a slot it does not own.
+        *trigger.inventory.write().await = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(100))
+            .set_active_mint(symbol.clone(), other_id.clone());
+
+        trigger
+            .abandon_mint_recovery_guard(&recovering_id, &symbol)
+            .await;
+
+        assert_eq!(
+            trigger.inventory.read().await.active_mint(&symbol),
+            Some(&other_id),
+            "abandon must not clear an active-mint slot owned by a different aggregate"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_after_explicit_mint_dispatch_failure_restores_available() {
+        let (trigger, _receiver) = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mint_id = IssuerRequestId::new("mint-explicit-rollback");
+        let tok = TokenizationRequestId("TOK-1".to_string());
+
+        // Explicit failure cancelled the in-flight back to available: 100/0.
+        *trigger.inventory.write().await =
+            InventoryView::default().with_equity(symbol.clone(), shares(0), shares(100));
+
+        let failed = TokenizedEquityMint::Failed {
+            symbol: symbol.clone(),
+            quantity: float!(10),
+            reason: "rejected".to_string(),
+            requested_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+
+        let rollback = trigger
+            .rebuild_mint_tracking_for_recovery(&mint_id, &failed, tok)
+            .await
+            .unwrap()
+            .expect_claimed();
+
+        // Rebuild moved available -> in-flight and installed tracking.
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(10))
+        );
+        assert!(trigger.mint_tracking.read().await.contains_key(&mint_id));
+
+        // The dispatch failed before the reactor ran; rolling back must restore
+        // the pre-recovery failed-mint shape.
+        trigger
+            .rollback_mint_tracking_for_recovery(
+                &mint_id,
+                &symbol,
+                FractionalShares::new(float!(10)),
+                rollback,
+            )
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::Hedging),
+            Some(shares(100))
+        );
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(0))
+        );
+        assert_eq!(inventory.active_mint(&symbol), None);
+        drop(inventory);
+        assert!(!trigger.mint_tracking.read().await.contains_key(&mint_id));
+        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+    }
+
+    #[tokio::test]
+    async fn rollback_after_timeout_mint_dispatch_failure_restores_tombstone() {
+        let (trigger, _receiver) = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mint_id = IssuerRequestId::new("mint-timeout-rollback");
+        let tok = TokenizationRequestId("TOK-1".to_string());
+        let tombstone_at = Utc::now();
+
+        // Timeout shape: available debited to 90, in-flight cleared, tombstoned.
+        *trigger.inventory.write().await =
+            InventoryView::default().with_equity(symbol.clone(), shares(0), shares(90));
+        trigger
+            .timed_out_mints
+            .write()
+            .await
+            .insert(mint_id.clone(), tombstone_at);
+        trigger
+            .suppressed_inflight_symbols
+            .write()
+            .await
+            .insert(symbol.clone(), tombstone_at);
+
+        let failed = TokenizedEquityMint::Failed {
+            symbol: symbol.clone(),
+            quantity: float!(10),
+            reason: "timeout".to_string(),
+            requested_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+
+        let rollback = trigger
+            .rebuild_mint_tracking_for_recovery(&mint_id, &failed, tok)
+            .await
+            .unwrap()
+            .expect_claimed();
+
+        // Rebuild dropped the tombstone and re-set the in-flight.
+        assert!(!trigger.timed_out_mints.read().await.contains_key(&mint_id));
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(10))
+        );
+
+        trigger
+            .rollback_mint_tracking_for_recovery(
+                &mint_id,
+                &symbol,
+                FractionalShares::new(float!(10)),
+                rollback,
+            )
+            .await
+            .unwrap();
+
+        // The tombstone + suppressed marker are restored and the in-flight is
+        // re-cleared without crediting available (it stays debited at 90).
+        assert_eq!(
+            trigger.timed_out_mints.read().await.get(&mint_id),
+            Some(&tombstone_at)
+        );
+        assert!(
+            trigger
+                .suppressed_inflight_symbols
+                .read()
+                .await
+                .contains_key(&symbol)
+        );
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::Hedging),
+            Some(shares(90))
+        );
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(0))
+        );
+        drop(inventory);
+        assert!(!trigger.mint_tracking.read().await.contains_key(&mint_id));
+        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+    }
+
+    #[tokio::test]
+    async fn rollback_after_timeout_redemption_dispatch_failure_restores_tombstone() {
+        let (trigger, _receiver) = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let redemption_id = RedemptionAggregateId::new("redemption-timeout-rollback");
+        let tombstone_at = Utc::now();
+
+        // Timeout cleared the MarketMaking in-flight and tombstoned; 90/0.
+        *trigger.inventory.write().await =
+            InventoryView::default().with_equity(symbol.clone(), shares(90), shares(0));
+        trigger
+            .timed_out_redemptions
+            .write()
+            .await
+            .insert(redemption_id.clone(), tombstone_at);
+        trigger
+            .suppressed_inflight_symbols
+            .write()
+            .await
+            .insert(symbol.clone(), tombstone_at);
+
+        let failed = EquityRedemption::Failed {
+            symbol: symbol.clone(),
+            quantity: float!(10),
+            raindex_withdraw_tx: None,
+            redemption_tx: Some(TxHash::random()),
+            tokenization_request_id: Some(TokenizationRequestId("TOK-2".to_string())),
+            reason: Some("timeout".to_string()),
+            started_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+
+        let rollback = trigger
+            .rebuild_redemption_tracking_for_recovery(&redemption_id, &failed)
+            .await
+            .unwrap()
+            .expect_claimed();
+
+        assert!(
+            !trigger
+                .timed_out_redemptions
+                .read()
+                .await
+                .contains_key(&redemption_id)
+        );
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_inflight(&symbol, Venue::MarketMaking),
+            Some(shares(10))
+        );
+
+        trigger
+            .rollback_redemption_tracking_for_recovery(&redemption_id, &symbol, rollback)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            trigger
+                .timed_out_redemptions
+                .read()
+                .await
+                .get(&redemption_id),
+            Some(&tombstone_at)
+        );
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(90))
+        );
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::MarketMaking),
+            Some(shares(0))
+        );
+        drop(inventory);
+        assert!(
+            !trigger
+                .redemption_tracking
+                .read()
+                .await
+                .contains_key(&redemption_id)
+        );
+        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+    }
+
+    #[tokio::test]
+    async fn rollback_after_explicit_redemption_dispatch_failure_keeps_inflight() {
+        let (trigger, _receiver) = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let redemption_id = RedemptionAggregateId::new("redemption-explicit-rollback");
+
+        // An explicit failure left the MarketMaking in-flight in place: 90
+        // available, 10 in-flight. Rebuild does not touch inventory here.
+        *trigger.inventory.write().await = InventoryView::default()
+            .with_equity(symbol.clone(), shares(90), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::set_inflight(Venue::MarketMaking, shares(10)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let failed = EquityRedemption::Failed {
+            symbol: symbol.clone(),
+            quantity: float!(10),
+            raindex_withdraw_tx: None,
+            redemption_tx: Some(TxHash::random()),
+            tokenization_request_id: Some(TokenizationRequestId("TOK-2".to_string())),
+            reason: Some("rejected".to_string()),
+            started_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+
+        let rollback = trigger
+            .rebuild_redemption_tracking_for_recovery(&redemption_id, &failed)
+            .await
+            .unwrap()
+            .expect_claimed();
+
+        trigger
+            .rollback_redemption_tracking_for_recovery(&redemption_id, &symbol, rollback)
+            .await
+            .unwrap();
+
+        // The held in-flight is untouched (rebuild never restored it); only the
+        // tracking + in-progress guard are dropped.
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_inflight(&symbol, Venue::MarketMaking),
+            Some(shares(10))
+        );
+        assert!(
+            !trigger
+                .redemption_tracking
+                .read()
+                .await
+                .contains_key(&redemption_id)
+        );
+        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+    }
+
+    #[tokio::test]
+    async fn rollback_redemption_clears_self_owned_active_redemption() {
+        let (trigger, _receiver) = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let redemption_id = RedemptionAggregateId::new("redemption-self-owned");
+
+        // Explicit-failure shape with the slot still self-owned (a reactor-less
+        // failure the live process never observed -- the claim treats this as
+        // recoverable). The dispatch then fails, so rollback must clear the now
+        // stale active_redemption rather than strand a phantom.
+        *trigger.inventory.write().await = InventoryView::default()
+            .with_equity(symbol.clone(), shares(90), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::set_inflight(Venue::MarketMaking, shares(10)),
+                Utc::now(),
+            )
+            .unwrap()
+            .set_active_redemption(symbol.clone(), redemption_id.clone());
+
+        let failed = EquityRedemption::Failed {
+            symbol: symbol.clone(),
+            quantity: float!(10),
+            raindex_withdraw_tx: None,
+            redemption_tx: Some(TxHash::random()),
+            tokenization_request_id: Some(TokenizationRequestId("TOK-2".to_string())),
+            reason: Some("rejected".to_string()),
+            started_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+
+        let rollback = trigger
+            .rebuild_redemption_tracking_for_recovery(&redemption_id, &failed)
+            .await
+            .unwrap()
+            .expect_claimed();
+
+        trigger
+            .rollback_redemption_tracking_for_recovery(&redemption_id, &symbol, rollback)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            trigger.inventory.read().await.active_redemption(&symbol),
+            None,
+            "rollback must clear the stale self-owned active_redemption slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_redemption_keeps_active_redemption_owned_by_other_id() {
+        let (trigger, _receiver) = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let redemption_id = RedemptionAggregateId::new("redemption-rollback");
+        let other_id = RedemptionAggregateId::new("other-redemption");
+
+        // No owner at claim time -> claim succeeds.
+        *trigger.inventory.write().await = InventoryView::default()
+            .with_equity(symbol.clone(), shares(90), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::set_inflight(Venue::MarketMaking, shares(10)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let failed = EquityRedemption::Failed {
+            symbol: symbol.clone(),
+            quantity: float!(10),
+            raindex_withdraw_tx: None,
+            redemption_tx: Some(TxHash::random()),
+            tokenization_request_id: Some(TokenizationRequestId("TOK-2".to_string())),
+            reason: Some("rejected".to_string()),
+            started_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+
+        let rollback = trigger
+            .rebuild_redemption_tracking_for_recovery(&redemption_id, &failed)
+            .await
+            .unwrap()
+            .expect_claimed();
+
+        // A concurrent redemption claims the slot before rollback runs; the
+        // ownership re-check must leave that claim intact.
+        {
+            let mut inventory = trigger.inventory.write().await;
+            *inventory = inventory
+                .clone()
+                .set_active_redemption(symbol.clone(), other_id.clone());
+        }
+
+        trigger
+            .rollback_redemption_tracking_for_recovery(&redemption_id, &symbol, rollback)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            trigger.inventory.read().await.active_redemption(&symbol),
+            Some(&other_id),
+            "rollback must not clear a slot owned by a different redemption"
+        );
     }
 
     #[tokio::test]
@@ -3830,7 +5188,6 @@ mod tests {
     fn make_tokens_received() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::TokensReceived {
             tx_hash: TxHash::random(),
-            receipt_id: ReceiptId(U256::from(789)),
             shares_minted: U256::from(30_000_000_000_000_000_000_u128),
             fees: None,
             received_at: Utc::now(),

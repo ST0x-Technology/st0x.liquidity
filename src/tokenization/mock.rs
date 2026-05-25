@@ -222,6 +222,19 @@ impl Tokenizer for MockTokenizer {
         }
     }
 
+    async fn get_request(
+        &self,
+        id: &TokenizationRequestId,
+    ) -> Result<TokenizationRequest, TokenizerError> {
+        self.pending_requests
+            .iter()
+            .find(|request| &request.id == id)
+            .cloned()
+            .ok_or_else(|| {
+                TokenizerError::Alpaca(AlpacaTokenizationError::RequestNotFound { id: id.clone() })
+            })
+    }
+
     fn redemption_wallet(&self) -> Option<Address> {
         self.redemption_wallet
     }
@@ -260,6 +273,17 @@ impl Tokenizer for MockTokenizer {
                 }))
             }
         }
+    }
+
+    async fn find_redemption_by_tx(
+        &self,
+        tx_hash: &TxHash,
+    ) -> Result<Option<TokenizationRequest>, TokenizerError> {
+        Ok(self
+            .pending_requests
+            .iter()
+            .find(|request| request.tx_hash.as_ref() == Some(tx_hash))
+            .cloned())
     }
 
     async fn poll_redemption_until_complete(

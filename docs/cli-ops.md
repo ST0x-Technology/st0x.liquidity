@@ -123,3 +123,64 @@ stox alpaca-transfers --pending      # Only pending transfers
 ```
 stox alpaca-tokenization-requests
 ```
+
+### Rechecking Failed Equity Transfers
+
+Use `recheck-transfer` when the bot marked an equity mint or redemption as
+failed, but Alpaca later shows the same provider request as completed.
+
+**The bot must be running.** `recheck-transfer` delegates to the bot's REST API
+(`POST /transfers/recheck/<kind>/<id>` on the configured `server_port`) rather
+than mutating the database directly. Recovery has to run inside the bot process
+so the recovery event dispatches through the in-process inventory reactor (which
+corrects the live inventory view) and shares the bot's resume lock (so it cannot
+race `/transfers/resume` into a double on-chain wrap).
+
+> **Operational guardrail:** like `/transfers/resume`, the `/transfers/recheck`
+> endpoint is currently **unauthenticated** — any caller that can reach
+> `server_port` can recover live transfers and trigger inventory-affecting
+> workflow steps. Until an auth guard is added, the bot's `server_port` **must**
+> be bound to an operator-only/firewalled interface and never exposed publicly.
+
+Recoverable cases:
+
+- Mint failed at acceptance (accepted by Alpaca, but tokens never received),
+  then Alpaca later reports the mint completed.
+  `stox recheck-transfer --type mint --id <issuer-request-id>` records provider
+  completion and resumes wrapping/depositing to Raindex. A mint that already
+  received tokens and then failed while wrapping or depositing is **not**
+  recoverable this way (recovery would re-wrap tokens that already moved); the
+  command reports it as not recoverable.
+- Redemption failed after tokens were sent, with a redemption tx in the
+  aggregate.
+  `stox recheck-transfer --type redemption --id <redemption-aggregate-id>`
+  completes it if Alpaca now reports completed.
+- Non-failed active mints/redemptions can also be passed to `recheck-transfer`;
+  the command resumes the normal workflow instead of forcing recovery.
+
+The command prints the recovery outcome: `recovered`, `resumed`,
+`already_completed`, `left_unchanged`, `not_detected_yet`, or `not_recoverable`.
+
+Not covered by `recheck-transfer` yet:
+
+- Mint requests rejected before Alpaca acceptance. There is no provider
+  completion to discover.
+- Mints that failed after receiving tokens (wrapping/deposit failures). The
+  tokens already left the issuer, so provider-completion recovery does not
+  apply.
+- Redemptions that failed before tokens were sent. The bot has no provider tx or
+  request id to look up, so this needs a retry/resume-send style CLI.
+- Provider rejections. These remain failed unless an operator performs a
+  separate manual reconciliation.
+- USDC rebalancing failures. Those use the USDC/CCTP state machine and need
+  separate recovery commands.
+
+For local dashboard testing, run:
+
+```
+nix run .#simulate-failures
+```
+
+The backend creates failed mint and redemption transfers whose mock Alpaca
+provider later completes, then prints the exact `recheck-transfer` commands for
+that run's generated config, secrets, database, and mock API port.

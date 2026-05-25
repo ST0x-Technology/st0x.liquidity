@@ -2012,6 +2012,19 @@ know about cross-venue inventory.
   `DetectionFailed` (ownership dropped so polls stop counting the stranded
   request and rebalancing resumes), while operators resolve the actual asset
   location manually
+- Failed equity transfer detail views surface the stranded quantity when the
+  terminal failure happened after equity left the bot's normal available
+  balance. Operators can run a targeted re-check command for a specific failed
+  mint or redemption aggregate; if the tokenization provider now reports the
+  request completed, the aggregate records recovery events and transitions to
+  the same success terminal as the normal flow. Pending, rejected, or missing
+  provider requests leave the aggregate unchanged. Recovery runs in-process via
+  the bot's REST API (`POST /transfers/recheck/<kind>/<id>`) so the recovery
+  event dispatches through the inventory reactor (applying the same inventory
+  effect as the successful flow) under the shared resume lock. Mint recovery
+  applies only to acceptance-stage failures (tokens never received); a mint that
+  failed after receiving tokens is reported as not recoverable so recovery never
+  re-wraps tokens that already moved.
 - `UsdcRebalanceEvent::WithdrawalConfirmed` - Moves USDC to inflight (leaving
   source)
 - `UsdcRebalanceEvent::DepositConfirmed` - Terminal success for AlpacaToBase;

@@ -107,6 +107,13 @@ impl<W: Wallet> AlpacaTokenizationService<W> {
             .await
     }
 
+    pub(crate) async fn get_request(
+        &self,
+        id: &TokenizationRequestId,
+    ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
+        self.client.get_request(id).await
+    }
+
     /// Returns the redemption wallet address, if configured.
     pub(crate) fn redemption_wallet(&self) -> Option<Address> {
         self.client.redemption_wallet
@@ -131,6 +138,13 @@ impl<W: Wallet> AlpacaTokenizationService<W> {
         self.client
             .poll_for_redemption_detection(tx_hash, &self.polling_config)
             .await
+    }
+
+    pub(crate) async fn find_redemption_by_tx(
+        &self,
+        tx_hash: &TxHash,
+    ) -> Result<Option<TokenizationRequest>, AlpacaTokenizationError> {
+        self.client.find_redemption_by_tx(tx_hash).await
     }
 
     /// Poll a redemption request until it reaches a terminal state.
@@ -874,6 +888,13 @@ impl<W: Wallet> Tokenizer for AlpacaTokenizationService<W> {
         Ok(Self::poll_mint_until_complete(self, id).await?)
     }
 
+    async fn get_request(
+        &self,
+        id: &TokenizationRequestId,
+    ) -> Result<TokenizationRequest, TokenizerError> {
+        Ok(Self::get_request(self, id).await?)
+    }
+
     fn redemption_wallet(&self) -> Option<Address> {
         Self::redemption_wallet(self)
     }
@@ -891,6 +912,13 @@ impl<W: Wallet> Tokenizer for AlpacaTokenizationService<W> {
         tx_hash: &TxHash,
     ) -> Result<TokenizationRequest, TokenizerError> {
         Ok(Self::poll_for_redemption(self, tx_hash).await?)
+    }
+
+    async fn find_redemption_by_tx(
+        &self,
+        tx_hash: &TxHash,
+    ) -> Result<Option<TokenizationRequest>, TokenizerError> {
+        Ok(Self::find_redemption_by_tx(self, tx_hash).await?)
     }
 
     async fn poll_redemption_until_complete(

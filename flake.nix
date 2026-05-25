@@ -311,6 +311,67 @@
               '';
             };
 
+            # Mock infra + bot + dashboard + recoverable failure injection.
+            #
+            # Run with `nix run .#simulate-failures`, press `q` to exit.
+            # Starts the same live dashboard stack as simulate, but first
+            # creates stuck mint and redemption rebalances whose Alpaca mock
+            # provider later completes. The backend logs the recheck-transfer
+            # commands needed to recover them.
+            "simulate-failures" = pkgs.writeShellApplication {
+              name = "simulate-failures";
+              runtimeInputs = [
+                pkgs.mprocs
+                pkgs.bun
+                pkgs.cargo-nextest
+                rainix.rust-toolchain.${system}
+              ];
+              text = ''
+                                port_free() {
+                                  ! (echo >"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+                                }
+
+                                offset=0
+                                max_offset=9
+                                while (( offset <= max_offset )); do
+                                  bot_port=$((8001 + offset))
+                                  vite_port=$((5173 + offset))
+                                  mock_api_port=$((8099 + offset))
+                                  if port_free "$bot_port" \
+                                    && port_free "$vite_port" \
+                                    && port_free "$mock_api_port"; then
+                                    break
+                                  fi
+                                  offset=$((offset + 1))
+                                done
+
+                                if (( offset > max_offset )); then
+                                  echo "simulate-failures: no free port offset in [0..$max_offset]" >&2
+                                  exit 1
+                                fi
+
+                                echo "simulate-failures: offset=$offset (bot=$bot_port \
+                vite=$vite_port mock_api=$mock_api_port)"
+
+                                backend="SIMULATE_BOT_PORT=$bot_port \
+                                  cargo nextest run --test e2e \
+                                  -E 'test(=full_system::simulate_failures)' \
+                                  --run-ignored ignored-only --no-capture"
+
+                                dashboard="cd dashboard && \
+                                  BACKEND_PORT=$bot_port \
+                                  PUBLIC_BACKEND_PORT=$bot_port \
+                                  PUBLIC_SIMULATE_REV=${self.shortRev or self.dirtyShortRev or "unknown"} \
+                                  PUBLIC_SIMULATE_SOURCE_ID=${builtins.substring 0 8 (baseNameOf self.outPath)} \
+                                  bun run dev --port=$vite_port --strictPort --open"
+
+                                mockApi="MOCK_REST_API_PORT=$mock_api_port \
+                                  bun run e2e/mock-rest-api.ts"
+
+                                exec mprocs "$backend" "$dashboard" "$mockApi"
+              '';
+            };
+
             # Sandbox-runnable test for scripts/patch-rain-math-float.nu so
             # the patch logic can't silently rot when upstream drifts.
             test-patch-rain-math-float =

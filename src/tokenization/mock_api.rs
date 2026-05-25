@@ -253,6 +253,49 @@ impl AlpacaTokenizationMock {
         lock(&self.state).polls_until_complete = polls_until_complete;
     }
 
+    /// Overrides one existing pending request's poll threshold.
+    pub fn set_request_polls_until_complete(&self, request_id: &str, polls_until_complete: usize) {
+        if let Some(request) = lock(&self.state)
+            .requests
+            .iter_mut()
+            .find(|request| request.tokenization_request_id == request_id)
+        {
+            request.polls_until_complete = polls_until_complete;
+        }
+    }
+
+    /// Overrides one existing request's status for recovery simulations.
+    ///
+    /// Forcing a redemption to `Completed` also returns its shares to the broker
+    /// -- the same side effect the normal poll path applies on completion.
+    /// Without it the provider would report "completed" while the broker position
+    /// still reflected a pending redemption, an inconsistent simulated world that
+    /// could mask or invent recovery bugs in E2E scenarios.
+    pub fn set_request_status(&self, request_id: &str, status: TokenizationStatus) {
+        let mut state = lock(&self.state);
+        let Some(request) = state
+            .requests
+            .iter_mut()
+            .find(|request| request.tokenization_request_id == request_id)
+        else {
+            return;
+        };
+
+        request.status = status;
+        let completed_redemption = request.status == TokenizationStatus::Completed
+            && request.request_type == TokenizationRequestType::Redeem;
+        let underlying_symbol = request.underlying_symbol.clone();
+        let quantity = request.quantity;
+        drop(state);
+
+        if completed_redemption
+            && let Ok(symbol) = Symbol::new(&underlying_symbol)
+            && let Err(error) = self.broker.adjust_position(&symbol, quantity)
+        {
+            warn!(target: "tokenization", %error, "failed to adjust broker position after forced redemption completion");
+        }
+    }
+
     /// Injects a pending tokenization request with an arbitrary wallet
     /// address. Used to simulate requests from other conductors sharing
     /// the same Alpaca account.

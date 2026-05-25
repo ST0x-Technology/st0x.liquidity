@@ -260,6 +260,10 @@ impl Conductor {
             failure_injector: ctx.failure_injector.clone(),
         };
 
+        // Clone before the builder consumes it; the recovery handle needs the
+        // rebalancing service to rebuild tracking during recheck recovery.
+        let recovery_rebalancing_service = rebalancing_service.clone();
+
         let mut conductor = builder::spawn()
             .context(conductor_ctx)
             .job_queue(job_queue)
@@ -280,8 +284,13 @@ impl Conductor {
         // Publish the recovery handle only after all startup work
         // (inventory hydration, orphan recovery, store builds) completes
         // so /transfers/resume returns 503 until the conductor is ready.
-        if let Some(transfer) = recovery_transfer {
-            let _ = recovery_cell.set(crate::api::RecoveryHandle { transfer });
+        if let (Some(transfer), Some(rebalancing_service)) =
+            (recovery_transfer, recovery_rebalancing_service)
+        {
+            let _ = recovery_cell.set(crate::api::RecoveryHandle {
+                transfer,
+                rebalancing_service,
+            });
         }
 
         info!("Conductor is running");

@@ -44,7 +44,7 @@ sol!(
 
 // ERC20 with configurable name, symbol, and decimals via constructor args.
 // Distinct from `TestERC20` (ArbTest Token) which has a no-arg constructor.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "mock", feature = "test-support"))]
 sol!(
     #![sol(all_derives = true, rpc)]
     #[derive(serde::Serialize, serde::Deserialize)]

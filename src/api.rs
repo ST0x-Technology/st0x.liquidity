@@ -5,6 +5,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::LazyLock;
 
+use alloy::primitives::U256;
 use chrono::{DateTime, Utc};
 use rocket::form::{self, FromFormField, ValueField};
 use rocket::http::Status;
@@ -17,9 +18,14 @@ use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 use tracing::{error, info};
 
+use st0x_execution::{FractionalShares, SharesBlockchain};
+
 use crate::config::Ctx;
 use crate::dashboard::transfer_loader::TransferKind;
-use crate::rebalancing::equity::CrossVenueEquityTransfer;
+use crate::equity_redemption::{EquityRedemptionEvent, RedemptionAggregateId};
+use crate::rebalancing::RebalancingService;
+use crate::rebalancing::equity::{CrossVenueEquityTransfer, RecheckError, RecheckOutcome};
+use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMintEvent};
 
 impl<'a> FromParam<'a> for TransferKind {
     type Error = String;
@@ -89,6 +95,46 @@ struct PendingOrderResponse {
     submitted_at: Option<String>,
     shares_filled: Option<String>,
     avg_price: Option<String>,
+}
+
+/// Where the stranded equity physically sits for a failed transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(crate = "rocket::serde", rename_all = "snake_case")]
+enum StuckLocation {
+    /// At the issuer (Alpaca): a mint was accepted but failed before tokens
+    /// were received on-chain.
+    Issuer,
+    /// In the bot wallet as unwrapped tokenized equity: a mint received tokens
+    /// but failed while wrapping.
+    BotWalletUnwrapped,
+    /// In the bot wallet as wrapped vault shares: a mint wrapped tokens but
+    /// failed depositing into Raindex.
+    BotWalletWrapped,
+    /// In the redemption wallet: a redemption sent tokens but failed during
+    /// detection or was rejected.
+    RedemptionWallet,
+}
+
+/// Why a transfer is stranded, mirroring the terminal failure event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(crate = "rocket::serde", rename_all = "snake_case")]
+enum StuckReason {
+    MintAcceptanceFailed,
+    WrappingFailed,
+    RaindexDepositFailed,
+    DetectionFailed,
+    RedemptionRejected,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(crate = "rocket::serde")]
+struct StuckTransferInfo {
+    #[serde(rename = "stuckAmount")]
+    amount: String,
+    #[serde(rename = "stuckLocation")]
+    location: StuckLocation,
+    #[serde(rename = "stuckReason")]
+    reason: StuckReason,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -773,17 +819,13 @@ async fn transfer_events(
         }
     };
 
-    let events: Vec<serde_json::Value> = rows
-        .into_iter()
-        .map(|(event_type, payload, sequence)| {
-            let step = event_type.split("::").last().unwrap_or("Unknown");
-            let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap_or_default();
+    let stuck = stuck_transfer_info(kind, &rows);
 
-            // Unwrap the variant key: {"MintRequested": {fields...}} -> {fields...}
-            let inner = parsed
-                .as_object()
-                .and_then(|obj| obj.get(step).cloned())
-                .unwrap_or(parsed);
+    let events: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(event_type, payload, sequence)| {
+            let step = event_step(event_type);
+            let inner = event_payload_inner(step, payload);
 
             serde_json::json!({
                 "step": step,
@@ -793,7 +835,216 @@ async fn transfer_events(
         })
         .collect();
 
-    Some(Json(serde_json::json!({ "events": events })))
+    Some(Json(serde_json::json!({
+        "events": events,
+        "stuck": stuck,
+    })))
+}
+
+fn event_step(event_type: &str) -> &str {
+    event_type.split("::").last().unwrap_or("Unknown")
+}
+
+fn event_payload_inner(step: &str, payload: &str) -> serde_json::Value {
+    let parsed: serde_json::Value = serde_json::from_str(payload)
+        .inspect_err(|error| {
+            tracing::warn!(
+                target: "dashboard",
+                %error,
+                step,
+                "Failed to parse event payload for display"
+            );
+        })
+        .unwrap_or_default();
+
+    parsed
+        .as_object()
+        .and_then(|obj| obj.get(step).cloned())
+        .unwrap_or(parsed)
+}
+
+fn stuck_transfer_info(
+    kind: TransferKind,
+    rows: &[(String, String, i64)],
+) -> Option<StuckTransferInfo> {
+    match kind {
+        TransferKind::EquityMint => stuck_mint_info(rows),
+        TransferKind::EquityRedemption => stuck_redemption_info(rows),
+        TransferKind::UsdcBridge => None,
+    }
+}
+
+/// Parses each persisted event payload into the typed mint event so the
+/// terminal-failure classification is checked exhaustively by the compiler:
+/// renaming or adding a variant forces this match to be updated, unlike a
+/// match on raw event-name strings.
+fn stuck_mint_info(rows: &[(String, String, i64)]) -> Option<StuckTransferInfo> {
+    use TokenizedEquityMintEvent::*;
+
+    let mut quantity = None;
+    let mut accepted = false;
+    let mut terminal = None;
+
+    for (event_type, payload, sequence) in rows {
+        let Some(event) = parse_event::<TokenizedEquityMintEvent>(event_type, payload, *sequence)
+        else {
+            continue;
+        };
+
+        match event {
+            MintRequested {
+                quantity: requested,
+                ..
+            } => quantity = Some(FractionalShares::new(requested).to_string()),
+            MintAccepted { .. } => accepted = true,
+            MintAcceptanceFailed { .. } if accepted => {
+                terminal = Some((StuckLocation::Issuer, StuckReason::MintAcceptanceFailed));
+            }
+            WrappingFailed { .. } => {
+                terminal = Some((
+                    StuckLocation::BotWalletUnwrapped,
+                    StuckReason::WrappingFailed,
+                ));
+            }
+            RaindexDepositFailed { .. } => {
+                terminal = Some((
+                    StuckLocation::BotWalletWrapped,
+                    StuckReason::RaindexDepositFailed,
+                ));
+            }
+            // Neither strands equity: a rejected mint never left the issuer,
+            // and a deposited mint completed successfully.
+            MintRejected { .. } | DepositedIntoRaindex { .. } => return None,
+            // Recovery un-failed the mint and put it back on the success path,
+            // so any stuck state observed before it no longer applies; the
+            // mint is re-derived from subsequent events (it may fail again).
+            ProviderCompletionRecovered { .. } => terminal = None,
+            MintAcceptanceFailed { .. }
+            | TokensReceived { .. }
+            | WrapSubmitted { .. }
+            | TokensWrapped { .. }
+            | VaultDepositSubmitted { .. } => {}
+        }
+    }
+
+    let (location, reason) = terminal?;
+    let amount = quantity?;
+
+    Some(StuckTransferInfo {
+        amount,
+        location,
+        reason,
+    })
+}
+
+fn stuck_redemption_info(rows: &[(String, String, i64)]) -> Option<StuckTransferInfo> {
+    use EquityRedemptionEvent::*;
+
+    let mut requested_quantity: Option<String> = None;
+    let mut withdrawn_amount: Option<U256> = None;
+    let mut unwrapped_quantity: Option<String> = None;
+    let mut sent = false;
+    let mut terminal = None;
+
+    for (event_type, payload, sequence) in rows {
+        let Some(event) = parse_event::<EquityRedemptionEvent>(event_type, payload, *sequence)
+        else {
+            continue;
+        };
+
+        match event {
+            VaultWithdrawPending { quantity, .. } | VaultWithdrawSubmitted { quantity, .. } => {
+                requested_quantity = requested_quantity
+                    .or_else(|| Some(FractionalShares::new(quantity).to_string()));
+            }
+            WithdrawnFromRaindex {
+                quantity,
+                wrapped_amount,
+                actual_wrapped_amount,
+                ..
+            } => {
+                requested_quantity = requested_quantity
+                    .or_else(|| Some(FractionalShares::new(quantity).to_string()));
+                withdrawn_amount = Some(actual_wrapped_amount.unwrap_or(wrapped_amount));
+            }
+            TokensUnwrapped {
+                quantity,
+                unwrapped_amount,
+                ..
+            } => {
+                // Prefer the recorded share quantity; when absent (older events),
+                // fall back to the actual unwrapped underlying amount -- the tokens
+                // physically stranded in the redemption wallet -- rather than the
+                // wrapped withdrawn amount, which can differ on a non-1:1 ratio.
+                unwrapped_quantity = quantity
+                    .map(|qty| FractionalShares::new(qty).to_string())
+                    .or_else(|| shares_from_u256_18_decimal(unwrapped_amount));
+            }
+            TokensSent { .. } => sent = true,
+            DetectionFailed { .. } if sent => {
+                terminal = Some((
+                    StuckLocation::RedemptionWallet,
+                    StuckReason::DetectionFailed,
+                ));
+            }
+            RedemptionRejected { .. } if sent => {
+                terminal = Some((
+                    StuckLocation::RedemptionWallet,
+                    StuckReason::RedemptionRejected,
+                ));
+            }
+            // A terminal success (including recovery, which evolves straight to
+            // Completed) means nothing is stranded.
+            TransferFailed { .. } | Completed { .. } | ProviderCompletionRecovered { .. } => {
+                return None;
+            }
+            DetectionFailed { .. }
+            | RedemptionRejected { .. }
+            | UnwrapPending { .. }
+            | UnwrapSubmitted { .. }
+            | SendPending { .. }
+            | Detected { .. } => {}
+        }
+    }
+
+    let (location, reason) = terminal?;
+    let amount = unwrapped_quantity
+        .or_else(|| withdrawn_amount.and_then(shares_from_u256_18_decimal))
+        .or(requested_quantity)?;
+
+    Some(StuckTransferInfo {
+        amount,
+        location,
+        reason,
+    })
+}
+
+/// Deserializes a persisted event row into its typed event, logging and
+/// skipping on failure. Persisted events are always well-formed (written by
+/// the framework), so a failure here signals a schema mismatch worth surfacing
+/// rather than silently dropping stuck detection.
+fn parse_event<Event: serde::de::DeserializeOwned>(
+    event_type: &str,
+    payload: &str,
+    sequence: i64,
+) -> Option<Event> {
+    serde_json::from_str(payload)
+        .inspect_err(|error| {
+            tracing::warn!(
+                target: "dashboard",
+                %error,
+                %event_type,
+                sequence,
+                "Failed to parse event for stuck detection"
+            );
+        })
+        .ok()
+}
+
+fn shares_from_u256_18_decimal(amount: U256) -> Option<String> {
+    FractionalShares::from_u256_18_decimals(amount)
+        .ok()
+        .map(|shares| shares.to_string())
 }
 
 /// Returns the full event history for a single trade aggregate.
@@ -920,10 +1171,15 @@ struct ErrorResponse {
     error: String,
 }
 
-/// Shared handle for resuming interrupted tokenization transfers at
-/// runtime, set by the conductor after startup completes.
+/// Shared handle for resuming interrupted tokenization transfers and
+/// re-checking failed ones at runtime, set by the conductor after startup
+/// completes.
 pub(crate) struct RecoveryHandle {
     pub(crate) transfer: Arc<CrossVenueEquityTransfer>,
+    /// Needed by `recheck` recovery to rebuild in-memory tracking before the
+    /// recovery event is dispatched, so the reactor applies its inventory
+    /// effect on the live bot.
+    pub(crate) rebalancing_service: Arc<RebalancingService>,
 }
 
 /// Prevents concurrent `/transfers/resume` requests from racing through
@@ -1063,6 +1319,123 @@ async fn resume_transfers(
     }))
 }
 
+#[derive(Serialize)]
+#[serde(crate = "rocket::serde", rename_all = "camelCase")]
+struct RecheckResponse {
+    outcome: RecheckOutcome,
+}
+
+/// Re-checks a single failed (or active) transfer against the tokenization
+/// provider, recovering it in-process so the live inventory view is corrected.
+///
+/// Runs inside the bot so the recovery event dispatches through the
+/// reactor-wired store; shares `resume_lock` with `/transfers/resume` so the
+/// two cannot race onchain wraps.
+///
+/// TODO(auth): like `/transfers/resume`, this mutation endpoint is currently
+/// unauthenticated. The `/transfers/*` mutation endpoints need an auth guard
+/// before the listener is exposed beyond the operator network -- tracked as a
+/// follow-up. Until then, deployment must keep the bind address firewalled.
+#[post("/transfers/recheck/<kind>/<id>")]
+async fn recheck_transfer(
+    pool: &State<SqlitePool>,
+    recovery: &State<Arc<tokio::sync::OnceCell<RecoveryHandle>>>,
+    resume_lock: &State<ResumeLock>,
+    kind: TransferKind,
+    id: &str,
+) -> Result<Json<RecheckResponse>, (Status, Json<ErrorResponse>)> {
+    let _guard = resume_lock.0.try_lock().map_err(|_| {
+        (
+            Status::Conflict,
+            Json(ErrorResponse {
+                error: "A resume or recheck operation is already in progress".to_string(),
+            }),
+        )
+    })?;
+
+    let handle = recovery.get().ok_or_else(|| {
+        (
+            Status::ServiceUnavailable,
+            Json(ErrorResponse {
+                error: "Recovery not ready yet (conductor still starting)".to_string(),
+            }),
+        )
+    })?;
+
+    let outcome = match kind {
+        TransferKind::EquityMint => {
+            handle
+                .transfer
+                .recover_mint(
+                    &IssuerRequestId::new(id),
+                    pool.inner(),
+                    &handle.rebalancing_service,
+                )
+                .await
+        }
+        TransferKind::EquityRedemption => {
+            let redemption_id = id.parse::<RedemptionAggregateId>().map_err(|error| {
+                (
+                    Status::BadRequest,
+                    Json(ErrorResponse {
+                        error: format!("Invalid redemption ID: {error}"),
+                    }),
+                )
+            })?;
+            handle
+                .transfer
+                .recover_redemption(&redemption_id, &handle.rebalancing_service)
+                .await
+        }
+        TransferKind::UsdcBridge => {
+            return Err((
+                Status::BadRequest,
+                Json(ErrorResponse {
+                    error: "recheck is not supported for USDC bridges".to_string(),
+                }),
+            ));
+        }
+    }
+    .map_err(|error| {
+        error!(?error, %id, "Failed to recheck transfer");
+        let (status, message) = recheck_error_response(&error);
+        (status, Json(ErrorResponse { error: message }))
+    })?;
+
+    info!(%id, ?kind, ?outcome, "Transfer recheck completed via API");
+
+    Ok(Json(RecheckResponse { outcome }))
+}
+
+/// Maps a [`RecheckError`] to an HTTP status and operator-facing message.
+///
+/// Distinguishes not-recoverable conditions (the persisted aggregate state
+/// does not permit provider-completion recovery -- retrying will not help) and
+/// transient upstream failures (the provider was unreachable -- retry later)
+/// from genuinely internal failures, so the operator running `recheck-transfer`
+/// during an incident learns whether to retry without reading bot logs. Bodies
+/// for the not-recoverable variants carry the typed error's message, which only
+/// references aggregate/request ids; internal failures stay generic so they do
+/// not leak internals (the full error is logged at the call site).
+fn recheck_error_response(error: &RecheckError) -> (Status, String) {
+    match error {
+        RecheckError::NoAcceptedRequest(_)
+        | RecheckError::MissingTxHash(_)
+        | RecheckError::MalformedWallet { .. } => (Status::UnprocessableEntity, error.to_string()),
+        RecheckError::Tokenizer(_) => (
+            Status::BadGateway,
+            "Tokenization provider unavailable; retry later".to_string(),
+        ),
+        RecheckError::Mint(_)
+        | RecheckError::Redemption(_)
+        | RecheckError::Rebalancing(_)
+        | RecheckError::Database(_) => (
+            Status::InternalServerError,
+            "Failed to recheck transfer".to_string(),
+        ),
+    }
+}
+
 pub(crate) fn routes() -> Vec<Route> {
     routes![
         health,
@@ -1074,7 +1447,8 @@ pub(crate) fn routes() -> Vec<Route> {
         transfer_events,
         raindex_orders,
         interrupted_transfers,
-        resume_transfers
+        resume_transfers,
+        recheck_transfer
     ]
 }
 
@@ -1086,9 +1460,343 @@ mod tests {
     use crate::config::tests::create_test_ctx_with_order_owner;
 
     #[test]
-    fn test_num_of_routes() {
-        let routes_list = routes();
-        assert_eq!(routes_list.len(), 10);
+    fn routes_include_recheck_transfer_endpoint() {
+        let recheck_routes: Vec<_> = routes()
+            .into_iter()
+            .filter(|route| {
+                route.method == rocket::http::Method::Post
+                    && route.uri.to_string().contains("/transfers/recheck/")
+            })
+            .collect();
+
+        assert_eq!(
+            recheck_routes.len(),
+            1,
+            "exactly one POST /transfers/recheck route must be wired into routes(), found: {:?}",
+            routes()
+                .iter()
+                .map(|route| format!("{} {}", route.method, route.uri))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn stuck_mint_info_reports_accepted_provider_failure() {
+        let rows = vec![
+            event_row(
+                "TokenizedEquityMintEvent::MintRequested",
+                r#"{"MintRequested":{"symbol":"AAPL","quantity":"12.5","wallet":"0x0000000000000000000000000000000000000001","requested_at":"2026-01-01T00:00:00Z"}}"#,
+                0,
+            ),
+            event_row(
+                "TokenizedEquityMintEvent::MintAccepted",
+                r#"{"MintAccepted":{"issuer_request_id":"mint-1","tokenization_request_id":"tok-1","accepted_at":"2026-01-01T00:00:01Z"}}"#,
+                1,
+            ),
+            event_row(
+                "TokenizedEquityMintEvent::MintAcceptanceFailed",
+                r#"{"MintAcceptanceFailed":{"reason":"timeout","failed_at":"2026-01-01T00:01:00Z"}}"#,
+                2,
+            ),
+        ];
+
+        let stuck = stuck_transfer_info(TransferKind::EquityMint, &rows).expect("stuck amount");
+
+        assert_eq!(stuck.amount, "12.5");
+        assert_eq!(stuck.location, StuckLocation::Issuer);
+        assert_eq!(stuck.reason, StuckReason::MintAcceptanceFailed);
+    }
+
+    #[test]
+    fn stuck_redemption_info_prefers_actual_unwrapped_quantity() {
+        let rows = vec![
+            event_row(
+                "EquityRedemptionEvent::VaultWithdrawPending",
+                r#"{"VaultWithdrawPending":{"symbol":"AAPL","quantity":"10","token":"0x0000000000000000000000000000000000000001","wrapped_amount":"10000000000000000000","pending_at":"2026-01-01T00:00:00Z"}}"#,
+                0,
+            ),
+            event_row(
+                "EquityRedemptionEvent::TokensUnwrapped",
+                r#"{"TokensUnwrapped":{"quantity":"9.75","underlying_token":"0x0000000000000000000000000000000000000002","unwrap_tx_hash":"0x1111111111111111111111111111111111111111111111111111111111111111","unwrapped_amount":"9750000000000000000","unwrapped_at":"2026-01-01T00:00:01Z"}}"#,
+                1,
+            ),
+            event_row(
+                "EquityRedemptionEvent::TokensSent",
+                r#"{"TokensSent":{"redemption_wallet":"0x0000000000000000000000000000000000000003","redemption_tx":"0x2222222222222222222222222222222222222222222222222222222222222222","sent_at":"2026-01-01T00:00:02Z"}}"#,
+                2,
+            ),
+            event_row(
+                "EquityRedemptionEvent::DetectionFailed",
+                r#"{"DetectionFailed":{"failure":"Timeout","failed_at":"2026-01-01T00:01:00Z"}}"#,
+                3,
+            ),
+        ];
+
+        let stuck =
+            stuck_transfer_info(TransferKind::EquityRedemption, &rows).expect("stuck amount");
+
+        assert_eq!(stuck.amount, "9.75");
+        assert_eq!(stuck.location, StuckLocation::RedemptionWallet);
+        assert_eq!(stuck.reason, StuckReason::DetectionFailed);
+    }
+
+    #[test]
+    fn stuck_mint_info_reports_wrapping_failure_in_bot_wallet() {
+        let rows = vec![
+            event_row(
+                "TokenizedEquityMintEvent::MintRequested",
+                r#"{"MintRequested":{"symbol":"AAPL","quantity":"7","wallet":"0x0000000000000000000000000000000000000001","requested_at":"2026-01-01T00:00:00Z"}}"#,
+                0,
+            ),
+            event_row(
+                "TokenizedEquityMintEvent::WrappingFailed",
+                r#"{"WrappingFailed":{"symbol":"AAPL","quantity":"7","reason":"revert","failed_at":"2026-01-01T00:01:00Z"}}"#,
+                1,
+            ),
+        ];
+
+        let stuck = stuck_transfer_info(TransferKind::EquityMint, &rows).expect("stuck amount");
+
+        assert_eq!(stuck.amount, "7");
+        assert_eq!(stuck.location, StuckLocation::BotWalletUnwrapped);
+        assert_eq!(stuck.reason, StuckReason::WrappingFailed);
+    }
+
+    #[test]
+    fn stuck_mint_info_reports_deposit_failure_as_wrapped_in_bot_wallet() {
+        let rows = vec![
+            event_row(
+                "TokenizedEquityMintEvent::MintRequested",
+                r#"{"MintRequested":{"symbol":"AAPL","quantity":"3.5","wallet":"0x0000000000000000000000000000000000000001","requested_at":"2026-01-01T00:00:00Z"}}"#,
+                0,
+            ),
+            event_row(
+                "TokenizedEquityMintEvent::RaindexDepositFailed",
+                r#"{"RaindexDepositFailed":{"reason":"revert","failed_at":"2026-01-01T00:01:00Z"}}"#,
+                1,
+            ),
+        ];
+
+        let stuck = stuck_transfer_info(TransferKind::EquityMint, &rows).expect("stuck amount");
+
+        assert_eq!(stuck.amount, "3.5");
+        assert_eq!(stuck.location, StuckLocation::BotWalletWrapped);
+        assert_eq!(stuck.reason, StuckReason::RaindexDepositFailed);
+    }
+
+    #[test]
+    fn stuck_mint_info_returns_none_for_completed_mint() {
+        let rows = vec![
+            event_row(
+                "TokenizedEquityMintEvent::MintRequested",
+                r#"{"MintRequested":{"symbol":"AAPL","quantity":"7","wallet":"0x0000000000000000000000000000000000000001","requested_at":"2026-01-01T00:00:00Z"}}"#,
+                0,
+            ),
+            event_row(
+                "TokenizedEquityMintEvent::DepositedIntoRaindex",
+                r#"{"DepositedIntoRaindex":{"vault_deposit_tx_hash":"0x1111111111111111111111111111111111111111111111111111111111111111","deposited_at":"2026-01-01T00:02:00Z"}}"#,
+                1,
+            ),
+        ];
+
+        assert!(stuck_transfer_info(TransferKind::EquityMint, &rows).is_none());
+    }
+
+    #[test]
+    fn stuck_redemption_info_cleared_after_provider_completion_recovery() {
+        let rows = vec![
+            event_row(
+                "EquityRedemptionEvent::VaultWithdrawPending",
+                r#"{"VaultWithdrawPending":{"symbol":"AAPL","quantity":"10","token":"0x0000000000000000000000000000000000000001","wrapped_amount":"10000000000000000000","pending_at":"2026-01-01T00:00:00Z"}}"#,
+                0,
+            ),
+            event_row(
+                "EquityRedemptionEvent::TokensSent",
+                r#"{"TokensSent":{"redemption_wallet":"0x0000000000000000000000000000000000000003","redemption_tx":"0x2222222222222222222222222222222222222222222222222222222222222222","sent_at":"2026-01-01T00:00:02Z"}}"#,
+                1,
+            ),
+            event_row(
+                "EquityRedemptionEvent::RedemptionRejected",
+                r#"{"RedemptionRejected":{"reason":"rejected","rejected_at":"2026-01-01T00:01:00Z"}}"#,
+                2,
+            ),
+            event_row(
+                "EquityRedemptionEvent::ProviderCompletionRecovered",
+                r#"{"ProviderCompletionRecovered":{"tokenization_request_id":"tok-1","recovered_at":"2026-01-01T00:02:00Z"}}"#,
+                3,
+            ),
+        ];
+
+        assert!(
+            stuck_transfer_info(TransferKind::EquityRedemption, &rows).is_none(),
+            "a recovered redemption must not be reported as stranded"
+        );
+    }
+
+    #[test]
+    fn stuck_transfer_info_serializes_to_dashboard_wire_format() {
+        let info = StuckTransferInfo {
+            amount: "12.5".to_string(),
+            location: StuckLocation::BotWalletWrapped,
+            reason: StuckReason::RaindexDepositFailed,
+        };
+
+        let json = serde_json::to_value(&info).expect("serialize stuck info");
+
+        assert_eq!(json["stuckAmount"], serde_json::json!("12.5"));
+        assert_eq!(
+            json["stuckLocation"],
+            serde_json::json!("bot_wallet_wrapped")
+        );
+        assert_eq!(
+            json["stuckReason"],
+            serde_json::json!("raindex_deposit_failed")
+        );
+    }
+
+    #[test]
+    fn stuck_mint_info_ignores_acceptance_failure_without_acceptance() {
+        // MintAcceptanceFailed without a preceding MintAccepted (the `if
+        // accepted` guard) means equity never left the issuer, so nothing is
+        // stranded.
+        let rows = vec![
+            event_row(
+                "TokenizedEquityMintEvent::MintRequested",
+                r#"{"MintRequested":{"symbol":"AAPL","quantity":"7","wallet":"0x0000000000000000000000000000000000000001","requested_at":"2026-01-01T00:00:00Z"}}"#,
+                0,
+            ),
+            event_row(
+                "TokenizedEquityMintEvent::MintAcceptanceFailed",
+                r#"{"MintAcceptanceFailed":{"reason":"never accepted","failed_at":"2026-01-01T00:01:00Z"}}"#,
+                1,
+            ),
+        ];
+
+        assert!(stuck_transfer_info(TransferKind::EquityMint, &rows).is_none());
+    }
+
+    #[test]
+    fn stuck_redemption_info_falls_back_to_withdrawn_amount_when_not_unwrapped() {
+        // No TokensUnwrapped event, so the amount comes from the withdrawn
+        // wrapped amount (18-decimal U256 -> shares), not the requested
+        // quantity.
+        let rows = vec![
+            event_row(
+                "EquityRedemptionEvent::VaultWithdrawPending",
+                r#"{"VaultWithdrawPending":{"symbol":"AAPL","quantity":"5","token":"0x0000000000000000000000000000000000000001","wrapped_amount":"5000000000000000000","pending_at":"2026-01-01T00:00:00Z"}}"#,
+                0,
+            ),
+            event_row(
+                "EquityRedemptionEvent::WithdrawnFromRaindex",
+                r#"{"WithdrawnFromRaindex":{"symbol":"AAPL","quantity":"5","token":"0x0000000000000000000000000000000000000001","wrapped_amount":"9000000000000000000","raindex_withdraw_tx":"0x1111111111111111111111111111111111111111111111111111111111111111","withdrawn_at":"2026-01-01T00:00:01Z"}}"#,
+                1,
+            ),
+            event_row(
+                "EquityRedemptionEvent::TokensSent",
+                r#"{"TokensSent":{"redemption_wallet":"0x0000000000000000000000000000000000000003","redemption_tx":"0x2222222222222222222222222222222222222222222222222222222222222222","sent_at":"2026-01-01T00:00:02Z"}}"#,
+                2,
+            ),
+            event_row(
+                "EquityRedemptionEvent::DetectionFailed",
+                r#"{"DetectionFailed":{"failure":"Timeout","failed_at":"2026-01-01T00:01:00Z"}}"#,
+                3,
+            ),
+        ];
+
+        let stuck =
+            stuck_transfer_info(TransferKind::EquityRedemption, &rows).expect("stuck amount");
+
+        assert_eq!(stuck.amount, "9");
+        assert_eq!(stuck.location, StuckLocation::RedemptionWallet);
+    }
+
+    #[test]
+    fn stuck_redemption_info_uses_unwrapped_amount_when_quantity_absent() {
+        // TokensUnwrapped with no recorded `quantity` but a known
+        // `unwrapped_amount`: the stranded amount must be the actual unwrapped
+        // underlying tokens (9.5), not the larger wrapped withdrawn amount (10).
+        let rows = vec![
+            event_row(
+                "EquityRedemptionEvent::WithdrawnFromRaindex",
+                r#"{"WithdrawnFromRaindex":{"symbol":"AAPL","quantity":"10","token":"0x0000000000000000000000000000000000000001","wrapped_amount":"10000000000000000000","raindex_withdraw_tx":"0x1111111111111111111111111111111111111111111111111111111111111111","withdrawn_at":"2026-01-01T00:00:01Z"}}"#,
+                0,
+            ),
+            event_row(
+                "EquityRedemptionEvent::TokensUnwrapped",
+                r#"{"TokensUnwrapped":{"quantity":null,"underlying_token":"0x0000000000000000000000000000000000000002","unwrap_tx_hash":"0x3333333333333333333333333333333333333333333333333333333333333333","unwrapped_amount":"9500000000000000000","unwrapped_at":"2026-01-01T00:00:02Z"}}"#,
+                1,
+            ),
+            event_row(
+                "EquityRedemptionEvent::TokensSent",
+                r#"{"TokensSent":{"redemption_wallet":"0x0000000000000000000000000000000000000003","redemption_tx":"0x2222222222222222222222222222222222222222222222222222222222222222","sent_at":"2026-01-01T00:00:03Z"}}"#,
+                2,
+            ),
+            event_row(
+                "EquityRedemptionEvent::DetectionFailed",
+                r#"{"DetectionFailed":{"failure":"Timeout","failed_at":"2026-01-01T00:01:00Z"}}"#,
+                3,
+            ),
+        ];
+
+        let stuck =
+            stuck_transfer_info(TransferKind::EquityRedemption, &rows).expect("stuck amount");
+
+        assert_eq!(stuck.amount, "9.5");
+        assert_eq!(stuck.location, StuckLocation::RedemptionWallet);
+        assert_eq!(stuck.reason, StuckReason::DetectionFailed);
+    }
+
+    #[test]
+    fn stuck_redemption_info_falls_back_to_requested_quantity() {
+        // Neither unwrapped nor withdrawn amounts are present, so the requested
+        // quantity is the last-resort amount.
+        let rows = vec![
+            event_row(
+                "EquityRedemptionEvent::VaultWithdrawPending",
+                r#"{"VaultWithdrawPending":{"symbol":"AAPL","quantity":"5","token":"0x0000000000000000000000000000000000000001","wrapped_amount":"5000000000000000000","pending_at":"2026-01-01T00:00:00Z"}}"#,
+                0,
+            ),
+            event_row(
+                "EquityRedemptionEvent::TokensSent",
+                r#"{"TokensSent":{"redemption_wallet":"0x0000000000000000000000000000000000000003","redemption_tx":"0x2222222222222222222222222222222222222222222222222222222222222222","sent_at":"2026-01-01T00:00:02Z"}}"#,
+                1,
+            ),
+            event_row(
+                "EquityRedemptionEvent::RedemptionRejected",
+                r#"{"RedemptionRejected":{"reason":"rejected","rejected_at":"2026-01-01T00:01:00Z"}}"#,
+                2,
+            ),
+        ];
+
+        let stuck =
+            stuck_transfer_info(TransferKind::EquityRedemption, &rows).expect("stuck amount");
+
+        assert_eq!(stuck.amount, "5");
+        assert_eq!(stuck.reason, StuckReason::RedemptionRejected);
+    }
+
+    #[test]
+    fn stuck_redemption_info_ignores_detection_failure_before_tokens_sent() {
+        // DetectionFailed before TokensSent (the `sent` guard) means tokens
+        // never left, so nothing is stranded in the redemption wallet.
+        let rows = vec![
+            event_row(
+                "EquityRedemptionEvent::VaultWithdrawPending",
+                r#"{"VaultWithdrawPending":{"symbol":"AAPL","quantity":"5","token":"0x0000000000000000000000000000000000000001","wrapped_amount":"5000000000000000000","pending_at":"2026-01-01T00:00:00Z"}}"#,
+                0,
+            ),
+            event_row(
+                "EquityRedemptionEvent::DetectionFailed",
+                r#"{"DetectionFailed":{"failure":"Timeout","failed_at":"2026-01-01T00:01:00Z"}}"#,
+                1,
+            ),
+        ];
+
+        assert!(stuck_transfer_info(TransferKind::EquityRedemption, &rows).is_none());
+    }
+
+    fn event_row(event_type: &str, payload: &str, sequence: i64) -> (String, String, i64) {
+        (event_type.to_string(), payload.to_string(), sequence)
     }
 
     #[tokio::test]
@@ -1626,5 +2334,78 @@ mod tests {
             body["error"],
             "Recovery not ready yet (conductor still starting)"
         );
+    }
+
+    #[tokio::test]
+    async fn recheck_transfer_returns_503_before_conductor_ready() {
+        let pool = create_test_pool().await;
+        let recovery = Arc::new(tokio::sync::OnceCell::<RecoveryHandle>::new());
+        let rocket = rocket::build()
+            .mount("/", routes![recheck_transfer])
+            .manage(pool)
+            .manage(recovery)
+            .manage(ResumeLock(Mutex::new(())));
+        let client = Client::tracked(rocket).await.unwrap();
+
+        let response = client
+            .post("/transfers/recheck/equity_mint/some-id")
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::ServiceUnavailable);
+
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+
+        assert_eq!(
+            body["error"],
+            "Recovery not ready yet (conductor still starting)"
+        );
+    }
+
+    #[test]
+    fn recheck_error_response_distinguishes_recoverability() {
+        use crate::tokenization::{MintVerificationError, TokenizerError};
+        use crate::tokenized_equity_mint::TokenizationRequestId;
+
+        // Not-recoverable: the persisted aggregate state forbids recovery, so
+        // retrying will not help -> 422 carrying the typed reason.
+        let (status, message) = recheck_error_response(&RecheckError::NoAcceptedRequest(
+            IssuerRequestId::new("mint-1"),
+        ));
+        assert_eq!(status, Status::UnprocessableEntity);
+        assert_eq!(
+            message,
+            "mint mint-1 has no accepted provider request to re-check"
+        );
+
+        let (status, _) = recheck_error_response(&RecheckError::MissingTxHash(
+            TokenizationRequestId("tok-1".to_string()),
+        ));
+        assert_eq!(status, Status::UnprocessableEntity);
+
+        let parse_error = "not-an-address"
+            .parse::<alloy::primitives::Address>()
+            .unwrap_err();
+        let (status, _) = recheck_error_response(&RecheckError::MalformedWallet {
+            id: IssuerRequestId::new("mint-1"),
+            source: parse_error,
+        });
+        assert_eq!(status, Status::UnprocessableEntity);
+
+        // Transient upstream provider failure -> 502 so the operator knows to
+        // retry, with a generic message that does not leak provider internals.
+        let (status, message) = recheck_error_response(&RecheckError::Tokenizer(
+            TokenizerError::MintVerification(MintVerificationError::ReceiptNotFound {
+                tx_hash: alloy::primitives::TxHash::random(),
+            }),
+        ));
+        assert_eq!(status, Status::BadGateway);
+        assert_eq!(message, "Tokenization provider unavailable; retry later");
+
+        // Genuinely internal failure -> 500 with a generic body.
+        let (status, message) =
+            recheck_error_response(&RecheckError::Database(sqlx::Error::RowNotFound));
+        assert_eq!(status, Status::InternalServerError);
+        assert_eq!(message, "Failed to recheck transfer");
     }
 }

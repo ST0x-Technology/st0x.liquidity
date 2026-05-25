@@ -7,7 +7,12 @@
   import type { Position } from '$lib/api/Position'
   import MultiSelect from '$lib/components/multi-select.svelte'
   import { reactive } from '$lib/frp.svelte'
-  import { getApiBaseUrl, getExplorerTxUrl } from '$lib/env'
+  import {
+    getApiBaseUrl,
+    getExplorerTxUrl,
+    getSimulateBackendPort,
+    getSimulateSourceId,
+  } from '$lib/env'
   import { formatUtc, toDatetimeLocal, TIME_PRESETS, FETCH_TIMEOUT_MS, toRfc3339 } from '$lib/time'
   import { formatDecimal } from '$lib/decimal'
   import { cashUsdTooltip, equityUsdTooltip } from '$lib/inventory-value'
@@ -19,9 +24,13 @@
     isTxHash,
     isTransferRef,
     formatFieldName,
+    formatNumericDetailValue,
     extractTimestamp,
     detailFields,
-    apiErrorStatus
+    apiErrorStatus,
+    stuckLocationLabel,
+    stuckReasonLabel,
+    recoveryCommand
   } from '$lib/transfer'
 
   const isNumeric = (value: unknown): boolean =>
@@ -60,6 +69,12 @@
     step: string
     sequence: number
     payload: Record<string, unknown>
+  }
+
+  type StuckTransferInfo = {
+    stuckAmount: string
+    stuckLocation: string
+    stuckReason: string
   }
 
   const PAGE_SIZE = 100
@@ -220,6 +235,7 @@
 
   let detailDialogEl: HTMLDialogElement | undefined = $state()
   const detailEvents = reactive<TransferEvent[]>([])
+  const detailStuck = reactive<StuckTransferInfo | null>(null)
   const detailTransfer = reactive<TransferEntry | null>(null)
   const detailLoading = reactive(false)
   const detailError = reactive<string | null>(null)
@@ -235,6 +251,7 @@
     detailLoading.update(() => true)
     detailError.update(() => null)
     detailEvents.update(() => [])
+    detailStuck.update(() => null)
     detailDialogEl?.showModal()
 
     try {
@@ -250,11 +267,15 @@
         return
       }
 
-      const data = (await response.json()) as { events: TransferEvent[] }
+      const data = (await response.json()) as {
+        events: TransferEvent[]
+        stuck: StuckTransferInfo | null
+      }
 
       if (isAborted()) return
 
       detailEvents.update(() => data.events)
+      detailStuck.update(() => data.stuck)
     } catch (err) {
       if (isAborted()) return
       detailError.update(() => (err instanceof Error ? err.message : 'Unknown error'))
@@ -264,6 +285,7 @@
       }
     }
   }
+
 </script>
 
 <Card.Root class="flex h-full flex-col overflow-hidden border-l-4 border-l-purple-500/50">
@@ -560,8 +582,39 @@
           Failed to load events: {detailError.current}
         </div>
       {:else}
+        <svelte:boundary onerror={(error) => console.error('Failed to render transfer detail', error)}>
+        {#if detailStuck.current}
+          {@const recovery = recoveryCommand({
+            simulateSourceId: getSimulateSourceId(),
+            backendPort: getSimulateBackendPort(),
+            kind: transfer.kind,
+            id: transfer.id
+          })}
+          <div class="mb-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs">
+            <div class="font-medium text-destructive">Stranded equity</div>
+            <div class="mt-1 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 font-mono">
+              <span class="text-muted-foreground">Amount</span>
+              <span>{formatDecimal(detailStuck.current.stuckAmount, 3)}</span>
+              <span class="text-muted-foreground">Location</span>
+              <span>{stuckLocationLabel(detailStuck.current.stuckLocation)}</span>
+              <span class="text-muted-foreground">Reason</span>
+              <span>{stuckReasonLabel(detailStuck.current.stuckReason)}</span>
+            </div>
+            {#if recovery}
+              <div class="mt-2 border-t border-destructive/20 pt-2">
+                <div class="font-medium text-destructive">Recovery command</div>
+                {#if recovery.mode === 'production'}
+                  <div class="mt-1 text-muted-foreground">Run on the server (ssh via Tailscale):</div>
+                {/if}
+                <pre class="mt-1 whitespace-pre-wrap break-all rounded bg-background/80 p-2 font-mono text-[11px] text-foreground">{recovery.command}</pre>
+              </div>
+            {/if}
+          </div>
+        {/if}
+
         <div class="relative space-y-0 border-l-2 border-muted pl-4">
           {#each detailEvents.current as event (event.sequence)}
+            <svelte:boundary onerror={(error) => console.error('Failed to render transfer event', error)}>
             {@const stepStyle = statusStyle(event.step)}
             {@const timestamp = extractTimestamp(event.payload)}
             {@const fields = detailFields(event.payload)}
@@ -601,7 +654,7 @@
                                 {JSON.stringify(value)}
                               {/if}
                             {:else if isNumeric(value)}
-                              {formatDecimal(String(value), 3)}
+                              {formatNumericDetailValue(key, String(value))}
                             {:else}
                               {String(value)}
                             {/if}
@@ -660,7 +713,7 @@
                         {:else if typeof value === 'object' && value !== null}
                           {JSON.stringify(value)}
                         {:else if isNumeric(value)}
-                          {formatDecimal(String(value), 3)}
+                          {formatNumericDetailValue(key, String(value))}
                         {:else}
                           {String(value)}
                         {/if}
@@ -670,8 +723,22 @@
                 </div>
               {/if}
             </div>
+
+            {#snippet failed()}
+              <div class="relative pb-4 text-xs text-destructive">
+                Something went wrong rendering this event — check the browser console.
+              </div>
+            {/snippet}
+            </svelte:boundary>
           {/each}
         </div>
+
+        {#snippet failed()}
+          <div class="flex items-center justify-center py-8 text-sm text-destructive">
+            Something went wrong — check the browser console.
+          </div>
+        {/snippet}
+        </svelte:boundary>
       {/if}
     </div>
   {/if}

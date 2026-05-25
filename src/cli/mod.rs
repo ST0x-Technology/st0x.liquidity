@@ -469,6 +469,20 @@ pub enum Commands {
         reason: String,
     },
 
+    /// Re-check a failed mint or redemption and complete it if the provider settled it
+    ///
+    /// Delegates to the running bot's REST API so recovery dispatches through
+    /// the in-process reactor (correcting live inventory). Requires the bot to
+    /// be running and serving its API on the configured `server_port`.
+    RecheckTransfer {
+        /// Transfer type: "mint" or "redemption"
+        #[arg(short = 't', long = "type")]
+        transfer_type: TransferType,
+        /// Aggregate ID (issuer_request_id for mint, redemption ID for redemption)
+        #[arg(short = 'i', long = "id")]
+        id: String,
+    },
+
     /// Rebuild a materialized view by replaying all events from scratch
     ///
     /// Use as an escape hatch when a view becomes corrupted (e.g., due to
@@ -625,6 +639,31 @@ enum SimpleCommand {
         id: String,
         reason: String,
     },
+    RecheckTransfer {
+        transfer_type: TransferType,
+        id: String,
+    },
+}
+
+#[cfg(feature = "test-support")]
+pub async fn fail_transfer_for_test(
+    pool: &SqlitePool,
+    transfer_type: TransferType,
+    id: &str,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let mut stdout = Vec::new();
+    rebalancing::fail_transfer_command(&mut stdout, pool, transfer_type, id, reason).await
+}
+
+#[cfg(feature = "test-support")]
+pub async fn recheck_transfer_for_test(
+    ctx: &Ctx,
+    transfer_type: TransferType,
+    id: &str,
+) -> anyhow::Result<()> {
+    let mut stdout = Vec::new();
+    rebalancing::recheck_transfer_command(&mut stdout, transfer_type, id, ctx).await
 }
 
 /// Commands that require a WebSocket provider.
@@ -820,6 +859,9 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             id,
             reason,
         }),
+        Commands::RecheckTransfer { transfer_type, id } => {
+            Ok(SimpleCommand::RecheckTransfer { transfer_type, id })
+        }
     }
 }
 
@@ -977,6 +1019,9 @@ async fn run_simple_command<W: Write>(
             id,
             reason,
         } => rebalancing::fail_transfer_command(stdout, pool, transfer_type, &id, &reason).await,
+        SimpleCommand::RecheckTransfer { transfer_type, id } => {
+            rebalancing::recheck_transfer_command(stdout, transfer_type, &id, ctx).await
+        }
     }
 }
 
@@ -1280,6 +1325,55 @@ mod tests {
                 | ProviderCommand::AlpacaTokenizationRequests,
             ) => panic!("expected process-tx provider command"),
             Ok(_) => panic!("expected provider command classification"),
+        }
+    }
+
+    #[test]
+    fn recheck_transfer_command_parses_type_and_id() {
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "recheck-transfer",
+            "--type",
+            "mint",
+            "--id",
+            "ISS001",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::RecheckTransfer { transfer_type, id } => {
+                assert!(matches!(transfer_type, TransferType::Mint));
+                assert_eq!(id, "ISS001");
+            }
+            other => panic!("expected recheck-transfer command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_recheck_transfer_command_as_simple() {
+        // The recheck-transfer command must route without a WebSocket provider:
+        // it delegates to the running bot's REST API rather than touching chain.
+        let command = Commands::RecheckTransfer {
+            transfer_type: TransferType::Redemption,
+            id: "redemption-1".to_string(),
+        };
+
+        match classify_command(command) {
+            Ok(SimpleCommand::RecheckTransfer { transfer_type, id }) => {
+                assert!(matches!(transfer_type, TransferType::Redemption));
+                assert_eq!(id, "redemption-1");
+            }
+            Ok(_) => panic!("expected recheck-transfer simple command"),
+            Err(
+                ProviderCommand::ProcessTx { .. }
+                | ProviderCommand::TransferUsdc { .. }
+                | ProviderCommand::CctpBridge { .. }
+                | ProviderCommand::CctpRecover { .. }
+                | ProviderCommand::ResetAllowance { .. }
+                | ProviderCommand::AlpacaTokenize { .. }
+                | ProviderCommand::AlpacaRedeem { .. }
+                | ProviderCommand::AlpacaTokenizationRequests,
+            ) => panic!("expected simple command classification, got provider command"),
         }
     }
 

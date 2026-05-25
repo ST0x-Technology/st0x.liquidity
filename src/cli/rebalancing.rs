@@ -35,11 +35,82 @@ use crate::usdc_rebalance::UsdcRebalance;
 use crate::vault_registry::VaultRegistry;
 use crate::wrapper::{Wrapper, WrapperService};
 
+struct EquityTransferCliServices {
+    transfer: CrossVenueEquityTransfer,
+    wallet: Address,
+}
+
 /// Resolves the redemption wallet address from CLI flag or config.
 ///
 /// CLI flag takes precedence. Falls back to `[tokenization]` config.
 fn resolve_redemption_wallet(flag: Option<Address>, ctx: &Ctx) -> anyhow::Result<Address> {
     flag.map_or_else(|| ctx.redemption_wallet().map_err(Into::into), Ok)
+}
+
+async fn build_equity_transfer_services(
+    redemption_wallet_flag: Option<Address>,
+    ctx: &Ctx,
+    pool: &SqlitePool,
+) -> anyhow::Result<EquityTransferCliServices> {
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
+        anyhow::bail!("transfer-equity requires Alpaca Broker API configuration");
+    };
+
+    let redemption_wallet = resolve_redemption_wallet(redemption_wallet_flag, ctx)?;
+    let wallet_ctx = ctx.wallet()?;
+    let wallet = wallet_ctx.base_wallet().address();
+    let base_caller = wallet_ctx.base_wallet().clone();
+
+    let tokenization_service: Arc<dyn Tokenizer> = Arc::new(AlpacaTokenizationService::new(
+        alpaca_auth.base_url().to_string(),
+        alpaca_auth.account_id,
+        alpaca_auth.api_key.clone(),
+        alpaca_auth.api_secret.clone(),
+        base_caller.clone(),
+        Some(redemption_wallet),
+    ));
+
+    let (_vault_store, vault_registry_projection) =
+        StoreBuilder::<VaultRegistry>::new(pool.clone())
+            .build(())
+            .await?;
+
+    let wrapper: Arc<dyn Wrapper> = Arc::new(WrapperService::new(
+        base_caller.clone(),
+        ctx.assets.equities.symbols.clone(),
+    ));
+
+    let raindex = Arc::new(RaindexService::new(
+        base_caller,
+        ctx.evm.orderbook,
+        vault_registry_projection,
+        wallet,
+    ));
+
+    let services = EquityTransferServices {
+        raindex: raindex.clone(),
+        tokenizer: tokenization_service.clone(),
+        wrapper: wrapper.clone(),
+    };
+
+    let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+        .build(services.clone())
+        .await?;
+
+    let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
+        .build(services.clone())
+        .await?;
+
+    let transfer = CrossVenueEquityTransfer::new(
+        raindex,
+        tokenization_service.clone(),
+        wrapper,
+        wallet,
+        mint_store,
+        redemption_store,
+    );
+
+    Ok(EquityTransferCliServices { transfer, wallet })
 }
 
 pub(super) async fn transfer_equity_command<Writer: Write>(
@@ -60,68 +131,13 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
     writeln!(stdout, "   Symbol: {symbol}")?;
     writeln!(stdout, "   Quantity: {quantity}")?;
 
-    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
-        anyhow::bail!("transfer-equity requires Alpaca Broker API configuration");
-    };
-
-    let redemption_wallet = resolve_redemption_wallet(redemption_wallet_flag, ctx)?;
-    let wallet_ctx = ctx.wallet()?;
-    let wallet = wallet_ctx.base_wallet().address();
-    let base_caller = wallet_ctx.base_wallet().clone();
-
-    let tokenization_service = Arc::new(AlpacaTokenizationService::new(
-        alpaca_auth.base_url().to_string(),
-        alpaca_auth.account_id,
-        alpaca_auth.api_key.clone(),
-        alpaca_auth.api_secret.clone(),
-        base_caller.clone(),
-        Some(redemption_wallet),
-    ));
-
-    let (_vault_store, vault_registry_projection) =
-        StoreBuilder::<VaultRegistry>::new(pool.clone())
-            .build(())
-            .await?;
-
-    let wrapper: Arc<dyn Wrapper> = Arc::new(WrapperService::new(
-        base_caller.clone(),
-        ctx.assets.equities.symbols.clone(),
-    ));
-
-    let raindex = Arc::new(RaindexService::new(
-        base_caller.clone(),
-        ctx.evm.orderbook,
-        vault_registry_projection,
-        wallet,
-    ));
-
-    let services = EquityTransferServices {
-        raindex: raindex.clone(),
-        tokenizer: tokenization_service.clone(),
-        wrapper: wrapper.clone(),
-    };
-
-    let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
-        .build(services.clone())
-        .await?;
-
-    let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
-        .build(services)
-        .await?;
-
-    let equity_transfer = CrossVenueEquityTransfer::new(
-        raindex,
-        tokenization_service,
-        wrapper,
-        wallet,
-        mint_store,
-        redemption_store,
-    );
+    let cli_services = build_equity_transfer_services(redemption_wallet_flag, ctx, pool).await?;
+    let equity_transfer = cli_services.transfer;
 
     match direction {
         TransferDirection::ToRaindex => {
             writeln!(stdout, "   Creating mint request...")?;
-            writeln!(stdout, "   Receiving Wallet: {wallet}")?;
+            writeln!(stdout, "   Receiving Wallet: {}", cli_services.wallet)?;
 
             CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
                 &equity_transfer,
@@ -661,6 +677,57 @@ pub(crate) async fn fail_transfer_command<W: Write>(
         }
     }
 
+    Ok(())
+}
+
+/// Re-checks a stuck transfer by calling the running bot's
+/// `/transfers/recheck` endpoint. Recovery must run in the bot process so the
+/// recovery event dispatches through the reactor-wired store (correcting the
+/// live inventory view) and shares the bot's resume lock. Requires the bot to
+/// be running and serving its REST API on the configured `server_port`.
+pub(crate) async fn recheck_transfer_command<W: Write>(
+    stdout: &mut W,
+    transfer_type: TransferType,
+    id: &str,
+    ctx: &Ctx,
+) -> anyhow::Result<()> {
+    let kind = match transfer_type {
+        TransferType::Mint => "equity_mint",
+        TransferType::Redemption => "equity_redemption",
+    };
+
+    let url = format!(
+        "http://127.0.0.1:{}/transfers/recheck/{kind}/{id}",
+        ctx.server_port
+    );
+    writeln!(stdout, "Re-checking {transfer_type:?} {id} via {url}")?;
+
+    // Bound the request so the CLI cannot hang indefinitely if the local bot
+    // stalls after accepting the connection.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let response = client.post(&url).send().await?;
+    let status = response.status();
+    let body = response.text().await?;
+
+    if !status.is_success() {
+        anyhow::bail!("recheck-transfer failed ({status}): {body}");
+    }
+
+    // The endpoint returns `{"outcome":"<snake_case>"}`; surface the outcome
+    // name (the operator-facing value documented in docs/cli-ops.md) rather
+    // than the raw JSON envelope, falling back to the body if it can't be parsed.
+    let outcome = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("outcome")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or(body);
+    writeln!(stdout, "recheck-transfer outcome: {outcome}")?;
     Ok(())
 }
 

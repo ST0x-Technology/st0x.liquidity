@@ -1,5 +1,6 @@
 use std::str::FromStr;
 
+use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -29,8 +30,7 @@ impl FromStr for AlpacaAccountId {
 }
 
 /// Mode for Alpaca Broker API
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AlpacaBrokerApiMode {
     /// Sandbox environment (paper trading)
     Sandbox,
@@ -38,8 +38,85 @@ pub enum AlpacaBrokerApiMode {
     Production,
     /// Mock mode for testing (available via `mock` feature or in tests)
     #[cfg(any(test, feature = "mock"))]
-    #[serde(skip_deserializing)]
     Mock(String),
+}
+
+impl<'de> Deserialize<'de> for AlpacaBrokerApiMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(AlpacaBrokerApiModeVisitor)
+    }
+}
+
+struct AlpacaBrokerApiModeVisitor;
+
+impl<'de> Visitor<'de> for AlpacaBrokerApiModeVisitor {
+    type Value = AlpacaBrokerApiMode;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .write_str("\"sandbox\", \"production\", or { type = \"mock\", base_url = \"...\" }")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        match value {
+            "sandbox" => Ok(AlpacaBrokerApiMode::Sandbox),
+            "production" => Ok(AlpacaBrokerApiMode::Production),
+            #[cfg(any(test, feature = "mock"))]
+            "mock" => Err(E::custom(
+                "mock mode requires { type = \"mock\", base_url = \"...\" }",
+            )),
+            #[cfg(not(any(test, feature = "mock")))]
+            "mock" => Err(E::custom("mock mode requires the mock feature")),
+            _ => Err(E::unknown_variant(value, &["sandbox", "production"])),
+        }
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut mode_type = None;
+        // `base_url` is only meaningful for the mock variant, which is
+        // feature-gated. Without the mock feature the value is consumed and
+        // discarded so parsing still succeeds (and yields the clearer
+        // "mock mode requires the mock feature" error below).
+        #[cfg(any(test, feature = "mock"))]
+        let mut base_url = None;
+
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "type" => mode_type = Some(map.next_value::<String>()?),
+                #[cfg(any(test, feature = "mock"))]
+                "base_url" => base_url = Some(map.next_value::<String>()?),
+                #[cfg(not(any(test, feature = "mock")))]
+                "base_url" => {
+                    map.next_value::<de::IgnoredAny>()?;
+                }
+                _ => return Err(de::Error::unknown_field(&key, &["type", "base_url"])),
+            }
+        }
+
+        match mode_type.as_deref() {
+            #[cfg(any(test, feature = "mock"))]
+            Some("mock") => {
+                let base_url = base_url.ok_or_else(|| de::Error::missing_field("base_url"))?;
+                Ok(AlpacaBrokerApiMode::Mock(base_url))
+            }
+            #[cfg(not(any(test, feature = "mock")))]
+            Some("mock") => Err(de::Error::custom("mock mode requires the mock feature")),
+            Some(other) => Err(de::Error::unknown_variant(
+                other,
+                &["sandbox", "production", "mock"],
+            )),
+            None => Err(de::Error::missing_field("type")),
+        }
+    }
 }
 
 impl AlpacaBrokerApiMode {
@@ -193,6 +270,66 @@ mod tests {
         assert_eq!(
             production_ctx.base_url(),
             "https://broker-api.alpaca.markets"
+        );
+    }
+
+    #[test]
+    fn test_alpaca_broker_api_mode_deserializes_mock_table() {
+        let mode: AlpacaBrokerApiMode =
+            serde_json::from_str(r#"{"type":"mock","base_url":"http://127.0.0.1:1234"}"#).unwrap();
+
+        assert_eq!(
+            mode,
+            AlpacaBrokerApiMode::Mock("http://127.0.0.1:1234".to_string())
+        );
+    }
+
+    #[test]
+    fn test_alpaca_broker_api_mode_deserializes_string_forms() {
+        let sandbox: AlpacaBrokerApiMode = serde_json::from_str(r#""sandbox""#).unwrap();
+        assert_eq!(sandbox, AlpacaBrokerApiMode::Sandbox);
+
+        let production: AlpacaBrokerApiMode = serde_json::from_str(r#""production""#).unwrap();
+        assert_eq!(production, AlpacaBrokerApiMode::Production);
+    }
+
+    #[test]
+    fn test_alpaca_broker_api_mode_unknown_string_errors() {
+        let error = serde_json::from_str::<AlpacaBrokerApiMode>(r#""fidelity""#).unwrap_err();
+        assert!(
+            error.to_string().contains("fidelity"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_alpaca_broker_api_mode_mock_table_missing_base_url_errors() {
+        let error = serde_json::from_str::<AlpacaBrokerApiMode>(r#"{"type":"mock"}"#).unwrap_err();
+        assert!(
+            error.to_string().contains("base_url"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_alpaca_broker_api_mode_unknown_type_errors() {
+        let error =
+            serde_json::from_str::<AlpacaBrokerApiMode>(r#"{"type":"fidelity"}"#).unwrap_err();
+        assert!(
+            error.to_string().contains("fidelity"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_alpaca_broker_api_mode_unknown_field_errors() {
+        let error = serde_json::from_str::<AlpacaBrokerApiMode>(
+            r#"{"type":"mock","base_url":"http://x","extra":"y"}"#,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("extra"),
+            "unexpected error: {error}"
         );
     }
 

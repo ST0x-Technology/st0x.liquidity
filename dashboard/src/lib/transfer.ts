@@ -1,3 +1,6 @@
+import { formatDecimal } from './decimal'
+import { formatBalance } from './format'
+
 export type StatusStyle = {
   text: string
   dot: string
@@ -45,6 +48,14 @@ export const isTxHash = (value: unknown): value is string =>
   typeof value === 'string' && /^0x[0-9a-fA-F]{64}$/.test(value)
 
 const SKIP_FIELDS = new Set(['attestation'])
+const TOKEN_UNIT_FIELDS = new Set([
+  'actual_wrapped_amount',
+  'shares_minted',
+  'unwrapped_amount',
+  'wrapped_amount',
+  'wrapped_shares',
+])
+const ADDRESS_FIELDS = new Set(['token', 'underlying_token', 'wallet', 'redemption_wallet'])
 
 export const isTimestampField = (key: string): boolean => key.endsWith('_at')
 
@@ -53,6 +64,28 @@ export const isTransferRef = (value: unknown): value is Record<string, string> =
 
 export const formatFieldName = (key: string): string =>
   key.replace(/_/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase())
+
+const formatDecimalAddress = (value: string): string | null => {
+  try {
+    return `0x${BigInt(value).toString(16).padStart(40, '0')}`
+  } catch {
+    return null
+  }
+}
+
+export const formatNumericDetailValue = (key: string, value: string): string => {
+  const address = ADDRESS_FIELDS.has(key) ? formatDecimalAddress(value) : null
+  if (address !== null) return address
+
+  // alloy serializes U256 fields as hex ("0x.."), but formatBalance and
+  // formatDecimal expect base-10 digit strings. Normalize integer hex to
+  // decimal first so the "0x" prefix doesn't make decimal.js throw (an
+  // unhandled throw here froze the detail modal on "Loading events...").
+  const normalized = /^0x[0-9a-fA-F]+$/.test(value) ? BigInt(value).toString() : value
+
+  const displayValue = TOKEN_UNIT_FIELDS.has(key) ? formatBalance(normalized, 18) : normalized
+  return formatDecimal(displayValue, 3)
+}
 
 export const extractTimestamp = (payload: Record<string, unknown>): string | null => {
   for (const [key, value] of Object.entries(payload)) {
@@ -79,4 +112,80 @@ export const apiErrorStatus = (value: unknown): string | null => {
   if (typeof status === 'string') return status
   if (typeof status === 'number') return String(status)
   return null
+}
+
+/// Human-readable label for a stranded-equity location code.
+export const stuckLocationLabel = (location: string): string => {
+  switch (location) {
+    case 'issuer':
+      return 'Issuer'
+    case 'redemption_wallet':
+      return 'Redemption wallet'
+    case 'bot_wallet_unwrapped':
+      return 'Bot wallet'
+    case 'bot_wallet_wrapped':
+      return 'Bot wallet (wrapped)'
+    default:
+      return location
+  }
+}
+
+/// Title-cases a snake_case stranded-equity reason code.
+export const stuckReasonLabel = (reason: string): string =>
+  reason
+    .split('_')
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(' ')
+
+/// Maps a transfer kind to the `recheck-transfer --type` flag value, or null
+/// for kinds that are not equity transfers (e.g. usdc_bridge).
+const recheckTransferType = (kind: string): string | null => {
+  switch (kind) {
+    case 'equity_mint':
+      return 'mint'
+    case 'equity_redemption':
+      return 'redemption'
+    default:
+      return null
+  }
+}
+
+/// A `recheck-transfer` command for a stranded transfer. The `mode`
+/// distinguishes a local simulation command from one an operator runs on the
+/// deployed server, so the UI can label them differently.
+export type RecoveryCommand =
+  | { mode: 'simulation'; command: string }
+  | { mode: 'production'; command: string }
+
+/// Builds the `recheck-transfer` CLI command shown to operators for a stranded
+/// transfer, or null for kinds with no recovery path (e.g. usdc_bridge).
+///
+/// Simulation builds set `simulateSourceId` (`PUBLIC_SIMULATE_SOURCE_ID`, set
+/// solely by the `simulate-failures` flake apps) and run the mock CLI against
+/// the harness's `/tmp` config, so they also need `backendPort`. Live
+/// deployments invoke the `stox` wrapper, which auto-loads prod config/secrets,
+/// so the production command needs no config paths or port.
+export const recoveryCommand = (params: {
+  simulateSourceId: string | null
+  backendPort: string | null
+  kind: string
+  id: string
+}): RecoveryCommand | null => {
+  const transferType = recheckTransferType(params.kind)
+  if (transferType === null) return null
+
+  if (params.simulateSourceId !== null) {
+    if (params.backendPort === null) return null
+
+    const basePath = `/tmp/st0x-simulate-failures-${params.backendPort}`
+    return {
+      mode: 'simulation',
+      command: `nix develop --command cargo run --features mock --bin cli -- --config ${basePath}.config.toml --secrets ${basePath}.secrets.toml recheck-transfer --type ${transferType} --id ${params.id}`,
+    }
+  }
+
+  return {
+    mode: 'production',
+    command: `stox recheck-transfer --type ${transferType} --id ${params.id}`,
+  }
 }

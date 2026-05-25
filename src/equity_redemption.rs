@@ -240,6 +240,10 @@ pub(crate) enum EquityRedemptionCommand {
     Complete,
     /// Alpaca rejected the redemption.
     RejectRedemption { reason: String },
+    /// Recover provider completion after the aggregate had failed.
+    RecoverProviderCompletion {
+        tokenization_request_id: TokenizationRequestId,
+    },
     /// Operator or timeout-driven failure from `WithdrawnFromRaindex` or
     /// `TokensUnwrapped` states.
     FailTransfer { reason: String },
@@ -367,6 +371,10 @@ pub(crate) enum EquityRedemptionEvent {
 
     Completed {
         completed_at: DateTime<Utc>,
+    },
+    ProviderCompletionRecovered {
+        tokenization_request_id: TokenizationRequestId,
+        recovered_at: DateTime<Utc>,
     },
 }
 
@@ -588,6 +596,16 @@ impl PartialEq for EquityRedemptionEvent {
             (Self::Completed { completed_at: c1 }, Self::Completed { completed_at: c2 }) => {
                 c1 == c2
             }
+            (
+                Self::ProviderCompletionRecovered {
+                    tokenization_request_id: id1,
+                    recovered_at: t1,
+                },
+                Self::ProviderCompletionRecovered {
+                    tokenization_request_id: id2,
+                    recovered_at: t2,
+                },
+            ) => id1 == id2 && t1 == t2,
             _ => false,
         }
     }
@@ -618,6 +636,9 @@ impl DomainEvent for EquityRedemptionEvent {
             Detected { .. } => "EquityRedemptionEvent::Detected".to_string(),
             RedemptionRejected { .. } => "EquityRedemptionEvent::RedemptionRejected".to_string(),
             Completed { .. } => "EquityRedemptionEvent::Completed".to_string(),
+            ProviderCompletionRecovered { .. } => {
+                "EquityRedemptionEvent::ProviderCompletionRecovered".to_string()
+            }
         }
     }
 
@@ -971,7 +992,9 @@ impl EventSourced for EquityRedemption {
 
     const AGGREGATE_TYPE: &'static str = "EquityRedemption";
     const PROJECTION: Nil = Nil;
-    const SCHEMA_VERSION: u64 = 2;
+    // v3: added the `ProviderCompletionRecovered` event for in-process
+    // failed-transfer recovery.
+    const SCHEMA_VERSION: u64 = 3;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use EquityRedemptionEvent::*;
@@ -1431,6 +1454,31 @@ impl EventSourced for EquityRedemption {
                     failed_at: *rejected_at,
                 })
             }
+
+            ProviderCompletionRecovered {
+                tokenization_request_id,
+                recovered_at,
+            } => {
+                let Self::Failed {
+                    symbol,
+                    quantity,
+                    redemption_tx: Some(redemption_tx),
+                    started_at,
+                    ..
+                } = entity
+                else {
+                    return Ok(None);
+                };
+
+                Some(Self::Completed {
+                    symbol: symbol.clone(),
+                    quantity: *quantity,
+                    redemption_tx: *redemption_tx,
+                    tokenization_request_id: tokenization_request_id.clone(),
+                    started_at: *started_at,
+                    completed_at: *recovered_at,
+                })
+            }
         })
     }
 
@@ -1464,6 +1512,7 @@ impl EventSourced for EquityRedemption {
             | FailDetection { .. }
             | Complete
             | RejectRedemption { .. }
+            | RecoverProviderCompletion { .. }
             | FailTransfer { .. } => Err(EquityRedemptionError::NotStarted),
         }
     }
@@ -1787,6 +1836,20 @@ impl EventSourced for EquityRedemption {
                 }]),
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+            },
+
+            RecoverProviderCompletion {
+                tokenization_request_id,
+            } => match self {
+                Self::Failed {
+                    redemption_tx: Some(_),
+                    ..
+                } => Ok(vec![ProviderCompletionRecovered {
+                    tokenization_request_id,
+                    recovered_at: Utc::now(),
+                }]),
+                Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
+                _ => Err(EquityRedemptionError::TokensNotSent),
             },
 
             FailTransfer { reason } => match self {
@@ -3896,6 +3959,93 @@ mod tests {
         assert_eq!(failed_at, later);
         assert_eq!(op.started_at, now);
         assert_eq!(op.updated_at, later);
+    }
+
+    #[test]
+    fn provider_completion_recovery_moves_failed_redemption_to_completed() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let started_at = Utc::now();
+        let recovered_at = started_at + chrono::Duration::seconds(60);
+        let redemption_tx = TxHash::repeat_byte(1);
+        let failed = EquityRedemption::Failed {
+            symbol: symbol.clone(),
+            quantity: float!(10),
+            raindex_withdraw_tx: None,
+            redemption_tx: Some(redemption_tx),
+            tokenization_request_id: None,
+            reason: Some("detection timeout".to_string()),
+            started_at,
+            failed_at: started_at + chrono::Duration::seconds(30),
+        };
+
+        let recovered = EquityRedemptionEvent::ProviderCompletionRecovered {
+            tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+            recovered_at,
+        };
+
+        let result = EquityRedemption::evolve(&failed, &recovered)
+            .unwrap()
+            .expect("recovered state");
+
+        assert!(
+            matches!(
+                result,
+                EquityRedemption::Completed {
+                    symbol: ref recovered_symbol,
+                    ref tokenization_request_id,
+                    redemption_tx: recovered_tx,
+                    ..
+                } if *recovered_symbol == symbol
+                    && *tokenization_request_id == TokenizationRequestId("TOK001".to_string())
+                    && recovered_tx == redemption_tx
+            ),
+            "expected recovered redemption to complete, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_provider_completion_rejected_for_active_redemption() {
+        let error = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(vec![withdrawn_from_raindex_event()])
+            .when(EquityRedemptionCommand::RecoverProviderCompletion {
+                tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(EquityRedemptionError::TokensNotSent)
+            ),
+            "active redemptions must not be provider-completion recovered, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_provider_completion_rejected_for_completed_redemption() {
+        let error = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(vec![
+                withdrawn_from_raindex_event(),
+                tokens_sent_event(),
+                detected_event(),
+                EquityRedemptionEvent::Completed {
+                    completed_at: Utc::now(),
+                },
+            ])
+            .when(EquityRedemptionCommand::RecoverProviderCompletion {
+                tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(EquityRedemptionError::AlreadyCompleted)
+            ),
+            "completed redemptions must not be recovered, got {error:?}"
+        );
     }
 
     #[tokio::test]

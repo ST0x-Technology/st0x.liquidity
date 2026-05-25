@@ -260,7 +260,9 @@ nix develop .#ci-backend -c cargo clippy --workspace --all-targets --all-feature
 
 `nix run .#simulate` launches a full local simulation of the market making
 system using [mprocs](https://github.com/pvolok/mprocs) to run the dashboard and
-the bot side-by-side.
+the bot side-by-side. `nix run .#simulate-failures` starts the same stack, then
+creates failed mint and redemption rebalances whose mock Alpaca provider later
+completes and prints the `recheck-transfer` commands that recover them.
 
 What it does:
 

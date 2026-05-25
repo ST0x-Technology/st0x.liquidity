@@ -83,6 +83,12 @@ pub(crate) trait Tokenizer: Send + Sync {
         id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, TokenizerError>;
 
+    /// Get a single tokenization provider request by ID.
+    async fn get_request(
+        &self,
+        id: &TokenizationRequestId,
+    ) -> Result<TokenizationRequest, TokenizerError>;
+
     /// Returns the redemption wallet address where tokens should be sent,
     /// if configured.
     fn redemption_wallet(&self) -> Option<Address>;
@@ -99,6 +105,12 @@ pub(crate) trait Tokenizer: Send + Sync {
         &self,
         tx_hash: &TxHash,
     ) -> Result<TokenizationRequest, TokenizerError>;
+
+    /// Find a redemption request by its onchain token transfer transaction.
+    async fn find_redemption_by_tx(
+        &self,
+        tx_hash: &TxHash,
+    ) -> Result<Option<TokenizationRequest>, TokenizerError>;
 
     /// Poll a redemption request until it reaches a terminal state.
     async fn poll_redemption_until_complete(

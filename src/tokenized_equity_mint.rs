@@ -89,10 +89,6 @@ impl std::fmt::Display for TokenizationRequestId {
     }
 }
 
-/// Onchain receipt identifier (U256) for the token transfer transaction.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct ReceiptId(pub(crate) U256);
-
 /// Errors that can occur during tokenized equity mint operations.
 ///
 /// These errors enforce state machine constraints and prevent
@@ -262,6 +258,14 @@ pub(crate) enum TokenizedEquityMintCommand {
     FailRaindexDeposit {
         reason: String,
     },
+    /// Recover a failed mint after the provider reports completion later.
+    RecoverProviderCompletion {
+        issuer_request_id: IssuerRequestId,
+        wallet: Address,
+        tokenization_request_id: TokenizationRequestId,
+        tx_hash: TxHash,
+        fees: Option<Float>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -297,7 +301,6 @@ pub(crate) enum TokenizedEquityMintEvent {
 
     TokensReceived {
         tx_hash: TxHash,
-        receipt_id: ReceiptId,
         shares_minted: U256,
         /// Tokenization fees charged by Alpaca (if reported).
         #[serde(
@@ -352,6 +355,21 @@ pub(crate) enum TokenizedEquityMintEvent {
     RaindexDepositFailed {
         reason: String,
         failed_at: DateTime<Utc>,
+    },
+    ProviderCompletionRecovered {
+        issuer_request_id: IssuerRequestId,
+        wallet: Address,
+        tokenization_request_id: TokenizationRequestId,
+        tx_hash: TxHash,
+        shares_minted: U256,
+        /// Tokenization fees charged by Alpaca (if reported).
+        #[serde(
+            default,
+            serialize_with = "st0x_float_serde::serialize_option_float",
+            deserialize_with = "st0x_float_serde::deserialize_option_float_from_number_or_string"
+        )]
+        fees: Option<Float>,
+        recovered_at: DateTime<Utc>,
     },
 }
 
@@ -422,21 +440,18 @@ impl PartialEq for TokenizedEquityMintEvent {
             (
                 Self::TokensReceived {
                     tx_hash: hash_a,
-                    receipt_id: rcpt_a,
                     shares_minted: mint_a,
                     fees: fees_a,
                     received_at: time_a,
                 },
                 Self::TokensReceived {
                     tx_hash: hash_b,
-                    receipt_id: rcpt_b,
                     shares_minted: mint_b,
                     fees: fees_b,
                     received_at: time_b,
                 },
             ) => {
                 hash_a == hash_b
-                    && rcpt_a == rcpt_b
                     && mint_a == mint_b
                     && match (fees_a, fees_b) {
                         (Some(a), Some(b)) => a.eq(*b).unwrap_or(false),
@@ -506,6 +521,38 @@ impl PartialEq for TokenizedEquityMintEvent {
                     deposited_at: time_b,
                 },
             ) => hash_a == hash_b && time_a == time_b,
+            (
+                Self::ProviderCompletionRecovered {
+                    issuer_request_id: issuer_a,
+                    wallet: wallet_a,
+                    tokenization_request_id: id_a,
+                    tx_hash: hash_a,
+                    shares_minted: shares_a,
+                    fees: fees_a,
+                    recovered_at: time_a,
+                },
+                Self::ProviderCompletionRecovered {
+                    issuer_request_id: issuer_b,
+                    wallet: wallet_b,
+                    tokenization_request_id: id_b,
+                    tx_hash: hash_b,
+                    shares_minted: shares_b,
+                    fees: fees_b,
+                    recovered_at: time_b,
+                },
+            ) => {
+                issuer_a == issuer_b
+                    && wallet_a == wallet_b
+                    && id_a == id_b
+                    && hash_a == hash_b
+                    && shares_a == shares_b
+                    && match (fees_a, fees_b) {
+                        (Some(a), Some(b)) => a.eq(*b).unwrap_or(false),
+                        (None, None) => true,
+                        _ => false,
+                    }
+                    && time_a == time_b
+            }
             _ => false,
         }
     }
@@ -534,6 +581,9 @@ impl DomainEvent for TokenizedEquityMintEvent {
             }
             Self::RaindexDepositFailed { .. } => {
                 "TokenizedEquityMintEvent::RaindexDepositFailed".to_string()
+            }
+            Self::ProviderCompletionRecovered { .. } => {
+                "TokenizedEquityMintEvent::ProviderCompletionRecovered".to_string()
             }
         }
     }
@@ -589,7 +639,6 @@ pub(crate) enum TokenizedEquityMint {
         issuer_request_id: IssuerRequestId,
         tokenization_request_id: TokenizationRequestId,
         tx_hash: TxHash,
-        receipt_id: ReceiptId,
         shares_minted: U256,
         #[serde(
             default,
@@ -614,7 +663,6 @@ pub(crate) enum TokenizedEquityMint {
         issuer_request_id: IssuerRequestId,
         tokenization_request_id: TokenizationRequestId,
         tx_hash: TxHash,
-        receipt_id: ReceiptId,
         shares_minted: U256,
         #[serde(
             default,
@@ -640,7 +688,6 @@ pub(crate) enum TokenizedEquityMint {
         issuer_request_id: IssuerRequestId,
         tokenization_request_id: TokenizationRequestId,
         tx_hash: TxHash,
-        receipt_id: ReceiptId,
         shares_minted: U256,
         wrap_tx_hash: TxHash,
         wrapped_shares: U256,
@@ -662,7 +709,6 @@ pub(crate) enum TokenizedEquityMint {
         issuer_request_id: IssuerRequestId,
         tokenization_request_id: TokenizationRequestId,
         tx_hash: TxHash,
-        receipt_id: ReceiptId,
         shares_minted: U256,
         wrap_tx_hash: TxHash,
         wrapped_shares: U256,
@@ -768,7 +814,6 @@ impl PartialEq for TokenizedEquityMint {
                     issuer_request_id: iss_a,
                     tokenization_request_id: tok_a,
                     tx_hash: hash_a,
-                    receipt_id: rcpt_a,
                     shares_minted: mint_a,
                     fees: fees_a,
                     requested_at: req_a,
@@ -782,7 +827,6 @@ impl PartialEq for TokenizedEquityMint {
                     issuer_request_id: iss_b,
                     tokenization_request_id: tok_b,
                     tx_hash: hash_b,
-                    receipt_id: rcpt_b,
                     shares_minted: mint_b,
                     fees: fees_b,
                     requested_at: req_b,
@@ -796,7 +840,6 @@ impl PartialEq for TokenizedEquityMint {
                     && iss_a == iss_b
                     && tok_a == tok_b
                     && hash_a == hash_b
-                    && rcpt_a == rcpt_b
                     && mint_a == mint_b
                     && match (fees_a, fees_b) {
                         (Some(a), Some(b)) => a.eq(*b).unwrap_or(false),
@@ -815,7 +858,6 @@ impl PartialEq for TokenizedEquityMint {
                     issuer_request_id: iss_a,
                     tokenization_request_id: tok_a,
                     tx_hash: hash_a,
-                    receipt_id: rcpt_a,
                     shares_minted: mint_a,
                     fees: fees_a,
                     requested_at: req_a,
@@ -830,7 +872,6 @@ impl PartialEq for TokenizedEquityMint {
                     issuer_request_id: iss_b,
                     tokenization_request_id: tok_b,
                     tx_hash: hash_b,
-                    receipt_id: rcpt_b,
                     shares_minted: mint_b,
                     fees: fees_b,
                     requested_at: req_b,
@@ -845,7 +886,6 @@ impl PartialEq for TokenizedEquityMint {
                     && iss_a == iss_b
                     && tok_a == tok_b
                     && hash_a == hash_b
-                    && rcpt_a == rcpt_b
                     && mint_a == mint_b
                     && match (fees_a, fees_b) {
                         (Some(a), Some(b)) => a.eq(*b).unwrap_or(false),
@@ -865,7 +905,6 @@ impl PartialEq for TokenizedEquityMint {
                     issuer_request_id: iss_a,
                     tokenization_request_id: tok_a,
                     tx_hash: hash_a,
-                    receipt_id: rcpt_a,
                     shares_minted: mint_a,
                     wrap_tx_hash: wrap_hash_a,
                     wrapped_shares: wrap_shares_a,
@@ -881,7 +920,6 @@ impl PartialEq for TokenizedEquityMint {
                     issuer_request_id: iss_b,
                     tokenization_request_id: tok_b,
                     tx_hash: hash_b,
-                    receipt_id: rcpt_b,
                     shares_minted: mint_b,
                     wrap_tx_hash: wrap_hash_b,
                     wrapped_shares: wrap_shares_b,
@@ -897,7 +935,6 @@ impl PartialEq for TokenizedEquityMint {
                     && iss_a == iss_b
                     && tok_a == tok_b
                     && hash_a == hash_b
-                    && rcpt_a == rcpt_b
                     && mint_a == mint_b
                     && wrap_hash_a == wrap_hash_b
                     && wrap_shares_a == wrap_shares_b
@@ -914,7 +951,6 @@ impl PartialEq for TokenizedEquityMint {
                     issuer_request_id: iss_a,
                     tokenization_request_id: tok_a,
                     tx_hash: hash_a,
-                    receipt_id: rcpt_a,
                     shares_minted: mint_a,
                     wrap_tx_hash: wrap_hash_a,
                     wrapped_shares: wrap_shares_a,
@@ -931,7 +967,6 @@ impl PartialEq for TokenizedEquityMint {
                     issuer_request_id: iss_b,
                     tokenization_request_id: tok_b,
                     tx_hash: hash_b,
-                    receipt_id: rcpt_b,
                     shares_minted: mint_b,
                     wrap_tx_hash: wrap_hash_b,
                     wrapped_shares: wrap_shares_b,
@@ -948,7 +983,6 @@ impl PartialEq for TokenizedEquityMint {
                     && iss_a == iss_b
                     && tok_a == tok_b
                     && hash_a == hash_b
-                    && rcpt_a == rcpt_b
                     && mint_a == mint_b
                     && wrap_hash_a == wrap_hash_b
                     && wrap_shares_a == wrap_shares_b
@@ -1158,6 +1192,7 @@ pub(crate) async fn interrupted_mint_ids(
          WHERE last_ev.aggregate_type = 'TokenizedEquityMint' \
            AND last_ev.event_type IN ( \
                'TokenizedEquityMintEvent::MintAccepted', \
+               'TokenizedEquityMintEvent::ProviderCompletionRecovered', \
                'TokenizedEquityMintEvent::TokensReceived', \
                'TokenizedEquityMintEvent::WrapSubmitted', \
                'TokenizedEquityMintEvent::TokensWrapped', \
@@ -1195,7 +1230,9 @@ impl EventSourced for TokenizedEquityMint {
 
     const AGGREGATE_TYPE: &'static str = "TokenizedEquityMint";
     const PROJECTION: Nil = Nil;
-    const SCHEMA_VERSION: u64 = 2;
+    // v3: removed the vestigial `receipt_id` field and added the
+    // `ProviderCompletionRecovered` event for in-process failed-transfer recovery.
+    const SCHEMA_VERSION: u64 = 3;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use TokenizedEquityMintEvent::*;
@@ -1308,7 +1345,6 @@ impl EventSourced for TokenizedEquityMint {
 
             TokensReceived {
                 tx_hash,
-                receipt_id,
                 shares_minted,
                 fees,
                 received_at,
@@ -1333,12 +1369,45 @@ impl EventSourced for TokenizedEquityMint {
                     issuer_request_id: issuer_request_id.clone(),
                     tokenization_request_id: tokenization_request_id.clone(),
                     tx_hash: *tx_hash,
-                    receipt_id: receipt_id.clone(),
                     shares_minted: *shares_minted,
                     fees: *fees,
                     requested_at: *requested_at,
                     accepted_at: *accepted_at,
                     received_at: *received_at,
+                })
+            }
+
+            ProviderCompletionRecovered {
+                issuer_request_id,
+                wallet,
+                tokenization_request_id,
+                tx_hash,
+                shares_minted,
+                fees,
+                recovered_at,
+            } => {
+                let Self::Failed {
+                    symbol,
+                    quantity,
+                    requested_at,
+                    ..
+                } = entity
+                else {
+                    return Ok(None);
+                };
+
+                Some(Self::TokensReceived {
+                    symbol: symbol.clone(),
+                    quantity: *quantity,
+                    wallet: *wallet,
+                    issuer_request_id: issuer_request_id.clone(),
+                    tokenization_request_id: tokenization_request_id.clone(),
+                    tx_hash: *tx_hash,
+                    shares_minted: *shares_minted,
+                    fees: *fees,
+                    requested_at: *requested_at,
+                    accepted_at: *recovered_at,
+                    received_at: *recovered_at,
                 })
             }
 
@@ -1353,7 +1422,6 @@ impl EventSourced for TokenizedEquityMint {
                     issuer_request_id,
                     tokenization_request_id,
                     tx_hash,
-                    receipt_id,
                     shares_minted,
                     fees,
                     requested_at,
@@ -1371,7 +1439,6 @@ impl EventSourced for TokenizedEquityMint {
                     issuer_request_id: issuer_request_id.clone(),
                     tokenization_request_id: tokenization_request_id.clone(),
                     tx_hash: *tx_hash,
-                    receipt_id: receipt_id.clone(),
                     shares_minted: *shares_minted,
                     fees: *fees,
                     requested_at: *requested_at,
@@ -1393,7 +1460,6 @@ impl EventSourced for TokenizedEquityMint {
                     issuer_request_id,
                     tokenization_request_id,
                     tx_hash,
-                    receipt_id,
                     shares_minted,
                     requested_at,
                     accepted_at,
@@ -1407,7 +1473,6 @@ impl EventSourced for TokenizedEquityMint {
                     issuer_request_id,
                     tokenization_request_id,
                     tx_hash,
-                    receipt_id,
                     shares_minted,
                     requested_at,
                     accepted_at,
@@ -1420,7 +1485,6 @@ impl EventSourced for TokenizedEquityMint {
                     issuer_request_id: issuer_request_id.clone(),
                     tokenization_request_id: tokenization_request_id.clone(),
                     tx_hash: *tx_hash,
-                    receipt_id: receipt_id.clone(),
                     shares_minted: *shares_minted,
                     wrap_tx_hash: *wrap_tx_hash,
                     wrapped_shares: *wrapped_shares,
@@ -1443,7 +1507,6 @@ impl EventSourced for TokenizedEquityMint {
                     issuer_request_id,
                     tokenization_request_id,
                     tx_hash,
-                    receipt_id,
                     shares_minted,
                     wrap_tx_hash,
                     wrapped_shares,
@@ -1463,7 +1526,6 @@ impl EventSourced for TokenizedEquityMint {
                     issuer_request_id: issuer_request_id.clone(),
                     tokenization_request_id: tokenization_request_id.clone(),
                     tx_hash: *tx_hash,
-                    receipt_id: receipt_id.clone(),
                     shares_minted: *shares_minted,
                     wrap_tx_hash: *wrap_tx_hash,
                     wrapped_shares: *wrapped_shares,
@@ -1691,7 +1753,6 @@ impl EventSourced for TokenizedEquityMint {
 
                             Ok(vec![TokensReceived {
                                 tx_hash,
-                                receipt_id: ReceiptId(U256::ZERO),
                                 shares_minted,
                                 fees: completed.fees,
                                 received_at: Utc::now(),
@@ -1858,6 +1919,28 @@ impl EventSourced for TokenizedEquityMint {
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
                 _ => Err(TokenizedEquityMintError::AlreadyInProgress),
             },
+
+            TokenizedEquityMintCommand::RecoverProviderCompletion {
+                issuer_request_id,
+                wallet,
+                tokenization_request_id,
+                tx_hash,
+                fees,
+            } => match self {
+                Self::Failed { quantity, .. } => Ok(vec![ProviderCompletionRecovered {
+                    issuer_request_id,
+                    wallet,
+                    tokenization_request_id,
+                    tx_hash,
+                    shares_minted: quantity_to_u256_18_decimals(*quantity)?,
+                    fees,
+                    recovered_at: Utc::now(),
+                }]),
+                Self::DepositedIntoRaindex { .. } => {
+                    Err(TokenizedEquityMintError::AlreadyCompleted)
+                }
+                _ => Err(TokenizedEquityMintError::AlreadyInProgress),
+            },
         }
     }
 }
@@ -1913,7 +1996,6 @@ mod tests {
     fn tokens_received_event() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::TokensReceived {
             tx_hash: TxHash::random(),
-            receipt_id: ReceiptId(U256::from(789)),
             shares_minted: U256::from(100_500_000_000_000_000_000_u128),
             fees: None,
             received_at: Utc::now(),
@@ -2151,7 +2233,6 @@ mod tests {
 
         let event = TokenizedEquityMintEvent::TokensReceived {
             tx_hash: TxHash::random(),
-            receipt_id: ReceiptId(U256::from(789)),
             shares_minted: U256::from(100_500_000_000_000_000_000_u128),
             fees: None,
             received_at: Utc::now(),
@@ -2412,7 +2493,6 @@ mod tests {
             issuer_request_id: IssuerRequestId::new("ISS001"),
             tokenization_request_id: TokenizationRequestId("REQ001".to_string()),
             tx_hash: TxHash::random(),
-            receipt_id: ReceiptId(U256::from(1)),
             shares_minted: U256::from(10_000_000_000_000_000_000_u128),
             fees: None,
             requested_at: Utc::now(),
@@ -2626,7 +2706,6 @@ mod tests {
             issuer_request_id: IssuerRequestId::new("ISS001"),
             tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
             tx_hash: TxHash::random(),
-            receipt_id: ReceiptId(U256::from(1)),
             shares_minted: U256::from(10_000_000_000_000_000_000_u128),
             fees: None,
             requested_at: now,
@@ -2651,7 +2730,6 @@ mod tests {
             issuer_request_id: IssuerRequestId::new("ISS001"),
             tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
             tx_hash: TxHash::random(),
-            receipt_id: ReceiptId(U256::from(1)),
             shares_minted: U256::from(10_000_000_000_000_000_000_u128),
             wrap_tx_hash: TxHash::random(),
             wrapped_shares: U256::from(10_000_000_000_000_000_000_u128),
@@ -2720,6 +2798,132 @@ mod tests {
         }
         assert_eq!(op.started_at, now);
         assert_eq!(op.updated_at, later);
+    }
+
+    #[test]
+    fn provider_completion_recovery_reopens_failed_mint_as_tokens_received() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let requested_at = Utc::now();
+        let recovered_at = requested_at + chrono::Duration::seconds(60);
+        let failed = TokenizedEquityMint::Failed {
+            symbol: symbol.clone(),
+            quantity: float!(10),
+            reason: "poll timeout".to_string(),
+            requested_at,
+            failed_at: requested_at + chrono::Duration::seconds(30),
+        };
+
+        let recovered = TokenizedEquityMintEvent::ProviderCompletionRecovered {
+            issuer_request_id: IssuerRequestId::new("ISS001"),
+            wallet: Address::ZERO,
+            tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+            tx_hash: TxHash::ZERO,
+            shares_minted: U256::from(10) * U256::from(10).pow(U256::from(18)),
+            fees: None,
+            recovered_at,
+        };
+
+        let result = TokenizedEquityMint::evolve(&failed, &recovered)
+            .unwrap()
+            .expect("recovered state");
+
+        assert!(
+            matches!(
+                result,
+                TokenizedEquityMint::TokensReceived {
+                    symbol: ref recovered_symbol,
+                    ref tokenization_request_id,
+                    ..
+                } if *recovered_symbol == symbol
+                    && *tokenization_request_id == TokenizationRequestId("TOK001".to_string())
+            ),
+            "expected recovered mint to move to TokensReceived, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn provider_completion_recovered_fees_serialize_as_decimal_string() {
+        use st0x_float_macro::float;
+
+        // Regression: without the custom Float serde annotation, `fees` would
+        // serialize via Float's default representation -- diverging from
+        // `TokensReceived.fees` and breaking event replay from the events
+        // table. Assert the decimal-string form (independent of the type under
+        // test) and a clean round-trip.
+        let event = TokenizedEquityMintEvent::ProviderCompletionRecovered {
+            issuer_request_id: IssuerRequestId::new("ISS001"),
+            wallet: Address::ZERO,
+            tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+            tx_hash: TxHash::ZERO,
+            shares_minted: U256::from(10),
+            fees: Some(float!("0.25")),
+            recovered_at: Utc::now(),
+        };
+
+        let serialized = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            serialized["ProviderCompletionRecovered"]["fees"],
+            serde_json::json!("0.25")
+        );
+
+        let deserialized: TokenizedEquityMintEvent = serde_json::from_value(serialized).unwrap();
+        let TokenizedEquityMintEvent::ProviderCompletionRecovered { fees, .. } = deserialized
+        else {
+            panic!("expected ProviderCompletionRecovered, got {deserialized:?}");
+        };
+        assert!(fees.unwrap().eq(float!("0.25")).unwrap());
+    }
+
+    #[tokio::test]
+    async fn recover_provider_completion_rejected_for_active_mint() {
+        let error = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
+            .given(vec![mint_requested_event()])
+            .when(TokenizedEquityMintCommand::RecoverProviderCompletion {
+                issuer_request_id: IssuerRequestId::new("ISS001"),
+                wallet: Address::ZERO,
+                tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+                tx_hash: TxHash::ZERO,
+                fees: None,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(TokenizedEquityMintError::AlreadyInProgress)
+            ),
+            "active mints must not be provider-completion recovered, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_provider_completion_rejected_for_completed_mint() {
+        let error = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
+            .given(vec![
+                mint_requested_event(),
+                mint_accepted_event(),
+                tokens_received_event(),
+                tokens_wrapped_event(),
+                vault_deposited_event(),
+            ])
+            .when(TokenizedEquityMintCommand::RecoverProviderCompletion {
+                issuer_request_id: IssuerRequestId::new("ISS001"),
+                wallet: Address::ZERO,
+                tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+                tx_hash: TxHash::ZERO,
+                fees: None,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(TokenizedEquityMintError::AlreadyCompleted)
+            ),
+            "completed mints must not be recovered, got {error:?}"
+        );
     }
 
     #[tokio::test]

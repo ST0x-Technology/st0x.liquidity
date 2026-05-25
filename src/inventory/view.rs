@@ -949,7 +949,6 @@ impl InventoryView {
     }
 
     /// Returns the equity inflight balance at the given venue for a symbol.
-    #[cfg(test)]
     pub(crate) fn equity_inflight(
         &self,
         symbol: &Symbol,
@@ -1319,13 +1318,11 @@ impl InventoryView {
     }
 
     /// Returns the aggregate ID of the in-flight mint for `symbol`, if any.
-    #[cfg(test)]
     pub(crate) fn active_mint(&self, symbol: &Symbol) -> Option<&IssuerRequestId> {
         self.active_mints.get(symbol)
     }
 
     /// Returns the aggregate ID of the in-flight redemption for `symbol`, if any.
-    #[cfg(test)]
     pub(crate) fn active_redemption(&self, symbol: &Symbol) -> Option<&RedemptionAggregateId> {
         self.active_redemptions.get(symbol)
     }
