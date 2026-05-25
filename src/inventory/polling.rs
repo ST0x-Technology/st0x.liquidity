@@ -122,6 +122,8 @@ where
     tokenizer: Option<Arc<dyn Tokenizer>>,
     pending_request_ownership: Option<Arc<dyn PendingRequestOwnership>>,
     external_pending_warnings: Mutex<HashSet<TokenizationRequestId>>,
+    unconfigured_symbol_warnings: Mutex<HashSet<Symbol>>,
+    configured_equity_symbols: Option<HashSet<Symbol>>,
     reserved_cash: Usd,
 }
 
@@ -151,8 +153,18 @@ where
             tokenizer,
             pending_request_ownership: None,
             external_pending_warnings: Mutex::new(HashSet::new()),
+            unconfigured_symbol_warnings: Mutex::new(HashSet::new()),
+            configured_equity_symbols: None,
             reserved_cash,
         }
+    }
+
+    pub(crate) fn with_configured_equity_symbols(
+        mut self,
+        configured_equity_symbols: HashSet<Symbol>,
+    ) -> Self {
+        self.configured_equity_symbols = Some(configured_equity_symbols);
+        self
     }
 
     pub(crate) fn with_pending_request_ownership(
@@ -455,11 +467,7 @@ where
             return Ok(());
         };
 
-        let positions: BTreeMap<_, _> = inventory
-            .positions
-            .into_iter()
-            .map(|position| (position.symbol, position.quantity))
-            .collect();
+        let positions = self.normalize_offchain_positions(inventory.positions);
 
         self.snapshot
             .send(
@@ -500,6 +508,67 @@ where
             .await?;
 
         Ok(())
+    }
+
+    fn normalize_offchain_positions(
+        &self,
+        broker_positions: Vec<st0x_execution::EquityPosition>,
+    ) -> BTreeMap<Symbol, FractionalShares> {
+        let Some(configured_symbols) = &self.configured_equity_symbols else {
+            return broker_positions
+                .into_iter()
+                .map(|position| (position.symbol, position.quantity))
+                .collect();
+        };
+
+        let mut positions: BTreeMap<_, _> = configured_symbols
+            .iter()
+            .map(|symbol| (symbol.clone(), FractionalShares::ZERO))
+            .collect();
+
+        let mut unconfigured_this_poll = HashSet::new();
+
+        for position in broker_positions {
+            if configured_symbols.contains(&position.symbol) {
+                positions.insert(position.symbol, position.quantity);
+            } else {
+                // Warn once per contiguous appearance, re-warning only if the
+                // symbol disappears and later returns (see the bounding retain
+                // below). The broker may hold positions outside the configured
+                // universe indefinitely, so warning every poll would spam logs.
+                if self
+                    .lock_unconfigured_symbol_warnings()
+                    .insert(position.symbol.clone())
+                {
+                    warn!(
+                        target: "inventory",
+                        symbol = %position.symbol,
+                        "Skipping unconfigured broker equity position"
+                    );
+                }
+
+                unconfigured_this_poll.insert(position.symbol);
+            }
+        }
+
+        // Bound the warn-once set to symbols still seen this poll so it cannot
+        // grow without bound as broker positions appear and disappear.
+        self.lock_unconfigured_symbol_warnings()
+            .retain(|symbol| unconfigured_this_poll.contains(symbol));
+
+        positions
+    }
+
+    fn lock_unconfigured_symbol_warnings(&self) -> MutexGuard<'_, HashSet<Symbol>> {
+        self.unconfigured_symbol_warnings
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                warn!(
+                    target: "inventory",
+                    "Unconfigured symbol warning tracker was poisoned; recovering state"
+                );
+                poisoned.into_inner()
+            })
     }
 
     fn aggregate_pending_requests(
@@ -946,6 +1015,10 @@ mod tests {
         FractionalShares::new(float!(&n.to_string()))
     }
 
+    fn configured_symbols(symbols: &[&str]) -> HashSet<Symbol> {
+        symbols.iter().map(|symbol| test_symbol(symbol)).collect()
+    }
+
     async fn create_test_raindex_service(
         pool: &SqlitePool,
         provider: impl Provider + Clone + 'static,
@@ -1025,6 +1098,131 @@ mod tests {
             positions.get(&test_symbol("MSFT")),
             Some(&test_shares(50)),
             "MSFT position mismatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_and_record_emits_zero_for_configured_position_absent_from_executor() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let (orderbook, order_owner) = test_addresses();
+
+        let inventory = Inventory {
+            positions: vec![EquityPosition {
+                symbol: test_symbol("AAPL"),
+                quantity: test_shares(100),
+                market_value: Some(float!(15000)),
+            }],
+            usd_balance_cents: 10_000_000,
+            cash_buying_power_cents: Some(10_000_000),
+            cash_withdrawable_cents: None,
+        };
+        let executor = MockExecutor::new().with_inventory(inventory);
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            executor,
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            None,
+            Usd::ZERO,
+        )
+        .with_configured_equity_symbols(configured_symbols(&["AAPL", "SPYM"]));
+
+        service.poll_and_record().await.unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        let offchain_equity_event = events
+            .iter()
+            .find(|event| matches!(event, InventorySnapshotEvent::OffchainEquity { .. }))
+            .expect("Expected OffchainEquity event to be emitted");
+
+        let InventorySnapshotEvent::OffchainEquity { positions, .. } = offchain_equity_event else {
+            panic!("Expected OffchainEquity event, got {offchain_equity_event:?}");
+        };
+        assert_eq!(
+            positions.get(&test_symbol("AAPL")),
+            Some(&test_shares(100)),
+            "present configured broker position must preserve quantity"
+        );
+        assert_eq!(
+            positions.get(&test_symbol("SPYM")),
+            Some(&FractionalShares::ZERO),
+            "absent configured broker position must be normalized to zero"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_and_record_ignores_executor_positions_not_in_configured_symbols() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let (orderbook, order_owner) = test_addresses();
+
+        let inventory = Inventory {
+            positions: vec![
+                EquityPosition {
+                    symbol: test_symbol("AAPL"),
+                    quantity: test_shares(100),
+                    market_value: Some(float!(15000)),
+                },
+                EquityPosition {
+                    symbol: test_symbol("UNKNOWN"),
+                    quantity: test_shares(50),
+                    market_value: Some(float!(5000)),
+                },
+            ],
+            usd_balance_cents: 10_000_000,
+            cash_buying_power_cents: Some(10_000_000),
+            cash_withdrawable_cents: None,
+        };
+        let executor = MockExecutor::new().with_inventory(inventory);
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            executor,
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            None,
+            Usd::ZERO,
+        )
+        .with_configured_equity_symbols(configured_symbols(&["AAPL"]));
+
+        service.poll_and_record().await.unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        let offchain_equity_event = events
+            .iter()
+            .find(|event| matches!(event, InventorySnapshotEvent::OffchainEquity { .. }))
+            .expect("Expected OffchainEquity event to be emitted");
+
+        let InventorySnapshotEvent::OffchainEquity { positions, .. } = offchain_equity_event else {
+            panic!("Expected OffchainEquity event, got {offchain_equity_event:?}");
+        };
+        assert_eq!(
+            positions.len(),
+            1,
+            "Only configured active symbols should be emitted"
+        );
+        assert_eq!(
+            positions.get(&test_symbol("AAPL")),
+            Some(&test_shares(100)),
+            "configured position mismatch"
+        );
+        assert!(
+            !positions.contains_key(&test_symbol("UNKNOWN")),
+            "unconfigured broker-only position must not be added to offchain equity"
         );
     }
 

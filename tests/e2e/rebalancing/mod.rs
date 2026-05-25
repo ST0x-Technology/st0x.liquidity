@@ -230,7 +230,11 @@ async fn equity_mint_handles_direct_high_precision_sell_price() -> anyhow::Resul
     let broker_fill_price = float!(110);
     let amount_per_trade = float!(7.5);
 
-    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
+    let infra = TestInfra::start(
+        vec![("AAPL", broker_fill_price)],
+        vec![("AAPL", float!(7.5))],
+    )
+    .await?;
 
     let mut prepared_orders = Vec::new();
     for _ in 0..3 {
@@ -1022,7 +1026,11 @@ async fn usdc_imbalance_triggers_base_to_alpaca() -> anyhow::Result<()> {
     let broker_fill_price = float!(155.00);
     let amount_per_trade = float!(7.5);
 
-    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
+    let infra = TestInfra::start(
+        vec![("AAPL", broker_fill_price)],
+        vec![("AAPL", float!(7.5))],
+    )
+    .await?;
     let cctp = CctpInfra::start(&infra).await?;
 
     // Pre-fund the USDC vault so the ratio stays below 0.6 before
@@ -1345,7 +1353,11 @@ async fn pending_requests_filtered_by_wallet() -> anyhow::Result<()> {
     let broker_fill_price = float!("148.00");
     let amount_per_trade = float!("7.5");
 
-    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
+    let infra = TestInfra::start(
+        vec![("AAPL", broker_fill_price)],
+        vec![("AAPL", float!(7.5))],
+    )
+    .await?;
 
     // Set up SellEquity orders to create TooMuchOffchain imbalance -> mint.
     let mut prepared_orders = Vec::new();
@@ -1496,7 +1508,8 @@ async fn inflight_polling_emits_events_for_pending_requests() -> anyhow::Result<
     let onchain_price = float!("150.00");
     let amount_per_trade = float!("5");
 
-    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
+    let infra =
+        TestInfra::start(vec![("AAPL", broker_fill_price)], vec![("AAPL", float!(5))]).await?;
     infra
         .tokenization_service
         .set_polls_until_complete(usize::MAX);
@@ -1609,7 +1622,11 @@ async fn interrupted_mint_resumes_after_restart() -> anyhow::Result<()> {
     let broker_fill_price = float!(148.00);
     let amount_per_trade = float!(7.5);
 
-    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
+    let infra = TestInfra::start(
+        vec![("AAPL", broker_fill_price)],
+        vec![("AAPL", float!(7.5))],
+    )
+    .await?;
     infra.tokenization_service.set_polls_until_complete(4);
 
     let wrapped_token = infra.equity_addresses[0].1;
@@ -2023,7 +2040,8 @@ async fn inflight_state_survives_restart() -> anyhow::Result<()> {
     let onchain_price = float!("150.00");
     let amount_per_trade = float!("5");
 
-    let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
+    let infra =
+        TestInfra::start(vec![("AAPL", broker_fill_price)], vec![("AAPL", float!(5))]).await?;
     infra
         .tokenization_service
         .set_polls_until_complete(usize::MAX);

@@ -824,6 +824,10 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             .await?;
 
         rebalancing_service
+            .recover_pending_offchain_order_symbols(&built.position_projection)
+            .await?;
+
+        rebalancing_service
             .set_stores(built.mint.clone(), built.redemption.clone())
             .await;
 

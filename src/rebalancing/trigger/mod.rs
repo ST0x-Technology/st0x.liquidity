@@ -38,7 +38,9 @@ use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, error, trace, warn};
 
 use rain_math_float::Float;
-use st0x_event_sorcery::{AggregateError, EntityList, LifecycleError, Reactor, Store, deps};
+use st0x_event_sorcery::{
+    AggregateError, EntityList, LifecycleError, Projection, ProjectionError, Reactor, Store, deps,
+};
 use st0x_execution::{FractionalShares, Positive, SharesBlockchain, SharesConversionError, Symbol};
 use st0x_finance::{HasZero, Usdc};
 
@@ -601,6 +603,7 @@ pub(crate) struct RebalancingService {
     order_owner: Address,
     inventory: Arc<BroadcastingInventory>,
     pub(crate) equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
+    pending_offchain_order_symbols: Arc<RwLock<HashSet<Symbol>>>,
     pub(crate) usdc_in_progress: Arc<AtomicBool>,
     sender: mpsc::Sender<TriggeredOperation>,
     wrapper: Arc<dyn Wrapper>,
@@ -663,6 +666,7 @@ impl RebalancingService {
             order_owner,
             inventory,
             equity_in_progress: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            pending_offchain_order_symbols: Arc::new(RwLock::new(HashSet::new())),
             usdc_in_progress: Arc::new(AtomicBool::new(false)),
             sender,
             wrapper,
@@ -694,6 +698,26 @@ impl RebalancingService {
     ) {
         *self.mint_store.write().await = Some(mint_store);
         *self.redemption_store.write().await = Some(redemption_store);
+    }
+
+    pub(crate) async fn recover_pending_offchain_order_symbols(
+        &self,
+        position_projection: &Projection<Position>,
+    ) -> Result<(), ProjectionError<Position>> {
+        let pending_symbols = position_projection
+            .load_all()
+            .await?
+            .into_iter()
+            .filter_map(|(symbol, position)| {
+                position
+                    .pending_offchain_order_id
+                    .is_some()
+                    .then_some(symbol)
+            })
+            .collect();
+
+        *self.pending_offchain_order_symbols.write().await = pending_symbols;
+        Ok(())
     }
 
     async fn expire_stuck_operations(
@@ -1342,7 +1366,13 @@ impl RebalancingService {
         match event {
             // Per-symbol equity snapshots: fan out into one equity check
             // per symbol so independent retries and parallel work fall
-            // out naturally.
+            // out naturally. Iterating the event map (not the view's full
+            // applied set) is sufficient: `InventoryView::apply_equity_snapshot`
+            // additionally zeroes symbols absent from a complete snapshot, but
+            // both feeders guarantee any such symbol is already a key here --
+            // offchain polling seeds every configured symbol explicitly, and
+            // onchain polling emits a key for every vault in the monotonic
+            // registry.
             OnchainEquity { balances, .. } => {
                 for symbol in balances.keys() {
                     self.equity_scheduler.enqueue_check(symbol.clone()).await;
@@ -1401,6 +1431,7 @@ impl Reactor for RebalancingService {
                 use PositionEvent::*;
 
                 let timestamp = event.timestamp();
+                let mut clear_pending_offchain_order = false;
                 let (equity_update, usdc_update) = match &event {
                     OnChainOrderFilled {
                         amount,
@@ -1426,6 +1457,14 @@ impl Reactor for RebalancingService {
                         price,
                         ..
                     } => {
+                        // Defer clearing the suppression until the fill has been
+                        // applied to inventory below. If that update fails, the
+                        // gate deliberately stays closed: we never resume equity
+                        // rebalancing on inventory we failed to record the fill
+                        // into. It self-heals when the next terminal offchain
+                        // order event for this symbol applies cleanly, or on
+                        // restart via recover_pending_offchain_order_symbols.
+                        clear_pending_offchain_order = true;
                         let equity_op: Operator = (*direction).into();
                         let quantity: Float = shares_filled.inner().into();
                         let price_value = price.inner();
@@ -1439,10 +1478,22 @@ impl Reactor for RebalancingService {
                             ),
                         )
                     }
-                    Initialized { .. }
-                    | OffChainOrderPlaced { .. }
-                    | OffChainOrderFailed { .. }
-                    | ThresholdUpdated { .. } => return Ok(()),
+                    OffChainOrderPlaced { .. } => {
+                        self.pending_offchain_order_symbols
+                            .write()
+                            .await
+                            .insert(symbol);
+                        return Ok(());
+                    }
+                    OffChainOrderFailed { .. } => {
+                        self.pending_offchain_order_symbols
+                            .write()
+                            .await
+                            .remove(&symbol);
+                        self.equity_scheduler.enqueue_check(symbol).await;
+                        return Ok(());
+                    }
+                    Initialized { .. } | ThresholdUpdated { .. } => return Ok(()),
                 };
 
                 let mut inventory = self.inventory.write().await;
@@ -1452,6 +1503,13 @@ impl Reactor for RebalancingService {
                     .update_usdc(usdc_update, timestamp)?;
                 *inventory = updated;
                 drop(inventory);
+
+                if clear_pending_offchain_order {
+                    self.pending_offchain_order_symbols
+                        .write()
+                        .await
+                        .remove(&symbol);
+                }
 
                 self.equity_scheduler.enqueue_check(symbol).await;
                 self.usdc_scheduler.enqueue_check().await;
@@ -1553,6 +1611,13 @@ impl RebalancingService {
 
     fn try_claim_equity_guard(&self, symbol: &Symbol) -> Option<equity::InProgressGuard> {
         equity::InProgressGuard::try_claim(symbol.clone(), Arc::clone(&self.equity_in_progress))
+    }
+
+    async fn has_pending_offchain_order(&self, symbol: &Symbol) -> bool {
+        self.pending_offchain_order_symbols
+            .read()
+            .await
+            .contains(symbol)
     }
 
     async fn build_equity_operation(
@@ -1820,6 +1885,11 @@ impl RebalancingService {
             return Ok(());
         }
 
+        if self.has_pending_offchain_order(symbol).await {
+            debug!(target: "rebalance", %symbol, "Skipped equity trigger: offchain hedge order pending");
+            return Ok(());
+        }
+
         let Some(guard) = self.try_claim_equity_guard(symbol) else {
             debug!(target: "rebalance", %symbol, "Skipped equity trigger: already in progress");
             return Ok(());
@@ -1838,6 +1908,24 @@ impl RebalancingService {
             }
             Err(error) => return Err(error),
         };
+
+        // Re-check immediately before dispatch: an OffChainOrderPlaced for this
+        // symbol may have landed during the awaits in build_equity_operation.
+        // try_send_operation is synchronous, so no await intervenes between this
+        // check and the send, keeping the race window as tight as possible.
+        // This narrows but cannot fully close the gap: the in-memory set is a
+        // reactor-lagged projection of the position aggregate's
+        // pending_offchain_order_id, so a just-committed OffChainOrderPlaced
+        // not yet seen by the reactor is invisible here. Closing that fully
+        // needs a source-side reservation, not a reactor-lagged projection.
+        if self.has_pending_offchain_order(symbol).await {
+            debug!(
+                target: "rebalance",
+                %symbol,
+                "Skipped equity trigger before dispatch: offchain hedge order became pending"
+            );
+            return Ok(());
+        }
 
         if !self.try_send_operation(&operation, "equity") {
             return Ok(());
@@ -2803,7 +2891,7 @@ mod tests {
     use st0x_event_sorcery::{
         EntityList, Never, Reactor, ReactorHarness, TestStore, deps, test_store,
     };
-    use st0x_execution::{Direction, ExecutorOrderId, Positive};
+    use st0x_execution::{Direction, ExecutorOrderId, Positive, SupportedExecutor};
     use st0x_finance::{Usd, Usdc};
     use std::collections::{BTreeMap, HashSet};
     use std::sync::Arc;
@@ -2828,7 +2916,7 @@ mod tests {
     use crate::inventory::view::Operator;
     use crate::inventory::{InventoryError, InventoryView, TransferOp, Venue};
     use crate::offchain::order::OffchainOrderId;
-    use crate::position::{Position, PositionEvent, TradeId};
+    use crate::position::{Position, PositionCommand, PositionEvent, TradeId, TriggerReason};
     use crate::threshold::ExecutionThreshold;
     use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
     use crate::usdc_rebalance::{
@@ -4467,6 +4555,28 @@ mod tests {
             executor_order_id: ExecutorOrderId::new("ORD1"),
             price: Usd::new(float!(150)),
             broker_timestamp,
+        }
+    }
+
+    fn make_offchain_placed(offchain_order_id: OffchainOrderId) -> PositionEvent {
+        PositionEvent::OffChainOrderPlaced {
+            offchain_order_id,
+            shares: Positive::new(shares(10)).unwrap(),
+            direction: Direction::Buy,
+            executor: SupportedExecutor::DryRun,
+            trigger_reason: TriggerReason::SharesThreshold {
+                net_position_shares: float!(10),
+                threshold_shares: float!(1),
+            },
+            placed_at: Utc::now(),
+        }
+    }
+
+    fn make_offchain_failed(offchain_order_id: OffchainOrderId) -> PositionEvent {
+        PositionEvent::OffChainOrderFailed {
+            offchain_order_id,
+            error: "test failure".to_string(),
+            failed_at: Utc::now(),
         }
     }
 
@@ -11144,6 +11254,257 @@ mod tests {
         assert!(
             matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
             "In-progress flag should suppress duplicate equity dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn equity_check_suppresses_dispatch_when_offchain_order_pending() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(80))
+            .with_usdc(usdc(500), usdc(500));
+
+        let (reactor, mut receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+
+        trigger
+            .pending_offchain_order_symbols
+            .write()
+            .await
+            .insert(symbol.clone());
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+            "Pending offchain hedge order should suppress equity rebalancing dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn position_offchain_order_lifecycle_blocks_then_releases_equity_check() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let offchain_order_id = OffchainOrderId::new();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(80))
+            .with_usdc(usdc(500), usdc(500));
+
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        harness
+            .receive::<Position>(symbol.clone(), make_offchain_placed(offchain_order_id))
+            .await
+            .unwrap();
+
+        assert!(
+            trigger.has_pending_offchain_order(&symbol).await,
+            "OffChainOrderPlaced should block equity rebalancing for the symbol"
+        );
+
+        harness
+            .receive::<Position>(symbol.clone(), make_offchain_failed(offchain_order_id))
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.has_pending_offchain_order(&symbol).await,
+            "Terminal offchain order event should release the rebalancing block"
+        );
+    }
+
+    #[tokio::test]
+    async fn offchain_order_filled_releases_equity_rebalancing_block() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let offchain_order_id = OffchainOrderId::new();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(80))
+            .with_usdc(usdc(5000), usdc(5000));
+
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        harness
+            .receive::<Position>(symbol.clone(), make_offchain_placed(offchain_order_id))
+            .await
+            .unwrap();
+
+        assert!(
+            trigger.has_pending_offchain_order(&symbol).await,
+            "OffChainOrderPlaced should block equity rebalancing for the symbol"
+        );
+
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_offchain_fill(shares(10), Direction::Sell),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.has_pending_offchain_order(&symbol).await,
+            "A filled offchain order should release the rebalancing block"
+        );
+    }
+
+    #[tokio::test]
+    async fn offchain_order_failed_enqueues_equity_recheck() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let offchain_order_id = OffchainOrderId::new();
+        // Balanced venues so the drained recheck evaluates cleanly without
+        // dispatching a rebalance.
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(500), usdc(500));
+
+        let (trigger, _receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        harness
+            .receive::<Position>(symbol.clone(), make_offchain_placed(offchain_order_id))
+            .await
+            .unwrap();
+
+        harness
+            .receive::<Position>(symbol.clone(), make_offchain_failed(offchain_order_id))
+            .await
+            .unwrap();
+
+        let processed = equity::drain_pending_equity_jobs(&trigger).await.unwrap();
+        assert_eq!(
+            processed, 1,
+            "A failed offchain order must enqueue exactly one equity recheck so hedging retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn offchain_order_filled_enqueues_equity_recheck() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let offchain_order_id = OffchainOrderId::new();
+        // Sized so the Hedging sell fill leaves both venues balanced (50/50),
+        // letting the drained recheck run to completion without dispatching.
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(60))
+            .with_usdc(usdc(500), usdc(500));
+
+        let (trigger, _receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        harness
+            .receive::<Position>(symbol.clone(), make_offchain_placed(offchain_order_id))
+            .await
+            .unwrap();
+
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_offchain_fill(shares(10), Direction::Sell),
+            )
+            .await
+            .unwrap();
+
+        let processed = equity::drain_pending_equity_jobs(&trigger).await.unwrap();
+        assert_eq!(
+            processed, 1,
+            "A filled offchain order must enqueue exactly one equity recheck so hedging re-evaluates"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_pending_offchain_order_symbols_restores_block_from_projection() {
+        let pending_symbol = Symbol::new("AAPL").unwrap();
+        let clear_symbol = Symbol::new("TSLA").unwrap();
+        let (trigger, _receiver) = make_trigger_with_inventory(InventoryView::default()).await;
+
+        // Persist two positions through the real command path: AAPL gets a
+        // pending offchain hedge order; TSLA only has an onchain fill.
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<Position>(pool.clone(), ());
+
+        store
+            .send(
+                &pending_symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: pending_symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: shares(10),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .send(
+                &pending_symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: OffchainOrderId::new(),
+                    shares: Positive::new(shares(10)).unwrap(),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .send(
+                &clear_symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: clear_symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 2,
+                    },
+                    amount: shares(10),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let projection = Projection::<Position>::sqlite(pool);
+        projection.catch_up().await.unwrap();
+
+        // Pre-populate a stale entry to prove recovery replaces the set rather
+        // than merging into it.
+        trigger
+            .pending_offchain_order_symbols
+            .write()
+            .await
+            .insert(clear_symbol.clone());
+
+        trigger
+            .recover_pending_offchain_order_symbols(&projection)
+            .await
+            .unwrap();
+
+        assert!(
+            trigger.has_pending_offchain_order(&pending_symbol).await,
+            "recovery must restore the block for a symbol with a pending offchain order"
+        );
+        assert!(
+            !trigger.has_pending_offchain_order(&clear_symbol).await,
+            "recovery must clear a symbol whose position has no pending offchain order"
         );
     }
 

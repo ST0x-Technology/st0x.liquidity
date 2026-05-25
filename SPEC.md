@@ -2085,7 +2085,10 @@ balances and emitting them as events the system can react to:
   actual balances fetched from onchain vaults and the offchain broker.
 - **InventoryPollingService**: Periodically polls actual balances from both
   venues, emitting InventorySnapshot events. InventoryView reacts to these
-  events to update tracked inventory.
+  events to update tracked inventory. Offchain equity polling normalizes active
+  configured equities omitted by the broker positions response to explicit zero
+  balances, and ignores broker-only symbols that are not configured as active
+  assets.
 - **Polling runs on a 60-second interval** during market hours as a background
   conductor task. Onchain polling uses the `vaultBalance2` contract call;
   offchain polling uses the `Executor::get_inventory()` trait method.
@@ -2100,6 +2103,17 @@ Each asset type (equities per symbol, USDC) is tracked via a generic
 `Inventory<T>` containing `Option<VenueBalance<T>>` per venue. The `Option`
 distinguishes "not yet polled" from "polled with zero balance" — imbalance
 detection requires both venues to have been initialized by snapshot events.
+
+When `InventoryView` applies an equity snapshot (`OnchainEquity` for the
+MarketMaking venue, `OffchainEquity` for the Hedging venue), it treats the
+snapshot as the complete picture of that venue: any symbol already tracked at
+the venue but absent from the snapshot is zeroed at that venue, subject to the
+same staleness guards (snapshot watermark, inflight transfers, last
+rebalancing). This keeps the live view consistent with the fully-replaced
+persisted snapshot rather than retaining a stale balance. It relies on both
+pollers emitting complete venue snapshots: offchain polling seeds an explicit
+zero for every configured symbol (above), and onchain polling emits a balance
+for every discovered vault in the monotonic vault registry.
 
 `InventoryView` listens to trading events (onchain/offchain fills),
 `TokenizedEquityMintEvent`, `EquityRedemptionEvent`, `UsdcRebalanceEvent`, and

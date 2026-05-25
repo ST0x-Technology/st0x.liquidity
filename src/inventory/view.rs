@@ -1136,7 +1136,30 @@ impl InventoryView {
         fetched_at: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
-        let (view, applied_symbols) = balances.into_iter().try_fold(
+        let snapshot: Vec<(Symbol, FractionalShares)> = balances
+            .into_iter()
+            .map(|(symbol, balance)| (symbol.clone(), *balance))
+            .collect();
+
+        let present: HashSet<&Symbol> = snapshot.iter().map(|(symbol, _)| symbol).collect();
+
+        // A venue snapshot is the complete picture of that venue at `fetched_at`:
+        // a brokerage omits zero-share positions and an onchain poll covers every
+        // discovered vault. Any symbol still tracked at this venue but absent from
+        // the snapshot has therefore gone to zero, so apply an explicit zero
+        // instead of leaving a stale balance behind. The same staleness guards
+        // (`equity_snapshot_would_apply`) protect these zeroes from clobbering
+        // fresher data or inflight transfers.
+        let absent_zeroes: Vec<(Symbol, FractionalShares)> = self
+            .equities
+            .iter()
+            .filter(|(symbol, inventory)| {
+                inventory.get_venue(venue).is_some() && !present.contains(symbol)
+            })
+            .map(|(symbol, _)| (symbol.clone(), FractionalShares::ZERO))
+            .collect();
+
+        let (view, applied_symbols) = snapshot.iter().chain(absent_zeroes.iter()).try_fold(
             (self, Vec::new()),
             |(view, mut applied_symbols), (symbol, snapshot_balance)| {
                 let should_record_watermark =
@@ -3139,6 +3162,199 @@ mod tests {
             inventory.detect_imbalance(&thresh).unwrap(),
             None,
             "Imbalance detection should return None when a venue is uninitialized"
+        );
+    }
+
+    #[test]
+    fn offchain_snapshot_zeroes_symbol_absent_from_complete_snapshot() {
+        // A brokerage omits zero-share positions, so a configured symbol that
+        // dropped to zero is absent from the snapshot. The live view must treat
+        // the snapshot as complete and zero the offchain balance instead of
+        // retaining the stale value, while leaving the onchain venue untouched.
+        let aapl = Symbol::new("AAPL").unwrap();
+        let tsla = Symbol::new("TSLA").unwrap();
+        let now = Utc::now();
+
+        let view = InventoryView::default()
+            .with_equity(aapl.clone(), shares(90), shares(10))
+            .with_equity(tsla.clone(), shares(50), shares(20));
+
+        let mut positions = BTreeMap::new();
+        positions.insert(aapl.clone(), shares(10));
+
+        let result = view
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OffchainEquity {
+                    positions,
+                    fetched_at: now,
+                },
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(
+            result.equity_available(&aapl, Venue::Hedging),
+            Some(shares(10)),
+            "present symbol keeps its reported offchain balance",
+        );
+        assert_eq!(
+            result.equity_available(&tsla, Venue::Hedging),
+            Some(shares(0)),
+            "symbol absent from the complete offchain snapshot is zeroed",
+        );
+        assert_eq!(
+            result.equity_available(&tsla, Venue::MarketMaking),
+            Some(shares(50)),
+            "the onchain venue of the absent symbol is untouched",
+        );
+        assert_eq!(
+            result.equity_available(&aapl, Venue::MarketMaking),
+            Some(shares(90)),
+            "the onchain venue of the present symbol is untouched",
+        );
+    }
+
+    #[test]
+    fn onchain_snapshot_zeroes_symbol_absent_from_complete_snapshot() {
+        // The same complete-snapshot semantics apply to the onchain venue: a
+        // symbol tracked onchain but absent from a fresh OnchainEquity snapshot
+        // has gone to zero onchain, leaving its offchain venue untouched.
+        let aapl = Symbol::new("AAPL").unwrap();
+        let tsla = Symbol::new("TSLA").unwrap();
+        let now = Utc::now();
+
+        let view = InventoryView::default()
+            .with_equity(aapl.clone(), shares(90), shares(10))
+            .with_equity(tsla.clone(), shares(50), shares(20));
+
+        let mut balances = BTreeMap::new();
+        balances.insert(aapl, shares(90));
+
+        let result = view
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainEquity {
+                    balances,
+                    fetched_at: now,
+                },
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(
+            result.equity_available(&tsla, Venue::MarketMaking),
+            Some(shares(0)),
+            "symbol absent from the complete onchain snapshot is zeroed",
+        );
+        assert_eq!(
+            result.equity_available(&tsla, Venue::Hedging),
+            Some(shares(20)),
+            "the offchain venue of the absent symbol is untouched",
+        );
+    }
+
+    #[test]
+    fn snapshot_does_not_zero_absent_symbol_with_inflight() {
+        // An absent symbol that has an inflight transfer must not be zeroed: the
+        // staleness guard cannot distinguish a completed-but-unconfirmed transfer
+        // from an unrelated change, so the stale balance is preserved.
+        let aapl = Symbol::new("AAPL").unwrap();
+        let tsla = Symbol::new("TSLA").unwrap();
+        let now = Utc::now();
+
+        let view = InventoryView {
+            equities: [
+                (
+                    aapl.clone(),
+                    Inventory {
+                        onchain: Some(VenueBalance::new(shares(90), FractionalShares::ZERO)),
+                        offchain: Some(VenueBalance::new(shares(10), FractionalShares::ZERO)),
+                        last_rebalancing: None,
+                    },
+                ),
+                (
+                    tsla.clone(),
+                    Inventory {
+                        onchain: Some(VenueBalance::new(shares(50), FractionalShares::ZERO)),
+                        offchain: Some(VenueBalance::new(shares(20), shares(5))),
+                        last_rebalancing: None,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..InventoryView::default()
+        };
+
+        let mut positions = BTreeMap::new();
+        positions.insert(aapl, shares(10));
+
+        let result = view
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OffchainEquity {
+                    positions,
+                    fetched_at: now,
+                },
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(
+            result.equity_available(&tsla, Venue::Hedging),
+            Some(shares(20)),
+            "absent symbol with inflight is not zeroed",
+        );
+        assert_eq!(
+            result.equity_inflight(&tsla, Venue::Hedging),
+            Some(shares(5)),
+            "absent symbol inflight is preserved",
+        );
+    }
+
+    #[test]
+    fn stale_snapshot_does_not_zero_absent_symbol() {
+        // A snapshot older than a symbol's recorded watermark must not zero it:
+        // out-of-order polls can land late, and a stale complete snapshot would
+        // otherwise wipe a fresher balance.
+        let aapl = Symbol::new("AAPL").unwrap();
+        let tsla = Symbol::new("TSLA").unwrap();
+        let fresh = Utc::now();
+        let stale = fresh - Duration::seconds(60);
+
+        // A fresh snapshot establishes watermarks for both symbols.
+        let mut fresh_positions = BTreeMap::new();
+        fresh_positions.insert(aapl.clone(), shares(10));
+        fresh_positions.insert(tsla.clone(), shares(20));
+
+        let view = InventoryView::default()
+            .with_equity(aapl.clone(), shares(90), shares(0))
+            .with_equity(tsla.clone(), shares(50), shares(0))
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OffchainEquity {
+                    positions: fresh_positions,
+                    fetched_at: fresh,
+                },
+                fresh,
+            )
+            .unwrap();
+
+        // A stale snapshot omitting TSLA arrives late; it must not zero TSLA.
+        let mut stale_positions = BTreeMap::new();
+        stale_positions.insert(aapl, shares(10));
+
+        let result = view
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OffchainEquity {
+                    positions: stale_positions,
+                    fetched_at: stale,
+                },
+                stale,
+            )
+            .unwrap();
+
+        assert_eq!(
+            result.equity_available(&tsla, Venue::Hedging),
+            Some(shares(20)),
+            "stale snapshot must not zero a symbol with a fresher watermark",
         );
     }
 

@@ -4,6 +4,7 @@ use alloy::providers::Provider;
 use apalis::prelude::Monitor;
 use apalis_core::worker::ext::circuit_breaker::config::CircuitBreakerConfig;
 use sqlx::SqlitePool;
+use std::collections::HashSet;
 use std::sync::Arc;
 use task_supervisor::SupervisorBuilder;
 use tokio::task::JoinHandle;
@@ -130,6 +131,18 @@ where
         owner: order_owner,
     };
 
+    let configured_equity_symbols: HashSet<_> = context
+        .ctx
+        .assets
+        .equities
+        .symbols
+        .keys()
+        .filter(|symbol| {
+            context.ctx.is_trading_enabled(symbol) || context.ctx.is_rebalancing_enabled(symbol)
+        })
+        .cloned()
+        .collect();
+
     let mut polling_service = InventoryPollingService::new(
         raindex_service,
         context.executor.clone(),
@@ -139,7 +152,8 @@ where
         context.wallet_polling,
         context.tokenizer,
         reserved_cash,
-    );
+    )
+    .with_configured_equity_symbols(configured_equity_symbols);
 
     if let Some(rebalancing_service) = &rebalancing_service {
         polling_service =
