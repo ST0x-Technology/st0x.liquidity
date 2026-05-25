@@ -1,13 +1,17 @@
 <script lang="ts">
+  import { createQuery } from '@tanstack/svelte-query'
   import { onMount } from 'svelte'
   import * as Card from '$lib/components/ui/card'
   import * as Table from '$lib/components/ui/table'
+  import HoverTooltip from '$lib/components/hover-tooltip.svelte'
+  import type { Position } from '$lib/api/Position'
   import MultiSelect from '$lib/components/multi-select.svelte'
   import { reactive } from '$lib/frp.svelte'
   import { getApiBaseUrl } from '$lib/env'
   import { formatUtc, toDatetimeLocal, TIME_PRESETS, FETCH_TIMEOUT_MS, toRfc3339 } from '$lib/time'
   import { formatDecimal } from '$lib/decimal'
   import { getExplorerTxUrl } from '$lib/env'
+  import { equityUsdTooltip } from '$lib/inventory-value'
 
   type TradeEvent = {
     step: string
@@ -50,21 +54,40 @@
   let sinceInput: HTMLInputElement | undefined
   let untilInput: HTMLInputElement | undefined
 
+  const positionsQuery = createQuery<Position[]>(() => ({
+    queryKey: ['positions'],
+    enabled: false
+  }))
+
+  const positionPrices = $derived(
+    new Map(
+      (positionsQuery.data ?? []).map((position) => [position.symbol, position.last_price_usdc])
+    )
+  )
+
   const venueLabel = (venue: string): string => {
     switch (venue) {
-      case 'raindex': return 'Raindex'
-      case 'alpaca': return 'Alpaca'
-      case 'dry_run': return 'DryRun'
-      default: return venue
+      case 'raindex':
+        return 'Raindex'
+      case 'alpaca':
+        return 'Alpaca'
+      case 'dry_run':
+        return 'DryRun'
+      default:
+        return venue
     }
   }
 
   const venueColor = (venue: string): string => {
     switch (venue) {
-      case 'raindex': return 'text-blue-400'
-      case 'alpaca': return 'text-amber-400'
-      case 'dry_run': return 'text-muted-foreground'
-      default: return ''
+      case 'raindex':
+        return 'text-blue-400'
+      case 'alpaca':
+        return 'text-amber-400'
+      case 'dry_run':
+        return 'text-muted-foreground'
+      default:
+        return ''
     }
   }
 
@@ -74,7 +97,7 @@
   const buildParams = (): URLSearchParams => {
     const params = new URLSearchParams({
       limit: String(PAGE_SIZE),
-      offset: String(offset.current),
+      offset: String(offset.current)
     })
 
     if (selectedVenues.current.size > 0 && selectedVenues.current.size < ALL_VENUES.length) {
@@ -108,17 +131,16 @@
 
     try {
       const baseUrl = getApiBaseUrl()
-      const response = await fetch(
-        `${baseUrl}/trades?${buildParams().toString()}`,
-        { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) }
-      )
+      const response = await fetch(`${baseUrl}/trades?${buildParams().toString()}`, {
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+      })
 
       if (!response.ok) {
         error.update(() => `HTTP ${String(response.status)}`)
         return
       }
 
-      const data: TradeResponse = await response.json() as TradeResponse
+      const data: TradeResponse = (await response.json()) as TradeResponse
       total.update(() => data.total)
       hasMore.update(() => data.hasMore)
 
@@ -135,7 +157,7 @@
         return [...merged].sort()
       })
     } catch (fetchError) {
-      error.update(() => fetchError instanceof Error ? fetchError.message : 'Unknown error')
+      error.update(() => (fetchError instanceof Error ? fetchError.message : 'Unknown error'))
     } finally {
       loading.update(() => false)
       loadingMore.update(() => false)
@@ -175,9 +197,9 @@
 
   const hasFilters = $derived(
     since.current !== '' ||
-    until.current !== '' ||
-    selectedVenues.current.size < ALL_VENUES.length ||
-    selectedSymbols.current.size > 0
+      until.current !== '' ||
+      selectedVenues.current.size < ALL_VENUES.length ||
+      selectedSymbols.current.size > 0
   )
 
   onMount(() => {
@@ -185,7 +207,9 @@
     const interval = setInterval(() => {
       if (offset.current === 0) void fetchTrades('replace')
     }, POLL_INTERVAL_MS)
-    return () => { clearInterval(interval) }
+    return () => {
+      clearInterval(interval)
+    }
   })
 
   const handleVenueChange = (selected: Set<string>) => {
@@ -217,6 +241,9 @@
 
   const fmtSize = (value: string): string => formatDecimal(value, 3)
 
+  const shareTooltip = (trade: TradeEntry): string =>
+    equityUsdTooltip(trade.shares, positionPrices.get(trade.symbol) ?? null)
+
   const isNumeric = (value: unknown): boolean =>
     typeof value === 'string' && value !== '' && !Number.isNaN(Number(value))
 
@@ -237,10 +264,9 @@
 
     try {
       const baseUrl = getApiBaseUrl()
-      const response = await fetch(
-        `${baseUrl}/trades/${trade.venue}/${trade.id}/events`,
-        { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) },
-      )
+      const response = await fetch(`${baseUrl}/trades/${trade.venue}/${trade.id}/events`, {
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+      })
 
       if (!response.ok) {
         detailError.update(() => `HTTP ${String(response.status)}`)
@@ -250,7 +276,7 @@
       const data = (await response.json()) as { events: TradeEvent[] }
       detailEvents.update(() => data.events)
     } catch (err) {
-      detailError.update(() => err instanceof Error ? err.message : 'Unknown error')
+      detailError.update(() => (err instanceof Error ? err.message : 'Unknown error'))
     } finally {
       detailLoading.update(() => false)
     }
@@ -258,8 +284,7 @@
 
   // -- Detail rendering helpers --
 
-  const humanizeStep = (step: string): string =>
-    step.replace(/([A-Z])/g, ' $1').trim()
+  const humanizeStep = (step: string): string => step.replace(/([A-Z])/g, ' $1').trim()
 
   const isTxHash = (value: unknown): value is string =>
     typeof value === 'string' && /^0x[0-9a-fA-F]{64}$/.test(value)
@@ -274,6 +299,22 @@
       if (isTimestampField(key) && typeof value === 'string') return value
     }
     return null
+  }
+
+  const formatUnknown = (value: unknown, fallback = ''): string => {
+    if (typeof value === 'string') return value
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+    return fallback
+  }
+
+  const formatPythPrice = (value: unknown): string => {
+    if (typeof value !== 'object' || value === null) return 'unavailable'
+
+    const pyth = value as Record<string, unknown>
+
+    return `$${formatDecimal(formatUnknown(pyth['value'], '0'), 3)} (conf: ${formatUnknown(
+      pyth['conf']
+    )}, expo: ${formatUnknown(pyth['expo'])})`
   }
 
   const stepStyle = (step: string): string => {
@@ -310,18 +351,35 @@
     <Card.Title class="flex items-center justify-between">
       <span class="flex items-center gap-1.5">
         Trade History
-        <span class="group relative cursor-help text-muted-foreground">
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="h-3.5 w-3.5"><path fill-rule="evenodd" d="M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Zm-7-4a1 1 0 1 1-2 0 1 1 0 0 1 2 0ZM9 9a.75.75 0 0 0 0 1.5h.253a.25.25 0 0 1 .244.304l-.459 2.066A1.75 1.75 0 0 0 10.747 15H11a.75.75 0 0 0 0-1.5h-.253a.25.25 0 0 1-.244-.304l.459-2.066A1.75 1.75 0 0 0 9.253 9H9Z" clip-rule="evenodd" /></svg>
-          <span class="pointer-events-none absolute left-0 top-full z-50 mt-1 hidden w-56 rounded bg-popover px-3 py-2 text-xs font-normal text-popover-foreground shadow-lg group-hover:block">
-            Onchain fills from Raindex orders and the corresponding Alpaca hedge trades placed to offset exposure.
-          </span>
-        </span>
+        <HoverTooltip
+          tooltip="Onchain fills from Raindex orders and the corresponding Alpaca hedge trades placed to offset exposure."
+          class="cursor-help text-muted-foreground"
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 20 20"
+            fill="currentColor"
+            class="h-3.5 w-3.5"
+            ><path
+              fill-rule="evenodd"
+              d="M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Zm-7-4a1 1 0 1 1-2 0 1 1 0 0 1 2 0ZM9 9a.75.75 0 0 0 0 1.5h.253a.25.25 0 0 1 .244.304l-.459 2.066A1.75 1.75 0 0 0 10.747 15H11a.75.75 0 0 0 0-1.5h-.253a.25.25 0 0 1-.244-.304l.459-2.066A1.75 1.75 0 0 0 9.253 9H9Z"
+              clip-rule="evenodd"
+            /></svg
+          >
+        </HoverTooltip>
       </span>
       <div class="flex items-center gap-2">
         {#if hasFilters}
-          <button class="rounded border bg-background px-2 py-1 text-xs hover:bg-accent" onclick={jumpToLatest}>Latest</button>
+          <button
+            class="rounded border bg-background px-2 py-1 text-xs hover:bg-accent"
+            onclick={jumpToLatest}>Latest</button
+          >
         {/if}
-        <button class="rounded border bg-background px-2 py-1 text-xs hover:bg-accent" onclick={refresh} disabled={loading.current}>
+        <button
+          class="rounded border bg-background px-2 py-1 text-xs hover:bg-accent"
+          onclick={refresh}
+          disabled={loading.current}
+        >
           {loading.current ? 'Loading...' : 'Refresh'}
         </button>
         <span class="text-sm font-normal text-muted-foreground">
@@ -331,15 +389,28 @@
     </Card.Title>
 
     <div class="flex flex-wrap items-center gap-2 rounded-md bg-muted/30 px-2 py-1.5 text-xs">
-      <MultiSelect label="Venues" options={venueOptions} selected={selectedVenues.current} onchange={handleVenueChange} />
+      <MultiSelect
+        label="Venues"
+        options={venueOptions}
+        selected={selectedVenues.current}
+        onchange={handleVenueChange}
+      />
 
       {#if symbolOptions.length > 0}
-        <MultiSelect label="Assets" options={symbolOptions} selected={selectedSymbols.current} onchange={handleSymbolChange} />
+        <MultiSelect
+          label="Assets"
+          options={symbolOptions}
+          selected={selectedSymbols.current}
+          onchange={handleSymbolChange}
+        />
       {/if}
 
       <div class="flex items-center gap-1">
         {#each TIME_PRESETS as preset (preset.label)}
-          <button class="rounded border bg-background px-1.5 py-0.5 text-xs hover:bg-accent" onclick={applyPreset(preset.minutes)}>
+          <button
+            class="rounded border bg-background px-1.5 py-0.5 text-xs hover:bg-accent"
+            onclick={applyPreset(preset.minutes)}
+          >
             {preset.label}
           </button>
         {/each}
@@ -347,9 +418,23 @@
 
       <div class="flex items-center gap-1 text-muted-foreground">
         <span>From (UTC)</span>
-        <input bind:this={sinceInput} type="datetime-local" class="rounded border bg-background px-1.5 py-0.5 text-xs text-foreground" style="color-scheme: dark" onchange={handleSinceChange} step="1" />
+        <input
+          bind:this={sinceInput}
+          type="datetime-local"
+          class="rounded border bg-background px-1.5 py-0.5 text-xs text-foreground"
+          style="color-scheme: dark"
+          onchange={handleSinceChange}
+          step="1"
+        />
         <span>to (UTC)</span>
-        <input bind:this={untilInput} type="datetime-local" class="rounded border bg-background px-1.5 py-0.5 text-xs text-foreground" style="color-scheme: dark" onchange={handleUntilChange} step="1" />
+        <input
+          bind:this={untilInput}
+          type="datetime-local"
+          class="rounded border bg-background px-1.5 py-0.5 text-xs text-foreground"
+          style="color-scheme: dark"
+          onchange={handleUntilChange}
+          step="1"
+        />
       </div>
     </div>
   </Card.Header>
@@ -360,9 +445,7 @@
         Failed to load trades: {error.current}
       </div>
     {:else if entries.current.length === 0 && !loading.current}
-      <div class="flex h-full items-center justify-center text-muted-foreground">
-        No trades yet
-      </div>
+      <div class="flex h-full items-center justify-center text-muted-foreground">No trades yet</div>
     {:else}
       <Table.Root>
         <Table.Header>
@@ -384,8 +467,17 @@
                   title="View trade details"
                   onclick={() => openDetail(trade)}
                 >
-                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="h-3.5 w-3.5">
-                    <path fill-rule="evenodd" d="M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Zm-7-4a1 1 0 1 1-2 0 1 1 0 0 1 2 0ZM9 9a.75.75 0 0 0 0 1.5h.253a.25.25 0 0 1 .244.304l-.459 2.066A1.75 1.75 0 0 0 10.747 15H11a.75.75 0 0 0 0-1.5h-.253a.25.25 0 0 1-.244-.304l.459-2.066A1.75 1.75 0 0 0 9.253 9H9Z" clip-rule="evenodd" />
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    viewBox="0 0 20 20"
+                    fill="currentColor"
+                    class="h-3.5 w-3.5"
+                  >
+                    <path
+                      fill-rule="evenodd"
+                      d="M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Zm-7-4a1 1 0 1 1-2 0 1 1 0 0 1 2 0ZM9 9a.75.75 0 0 0 0 1.5h.253a.25.25 0 0 1 .244.304l-.459 2.066A1.75 1.75 0 0 0 10.747 15H11a.75.75 0 0 0 0-1.5h-.253a.25.25 0 0 1-.244-.304l.459-2.066A1.75 1.75 0 0 0 9.253 9H9Z"
+                      clip-rule="evenodd"
+                    />
                   </svg>
                 </button>
               </Table.Cell>
@@ -393,11 +485,20 @@
                 {formatUtc(trade.filledAt)}
               </Table.Cell>
               <Table.Cell class="font-mono text-xs font-medium">{trade.symbol}</Table.Cell>
-              <Table.Cell class="text-right text-xs font-medium {venueColor(trade.venue)}">{venueLabel(trade.venue)}</Table.Cell>
+              <Table.Cell class="text-right text-xs font-medium {venueColor(trade.venue)}"
+                >{venueLabel(trade.venue)}</Table.Cell
+              >
               <Table.Cell class="text-right text-xs font-medium {directionColor(trade.direction)}">
                 {trade.direction}
               </Table.Cell>
-              <Table.Cell class="text-center font-mono text-xs">{fmtSize(trade.shares)}</Table.Cell>
+              <Table.Cell class="text-center font-mono text-xs">
+                <HoverTooltip tooltip={shareTooltip(trade)}>
+                  <span
+                    class="cursor-help hover:underline hover:decoration-dotted hover:decoration-muted-foreground hover:underline-offset-4"
+                    >{fmtSize(trade.shares)}</span
+                  >
+                </HoverTooltip>
+              </Table.Cell>
             </Table.Row>
           {/each}
         </Table.Body>
@@ -405,13 +506,19 @@
 
       {#if hasMore.current}
         <div class="flex justify-center py-2">
-          <button class="rounded border bg-background px-3 py-1 text-xs hover:bg-accent" onclick={loadMore} disabled={loadingMore.current}>
+          <button
+            class="rounded border bg-background px-3 py-1 text-xs hover:bg-accent"
+            onclick={loadMore}
+            disabled={loadingMore.current}
+          >
             {loadingMore.current ? 'Loading...' : 'Load older trades'}
           </button>
         </div>
       {/if}
 
-      <div class="pointer-events-none sticky bottom-0 h-8 bg-gradient-to-t from-card to-transparent"></div>
+      <div
+        class="pointer-events-none sticky bottom-0 h-8 bg-gradient-to-t from-card to-transparent"
+      ></div>
     {/if}
   </Card.Content>
 </Card.Root>
@@ -419,7 +526,9 @@
 <dialog
   bind:this={detailDialogEl}
   class="w-full max-w-lg rounded-lg border bg-card p-0 text-foreground shadow-lg backdrop:bg-black/50"
-  onclick={(event) => { if (event.target === detailDialogEl) detailDialogEl.close() }}
+  onclick={(event) => {
+    if (event.target === detailDialogEl) detailDialogEl.close()
+  }}
 >
   {#if detailTrade.current}
     {@const trade = detailTrade.current}
@@ -427,7 +536,12 @@
       <div class="flex items-center gap-2 text-sm font-semibold">
         <span class={directionColor(trade.direction)}>{trade.direction}</span>
         <span class="font-mono text-xs font-normal">{trade.symbol}</span>
-        <span class="font-mono text-xs font-normal text-muted-foreground">{fmtSize(trade.shares)} shares</span>
+        <HoverTooltip tooltip={shareTooltip(trade)}>
+          <span
+            class="cursor-help font-mono text-xs font-normal text-muted-foreground hover:underline hover:decoration-dotted hover:decoration-muted-foreground hover:underline-offset-4"
+            >{fmtSize(trade.shares)} shares</span
+          >
+        </HoverTooltip>
         <span class="text-xs font-normal {venueColor(trade.venue)}">{venueLabel(trade.venue)}</span>
       </div>
       <button
@@ -462,9 +576,18 @@
                 class="inline-flex items-center gap-1 text-blue-400 hover:text-blue-300"
               >
                 {txHash.slice(0, 10)}...{txHash.slice(-8)}
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="h-3 w-3">
-                  <path d="M6.22 8.72a.75.75 0 0 0 1.06 1.06l5.22-5.22v1.69a.75.75 0 0 0 1.5 0v-3.5a.75.75 0 0 0-.75-.75h-3.5a.75.75 0 0 0 0 1.5h1.69L6.22 8.72Z" />
-                  <path d="M3.5 6.75c0-.69.56-1.25 1.25-1.25H7A.75.75 0 0 0 7 4H4.75A2.75 2.75 0 0 0 2 6.75v4.5A2.75 2.75 0 0 0 4.75 14h4.5A2.75 2.75 0 0 0 12 11.25V9a.75.75 0 0 0-1.5 0v2.25c0 .69-.56 1.25-1.25 1.25h-4.5c-.69 0-1.25-.56-1.25-1.25v-4.5Z" />
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  viewBox="0 0 16 16"
+                  fill="currentColor"
+                  class="h-3 w-3"
+                >
+                  <path
+                    d="M6.22 8.72a.75.75 0 0 0 1.06 1.06l5.22-5.22v1.69a.75.75 0 0 0 1.5 0v-3.5a.75.75 0 0 0-.75-.75h-3.5a.75.75 0 0 0 0 1.5h1.69L6.22 8.72Z"
+                  />
+                  <path
+                    d="M3.5 6.75c0-.69.56-1.25 1.25-1.25H7A.75.75 0 0 0 7 4H4.75A2.75 2.75 0 0 0 2 6.75v4.5A2.75 2.75 0 0 0 4.75 14h4.5A2.75 2.75 0 0 0 12 11.25V9a.75.75 0 0 0-1.5 0v2.25c0 .69-.56 1.25-1.25 1.25h-4.5c-.69 0-1.25-.56-1.25-1.25v-4.5Z"
+                  />
                 </svg>
               </a>
               <span class="text-muted-foreground">(log {logIndex})</span>
@@ -483,10 +606,16 @@
         <div class="relative space-y-0 border-l-2 border-muted pl-4">
           {#each detailEvents.current as event (event.sequence)}
             {@const timestamp = extractTimestamp(event.payload)}
-            {@const fields = Object.entries(event.payload).filter(([key]) => !isTimestampField(key))}
+            {@const fields = Object.entries(event.payload).filter(
+              ([key]) => !isTimestampField(key)
+            )}
             <div class="relative pb-4">
               <!-- Timeline dot -->
-              <div class="absolute -left-[calc(0.25rem+1px+1rem)] top-0.5 h-2 w-2 rounded-full {stepDot(event.step)}"></div>
+              <div
+                class="absolute -left-[calc(0.25rem+1px+1rem)] top-0.5 h-2 w-2 rounded-full {stepDot(
+                  event.step
+                )}"
+              ></div>
 
               <div class="text-xs font-medium {stepStyle(event.step)}">
                 {humanizeStep(event.step)}
@@ -514,16 +643,24 @@
                             class="inline-flex items-center gap-1 text-blue-400 hover:text-blue-300"
                           >
                             {value.slice(0, 10)}...{value.slice(-8)}
-                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="h-3 w-3">
-                              <path d="M6.22 8.72a.75.75 0 0 0 1.06 1.06l5.22-5.22v1.69a.75.75 0 0 0 1.5 0v-3.5a.75.75 0 0 0-.75-.75h-3.5a.75.75 0 0 0 0 1.5h1.69L6.22 8.72Z" />
-                              <path d="M3.5 6.75c0-.69.56-1.25 1.25-1.25H7A.75.75 0 0 0 7 4H4.75A2.75 2.75 0 0 0 2 6.75v4.5A2.75 2.75 0 0 0 4.75 14h4.5A2.75 2.75 0 0 0 12 11.25V9a.75.75 0 0 0-1.5 0v2.25c0 .69-.56 1.25-1.25 1.25h-4.5c-.69 0-1.25-.56-1.25-1.25v-4.5Z" />
+                            <svg
+                              xmlns="http://www.w3.org/2000/svg"
+                              viewBox="0 0 16 16"
+                              fill="currentColor"
+                              class="h-3 w-3"
+                            >
+                              <path
+                                d="M6.22 8.72a.75.75 0 0 0 1.06 1.06l5.22-5.22v1.69a.75.75 0 0 0 1.5 0v-3.5a.75.75 0 0 0-.75-.75h-3.5a.75.75 0 0 0 0 1.5h1.69L6.22 8.72Z"
+                              />
+                              <path
+                                d="M3.5 6.75c0-.69.56-1.25 1.25-1.25H7A.75.75 0 0 0 7 4H4.75A2.75 2.75 0 0 0 2 6.75v4.5A2.75 2.75 0 0 0 4.75 14h4.5A2.75 2.75 0 0 0 12 11.25V9a.75.75 0 0 0-1.5 0v2.25c0 .69-.56 1.25-1.25 1.25h-4.5c-.69 0-1.25-.56-1.25-1.25v-4.5Z"
+                              />
                             </svg>
                           </a>
                         {:else if key === 'executor_order_id' && typeof value === 'object' && value !== null}
                           <span class="text-muted-foreground">{JSON.stringify(value)}</span>
                         {:else if key === 'pyth_price' && typeof value === 'object' && value !== null}
-                          {@const pyth = value as Record<string, string | number>}
-                          <span>${formatDecimal(String(pyth['value'] ?? '0'), 3)} (conf: {String(pyth['conf'] ?? '')}, expo: {String(pyth['expo'] ?? '')})</span>
+                          <span>{formatPythPrice(value)}</span>
                         {:else if typeof value === 'object' && value !== null}
                           {JSON.stringify(value)}
                         {:else if isNumeric(value)}

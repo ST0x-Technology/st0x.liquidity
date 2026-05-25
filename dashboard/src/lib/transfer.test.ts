@@ -1,10 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import {
-  statusStyle,
-  isTxHash,
-  extractTimestamp,
-  detailFields,
-} from './transfer'
+import { statusStyle, isTxHash, extractTimestamp, detailFields, apiErrorStatus } from './transfer'
 
 describe('statusStyle', () => {
   it('matches completed substring case-insensitively', () => {
@@ -60,16 +55,18 @@ describe('extractTimestamp', () => {
     // Object.entries order matters -- first _at field wins
     const result = extractTimestamp({
       submitted_at: '2024-01-01T00:00:00Z',
-      confirmed_at: '2024-01-02T00:00:00Z',
+      confirmed_at: '2024-01-02T00:00:00Z'
     })
     expect(result).toBe('2024-01-01T00:00:00Z')
   })
 
   it('skips _at fields with non-string values', () => {
-    expect(extractTimestamp({
-      created_at: 1234567890,
-      confirmed_at: '2024-06-15T00:00:00Z',
-    })).toBe('2024-06-15T00:00:00Z')
+    expect(
+      extractTimestamp({
+        created_at: 1234567890,
+        confirmed_at: '2024-06-15T00:00:00Z'
+      })
+    ).toBe('2024-06-15T00:00:00Z')
   })
 
   it('returns null when no _at fields exist', () => {
@@ -88,11 +85,11 @@ describe('detailFields', () => {
       created_at: '2024-01-01T00:00:00Z',
       attestation: 'long-blob',
       tx_hash: '0xabc',
-      confirmed_at: '2024-01-02T00:00:00Z',
+      confirmed_at: '2024-01-02T00:00:00Z'
     })
     expect(result).toEqual([
       ['amount', '100'],
-      ['tx_hash', '0xabc'],
+      ['tx_hash', '0xabc']
     ])
   })
 
@@ -100,15 +97,46 @@ describe('detailFields', () => {
     const result = detailFields({ z_field: '1', a_field: '2' })
     expect(result).toEqual([
       ['z_field', '1'],
-      ['a_field', '2'],
+      ['a_field', '2']
     ])
   })
 
   it('returns empty when all fields are filtered', () => {
-    expect(detailFields({
-      created_at: '2024-01-01',
-      attestation: 'x',
-      submitted_at: 'y',
-    })).toEqual([])
+    expect(
+      detailFields({
+        created_at: '2024-01-01',
+        attestation: 'x',
+        submitted_at: 'y'
+      })
+    ).toEqual([])
+  })
+})
+
+describe('apiErrorStatus', () => {
+  it('reads status_code from the nested ApiError payload', () => {
+    expect(apiErrorStatus({ ApiError: { status_code: 404 } })).toBe('404')
+  })
+
+  it('stringifies a numeric status_code', () => {
+    expect(apiErrorStatus({ ApiError: { status_code: 500 } })).toBe('500')
+  })
+
+  it('passes through a string status_code', () => {
+    expect(apiErrorStatus({ ApiError: { status_code: '403' } })).toBe('403')
+  })
+
+  it('returns null when status_code is absent (None)', () => {
+    expect(apiErrorStatus({ ApiError: { status_code: null } })).toBeNull()
+    expect(apiErrorStatus({ ApiError: {} })).toBeNull()
+  })
+
+  it('returns null when the ApiError payload is missing', () => {
+    expect(apiErrorStatus({ Timeout: null })).toBeNull()
+    expect(apiErrorStatus({ status_code: 404 })).toBeNull()
+  })
+
+  it('returns null for non-object input', () => {
+    expect(apiErrorStatus(null)).toBeNull()
+    expect(apiErrorStatus('ApiError')).toBeNull()
   })
 })

@@ -4,8 +4,10 @@
   import type { UsdcInventory } from '$lib/api/UsdcInventory'
   import type { Position } from '$lib/api/Position'
   import type { Settings } from '$lib/api/Settings'
+  import InventoryHoverValue from '$lib/components/inventory-hover-value.svelte'
   import { decimalAdd, decimalCompare, decimalIsZero, formatDecimal } from '$lib/decimal'
   import { reactive } from '$lib/frp.svelte'
+  import { cashUsdTooltip, equityUsdTooltip, positionSharesTooltip } from '$lib/inventory-value'
 
   interface Props {
     symbols: SymbolInventory[]
@@ -30,7 +32,7 @@
     return {
       display,
       full: value,
-      truncated,
+      truncated
     }
   }
 
@@ -46,7 +48,16 @@
   }
 
   type SortDir = 'asc' | 'desc'
-  type EquityCol = 'asset' | 'alpaca' | 'inflight' | 'unwrapped' | 'wrapped' | 'raindex' | 'total' | 'ratio' | 'exposure'
+  type EquityCol =
+    | 'asset'
+    | 'alpaca'
+    | 'inflight'
+    | 'unwrapped'
+    | 'wrapped'
+    | 'raindex'
+    | 'total'
+    | 'ratio'
+    | 'exposure'
   type EquitySortState = { column: EquityCol; dir: SortDir } | null
 
   const sort = reactive<EquitySortState>(null)
@@ -60,7 +71,10 @@
     })
   }
 
-  const ariaSort = (state: EquitySortState, col: EquityCol): 'ascending' | 'descending' | 'none' => {
+  const ariaSort = (
+    state: EquitySortState,
+    col: EquityCol
+  ): 'ascending' | 'descending' | 'none' => {
     if (state?.column !== col) return 'none'
     return state.dir === 'asc' ? 'ascending' : 'descending'
   }
@@ -80,19 +94,20 @@
     return onchain / total
   }
 
-  const formatRatio = (ratio: number): string =>
-    `${(ratio * 100).toFixed(1)}%`
+  const formatRatio = (ratio: number): string => `${(ratio * 100).toFixed(1)}%`
 
-  type PositionInfo = { net: number; priceUsdc: number }
+  type PositionInfo = { net: string; priceUsdc: string | null }
 
   const positionMap = $derived(
-    new Map(positions.map((position) => [
-      position.symbol,
-      {
-        net: parseFloat(position.net),
-        priceUsdc: position.last_price_usdc ? parseFloat(position.last_price_usdc) : 0,
-      } satisfies PositionInfo,
-    ]))
+    new Map(
+      positions.map((position) => [
+        position.symbol,
+        {
+          net: position.net,
+          priceUsdc: position.last_price_usdc
+        } satisfies PositionInfo
+      ])
+    )
   )
 
   type EquityRow = {
@@ -105,6 +120,8 @@
     total: Formatted
     ratio: number
     exposure: number
+    netShares: string
+    priceUsdc: string | null
     trading: boolean
   }
 
@@ -120,6 +137,8 @@
         inflight
       )
       const stripped = stripPrefix(item.symbol)
+      const pos = positionMap.get(stripped)
+
       return {
         asset: stripped,
         alpaca: fmt(item.offchainAvailable),
@@ -129,12 +148,10 @@
         raindex: fmt(item.onchainAvailable),
         total: fmtValue(totalVal),
         ratio: computeRatio(item.onchainAvailable, item.offchainAvailable),
-        exposure: (() => {
-          const pos = positionMap.get(stripped)
-          if (!pos) return 0
-          return pos.net * pos.priceUsdc
-        })(),
-        trading: tradingSet.has(stripped),
+        exposure: pos?.priceUsdc ? parseFloat(pos.net) * parseFloat(pos.priceUsdc) : 0,
+        netShares: pos?.net ?? '0',
+        priceUsdc: pos?.priceUsdc ?? null,
+        trading: tradingSet.has(stripped)
       }
     })
   )
@@ -155,21 +172,19 @@
     if (!usdc) return null
 
     const inflight = decimalAdd(usdc.onchainInflight, usdc.offchainInflight)
-    const total = decimalAdd(
-      decimalAdd(usdc.onchainAvailable, usdc.offchainAvailable),
-      inflight
-    )
+    const total = decimalAdd(decimalAdd(usdc.onchainAvailable, usdc.offchainAvailable), inflight)
 
     return {
       alpacaAvail: fmt(usdc.offchainAvailable),
       gross: usdc.offchainGross === null ? null : fmt(usdc.offchainGross),
       withdrawable: usdc.withdrawableCash === null ? null : fmt(usdc.withdrawableCash),
       inflight: fmt(inflight),
-      ethWallet: usdc.inflightCash.ethereumWallet === null ? null : fmt(usdc.inflightCash.ethereumWallet),
+      ethWallet:
+        usdc.inflightCash.ethereumWallet === null ? null : fmt(usdc.inflightCash.ethereumWallet),
       baseWallet: usdc.inflightCash.baseWallet === null ? null : fmt(usdc.inflightCash.baseWallet),
       raindex: fmt(usdc.onchainAvailable),
       total: fmtValue(total),
-      ratio: computeRatio(usdc.onchainAvailable, usdc.offchainAvailable),
+      ratio: computeRatio(usdc.onchainAvailable, usdc.offchainAvailable)
     }
   })
 
@@ -182,7 +197,7 @@
     raindex: (lhs, rhs) => decimalCompare(lhs.raindex.full, rhs.raindex.full),
     total: (lhs, rhs) => decimalCompare(lhs.total.full, rhs.total.full),
     ratio: (lhs, rhs) => lhs.ratio - rhs.ratio,
-    exposure: (lhs, rhs) => lhs.exposure - rhs.exposure,
+    exposure: (lhs, rhs) => lhs.exposure - rhs.exposure
   }
 
   const sortedEquities = $derived.by(() => {
@@ -206,7 +221,16 @@
   })
 
   const approxClass = (val: Formatted): string =>
-    val.truncated ? 'cursor-help opacity-80 hover:underline hover:decoration-dotted hover:decoration-muted-foreground hover:underline-offset-4' : ''
+    val.truncated
+      ? 'cursor-help opacity-80 hover:underline hover:decoration-dotted hover:decoration-muted-foreground hover:underline-offset-4'
+      : ''
+
+  const valueClass = (val: Formatted): string =>
+    val.truncated
+      ? approxClass(val)
+      : 'cursor-help hover:underline hover:decoration-dotted hover:decoration-muted-foreground hover:underline-offset-4'
+
+  const dimClass = (base: string, trading = true): string => (trading ? base : `${base} opacity-40`)
 
   type DeviationStyle = 'normal' | 'high' | 'low'
 
@@ -216,7 +240,9 @@
     if (!settings) return null
 
     const target = isCash ? (settings.usdcTarget ?? settings.equityTarget) : settings.equityTarget
-    const deviation = isCash ? (settings.usdcDeviation ?? settings.equityDeviation) : settings.equityDeviation
+    const deviation = isCash
+      ? (settings.usdcDeviation ?? settings.equityDeviation)
+      : settings.equityDeviation
     const diff = ratio - target
     const sign = diff >= 0 ? '+' : ''
     const text = `${sign}${(diff * 100).toFixed(1)}%`
@@ -242,15 +268,29 @@
   }
 
   const showGross = $derived(cashCells?.gross !== null && cashCells?.gross !== undefined)
-  const showWithdrawable = $derived(cashCells?.withdrawable !== null && cashCells?.withdrawable !== undefined)
-  const showEthWallet = $derived(cashCells?.ethWallet !== null && cashCells?.ethWallet !== undefined)
-  const showBaseWallet = $derived(cashCells?.baseWallet !== null && cashCells?.baseWallet !== undefined)
+  const showWithdrawable = $derived(
+    cashCells?.withdrawable !== null && cashCells?.withdrawable !== undefined
+  )
+  const showEthWallet = $derived(
+    cashCells?.ethWallet !== null && cashCells?.ethWallet !== undefined
+  )
+  const showBaseWallet = $derived(
+    cashCells?.baseWallet !== null && cashCells?.baseWallet !== undefined
+  )
 
   // Visual separator before wallet-observed / info columns to signal they're
   // out-of-band and not part of imbalance math.
   const infoSepClass = 'border-l border-border pl-6'
   const cashFirstInfoCol = $derived<'gross' | 'withdrawable' | 'eth' | 'base' | null>(
-    showGross ? 'gross' : showWithdrawable ? 'withdrawable' : showEthWallet ? 'eth' : showBaseWallet ? 'base' : null,
+    showGross
+      ? 'gross'
+      : showWithdrawable
+        ? 'withdrawable'
+        : showEthWallet
+          ? 'eth'
+          : showBaseWallet
+            ? 'base'
+            : null
   )
   const cashInfoBoundary = (col: 'gross' | 'withdrawable' | 'eth' | 'base'): string =>
     cashFirstInfoCol === col ? infoSepClass : ''
@@ -259,224 +299,361 @@
 {#if cashCells}
   {@const dev = ratioDeviation(cashCells.ratio, true)}
   <div class="cash-table">
-  <Table.Root>
-    <Table.Header>
-      <Table.Row>
-        <Table.Head class="text-left">Asset</Table.Head>
-        <Table.Head class="text-left" title="USDC available in Raindex vaults to settle takers.">Raindex</Table.Head>
-        <Table.Head class="text-left" title="USDC the books track as in motion between venues (CCTP transfers, pending settlements). Part of imbalance math.">Inflight</Table.Head>
-        <Table.Head class="text-left" title="USDC available to trade on Alpaca after subtracting the configured cash reserve.">Alpaca Available</Table.Head>
-        <Table.Head class="text-left">Total</Table.Head>
-        <Table.Head class="text-left" title="Proportion of total cash on Raindex (onchain / total).">Ratio</Table.Head>
-        <Table.Head class="w-full" aria-hidden="true"></Table.Head>
-        {#if showGross}
-          <Table.Head class="info-col text-left {cashInfoBoundary('gross')}" title="Full broker USDC balance before subtracting the configured cash reserve.">Gross</Table.Head>
-        {/if}
-        {#if showWithdrawable}
-          <Table.Head class="info-col text-left {cashInfoBoundary('withdrawable')}" title="Settled cash that can be withdrawn or transferred to Raindex. Excludes T+1 unsettled equity-sale proceeds.">Withdrawable</Table.Head>
-        {/if}
-        {#if showEthWallet}
-          <Table.Head class="info-col text-left {cashInfoBoundary('eth')}" title="Wallet-observed USDC on the Ethereum wallet between Alpaca and CCTP. Not part of imbalance math.">Eth Wallet</Table.Head>
-        {/if}
-        {#if showBaseWallet}
-          <Table.Head class="info-col text-left {cashInfoBoundary('base')}" title="Wallet-observed USDC on the Base wallet between CCTP and Raindex vaults. Not part of imbalance math.">Base Wallet</Table.Head>
-        {/if}
-      </Table.Row>
-    </Table.Header>
+    <Table.Root>
+      <Table.Header>
+        <Table.Row>
+          <Table.Head class="text-left">Asset</Table.Head>
+          <Table.Head class="text-left" title="USDC available in Raindex vaults to settle takers."
+            >Raindex</Table.Head
+          >
+          <Table.Head
+            class="text-left"
+            title="USDC the books track as in motion between venues (CCTP transfers, pending settlements). Part of imbalance math."
+            >Inflight</Table.Head
+          >
+          <Table.Head
+            class="text-left"
+            title="USDC available to trade on Alpaca after subtracting the configured cash reserve."
+            >Alpaca Available</Table.Head
+          >
+          <Table.Head class="text-left">Total</Table.Head>
+          <Table.Head
+            class="text-left"
+            title="Proportion of total cash on Raindex (onchain / total).">Ratio</Table.Head
+          >
+          <Table.Head class="w-full" aria-hidden="true"></Table.Head>
+          {#if showGross}
+            <Table.Head
+              class="info-col text-left {cashInfoBoundary('gross')}"
+              title="Full broker USDC balance before subtracting the configured cash reserve."
+              >Gross</Table.Head
+            >
+          {/if}
+          {#if showWithdrawable}
+            <Table.Head
+              class="info-col text-left {cashInfoBoundary('withdrawable')}"
+              title="Settled cash that can be withdrawn or transferred to Raindex. Excludes T+1 unsettled equity-sale proceeds."
+              >Withdrawable</Table.Head
+            >
+          {/if}
+          {#if showEthWallet}
+            <Table.Head
+              class="info-col text-left {cashInfoBoundary('eth')}"
+              title="Wallet-observed USDC on the Ethereum wallet between Alpaca and CCTP. Not part of imbalance math."
+              >Eth Wallet</Table.Head
+            >
+          {/if}
+          {#if showBaseWallet}
+            <Table.Head
+              class="info-col text-left {cashInfoBoundary('base')}"
+              title="Wallet-observed USDC on the Base wallet between CCTP and Raindex vaults. Not part of imbalance math."
+              >Base Wallet</Table.Head
+            >
+          {/if}
+        </Table.Row>
+      </Table.Header>
 
-    <Table.Body>
-      <Table.Row>
-        <Table.Cell class="font-mono font-medium">Cash</Table.Cell>
+      <Table.Body>
+        <Table.Row>
+          <Table.Cell class="font-mono font-medium">Cash</Table.Cell>
 
-        <Table.Cell class="text-left font-mono opacity-90">
-          <span class={approxClass(cashCells.raindex)} title={cashCells.raindex.truncated ? cashCells.raindex.full : undefined}>{cashCells.raindex.display}</span>
-        </Table.Cell>
+          <Table.Cell class="text-left font-mono">
+            <InventoryHoverValue
+              display={cashCells.raindex.display}
+              tooltip={cashUsdTooltip(cashCells.raindex.full)}
+              class={dimClass(valueClass(cashCells.raindex), true)}
+            />
+          </Table.Cell>
 
-        <Table.Cell class="text-left font-mono opacity-50">
-          <span class={approxClass(cashCells.inflight)} title={cashCells.inflight.truncated ? cashCells.inflight.full : undefined}>{cashCells.inflight.display}</span>
-        </Table.Cell>
+          <Table.Cell class="text-left font-mono">
+            <InventoryHoverValue
+              display={cashCells.inflight.display}
+              tooltip={cashUsdTooltip(cashCells.inflight.full)}
+              class={dimClass(`${valueClass(cashCells.inflight)} opacity-50`, true)}
+            />
+          </Table.Cell>
 
-        <Table.Cell class="text-left font-mono opacity-90">
-          <span class={approxClass(cashCells.alpacaAvail)} title={cashCells.alpacaAvail.truncated ? cashCells.alpacaAvail.full : undefined}>{cashCells.alpacaAvail.display}</span>
-        </Table.Cell>
+          <Table.Cell class="text-left font-mono">
+            <InventoryHoverValue
+              display={cashCells.alpacaAvail.display}
+              tooltip={cashUsdTooltip(cashCells.alpacaAvail.full)}
+              class={valueClass(cashCells.alpacaAvail)}
+            />
+          </Table.Cell>
 
-        <Table.Cell class="text-left font-mono font-semibold">
-          <span class={approxClass(cashCells.total)} title={cashCells.total.truncated ? cashCells.total.full : undefined}>{cashCells.total.display}</span>
-        </Table.Cell>
+          <Table.Cell class="text-left font-mono font-semibold">
+            <InventoryHoverValue
+              display={cashCells.total.display}
+              tooltip={cashUsdTooltip(cashCells.total.full)}
+              class={valueClass(cashCells.total)}
+            />
+          </Table.Cell>
 
-        <Table.Cell>
-          <div class="flex items-center gap-2">
-            <div class="h-1.5 w-16 overflow-hidden rounded-full bg-muted">
-              <div class="h-full rounded-full {dev?.style === 'high' ? 'bg-green-500' : dev?.style === 'low' ? 'bg-red-500' : 'bg-blue-400'}" style="width: {String(Math.min(cashCells.ratio * 100, 100))}%"></div>
+          <Table.Cell>
+            <div class="flex items-center gap-2">
+              <div class="h-1.5 w-16 overflow-hidden rounded-full bg-muted">
+                <div
+                  class="h-full rounded-full {dev?.style === 'high'
+                    ? 'bg-green-500'
+                    : dev?.style === 'low'
+                      ? 'bg-red-500'
+                      : 'bg-blue-400'}"
+                  style="width: {String(Math.min(cashCells.ratio * 100, 100))}%"
+                ></div>
+              </div>
+              <span class="font-mono text-xs">{formatRatio(cashCells.ratio)}</span>
+              {#if dev}
+                <span class="text-xs {deviationColor(dev.style)}">({dev.text})</span>
+              {/if}
             </div>
-            <span class="font-mono text-xs">{formatRatio(cashCells.ratio)}</span>
-            {#if dev}
-              <span class="text-xs {deviationColor(dev.style)}">({dev.text})</span>
-            {/if}
-          </div>
-        </Table.Cell>
-
-        <Table.Cell class="w-full" aria-hidden="true"></Table.Cell>
-
-        {#if showGross && cashCells.gross}
-          <Table.Cell class="info-col text-left font-mono opacity-90 {cashInfoBoundary('gross')}">
-            <span class={approxClass(cashCells.gross)} title={cashCells.gross.truncated ? cashCells.gross.full : undefined}>{cashCells.gross.display}</span>
           </Table.Cell>
-        {/if}
 
-        {#if showWithdrawable && cashCells.withdrawable}
-          <Table.Cell class="info-col text-left font-mono opacity-90 {cashInfoBoundary('withdrawable')}">
-            <span class={approxClass(cashCells.withdrawable)} title={cashCells.withdrawable.truncated ? cashCells.withdrawable.full : undefined}>{cashCells.withdrawable.display}</span>
-          </Table.Cell>
-        {/if}
+          <Table.Cell class="w-full" aria-hidden="true"></Table.Cell>
 
-        {#if showEthWallet && cashCells.ethWallet}
-          <Table.Cell class="info-col text-left font-mono opacity-50 {cashInfoBoundary('eth')}">
-            <span class={approxClass(cashCells.ethWallet)} title={cashCells.ethWallet.truncated ? cashCells.ethWallet.full : undefined}>{cashCells.ethWallet.display}</span>
-          </Table.Cell>
-        {/if}
+          {#if showGross && cashCells.gross}
+            <Table.Cell class="info-col text-left font-mono {cashInfoBoundary('gross')}">
+              <InventoryHoverValue
+                display={cashCells.gross.display}
+                tooltip={cashUsdTooltip(cashCells.gross.full)}
+                class={valueClass(cashCells.gross)}
+              />
+            </Table.Cell>
+          {/if}
 
-        {#if showBaseWallet && cashCells.baseWallet}
-          <Table.Cell class="info-col text-left font-mono opacity-50 {cashInfoBoundary('base')}">
-            <span class={approxClass(cashCells.baseWallet)} title={cashCells.baseWallet.truncated ? cashCells.baseWallet.full : undefined}>{cashCells.baseWallet.display}</span>
-          </Table.Cell>
-        {/if}
-      </Table.Row>
-    </Table.Body>
-  </Table.Root>
+          {#if showWithdrawable && cashCells.withdrawable}
+            <Table.Cell class="info-col text-left font-mono {cashInfoBoundary('withdrawable')}">
+              <InventoryHoverValue
+                display={cashCells.withdrawable.display}
+                tooltip={cashUsdTooltip(cashCells.withdrawable.full)}
+                class={valueClass(cashCells.withdrawable)}
+              />
+            </Table.Cell>
+          {/if}
+
+          {#if showEthWallet && cashCells.ethWallet}
+            <Table.Cell class="info-col text-left font-mono {cashInfoBoundary('eth')}">
+              <InventoryHoverValue
+                display={cashCells.ethWallet.display}
+                tooltip={cashUsdTooltip(cashCells.ethWallet.full)}
+                class={`${valueClass(cashCells.ethWallet)} opacity-50`}
+              />
+            </Table.Cell>
+          {/if}
+
+          {#if showBaseWallet && cashCells.baseWallet}
+            <Table.Cell class="info-col text-left font-mono {cashInfoBoundary('base')}">
+              <InventoryHoverValue
+                display={cashCells.baseWallet.display}
+                tooltip={cashUsdTooltip(cashCells.baseWallet.full)}
+                class={`${valueClass(cashCells.baseWallet)} opacity-50`}
+              />
+            </Table.Cell>
+          {/if}
+        </Table.Row>
+      </Table.Body>
+    </Table.Root>
   </div>
 
   <div class="my-4 h-px bg-border"></div>
 {/if}
 
 <div class="equity-table">
-<Table.Root>
-  <Table.Header>
-    <Table.Row>
-      <Table.Head class="text-left" aria-sort={ariaSort(sort.current, 'asset')}>
-        <button class="{sortBtnClass} text-left" onclick={toggleSort('asset')}>
-          Asset{sortIndicator(sort.current, 'asset')}
-        </button>
-      </Table.Head>
+  <Table.Root>
+    <Table.Header>
+      <Table.Row>
+        <Table.Head class="text-left" aria-sort={ariaSort(sort.current, 'asset')}>
+          <button class="{sortBtnClass} text-left" onclick={toggleSort('asset')}>
+            Asset{sortIndicator(sort.current, 'asset')}
+          </button>
+        </Table.Head>
 
-      <Table.Head class="text-left" aria-sort={ariaSort(sort.current, 'raindex')}>
-        <button class="{sortBtnClass} text-left" onclick={toggleSort('raindex')} title="Tokens in Raindex vaults.">
-          Raindex{sortIndicator(sort.current, 'raindex')}
-        </button>
-      </Table.Head>
+        <Table.Head class="text-left" aria-sort={ariaSort(sort.current, 'raindex')}>
+          <button
+            class="{sortBtnClass} text-left"
+            onclick={toggleSort('raindex')}
+            title="Tokens in Raindex vaults."
+          >
+            Raindex{sortIndicator(sort.current, 'raindex')}
+          </button>
+        </Table.Head>
 
-      <Table.Head class="text-left" aria-sort={ariaSort(sort.current, 'inflight')}>
-        <button class="{sortBtnClass} text-left" onclick={toggleSort('inflight')} title="Shares the books track as in motion between venues (mints, redeems). Part of imbalance math.">
-          Inflight{sortIndicator(sort.current, 'inflight')}
-        </button>
-      </Table.Head>
+        <Table.Head class="text-left" aria-sort={ariaSort(sort.current, 'inflight')}>
+          <button
+            class="{sortBtnClass} text-left"
+            onclick={toggleSort('inflight')}
+            title="Shares the books track as in motion between venues (mints, redeems). Part of imbalance math."
+          >
+            Inflight{sortIndicator(sort.current, 'inflight')}
+          </button>
+        </Table.Head>
 
-      <Table.Head class="text-left" aria-sort={ariaSort(sort.current, 'alpaca')}>
-        <button class="{sortBtnClass} text-left" onclick={toggleSort('alpaca')} title="Shares held at Alpaca.">
-          Alpaca{sortIndicator(sort.current, 'alpaca')}
-        </button>
-      </Table.Head>
+        <Table.Head class="text-left" aria-sort={ariaSort(sort.current, 'alpaca')}>
+          <button
+            class="{sortBtnClass} text-left"
+            onclick={toggleSort('alpaca')}
+            title="Shares held at Alpaca."
+          >
+            Alpaca{sortIndicator(sort.current, 'alpaca')}
+          </button>
+        </Table.Head>
 
-      <Table.Head class="text-left" aria-sort={ariaSort(sort.current, 'total')}>
-        <button class="{sortBtnClass} text-left" onclick={toggleSort('total')}>
-          Total{sortIndicator(sort.current, 'total')}
-        </button>
-      </Table.Head>
+        <Table.Head class="text-left" aria-sort={ariaSort(sort.current, 'total')}>
+          <button class="{sortBtnClass} text-left" onclick={toggleSort('total')}>
+            Total{sortIndicator(sort.current, 'total')}
+          </button>
+        </Table.Head>
 
-      <Table.Head class="text-left" aria-sort={ariaSort(sort.current, 'ratio')}>
-        <button
-          class="{sortBtnClass} text-left"
-          onclick={toggleSort('ratio')}
-          title="Proportion of total holdings on Raindex (onchain / total)."
+        <Table.Head class="text-left" aria-sort={ariaSort(sort.current, 'ratio')}>
+          <button
+            class="{sortBtnClass} text-left"
+            onclick={toggleSort('ratio')}
+            title="Proportion of total holdings on Raindex (onchain / total)."
+          >
+            Ratio{sortIndicator(sort.current, 'ratio')}
+          </button>
+        </Table.Head>
+
+        <Table.Head class="text-left" aria-sort={ariaSort(sort.current, 'exposure')}>
+          <button
+            class="{sortBtnClass} text-left"
+            onclick={toggleSort('exposure')}
+            title="Net directional exposure from counterparty fills."
+          >
+            Exposure{sortIndicator(sort.current, 'exposure')}
+          </button>
+        </Table.Head>
+
+        <Table.Head class="w-full" aria-hidden="true"></Table.Head>
+
+        <Table.Head
+          class="info-col text-left {infoSepClass}"
+          aria-sort={ariaSort(sort.current, 'unwrapped')}
         >
-          Ratio{sortIndicator(sort.current, 'ratio')}
-        </button>
-      </Table.Head>
+          <button
+            class="{sortBtnClass} text-left"
+            onclick={toggleSort('unwrapped')}
+            title="Unwrapped tokenized equity (tSTOCK) parked on the Base wallet between venues. Wallet-observed, not part of imbalance math."
+          >
+            Unwrapped{sortIndicator(sort.current, 'unwrapped')}
+          </button>
+        </Table.Head>
 
-      <Table.Head class="text-left" aria-sort={ariaSort(sort.current, 'exposure')}>
-        <button
-          class="{sortBtnClass} text-left"
-          onclick={toggleSort('exposure')}
-          title="Net directional exposure from counterparty fills."
-        >
-          Exposure{sortIndicator(sort.current, 'exposure')}
-        </button>
-      </Table.Head>
-
-      <Table.Head class="w-full" aria-hidden="true"></Table.Head>
-
-      <Table.Head class="info-col text-left {infoSepClass}" aria-sort={ariaSort(sort.current, 'unwrapped')}>
-        <button class="{sortBtnClass} text-left" onclick={toggleSort('unwrapped')} title="Unwrapped tokenized equity (tSTOCK) parked on the Base wallet between venues. Wallet-observed, not part of imbalance math.">
-          Unwrapped{sortIndicator(sort.current, 'unwrapped')}
-        </button>
-      </Table.Head>
-
-      <Table.Head class="info-col text-left" aria-sort={ariaSort(sort.current, 'wrapped')}>
-        <button class="{sortBtnClass} text-left" onclick={toggleSort('wrapped')} title="Wrapped equity vault shares (wtSTOCK) parked on the Base wallet between venues. Wallet-observed, not part of imbalance math.">
-          Wrapped{sortIndicator(sort.current, 'wrapped')}
-        </button>
-      </Table.Head>
-    </Table.Row>
-  </Table.Header>
-
-  <Table.Body>
-    {#each sortedEquities as row, idx (row.asset)}
-      {@const dev = ratioDeviation(row.ratio, false)}
-      <Table.Row class="{idx % 2 === 0 ? 'bg-muted/40' : ''} {row.trading ? '' : 'opacity-40'}">
-        <Table.Cell class="font-mono font-medium">{row.asset}</Table.Cell>
-
-        <Table.Cell class="text-left font-mono opacity-90">
-          <span class={approxClass(row.raindex)} title={row.raindex.truncated ? row.raindex.full : undefined}>{row.raindex.display}</span>
-        </Table.Cell>
-
-        <Table.Cell class="text-left font-mono opacity-50">
-          <span class={approxClass(row.inflight)} title={row.inflight.truncated ? row.inflight.full : undefined}>{row.inflight.display}</span>
-        </Table.Cell>
-
-        <Table.Cell class="text-left font-mono opacity-90">
-          <span class={approxClass(row.alpaca)} title={row.alpaca.truncated ? row.alpaca.full : undefined}>{row.alpaca.display}</span>
-        </Table.Cell>
-
-        <Table.Cell class="text-left font-mono font-semibold">
-          <span class={approxClass(row.total)} title={row.total.truncated ? row.total.full : undefined}>{row.total.display}</span>
-        </Table.Cell>
-
-        <Table.Cell>
-          <div class="flex items-center gap-2">
-            <div class="h-1.5 w-16 overflow-hidden rounded-full bg-muted">
-              <div class="h-full rounded-full {dev?.style === 'high' ? 'bg-green-500' : dev?.style === 'low' ? 'bg-red-500' : 'bg-blue-400'}" style="width: {String(Math.min(row.ratio * 100, 100))}%"></div>
-            </div>
-            <span class="font-mono text-xs">{formatRatio(row.ratio)}</span>
-            {#if dev}
-              <span class="text-xs {deviationColor(dev.style)}">({dev.text})</span>
-            {/if}
-          </div>
-        </Table.Cell>
-
-        <Table.Cell>
-          <div class="flex items-center gap-1.5 font-mono text-xs">
-            {#if !isNegligible(row.exposure) && row.exposure !== 0}
-              <span class="text-base leading-none {row.exposure > 0 ? 'text-green-500' : 'text-red-500'}">{row.exposure > 0 ? '▲' : '▼'}</span>
-            {/if}
-            <span class={row.exposure === 0 || isNegligible(row.exposure) ? 'text-muted-foreground' : row.exposure > 0 ? 'text-green-500' : 'text-red-500'}>
-              {fmtExposure(row.exposure)}
-            </span>
-          </div>
-        </Table.Cell>
-
-        <Table.Cell class="w-full" aria-hidden="true"></Table.Cell>
-
-        <Table.Cell class="info-col text-left font-mono opacity-50 {infoSepClass}">
-          <span class={approxClass(row.unwrapped)} title={row.unwrapped.truncated ? row.unwrapped.full : undefined}>{row.unwrapped.display}</span>
-        </Table.Cell>
-
-        <Table.Cell class="info-col text-left font-mono opacity-50">
-          <span class={approxClass(row.wrapped)} title={row.wrapped.truncated ? row.wrapped.full : undefined}>{row.wrapped.display}</span>
-        </Table.Cell>
+        <Table.Head class="info-col text-left" aria-sort={ariaSort(sort.current, 'wrapped')}>
+          <button
+            class="{sortBtnClass} text-left"
+            onclick={toggleSort('wrapped')}
+            title="Wrapped equity vault shares (wtSTOCK) parked on the Base wallet between venues. Wallet-observed, not part of imbalance math."
+          >
+            Wrapped{sortIndicator(sort.current, 'wrapped')}
+          </button>
+        </Table.Head>
       </Table.Row>
-    {/each}
-  </Table.Body>
-</Table.Root>
+    </Table.Header>
+
+    <Table.Body>
+      {#each sortedEquities as row, idx (row.asset)}
+        {@const dev = ratioDeviation(row.ratio, false)}
+        <Table.Row class={idx % 2 === 0 ? 'bg-muted/40' : ''}>
+          <Table.Cell class="font-mono font-medium {row.trading ? '' : 'opacity-40'}"
+            >{row.asset}</Table.Cell
+          >
+
+          <Table.Cell class="text-left font-mono">
+            <InventoryHoverValue
+              display={row.raindex.display}
+              tooltip={equityUsdTooltip(row.raindex.full, row.priceUsdc)}
+              class={dimClass(valueClass(row.raindex), row.trading)}
+            />
+          </Table.Cell>
+
+          <Table.Cell class="text-left font-mono">
+            <InventoryHoverValue
+              display={row.inflight.display}
+              tooltip={equityUsdTooltip(row.inflight.full, row.priceUsdc)}
+              class={dimClass(`${valueClass(row.inflight)} opacity-50`, row.trading)}
+            />
+          </Table.Cell>
+
+          <Table.Cell class="text-left font-mono">
+            <InventoryHoverValue
+              display={row.alpaca.display}
+              tooltip={equityUsdTooltip(row.alpaca.full, row.priceUsdc)}
+              class={dimClass(valueClass(row.alpaca), row.trading)}
+            />
+          </Table.Cell>
+
+          <Table.Cell class="text-left font-mono font-semibold">
+            <InventoryHoverValue
+              display={row.total.display}
+              tooltip={equityUsdTooltip(row.total.full, row.priceUsdc)}
+              class={dimClass(valueClass(row.total), row.trading)}
+            />
+          </Table.Cell>
+
+          <Table.Cell>
+            <div class="flex items-center gap-2">
+              <div class="h-1.5 w-16 overflow-hidden rounded-full bg-muted">
+                <div
+                  class="h-full rounded-full {dev?.style === 'high'
+                    ? 'bg-green-500'
+                    : dev?.style === 'low'
+                      ? 'bg-red-500'
+                      : 'bg-blue-400'}"
+                  style="width: {String(Math.min(row.ratio * 100, 100))}%"
+                ></div>
+              </div>
+              <span class="font-mono text-xs {row.trading ? '' : 'opacity-40'}"
+                >{formatRatio(row.ratio)}</span
+              >
+              {#if dev}
+                <span class="text-xs {deviationColor(dev.style)} {row.trading ? '' : 'opacity-40'}"
+                  >({dev.text})</span
+                >
+              {/if}
+            </div>
+          </Table.Cell>
+
+          <Table.Cell>
+            <div class="flex items-center gap-1.5 font-mono text-xs">
+              {#if !isNegligible(row.exposure) && row.exposure !== 0}
+                <span
+                  class="text-base leading-none {row.exposure > 0
+                    ? 'text-green-500'
+                    : 'text-red-500'}">{row.exposure > 0 ? '▲' : '▼'}</span
+                >
+              {/if}
+              <InventoryHoverValue
+                display={fmtExposure(row.exposure)}
+                tooltip={positionSharesTooltip(row.netShares)}
+                class={dimClass(
+                  `cursor-help hover:underline hover:decoration-dotted hover:decoration-muted-foreground hover:underline-offset-4 ${row.exposure === 0 || isNegligible(row.exposure) ? 'text-muted-foreground' : row.exposure > 0 ? 'text-green-500' : 'text-red-500'}`,
+                  row.trading
+                )}
+              />
+            </div>
+          </Table.Cell>
+
+          <Table.Cell class="w-full" aria-hidden="true"></Table.Cell>
+
+          <Table.Cell class="info-col text-left font-mono {infoSepClass}">
+            <InventoryHoverValue
+              display={row.unwrapped.display}
+              tooltip={equityUsdTooltip(row.unwrapped.full, row.priceUsdc)}
+              class={dimClass(`${valueClass(row.unwrapped)} opacity-50`, row.trading)}
+            />
+          </Table.Cell>
+
+          <Table.Cell class="info-col text-left font-mono">
+            <InventoryHoverValue
+              display={row.wrapped.display}
+              tooltip={equityUsdTooltip(row.wrapped.full, row.priceUsdc)}
+              class={dimClass(`${valueClass(row.wrapped)} opacity-50`, row.trading)}
+            />
+          </Table.Cell>
+        </Table.Row>
+      {/each}
+    </Table.Body>
+  </Table.Root>
 </div>
 
 <style>

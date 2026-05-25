@@ -1,12 +1,16 @@
 <script lang="ts">
+  import { createQuery } from '@tanstack/svelte-query'
   import { onMount } from 'svelte'
   import * as Card from '$lib/components/ui/card'
   import * as Table from '$lib/components/ui/table'
+  import HoverTooltip from '$lib/components/hover-tooltip.svelte'
+  import type { Position } from '$lib/api/Position'
   import MultiSelect from '$lib/components/multi-select.svelte'
   import { reactive } from '$lib/frp.svelte'
   import { getApiBaseUrl, getExplorerTxUrl } from '$lib/env'
   import { formatUtc, toDatetimeLocal, TIME_PRESETS, FETCH_TIMEOUT_MS, toRfc3339 } from '$lib/time'
   import { formatDecimal } from '$lib/decimal'
+  import { cashUsdTooltip, equityUsdTooltip } from '$lib/inventory-value'
   import {
     kindLabel,
     statusStyle,
@@ -17,10 +21,22 @@
     formatFieldName,
     extractTimestamp,
     detailFields,
+    apiErrorStatus
   } from '$lib/transfer'
 
   const isNumeric = (value: unknown): boolean =>
     typeof value === 'string' && value !== '' && !Number.isNaN(Number(value))
+
+  const transferAmount = (transfer: TransferEntry): string | null =>
+    transfer.quantity ?? transfer.amount ?? null
+
+  const transferAmountTooltip = (transfer: TransferEntry): string => {
+    if (transfer.quantity) {
+      return equityUsdTooltip(transfer.quantity, positionPrices.get(transfer.symbol ?? '') ?? null)
+    }
+    if (transfer.amount) return cashUsdTooltip(transfer.amount)
+    return ''
+  }
 
   type TransferEntry = {
     kind: string
@@ -64,12 +80,23 @@
   let sinceInput: HTMLInputElement | undefined
   let untilInput: HTMLInputElement | undefined
 
+  const positionsQuery = createQuery<Position[]>(() => ({
+    queryKey: ['positions'],
+    enabled: false
+  }))
+
+  const positionPrices = $derived(
+    new Map(
+      (positionsQuery.data ?? []).map((position) => [position.symbol, position.last_price_usdc])
+    )
+  )
+
   const kindOptions = ALL_KINDS.map((kind) => ({ value: kind, label: kindLabel(kind) }))
 
   const buildParams = (): URLSearchParams => {
     const params = new URLSearchParams({
       limit: String(PAGE_SIZE),
-      offset: String(offset.current),
+      offset: String(offset.current)
     })
 
     if (selectedKinds.current.size > 0 && selectedKinds.current.size < ALL_KINDS.length) {
@@ -99,17 +126,16 @@
 
     try {
       const baseUrl = getApiBaseUrl()
-      const response = await fetch(
-        `${baseUrl}/transfers?${buildParams().toString()}`,
-        { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) }
-      )
+      const response = await fetch(`${baseUrl}/transfers?${buildParams().toString()}`, {
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+      })
 
       if (!response.ok) {
         error.update(() => `HTTP ${String(response.status)}`)
         return
       }
 
-      const data: TransferResponse = await response.json() as TransferResponse
+      const data: TransferResponse = (await response.json()) as TransferResponse
       total.update(() => data.total)
       hasMore.update(() => data.hasMore)
 
@@ -119,7 +145,7 @@
         entries.update(() => data.entries)
       }
     } catch (fetchError) {
-      error.update(() => fetchError instanceof Error ? fetchError.message : 'Unknown error')
+      error.update(() => (fetchError instanceof Error ? fetchError.message : 'Unknown error'))
     } finally {
       loading.update(() => false)
       loadingMore.update(() => false)
@@ -157,9 +183,7 @@
   }
 
   const hasFilters = $derived(
-    since.current !== '' ||
-    until.current !== '' ||
-    selectedKinds.current.size < ALL_KINDS.length
+    since.current !== '' || until.current !== '' || selectedKinds.current.size < ALL_KINDS.length
   )
 
   onMount(() => {
@@ -167,7 +191,9 @@
     const interval = setInterval(() => {
       if (offset.current === 0) void fetchTransfers('replace')
     }, POLL_INTERVAL_MS)
-    return () => { clearInterval(interval) }
+    return () => {
+      clearInterval(interval)
+    }
   })
 
   const handleKindChange = (selected: Set<string>) => {
@@ -213,15 +239,9 @@
 
     try {
       const baseUrl = getApiBaseUrl()
-      const response = await fetch(
-        `${baseUrl}/transfers/${transfer.kind}/${transfer.id}/events`,
-        {
-          signal: AbortSignal.any([
-            controller.signal,
-            AbortSignal.timeout(FETCH_TIMEOUT_MS),
-          ]),
-        },
-      )
+      const response = await fetch(`${baseUrl}/transfers/${transfer.kind}/${transfer.id}/events`, {
+        signal: AbortSignal.any([controller.signal, AbortSignal.timeout(FETCH_TIMEOUT_MS)])
+      })
 
       if (isAborted()) return
 
@@ -237,14 +257,13 @@
       detailEvents.update(() => data.events)
     } catch (err) {
       if (isAborted()) return
-      detailError.update(() => err instanceof Error ? err.message : 'Unknown error')
+      detailError.update(() => (err instanceof Error ? err.message : 'Unknown error'))
     } finally {
       if (!isAborted()) {
         detailLoading.update(() => false)
       }
     }
   }
-
 </script>
 
 <Card.Root class="flex h-full flex-col overflow-hidden border-l-4 border-l-purple-500/50">
@@ -252,18 +271,35 @@
     <Card.Title class="flex items-center justify-between">
       <span class="flex items-center gap-1.5">
         Cross-venue Transfers
-        <span class="group relative cursor-help text-muted-foreground">
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="h-3.5 w-3.5"><path fill-rule="evenodd" d="M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Zm-7-4a1 1 0 1 1-2 0 1 1 0 0 1 2 0ZM9 9a.75.75 0 0 0 0 1.5h.253a.25.25 0 0 1 .244.304l-.459 2.066A1.75 1.75 0 0 0 10.747 15H11a.75.75 0 0 0 0-1.5h-.253a.25.25 0 0 1-.244-.304l.459-2.066A1.75 1.75 0 0 0 9.253 9H9Z" clip-rule="evenodd" /></svg>
-          <span class="pointer-events-none absolute left-0 top-full z-50 mt-1 hidden w-64 rounded bg-popover px-3 py-2 text-xs font-normal text-popover-foreground shadow-lg group-hover:block">
-            Asset movements between venues to rebalance inventory: equity mints (Alpaca to onchain), redemptions (onchain to Alpaca), and USDC bridges (Base/Ethereum via CCTP).
-          </span>
-        </span>
+        <HoverTooltip
+          tooltip="Asset movements between venues to rebalance inventory: equity mints (Alpaca to onchain), redemptions (onchain to Alpaca), and USDC bridges (Base/Ethereum via CCTP)."
+          class="cursor-help text-muted-foreground"
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 20 20"
+            fill="currentColor"
+            class="h-3.5 w-3.5"
+            ><path
+              fill-rule="evenodd"
+              d="M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Zm-7-4a1 1 0 1 1-2 0 1 1 0 0 1 2 0ZM9 9a.75.75 0 0 0 0 1.5h.253a.25.25 0 0 1 .244.304l-.459 2.066A1.75 1.75 0 0 0 10.747 15H11a.75.75 0 0 0 0-1.5h-.253a.25.25 0 0 1-.244-.304l.459-2.066A1.75 1.75 0 0 0 9.253 9H9Z"
+              clip-rule="evenodd"
+            /></svg
+          >
+        </HoverTooltip>
       </span>
       <div class="flex items-center gap-2">
         {#if hasFilters}
-          <button class="rounded border bg-background px-2 py-1 text-xs hover:bg-accent" onclick={jumpToLatest}>Latest</button>
+          <button
+            class="rounded border bg-background px-2 py-1 text-xs hover:bg-accent"
+            onclick={jumpToLatest}>Latest</button
+          >
         {/if}
-        <button class="rounded border bg-background px-2 py-1 text-xs hover:bg-accent" onclick={refresh} disabled={loading.current}>
+        <button
+          class="rounded border bg-background px-2 py-1 text-xs hover:bg-accent"
+          onclick={refresh}
+          disabled={loading.current}
+        >
           {loading.current ? 'Loading...' : 'Refresh'}
         </button>
         <span class="text-sm font-normal text-muted-foreground">
@@ -273,11 +309,19 @@
     </Card.Title>
 
     <div class="flex flex-wrap items-center gap-2 rounded-md bg-muted/30 px-2 py-1.5 text-xs">
-      <MultiSelect label="Type" options={kindOptions} selected={selectedKinds.current} onchange={handleKindChange} />
+      <MultiSelect
+        label="Type"
+        options={kindOptions}
+        selected={selectedKinds.current}
+        onchange={handleKindChange}
+      />
 
       <div class="flex items-center gap-1">
         {#each TIME_PRESETS as preset (preset.label)}
-          <button class="rounded border bg-background px-1.5 py-0.5 text-xs hover:bg-accent" onclick={applyPreset(preset.minutes)}>
+          <button
+            class="rounded border bg-background px-1.5 py-0.5 text-xs hover:bg-accent"
+            onclick={applyPreset(preset.minutes)}
+          >
             {preset.label}
           </button>
         {/each}
@@ -285,9 +329,23 @@
 
       <div class="flex items-center gap-1 text-muted-foreground">
         <span>From (UTC)</span>
-        <input bind:this={sinceInput} type="datetime-local" class="rounded border bg-background px-1.5 py-0.5 text-xs text-foreground" style="color-scheme: dark" onchange={handleSinceChange} step="1" />
+        <input
+          bind:this={sinceInput}
+          type="datetime-local"
+          class="rounded border bg-background px-1.5 py-0.5 text-xs text-foreground"
+          style="color-scheme: dark"
+          onchange={handleSinceChange}
+          step="1"
+        />
         <span>to (UTC)</span>
-        <input bind:this={untilInput} type="datetime-local" class="rounded border bg-background px-1.5 py-0.5 text-xs text-foreground" style="color-scheme: dark" onchange={handleUntilChange} step="1" />
+        <input
+          bind:this={untilInput}
+          type="datetime-local"
+          class="rounded border bg-background px-1.5 py-0.5 text-xs text-foreground"
+          style="color-scheme: dark"
+          onchange={handleUntilChange}
+          step="1"
+        />
       </div>
     </div>
   </Card.Header>
@@ -298,9 +356,7 @@
         Failed to load transfers: {error.current}
       </div>
     {:else if entries.current.length === 0 && !loading.current}
-      <div class="flex h-full items-center justify-center text-muted-foreground">
-        No transfers
-      </div>
+      <div class="flex h-full items-center justify-center text-muted-foreground">No transfers</div>
     {:else}
       <Table.Root>
         <Table.Header>
@@ -316,9 +372,21 @@
                 <button
                   class="text-muted-foreground hover:text-foreground"
                   aria-label="Show status legend"
-                  onclick={() => { statusInfoOpen = !statusInfoOpen }}
+                  onclick={() => {
+                    statusInfoOpen = !statusInfoOpen
+                  }}
                 >
-                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="h-3.5 w-3.5"><path fill-rule="evenodd" d="M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Zm-7-4a1 1 0 1 1-2 0 1 1 0 0 1 2 0ZM9 9a.75.75 0 0 0 0 1.5h.253a.25.25 0 0 1 .244.304l-.459 2.066A1.75 1.75 0 0 0 10.747 15H11a.75.75 0 0 0 0-1.5h-.253a.25.25 0 0 1-.244-.304l.459-2.066A1.75 1.75 0 0 0 9.253 9H9Z" clip-rule="evenodd" /></svg>
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    viewBox="0 0 20 20"
+                    fill="currentColor"
+                    class="h-3.5 w-3.5"
+                    ><path
+                      fill-rule="evenodd"
+                      d="M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Zm-7-4a1 1 0 1 1-2 0 1 1 0 0 1 2 0ZM9 9a.75.75 0 0 0 0 1.5h.253a.25.25 0 0 1 .244.304l-.459 2.066A1.75 1.75 0 0 0 10.747 15H11a.75.75 0 0 0 0-1.5h-.253a.25.25 0 0 1-.244-.304l.459-2.066A1.75 1.75 0 0 0 9.253 9H9Z"
+                      clip-rule="evenodd"
+                    /></svg
+                  >
                 </button>
               </span>
             </Table.Head>
@@ -336,8 +404,17 @@
                   title="View event history"
                   onclick={() => openDetail(transfer)}
                 >
-                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="h-3.5 w-3.5">
-                    <path fill-rule="evenodd" d="M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Zm-7-4a1 1 0 1 1-2 0 1 1 0 0 1 2 0ZM9 9a.75.75 0 0 0 0 1.5h.253a.25.25 0 0 1 .244.304l-.459 2.066A1.75 1.75 0 0 0 10.747 15H11a.75.75 0 0 0 0-1.5h-.253a.25.25 0 0 1-.244-.304l.459-2.066A1.75 1.75 0 0 0 9.253 9H9Z" clip-rule="evenodd" />
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    viewBox="0 0 20 20"
+                    fill="currentColor"
+                    class="h-3.5 w-3.5"
+                  >
+                    <path
+                      fill-rule="evenodd"
+                      d="M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Zm-7-4a1 1 0 1 1-2 0 1 1 0 0 1 2 0ZM9 9a.75.75 0 0 0 0 1.5h.253a.25.25 0 0 1 .244.304l-.459 2.066A1.75 1.75 0 0 0 10.747 15H11a.75.75 0 0 0 0-1.5h-.253a.25.25 0 0 1-.244-.304l.459-2.066A1.75 1.75 0 0 0 9.253 9H9Z"
+                      clip-rule="evenodd"
+                    />
                   </svg>
                 </button>
               </Table.Cell>
@@ -348,10 +425,18 @@
                 {kindLabel(transfer.kind)}
               </Table.Cell>
               <Table.Cell class="font-mono text-xs">
-                {transfer.kind === 'usdc_bridge' ? 'USDC' : transfer.symbol ?? ''}
+                {transfer.kind === 'usdc_bridge' ? 'USDC' : (transfer.symbol ?? '')}
               </Table.Cell>
               <Table.Cell class="text-right font-mono text-xs">
-                {#if transfer.quantity}{formatDecimal(transfer.quantity, 3)}{:else if transfer.amount}{formatDecimal(transfer.amount, 3)}{/if}
+                {@const amount = transferAmount(transfer)}
+                {#if amount}
+                  <HoverTooltip tooltip={transferAmountTooltip(transfer)}>
+                    <span
+                      class="cursor-help hover:underline hover:decoration-dotted hover:decoration-muted-foreground hover:underline-offset-4"
+                      >{formatDecimal(amount, 3)}</span
+                    >
+                  </HoverTooltip>
+                {/if}
               </Table.Cell>
               <Table.Cell class="text-right text-xs {style.text}">
                 <span class="inline-flex items-center gap-1.5">
@@ -369,13 +454,19 @@
 
       {#if hasMore.current}
         <div class="flex justify-center py-2">
-          <button class="rounded border bg-background px-3 py-1 text-xs hover:bg-accent" onclick={loadMore} disabled={loadingMore.current}>
+          <button
+            class="rounded border bg-background px-3 py-1 text-xs hover:bg-accent"
+            onclick={loadMore}
+            disabled={loadingMore.current}
+          >
             {loadingMore.current ? 'Loading...' : 'Load older transfers'}
           </button>
         </div>
       {/if}
 
-      <div class="pointer-events-none sticky bottom-0 h-8 bg-gradient-to-t from-card to-transparent"></div>
+      <div
+        class="pointer-events-none sticky bottom-0 h-8 bg-gradient-to-t from-card to-transparent"
+      ></div>
     {/if}
   </Card.Content>
 </Card.Root>
@@ -384,10 +475,16 @@
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
     class="fixed inset-0 z-40"
-    onclick={() => { statusInfoOpen = false }}
-    onkeydown={(event) => { if (event.key === 'Escape') statusInfoOpen = false }}
+    onclick={() => {
+      statusInfoOpen = false
+    }}
+    onkeydown={(event) => {
+      if (event.key === 'Escape') statusInfoOpen = false
+    }}
   ></div>
-  <div class="fixed right-8 top-1/3 z-50 w-64 rounded-lg border bg-popover px-4 py-3 text-xs text-popover-foreground shadow-lg">
+  <div
+    class="fixed right-8 top-1/3 z-50 w-64 rounded-lg border bg-popover px-4 py-3 text-xs text-popover-foreground shadow-lg"
+  >
     <div class="mb-2 font-semibold">Status flows by type</div>
 
     <div class="mb-1.5">
@@ -397,39 +494,52 @@
 
     <div class="mb-1.5">
       <div class="mb-0.5 font-medium text-muted-foreground">Redeem</div>
-      <div>Withdrawing → Unwrapping → Sending → Pending Confirmation → <span class="text-green-500">Completed</span></div>
+      <div>
+        Withdrawing → Unwrapping → Sending → Pending Confirmation → <span class="text-green-500"
+          >Completed</span
+        >
+      </div>
     </div>
 
     <div class="mb-1.5">
       <div class="mb-0.5 font-medium text-muted-foreground">USDC Bridge</div>
-      <div>Converting → Withdrawing → Bridging → Depositing → <span class="text-green-500">Completed</span></div>
+      <div>
+        Converting → Withdrawing → Bridging → Depositing → <span class="text-green-500"
+          >Completed</span
+        >
+      </div>
     </div>
 
-    <div class="text-muted-foreground">Any step can transition to <span class="text-destructive">Failed</span></div>
+    <div class="text-muted-foreground">
+      Any step can transition to <span class="text-destructive">Failed</span>
+    </div>
   </div>
 {/if}
 
 <dialog
   bind:this={detailDialogEl}
   class="w-full max-w-lg rounded-lg border bg-card p-0 text-foreground shadow-lg backdrop:bg-black/50"
-  onclick={(event) => { if (event.target === detailDialogEl) detailDialogEl.close() }}
+  onclick={(event) => {
+    if (event.target === detailDialogEl) detailDialogEl.close()
+  }}
 >
   {#if detailTransfer.current}
     {@const transfer = detailTransfer.current}
+    {@const amount = transferAmount(transfer)}
     <div class="flex items-center justify-between border-b px-5 py-3">
       <div class="flex items-center gap-2 text-sm font-semibold">
         <span>{kindLabel(transfer.kind)}</span>
         <span class="font-mono text-xs font-normal text-muted-foreground">
-          {transfer.kind === 'usdc_bridge' ? 'USDC' : transfer.symbol ?? ''}
+          {transfer.kind === 'usdc_bridge' ? 'USDC' : (transfer.symbol ?? '')}
         </span>
-        {#if transfer.quantity}
-          <span class="font-mono text-xs font-normal text-muted-foreground">
-            {formatDecimal(transfer.quantity, 3)}
-          </span>
-        {:else if transfer.amount}
-          <span class="font-mono text-xs font-normal text-muted-foreground">
-            {formatDecimal(transfer.amount, 3)}
-          </span>
+        {#if amount}
+          <HoverTooltip tooltip={transferAmountTooltip(transfer)}>
+            <span
+              class="cursor-help font-mono text-xs font-normal text-muted-foreground hover:underline hover:decoration-dotted hover:decoration-muted-foreground hover:underline-offset-4"
+            >
+              {formatDecimal(amount, 3)}
+            </span>
+          </HoverTooltip>
         {/if}
       </div>
       <button
@@ -457,7 +567,9 @@
             {@const fields = detailFields(event.payload)}
             <div class="relative pb-4">
               <!-- Timeline dot -->
-              <div class="absolute -left-[calc(0.25rem+1px+1rem)] top-0.5 h-2 w-2 rounded-full {stepStyle.dot}"></div>
+              <div
+                class="absolute -left-[calc(0.25rem+1px+1rem)] top-0.5 h-2 w-2 rounded-full {stepStyle.dot}"
+              ></div>
 
               <div class="text-xs font-medium {stepStyle.text}">
                 {humanizeStep(event.step)}
@@ -481,7 +593,8 @@
                           <span class="text-destructive">
                             {#if typeof value === 'object' && value !== null}
                               {#if 'ApiError' in value}
-                                API error{@const apiErr = value as Record<string, unknown>}{#if apiErr['status_code']} (status {apiErr['status_code']}){/if}
+                                API error{@const status = apiErrorStatus(value)}{#if status}
+                                  (status {status}){/if}
                               {:else if 'Timeout' in value}
                                 Timeout
                               {:else}
@@ -501,9 +614,18 @@
                             class="inline-flex items-center gap-1 text-blue-400 hover:text-blue-300"
                           >
                             {value.slice(0, 10)}...{value.slice(-8)}
-                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="h-3 w-3">
-                              <path d="M6.22 8.72a.75.75 0 0 0 1.06 1.06l5.22-5.22v1.69a.75.75 0 0 0 1.5 0v-3.5a.75.75 0 0 0-.75-.75h-3.5a.75.75 0 0 0 0 1.5h1.69L6.22 8.72Z" />
-                              <path d="M3.5 6.75c0-.69.56-1.25 1.25-1.25H7A.75.75 0 0 0 7 4H4.75A2.75 2.75 0 0 0 2 6.75v4.5A2.75 2.75 0 0 0 4.75 14h4.5A2.75 2.75 0 0 0 12 11.25V9a.75.75 0 0 0-1.5 0v2.25c0 .69-.56 1.25-1.25 1.25h-4.5c-.69 0-1.25-.56-1.25-1.25v-4.5Z" />
+                            <svg
+                              xmlns="http://www.w3.org/2000/svg"
+                              viewBox="0 0 16 16"
+                              fill="currentColor"
+                              class="h-3 w-3"
+                            >
+                              <path
+                                d="M6.22 8.72a.75.75 0 0 0 1.06 1.06l5.22-5.22v1.69a.75.75 0 0 0 1.5 0v-3.5a.75.75 0 0 0-.75-.75h-3.5a.75.75 0 0 0 0 1.5h1.69L6.22 8.72Z"
+                              />
+                              <path
+                                d="M3.5 6.75c0-.69.56-1.25 1.25-1.25H7A.75.75 0 0 0 7 4H4.75A2.75 2.75 0 0 0 2 6.75v4.5A2.75 2.75 0 0 0 4.75 14h4.5A2.75 2.75 0 0 0 12 11.25V9a.75.75 0 0 0-1.5 0v2.25c0 .69-.56 1.25-1.25 1.25h-4.5c-.69 0-1.25-.56-1.25-1.25v-4.5Z"
+                              />
                             </svg>
                           </a>
                         {:else if isTransferRef(value)}
@@ -516,9 +638,18 @@
                               class="inline-flex items-center gap-1 text-blue-400 hover:text-blue-300"
                             >
                               {txHash.slice(0, 10)}...{txHash.slice(-8)}
-                              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="h-3 w-3">
-                                <path d="M6.22 8.72a.75.75 0 0 0 1.06 1.06l5.22-5.22v1.69a.75.75 0 0 0 1.5 0v-3.5a.75.75 0 0 0-.75-.75h-3.5a.75.75 0 0 0 0 1.5h1.69L6.22 8.72Z" />
-                                <path d="M3.5 6.75c0-.69.56-1.25 1.25-1.25H7A.75.75 0 0 0 7 4H4.75A2.75 2.75 0 0 0 2 6.75v4.5A2.75 2.75 0 0 0 4.75 14h4.5A2.75 2.75 0 0 0 12 11.25V9a.75.75 0 0 0-1.5 0v2.25c0 .69-.56 1.25-1.25 1.25h-4.5c-.69 0-1.25-.56-1.25-1.25v-4.5Z" />
+                              <svg
+                                xmlns="http://www.w3.org/2000/svg"
+                                viewBox="0 0 16 16"
+                                fill="currentColor"
+                                class="h-3 w-3"
+                              >
+                                <path
+                                  d="M6.22 8.72a.75.75 0 0 0 1.06 1.06l5.22-5.22v1.69a.75.75 0 0 0 1.5 0v-3.5a.75.75 0 0 0-.75-.75h-3.5a.75.75 0 0 0 0 1.5h1.69L6.22 8.72Z"
+                                />
+                                <path
+                                  d="M3.5 6.75c0-.69.56-1.25 1.25-1.25H7A.75.75 0 0 0 7 4H4.75A2.75 2.75 0 0 0 2 6.75v4.5A2.75 2.75 0 0 0 4.75 14h4.5A2.75 2.75 0 0 0 12 11.25V9a.75.75 0 0 0-1.5 0v2.25c0 .69-.56 1.25-1.25 1.25h-4.5c-.69 0-1.25-.56-1.25-1.25v-4.5Z"
+                                />
                               </svg>
                             </a>
                           {:else if 'AlpacaId' in value}
