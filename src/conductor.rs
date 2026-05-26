@@ -1070,7 +1070,17 @@ async fn recover_single_orphaned_order(
     order_id: OffchainOrderId,
 ) -> anyhow::Result<()> {
     let Some(order) = offchain_order.load(&order_id).await? else {
-        warn!(%symbol, %order_id, "Pending offchain order not found in store -- skipping");
+        warn!(%symbol, %order_id, "Pending offchain order not found in store -- recovering");
+        position
+            .send(
+                symbol,
+                PositionCommand::FailOffChainOrder {
+                    offchain_order_id: order_id,
+                    error: "pending offchain order has no offchain order aggregate".to_string(),
+                },
+            )
+            .await?;
+        info!(%symbol, %order_id, "Orphaned missing pending order recovered");
         return Ok(());
     };
 
@@ -4609,6 +4619,76 @@ mod tests {
         assert_eq!(
             pos.pending_offchain_order_id, None,
             "Recovery should clear pending_offchain_order_id for filled orders"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_orphaned_pending_clears_missing_order_aggregate() {
+        let pool = setup_test_db().await;
+        let order_placer = crate::offchain::order::noop_order_placer();
+
+        let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let (offchain_order, _offchain_order_projection) =
+            StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(order_placer)
+                .await
+                .unwrap();
+
+        let symbol = Symbol::new("MSTR").unwrap();
+        let threshold = ExecutionThreshold::whole_share();
+        let offchain_order_id = OffchainOrderId::new();
+        let shares = Positive::new(st0x_execution::FractionalShares::new(float!(0.5))).unwrap();
+
+        position
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold,
+                    trade_id: TradeId {
+                        tx_hash: fixed_bytes!(
+                            "0000000000000000000000000000000000000000000000000000000000000004"
+                        ),
+                        log_index: 0,
+                    },
+                    amount: st0x_execution::FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(420),
+                    block_timestamp: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id,
+                    shares,
+                    direction: Direction::Sell,
+                    executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                    threshold,
+                },
+            )
+            .await
+            .unwrap();
+
+        let pos = position_projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(pos.pending_offchain_order_id, Some(offchain_order_id));
+
+        recover_orphaned_pending_offchain_orders(&position, &position_projection, &offchain_order)
+            .await
+            .unwrap();
+
+        let pos = position_projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(
+            pos.pending_offchain_order_id, None,
+            "Recovery should clear a pending order id when the offchain order aggregate is missing"
         );
     }
 

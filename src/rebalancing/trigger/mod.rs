@@ -1906,6 +1906,14 @@ impl RebalancingService {
                 );
                 return Ok(());
             }
+            Err(equity::EquityTriggerError::TokenNotInRegistry(symbol)) => {
+                warn!(
+                    target: "rebalance",
+                    %symbol,
+                    "Skipped equity trigger: symbol not in vault registry"
+                );
+                return Ok(());
+            }
             Err(error) => return Err(error),
         };
 
@@ -11717,10 +11725,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_and_trigger_equity_propagates_token_not_in_registry() {
-        // Registry is initialized (for `seeded`), but the symbol we ask
-        // about is not present. build_equity_operation must surface
-        // TokenNotInRegistry instead of silently returning Ok.
+    async fn check_and_trigger_equity_skips_token_not_in_registry() {
         let seeded = Symbol::new("AAPL").unwrap();
         let unknown = Symbol::new("MSFT").unwrap();
         let inventory = InventoryView::default().with_equity(seeded.clone(), shares(0), shares(0));
@@ -11729,19 +11734,10 @@ mod tests {
             make_trigger_with_inventory_and_registry(inventory, &seeded).await;
         let trigger = reactor.clone();
 
-        let error = trigger
+        trigger
             .check_and_trigger_equity(&unknown)
             .await
-            .unwrap_err();
-
-        assert!(
-            matches!(
-                error,
-                equity::EquityTriggerError::TokenNotInRegistry(ref symbol)
-                    if symbol == &unknown
-            ),
-            "expected TokenNotInRegistry for {unknown}, got {error:?}"
-        );
+            .expect("stale queued checks for unregistered symbols should no-op");
     }
 
     #[tokio::test]

@@ -3,6 +3,7 @@
 mod alpaca_wallet;
 mod cctp;
 mod rebalancing;
+mod repair;
 mod submit;
 mod trading;
 mod vault;
@@ -74,6 +75,27 @@ pub enum CctpChain {
     Ethereum,
     /// Base mainnet (destination: Ethereum)
     Base,
+}
+
+/// Manual repair operations for stuck local CQRS state.
+#[derive(Debug, Subcommand)]
+pub enum RepairCommand {
+    /// Fail a position's pending offchain order pointer so normal hedging can retry.
+    FailPendingOffchainOrder {
+        /// Position symbol (e.g., MSTR)
+        #[arg(short = 's', long = "symbol")]
+        symbol: Symbol,
+        /// Pending offchain order ID recorded on the position
+        #[arg(short = 'o', long = "order-id")]
+        order_id: OffchainOrderId,
+        /// Reason to persist on the Position::FailOffChainOrder event
+        #[arg(
+            short = 'r',
+            long = "reason",
+            default_value = "Manually failed pending offchain order via CLI"
+        )]
+        reason: String,
+    },
 }
 
 fn parse_float(input: &str) -> Result<Float, String> {
@@ -501,6 +523,12 @@ pub enum Commands {
         #[arg(long = "all", conflicts_with = "id", required_unless_present = "id")]
         all: bool,
     },
+
+    /// Repair stuck local CQRS state through aggregate commands.
+    Repair {
+        #[command(subcommand)]
+        command: RepairCommand,
+    },
 }
 
 #[derive(Debug, Parser)]
@@ -633,6 +661,9 @@ enum SimpleCommand {
         aggregate: AggregateView,
         id: Option<String>,
         all: bool,
+    },
+    Repair {
+        command: RepairCommand,
     },
     FailTransfer {
         transfer_type: TransferType,
@@ -850,6 +881,7 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
         Commands::RebuildView { aggregate, id, all } => {
             Ok(SimpleCommand::RebuildView { aggregate, id, all })
         }
+        Commands::Repair { command } => Ok(SimpleCommand::Repair { command }),
         Commands::FailTransfer {
             transfer_type,
             id,
@@ -1014,6 +1046,7 @@ async fn run_simple_command<W: Write>(
         SimpleCommand::RebuildView { aggregate, id, all } => {
             rebuild_view(stdout, pool, aggregate, id, all).await
         }
+        SimpleCommand::Repair { command } => run_repair_command(stdout, pool, command).await,
         SimpleCommand::FailTransfer {
             transfer_type,
             id,
@@ -1072,6 +1105,23 @@ async fn rebuild_view<W: Write>(
     }
 
     Ok(())
+}
+
+async fn run_repair_command<W: Write>(
+    stdout: &mut W,
+    pool: &SqlitePool,
+    command: RepairCommand,
+) -> anyhow::Result<()> {
+    match command {
+        RepairCommand::FailPendingOffchainOrder {
+            symbol,
+            order_id,
+            reason,
+        } => {
+            repair::fail_pending_offchain_order_command(stdout, pool, &symbol, order_id, reason)
+                .await
+        }
+    }
 }
 
 async fn run_provider_command<W: Write>(
@@ -1374,6 +1424,77 @@ mod tests {
                 | ProviderCommand::AlpacaRedeem { .. }
                 | ProviderCommand::AlpacaTokenizationRequests,
             ) => panic!("expected simple command classification, got provider command"),
+        }
+    }
+
+    #[test]
+    fn repair_fail_pending_offchain_order_parses() {
+        let order_id = OffchainOrderId::new();
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "repair",
+            "fail-pending-offchain-order",
+            "--symbol",
+            "MSTR",
+            "--order-id",
+            &order_id.to_string(),
+            "--reason",
+            "operator repair",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Repair {
+                command:
+                    RepairCommand::FailPendingOffchainOrder {
+                        symbol,
+                        order_id: parsed_order_id,
+                        reason,
+                    },
+            } => {
+                assert_eq!(symbol, Symbol::new("MSTR").unwrap());
+                assert_eq!(parsed_order_id, order_id);
+                assert_eq!(reason, "operator repair");
+            }
+            other => panic!("expected repair command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_repair_command_as_simple() {
+        let order_id = OffchainOrderId::new();
+        let command = Commands::Repair {
+            command: RepairCommand::FailPendingOffchainOrder {
+                symbol: Symbol::new("MSTR").unwrap(),
+                order_id,
+                reason: "operator repair".to_string(),
+            },
+        };
+
+        match classify_command(command) {
+            Ok(SimpleCommand::Repair {
+                command:
+                    RepairCommand::FailPendingOffchainOrder {
+                        symbol,
+                        order_id: parsed_order_id,
+                        reason,
+                    },
+            }) => {
+                assert_eq!(symbol, Symbol::new("MSTR").unwrap());
+                assert_eq!(parsed_order_id, order_id);
+                assert_eq!(reason, "operator repair");
+            }
+            Ok(_) => panic!("expected repair simple command"),
+            Err(
+                ProviderCommand::ProcessTx { .. }
+                | ProviderCommand::TransferUsdc { .. }
+                | ProviderCommand::CctpBridge { .. }
+                | ProviderCommand::CctpRecover { .. }
+                | ProviderCommand::ResetAllowance { .. }
+                | ProviderCommand::AlpacaTokenize { .. }
+                | ProviderCommand::AlpacaRedeem { .. }
+                | ProviderCommand::AlpacaTokenizationRequests,
+            ) => panic!("expected simple command classification"),
         }
     }
 
