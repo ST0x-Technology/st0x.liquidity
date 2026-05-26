@@ -4,9 +4,9 @@ Real-time monitoring dashboard for the st0x liquidity system.
 
 ## Panels
 
-- Dashboard: inventory, pending orders, recent trades, and transfers.
+- Dashboard: inventory, recent trades, and transfers.
 - Orders: active Raindex order view.
-- PnL: prototype order-ID counter-trade PnL, directional exposure PnL, total PnL, and inventory drift from event-store fills.
+- PnL: persisted fill replay for counter-trade PnL, directional exposure PnL, total PnL, and current replay exposure.
 - Logs: structured production log browser.
 
 ## Development

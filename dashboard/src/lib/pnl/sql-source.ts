@@ -896,6 +896,66 @@ const symbolSummaryToDto = (symbol: string, summary: SummaryAcc): PnlSymbolSumma
   }
 }
 
+const withReplayExposure = (filtered: PnlSummary, replay: PnlSummary): PnlSummary => ({
+  ...filtered,
+  inventoryDriftShares: replay.inventoryDriftShares,
+  inventoryDriftUsd: replay.inventoryDriftUsd,
+  openLongShares: replay.openLongShares,
+  openShortShares: replay.openShortShares,
+  unmatchedOffchainShares: replay.unmatchedOffchainShares,
+  unmatchedOffchainNotionalUsd: replay.unmatchedOffchainNotionalUsd,
+  openLotCount: replay.openLotCount,
+  unmatchedOffchainFillCount: replay.unmatchedOffchainFillCount
+})
+
+const withSymbolReplayExposure = (
+  filtered: PnlSymbolSummary,
+  replay: PnlSymbolSummary
+): PnlSymbolSummary => ({
+  ...filtered,
+  inventoryDriftShares: replay.inventoryDriftShares,
+  inventoryDriftUsd: replay.inventoryDriftUsd,
+  openLongShares: replay.openLongShares,
+  openShortShares: replay.openShortShares,
+  unmatchedOffchainShares: replay.unmatchedOffchainShares,
+  unmatchedOffchainFillCount: replay.unmatchedOffchainFillCount
+})
+
+const emptySymbolSummary = (symbol: string): PnlSymbolSummary =>
+  symbolSummaryToDto(symbol, emptySummary())
+
+const isNonZeroText = (value: string): boolean => {
+  try {
+    return !new Decimal(value).isZero()
+  } catch {
+    return false
+  }
+}
+
+const hasReplayExposure = (summary: PnlSymbolSummary): boolean =>
+  isNonZeroText(summary.inventoryDriftShares) ||
+  isNonZeroText(summary.inventoryDriftUsd) ||
+  isNonZeroText(summary.openLongShares) ||
+  isNonZeroText(summary.openShortShares) ||
+  isNonZeroText(summary.unmatchedOffchainShares) ||
+  summary.unmatchedOffchainFillCount > 0
+
+const mergeSymbolReplayExposure = (
+  filteredSymbols: PnlSymbolSummary[],
+  replaySymbols: PnlSymbolSummary[]
+): PnlSymbolSummary[] => {
+  const bySymbol = new Map(filteredSymbols.map((row) => [row.symbol, row]))
+
+  for (const replay of replaySymbols) {
+    const existing = bySymbol.get(replay.symbol) ?? emptySymbolSummary(replay.symbol)
+    if (bySymbol.has(replay.symbol) || hasReplayExposure(replay)) {
+      bySymbol.set(replay.symbol, withSymbolReplayExposure(existing, replay))
+    }
+  }
+
+  return [...bySymbol.values()].sort((left, right) => left.symbol.localeCompare(right.symbol))
+}
+
 const entryBucketToStream = (bucket: string): PnlStreamKey | null => {
   if (bucket === 'counter_trade') return 'counterTradePnlUsd'
   if (bucket === 'onchain_netting') return 'onchainNettingPnlUsd'
@@ -1110,9 +1170,11 @@ export const buildPnlResponseFromSqlRows = (
   }
 
   const fullTotal = emptySummary()
+  const replaySymbols: PnlSymbolSummary[] = []
   for (const [symbol, book] of books) {
     finalizeBook(symbol, book, markPrices, positionNets, warnings, positionReplayDeltas)
     addSummary(fullTotal, book.summary)
+    replaySymbols.push(symbolSummaryToDto(symbol, book.summary))
   }
   appendReplayDiagnostics(warnings, unmatchedOffchainAllocations, positionReplayDeltas)
 
@@ -1124,16 +1186,19 @@ export const buildPnlResponseFromSqlRows = (
   const end = Math.min(start + query.limit, total)
   const pageEntries = filteredEntries.slice(start, end)
   const filtered = summaryFromEntries(filteredEntries)
+  const replaySummary = summaryToDto(fullTotal)
+  const summary = withReplayExposure(filtered.summary, replaySummary)
+  const symbols = mergeSymbolReplayExposure(filtered.symbols, replaySymbols)
   const symbolUniverse = [
-    ...new Set([...positionSymbols, ...books.keys(), ...filtered.symbols.map((row) => row.symbol)])
+    ...new Set([...positionSymbols, ...books.keys(), ...symbols.map((row) => row.symbol)])
   ].sort()
 
   return {
     attributionMethod: ATTRIBUTION_METHOD,
     warnings,
     sampleStats,
-    summary: filtered.summary,
-    symbols: filtered.symbols,
+    summary,
+    symbols,
     symbolUniverse,
     entries: pageEntries,
     total,

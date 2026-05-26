@@ -207,5 +207,42 @@ describe('buildPnlResponseFromSqlRows', () => {
     )
     expect(report.warnings.some((warning) => warning.includes('no open opposite-side'))).toBe(false)
     expect(report.warnings.some((warning) => warning.includes('PnL audit warning'))).toBe(false)
+    expect(report.summary.unmatchedOffchainFillCount).toBe(1)
+    expect(report.summary.unmatchedOffchainShares).toBe('1')
+    expect(report.summary.openLongShares).toBe('1')
+    expect(report.symbols).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          symbol: 'RKLB',
+          unmatchedOffchainFillCount: 1,
+          unmatchedOffchainShares: '1',
+          openLongShares: '1'
+        })
+      ])
+    )
+  })
+
+  it('keeps current replay exposure even when there are no closed PnL lots', () => {
+    const report = buildPnlResponseFromSqlRows(
+      [onchainSell(1, '10')],
+      positionRows,
+      sampleRows,
+      baseQuery
+    )
+
+    expect(report.entries).toEqual([])
+    expect(report.summary.totalPnlUsd).toBe('0')
+    expect(report.summary.openShortShares).toBe('1')
+    expect(report.summary.inventoryDriftShares).toBe('-1')
+    expect(report.symbols).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          symbol: 'RKLB',
+          totalPnlUsd: '0',
+          openShortShares: '1',
+          inventoryDriftShares: '-1'
+        })
+      ])
+    )
   })
 })
