@@ -1457,13 +1457,15 @@ impl Reactor for RebalancingService {
                         price,
                         ..
                     } => {
-                        // Defer clearing the suppression until the fill has been
-                        // applied to inventory below. If that update fails, the
-                        // gate deliberately stays closed: we never resume equity
-                        // rebalancing on inventory we failed to record the fill
-                        // into. It self-heals when the next terminal offchain
-                        // order event for this symbol applies cleanly, or on
-                        // restart via recover_pending_offchain_order_symbols.
+                        // Always clear the gate on a Filled event, even if the
+                        // inventory update below fails. A fail-closed gate would
+                        // deadlock equity rebalancing for the symbol until the
+                        // next bot restart, because the only event that could
+                        // re-clear it (a later terminal offchain event) is
+                        // itself gated. The polling cycle is the source of
+                        // truth for the broker balance, so any local
+                        // bookkeeping miss self-heals within ~60s and is bounded
+                        // to wasted rebalances, not lost capital.
                         clear_pending_offchain_order = true;
                         let equity_op: Operator = (*direction).into();
                         let quantity: Float = shares_filled.inner().into();
@@ -1496,21 +1498,48 @@ impl Reactor for RebalancingService {
                     Initialized { .. } | ThresholdUpdated { .. } => return Ok(()),
                 };
 
-                let mut inventory = self.inventory.write().await;
-                let updated = inventory
-                    .clone()
-                    .update_equity(&symbol, equity_update, timestamp)?
-                    .update_usdc(usdc_update, timestamp)?;
-                *inventory = updated;
-                drop(inventory);
+                let inventory_result = {
+                    let mut inventory = self.inventory.write().await;
+                    let result = inventory
+                        .clone()
+                        .update_equity(&symbol, equity_update, timestamp)
+                        .and_then(|inv| inv.update_usdc(usdc_update, timestamp));
+                    if let Ok(updated) = &result {
+                        *inventory = updated.clone();
+                    }
+                    result
+                };
 
                 if clear_pending_offchain_order {
+                    // Clear the gate regardless of inventory outcome. See the
+                    // OffChainOrderFilled arm above for the rationale.
+                    if let Err(error) = &inventory_result {
+                        warn!(
+                            target: "rebalance",
+                            %symbol,
+                            ?error,
+                            "Inventory update failed for offchain fill; clearing gate anyway and relying on next polling snapshot"
+                        );
+                    }
                     self.pending_offchain_order_symbols
                         .write()
                         .await
                         .remove(&symbol);
+                    self.equity_scheduler.enqueue_check(symbol).await;
+                    // Only re-check USDC if the cash leg actually applied.
+                    // With and_then chaining, inventory_result == Err means
+                    // neither leg was persisted, so the USDC mirror is
+                    // unchanged from before this event -- the check would
+                    // re-evaluate identical inputs and produce no new
+                    // decision. The periodic USDC scheduler tick covers
+                    // any drift the polling snapshot picks up.
+                    if inventory_result.is_ok() {
+                        self.usdc_scheduler.enqueue_check().await;
+                    }
+                    return Ok(());
                 }
 
+                inventory_result?;
                 self.equity_scheduler.enqueue_check(symbol).await;
                 self.usdc_scheduler.enqueue_check().await;
                 Ok::<(), RebalancingServiceError>(())
@@ -11359,6 +11388,51 @@ mod tests {
         assert!(
             !trigger.has_pending_offchain_order(&symbol).await,
             "A filled offchain order should release the rebalancing block"
+        );
+    }
+
+    /// A Filled event whose inventory update would underflow (because the
+    /// polling snapshot already absorbed the fill before the reactor saw it)
+    /// must still clear the gate. Holding the gate closed deadlocks equity
+    /// rebalancing for the symbol until the next bot restart, because the
+    /// only path that could re-issue a terminal offchain event for the
+    /// symbol is itself gated. Inventory drift is bounded by the next
+    /// polling snapshot (~60s) and is preferable to indefinite deadlock.
+    #[tokio::test]
+    async fn offchain_order_filled_releases_gate_even_when_inventory_update_fails() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let offchain_order_id = OffchainOrderId::new();
+        // Offchain shows only 4 shares (e.g., the polling snapshot already
+        // reflects a 10-share sell that the broker filled before the reactor
+        // got a chance to record it). The fill below subtracts 10, which
+        // would underflow the in-memory mirror.
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(4))
+            .with_usdc(usdc(5000), usdc(5000));
+
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        harness
+            .receive::<Position>(symbol.clone(), make_offchain_placed(offchain_order_id))
+            .await
+            .unwrap();
+        assert!(
+            trigger.has_pending_offchain_order(&symbol).await,
+            "OffChainOrderPlaced should set the gate"
+        );
+
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_offchain_fill(shares(10), Direction::Sell),
+            )
+            .await
+            .expect("reactor must not propagate inventory underflow for offchain fills");
+
+        assert!(
+            !trigger.has_pending_offchain_order(&symbol).await,
+            "Inventory update failure on a Filled event must not leave the gate stuck"
         );
     }
 
