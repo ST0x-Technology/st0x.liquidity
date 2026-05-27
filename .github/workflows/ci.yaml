@@ -129,6 +129,23 @@ jobs:
       - name: Dashboard
         run: nix build .#st0x-dashboard
 
+  packages:
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            accept-flake-config = true
+            fallback = true
+
+      - name: Build st0x-liquidity
+        run: nix build .#st0x-liquidity
+
+      - name: Build st0x-cli
+        run: nix build .#st0x-cli
+
   hooks:
     runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:

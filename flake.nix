@@ -50,14 +50,13 @@
   };
 
   outputs =
-    {
+    inputs@{
       self,
       flake-utils,
       rainix,
       rain-math-float,
       rain-orderbook,
       forge-std,
-      bun2nix,
       ragenix,
       deploy-rs,
       disko,
@@ -137,14 +136,21 @@
           config.allowUnfreePredicate = pkg: builtins.elem (pkgs.lib.getName pkg) [ "terraform" ];
         };
 
-        craneLib = (crane.mkLib pkgs).overrideToolchain rainix.rust-toolchain.${system};
-
+        rustToolchain = rainix.rust-toolchain.${system};
+        rustShell = rainix.devShells.${system}.rust-shell;
+        foundryBin = rainix.pkgs.${system}.foundry-bin;
         rainixPkgs = rainix.packages.${system};
+
+        bun2nix = inputs.bun2nix.packages.${system}.default;
+        ragenixPkg = ragenix.packages.${system}.default;
+        nixosAnywherePkg = nixos-anywhere.packages.${system}.default;
+
+        craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
+
         infraPkgs = import ./infra {
           inherit
             pkgs
             ragenix
-            rainix
             system
             ;
           environments = envNames;
@@ -180,7 +186,7 @@
         inherit
           (import ./nix/mk-abi.nix {
             inherit pkgs;
-            foundry = rainix.pkgs.${system}.foundry-bin;
+            foundry = foundryBin;
             solc = rainix.pkgs.${system}.solc_0_8_25;
           })
           mkAbi
@@ -198,266 +204,216 @@
           abiEnv
           ;
 
-        st0xRust = pkgs.callPackage ./rust.nix {
+        rust = pkgs.callPackage ./rust.nix {
           inherit craneLib rainMathFloatSrc abiEnv;
         };
-
       in
+
       rec {
         packages =
-          rainixPkgs
-          // infraPkgs.packages
-          // deployScripts
-          // abis
-          // {
-            st0x-dto = st0xRust.dto;
-            st0x-liquidity = st0xRust.package;
-            st0x-cli = st0xRust.cli;
-            decode-floats = st0xRust.decodeFloats;
-            inherit (pkgs) datasette;
+          let
+            simulationRuntimeInputs = [
+              pkgs.mprocs
+              pkgs.bun
+              pkgs.cargo-nextest
+              pkgs.openssl
+              pkgs.sqlite
+              pkgs.pkg-config
+              rustToolchain
+            ];
 
-            st0x-dashboard = pkgs.callPackage ./dashboard {
-              bun2nix = bun2nix.packages.${system}.default;
-              st0x-dto = st0xRust.dto;
-            };
+            # Mock infra + bot + dashboard + e2e driver. Picks the lowest port
+            # offset whose bot/vite/mock-api ports are all free so multiple
+            # instances can run side-by-side without collisions. The dashboard
+            # auto-opens in the browser on start. Press `q` to exit.
+            mkSimulation =
+              { name, testFilter }:
+              pkgs.writeShellApplication {
+                inherit name;
+                runtimeInputs = simulationRuntimeInputs;
+                text = ''
+                  port_free() {
+                    ! (echo >"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+                  }
 
-            ci = pkgs.writeShellApplication {
-              name = "ci";
-              text = ''
-                set -euxo pipefail
+                  offset=0
+                  max_offset=9
+                  while (( offset <= max_offset )); do
+                    bot_port=$((8001 + offset))
+                    vite_port=$((5173 + offset))
+                    mock_api_port=$((8099 + offset))
+                    if port_free "$bot_port" \
+                      && port_free "$vite_port" \
+                      && port_free "$mock_api_port"; then
+                      break
+                    fi
+                    offset=$((offset + 1))
+                  done
 
-                # Backend: cargo check, test, clippy, fmt
-                nix develop .#ci-backend -c bash -c '
-                  set -euxo pipefail
-                  cargo check --workspace
-                  cargo check --workspace --all-features
-                  cargo nextest run --workspace --all-features
-                  cargo clippy --workspace --all-targets --all-features
-                  cargo fmt -- --check
-                '
+                  if (( offset > max_offset )); then
+                    echo "${name}: no free port offset in [0..$max_offset]" >&2
+                    exit 1
+                  fi
 
-                # Dashboard: bun.nix freshness, DTO generation, lint, svelte-check
-                nix run .#genBunNix
-                nix fmt -- dashboard/bun.nix
-                nix run .#st0x-dto -- dashboard/src/lib/api
-                nix develop .#ci-dashboard -c bash -c '
-                  set -euxo pipefail
-                  cd dashboard
-                  bun install --frozen-lockfile
-                  bun run lint
-                  bun run check
-                '
-              '';
-            };
+                  echo "${name}: offset=$offset (bot=$bot_port \
+                    vite=$vite_port mock_api=$mock_api_port)"
 
-            # Mock infra + bot + dashboard + continuous user trades.
-            #
-            # Run with `nix run .#simulate`, press `q` to exit. Picks the
-            # lowest port offset whose bot/vite/mock-api ports are all
-            # free, so multiple instances can run side-by-side without
-            # collisions. The dashboard auto-opens in the browser on
-            # start.
-            simulate = pkgs.writeShellApplication {
-              name = "simulate";
-              runtimeInputs = [
-                pkgs.mprocs
-                pkgs.bun
-                pkgs.cargo-nextest
-                rainix.rust-toolchain.${system}
-              ];
-              text = ''
-                                port_free() {
-                                  ! (echo >"/dev/tcp/127.0.0.1/$1") 2>/dev/null
-                                }
+                  backend="SIMULATE_BOT_PORT=$bot_port \
+                    cargo nextest run --test e2e \
+                    -E 'test(=full_system::${testFilter})' \
+                    --run-ignored ignored-only --no-capture"
 
-                                offset=0
-                                max_offset=9
-                                while (( offset <= max_offset )); do
-                                  bot_port=$((8001 + offset))
-                                  vite_port=$((5173 + offset))
-                                  mock_api_port=$((8099 + offset))
-                                  if port_free "$bot_port" \
-                                    && port_free "$vite_port" \
-                                    && port_free "$mock_api_port"; then
-                                    break
-                                  fi
-                                  offset=$((offset + 1))
-                                done
+                  dashboard="cd dashboard && \
+                    BACKEND_PORT=$bot_port \
+                    PUBLIC_BACKEND_PORT=$bot_port \
+                    PUBLIC_SIMULATE_REV=${self.shortRev or self.dirtyShortRev or "unknown"} \
+                    PUBLIC_SIMULATE_SOURCE_ID=${builtins.substring 0 8 (baseNameOf self.outPath)} \
+                    bun run dev --port=$vite_port --strictPort --open"
 
-                                if (( offset > max_offset )); then
-                                  echo "simulate: no free port offset in [0..$max_offset]" >&2
-                                  exit 1
-                                fi
+                  mockApi="MOCK_REST_API_PORT=$mock_api_port \
+                    bun run e2e/mock-rest-api.ts"
 
-                                echo "simulate: offset=$offset (bot=$bot_port \
-                vite=$vite_port mock_api=$mock_api_port)"
-
-                                backend="SIMULATE_BOT_PORT=$bot_port \
-                                  cargo nextest run --test e2e \
-                                  -E 'test(=full_system::simulate)' \
-                                  --run-ignored ignored-only --no-capture"
-
-                                dashboard="cd dashboard && \
-                                  BACKEND_PORT=$bot_port \
-                                  PUBLIC_BACKEND_PORT=$bot_port \
-                                  PUBLIC_SIMULATE_REV=${self.shortRev or self.dirtyShortRev or "unknown"} \
-                                  PUBLIC_SIMULATE_SOURCE_ID=${builtins.substring 0 8 (baseNameOf self.outPath)} \
-                                  bun run dev --port=$vite_port --strictPort --open"
-
-                                mockApi="MOCK_REST_API_PORT=$mock_api_port \
-                                  bun run e2e/mock-rest-api.ts"
-
-                                exec mprocs "$backend" "$dashboard" "$mockApi"
-              '';
-            };
-
-            # Mock infra + bot + dashboard + recoverable failure injection.
-            #
-            # Run with `nix run .#simulate-failures`, press `q` to exit.
-            # Starts the same live dashboard stack as simulate, but first
-            # creates stuck mint and redemption rebalances whose Alpaca mock
-            # provider later completes. The backend logs the recheck-transfer
-            # commands needed to recover them.
-            "simulate-failures" = pkgs.writeShellApplication {
-              name = "simulate-failures";
-              runtimeInputs = [
-                pkgs.mprocs
-                pkgs.bun
-                pkgs.cargo-nextest
-                rainix.rust-toolchain.${system}
-              ];
-              text = ''
-                                port_free() {
-                                  ! (echo >"/dev/tcp/127.0.0.1/$1") 2>/dev/null
-                                }
-
-                                offset=0
-                                max_offset=9
-                                while (( offset <= max_offset )); do
-                                  bot_port=$((8001 + offset))
-                                  vite_port=$((5173 + offset))
-                                  mock_api_port=$((8099 + offset))
-                                  if port_free "$bot_port" \
-                                    && port_free "$vite_port" \
-                                    && port_free "$mock_api_port"; then
-                                    break
-                                  fi
-                                  offset=$((offset + 1))
-                                done
-
-                                if (( offset > max_offset )); then
-                                  echo "simulate-failures: no free port offset in [0..$max_offset]" >&2
-                                  exit 1
-                                fi
-
-                                echo "simulate-failures: offset=$offset (bot=$bot_port \
-                vite=$vite_port mock_api=$mock_api_port)"
-
-                                backend="SIMULATE_BOT_PORT=$bot_port \
-                                  cargo nextest run --test e2e \
-                                  -E 'test(=full_system::simulate_failures)' \
-                                  --run-ignored ignored-only --no-capture"
-
-                                dashboard="cd dashboard && \
-                                  BACKEND_PORT=$bot_port \
-                                  PUBLIC_BACKEND_PORT=$bot_port \
-                                  PUBLIC_SIMULATE_REV=${self.shortRev or self.dirtyShortRev or "unknown"} \
-                                  PUBLIC_SIMULATE_SOURCE_ID=${builtins.substring 0 8 (baseNameOf self.outPath)} \
-                                  bun run dev --port=$vite_port --strictPort --open"
-
-                                mockApi="MOCK_REST_API_PORT=$mock_api_port \
-                                  bun run e2e/mock-rest-api.ts"
-
-                                exec mprocs "$backend" "$dashboard" "$mockApi"
-              '';
-            };
-
-            # Sandbox-runnable test for scripts/patch-rain-math-float.nu so
-            # the patch logic can't silently rot when upstream drifts.
-            test-patch-rain-math-float =
-              pkgs.runCommand "test-patch-rain-math-float"
-                {
-                  nativeBuildInputs = [ pkgs.nushell ];
-                }
-                ''
-                  cp -r ${./scripts} scripts
-                  chmod -R u+w scripts
-                  nu scripts/patch-rain-math-float.test.nu
-                  touch $out
+                  exec mprocs "$backend" "$dashboard" "$mockApi"
                 '';
+              };
 
-            genBunNix = rainix.mkTask.${system} {
-              name = "gen-bun-nix";
-              additionalBuildInputs = [ bun2nix.packages.${system}.default ];
-              body = ''
-                exec bun2nix -o dashboard/bun.nix --lock-file dashboard/bun.lock
-              '';
+            others = {
+              inherit (rust)
+                st0x-dto
+                st0x-liquidity
+                st0x-cli
+                decodeFloats
+                ;
+              inherit (pkgs) datasette;
+
+              st0x-dashboard = pkgs.callPackage ./dashboard {
+                inherit bun2nix;
+                inherit (rust) st0x-dto;
+              };
+
+              ci = pkgs.writeShellApplication {
+                name = "ci";
+                text = ''
+                  set -euxo pipefail
+
+                  # Backend: cargo check, test, clippy, fmt
+                  nix develop .#ci-backend -c bash -c '
+                    set -euxo pipefail
+                    cargo check --workspace
+                    cargo check --workspace --all-features
+                    cargo nextest run --workspace --all-features
+                    cargo clippy --workspace --all-targets --all-features
+                    cargo fmt -- --check
+                  '
+
+                  # Dashboard: bun.nix freshness, DTO generation, lint, svelte-check
+                  nix run .#genBunNix
+                  nix fmt -- dashboard/bun.nix
+                  nix run .#st0x-dto -- dashboard/src/lib/api
+                  nix develop .#ci-dashboard -c bash -c '
+                    set -euxo pipefail
+                    cd dashboard
+                    bun install --frozen-lockfile
+                    bun run lint
+                    bun run check
+                  '
+                '';
+              };
+
+              # Continuous user-trade driver — the default simulation.
+              simulate = mkSimulation {
+                name = "simulate";
+                testFilter = "simulate";
+              };
+
+              # Same live dashboard stack as `simulate`, but first creates
+              # stuck mint and redemption rebalances whose Alpaca mock
+              # provider later completes. The backend logs the
+              # recheck-transfer commands needed to recover them.
+              "simulate-failures" = mkSimulation {
+                name = "simulate-failures";
+                testFilter = "simulate_failures";
+              };
+
+              # Sandbox-runnable test for scripts/patch-rain-math-float.nu so
+              # the patch logic can't silently rot when upstream drifts.
+              test-patch-rain-math-float =
+                pkgs.runCommand "test-patch-rain-math-float"
+                  {
+                    nativeBuildInputs = [ pkgs.nushell ];
+                  }
+                  ''
+                    cp -r ${./scripts} scripts
+                    chmod -R u+w scripts
+                    nu scripts/patch-rain-math-float.test.nu
+                    touch $out
+                  '';
+
+              genBunNix = pkgs.writeShellApplication {
+                name = "gen-bun-nix";
+                runtimeInputs = [ bun2nix ];
+                text = ''
+                  exec bun2nix -o dashboard/bun.nix --lock-file dashboard/bun.lock
+                '';
+              };
+
+              bootstrap = pkgs.writeShellApplication {
+                name = "bootstrap-nixos";
+                runtimeInputs = infraPkgs.buildInputs ++ [
+                  nixosAnywherePkg
+                  pkgs.gnused
+                ];
+                text = ''
+                  env="''${1:?usage: bootstrap <prod|staging>}"
+                  shift
+
+                  case "$env" in
+                    ${builtins.concatStringsSep "\n" (
+                      map (env: ''
+                        ${env})
+                          flake_config="${environments.${env}.nodeName}-bootstrap"
+                          host_key_field="host-${env}" ;;'') envNames
+                    )}
+                    *)
+                      echo "ERROR: unknown environment '$env'" >&2
+                      exit 1 ;;
+                  esac
+
+                  ${infraPkgs.parseIdentity}
+
+                  export env flake_config host_key_field identity
+
+                  exec ${./scripts/bootstrap.sh} "$@"
+                '';
+              };
+
+              secret = pkgs.writeShellApplication {
+                name = "secret";
+                runtimeInputs = [ ragenixPkg ];
+                text = ''
+                  ${infraPkgs.parseIdentity}
+                  hash_before=$(sha256sum "$1")
+                  ragenix --rules ./secret/secrets.nix -i "$identity" -e "$@"
+                  hash_after=$(sha256sum "$1")
+                  if [ "$hash_before" != "$hash_after" ]; then
+                    ${rekeySecrets}
+                  fi
+                '';
+              };
+
+              rekey = pkgs.writeShellApplication {
+                name = "rekey";
+                runtimeInputs = [ ragenixPkg ];
+                text = ''
+                  ${infraPkgs.parseIdentity}
+                  exec ${rekeySecrets}
+                '';
+              };
             };
-
-            bootstrap = rainix.mkTask.${system} {
-              name = "bootstrap-nixos";
-              additionalBuildInputs = infraPkgs.buildInputs ++ [
-                nixos-anywhere.packages.${system}.default
-                pkgs.gnused
-              ];
-              body = ''
-                env="''${1:?usage: bootstrap <prod|staging>}"
-                shift
-
-                case "$env" in
-                  ${builtins.concatStringsSep "\n" (
-                    map (env: ''
-                      ${env})
-                        flake_config="${environments.${env}.nodeName}-bootstrap"
-                        host_key_field="host-${env}" ;;'') envNames
-                  )}
-                  *)
-                    echo "ERROR: unknown environment '$env'" >&2
-                    exit 1 ;;
-                esac
-
-                ${infraPkgs.parseIdentity}
-
-                export env flake_config host_key_field identity
-
-                exec ${./scripts/bootstrap.sh} "$@"
-              '';
-            };
-
-            secret = rainix.mkTask.${system} {
-              name = "secret";
-              additionalBuildInputs = [ ragenix.packages.${system}.default ];
-              body = ''
-                set -euo pipefail
-                ${infraPkgs.parseIdentity}
-                hash_before=$(sha256sum "$1")
-                ragenix --rules ./secret/secrets.nix -i "$identity" -e "$@"
-                hash_after=$(sha256sum "$1")
-                if [ "$hash_before" != "$hash_after" ]; then
-                  ${rekeySecrets}
-                fi
-              '';
-            };
-
-            rekey = rainix.mkTask.${system} {
-              name = "rekey";
-              additionalBuildInputs = [ ragenix.packages.${system}.default ];
-              body = ''
-                ${infraPkgs.parseIdentity}
-                exec ${rekeySecrets}
-              '';
-            };
-
-            tfRekey = rainix.mkTask.${system} {
-              name = "tf-rekey";
-              additionalBuildInputs = infraPkgs.buildInputs;
-              body = infraPkgs.tfRekey;
-            };
-
-          };
+          in
+          rainixPkgs // infraPkgs.packages // deployScripts // abis // others;
 
         checks = { inherit (packages) test-patch-rain-math-float; };
-
         formatter = pkgs.nixfmt-rfc-style;
 
         devShells =
@@ -477,7 +433,7 @@
             # deno that rainix's full devShell brings in -- CI doesn't run them
             # and they bloat the closure.
             backendInputs = [
-              rainix.rust-toolchain.${system}
+              rustToolchain
               pkgs.openssl
               pkgs.sqlite
               pkgs.pkg-config
@@ -486,10 +442,10 @@
           in
           {
             # Local development. Rust-only rainix shell + infra/deploy tooling,
-            # bacon, sqlx, bun. Not used by CI.
+            # sqlx, bun, sccache. Not used by CI.
             default = pkgs.mkShell (
               {
-                shellHook = rainix.devShells.${system}.rust-shell.shellHook + rainMathFloatLink;
+                shellHook = rustShell.shellHook + rainMathFloatLink;
 
                 SQLX_OFFLINE = true;
                 DATABASE_URL = "sqlite:dev.db";
@@ -502,20 +458,18 @@
                 buildInputs =
                   with pkgs;
                   [
-                    bacon
                     bun
                     sccache
                     sqlx-cli
-                    cargo-expand
                     cargo-nextest
-                    ragenix.packages.${system}.default
-                    packages.ci
+                    ragenixPkg
                     packages.secret
                     packages.rekey
+                    packages.ci
                   ]
                   ++ builtins.attrValues infraPkgs.packages
                   ++ builtins.attrValues deployScripts
-                  ++ rainix.devShells.${system}.rust-shell.buildInputs;
+                  ++ rustShell.buildInputs;
               }
               // abiEnv
             );
@@ -529,7 +483,7 @@
                 buildInputs = backendInputs ++ [
                   pkgs.sqlx-cli
                   pkgs.cargo-nextest
-                  rainix.pkgs.${system}.foundry-bin
+                  foundryBin
                 ];
 
                 shellHook = rainMathFloatLink;
@@ -551,8 +505,8 @@
             # taplo/yamlfmt/shellcheck/deno) without the heavy default closure.
             ci-hooks = pkgs.mkShell (
               {
-                shellHook = rainix.devShells.${system}.rust-shell.shellHook + rainMathFloatLink;
-                inherit (rainix.devShells.${system}.rust-shell) buildInputs;
+                shellHook = rustShell.shellHook + rainMathFloatLink;
+                inherit (rustShell) buildInputs;
               }
               // abiEnv
             );

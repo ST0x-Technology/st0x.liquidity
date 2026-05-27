@@ -44,9 +44,12 @@ let
     src = fullSrc;
     cargoLock = ./Cargo.lock;
     outputHashes = {
-      "sqlite-es-0.1.0" = "sha256-Pf9nBYz2glSuEvBXnH0+5yqs+ZAOhd7xVTByWt6FMm0=";
-      "rain-error-decoding-0.1.0" = "sha256-dDsvRkrGXhfoFunvk6fwP+12fSsjiWYoxz/CzVVGpHA=";
-      "wasm-bindgen-utils-0.0.10" = "sha256-MkuPc9mWAmry5Yzjph4/IbaIvjevFUerji1lipLUK4g=";
+      "git+https://github.com/rainlanguage/rain.error#3d2ed70fb2f7c6156706846e10f163d1e493a8d3" =
+        "sha256-dDsvRkrGXhfoFunvk6fwP+12fSsjiWYoxz/CzVVGpHA=";
+      "git+https://github.com/ST0x-Technology/event-sorcery.git?branch=docs/examples#262d12b3f797a0b7445ee62d846119d3d7110dc7" =
+        "sha256-bpj3QE2z2F8RLH4O++5gor1SrDFGf23CnzGgATUE5OQ=";
+      "git+https://github.com/rainlanguage/rain.wasm?rev=06990d85a0b7c55378a1c8cca4dd9e2bc34a596a#06990d85a0b7c55378a1c8cca4dd9e2bc34a596a" =
+        "sha256-MkuPc9mWAmry5Yzjph4/IbaIvjevFUerji1lipLUK4g=";
     };
   };
 
@@ -119,30 +122,20 @@ let
 
 in
 {
-  # DTO crate for TypeScript codegen
-  dto = craneLib.buildPackage (
-    commonArgs
-    // {
-      pname = "st0x-dto";
-      inherit cargoArtifacts;
-      cargoExtraArgs = "-p st0x-dto";
-      doCheck = false;
-
-      meta = {
-        description = "st0x DTO types for TypeScript codegen";
-        homepage = "https://github.com/ST0x-Technology/st0x.liquidity";
-      };
-    }
-  );
+  # DTO crate for TypeScript codegen. Build config lives next to the crate
+  # source at crates/dto/default.nix; rust.nix only supplies shared crane
+  # infra.
+  st0x-dto = import ./crates/dto {
+    inherit craneLib commonArgs cargoArtifacts;
+  };
 
   # Server binary for deployment
-  package = craneLib.buildPackage (
+  st0x-liquidity = craneLib.buildPackage (
     commonArgs
     // {
       inherit cargoArtifacts;
 
       cargoExtraArgs = "--bin server --bin validate-config --features wallet-turnkey";
-      doCheck = false;
 
       meta = {
         description = "st0x liquidity market making server";
@@ -152,14 +145,13 @@ in
   );
 
   # CLI binary for remote operations
-  cli = craneLib.buildPackage (
+  st0x-cli = craneLib.buildPackage (
     commonArgs
     // {
       pname = "st0x-cli";
       inherit cargoArtifacts;
 
       cargoExtraArgs = "--bin cli --features wallet-turnkey";
-      doCheck = false;
 
       postInstall = ''
         mv $out/bin/cli $out/bin/st0x-cli
@@ -175,12 +167,11 @@ in
   # Float decoder used by status scripts to render Raindex vault balances
   decodeFloats = craneLib.buildPackage (
     commonArgs
-    // {
+    // rec {
       pname = "decode-floats";
       inherit cargoArtifacts;
 
-      cargoExtraArgs = "--bin decode-floats";
-      doCheck = false;
+      cargoExtraArgs = "--bin ${pname}";
 
       meta = {
         description = "Decode Rain Float hex values to human-readable decimals";
