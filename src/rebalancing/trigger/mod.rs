@@ -42,7 +42,7 @@ use st0x_event_sorcery::{
     AggregateError, EntityList, LifecycleError, Projection, ProjectionError, Reactor, Store, deps,
 };
 use st0x_execution::{FractionalShares, Positive, SharesBlockchain, SharesConversionError, Symbol};
-use st0x_finance::{HasZero, Usdc};
+use st0x_finance::{HasZero, Usd, Usdc};
 
 use crate::config::AssetsConfig;
 use crate::equity_redemption::{
@@ -1384,7 +1384,15 @@ impl RebalancingService {
                 }
             }
             // Global USDC snapshots: one USDC check.
-            OnchainUsdc { .. } | OffchainUsd { .. } => {
+            //
+            // OffchainCashWithdrawable feeds the Alpaca-to-Base capacity
+            // gate (`withdrawable_cash_cents - reserved`). After the
+            // trigger skips with `MissingWithdrawableCash` because the
+            // broker omitted the field, the recovery snapshot is what
+            // brings rebalancing back online — without scheduling on it,
+            // the imbalance would remain unresolved until some unrelated
+            // USDC balance event happened to arrive.
+            OnchainUsdc { .. } | OffchainUsd { .. } | OffchainCashWithdrawable { .. } => {
                 self.usdc_scheduler.enqueue_check().await;
             }
             // Wallet-read USDC events update `inflight_cash` for
@@ -1395,10 +1403,9 @@ impl RebalancingService {
             | BaseWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
             | BaseWalletWrappedEquity { .. }
-            // Buying power and withdrawable cash are display-only and
-            // don't feed venue balances, so they never drive a rebalance.
+            // Buying power is display-only and doesn't feed any rebalance
+            // decision.
             | OffchainCashBuyingPower { .. }
-            | OffchainCashWithdrawable { .. }
             // Inflight snapshots don't trigger rebalancing -- they
             // indicate transfers already in progress, not new balances
             // to rebalance.
@@ -1992,25 +1999,23 @@ impl RebalancingService {
     }
 
     /// Returns USDC rebalancing parameters if rebalancing is enabled in config.
-    fn usdc_rebalancing_params(&self) -> Option<(ImbalanceThreshold, Option<Usdc>)> {
+    fn usdc_rebalancing_params(&self) -> Option<(ImbalanceThreshold, Option<Usdc>, Option<Usd>)> {
         let threshold = self.config.usdc.as_ref()?;
 
-        let usdc_limit = self
-            .config
-            .assets
-            .cash
-            .as_ref()
+        let cash = self.config.assets.cash.as_ref();
+        let usdc_limit = cash
             .and_then(|cash| cash.operational_limit)
             .map(Positive::inner);
+        let reserved = cash.and_then(|cash| cash.reserved).map(Positive::inner);
 
-        Some((*threshold, usdc_limit))
+        Some((*threshold, usdc_limit, reserved))
     }
 
     /// Checks inventory for USDC imbalance and triggers operation if needed.
     pub(crate) async fn check_and_trigger_usdc(&self) {
         self.expire_stuck_operations_with_logging().await;
 
-        let Some((threshold, usdc_limit)) = self.usdc_rebalancing_params() else {
+        let Some((threshold, usdc_limit, reserved)) = self.usdc_rebalancing_params() else {
             return;
         };
 
@@ -2019,11 +2024,14 @@ impl RebalancingService {
             return;
         };
 
-        let Ok(operation) =
-            usdc::check_imbalance_and_build_operation(&threshold, &self.inventory, usdc_limit)
-                .await
-                .inspect_err(|skip| debug!(target: "rebalance", ?skip, "Skipped USDC trigger"))
-        else {
+        let Ok(operation) = usdc::check_imbalance_and_build_operation(
+            &threshold,
+            &self.inventory,
+            usdc_limit,
+            reserved,
+        )
+        .await
+        .inspect_err(|skip| debug!(target: "rebalance", ?skip, "Skipped USDC trigger")) else {
             return;
         };
 
@@ -6396,7 +6404,9 @@ mod tests {
         // Start with USDC imbalance: 200 onchain, 800 offchain = 20% ratio
         // With target 50%, deviation 30%, lower bound = 20%: at boundary, no trigger
         // Use 100 onchain, 900 offchain = 10% ratio -> triggers TooMuchOffchain
-        let inventory = InventoryView::default().with_usdc(usdc(100), usdc(900));
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(100), usdc(900))
+            .with_withdrawable_cash_cents(90_000);
 
         let (reactor, mut receiver) = make_trigger_with_inventory(inventory).await;
         let trigger = reactor.clone();
@@ -7099,6 +7109,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_offchain_cash_withdrawable_via_reactor_enqueues_usdc_check() {
+        // Withdrawable cash now gates the Alpaca-to-Base capacity check, so a
+        // recovery from MissingWithdrawableCash must arrive as a snapshot
+        // event that re-enqueues a USDC check. If withdrawable updates did
+        // not enqueue, a transient broker omission would permanently suppress
+        // rebalancing until some unrelated USDC balance event fired.
+        let inventory = InventoryView::default().with_usdc(usdc(500), usdc(500));
+        let symbol = Symbol::new("AAPL").unwrap();
+        let (reactor, _receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+        let pool = trigger.usdc_scheduler.queue().pool().clone();
+
+        let pending_before: i64 =
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type LIKE '%UsdcRebalancingCheck'",
+            )
+                .fetch_one(&pool)
+                .await
+                .expect("count pending usdc-check jobs before snapshot");
+
+        apply_and_dispatch_snapshot(
+            reactor.clone(),
+            id,
+            InventorySnapshotEvent::OffchainCashWithdrawable {
+                cash_withdrawable_cents: Some(50_000),
+                fetched_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let pending_after: i64 =
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type LIKE '%UsdcRebalancingCheck'",
+            )
+                .fetch_one(&pool)
+                .await
+                .expect("count pending usdc-check jobs after snapshot");
+
+        assert!(
+            pending_after > pending_before,
+            "OffchainCashWithdrawable snapshot must enqueue a USDC check so the trigger \
+             recovers after a MissingWithdrawableCash skip (before: {pending_before}, \
+             after: {pending_after})"
+        );
+    }
+
+    #[tokio::test]
     async fn snapshot_offchain_usd_via_reactor_updates_usdc_balance() {
         // Start with 900 onchain, 100 offchain = 90% ratio -> TooMuchOnchain
         let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
@@ -7631,6 +7694,7 @@ mod tests {
     async fn timed_out_usdc_rebalance_clears_guards_and_ignores_late_events() {
         let inventory = InventoryView::default()
             .with_usdc(usdc(100), usdc(900))
+            .with_withdrawable_cash_cents(90_000)
             .update_usdc(
                 Inventory::transfer(Venue::Hedging, TransferOp::Start, usdc(400)),
                 Utc::now(),
@@ -9057,7 +9121,8 @@ mod tests {
         // 20% < 30% -> should trigger USDC rebalancing (AlpacaToBase).
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(0), shares(0))
-            .with_usdc(usdc(2000), usdc(2000));
+            .with_usdc(usdc(2000), usdc(2000))
+            .with_withdrawable_cash_cents(200_000);
 
         let (trigger, mut receiver) =
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
@@ -11226,7 +11291,9 @@ mod tests {
 
     #[tokio::test]
     async fn usdc_check_dispatches_transfer_on_imbalance() {
-        let inventory = InventoryView::default().with_usdc(usdc(100), usdc(900));
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(100), usdc(900))
+            .with_withdrawable_cash_cents(90_000);
         let (reactor, mut receiver) = make_trigger_with_inventory(inventory).await;
         let trigger = reactor.clone();
 

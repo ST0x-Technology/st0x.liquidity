@@ -12,7 +12,7 @@ use tracing::{debug, warn};
 
 use st0x_dto::{InFlightCash, InFlightEquity, SymbolInventory, UsdcInventory};
 use st0x_execution::{Direction, FractionalShares, HasZero, Symbol};
-use st0x_finance::Usdc;
+use st0x_finance::{Usd, Usdc};
 use st0x_float_macro::float;
 
 use super::snapshot::InventorySnapshotEvent;
@@ -275,75 +275,6 @@ where
         + std::fmt::Display
         + std::fmt::Debug,
 {
-    /// Returns the ratio of onchain to total inventory.
-    /// Returns `Ok(None)` if either venue is uninitialized or total is zero.
-    fn ratio(&self) -> Result<Option<Float>, FloatError> {
-        let Some(onchain_ref) = self.onchain.as_ref() else {
-            return Ok(None);
-        };
-        let Some(offchain_ref) = self.offchain.as_ref() else {
-            return Ok(None);
-        };
-
-        let onchain: Float = onchain_ref.total()?.into();
-        let offchain: Float = offchain_ref.total()?.into();
-        let total = (onchain + offchain)?;
-
-        if total.is_zero()? {
-            return Ok(None);
-        }
-
-        Ok(Some((onchain / total)?))
-    }
-
-    /// Detects imbalance based on threshold configuration.
-    /// Returns `Ok(None)` if either venue is uninitialized, balanced, has inflight
-    /// operations, or total is zero.
-    fn detect_imbalance(
-        &self,
-        threshold: &ImbalanceThreshold,
-    ) -> Result<Option<Imbalance<T>>, FloatError> {
-        // Require both venues to be initialized before detecting imbalance.
-        // This prevents triggering rebalancing when only one venue has been polled.
-        let Some(onchain_venue) = self.onchain.as_ref() else {
-            return Ok(None);
-        };
-        let Some(offchain_venue) = self.offchain.as_ref() else {
-            return Ok(None);
-        };
-
-        if onchain_venue.has_inflight()? || offchain_venue.has_inflight()? {
-            return Ok(None);
-        }
-
-        let Some(ratio) = self.ratio()? else {
-            return Ok(None);
-        };
-
-        let lower = (threshold.target - threshold.deviation)?;
-        let upper = (threshold.target + threshold.deviation)?;
-
-        if ratio.lt(lower)? {
-            let onchain = onchain_venue.total()?;
-            let offchain = offchain_venue.total()?;
-            let total = (onchain + offchain)?;
-            let target_onchain = (total * threshold.target)?;
-            let excess = (target_onchain - onchain)?;
-
-            Ok(Some(Imbalance::TooMuchOffchain { excess }))
-        } else if ratio.gt(upper)? {
-            let onchain = onchain_venue.total()?;
-            let offchain = offchain_venue.total()?;
-            let total = (onchain + offchain)?;
-            let target_onchain = (total * threshold.target)?;
-            let excess = (onchain - target_onchain)?;
-
-            Ok(Some(Imbalance::TooMuchOnchain { excess }))
-        } else {
-            Ok(None)
-        }
-    }
-
     /// Detects imbalance using a normalized onchain value.
     ///
     /// This is used when onchain balance is in wrapped tokens and needs to be
@@ -638,10 +569,10 @@ where
 ///
 /// These slots track wallet balances observed by polling rather than
 /// venue inventory. The underlying imbalance math
-/// ([`InventoryView::check_usdc_imbalance`]) operates strictly on venue
-/// totals so wallet readings can never compensate a real venue
-/// imbalance. Wallet-residue-driven suppression is deferred to a broader
-/// orphan-state detection mechanism.
+/// ([`InventoryView::check_usdc_imbalance_with_gross_offchain`]) operates
+/// strictly on venue totals so wallet readings can never compensate a real
+/// venue imbalance. Wallet-residue-driven suppression is deferred to a
+/// broader orphan-state detection mechanism.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum InFlightCashLocation {
     /// USDC parked on the Ethereum wallet between Alpaca withdrawal and
@@ -788,19 +719,101 @@ impl InventoryView {
         Ok(inventory.detect_imbalance_normalized(threshold, onchain_equivalent)?)
     }
 
-    /// Checks USDC inventory for imbalance against the threshold.
-    /// Returns the imbalance if one exists.
+    /// Checks USDC imbalance using gross offchain cash when available.
     ///
-    /// Wallet readings (`inflight_cash`) never enter the imbalance math:
-    /// the design explicitly keeps `check_usdc_imbalance` venue-only so
-    /// wallet observations cannot mask or compensate a real venue
-    /// imbalance. Suppression-based on wallet residue is tracked
-    /// separately by a broader orphan-state detection mechanism.
-    pub(crate) fn check_usdc_imbalance(
+    /// `reserved` cash is subtracted before `OffchainUsd` is stored for
+    /// dashboard and spending-cap purposes. Rebalancing allocation should
+    /// still use gross venue balances so the reserve does not make the system
+    /// look artificially onchain-heavy. When a reserve is configured but the
+    /// gross offchain snapshot is missing, this returns `None` rather than
+    /// falling back to the reserve-adjusted venue balance — using the net
+    /// value would be the exact regression this PR exists to prevent.
+    ///
+    /// Wallet readings (`inflight_cash`) never enter the imbalance math: the
+    /// design keeps this check venue-only so wallet observations cannot mask
+    /// or compensate a real venue imbalance. Suppression based on wallet
+    /// residue is tracked separately by a broader orphan-state detection
+    /// mechanism.
+    pub(crate) fn check_usdc_imbalance_with_gross_offchain(
         &self,
         threshold: &ImbalanceThreshold,
-    ) -> Result<Option<Imbalance<Usdc>>, FloatError> {
-        self.usdc.detect_imbalance(threshold)
+        reserved: Option<Usd>,
+    ) -> Result<Option<Imbalance<Usdc>>, InventoryViewError> {
+        let Some(onchain_venue) = self.usdc.onchain.as_ref() else {
+            return Ok(None);
+        };
+        let Some(offchain_venue) = self.usdc.offchain.as_ref() else {
+            return Ok(None);
+        };
+
+        if onchain_venue.has_inflight()? || offchain_venue.has_inflight()? {
+            return Ok(None);
+        }
+
+        let onchain = onchain_venue.total()?;
+        let offchain = match (self.offchain_gross_usd_cents, reserved) {
+            (Some(cents), _) => {
+                Usdc::from_cents(cents).ok_or(InventoryViewError::UsdBalanceConversion(cents))?
+            }
+            (None, None) => offchain_venue.total()?,
+            (None, Some(_)) => {
+                tracing::warn!(
+                    target: "rebalance",
+                    "USDC imbalance check skipped: gross offchain cash snapshot is missing while a reserve is configured; refusing to compute ratio against reserve-adjusted net offchain"
+                );
+                return Ok(None);
+            }
+        };
+        let total = (onchain + offchain)?;
+        let total_float: Float = total.into();
+
+        if total_float.is_zero()? {
+            return Ok(None);
+        }
+
+        let onchain_float: Float = onchain.into();
+        let ratio = (onchain_float / total_float)?;
+        let lower = (threshold.target - threshold.deviation)?;
+        let upper = (threshold.target + threshold.deviation)?;
+
+        if ratio.lt(lower)? {
+            let target_onchain = (total * threshold.target)?;
+            let excess = (target_onchain - onchain)?;
+
+            Ok(Some(Imbalance::TooMuchOffchain { excess }))
+        } else if ratio.gt(upper)? {
+            let target_onchain = (total * threshold.target)?;
+            let excess = (onchain - target_onchain)?;
+
+            Ok(Some(Imbalance::TooMuchOnchain { excess }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Maximum USDC that may leave Alpaca while preserving the configured
+    /// offchain reserve. Returns `None` when the broker did not report
+    /// withdrawable cash, because settled cash is the outbound capacity source
+    /// of truth. Returns `Some(Usdc::ZERO)` when withdrawable cash is at or
+    /// below the reserve — the caller is expected to surface this as a
+    /// distinct skip reason rather than treating it as "below minimum
+    /// withdrawal."
+    pub(crate) fn alpaca_to_base_usdc_capacity(
+        &self,
+        reserved: Option<Usd>,
+    ) -> Result<Option<Usdc>, InventoryViewError> {
+        let Some(withdrawable_cents) = self.withdrawable_cash_cents else {
+            return Ok(None);
+        };
+        let withdrawable = Usdc::from_cents(withdrawable_cents)
+            .ok_or(InventoryViewError::UsdBalanceConversion(withdrawable_cents))?;
+        let reserved = reserved.map_or(Usdc::ZERO, |amount| Usdc::new(amount.inner()));
+
+        if reserved.gt(&withdrawable)? {
+            return Ok(Some(Usdc::ZERO));
+        }
+
+        Ok(Some((withdrawable - reserved)?))
     }
 
     /// Converts the in-memory inventory view to a DTO for dashboard serialization.
@@ -985,6 +998,24 @@ impl InventoryView {
                 offchain: Some(VenueBalance::new(offchain_available, Usdc::ZERO)),
                 last_rebalancing: None,
             },
+            ..self
+        }
+    }
+
+    /// Sets the gross offchain cash balance recorded by the inventory poller.
+    #[cfg(test)]
+    pub(crate) fn with_offchain_gross_usd_cents(self, cents: i64) -> Self {
+        Self {
+            offchain_gross_usd_cents: Some(cents),
+            ..self
+        }
+    }
+
+    /// Sets the offchain withdrawable cash balance reported by the broker.
+    #[cfg(test)]
+    pub(crate) fn with_withdrawable_cash_cents(self, cents: i64) -> Self {
+        Self {
+            withdrawable_cash_cents: Some(cents),
             ..self
         }
     }
@@ -1873,63 +1904,6 @@ mod tests {
     }
 
     #[test]
-    fn ratio_returns_none_when_total_is_zero() {
-        let inventory = make_inventory(0, 0, 0, 0);
-        assert!(inventory.ratio().unwrap().is_none());
-    }
-
-    #[test]
-    fn ratio_returns_half_for_equal_split() {
-        let inventory = make_inventory(50, 0, 50, 0);
-        assert!(inventory.ratio().unwrap().unwrap().eq(float!(0.5)).unwrap());
-    }
-
-    #[test]
-    fn ratio_returns_one_when_all_onchain() {
-        let inventory = make_inventory(100, 0, 0, 0);
-        assert!(inventory.ratio().unwrap().unwrap().eq(float!(1)).unwrap());
-    }
-
-    #[test]
-    fn ratio_returns_zero_when_all_offchain() {
-        let inventory = make_inventory(0, 0, 100, 0);
-        assert!(
-            inventory
-                .ratio()
-                .unwrap()
-                .unwrap()
-                .eq(Float::zero().unwrap())
-                .unwrap()
-        );
-    }
-
-    #[test]
-    fn ratio_includes_inflight_in_total() {
-        let inventory = make_inventory(25, 25, 25, 25);
-        assert!(inventory.ratio().unwrap().unwrap().eq(float!(0.5)).unwrap());
-    }
-
-    #[test]
-    fn ratio_returns_none_when_onchain_uninitialized() {
-        let inventory = Inventory {
-            onchain: None,
-            offchain: Some(venue(100, 0)),
-            last_rebalancing: None,
-        };
-        assert!(inventory.ratio().unwrap().is_none());
-    }
-
-    #[test]
-    fn ratio_returns_none_when_offchain_uninitialized() {
-        let inventory = Inventory {
-            onchain: Some(venue(100, 0)),
-            offchain: None,
-            last_rebalancing: None,
-        };
-        assert!(inventory.ratio().unwrap().is_none());
-    }
-
-    #[test]
     fn has_inflight_false_when_no_inflight() {
         let inventory = make_inventory(50, 0, 50, 0);
         assert!(!inventory.has_inflight().unwrap());
@@ -1951,108 +1925,6 @@ mod tests {
     fn has_inflight_true_when_both_inflight() {
         let inventory = make_inventory(50, 10, 50, 10);
         assert!(inventory.has_inflight().unwrap());
-    }
-
-    #[test]
-    fn detect_imbalance_returns_none_when_balanced() {
-        let inventory = make_inventory(50, 0, 50, 0);
-        let thresh = threshold("0.5", "0.2");
-
-        assert_eq!(inventory.detect_imbalance(&thresh).unwrap(), None);
-    }
-
-    #[test]
-    fn detect_imbalance_returns_none_when_has_inflight() {
-        let inventory = make_inventory(80, 10, 20, 0);
-        let thresh = threshold("0.5", "0.2");
-
-        assert_eq!(inventory.detect_imbalance(&thresh).unwrap(), None);
-    }
-
-    #[test]
-    fn detect_imbalance_returns_none_when_total_is_zero() {
-        let inventory = make_inventory(0, 0, 0, 0);
-        let thresh = threshold("0.5", "0.2");
-
-        assert_eq!(inventory.detect_imbalance(&thresh).unwrap(), None);
-    }
-
-    #[test]
-    fn detect_imbalance_returns_too_much_onchain() {
-        // 80 onchain, 20 offchain = 80% ratio, threshold is 50% +- 20%
-        let inventory = make_inventory(80, 0, 20, 0);
-        let thresh = threshold("0.5", "0.2");
-
-        let imbalance = inventory.detect_imbalance(&thresh).unwrap().unwrap();
-
-        // Target is 50 onchain, current is 80, excess = 30
-        assert_eq!(imbalance, Imbalance::TooMuchOnchain { excess: shares(30) });
-    }
-
-    #[test]
-    fn detect_imbalance_returns_too_much_offchain() {
-        // 20 onchain, 80 offchain = 20% ratio, threshold is 50% +- 20%
-        let inventory = make_inventory(20, 0, 80, 0);
-        let thresh = threshold("0.5", "0.2");
-
-        let imbalance = inventory.detect_imbalance(&thresh).unwrap().unwrap();
-
-        // Target is 50 onchain, current is 20, excess = 30
-        assert_eq!(imbalance, Imbalance::TooMuchOffchain { excess: shares(30) });
-    }
-
-    #[test]
-    fn detect_imbalance_at_upper_boundary_is_balanced() {
-        // 70% ratio exactly at upper threshold (50% +- 20%)
-        let inventory = make_inventory(70, 0, 30, 0);
-        let thresh = threshold("0.5", "0.2");
-
-        assert_eq!(inventory.detect_imbalance(&thresh).unwrap(), None);
-    }
-
-    #[test]
-    fn detect_imbalance_at_lower_boundary_is_balanced() {
-        // 30% ratio exactly at lower threshold (50% +- 20%)
-        let inventory = make_inventory(30, 0, 70, 0);
-        let thresh = threshold("0.5", "0.2");
-
-        assert_eq!(inventory.detect_imbalance(&thresh).unwrap(), None);
-    }
-
-    #[test]
-    fn detect_imbalance_returns_none_when_onchain_not_initialized() {
-        let inventory = Inventory::<FractionalShares> {
-            onchain: None,
-            offchain: Some(venue(50, 0)),
-            last_rebalancing: None,
-        };
-        let thresh = threshold("0.5", "0.2");
-
-        assert_eq!(inventory.detect_imbalance(&thresh).unwrap(), None);
-    }
-
-    #[test]
-    fn detect_imbalance_returns_none_when_offchain_not_initialized() {
-        let inventory = Inventory::<FractionalShares> {
-            onchain: Some(venue(50, 0)),
-            offchain: None,
-            last_rebalancing: None,
-        };
-        let thresh = threshold("0.5", "0.2");
-
-        assert_eq!(inventory.detect_imbalance(&thresh).unwrap(), None);
-    }
-
-    #[test]
-    fn detect_imbalance_returns_none_when_neither_venue_initialized() {
-        let inventory = Inventory::<FractionalShares> {
-            onchain: None,
-            offchain: None,
-            last_rebalancing: None,
-        };
-        let thresh = threshold("0.5", "0.2");
-
-        assert_eq!(inventory.detect_imbalance(&thresh).unwrap(), None);
     }
 
     fn usdc_venue(available: i64, inflight: i64) -> VenueBalance<Usdc> {
@@ -2123,19 +1995,6 @@ mod tests {
             onchain_equity_snapshot_watermarks: HashMap::new(),
             offchain_equity_snapshot_watermarks: HashMap::new(),
         }
-    }
-
-    #[test]
-    fn usdc_inflight_blocks_imbalance_detection() {
-        let inventory = usdc_make_inventory(800, 0, 200, 0);
-        let thresh = threshold("0.5", "0.2");
-        assert!(inventory.detect_imbalance(&thresh).unwrap().is_some());
-
-        let inventory_with_inflight = usdc_make_inventory(700, 100, 200, 0);
-        assert_eq!(
-            inventory_with_inflight.detect_imbalance(&thresh).unwrap(),
-            None
-        );
     }
 
     #[test]
@@ -2321,50 +2180,6 @@ mod tests {
         assert!(result.unwrap().is_none());
     }
 
-    #[test]
-    fn check_usdc_imbalance_returns_none_when_balanced() {
-        let view = make_usdc_view(500, 0, 500, 0);
-
-        assert_eq!(
-            view.check_usdc_imbalance(&threshold("0.5", "0.3")).unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn check_usdc_imbalance_returns_too_much_onchain() {
-        let view = make_usdc_view(900, 0, 100, 0);
-
-        let imbalance = view
-            .check_usdc_imbalance(&threshold("0.5", "0.3"))
-            .unwrap()
-            .unwrap();
-
-        assert!(matches!(imbalance, Imbalance::TooMuchOnchain { .. }));
-    }
-
-    #[test]
-    fn check_usdc_imbalance_returns_too_much_offchain() {
-        let view = make_usdc_view(100, 0, 900, 0);
-
-        let imbalance = view
-            .check_usdc_imbalance(&threshold("0.5", "0.3"))
-            .unwrap()
-            .unwrap();
-
-        assert!(matches!(imbalance, Imbalance::TooMuchOffchain { .. }));
-    }
-
-    #[test]
-    fn check_usdc_imbalance_returns_none_when_inflight() {
-        let view = make_usdc_view(700, 200, 100, 0);
-
-        assert_eq!(
-            view.check_usdc_imbalance(&threshold("0.5", "0.3")).unwrap(),
-            None
-        );
-    }
-
     /// Wallet-read events must populate `inflight_cash` rather than the
     /// venue inventory slots. The venue snapshot semantics ("wallet
     /// balances are a transfer-in-progress signal, not part of the
@@ -2462,16 +2277,17 @@ mod tests {
     }
 
     /// Wallet balances must NOT enter the imbalance math. The design
-    /// explicitly keeps `check_usdc_imbalance` operating on venue totals
-    /// only, so wallet readings can never mask or compensate a real venue
-    /// imbalance. Wallet-residue-driven suppression is deferred to a
-    /// broader orphan-state detection mechanism, where distinguishing
-    /// "in-flight" from "settled-with-baseline" requires transfer history.
+    /// explicitly keeps `check_usdc_imbalance_with_gross_offchain`
+    /// operating on venue totals only, so wallet readings can never mask
+    /// or compensate a real venue imbalance. Wallet-residue-driven
+    /// suppression is deferred to a broader orphan-state detection
+    /// mechanism, where distinguishing "in-flight" from
+    /// "settled-with-baseline" requires transfer history.
     #[test]
     fn wallet_balances_do_not_enter_imbalance_math() {
         let now = Utc::now();
         let imbalance_without_wallet = make_usdc_view(900, 0, 100, 0)
-            .check_usdc_imbalance(&threshold("0.5", "0.3"))
+            .check_usdc_imbalance_with_gross_offchain(&threshold("0.5", "0.3"), None)
             .unwrap();
         assert!(
             matches!(
@@ -2491,7 +2307,7 @@ mod tests {
             )
             .unwrap();
         let imbalance_with_wallet = with_huge_wallet
-            .check_usdc_imbalance(&threshold("0.5", "0.3"))
+            .check_usdc_imbalance_with_gross_offchain(&threshold("0.5", "0.3"), None)
             .unwrap();
         assert_eq!(
             imbalance_without_wallet, imbalance_with_wallet,
@@ -3154,14 +2970,6 @@ mod tests {
         assert!(
             inventory.onchain.is_none(),
             "Empty inflight snapshot should not initialize a missing venue to Some(0, 0)"
-        );
-
-        // Imbalance detection should still return None since one venue is uninitialized
-        let thresh = threshold("0.5", "0.2");
-        assert_eq!(
-            inventory.detect_imbalance(&thresh).unwrap(),
-            None,
-            "Imbalance detection should return None when a venue is uninitialized"
         );
     }
 

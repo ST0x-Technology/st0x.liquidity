@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use st0x_float_macro::float;
 use tracing::{debug, trace, warn};
 
-use st0x_finance::Usdc;
+use st0x_finance::{Usd, Usdc};
 
 use super::{RebalancingService, RebalancingServiceError, TriggeredOperation};
 #[cfg(any(test, feature = "test-support"))]
@@ -187,6 +187,13 @@ const USDC_TRANSFER_MAX_DECIMAL_PLACES: u8 = 6;
 pub(crate) enum UsdcTriggerSkip {
     /// No USDC imbalance detected.
     NoImbalance,
+    /// Alpaca did not report settled withdrawable cash, so outbound
+    /// Alpaca-to-Base capacity cannot be proven reserve-safe.
+    MissingWithdrawableCash,
+    /// Withdrawable cash is at or below the configured reserve, so no
+    /// Alpaca-to-Base capacity is available. Operators should investigate;
+    /// the reserve may need to be lowered or the broker rebalanced.
+    ReserveCapacityExhausted,
     /// Imbalance exists but amount is below Alpaca's minimum withdrawal ($51).
     BelowMinimumWithdrawal { excess: Usdc },
     /// Arithmetic error during imbalance calculation.
@@ -242,18 +249,46 @@ pub(super) async fn check_imbalance_and_build_operation(
     threshold: &ImbalanceThreshold,
     inventory: &Arc<BroadcastingInventory>,
     usdc_limit: Option<Usdc>,
+    reserved: Option<Usd>,
 ) -> Result<TriggeredOperation, UsdcTriggerSkip> {
-    let imbalance = {
+    let imbalance_check = {
         let inventory = inventory.read().await;
-        inventory.check_usdc_imbalance(threshold).map_err(|error| {
-            warn!(
-                target: "rebalance",
-                ?error,
-                "USDC imbalance check failed due to arithmetic error"
-            );
-            UsdcTriggerSkip::ArithmeticError
-        })?
+        let imbalance = inventory
+            .check_usdc_imbalance_with_gross_offchain(threshold, reserved)
+            .map_err(|error| {
+                warn!(
+                    target: "rebalance",
+                    ?error,
+                    "USDC imbalance check failed due to inventory error"
+                );
+                UsdcTriggerSkip::ArithmeticError
+            })?;
+        // Only compute the Alpaca-to-Base capacity when we will actually use
+        // it: the imbalance is offchain-heavy AND a reserve is configured.
+        // Capacity reads parse `withdrawable_cash_cents`, so binding it to
+        // unrelated branches would let a malformed withdrawable value block
+        // Base-to-Alpaca rebalancing, which is supposed to be independent of
+        // withdrawable cash. Holding the same read guard while computing both
+        // values preserves TOCTOU safety against polling-driven updates.
+        let capacity = match (&imbalance, reserved) {
+            (Some(Imbalance::TooMuchOffchain { .. }), Some(_)) => Some(
+                inventory
+                    .alpaca_to_base_usdc_capacity(reserved)
+                    .map_err(|error| {
+                        warn!(
+                            target: "rebalance",
+                            ?error,
+                            "USDC Alpaca-to-Base capacity check failed due to inventory error"
+                        );
+                        UsdcTriggerSkip::ArithmeticError
+                    })?,
+            ),
+            _ => None,
+        };
+        drop(inventory);
+        (imbalance, capacity)
     };
+    let (imbalance, alpaca_to_base_capacity) = imbalance_check;
 
     let Some(imbalance) = imbalance else {
         trace!(target: "rebalance", "No USDC imbalance detected (balanced, partial data, or inflight)");
@@ -262,7 +297,61 @@ pub(super) async fn check_imbalance_and_build_operation(
 
     match imbalance {
         Imbalance::TooMuchOffchain { excess } => {
-            let capped = truncate_for_transfer(cap_usdc(excess, usdc_limit)).map_err(|error| {
+            // `alpaca_to_base_capacity` is `Some(capacity)` only when a
+            // reserve is configured (see the capacity computation above);
+            // when reserved is `None`, there is no reserve to protect and
+            // the transfer is constrained only by `usdc_limit` and the
+            // Alpaca minimum withdrawal.
+            let capped_by_capacity = match alpaca_to_base_capacity {
+                Some(capacity_opt) => {
+                    let Some(capacity) = capacity_opt else {
+                        warn!(
+                            target: "rebalance",
+                            excess = ?excess,
+                            "Skipping Alpaca-to-Base USDC rebalance: broker did not report withdrawable cash; reserve-safety cannot be proven"
+                        );
+                        return Err(UsdcTriggerSkip::MissingWithdrawableCash);
+                    };
+
+                    // A reserve that leaves capacity below the Alpaca minimum
+                    // withdrawal is operationally equivalent to capacity == 0
+                    // — the bot cannot make ANY reserve-safe transfer. Report
+                    // it with the precise reason rather than letting the
+                    // result fall through to BelowMinimumWithdrawal, which
+                    // would be misleading.
+                    if capacity.lt(&ALPACA_MINIMUM_WITHDRAWAL).map_err(|error| {
+                        warn!(
+                            target: "rebalance",
+                            ?error,
+                            "USDC capacity minimum-comparison failed"
+                        );
+                        UsdcTriggerSkip::ArithmeticError
+                    })? {
+                        warn!(
+                            target: "rebalance",
+                            excess = ?excess,
+                            ?reserved,
+                            ?capacity,
+                            minimum = ?*ALPACA_MINIMUM_WITHDRAWAL,
+                            "Skipping Alpaca-to-Base USDC rebalance: reserve leaves withdrawable capacity below Alpaca minimum withdrawal"
+                        );
+                        return Err(UsdcTriggerSkip::ReserveCapacityExhausted);
+                    }
+
+                    let capped = cap_usdc(excess, usdc_limit);
+                    cap_usdc_by_alpaca_capacity(capped, capacity).map_err(|error| {
+                        warn!(
+                            target: "rebalance",
+                            ?error,
+                            "USDC Alpaca capacity comparison failed"
+                        );
+                        UsdcTriggerSkip::ArithmeticError
+                    })?
+                }
+                None => cap_usdc(excess, usdc_limit),
+            };
+
+            let capped = truncate_for_transfer(capped_by_capacity).map_err(|error| {
                 warn!(
                     target: "rebalance",
                     ?error,
@@ -271,10 +360,14 @@ pub(super) async fn check_imbalance_and_build_operation(
                 UsdcTriggerSkip::ArithmeticError
             })?;
 
-            if capped
-                .lt(&ALPACA_MINIMUM_WITHDRAWAL)
-                .map_err(|_| UsdcTriggerSkip::NoImbalance)?
-            {
+            if capped.lt(&ALPACA_MINIMUM_WITHDRAWAL).map_err(|error| {
+                warn!(
+                    target: "rebalance",
+                    ?error,
+                    "USDC minimum-withdrawal comparison failed"
+                );
+                UsdcTriggerSkip::ArithmeticError
+            })? {
                 debug!(
                     target: "rebalance",
                     excess = ?capped,
@@ -296,11 +389,14 @@ pub(super) async fn check_imbalance_and_build_operation(
                 UsdcTriggerSkip::ArithmeticError
             })?;
 
-            if amount
-                .inner()
-                .is_zero()
-                .map_err(|_| UsdcTriggerSkip::NoImbalance)?
-            {
+            if amount.inner().is_zero().map_err(|error| {
+                warn!(
+                    target: "rebalance",
+                    ?error,
+                    "USDC truncated-amount zero-check failed"
+                );
+                UsdcTriggerSkip::ArithmeticError
+            })? {
                 debug!(
                     target: "rebalance",
                     excess = ?excess,
@@ -329,6 +425,20 @@ fn cap_usdc(amount: Usdc, usdc_limit: Option<Usdc>) -> Usdc {
         cap
     } else {
         amount
+    }
+}
+
+fn cap_usdc_by_alpaca_capacity(amount: Usdc, capacity: Usdc) -> Result<Usdc, FloatError> {
+    if amount.gt(&capacity)? {
+        warn!(
+            target: "rebalance",
+            computed = %amount,
+            capacity = %capacity,
+            "USDC rebalancing amount capped by Alpaca withdrawable cash after reserve"
+        );
+        Ok(capacity)
+    } else {
+        Ok(amount)
     }
 }
 
@@ -910,7 +1020,7 @@ mod tests {
             deviation: float!(0.2),
         };
 
-        let result = check_imbalance_and_build_operation(&threshold, &inventory, None).await;
+        let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
 
         assert_eq!(result, Err(UsdcTriggerSkip::NoImbalance));
     }
@@ -928,8 +1038,9 @@ mod tests {
     async fn test_excess_below_minimum_returns_below_minimum_withdrawal() {
         // 90 offchain, 10 onchain = 90% offchain
         // Excess to reach 50% target = 90 - 50 = 40 USDC (below $51 minimum)
-        let inventory =
-            InventoryView::default().with_usdc(Usdc::new(float!(10)), Usdc::new(float!(90)));
+        let inventory = InventoryView::default()
+            .with_usdc(Usdc::new(float!(10)), Usdc::new(float!(90)))
+            .with_withdrawable_cash_cents(9000);
 
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
@@ -938,7 +1049,7 @@ mod tests {
             deviation: float!(0.2),
         };
 
-        let result = check_imbalance_and_build_operation(&threshold, &inventory, None).await;
+        let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
 
         assert!(
             matches!(result, Err(UsdcTriggerSkip::BelowMinimumWithdrawal { excess }) if excess.inner().lt(float!(51)).unwrap_or(false)),
@@ -950,8 +1061,9 @@ mod tests {
     async fn test_excess_above_minimum_triggers_alpaca_to_base() {
         // 500 offchain, 100 onchain = 83% offchain
         // To reach 50% target: need 300 each, so excess = 500 - 300 = 200 USDC
-        let inventory =
-            InventoryView::default().with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500)));
+        let inventory = InventoryView::default()
+            .with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500)))
+            .with_withdrawable_cash_cents(50_000);
 
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
@@ -960,7 +1072,7 @@ mod tests {
             deviation: float!(0.2),
         };
 
-        let result = check_imbalance_and_build_operation(&threshold, &inventory, None).await;
+        let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
 
         assert!(
             matches!(result, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if !amount.inner().lt(float!(51)).unwrap_or(true)),
@@ -973,8 +1085,9 @@ mod tests {
         // Edge case: excess is exactly $51
         // Total = 102, target = 51 each
         // If offchain = 102, onchain = 0, excess = 102 - 51 = 51
-        let inventory =
-            InventoryView::default().with_usdc(Usdc::new(float!(0)), Usdc::new(float!(102)));
+        let inventory = InventoryView::default()
+            .with_usdc(Usdc::new(float!(0)), Usdc::new(float!(102)))
+            .with_withdrawable_cash_cents(10_200);
 
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
@@ -983,7 +1096,7 @@ mod tests {
             deviation: float!(0.2),
         };
 
-        let result = check_imbalance_and_build_operation(&threshold, &inventory, None).await;
+        let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
 
         assert!(
             matches!(result, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount == Usdc::new(float!(51))),
@@ -1007,7 +1120,7 @@ mod tests {
             deviation: float!(0.2),
         };
 
-        let result = check_imbalance_and_build_operation(&threshold, &inventory, None).await;
+        let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
 
         assert!(
             matches!(result, Ok(TriggeredOperation::UsdcBaseToAlpaca { amount }) if amount == Usdc::new(float!(40))),
@@ -1017,8 +1130,9 @@ mod tests {
 
     #[tokio::test]
     async fn operational_limits_cap_usdc_amount() {
-        let inventory =
-            InventoryView::default().with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500)));
+        let inventory = InventoryView::default()
+            .with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500)))
+            .with_withdrawable_cash_cents(50_000);
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
         let threshold = ImbalanceThreshold {
@@ -1027,7 +1141,8 @@ mod tests {
         };
         let usdc_limit = Some(Usdc::new(float!(100)));
 
-        let result = check_imbalance_and_build_operation(&threshold, &inventory, usdc_limit).await;
+        let result =
+            check_imbalance_and_build_operation(&threshold, &inventory, usdc_limit, None).await;
 
         assert!(
             matches!(result, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
@@ -1046,11 +1161,14 @@ mod tests {
         // 100 onchain / 500 offchain -> 83% offchain, excess = 200
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
-            InventoryView::default().with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500))),
+            InventoryView::default()
+                .with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500)))
+                .with_withdrawable_cash_cents(50_000),
             event_sender,
         ));
 
-        let first = check_imbalance_and_build_operation(&threshold, &inventory, usdc_limit).await;
+        let first =
+            check_imbalance_and_build_operation(&threshold, &inventory, usdc_limit, None).await;
         assert!(
             matches!(first, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
             "First transfer capped to 100, got {first:?}"
@@ -1060,12 +1178,14 @@ mod tests {
         // Still above 70% threshold? No - 400/600 = 66.7%, within 30%-70%. No trigger.
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let after_first = Arc::new(BroadcastingInventory::new(
-            InventoryView::default().with_usdc(Usdc::new(float!(200)), Usdc::new(float!(400))),
+            InventoryView::default()
+                .with_usdc(Usdc::new(float!(200)), Usdc::new(float!(400)))
+                .with_withdrawable_cash_cents(40_000),
             event_sender,
         ));
 
         let second =
-            check_imbalance_and_build_operation(&threshold, &after_first, usdc_limit).await;
+            check_imbalance_and_build_operation(&threshold, &after_first, usdc_limit, None).await;
         assert_eq!(
             second,
             Err(UsdcTriggerSkip::NoImbalance),
@@ -1076,12 +1196,15 @@ mod tests {
         // Still above 70%, so triggers again
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let partially_resolved = Arc::new(BroadcastingInventory::new(
-            InventoryView::default().with_usdc(Usdc::new(float!(150)), Usdc::new(float!(450))),
+            InventoryView::default()
+                .with_usdc(Usdc::new(float!(150)), Usdc::new(float!(450)))
+                .with_withdrawable_cash_cents(45_000),
             event_sender,
         ));
 
         let third =
-            check_imbalance_and_build_operation(&threshold, &partially_resolved, usdc_limit).await;
+            check_imbalance_and_build_operation(&threshold, &partially_resolved, usdc_limit, None)
+                .await;
         assert!(
             matches!(third, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
             "Remaining imbalance triggers another capped transfer, got {third:?}"
@@ -1093,7 +1216,9 @@ mod tests {
         // excess = $200 (above $51 minimum), but limit = $30 caps it below minimum
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
-            InventoryView::default().with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500))),
+            InventoryView::default()
+                .with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500)))
+                .with_withdrawable_cash_cents(50_000),
             event_sender,
         ));
         let threshold = ImbalanceThreshold {
@@ -1102,7 +1227,8 @@ mod tests {
         };
         let usdc_limit = Some(Usdc::new(float!(30)));
 
-        let result = check_imbalance_and_build_operation(&threshold, &inventory, usdc_limit).await;
+        let result =
+            check_imbalance_and_build_operation(&threshold, &inventory, usdc_limit, None).await;
 
         assert!(
             matches!(
@@ -1111,6 +1237,262 @@ mod tests {
                     if excess == Usdc::new(float!(30))
             ),
             "Cap of $30 should produce BelowMinimumWithdrawal, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gross_offchain_cash_is_used_for_usdc_ratio_even_with_reserve() {
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default()
+                .with_usdc(Usdc::new(float!(12600)), Usdc::new(float!(800)))
+                .with_offchain_gross_usd_cents(2_580_000)
+                .with_withdrawable_cash_cents(2_580_000),
+            event_sender,
+        ));
+        let threshold = ImbalanceThreshold {
+            target: float!(0.5),
+            deviation: float!(0.2),
+        };
+
+        let result = check_imbalance_and_build_operation(
+            &threshold,
+            &inventory,
+            None,
+            Some(Usd::new(float!(25000))),
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Err(UsdcTriggerSkip::NoImbalance),
+            "Gross offchain cash should keep 12.6k/25.8k within the 30%-70% band"
+        );
+    }
+
+    #[tokio::test]
+    async fn alpaca_to_base_skips_when_withdrawable_cash_is_missing() {
+        // Reserve configured + gross set (production invariant after first poll)
+        // but withdrawable is missing -> capacity unknown -> skip.
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default()
+                .with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500)))
+                .with_offchain_gross_usd_cents(50_000),
+            event_sender,
+        ));
+        let threshold = ImbalanceThreshold {
+            target: float!(0.5),
+            deviation: float!(0.2),
+        };
+
+        let result = check_imbalance_and_build_operation(
+            &threshold,
+            &inventory,
+            None,
+            Some(Usd::new(float!(250))),
+        )
+        .await;
+
+        assert_eq!(result, Err(UsdcTriggerSkip::MissingWithdrawableCash));
+    }
+
+    #[tokio::test]
+    async fn alpaca_to_base_is_capped_by_withdrawable_cash_after_reserve() {
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default()
+                .with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500)))
+                .with_offchain_gross_usd_cents(50_000)
+                .with_withdrawable_cash_cents(35_000),
+            event_sender,
+        ));
+        let threshold = ImbalanceThreshold {
+            target: float!(0.5),
+            deviation: float!(0.2),
+        };
+
+        let result = check_imbalance_and_build_operation(
+            &threshold,
+            &inventory,
+            None,
+            Some(Usd::new(float!(250))),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
+            "Expected reserve-adjusted withdrawable capacity to cap transfer to 100, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn alpaca_to_base_skips_when_reserve_exhausts_capacity() {
+        // withdrawable == reserved -> capacity = 0 -> ReserveCapacityExhausted
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default()
+                .with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500)))
+                .with_offchain_gross_usd_cents(50_000)
+                .with_withdrawable_cash_cents(2_500_000),
+            event_sender,
+        ));
+        let threshold = ImbalanceThreshold {
+            target: float!(0.5),
+            deviation: float!(0.2),
+        };
+
+        let result = check_imbalance_and_build_operation(
+            &threshold,
+            &inventory,
+            None,
+            Some(Usd::new(float!(25000))),
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Err(UsdcTriggerSkip::ReserveCapacityExhausted),
+            "withdrawable ({}) <= reserved ({}) should produce ReserveCapacityExhausted, got {result:?}",
+            "25000",
+            "25000"
+        );
+    }
+
+    #[tokio::test]
+    async fn alpaca_to_base_skips_when_reserve_exceeds_withdrawable() {
+        // withdrawable < reserved -> capacity = 0 -> ReserveCapacityExhausted
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default()
+                .with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500)))
+                .with_offchain_gross_usd_cents(50_000)
+                .with_withdrawable_cash_cents(2_000_000),
+            event_sender,
+        ));
+        let threshold = ImbalanceThreshold {
+            target: float!(0.5),
+            deviation: float!(0.2),
+        };
+
+        let result = check_imbalance_and_build_operation(
+            &threshold,
+            &inventory,
+            None,
+            Some(Usd::new(float!(25000))),
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Err(UsdcTriggerSkip::ReserveCapacityExhausted),
+            "reserved exceeding withdrawable should produce ReserveCapacityExhausted, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn alpaca_to_base_recovers_after_withdrawable_cash_returns() {
+        // End-to-end recovery: a transient broker omission causes
+        // MissingWithdrawableCash; once withdrawable cash returns, the next
+        // trigger must succeed. Pins the conjunction of the
+        // (TooMuchOffchain + reserve + missing-withdrawable) skip and the
+        // post-recovery dispatch.
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default()
+                .with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500)))
+                .with_offchain_gross_usd_cents(50_000),
+            event_sender,
+        ));
+        let threshold = ImbalanceThreshold {
+            target: float!(0.5),
+            deviation: float!(0.2),
+        };
+        let reserved = Some(Usd::new(float!(250)));
+
+        let before =
+            check_imbalance_and_build_operation(&threshold, &inventory, None, reserved).await;
+        assert_eq!(
+            before,
+            Err(UsdcTriggerSkip::MissingWithdrawableCash),
+            "Missing withdrawable cash must skip with the precise reason"
+        );
+
+        // Polling-side recovery: withdrawable cash arrives with enough
+        // headroom over the reserve to fund the transfer.
+        {
+            let mut guard = inventory.write().await;
+            let taken = std::mem::take(&mut *guard);
+            *guard = taken
+                .with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500)))
+                .with_offchain_gross_usd_cents(50_000)
+                .with_withdrawable_cash_cents(35_000);
+        }
+
+        let after =
+            check_imbalance_and_build_operation(&threshold, &inventory, None, reserved).await;
+        assert!(
+            matches!(after, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
+            "Post-recovery trigger must dispatch the reserve-aware capped transfer, got {after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn imbalance_check_skips_when_gross_missing_with_reserve_configured() {
+        // No offchain_gross_usd_cents, reserve configured -> skip (NoImbalance) rather
+        // than fall back to net offchain in the ratio.
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default()
+                .with_usdc(Usdc::new(float!(12600)), Usdc::new(float!(800)))
+                .with_withdrawable_cash_cents(2_580_000),
+            event_sender,
+        ));
+        let threshold = ImbalanceThreshold {
+            target: float!(0.5),
+            deviation: float!(0.2),
+        };
+
+        let result = check_imbalance_and_build_operation(
+            &threshold,
+            &inventory,
+            None,
+            Some(Usd::new(float!(25000))),
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Err(UsdcTriggerSkip::NoImbalance),
+            "Reserve configured but gross offchain missing should skip rather than use net offchain, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn base_to_alpaca_is_not_capped_by_reserve_or_withdrawable_cash() {
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default()
+                .with_usdc(Usdc::new(float!(900)), Usdc::new(float!(100)))
+                .with_offchain_gross_usd_cents(10_000),
+            event_sender,
+        ));
+        let threshold = ImbalanceThreshold {
+            target: float!(0.5),
+            deviation: float!(0.2),
+        };
+
+        let result = check_imbalance_and_build_operation(
+            &threshold,
+            &inventory,
+            None,
+            Some(Usd::new(float!(100000))),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Ok(TriggeredOperation::UsdcBaseToAlpaca { amount }) if amount == Usdc::new(float!(400))),
+            "Expected Base-to-Alpaca transfer to ignore reserve and withdrawable cash, got {result:?}"
         );
     }
 

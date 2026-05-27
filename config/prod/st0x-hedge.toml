@@ -49,7 +49,9 @@ redemption_wallet = "0x1c66D6708914C40239D54919320b4C48cAE3D1A9"
 transfer_timeout_secs = 1800
 
 [rebalancing.usdc]
-mode = "disabled"
+mode = "enabled"
+target = 0.5
+deviation = 0.2
 
 [rebalancing.equity]
 target = 0.6
@@ -61,10 +63,13 @@ url = "https://api.st0x.io"
 # USDC vault and rebalancing settings.
 [assets.cash]
 # Raindex vault ID for USDC deposits/withdrawals.
-vault_id = "0xfab2"
+vault_id = "0xfab4"
 # Whether automatic USDC rebalancing between venues is active.
 rebalancing = "enabled"
-# operational_limit = 0.01
+# Maximum USDC moved per rebalance operation.
+operational_limit = 1000
+# USD cash kept offchain and unavailable for rebalancing.
+reserved = 25000
 
 # Per-equity asset configuration.
 # - trading: whether the bot hedges fills for this asset.

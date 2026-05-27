@@ -380,9 +380,14 @@ async fn build_imbalanced_inventory(imbalance: Imbalance<'_>) {
             onchain,
             offchain,
         } => {
+            let withdrawable_cash_cents = Usd::new(offchain.inner())
+                .to_cents()
+                .expect("test USDC balances should be cent-denominated");
             let mut guard = inventory.write().await;
             let taken = std::mem::take(&mut *guard);
-            *guard = taken.with_usdc(onchain, offchain);
+            *guard = taken
+                .with_usdc(onchain, offchain)
+                .with_withdrawable_cash_cents(withdrawable_cash_cents);
         }
     }
 }
@@ -1131,18 +1136,18 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
     );
 }
 
-/// Verifies that cash reserve shifts the effective offchain balance by
-/// wiring up the actual `InventoryPollingService` with `reserved_cash`.
+/// Verifies that the configured cash reserve does NOT shift the rebalancing
+/// ratio. Polling subtracts the reserve from `OffchainUsd` for dashboard and
+/// spending-cap purposes, but the imbalance check uses gross offchain cash
+/// (`offchain_gross_usd_cents`) so the reserve cannot make the system look
+/// artificially onchain-heavy and pull cash onchain unnecessarily.
 ///
-/// The broker reports $500, reserve is $300, so polling's
-/// `compute_available_cash` subtracts the reserve -> effective offchain = $200.
-///
-/// Without reserve: 500 onchain / 500 offchain = 50% ratio -> balanced.
-/// With $300 reserve: effective offchain = 200, ratio = 500/700 = 71.4%
-/// -> above 70% upper bound -> TooMuchOnchain -> base_to_alpaca.
-/// Excess = 500 - 350 (target = 0.5 * 700) = $150.
+/// The broker reports $500 gross, reserve is $300. Polling emits
+/// `OffchainUsd` with available = $200 and `gross_usd_cents = Some(50000)`.
+/// Rebalancing uses gross: 500 onchain / 500 gross offchain = 50% -> balanced
+/// -> no operation triggered.
 #[tokio::test]
-async fn cash_reserve_shifts_offchain_balance_triggering_base_to_alpaca() {
+async fn cash_reserve_does_not_shift_rebalancing_ratio() {
     use alloy::providers::{ProviderBuilder, mock::Asserter};
 
     use st0x_event_sorcery::StoreBuilder;
@@ -1167,8 +1172,15 @@ async fn cash_reserve_shifts_offchain_balance_triggering_base_to_alpaca() {
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
     let wrapper = Arc::new(MockWrapper::new());
 
+    // Trigger config mirrors prod: reserved is configured here so the
+    // imbalance check exercises the (reserved=Some, gross=Some) path
+    // end-to-end, matching what the polling side will write.
+    let mut trigger_config = test_trigger_config();
+    if let Some(cash) = trigger_config.assets.cash.as_mut() {
+        cash.reserved = Some(Positive::new(Usd::new(float!(300))).unwrap());
+    }
     let service = Arc::new(RebalancingService::new(
-        test_trigger_config(),
+        trigger_config,
         Arc::clone(&vault_registry),
         TEST_ORDERBOOK,
         TEST_ORDER_OWNER,
@@ -1256,7 +1268,9 @@ async fn cash_reserve_shifts_offchain_balance_triggering_base_to_alpaca() {
     );
     drop(view);
 
-    // Trigger checks thresholds against the reserve-shifted inventory.
+    // Trigger checks thresholds. The reserve subtraction lives in
+    // `usdc_available`; the imbalance check uses gross offchain cash so the
+    // ratio stays balanced (500/500) despite the reserve.
     service.check_and_trigger_usdc().await;
 
     let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
@@ -1285,17 +1299,9 @@ async fn cash_reserve_shifts_offchain_balance_triggering_base_to_alpaca() {
 
     assert_eq!(
         usdc.base_to_alpaca_calls(),
-        1,
-        "Reserve-shifted imbalance should trigger base_to_alpaca"
-    );
-
-    let call = usdc
-        .last_base_to_alpaca_call()
-        .expect("Expected a captured call");
-    assert_eq!(
-        call.amount,
-        Usdc::new(float!(150)),
-        "Expected excess of $150 (actual $500 - target $350)"
+        0,
+        "Gross offchain cash is used for the rebalancing ratio, so a $300 \
+         reserve must not trigger base_to_alpaca on a balanced 500/500 split"
     );
 
     assert_eq!(
@@ -1307,7 +1313,7 @@ async fn cash_reserve_shifts_offchain_balance_triggering_base_to_alpaca() {
 
 /// Verifies that without reserve, the same 500/500 split is balanced
 /// and no rebalancing triggers. This is the counterpart to
-/// `cash_reserve_shifts_offchain_balance_triggering_base_to_alpaca`.
+/// `cash_reserve_does_not_shift_rebalancing_ratio`.
 #[tokio::test]
 async fn balanced_usdc_without_reserve_triggers_no_rebalancing() {
     let pool = setup_test_db().await;
@@ -1348,6 +1354,65 @@ async fn balanced_usdc_without_reserve_triggers_no_rebalancing() {
     assert!(
         matches!(receiver.try_recv(), Err(TryRecvError::Disconnected)),
         "Balanced 500/500 split should not trigger any USDC rebalancing"
+    );
+}
+
+/// Verifies that when a reserve is configured and the broker stops
+/// reporting `cash_withdrawable_cents` (e.g. transient Alpaca outage), an
+/// existing offchain imbalance does not trigger an Alpaca-to-Base
+/// transfer: the system refuses to act because reserve-safety cannot be
+/// proven. Companion to `cash_reserve_does_not_shift_rebalancing_ratio`
+/// which covers the balanced case.
+#[tokio::test]
+async fn usdc_alpaca_to_base_skips_when_withdrawable_cash_missing_with_reserve() {
+    let pool = setup_test_db().await;
+
+    let (event_sender, _) = broadcast::channel::<Statement>(16);
+    let inventory = Arc::new(BroadcastingInventory::new(
+        InventoryView::default(),
+        event_sender,
+    ));
+
+    // Imbalanced 100 onchain / 500 offchain (17% / 83%) is well outside the
+    // 30%-70% band. gross is set (production invariant after first poll
+    // when a reserve is configured), but the broker did not report
+    // withdrawable cash.
+    {
+        let mut guard = inventory.write().await;
+        let taken = std::mem::take(&mut *guard);
+        *guard = taken
+            .with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500)))
+            .with_offchain_gross_usd_cents(50_000);
+    }
+
+    let mut config = test_trigger_config();
+    if let Some(cash) = config.assets.cash.as_mut() {
+        cash.reserved = Some(Positive::new(Usd::new(float!(100))).unwrap());
+    }
+
+    let (sender, mut receiver) = mpsc::channel(10);
+
+    let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
+    let wrapper = Arc::new(MockWrapper::new());
+
+    let trigger = RebalancingService::new(
+        config,
+        vault_registry,
+        TEST_ORDERBOOK,
+        TEST_ORDER_OWNER,
+        Arc::clone(&inventory),
+        sender,
+        wrapper,
+        RebalancingSchedulers::new(&pool),
+    );
+
+    trigger.check_and_trigger_usdc().await;
+
+    drop(trigger);
+
+    assert!(
+        matches!(receiver.try_recv(), Err(TryRecvError::Disconnected)),
+        "Missing withdrawable cash + reserve configured must suppress Alpaca-to-Base rebalancing even with a real imbalance"
     );
 }
 
@@ -1395,7 +1460,7 @@ async fn usdc_none_disables_usdc_rebalancing() {
     drop(trigger);
 
     assert!(
-        receiver.try_recv().is_err(),
+        matches!(receiver.try_recv(), Err(TryRecvError::Disconnected)),
         "No USDC operation should be dispatched when usdc threshold is None"
     );
 }
@@ -1553,7 +1618,9 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
     // Excess to reach 50% target = 500 - 50 = 450 USDC
     let (event_sender, _) = broadcast::channel::<Statement>(16);
     let inventory = Arc::new(BroadcastingInventory::new(
-        InventoryView::default().with_usdc(Usdc::new(float!(50)), Usdc::new(float!(950))),
+        InventoryView::default()
+            .with_usdc(Usdc::new(float!(50)), Usdc::new(float!(950)))
+            .with_withdrawable_cash_cents(95_000),
         event_sender,
     ));
 
@@ -1616,7 +1683,9 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
     {
         let mut guard = inventory.write().await;
         let taken = std::mem::take(&mut *guard);
-        *guard = taken.with_usdc(Usdc::new(float!(150)), Usdc::new(float!(850)));
+        *guard = taken
+            .with_usdc(Usdc::new(float!(150)), Usdc::new(float!(850)))
+            .with_withdrawable_cash_cents(85_000);
     }
 
     // Cycle 2: excess = 350, capped to 100
@@ -1639,7 +1708,9 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
     {
         let mut guard = inventory.write().await;
         let taken = std::mem::take(&mut *guard);
-        *guard = taken.with_usdc(Usdc::new(float!(250)), Usdc::new(float!(750)));
+        *guard = taken
+            .with_usdc(Usdc::new(float!(250)), Usdc::new(float!(750)))
+            .with_withdrawable_cash_cents(75_000);
     }
 
     // Cycle 3: excess = 250, capped to 100
@@ -1662,7 +1733,9 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
     {
         let mut guard = inventory.write().await;
         let taken = std::mem::take(&mut *guard);
-        *guard = taken.with_usdc(Usdc::new(float!(350)), Usdc::new(float!(650)));
+        *guard = taken
+            .with_usdc(Usdc::new(float!(350)), Usdc::new(float!(650)))
+            .with_withdrawable_cash_cents(65_000);
     }
 
     trigger.check_and_trigger_usdc().await;
@@ -1686,7 +1759,9 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
     // Large imbalance: 100 onchain, 900 offchain
     let (event_sender, _) = broadcast::channel::<Statement>(16);
     let inventory = Arc::new(BroadcastingInventory::new(
-        InventoryView::default().with_usdc(Usdc::new(float!(100)), Usdc::new(float!(900))),
+        InventoryView::default()
+            .with_usdc(Usdc::new(float!(100)), Usdc::new(float!(900)))
+            .with_withdrawable_cash_cents(90_000),
         event_sender,
     ));
 
