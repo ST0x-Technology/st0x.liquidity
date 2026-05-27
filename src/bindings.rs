@@ -81,8 +81,3 @@ sol!(
     #[derive(serde::Serialize, serde::Deserialize)]
     IPyth, env!("ST0X_IPYTH_ABI")
 );
-
-sol!(
-    #![sol(all_derives = true)]
-    LibDecimalFloat, env!("ST0X_LIB_DECIMAL_FLOAT_ABI")
-);

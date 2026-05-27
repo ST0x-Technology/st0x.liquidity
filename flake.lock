@@ -676,20 +676,16 @@
     "rain-math-float": {
       "flake": false,
       "locked": {
-        "allRefs": true,
-        "lastModified": 1778084778,
-        "narHash": "sha256-rbdUzWU8eNA1BljT9maJFRqt7P+/5J3BTKfhd6Kge9Y=",
+        "lastModified": 1779905451,
+        "narHash": "sha256-cEU1a1amEAgFxNNkEa1CvteDFlkbgrTSlPcTu7t/hI4=",
         "ref": "refs/heads/main",
-        "rev": "123dfa59f9d1c0b84333fb5b3aa7345de4a23790",
-        "revCount": 890,
-        "submodules": true,
+        "rev": "5a12bf839bea0ce9528a0e1810d620c44812283a",
+        "revCount": 1011,
         "type": "git",
         "url": "https://github.com/rainlanguage/rain.math.float"
       },
       "original": {
-        "allRefs": true,
-        "rev": "123dfa59f9d1c0b84333fb5b3aa7345de4a23790",
-        "submodules": true,
+        "rev": "5a12bf839bea0ce9528a0e1810d620c44812283a",
         "type": "git",
         "url": "https://github.com/rainlanguage/rain.math.float"
       }
@@ -697,9 +693,9 @@
     "rain-orderbook": {
       "flake": false,
       "locked": {
-        "allRefs": true,
         "lastModified": 1773775933,
         "narHash": "sha256-vBmhB2R8b708o1fLzcig3vQ7ZMPUqwd6rwAIQtgJYIo=",
+        "ref": "refs/heads/main",
         "rev": "f7bf51ab3db0bac4f8551b91000c69cc5ba0db71",
         "revCount": 11468,
         "submodules": true,
@@ -707,7 +703,6 @@
         "url": "https://github.com/rainlanguage/rain.orderbook"
       },
       "original": {
-        "allRefs": true,
         "rev": "f7bf51ab3db0bac4f8551b91000c69cc5ba0db71",
         "submodules": true,
         "type": "git",

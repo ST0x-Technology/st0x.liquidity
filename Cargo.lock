@@ -5143,7 +5143,7 @@ dependencies = [
 
 [[package]]
 name = "rain-math-float"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "alloy",
  "anyhow",
@@ -8332,8 +8332,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-utils"
-version = "0.0.10"
-source = "git+https://github.com/rainlanguage/rain.wasm?rev=06990d85a0b7c55378a1c8cca4dd9e2bc34a596a#06990d85a0b7c55378a1c8cca4dd9e2bc34a596a"
+version = "0.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fcbbd367f4921f4e3291bc0e789de16303a2dcfcf8b3b11e0c21f4ed4cefba93"
 dependencies = [
  "js-sys",
  "paste",
@@ -8347,8 +8348,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-utils-macros"
-version = "0.0.5"
-source = "git+https://github.com/rainlanguage/rain.wasm?rev=06990d85a0b7c55378a1c8cca4dd9e2bc34a596a#06990d85a0b7c55378a1c8cca4dd9e2bc34a596a"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8fed599c9e990172750babd2e8b880c70bb796b170ff3f1ae0b8aed16279303a"
 dependencies = [
  "proc-macro2",
  "quote",
