@@ -6,7 +6,8 @@ Real-time monitoring dashboard for the st0x liquidity system.
 
 - Dashboard: inventory, recent trades, and transfers.
 - Orders: active Raindex order view.
-- PnL: persisted fill replay for counter-trade PnL, directional exposure PnL, total PnL, and current replay exposure.
+- PnL: persisted fill replay for counter-trade PnL, directional exposure PnL,
+  total PnL, and current replay exposure.
 - Logs: structured production log browser.
 
 ## Development
@@ -39,7 +40,8 @@ PUBLIC_PNL_SQL_API_URL=http://st0x-liquidity-nixos.taile5cf8a.ts.net:8081/st0x-h
 bun run dev
 ```
 
-Run the full dashboard locally against production backend data and production PnL SQL data:
+Run the full dashboard locally against production backend data and production
+PnL SQL data:
 
 ```sh
 PUBLIC_BACKEND_API_URL=https://st0x-liquidity-nixos.taile5cf8a.ts.net \
@@ -47,7 +49,11 @@ PUBLIC_PNL_SQL_API_URL=http://st0x-liquidity-nixos.taile5cf8a.ts.net:8081/st0x-h
 bun run dev
 ```
 
-In local dev, absolute SQL URLs are proxied through `/__pnl_sql` so the browser does not depend on CORS headers from the SQL endpoint. `PUBLIC_BACKEND_API_URL` points the existing dashboard API proxy at a backend origin. In production, set `PUBLIC_PNL_SQL_API_URL` to a same-origin path or to an endpoint that allows the dashboard origin.
+In local dev, absolute SQL URLs are proxied through `/__pnl_sql` so the browser
+does not depend on CORS headers from the SQL endpoint. `PUBLIC_BACKEND_API_URL`
+points the existing dashboard API proxy at a backend origin. In production, set
+`PUBLIC_PNL_SQL_API_URL` to a same-origin path or to an endpoint that allows the
+dashboard origin.
 
 The adapter expects URLs with this shape:
 
