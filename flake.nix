@@ -396,7 +396,10 @@
 
             bootstrap = rainix.mkTask.${system} {
               name = "bootstrap-nixos";
-              additionalBuildInputs = infraPkgs.buildInputs ++ [ nixos-anywhere.packages.${system}.default ];
+              additionalBuildInputs = infraPkgs.buildInputs ++ [
+                nixos-anywhere.packages.${system}.default
+                pkgs.gnused
+              ];
               body = ''
                 env="''${1:?usage: bootstrap <prod|staging>}"
                 shift
@@ -415,54 +418,9 @@
 
                 ${infraPkgs.parseIdentity}
 
-                # Resolve IP from terraform state
-                trap "rm -f infra/terraform.tfstate" EXIT
-                if [ -f "infra/terraform.tfstate.age" ]; then
-                  rage -d -i "$identity" infra/terraform.tfstate.age > infra/terraform.tfstate
-                fi
-                host_ip=$(jq -r ".outputs.''${env}_droplet_ipv4.value" infra/terraform.tfstate)
-                rm -f infra/terraform.tfstate
-                if [ -z "$host_ip" ] || [ "$host_ip" = "null" ]; then
-                  echo "ERROR: could not resolve IP from terraform output '''''${env}_droplet_ipv4'" >&2
-                  exit 1
-                fi
+                export env flake_config host_key_field identity
 
-                ssh_opts="-o StrictHostKeyChecking=no -o ConnectTimeout=5 -i $identity"
-
-                nixos-anywhere --flake ".#$flake_config" \
-                  --option pure-eval false \
-                  --ssh-option "IdentityFile=$identity" \
-                  --target-host "root@$host_ip" "$@"
-
-                echo "Waiting for host to come back up..."
-                retries=0
-                until ssh $ssh_opts "root@$host_ip" true 2>/dev/null; do
-                  retries=$((retries + 1))
-                  if [ "$retries" -ge 60 ]; then
-                    echo "Host did not come back up after 5 minutes" >&2
-                    exit 1
-                  fi
-                  sleep 5
-                done
-
-                new_key=$(
-                  ssh $ssh_opts "root@$host_ip" \
-                    cat /etc/ssh/ssh_host_ed25519_key.pub \
-                    | awk '{print $1 " " $2}'
-                )
-
-                valid_key='^ssh-ed25519 [A-Za-z0-9+/=]+$'
-                if [ -z "$new_key" ] || ! echo "$new_key" | grep -qE "$valid_key"; then
-                  echo "ERROR: SSH host key is empty or malformed: '$new_key'" >&2
-                  exit 1
-                fi
-
-                ${pkgs.gnused}/bin/sed -i \
-                  "/$host_key_field =/{n;s|\"ssh-ed25519 [A-Za-z0-9+/=_]*\"|\"$new_key\"|;}" \
-                  keys.nix
-
-                echo "Updated $host_key_field in keys.nix, rekeying secrets..."
-                ${rekeySecrets}
+                exec ${./scripts/bootstrap.sh} "$@"
               '';
             };
 
