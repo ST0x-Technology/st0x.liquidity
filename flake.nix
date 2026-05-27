@@ -63,16 +63,19 @@
     }:
     let
       inherit (import ./keys.nix) keys;
+      inherit (rainix.inputs.nixpkgs) lib;
       environments = {
         prod = {
           nodeName = "st0x-liquidity";
           volumeName = "st0x-liquidity-data";
           hostKey = keys.host-prod;
+          tailscaleMagicDnsName = "st0x-liquidity-nixos.taile5cf8a.ts.net";
         };
         staging = {
           nodeName = "st0x-liquidity-staging";
           volumeName = "st0x-liquidity-staging-data";
           hostKey = keys.host-staging;
+          tailscaleMagicDnsName = "st0x-liquidity-staging.taile5cf8a.ts.net";
         };
       };
       envNames = builtins.attrNames environments;
@@ -82,11 +85,11 @@
         let
           mkNixos =
             { environment, modules }:
-            rainix.inputs.nixpkgs.lib.nixosSystem {
+            lib.nixosSystem {
               system = "x86_64-linux";
               specialArgs = {
                 inherit environment;
-                inherit (environments.${environment}) volumeName;
+                inherit (environments.${environment}) volumeName tailscaleMagicDnsName;
                 inherit (self.packages.x86_64-linux) st0x-cli;
               };
               modules = [ disko.nixosModules.disko ] ++ modules;
@@ -123,7 +126,15 @@
           ]) envNames
         );
 
-      deploy = (import ./deploy.nix { inherit deploy-rs self environments; }).config;
+      deploy =
+        (import ./deploy.nix {
+          inherit
+            lib
+            deploy-rs
+            self
+            environments
+            ;
+        }).config;
     }
     // flake-utils.lib.eachDefaultSystem (
       system:
@@ -156,7 +167,12 @@
 
         deployScripts =
           (import ./deploy.nix {
-            inherit deploy-rs self environments;
+            inherit
+              lib
+              deploy-rs
+              self
+              environments
+              ;
           }).mkDeployScripts
             {
               inherit pkgs infraPkgs;
