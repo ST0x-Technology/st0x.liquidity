@@ -26,37 +26,43 @@ jobs:
         include:
           - name: check
             cache_target: check
-            command: nix develop .#ci-backend -c cargo check --workspace
+            command: >
+              nix --accept-flake-config develop .#ci-backend -c
+              cargo check --workspace
 
           - name: test 1 of 4
             cache_target: test
             command: >
-              nix develop .#ci-backend -c cargo nextest run --workspace
-              --all-features --profile ci --partition hash:1/4
+              nix --accept-flake-config develop .#ci-backend -c
+              cargo nextest run --workspace --all-features
+              --profile ci --partition hash:1/4
 
           - name: test 2 of 4
             cache_target: test
             command: >
-              nix develop .#ci-backend -c cargo nextest run --workspace
-              --all-features --profile ci --partition hash:2/4
+              nix --accept-flake-config develop .#ci-backend -c
+              cargo nextest run --workspace --all-features
+              --profile ci --partition hash:2/4
 
           - name: test 3 of 4
             cache_target: test
             command: >
-              nix develop .#ci-backend -c cargo nextest run --workspace
-              --all-features --profile ci --partition hash:3/4
+              nix --accept-flake-config develop .#ci-backend -c
+              cargo nextest run --workspace --all-features
+              --profile ci --partition hash:3/4
 
           - name: test 4 of 4
             cache_target: test
             command: >
-              nix develop .#ci-backend -c cargo nextest run --workspace
-              --all-features --profile ci --partition hash:4/4
+              nix --accept-flake-config develop .#ci-backend -c
+              cargo nextest run --workspace --all-features
+              --profile ci --partition hash:4/4
 
           - name: clippy
             cache_target: clippy
             command: >
-              nix develop .#ci-backend -c cargo clippy --workspace
-              --all-targets --all-features
+              nix --accept-flake-config develop .#ci-backend -c
+              cargo clippy --workspace --all-targets --all-features
 
     env:
       CARGO_INCREMENTAL: "0"
@@ -113,21 +119,26 @@ jobs:
 
       - name: Check bun.nix is up to date
         run: |
-          nix run .#genBunNix
-          nix fmt -- dashboard/bun.nix
+          nix --accept-flake-config run .#genBunNix
+
+          nix --accept-flake-config fmt -- dashboard/bun.nix
+
           git diff --exit-code dashboard/bun.nix
 
       - name: Generate dashboard API bindings
-        run: nix run .#st0x-dto -- dashboard/src/lib/api
+        run: nix --accept-flake-config run .#st0x-dto -- dashboard/src/lib/api
 
       - name: Dashboard lint
         working-directory: dashboard
         run: |
-          nix develop "$GITHUB_WORKSPACE#ci-dashboard" -c bun install --frozen-lockfile
-          nix develop "$GITHUB_WORKSPACE#ci-dashboard" -c bun run lint
+          nix --accept-flake-config develop "$GITHUB_WORKSPACE#ci-dashboard" \
+            -c bun install --frozen-lockfile
+
+          nix --accept-flake-config develop "$GITHUB_WORKSPACE#ci-dashboard" \
+            -c bun run lint
 
       - name: Dashboard
-        run: nix build .#st0x-dashboard
+        run: nix --accept-flake-config build .#st0x-dashboard
 
   packages:
     runs-on: blacksmith-8vcpu-ubuntu-2404
@@ -158,7 +169,7 @@ jobs:
             fallback = true
 
       - name: pre-commit hooks
-        run: nix develop .#ci-hooks -c pre-commit run --all-files
+        run: nix --accept-flake-config develop .#ci-hooks -c pre-commit run --all-files
 
       - name: patch-rain-math-float script tests
-        run: nix build .#test-patch-rain-math-float
+        run: nix --accept-flake-config build .#test-patch-rain-math-float
