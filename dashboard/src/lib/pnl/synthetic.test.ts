@@ -82,6 +82,12 @@ describe('generateSyntheticPnlDataset', () => {
         + Number(summary.directionalImbalanceExcessPnlUsd),
       1,
     )
+    expect(Number(summary.realizedPnlUsd)).toBeCloseTo(
+      Number(summary.counterTradePnlUsd)
+        + Number(summary.onchainNettingPnlUsd)
+        + Number(summary.directionalImbalanceExcessPnlUsd),
+      1,
+    )
     expect(entrySum('counter_trade')).toBeCloseTo(Number(summary.counterTradePnlUsd), 1)
     expect(entrySum('onchain_netting')).toBeCloseTo(Number(summary.onchainNettingPnlUsd), 1)
     expect(entrySum('directional_exposure')).toBeCloseTo(Number(summary.directionalImbalanceExcessPnlUsd), 1)

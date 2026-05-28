@@ -233,7 +233,7 @@
     target.directionalInventoryBaselinePnlUsd = moneyText(baseline)
     target.directionalImbalanceExcessPnlUsd = moneyText(excess)
     target.directionalExposurePnlUsd = moneyText(directional)
-    target.realizedPnlUsd = moneyText(realized)
+    target.realizedPnlUsd = moneyText(realized + excess)
     target.totalPnlUsd = moneyText(realized + directional)
     target.inventoryDriftUsd = target.directionalInventoryBaselinePnlUsd
   }
@@ -366,7 +366,8 @@
     )
     const directional =
       sums.directionalInventoryBaselinePnlUsd + sums.directionalImbalanceExcessPnlUsd
-    const realized = sums.counterTradePnlUsd + sums.onchainNettingPnlUsd
+    const realized =
+      sums.counterTradePnlUsd + sums.onchainNettingPnlUsd + sums.directionalImbalanceExcessPnlUsd
 
     return {
       counterTradePnlUsd: moneyText(sums.counterTradePnlUsd),
@@ -375,7 +376,7 @@
       directionalImbalanceExcessPnlUsd: moneyText(sums.directionalImbalanceExcessPnlUsd),
       directionalExposurePnlUsd: moneyText(directional),
       realizedPnlUsd: moneyText(realized),
-      totalPnlUsd: moneyText(realized + directional),
+      totalPnlUsd: moneyText(realized + sums.directionalInventoryBaselinePnlUsd),
       inventoryDriftShares: '0',
       inventoryDriftUsd: moneyText(sums.directionalInventoryBaselinePnlUsd),
       openLongShares: '0',

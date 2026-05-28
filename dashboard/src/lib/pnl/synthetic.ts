@@ -274,7 +274,7 @@ const addSummaryStreams = (
   const baseline = Number(target.directionalInventoryBaselinePnlUsd) + Number(row.directionalInventoryBaselinePnlUsd)
   const excess = Number(target.directionalImbalanceExcessPnlUsd) + Number(row.directionalImbalanceExcessPnlUsd)
   const directional = baseline + excess
-  const realized = counter + onchain
+  const realized = counter + onchain + excess
 
   target.counterTradePnlUsd = moneyText(counter)
   target.onchainNettingPnlUsd = moneyText(onchain)
@@ -282,7 +282,7 @@ const addSummaryStreams = (
   target.directionalImbalanceExcessPnlUsd = moneyText(excess)
   target.directionalExposurePnlUsd = moneyText(directional)
   target.realizedPnlUsd = moneyText(realized)
-  target.totalPnlUsd = moneyText(realized + directional)
+  target.totalPnlUsd = moneyText(realized + baseline)
 }
 
 const addSymbolStreams = (
@@ -294,7 +294,7 @@ const addSymbolStreams = (
   const baseline = Number(target.directionalInventoryBaselinePnlUsd) + Number(row.directionalInventoryBaselinePnlUsd)
   const excess = Number(target.directionalImbalanceExcessPnlUsd) + Number(row.directionalImbalanceExcessPnlUsd)
   const directional = baseline + excess
-  const realized = counter + onchain
+  const realized = counter + onchain + excess
 
   target.counterTradePnlUsd = moneyText(counter)
   target.onchainNettingPnlUsd = moneyText(onchain)
@@ -302,7 +302,7 @@ const addSymbolStreams = (
   target.directionalImbalanceExcessPnlUsd = moneyText(excess)
   target.directionalExposurePnlUsd = moneyText(directional)
   target.realizedPnlUsd = moneyText(realized)
-  target.totalPnlUsd = moneyText(realized + directional)
+  target.totalPnlUsd = moneyText(realized + baseline)
 }
 
 const symbolSummary = (symbol: string): PnlSymbolSummary => ({

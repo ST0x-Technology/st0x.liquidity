@@ -147,6 +147,7 @@ describe('buildPnlResponseFromSqlRows', () => {
     expect(report.summary.directionalImbalanceExcessPnlUsd).toBe('2')
     expect(report.summary.directionalExposurePnlUsd).toBe('2')
     expect(report.summary.totalPnlUsd).toBe('2')
+    expect(report.summary.realizedPnlUsd).toBe('2')
     expect(report.entries[0]?.pnlBucket).toBe('directional_exposure')
     expect(report.entries[0]?.delayedCounterTrade).toBe(true)
   })
@@ -295,6 +296,7 @@ describe('buildPnlResponseFromSqlRows', () => {
 
     expect(report.summary.totalPnlUsd).toBe('2')
     expect(report.summary.directionalImbalanceExcessPnlUsd).toBe('2')
+    expect(report.summary.realizedPnlUsd).toBe('2')
     expect(report.summary.onchainNotionalUsd).toBe('10')
     expect(report.summary.offchainNotionalUsd).toBe('8')
     expect(report.summary.unmatchedOffchainShares).toBe('0')

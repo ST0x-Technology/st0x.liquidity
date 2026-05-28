@@ -445,6 +445,7 @@ const addRealizedPnl = (summary: SummaryAcc, bucket: PnlBucket, value: Decimal):
 
   summary.directionalImbalanceExcessPnlUsd = summary.directionalImbalanceExcessPnlUsd.plus(value)
   summary.directionalExposurePnlUsd = summary.directionalExposurePnlUsd.plus(value)
+  summary.realizedPnlUsd = summary.realizedPnlUsd.plus(value)
 }
 
 const parseOnchainFill = (row: SqlPositionEventRow, warnings: string[]): Fill | null => {
@@ -1042,6 +1043,7 @@ const summaryFromEntries = (
     } else if (entry.pnlBucket === 'directional_exposure') {
       summary.directionalImbalanceExcessPnlUsd = summary.directionalImbalanceExcessPnlUsd.plus(pnl)
       summary.directionalExposurePnlUsd = summary.directionalExposurePnlUsd.plus(pnl)
+      summary.realizedPnlUsd = summary.realizedPnlUsd.plus(pnl)
     }
   }
 
