@@ -1041,7 +1041,12 @@ const buildWindows = (entries: PnlEntry[], symbols: string[]): SyntheticPnlWindo
 
   for (const entry of entries) {
     const key = dateKey(entry.closedAt)
-    byDate.set(key, [...(byDate.get(key) ?? []), entry])
+    const dayEntries = byDate.get(key)
+    if (dayEntries === undefined) {
+      byDate.set(key, [entry])
+    } else {
+      dayEntries.push(entry)
+    }
   }
 
   return [...byDate.entries()]
