@@ -112,6 +112,7 @@
     presetStartForRange('1w', initialAvailableStartDate, initialAvailableEndDate)
   )
   const toDate = reactive(initialAvailableEndDate)
+  let fetchSeq = 0
 
   const streamLabels: Record<PnlStreamKey, string> = {
     counterTradePnlUsd: 'Counter-trade',
@@ -410,6 +411,8 @@
   }
 
   const fetchPnl = async () => {
+    const seq = ++fetchSeq
+
     if (dataMode.current === 'synthetic') {
       loadSyntheticPnl()
       return
@@ -428,15 +431,19 @@
         dayFilter: dayFilter.current
       })
 
+      if (seq !== fetchSeq) return
+
       report.update(() => data)
       total.update(() => data.total)
       entries.update(() => data.entries)
 
       syncAvailableSymbols(data.symbolUniverse ?? data.symbols.map((summary) => summary.symbol))
     } catch (fetchError) {
+      if (seq !== fetchSeq) return
+
       error.update(() => (fetchError instanceof Error ? fetchError.message : 'Unknown error'))
     } finally {
-      loading.update(() => false)
+      if (seq === fetchSeq) loading.update(() => false)
     }
   }
 
