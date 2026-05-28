@@ -94,15 +94,24 @@ describe('buildSqlApiUrl', () => {
   })
 
   it('supports the local same-origin SQL proxy path', () => {
-    Object.defineProperty(globalThis, 'location', {
-      value: { origin: 'http://localhost:5174' },
-      writable: true,
-      configurable: true
-    })
+    const previousLocation = (globalThis as { location?: Location }).location
+    try {
+      Object.defineProperty(globalThis, 'location', {
+        value: { origin: 'http://localhost:5174' },
+        writable: true,
+        configurable: true
+      })
 
-    expect(buildSqlApiUrl('/__pnl_sql', 'SELECT 1')).toBe(
-      'http://localhost:5174/__pnl_sql?sql=SELECT+1&_shape=objects&_size=max'
-    )
+      expect(buildSqlApiUrl('/__pnl_sql', 'SELECT 1')).toBe(
+        'http://localhost:5174/__pnl_sql?sql=SELECT+1&_shape=objects&_size=max'
+      )
+    } finally {
+      Object.defineProperty(globalThis, 'location', {
+        value: previousLocation,
+        writable: true,
+        configurable: true
+      })
+    }
   })
 })
 
