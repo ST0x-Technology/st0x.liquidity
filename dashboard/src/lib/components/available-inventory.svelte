@@ -7,6 +7,7 @@
   import InventoryHoverValue from '$lib/components/inventory-hover-value.svelte'
   import { decimalAdd, decimalCompare, decimalIsZero, formatDecimal } from '$lib/decimal'
   import { reactive } from '$lib/frp.svelte'
+  import { cashInventoryAmounts } from '$lib/inventory-cash'
   import { cashUsdTooltip, equityUsdTooltip, positionSharesTooltip } from '$lib/inventory-value'
 
   interface Props {
@@ -26,7 +27,7 @@
   type Formatted = { display: string; full: string; truncated: boolean }
 
   const fmtValue = (value: string): Formatted => {
-    const display = trimTrailingZeros(formatDecimal(value, 3))
+    const display = trimTrailingZeros(formatDecimal(value, 2))
     const lossless = trimTrailingZeros(formatDecimal(value, 18))
     const truncated = display !== lossless
     return {
@@ -157,9 +158,10 @@
   )
 
   type CashCells = {
-    alpacaAvail: Formatted
-    gross: Formatted | null
-    withdrawable: Formatted | null
+    alpacaUsd: Formatted
+    alpacaUsdc: Formatted | null
+    counterTradeUsd: Formatted
+    rebalanceableUsd: Formatted | null
     inflight: Formatted
     ethWallet: Formatted | null
     baseWallet: Formatted | null
@@ -172,19 +174,21 @@
     if (!usdc) return null
 
     const inflight = decimalAdd(usdc.onchainInflight, usdc.offchainInflight)
-    const total = decimalAdd(decimalAdd(usdc.onchainAvailable, usdc.offchainAvailable), inflight)
+    const amounts = cashInventoryAmounts(usdc, settings?.cashReserved ?? null)
 
     return {
-      alpacaAvail: fmt(usdc.offchainAvailable),
-      gross: usdc.offchainGross === null ? null : fmt(usdc.offchainGross),
-      withdrawable: usdc.withdrawableCash === null ? null : fmt(usdc.withdrawableCash),
+      alpacaUsd: fmt(amounts.alpacaUsd),
+      alpacaUsdc: amounts.alpacaUsdc === null ? null : fmt(amounts.alpacaUsdc),
+      counterTradeUsd: fmt(amounts.counterTradeUsd),
+      rebalanceableUsd:
+        amounts.rebalanceableUsd === null ? null : fmt(amounts.rebalanceableUsd),
       inflight: fmt(inflight),
       ethWallet:
         usdc.inflightCash.ethereumWallet === null ? null : fmt(usdc.inflightCash.ethereumWallet),
       baseWallet: usdc.inflightCash.baseWallet === null ? null : fmt(usdc.inflightCash.baseWallet),
       raindex: fmt(usdc.onchainAvailable),
-      total: fmtValue(total),
-      ratio: computeRatio(usdc.onchainAvailable, usdc.offchainAvailable)
+      total: fmtValue(amounts.trackedTotal),
+      ratio: amounts.venueRatio
     }
   })
 
@@ -234,7 +238,7 @@
 
   type DeviationStyle = 'normal' | 'high' | 'low'
 
-  type Deviation = { text: string; style: DeviationStyle }
+  type Deviation = { style: DeviationStyle }
 
   const ratioDeviation = (ratio: number, isCash: boolean): Deviation | null => {
     if (!settings) return null
@@ -244,18 +248,10 @@
       ? (settings.usdcDeviation ?? settings.equityDeviation)
       : settings.equityDeviation
     const diff = ratio - target
-    const sign = diff >= 0 ? '+' : ''
-    const text = `${sign}${(diff * 100).toFixed(1)}%`
 
-    if (diff > deviation) return { text, style: 'high' }
-    if (diff < -deviation) return { text, style: 'low' }
-    return { text, style: 'normal' }
-  }
-
-  const deviationColor = (style: DeviationStyle): string => {
-    if (style === 'high') return 'text-green-500'
-    if (style === 'low') return 'text-red-500'
-    return 'text-muted-foreground'
+    if (diff > deviation) return { style: 'high' }
+    if (diff < -deviation) return { style: 'low' }
+    return { style: 'normal' }
   }
 
   const isNegligible = (value: number): boolean => Math.abs(value) < 0.01
@@ -267,9 +263,11 @@
     return `${sign}$${abs.toFixed(2)}`
   }
 
-  const showGross = $derived(cashCells?.gross !== null && cashCells?.gross !== undefined)
-  const showWithdrawable = $derived(
-    cashCells?.withdrawable !== null && cashCells?.withdrawable !== undefined
+  const showRebalanceable = $derived(
+    cashCells?.rebalanceableUsd !== null && cashCells?.rebalanceableUsd !== undefined
+  )
+  const showAlpacaUsdc = $derived(
+    cashCells?.alpacaUsdc !== null && cashCells?.alpacaUsdc !== undefined
   )
   const showEthWallet = $derived(
     cashCells?.ethWallet !== null && cashCells?.ethWallet !== undefined
@@ -281,73 +279,110 @@
   // Visual separator before wallet-observed / info columns to signal they're
   // out-of-band and not part of imbalance math.
   const infoSepClass = 'border-l border-border pl-6'
-  const cashFirstInfoCol = $derived<'gross' | 'withdrawable' | 'eth' | 'base' | null>(
-    showGross
-      ? 'gross'
-      : showWithdrawable
-        ? 'withdrawable'
-        : showEthWallet
-          ? 'eth'
-          : showBaseWallet
-            ? 'base'
-            : null
+  const groupSepClass = 'border-l border-border'
+  const cashCoreHeadClass = 'h-8 align-bottom pb-1 text-left'
+  const cashGroupHeadClass = 'h-4 pb-0 pt-1 text-center align-bottom text-[10px]'
+  const cashSubHeadClass = 'h-6 pt-0 text-left'
+  const inventoryNumberClass = 'text-[13px]'
+  type CashInfoCol = 'alpacaUsdc' | 'rebalanceable' | 'counterTrade' | 'eth' | 'base'
+
+  const alpacaCashColCount = $derived(
+    (showAlpacaUsdc ? 1 : 0) + (showRebalanceable ? 1 : 0) + (cashCells ? 1 : 0)
   )
-  const cashInfoBoundary = (col: 'gross' | 'withdrawable' | 'eth' | 'base'): string =>
-    cashFirstInfoCol === col ? infoSepClass : ''
+  const walletCashColCount = $derived((showEthWallet ? 1 : 0) + (showBaseWallet ? 1 : 0))
+  const cashFirstAlpacaCol = $derived<CashInfoCol | null>(
+    showAlpacaUsdc
+      ? 'alpacaUsdc'
+      : showRebalanceable
+        ? 'rebalanceable'
+        : cashCells
+          ? 'counterTrade'
+          : null
+  )
+  const cashFirstWalletCol = $derived<CashInfoCol | null>(
+    showEthWallet ? 'eth' : showBaseWallet ? 'base' : null
+  )
+  const cashSectionBoundary = (col: CashInfoCol): string =>
+    col === cashFirstAlpacaCol || col === cashFirstWalletCol ? infoSepClass : ''
 </script>
 
 {#if cashCells}
   {@const dev = ratioDeviation(cashCells.ratio, true)}
   <div class="cash-table">
     <Table.Root>
-      <Table.Header>
+      <Table.Header class="[&_tr:first-child]:border-b-0">
         <Table.Row>
-          <Table.Head class="text-left">Asset</Table.Head>
-          <Table.Head class="text-left" title="USDC available in Raindex vaults to settle takers."
+          <Table.Head class={cashCoreHeadClass} rowspan={2}>Asset</Table.Head>
+          <Table.Head
+            class={cashCoreHeadClass}
+            rowspan={2}
+            title="USDC available in Raindex vaults to settle takers."
             >Raindex</Table.Head
           >
           <Table.Head
-            class="text-left"
+            class={cashCoreHeadClass}
+            rowspan={2}
             title="USDC the books track as in motion between venues (CCTP transfers, pending settlements). Part of imbalance math."
             >Inflight</Table.Head
           >
           <Table.Head
-            class="text-left"
-            title="USDC available to trade on Alpaca after subtracting the configured cash reserve."
-            >Alpaca Available</Table.Head
+            class={cashCoreHeadClass}
+            rowspan={2}
+            title="Total USD sitting at Alpaca. If no reserve is configured, this equals the reserve-adjusted balance."
+            >Alpaca Total</Table.Head
           >
-          <Table.Head class="text-left">Total</Table.Head>
+          <Table.Head class={cashCoreHeadClass} rowspan={2}>Total</Table.Head>
           <Table.Head
-            class="text-left"
-            title="Proportion of total cash on Raindex (onchain / total).">Ratio</Table.Head
+            class={cashCoreHeadClass}
+            rowspan={2}
+            title="Venue split for cash allocation: Raindex / (Raindex + Alpaca Total). Tracked Inflight is shown in Total but excluded from this venue ratio."
+            >Ratio</Table.Head
           >
-          <Table.Head class="w-full" aria-hidden="true"></Table.Head>
-          {#if showGross}
-            <Table.Head
-              class="info-col text-left {cashInfoBoundary('gross')}"
-              title="Full broker USDC balance before subtracting the configured cash reserve."
-              >Gross</Table.Head
+          <Table.Head class="h-8 w-full" rowspan={2} aria-hidden="true"></Table.Head>
+          <Table.Head class="info-col {cashGroupHeadClass} {groupSepClass}" colspan={alpacaCashColCount}
+            >Alpaca</Table.Head
+          >
+          {#if walletCashColCount > 0}
+            <Table.Head class="info-col {cashGroupHeadClass} {groupSepClass}" colspan={walletCashColCount}
+              >Wallets</Table.Head
             >
           {/if}
-          {#if showWithdrawable}
+        </Table.Row>
+
+        <Table.Row>
+          {#if showAlpacaUsdc}
             <Table.Head
-              class="info-col text-left {cashInfoBoundary('withdrawable')}"
-              title="Settled cash that can be withdrawn or transferred to Raindex. Excludes T+1 unsettled equity-sale proceeds."
-              >Withdrawable</Table.Head
+              class="info-col {cashSubHeadClass} {cashSectionBoundary('alpacaUsdc')}"
+              title="USDC token balance held in the Alpaca account. This is separate from Alpaca USD cash and does not count toward the cash reserve."
+              >USDC</Table.Head
+            >
+          {/if}
+          {#if showRebalanceable}
+            <Table.Head
+              class="info-col {cashSubHeadClass} {cashSectionBoundary('rebalanceable')}"
+              title="Settled Alpaca cash that can move to Raindex after preserving the configured reserve."
+              >Rebalanceable</Table.Head
+            >
+          {/if}
+          {#if cashCells}
+            <Table.Head
+              class="info-col {cashSubHeadClass} {cashSectionBoundary('counterTrade')}"
+              title="USD available for buy-side equity hedges. The configured reserve is not subtracted from counter-trade preflight."
+              >Counter-tradeable</Table.Head
             >
           {/if}
           {#if showEthWallet}
             <Table.Head
-              class="info-col text-left {cashInfoBoundary('eth')}"
+              class="info-col {cashSubHeadClass} {cashSectionBoundary('eth')}"
               title="Wallet-observed USDC on the Ethereum wallet between Alpaca and CCTP. Not part of imbalance math."
-              >Eth Wallet</Table.Head
+              >Eth</Table.Head
             >
           {/if}
           {#if showBaseWallet}
             <Table.Head
-              class="info-col text-left {cashInfoBoundary('base')}"
+              class="info-col {cashSubHeadClass} {cashSectionBoundary('base')}"
               title="Wallet-observed USDC on the Base wallet between CCTP and Raindex vaults. Not part of imbalance math."
-              >Base Wallet</Table.Head
+              >Base</Table.Head
             >
           {/if}
         </Table.Row>
@@ -357,7 +392,7 @@
         <Table.Row>
           <Table.Cell class="font-mono font-medium">Cash</Table.Cell>
 
-          <Table.Cell class="text-left font-mono">
+          <Table.Cell class="text-left font-mono {inventoryNumberClass}">
             <InventoryHoverValue
               display={cashCells.raindex.display}
               tooltip={cashUsdTooltip(cashCells.raindex.full)}
@@ -365,7 +400,7 @@
             />
           </Table.Cell>
 
-          <Table.Cell class="text-left font-mono">
+          <Table.Cell class="text-left font-mono {inventoryNumberClass}">
             <InventoryHoverValue
               display={cashCells.inflight.display}
               tooltip={cashUsdTooltip(cashCells.inflight.full)}
@@ -373,15 +408,15 @@
             />
           </Table.Cell>
 
-          <Table.Cell class="text-left font-mono">
+          <Table.Cell class="text-left font-mono {inventoryNumberClass}">
             <InventoryHoverValue
-              display={cashCells.alpacaAvail.display}
-              tooltip={cashUsdTooltip(cashCells.alpacaAvail.full)}
-              class={valueClass(cashCells.alpacaAvail)}
+              display={cashCells.alpacaUsd.display}
+              tooltip={cashUsdTooltip(cashCells.alpacaUsd.full)}
+              class={valueClass(cashCells.alpacaUsd)}
             />
           </Table.Cell>
 
-          <Table.Cell class="text-left font-mono font-semibold">
+          <Table.Cell class="text-left font-mono {inventoryNumberClass} font-semibold">
             <InventoryHoverValue
               display={cashCells.total.display}
               tooltip={cashUsdTooltip(cashCells.total.full)}
@@ -401,37 +436,42 @@
                   style="width: {String(Math.min(cashCells.ratio * 100, 100))}%"
                 ></div>
               </div>
-              <span class="font-mono text-xs">{formatRatio(cashCells.ratio)}</span>
-              {#if dev}
-                <span class="text-xs {deviationColor(dev.style)}">({dev.text})</span>
-              {/if}
+              <span class="font-mono text-[11px]">{formatRatio(cashCells.ratio)}</span>
             </div>
           </Table.Cell>
 
           <Table.Cell class="w-full" aria-hidden="true"></Table.Cell>
 
-          {#if showGross && cashCells.gross}
-            <Table.Cell class="info-col text-left font-mono {cashInfoBoundary('gross')}">
+          {#if showAlpacaUsdc && cashCells.alpacaUsdc}
+            <Table.Cell class="info-col text-left font-mono {inventoryNumberClass} {cashSectionBoundary('alpacaUsdc')}">
               <InventoryHoverValue
-                display={cashCells.gross.display}
-                tooltip={cashUsdTooltip(cashCells.gross.full)}
-                class={valueClass(cashCells.gross)}
+                display={cashCells.alpacaUsdc.display}
+                tooltip={cashUsdTooltip(cashCells.alpacaUsdc.full)}
+                class={valueClass(cashCells.alpacaUsdc)}
               />
             </Table.Cell>
           {/if}
 
-          {#if showWithdrawable && cashCells.withdrawable}
-            <Table.Cell class="info-col text-left font-mono {cashInfoBoundary('withdrawable')}">
+          {#if showRebalanceable && cashCells.rebalanceableUsd}
+            <Table.Cell class="info-col text-left font-mono {inventoryNumberClass} {cashSectionBoundary('rebalanceable')}">
               <InventoryHoverValue
-                display={cashCells.withdrawable.display}
-                tooltip={cashUsdTooltip(cashCells.withdrawable.full)}
-                class={valueClass(cashCells.withdrawable)}
+                display={cashCells.rebalanceableUsd.display}
+                tooltip={cashUsdTooltip(cashCells.rebalanceableUsd.full)}
+                class={valueClass(cashCells.rebalanceableUsd)}
               />
             </Table.Cell>
           {/if}
+
+          <Table.Cell class="info-col text-left font-mono {inventoryNumberClass} {cashSectionBoundary('counterTrade')}">
+            <InventoryHoverValue
+              display={cashCells.counterTradeUsd.display}
+              tooltip={cashUsdTooltip(cashCells.counterTradeUsd.full)}
+              class={valueClass(cashCells.counterTradeUsd)}
+            />
+          </Table.Cell>
 
           {#if showEthWallet && cashCells.ethWallet}
-            <Table.Cell class="info-col text-left font-mono {cashInfoBoundary('eth')}">
+            <Table.Cell class="info-col text-left font-mono {inventoryNumberClass} {cashSectionBoundary('eth')}">
               <InventoryHoverValue
                 display={cashCells.ethWallet.display}
                 tooltip={cashUsdTooltip(cashCells.ethWallet.full)}
@@ -441,7 +481,7 @@
           {/if}
 
           {#if showBaseWallet && cashCells.baseWallet}
-            <Table.Cell class="info-col text-left font-mono {cashInfoBoundary('base')}">
+            <Table.Cell class="info-col text-left font-mono {inventoryNumberClass} {cashSectionBoundary('base')}">
               <InventoryHoverValue
                 display={cashCells.baseWallet.display}
                 tooltip={cashUsdTooltip(cashCells.baseWallet.full)}
@@ -558,7 +598,7 @@
             >{row.asset}</Table.Cell
           >
 
-          <Table.Cell class="text-left font-mono">
+          <Table.Cell class="text-left font-mono {inventoryNumberClass}">
             <InventoryHoverValue
               display={row.raindex.display}
               tooltip={equityUsdTooltip(row.raindex.full, row.priceUsdc)}
@@ -566,7 +606,7 @@
             />
           </Table.Cell>
 
-          <Table.Cell class="text-left font-mono">
+          <Table.Cell class="text-left font-mono {inventoryNumberClass}">
             <InventoryHoverValue
               display={row.inflight.display}
               tooltip={equityUsdTooltip(row.inflight.full, row.priceUsdc)}
@@ -574,7 +614,7 @@
             />
           </Table.Cell>
 
-          <Table.Cell class="text-left font-mono">
+          <Table.Cell class="text-left font-mono {inventoryNumberClass}">
             <InventoryHoverValue
               display={row.alpaca.display}
               tooltip={equityUsdTooltip(row.alpaca.full, row.priceUsdc)}
@@ -582,7 +622,7 @@
             />
           </Table.Cell>
 
-          <Table.Cell class="text-left font-mono font-semibold">
+          <Table.Cell class="text-left font-mono {inventoryNumberClass} font-semibold">
             <InventoryHoverValue
               display={row.total.display}
               tooltip={equityUsdTooltip(row.total.full, row.priceUsdc)}
@@ -602,19 +642,14 @@
                   style="width: {String(Math.min(row.ratio * 100, 100))}%"
                 ></div>
               </div>
-              <span class="font-mono text-xs {row.trading ? '' : 'opacity-40'}"
+              <span class="font-mono text-[11px] {row.trading ? '' : 'opacity-40'}"
                 >{formatRatio(row.ratio)}</span
               >
-              {#if dev}
-                <span class="text-xs {deviationColor(dev.style)} {row.trading ? '' : 'opacity-40'}"
-                  >({dev.text})</span
-                >
-              {/if}
             </div>
           </Table.Cell>
 
           <Table.Cell>
-            <div class="flex items-center gap-1.5 font-mono text-xs">
+            <div class="flex items-center gap-1.5 font-mono text-[11px]">
               {#if !isNegligible(row.exposure) && row.exposure !== 0}
                 <span
                   class="text-base leading-none {row.exposure > 0
@@ -635,7 +670,7 @@
 
           <Table.Cell class="w-full" aria-hidden="true"></Table.Cell>
 
-          <Table.Cell class="info-col text-left font-mono {infoSepClass}">
+          <Table.Cell class="info-col text-left font-mono {inventoryNumberClass} {infoSepClass}">
             <InventoryHoverValue
               display={row.unwrapped.display}
               tooltip={equityUsdTooltip(row.unwrapped.full, row.priceUsdc)}
@@ -643,7 +678,7 @@
             />
           </Table.Cell>
 
-          <Table.Cell class="info-col text-left font-mono">
+          <Table.Cell class="info-col text-left font-mono {inventoryNumberClass}">
             <InventoryHoverValue
               display={row.wrapped.display}
               tooltip={equityUsdTooltip(row.wrapped.full, row.priceUsdc)}

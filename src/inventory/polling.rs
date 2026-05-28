@@ -21,9 +21,9 @@ use st0x_evm::{Evm, EvmError, OpenChainErrorRegistry, Wallet};
 use st0x_execution::{
     Executor, FractionalShares, InventoryResult, SharesBlockchain, SharesConversionError, Symbol,
 };
-use st0x_finance::{HasZero, NotNonNegative, Usd, UsdToCentsError};
+use st0x_finance::{HasZero, Usd, UsdToCentsError};
 
-use crate::alpaca_wallet::AlpacaWalletError;
+use crate::alpaca_wallet::{AlpacaWalletError, AlpacaWalletService, Network, TokenSymbol};
 use crate::bindings::IERC20;
 use crate::inventory::snapshot::{
     InventorySnapshot, InventorySnapshotCommand, InventorySnapshotId,
@@ -91,8 +91,8 @@ pub(crate) enum InventoryPollingError<ExecutorError> {
 /// the configured reserve from the gross broker balance.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ReserveError {
-    #[error("gross balance is less than reserve: {0}")]
-    NotNonNegative(#[from] NotNonNegative<Usd>),
+    #[error("broker USD balance is negative: {cents} cents")]
+    NegativeBrokerBalance { cents: i64 },
     #[error(transparent)]
     Arithmetic(#[from] FloatError),
     #[error(transparent)]
@@ -119,6 +119,7 @@ where
     snapshot_id: InventorySnapshotId,
     snapshot: Arc<Store<InventorySnapshot>>,
     wallet_polling: Option<WalletPollingCtx>,
+    alpaca_wallet: Option<Arc<AlpacaWalletService>>,
     tokenizer: Option<Arc<dyn Tokenizer>>,
     pending_request_ownership: Option<Arc<dyn PendingRequestOwnership>>,
     external_pending_warnings: Mutex<HashSet<TokenizationRequestId>>,
@@ -150,6 +151,7 @@ where
             snapshot_id,
             snapshot,
             wallet_polling,
+            alpaca_wallet: None,
             tokenizer,
             pending_request_ownership: None,
             external_pending_warnings: Mutex::new(HashSet::new()),
@@ -175,12 +177,18 @@ where
         self
     }
 
+    pub(crate) fn with_alpaca_wallet(mut self, alpaca_wallet: Arc<AlpacaWalletService>) -> Self {
+        self.alpaca_wallet = Some(alpaca_wallet);
+        self
+    }
+
     /// Polls actual inventory from all venues and emits snapshot commands.
     ///
     /// 1. Queries inflight equity from tokenization provider (must be first)
     /// 2. Queries onchain equity and USDC balances from Base vaults
     /// 3. Queries Ethereum wallet USDC balance (if configured)
-    /// 4. Queries offchain positions and cash from executor
+    /// 4. Queries Alpaca account USDC balance (if configured)
+    /// 5. Queries offchain positions and cash from executor
     ///
     /// Inflight must be polled first. Balance snapshots trigger
     /// check_and_trigger_equity, which skips when has_inflight() is true.
@@ -193,6 +201,7 @@ where
         self.poll_inflight_equity(snapshot_id).await?;
         self.poll_onchain(snapshot_id).await?;
         self.poll_wallets(snapshot_id).await?;
+        self.poll_alpaca_usdc(snapshot_id).await?;
         self.poll_offchain(snapshot_id).await?;
 
         Ok(())
@@ -450,6 +459,29 @@ where
         let results = try_join_all(balance_futures).await?;
 
         Ok(results.into_iter().collect())
+    }
+
+    async fn poll_alpaca_usdc(
+        &self,
+        snapshot_id: &InventorySnapshotId,
+    ) -> Result<(), InventoryPollingError<Exe::Error>> {
+        let Some(alpaca_wallet) = &self.alpaca_wallet else {
+            debug!(target: "inventory", "No Alpaca asset balance polling configured, skipping Alpaca USDC polling");
+            return Ok(());
+        };
+
+        let usdc_balance = alpaca_wallet
+            .get_asset_balance(&TokenSymbol::new("USDC"), &Network::new("ethereum"))
+            .await?;
+
+        self.snapshot
+            .send(
+                snapshot_id,
+                InventorySnapshotCommand::AlpacaUsdc { usdc_balance },
+            )
+            .await?;
+
+        Ok(())
     }
 
     async fn poll_offchain(
@@ -750,11 +782,15 @@ where
     }
 }
 
-/// Computes gross and available cash in cents after subtracting the reserve.
+/// Computes gross and reserve-adjusted available cash in cents.
 ///
 /// Returns `(gross_usd_cents, available_usd_cents)`. `gross_usd_cents` is
 /// `None` when `reserved_cash` is zero (no reserve configured), so the
-/// dashboard can hide the Gross/Reserve row for no-reserve deployments.
+/// dashboard can hide reserve-specific context for no-reserve deployments.
+///
+/// When the broker balance is below the configured reserve, available cash is
+/// explicitly zero. This is a valid capacity state: all Alpaca cash is protected
+/// by the reserve, and downstream rebalancing should see no outbound capacity.
 fn compute_available_cash(
     broker_usd_balance_cents: i64,
     reserved_cash: Usd,
@@ -763,15 +799,25 @@ fn compute_available_cash(
         Usd::from_cents(broker_usd_balance_cents).ok_or(ReserveError::BrokerCentsConversion {
             cents: broker_usd_balance_cents,
         })?;
-    let available = (gross - reserved_cash)?;
-    let available = st0x_finance::NonNegative::new(available)?;
+
+    if gross < Usd::ZERO {
+        return Err(ReserveError::NegativeBrokerBalance {
+            cents: broker_usd_balance_cents,
+        });
+    }
+
+    let available = if gross < reserved_cash {
+        Usd::ZERO
+    } else {
+        (gross - reserved_cash)?
+    };
 
     let gross_usd_cents = if reserved_cash > Usd::ZERO {
         Some(gross.to_cents()?)
     } else {
         None
     };
-    let available_usd_cents = available.inner().to_cents()?;
+    let available_usd_cents = available.to_cents()?;
 
     Ok((gross_usd_cents, available_usd_cents))
 }
@@ -815,11 +861,16 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Utc;
     use httpmock::prelude::*;
+    use serde_json::json;
     use sqlx::{Row, SqlitePool};
     use st0x_event_sorcery::{StoreBuilder, test_store};
     use st0x_evm::ReadOnlyEvm;
-    use st0x_execution::{EquityPosition, FractionalShares, Inventory, MockExecutor, Symbol};
+    use st0x_execution::{
+        AlpacaAccountId, EquityPosition, FractionalShares, Inventory, MockExecutor, Symbol,
+    };
+    use st0x_finance::Usdc;
     use st0x_float_macro::float;
+    use uuid::uuid;
 
     use super::*;
     use crate::inventory::snapshot::InventorySnapshotEvent;
@@ -1335,7 +1386,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reserved_cash_larger_than_balance_errors() {
+    async fn reserved_cash_larger_than_balance_sets_available_to_zero() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
         let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
@@ -1365,11 +1416,31 @@ mod tests {
             reserved,
         );
 
-        let error = service.poll_and_record().await.unwrap_err();
+        service.poll_and_record().await.unwrap();
 
-        assert!(
-            matches!(error, InventoryPollingError::Reserve(_)),
-            "Expected Reserve error when gross < reserved, got: {error:?}"
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        let offchain_usd_event = events
+            .iter()
+            .find(|event| matches!(event, InventorySnapshotEvent::OffchainUsd { .. }))
+            .expect("Expected OffchainUsd event");
+
+        let InventorySnapshotEvent::OffchainUsd {
+            usd_balance_cents,
+            gross_usd_cents,
+            ..
+        } = offchain_usd_event
+        else {
+            panic!("Expected OffchainUsd event");
+        };
+
+        assert_eq!(
+            *usd_balance_cents, 0,
+            "Reserve-adjusted available cash should be zero when gross is below reserve"
+        );
+        assert_eq!(
+            *gross_usd_cents,
+            Some(3_000_000),
+            "Gross balance should still be emitted so the dashboard can show cash below reserve"
         );
     }
 
@@ -1951,6 +2022,157 @@ mod tests {
     }
 
     /// Loads all InventorySnapshotEvents for the given orderbook/owner from the event store.
+    const TEST_ALPACA_ACCOUNT_ID: AlpacaAccountId =
+        AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
+
+    fn alpaca_wallet_balance_mock<'server>(
+        server: &'server MockServer,
+        balance: &str,
+    ) -> httpmock::Mock<'server> {
+        server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v1/accounts/{TEST_ALPACA_ACCOUNT_ID}/wallets"))
+                .query_param("asset", "USDC")
+                .query_param("network", "ethereum");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "asset_id": "5d0de74f-827b-41a7-9f74-9c07c08fe55f",
+                    "asset": "USDC",
+                    "address": "0x42a76C83014e886e639768D84EAF3573b1876844",
+                    "balance": balance,
+                    "created_at": "2025-08-07T08:52:40.656166Z"
+                }));
+        })
+    }
+
+    fn alpaca_wallet_service(server: &MockServer) -> Arc<AlpacaWalletService> {
+        Arc::new(AlpacaWalletService::new(
+            server.base_url(),
+            TEST_ALPACA_ACCOUNT_ID,
+            "test_key_id".to_string(),
+            "test_secret_key".to_string(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn poll_alpaca_usdc_emits_command_with_polled_balance() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let (orderbook, order_owner) = test_addresses();
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+
+        let server = MockServer::start();
+        let mock = alpaca_wallet_balance_mock(&server, "125.75");
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            MockExecutor::new(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            snapshot_id.clone(),
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            None,
+            Usd::ZERO,
+        )
+        .with_alpaca_wallet(alpaca_wallet_service(&server));
+
+        service.poll_alpaca_usdc(&snapshot_id).await.unwrap();
+
+        mock.assert();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        let alpaca_event = events
+            .iter()
+            .find(|event| matches!(event, InventorySnapshotEvent::AlpacaUsdc { .. }))
+            .expect("Expected AlpacaUsdc event to be emitted");
+
+        let InventorySnapshotEvent::AlpacaUsdc { usdc_balance, .. } = alpaca_event else {
+            panic!("Expected AlpacaUsdc event, got {alpaca_event:?}");
+        };
+        assert_eq!(*usdc_balance, Usdc::new(float!(125.75)));
+    }
+
+    #[tokio::test]
+    async fn poll_alpaca_usdc_is_noop_when_wallet_unconfigured() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let (orderbook, order_owner) = test_addresses();
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            MockExecutor::new(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            snapshot_id.clone(),
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            None,
+            Usd::ZERO,
+        );
+
+        service.poll_alpaca_usdc(&snapshot_id).await.unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, InventorySnapshotEvent::AlpacaUsdc { .. })),
+            "Must not emit AlpacaUsdc when no Alpaca wallet is configured",
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_alpaca_usdc_propagates_balance_query_error() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let (orderbook, order_owner) = test_addresses();
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v1/accounts/{TEST_ALPACA_ACCOUNT_ID}/wallets"))
+                .query_param("asset", "USDC")
+                .query_param("network", "ethereum");
+            then.status(500)
+                .header("content-type", "application/json")
+                .json_body(json!({ "message": "internal error" }));
+        });
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            MockExecutor::new(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            snapshot_id.clone(),
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            None,
+            Usd::ZERO,
+        )
+        .with_alpaca_wallet(alpaca_wallet_service(&server));
+
+        let error = service.poll_alpaca_usdc(&snapshot_id).await.unwrap_err();
+
+        mock.assert();
+        assert!(
+            matches!(error, InventoryPollingError::AlpacaWallet(_)),
+            "Balance query failure must surface as AlpacaWallet error, got {error:?}",
+        );
+    }
+
     async fn load_snapshot_events(
         pool: &SqlitePool,
         orderbook: Address,

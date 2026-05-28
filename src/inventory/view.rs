@@ -636,6 +636,9 @@ pub(crate) struct InventoryView {
     /// Gross offchain USD balance in cents (before cash reserve subtraction).
     #[serde(default)]
     offchain_gross_usd_cents: Option<i64>,
+    /// USDC token balance held in the Alpaca account.
+    #[serde(default)]
+    alpaca_usdc: Option<Usdc>,
     /// USDC observed at intermediate locations between the two venues.
     /// Populated from wallet-read snapshots and exposed for visibility
     /// into in-flight transit. Does not feed the imbalance math.
@@ -886,6 +889,7 @@ impl InventoryView {
                 offchain_inflight: usdc_offchain_inflight,
                 offchain_gross,
                 withdrawable_cash,
+                alpaca_usdc: self.alpaca_usdc,
                 inflight_cash,
             },
         }
@@ -914,6 +918,7 @@ impl Default for InventoryView {
             buying_power_cents: None,
             withdrawable_cash_cents: None,
             offchain_gross_usd_cents: None,
+            alpaca_usdc: None,
             inflight_cash: HashMap::new(),
             active_usdc_rebalance: None,
             active_mints: HashMap::new(),
@@ -1062,6 +1067,7 @@ impl InventoryView {
             buying_power_cents: self.buying_power_cents,
             withdrawable_cash_cents: self.withdrawable_cash_cents,
             offchain_gross_usd_cents: self.offchain_gross_usd_cents,
+            alpaca_usdc: self.alpaca_usdc,
             inflight_cash: self.inflight_cash,
             active_usdc_rebalance: self.active_usdc_rebalance,
             active_mints: self.active_mints,
@@ -1088,6 +1094,7 @@ impl InventoryView {
             buying_power_cents: self.buying_power_cents,
             withdrawable_cash_cents: self.withdrawable_cash_cents,
             offchain_gross_usd_cents: self.offchain_gross_usd_cents,
+            alpaca_usdc: self.alpaca_usdc,
             inflight_cash: self.inflight_cash,
             active_usdc_rebalance: self.active_usdc_rebalance,
             active_mints: self.active_mints,
@@ -1326,6 +1333,7 @@ impl InventoryView {
             buying_power_cents: self.buying_power_cents,
             withdrawable_cash_cents: self.withdrawable_cash_cents,
             offchain_gross_usd_cents: self.offchain_gross_usd_cents,
+            alpaca_usdc: self.alpaca_usdc,
             inflight_cash: self.inflight_cash,
             active_usdc_rebalance: self.active_usdc_rebalance,
             active_mints: self.active_mints,
@@ -1353,6 +1361,7 @@ impl InventoryView {
             buying_power_cents: self.buying_power_cents,
             withdrawable_cash_cents: self.withdrawable_cash_cents,
             offchain_gross_usd_cents: self.offchain_gross_usd_cents,
+            alpaca_usdc: self.alpaca_usdc,
             inflight_cash: self.inflight_cash,
             active_usdc_rebalance: self.active_usdc_rebalance,
             active_mints: self.active_mints,
@@ -1658,6 +1667,11 @@ impl InventoryView {
                 })
             }
 
+            AlpacaUsdc { usdc_balance, .. } => Ok(Self {
+                alpaca_usdc: Some(*usdc_balance),
+                ..self
+            }),
+
             EthereumUsdc {
                 usdc_balance,
                 fetched_at,
@@ -1809,6 +1823,11 @@ impl InventoryView {
                 ..self
             }),
 
+            AlpacaUsdc { usdc_balance, .. } => Ok(Self {
+                alpaca_usdc: Some(*usdc_balance),
+                ..self
+            }),
+
             EthereumUsdc {
                 usdc_balance,
                 fetched_at,
@@ -1955,6 +1974,7 @@ mod tests {
             buying_power_cents: None,
             withdrawable_cash_cents: None,
             offchain_gross_usd_cents: None,
+            alpaca_usdc: None,
             inflight_cash: HashMap::new(),
             active_usdc_rebalance: None,
             active_mints: HashMap::new(),
@@ -1985,6 +2005,7 @@ mod tests {
             buying_power_cents: None,
             withdrawable_cash_cents: None,
             offchain_gross_usd_cents: None,
+            alpaca_usdc: None,
             inflight_cash: HashMap::new(),
             active_usdc_rebalance: None,
             active_mints: HashMap::new(),
@@ -3350,6 +3371,7 @@ mod tests {
             buying_power_cents: None,
             withdrawable_cash_cents: None,
             offchain_gross_usd_cents: None,
+            alpaca_usdc: None,
             inflight_cash: HashMap::new(),
             active_usdc_rebalance: None,
             active_mints: HashMap::new(),
@@ -3402,6 +3424,7 @@ mod tests {
             buying_power_cents: None,
             withdrawable_cash_cents: None,
             offchain_gross_usd_cents: None,
+            alpaca_usdc: None,
             inflight_cash: HashMap::new(),
             active_usdc_rebalance: None,
             active_mints: HashMap::new(),
@@ -3481,6 +3504,54 @@ mod tests {
 
         assert_eq!(dto.usdc.inflight_cash.ethereum_wallet, None);
         assert_eq!(dto.usdc.inflight_cash.base_wallet, None);
+    }
+
+    #[test]
+    fn to_dto_exports_alpaca_usdc_from_applied_snapshot_event() {
+        let now = Utc::now();
+        let balance = Usdc::new(float!(12.5));
+
+        let dto = InventoryView::default()
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::AlpacaUsdc {
+                    usdc_balance: balance,
+                    fetched_at: now,
+                },
+                now,
+            )
+            .unwrap()
+            .to_dto();
+
+        assert_eq!(
+            dto.usdc.alpaca_usdc,
+            Some(balance),
+            "AlpacaUsdc snapshot event must survive apply_snapshot_event into the DTO",
+        );
+    }
+
+    #[test]
+    fn to_dto_exports_alpaca_usdc_from_force_applied_snapshot_event() {
+        let now = Utc::now();
+        let balance = Usdc::new(float!(12.5));
+        let reason = Arc::new(InventoryViewError::UsdBalanceConversion(0));
+
+        let dto = InventoryView::default()
+            .force_apply_snapshot_event(
+                &InventorySnapshotEvent::AlpacaUsdc {
+                    usdc_balance: balance,
+                    fetched_at: now,
+                },
+                now,
+                reason,
+            )
+            .unwrap()
+            .to_dto();
+
+        assert_eq!(
+            dto.usdc.alpaca_usdc,
+            Some(balance),
+            "AlpacaUsdc snapshot event must survive force_apply_snapshot_event into the DTO",
+        );
     }
 
     #[test]

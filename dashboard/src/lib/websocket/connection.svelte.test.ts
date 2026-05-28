@@ -198,6 +198,7 @@ describe('createWebSocket', () => {
               offchainInflight: '0',
               offchainGross: null,
               withdrawableCash: null,
+              alpacaUsdc: null,
               inflightCash: { ethereumWallet: null, baseWallet: null }
             }
           },
@@ -310,6 +311,7 @@ describe('createWebSocket', () => {
           offchainInflight: '0',
           offchainGross: null,
           withdrawableCash: null,
+          alpacaUsdc: null,
           inflightCash: { ethereumWallet: null, baseWallet: null }
         }
       }

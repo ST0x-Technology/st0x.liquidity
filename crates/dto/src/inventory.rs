@@ -60,6 +60,9 @@ pub struct UsdcInventory {
     /// Raindex.
     #[ts(type = "string | null")]
     pub withdrawable_cash: Option<Usdc>,
+    /// USDC held as a token asset in the Alpaca account.
+    #[ts(type = "string | null")]
+    pub alpaca_usdc: Option<Usdc>,
     /// USDC observed at intermediate wallet locations between venues.
     pub inflight_cash: InFlightCash,
 }
@@ -110,6 +113,7 @@ impl Inventory {
                 offchain_inflight: Usdc::ZERO,
                 offchain_gross: None,
                 withdrawable_cash: None,
+                alpaca_usdc: None,
                 inflight_cash: InFlightCash::empty(),
             },
         }
@@ -152,6 +156,7 @@ mod tests {
                 offchain_inflight: Usdc::new(float!(500)),
                 offchain_gross: Some(Usdc::new(float!(6000))),
                 withdrawable_cash: Some(Usdc::new(float!(4500))),
+                alpaca_usdc: Some(Usdc::new(float!(125))),
                 inflight_cash: InFlightCash {
                     ethereum_wallet: Some(Usdc::new(float!(250))),
                     base_wallet: Some(Usdc::ZERO),
@@ -177,6 +182,7 @@ mod tests {
         assert_eq!(usdc["offchainInflight"], json!("500"));
         assert_eq!(usdc["offchainGross"], json!("6000"));
         assert_eq!(usdc["withdrawableCash"], json!("4500"));
+        assert_eq!(usdc["alpacaUsdc"], json!("125"));
         assert_eq!(usdc["inflightCash"]["ethereumWallet"], json!("250"));
         assert_eq!(usdc["inflightCash"]["baseWallet"], json!("0"));
     }

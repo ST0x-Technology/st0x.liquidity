@@ -148,6 +148,15 @@ impl AlpacaWalletService {
         self.client.get_wallet_address(asset, network).await
     }
 
+    /// Gets the Alpaca account balance for the given token.
+    pub(crate) async fn get_asset_balance(
+        &self,
+        asset: &TokenSymbol,
+        network: &Network,
+    ) -> Result<Usdc, AlpacaWalletError> {
+        self.client.get_asset_balance(asset, network).await
+    }
+
     pub(crate) async fn create_whitelist_entry(
         &self,
         address: &Address,

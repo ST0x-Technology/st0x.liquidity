@@ -94,6 +94,9 @@ pub(crate) struct InventorySnapshot {
     /// proceeds). What's actually movable to Raindex during rebalancing.
     #[serde(default)]
     pub(crate) offchain_cash_withdrawable_cents: Option<i64>,
+    /// Latest USDC token balance held in the Alpaca account.
+    #[serde(default)]
+    pub(crate) alpaca_usdc: Option<Usdc>,
     /// Latest Ethereum wallet USDC balance
     pub(crate) ethereum_usdc: Option<Usdc>,
     /// Latest Base wallet USDC balance (outside Raindex vaults)
@@ -141,6 +144,7 @@ impl EventSourced for InventorySnapshot {
             offchain_gross_usd_cents: None,
             offchain_cash_buying_power_cents: None,
             offchain_cash_withdrawable_cents: None,
+            alpaca_usdc: None,
             ethereum_usdc: None,
             base_wallet_usdc: None,
             inflight_mints: BTreeMap::new(),
@@ -197,6 +201,10 @@ impl EventSourced for InventorySnapshot {
                 cash_withdrawable_cents,
             } => InventorySnapshotEvent::OffchainCashWithdrawable {
                 cash_withdrawable_cents,
+                fetched_at: now,
+            },
+            AlpacaUsdc { usdc_balance } => InventorySnapshotEvent::AlpacaUsdc {
+                usdc_balance,
                 fetched_at: now,
             },
             EthereumUsdc { usdc_balance } => InventorySnapshotEvent::EthereumUsdc {
@@ -301,6 +309,15 @@ impl EventSourced for InventorySnapshot {
                 }
                 Ok(vec![InventorySnapshotEvent::OffchainCashWithdrawable {
                     cash_withdrawable_cents,
+                    fetched_at: now,
+                }])
+            }
+            AlpacaUsdc { usdc_balance } => {
+                if self.alpaca_usdc == Some(usdc_balance) {
+                    return Ok(vec![]);
+                }
+                Ok(vec![InventorySnapshotEvent::AlpacaUsdc {
+                    usdc_balance,
                     fetched_at: now,
                 }])
             }
@@ -433,6 +450,13 @@ impl InventorySnapshot {
             });
         }
 
+        if let Some(usdc_balance) = self.alpaca_usdc {
+            events.push(InventorySnapshotEvent::AlpacaUsdc {
+                usdc_balance,
+                fetched_at,
+            });
+        }
+
         if let Some(usdc_balance) = self.ethereum_usdc {
             events.push(InventorySnapshotEvent::EthereumUsdc {
                 usdc_balance,
@@ -539,6 +563,9 @@ impl InventorySnapshot {
             } => {
                 self.offchain_cash_withdrawable_cents = *cash_withdrawable_cents;
             }
+            InventorySnapshotEvent::AlpacaUsdc { usdc_balance, .. } => {
+                self.alpaca_usdc = Some(*usdc_balance);
+            }
             InventorySnapshotEvent::EthereumUsdc { usdc_balance, .. } => {
                 self.ethereum_usdc = Some(*usdc_balance);
             }
@@ -586,6 +613,9 @@ pub(crate) enum InventorySnapshotCommand {
     },
     OffchainCashWithdrawable {
         cash_withdrawable_cents: Option<i64>,
+    },
+    AlpacaUsdc {
+        usdc_balance: Usdc,
     },
     EthereumUsdc {
         usdc_balance: Usdc,
@@ -642,6 +672,10 @@ pub(crate) enum InventorySnapshotEvent {
         cash_withdrawable_cents: Option<i64>,
         fetched_at: DateTime<Utc>,
     },
+    AlpacaUsdc {
+        usdc_balance: Usdc,
+        fetched_at: DateTime<Utc>,
+    },
     #[serde(alias = "EthereumCash")]
     EthereumUsdc {
         usdc_balance: Usdc,
@@ -678,6 +712,7 @@ impl InventorySnapshotEvent {
             | Self::OffchainUsd { fetched_at, .. }
             | Self::OffchainCashBuyingPower { fetched_at, .. }
             | Self::OffchainCashWithdrawable { fetched_at, .. }
+            | Self::AlpacaUsdc { fetched_at, .. }
             | Self::EthereumUsdc { fetched_at, .. }
             | Self::BaseWalletUsdc { fetched_at, .. }
             | Self::BaseWalletUnwrappedEquity { fetched_at, .. }
@@ -700,6 +735,7 @@ impl DomainEvent for InventorySnapshotEvent {
             Self::OffchainCashWithdrawable { .. } => {
                 "InventorySnapshotEvent::OffchainCashWithdrawable".to_string()
             }
+            Self::AlpacaUsdc { .. } => "InventorySnapshotEvent::AlpacaUsdc".to_string(),
             Self::EthereumUsdc { .. } => "InventorySnapshotEvent::EthereumUsdc".to_string(),
             Self::BaseWalletUsdc { .. } => "InventorySnapshotEvent::BaseWalletUsdc".to_string(),
             Self::BaseWalletUnwrappedEquity { .. } => {
@@ -1792,6 +1828,7 @@ mod tests {
             offchain_gross_usd_cents: None,
             offchain_cash_buying_power_cents: None,
             offchain_cash_withdrawable_cents: None,
+            alpaca_usdc: None,
             ethereum_usdc: None,
             base_wallet_usdc: None,
             base_wallet_unwrapped_equity: BTreeMap::new(),
@@ -1825,6 +1862,7 @@ mod tests {
             offchain_gross_usd_cents: Some(50_00),
             offchain_cash_buying_power_cents: Some(10_000),
             offchain_cash_withdrawable_cents: Some(38_00),
+            alpaca_usdc: Some(Usdc::from_str("125").unwrap()),
             ethereum_usdc: None,
             base_wallet_usdc: None,
             base_wallet_unwrapped_equity: BTreeMap::new(),
@@ -1851,6 +1889,7 @@ mod tests {
             reconstructed.offchain_cash_buying_power_cents,
             original.offchain_cash_buying_power_cents
         );
+        assert_eq!(reconstructed.alpaca_usdc, original.alpaca_usdc);
         assert_eq!(reconstructed.inflight_mints, original.inflight_mints);
     }
 

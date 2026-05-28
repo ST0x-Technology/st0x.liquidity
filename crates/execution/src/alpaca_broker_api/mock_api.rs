@@ -584,7 +584,8 @@ async fn scan_block_for_deposits<P: Provider>(
 
             let tx_hash_hex = format!("{tx_hash:#x}");
 
-            let already_exists = lock(state)
+            let mut state = lock(state);
+            let already_exists = state
                 .wallet_transfers
                 .iter()
                 .any(|transfer| transfer.tx_hash == tx_hash_hex);
@@ -599,7 +600,11 @@ async fn scan_block_for_deposits<P: Provider>(
                 continue;
             };
 
-            lock(state).wallet_transfers.push(MockWalletTransfer {
+            if add_wallet_balance(&mut state, "USDC", amount).is_err() {
+                continue;
+            }
+
+            state.wallet_transfers.push(MockWalletTransfer {
                 transfer_id: Uuid::new_v4().to_string(),
                 direction: TransferDirection::Incoming,
                 amount,
@@ -641,6 +646,43 @@ async fn scan_deposit_range<P: Provider>(
 /// Safe for test mocks - we still want to inspect state after panics.
 fn lock(state: &Mutex<MockState>) -> MutexGuard<'_, MockState> {
     state.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn add_wallet_balance(
+    state: &mut MockState,
+    asset: &str,
+    amount: Float,
+) -> Result<(), rain_math_float::FloatError> {
+    let current = state
+        .wallet_balances
+        .get(asset)
+        .copied()
+        .unwrap_or_else(|| float!(0));
+    let updated = (current + amount)?;
+    state.wallet_balances.insert(asset.to_string(), updated);
+
+    Ok(())
+}
+
+fn subtract_wallet_balance(
+    state: &mut MockState,
+    asset: &str,
+    amount: Float,
+) -> Result<bool, rain_math_float::FloatError> {
+    let current = state
+        .wallet_balances
+        .get(asset)
+        .copied()
+        .unwrap_or_else(|| float!(0));
+    let updated = (current - amount)?;
+
+    if updated.lt(float!(0))? {
+        return Ok(false);
+    }
+
+    state.wallet_balances.insert(asset.to_string(), updated);
+
+    Ok(true)
 }
 
 /// Registers all dynamic endpoints on the mock server.
@@ -942,6 +984,42 @@ fn handle_crypto_order(
         OrderSide::Buy => state.account.cash - cash_delta,
         OrderSide::Sell => state.account.cash + cash_delta,
     };
+
+    let current_wallet_balance = state
+        .wallet_balances
+        .get("USDC")
+        .copied()
+        .unwrap_or_else(|| float!(0));
+    let updated_wallet_balance = match side {
+        OrderSide::Buy => current_wallet_balance + quantized_quantity,
+        OrderSide::Sell => current_wallet_balance - quantized_quantity,
+    };
+    let updated_wallet_balance = match updated_wallet_balance {
+        Ok(balance) => balance,
+        Err(error) => {
+            return json_response(
+                500,
+                &json!({"message": format!("wallet balance arithmetic error: {error}")}),
+            );
+        }
+    };
+
+    match updated_wallet_balance.lt(float!(0)) {
+        Ok(false) => {}
+        Ok(true) => {
+            return json_response(
+                422,
+                &json!({"message": "insufficient USDC balance for crypto sell"}),
+            );
+        }
+        Err(error) => {
+            return json_response(
+                500,
+                &json!({"message": format!("wallet balance comparison error: {error}")}),
+            );
+        }
+    }
+
     match updated_cash {
         Ok(cash) => state.account.cash = cash,
         Err(error) => {
@@ -951,6 +1029,9 @@ fn handle_crypto_order(
             );
         }
     }
+    state
+        .wallet_balances
+        .insert("USDC".to_string(), updated_wallet_balance);
 
     let fill_price = float!(1);
     let quantity_formatted = format_float_with_fallback(&quantized_quantity);
@@ -1396,6 +1477,24 @@ fn register_wallet_transfers_post_endpoint(server: &MockServer, state: &Arc<Mute
                     );
                 };
 
+                match subtract_wallet_balance(&mut state, &asset, amount) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return json_response(
+                            422,
+                            &json!({"message": "insufficient wallet balance for transfer"}),
+                        );
+                    }
+                    Err(error) => {
+                        return json_response(
+                            500,
+                            &json!({"message": format!(
+                                "wallet balance arithmetic error: {error}"
+                            )}),
+                        );
+                    }
+                }
+
                 state.wallet_transfers.push(MockWalletTransfer {
                     transfer_id: transfer_id.clone(),
                     direction: TransferDirection::Outgoing,
@@ -1604,9 +1703,64 @@ mod tests {
             "cash should be 100 - 12.34 after cent quantization, got: {:?}",
             state.account.cash
         );
+        assert!(
+            state.wallet_balances["USDC"].eq(float!(12.345678)).unwrap(),
+            "buying USDCUSD should increase Alpaca USDC balance"
+        );
 
         let order = state.orders.get("order-1").unwrap();
         assert!(order.quantity.eq(float!(12.345678)).unwrap());
+    }
+
+    #[test]
+    fn crypto_sell_debits_wallet_usdc_before_crediting_cash() {
+        let mut state = MockState {
+            account: MockAccount {
+                cash: float!(100),
+                buying_power: float!(100),
+                positions: HashMap::new(),
+            },
+            orders: HashMap::new(),
+            symbol_fill_prices: HashMap::new(),
+            mode: MockMode::HappyPath,
+            symbol_fill_delays: HashMap::new(),
+            calendar_entries: vec![],
+            wallet_transfers: vec![],
+            alpaca_deposit_address: format!("{:#x}", Address::ZERO),
+            wallet_balances: HashMap::from([("USDC".to_string(), float!(20))]),
+            whitelisted_addresses: vec![],
+        };
+
+        let response = handle_crypto_order(
+            &mut state,
+            "order-1",
+            &Symbol::new("USDCUSD").unwrap(),
+            float!(5),
+            OrderSide::Sell,
+        );
+
+        assert_eq!(response.status, Some(200));
+        assert!(state.account.cash.eq(float!(105)).unwrap());
+        assert!(state.wallet_balances["USDC"].eq(float!(15)).unwrap());
+
+        let rejected = handle_crypto_order(
+            &mut state,
+            "order-2",
+            &Symbol::new("USDCUSD").unwrap(),
+            float!(16),
+            OrderSide::Sell,
+        );
+
+        assert_eq!(rejected.status, Some(422));
+        assert!(
+            state.account.cash.eq(float!(105)).unwrap(),
+            "rejected USDC sell must not credit USD cash"
+        );
+        assert!(
+            state.wallet_balances["USDC"].eq(float!(15)).unwrap(),
+            "rejected USDC sell must not debit Alpaca USDC"
+        );
+        assert!(!state.orders.contains_key("order-2"));
     }
 
     #[test]

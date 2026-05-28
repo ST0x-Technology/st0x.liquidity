@@ -38,14 +38,15 @@
   const cashEntries: GlossaryEntry[] = [
     { name: 'Asset', def: 'Always "Cash" for the USDC row.' },
     { name: 'Raindex', def: 'USDC available in the Raindex vaults to settle takers.' },
-    { name: 'Inflight', def: 'USDC the books track as in motion between venues (pending CCTP transfers, pending settlements). Already accounted for in imbalance math.' },
-    { name: 'Alpaca Available', def: 'USDC available to trade on Alpaca after subtracting the configured cash reserve. This is what the bot can spend on equity buys.' },
-    { name: 'Total', def: 'Raindex + Inflight + Alpaca Available. Excludes wallet-observed amounts.' },
-    { name: 'Ratio', def: 'Proportion of total cash sitting on Raindex (onchain / total). The bar and percent reflect the current split; the colored offset is the deviation from the configured target.' },
-    { name: 'Gross', def: 'Full broker USDC balance before subtracting the configured cash reserve. Hidden when no reserve is configured. (Reserved = Gross − Alpaca Available.)' },
-    { name: 'Withdrawable', def: 'Settled cash that can actually be withdrawn or transferred to Raindex. Excludes T+1 unsettled equity-sale proceeds. This is what the bot can rebalance.' },
-    { name: 'Eth Wallet', def: 'Wallet-observed USDC sitting on the Ethereum wallet between Alpaca and CCTP. Out-of-band sanity check — NOT part of imbalance math.' },
-    { name: 'Base Wallet', def: 'Wallet-observed USDC sitting on the Base wallet between CCTP and the Raindex vaults. Out-of-band sanity check — NOT part of imbalance math.' },
+    { name: 'Inflight', def: 'USDC the bot has already committed to transfers or settlements between venues. Included in Total, but not in Ratio.' },
+    { name: 'Alpaca Total', def: 'Alpaca USD cash used for inventory math: gross broker cash when available, otherwise available cash. This is USD cash at Alpaca, not wallet-observed USDC.' },
+    { name: 'Total', def: 'Raindex + Inflight + Alpaca Total. Wallet-observed Eth/Base balances are excluded.' },
+    { name: 'Ratio', def: 'Venue split for cash allocation: Raindex / (Raindex + Alpaca Total). Inflight and wallet-observed balances are excluded from the ratio.' },
+    { name: 'Alpaca / USDC', def: 'USDC token balance held in the Alpaca account. This is separate from Alpaca USD cash and does not count toward the cash reserve.' },
+    { name: 'Alpaca / Rebalanceable', def: 'Settled Alpaca cash that can leave Alpaca for USDC rebalancing after preserving the configured reserve.' },
+    { name: 'Alpaca / Counter-tradeable', def: 'Alpaca cash available for buy-side equity counter-trades. The configured reserve is not subtracted from this value.' },
+    { name: 'Eth', def: 'USDC observed in the Ethereum wallet while moving between Alpaca and CCTP. Not included in Total, Ratio, or rebalancing decisions.' },
+    { name: 'Base', def: 'USDC observed in the Base wallet while moving between CCTP and Raindex. Not included in Total, Ratio, or rebalancing decisions.' },
   ]
 
   const equityEntries: GlossaryEntry[] = [
@@ -130,7 +131,7 @@
     </section>
 
     <section class="rounded border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-muted-foreground">
-      <strong class="text-foreground">Wallet-observed</strong> columns (Eth Wallet, Base Wallet, Unwrapped, Wrapped) come from polling the on-chain wallets directly. They are a sanity check for funds in transit between venues and are <strong>NOT</strong> included in Total, Ratio, or imbalance / rebalancing decisions.
+      <strong class="text-foreground">Wallet-observed</strong> columns (Eth, Base, Unwrapped, Wrapped) come from polling the on-chain wallets directly. They are a sanity check for funds in transit between venues and are <strong>NOT</strong> included in Total, Ratio, or imbalance / rebalancing decisions.
     </section>
   </div>
 </dialog>

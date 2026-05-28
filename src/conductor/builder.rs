@@ -74,6 +74,7 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
     pub(crate) frameworks: CqrsFrameworks,
     pub(crate) pool: SqlitePool,
     pub(crate) wallet_polling: Option<WalletPollingCtx>,
+    pub(crate) alpaca_wallet: Option<Arc<crate::alpaca_wallet::AlpacaWalletService>>,
     pub(crate) tokenizer: Option<Arc<dyn Tokenizer>>,
     pub(crate) shutdown_token: CancellationToken,
     #[cfg(any(test, feature = "test-support"))]
@@ -143,17 +144,25 @@ where
         .cloned()
         .collect();
 
+    let wallet_polling = context.wallet_polling;
+    let alpaca_wallet = context.alpaca_wallet;
+    let tokenizer = context.tokenizer;
+
     let mut polling_service = InventoryPollingService::new(
         raindex_service,
         context.executor.clone(),
         context.frameworks.vault_registry.clone(),
         snapshot_id,
         context.frameworks.snapshot,
-        context.wallet_polling,
-        context.tokenizer,
+        wallet_polling,
+        tokenizer,
         reserved_cash,
     )
     .with_configured_equity_symbols(configured_equity_symbols);
+
+    if let Some(alpaca_wallet) = alpaca_wallet {
+        polling_service = polling_service.with_alpaca_wallet(alpaca_wallet);
+    }
 
     if let Some(rebalancing_service) = &rebalancing_service {
         polling_service =

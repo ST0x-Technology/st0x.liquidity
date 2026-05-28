@@ -1222,6 +1222,7 @@ impl RebalancingService {
             OffchainUsd { .. }
             | OffchainCashBuyingPower { .. }
             | OffchainCashWithdrawable { .. }
+            | AlpacaUsdc { .. }
             | EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
@@ -1325,6 +1326,7 @@ impl RebalancingService {
             | OffchainUsd { .. }
             | OffchainCashBuyingPower { .. }
             | OffchainCashWithdrawable { .. }
+            | AlpacaUsdc { .. }
             | EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
@@ -1401,6 +1403,7 @@ impl RebalancingService {
             // orphan-vs-baseline detection is in place.
             EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
+            | AlpacaUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
             | BaseWalletWrappedEquity { .. }
             // Buying power is display-only and doesn't feed any rebalance

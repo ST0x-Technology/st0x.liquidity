@@ -879,7 +879,7 @@ async fn simulate() -> anyhow::Result<()> {
         .equity_vault_ids(&equity_vault_ids)
         .cash_vault_id(usdc_vault_id)
         .cctp(cctp.cctp_overrides())
-        .cash_reserved(Positive::new(Usd::new(float!(50000)))?)
+        .cash_reserved(Positive::new(Usd::new(float!(25000)))?)
         .server_port(server_port)
         .call()?;
     ctx.log_dir = Some(log_dir.display().to_string());
@@ -1077,7 +1077,7 @@ async fn simulate_failures() -> anyhow::Result<()> {
         .equity_vault_ids(&equity_vault_ids)
         .cash_vault_id(usdc_vault_id)
         .cctp(cctp.cctp_overrides())
-        .cash_reserved(Positive::new(Usd::new(float!(50000)))?)
+        .cash_reserved(Positive::new(Usd::new(float!(25000)))?)
         .server_port(server_port)
         .call()?;
     ctx.log_dir = Some(log_dir.display().to_string());

@@ -69,6 +69,7 @@ jobs:
           extra-conf: |
             accept-flake-config = true
             fallback = true
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
 
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
@@ -110,6 +111,7 @@ jobs:
           extra-conf: |
             accept-flake-config = true
             fallback = true
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
 
       - name: Check bun.nix is up to date
         run: |
@@ -139,6 +141,7 @@ jobs:
           extra-conf: |
             accept-flake-config = true
             fallback = true
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
 
       - name: pre-commit hooks
         run: nix develop .#ci-hooks -c pre-commit run --all-files
