@@ -4,8 +4,16 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
-    rainix.url = "github:rainprotocol/rainix?rev=36342d3f1a104adf987793df7f101cf804e62a34";
-    rainix.inputs.nixpkgs.follows = "nixpkgs";
+    rainix = {
+      url = "github:rainprotocol/rainix?rev=36342d3f1a104adf987793df7f101cf804e62a34";
+      inputs = {
+        foundry.inputs.nixpkgs.follows = "nixpkgs";
+        git-hooks-nix.inputs.nixpkgs.follows = "nixpkgs";
+        nixpkgs.follows = "nixpkgs";
+        rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
+        solc.inputs.nixpkgs.follows = "nixpkgs";
+      };
+    };
 
     rain-math-float = {
       type = "git";
@@ -34,8 +42,13 @@
     };
 
     flake-utils.url = "github:numtide/flake-utils";
-    ragenix.url = "github:yaxitech/ragenix";
+    ragenix = {
+      url = "github:yaxitech/ragenix";
+      inputs.crane.follows = "crane";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     deploy-rs.url = "github:serokell/deploy-rs";
+    deploy-rs.inputs.nixpkgs.follows = "nixpkgs";
 
     bun2nix.url = "github:nix-community/bun2nix/2.0.8";
     bun2nix.inputs.nixpkgs.follows = "nixpkgs";
@@ -45,8 +58,11 @@
     disko.url = "github:nix-community/disko";
     disko.inputs.nixpkgs.follows = "nixpkgs";
 
-    nixos-anywhere.url = "github:nix-community/nixos-anywhere";
-    nixos-anywhere.inputs.nixpkgs.follows = "nixpkgs";
+    nixos-anywhere = {
+      url = "github:nix-community/nixos-anywhere";
+      inputs.nixos-stable.follows = "nixpkgs";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
