@@ -46,6 +46,7 @@ type Direction = 'Buy' | 'Sell'
 type LotSide = 'long' | 'short'
 type PnlBucket = 'counter_trade' | 'onchain_netting' | 'directional_exposure'
 type SqlSymbolColumn = 'aggregate_id' | 'symbol'
+type Venue = 'onchain' | 'offchain'
 
 type Fill = {
   rowid: number
@@ -55,6 +56,7 @@ type Fill = {
   direction: Direction
   price: Decimal
   executedAt: string
+  venue: Venue
 }
 
 type Lot = {
@@ -64,6 +66,7 @@ type Lot = {
   price: Decimal
   openedAt: string
   openedRowid: number
+  openedVenue: Venue
 }
 
 type SummaryAcc = {
@@ -94,8 +97,6 @@ type SummaryAcc = {
 type SymbolBook = {
   longLots: Lot[]
   shortLots: Lot[]
-  unmatchedOffchainLongLots: Lot[]
-  unmatchedOffchainShortLots: Lot[]
   seenOnchainFillIds: Set<string>
   seenOffchainPlacementIds: Set<string>
   seenOffchainFillIds: Set<string>
@@ -124,7 +125,7 @@ const SAFE_SQL_SYMBOL = /^[A-Za-z0-9._-]+$/u
 const ZERO = new Decimal(0)
 
 const ATTRIBUTION_WARNING =
-  'PnL source: rows are read from the deployed SQL JSON endpoint. Offchain fills are allocated to open opposite-side onchain lots by deterministic FIFO replay because explicit offchain_order_id -> onchain_trade_ids parentage is not currently persisted.'
+  'PnL source: rows are read from the deployed SQL JSON endpoint. Fills are replayed through per-symbol FIFO inventory lots for accounting and attribution; explicit offchain_order_id -> onchain_trade_ids parentage is not currently persisted.'
 const BASELINE_WARNING =
   'Baseline drift is reported as zero in the deployed view because historical portfolio state and price/NAV snapshots are not currently persisted. Realized replay buckets are computed from persisted fills.'
 
@@ -156,8 +157,6 @@ const emptySummary = (): SummaryAcc => ({
 const emptyBook = (): SymbolBook => ({
   longLots: [],
   shortLots: [],
-  unmatchedOffchainLongLots: [],
-  unmatchedOffchainShortLots: [],
   seenOnchainFillIds: new Set(),
   seenOffchainPlacementIds: new Set(),
   seenOffchainFillIds: new Set(),
@@ -201,7 +200,7 @@ export const buildSqlApiUrl = (baseUrl: string, sql: string): string => {
   return url.toString()
 }
 
-type DatasetteRowsResponse<Row> = {
+type DatasetteRowsResponse = {
   rows?: unknown
   truncated?: boolean
 }
@@ -215,7 +214,7 @@ const fetchSqlRows = async <Row>(baseUrl: string, sql: string): Promise<Row[]> =
     throw new Error(`SQL endpoint HTTP ${String(response.status)}`)
   }
 
-  const body = (await response.json()) as DatasetteRowsResponse<Row>
+  const body = (await response.json()) as DatasetteRowsResponse
   if (!Array.isArray(body.rows)) {
     throw new Error('SQL endpoint returned a response without rows')
   }
@@ -382,7 +381,7 @@ const allocationSummaryText = (allocations: UnmatchedOffchainAllocation[]): stri
     )
     .join('; ')
 
-  return `Allocation note: ${String(allocations.length)} offchain fills are outside the matched onchain replay (${symbolDetails}). Those shares are carried as unmatched offchain exposure in the deployed view.`
+  return `Allocation note: ${String(allocations.length)} offchain fills opened offchain-origin inventory outside the intended onchain-to-offchain hedge flow (${symbolDetails}). Those shares are carried in the FIFO ledger so later fills can close them.`
 }
 
 const positionReplayDeltaText = (deltas: PositionReplayDelta[]): string | null => {
@@ -422,8 +421,6 @@ const appendReplayDiagnostics = (
 
 const directionLabel = (direction: Direction): string => (direction === 'Buy' ? 'buy' : 'sell')
 const lotSideToOnchainDirection = (side: LotSide): string => (side === 'long' ? 'buy' : 'sell')
-const closingVenue = (bucket: PnlBucket): string =>
-  bucket === 'onchain_netting' ? 'onchain' : 'offchain'
 
 const addRealizedPnl = (summary: SummaryAcc, bucket: PnlBucket, value: Decimal): void => {
   if (bucket === 'counter_trade') {
@@ -479,7 +476,8 @@ const parseOnchainFill = (row: SqlPositionEventRow, warnings: string[]): Fill | 
     shares: amount,
     direction,
     price,
-    executedAt
+    executedAt,
+    venue: 'onchain'
   }
 }
 
@@ -517,7 +515,8 @@ const parseOffchainFill = (row: SqlPositionEventRow, warnings: string[]): Fill |
     shares,
     direction,
     price,
-    executedAt
+    executedAt,
+    venue: 'offchain'
   }
 }
 
@@ -539,6 +538,25 @@ const getBook = (books: Map<string, SymbolBook>, symbol: string): SymbolBook => 
   const book = emptyBook()
   books.set(symbol, book)
   return book
+}
+
+const openResidualLot = (book: SymbolBook, fill: Fill, remaining: Decimal): void => {
+  const side: LotSide = fill.direction === 'Buy' ? 'long' : 'short'
+  const lot: Lot = {
+    tradeId: fill.id,
+    side,
+    remainingShares: remaining,
+    price: fill.price,
+    openedAt: fill.executedAt,
+    openedRowid: fill.rowid,
+    openedVenue: fill.venue
+  }
+
+  if (side === 'long') {
+    book.longLots.push(lot)
+  } else {
+    book.shortLots.push(lot)
+  }
 }
 
 const applyOnchainFill = (
@@ -571,21 +589,7 @@ const applyOnchainFill = (
   const original = book.originalOnchainShares.get(fill.id) ?? ZERO
   book.originalOnchainShares.set(fill.id, original.plus(remaining))
 
-  const side: LotSide = fill.direction === 'Buy' ? 'long' : 'short'
-  const lot: Lot = {
-    tradeId: fill.id,
-    side,
-    remainingShares: remaining,
-    price: fill.price,
-    openedAt: fill.executedAt,
-    openedRowid: fill.rowid
-  }
-
-  if (side === 'long') {
-    book.longLots.push(lot)
-  } else {
-    book.shortLots.push(lot)
-  }
+  openResidualLot(book, fill, remaining)
 }
 
 const applyOffchainPlacement = (
@@ -638,7 +642,7 @@ const applyOffchainFill = (
       fillId: fill.id,
       shares: remaining
     })
-    recordUnmatchedOffchain(book, fill, remaining)
+    openResidualLot(book, fill, remaining)
   }
 }
 
@@ -664,9 +668,11 @@ const matchFillAgainstLots = (
 
     const elapsedSeconds = secondsBetween(frontLot.openedAt, fill.executedAt)
     const effectiveBucket: PnlBucket =
-      bucket === 'counter_trade' && elapsedSeconds > COUNTER_TRADE_THRESHOLD_SECONDS
+      frontLot.openedVenue === 'offchain'
         ? 'directional_exposure'
-        : bucket
+        : bucket === 'counter_trade' && elapsedSeconds > COUNTER_TRADE_THRESHOLD_SECONDS
+          ? 'directional_exposure'
+          : bucket
     const spread =
       frontLot.side === 'long' ? fill.price.minus(frontLot.price) : frontLot.price.minus(fill.price)
     const realizedPnl = matchedShares.mul(spread)
@@ -688,13 +694,27 @@ const matchFillAgainstLots = (
     }
     summary.matchedLotCount += 1
 
-    const matched = matchedOnchainShares.get(frontLot.tradeId) ?? ZERO
-    matchedOnchainShares.set(frontLot.tradeId, matched.plus(matchedShares))
+    if (frontLot.openedVenue === 'onchain') {
+      const matched = matchedOnchainShares.get(frontLot.tradeId) ?? ZERO
+      matchedOnchainShares.set(frontLot.tradeId, matched.plus(matchedShares))
+    }
 
     const openingDirection = lotSideToOnchainDirection(frontLot.side)
     const closingDirection = directionLabel(fill.direction)
     const openingPriceText = fmtDecimal(frontLot.price)
     const closingPriceText = fmtDecimal(fill.price)
+    const onchainTradeId =
+      frontLot.openedVenue === 'onchain'
+        ? frontLot.tradeId
+        : fill.venue === 'onchain'
+          ? fill.id
+          : ''
+    const offchainOrderId =
+      frontLot.openedVenue === 'offchain'
+        ? frontLot.tradeId
+        : fill.venue === 'offchain'
+          ? fill.id
+          : ''
 
     entries.push({
       symbol: fill.symbol,
@@ -706,14 +726,14 @@ const matchFillAgainstLots = (
       closingFillId: fill.id,
       openingRowid: frontLot.openedRowid,
       closingRowid: fill.rowid,
-      openingVenue: 'onchain',
-      closingVenue: closingVenue(effectiveBucket),
+      openingVenue: frontLot.openedVenue,
+      closingVenue: fill.venue,
       openingDirection,
       closingDirection,
       openingPriceUsd: openingPriceText,
       closingPriceUsd: closingPriceText,
-      onchainTradeId: frontLot.tradeId,
-      offchainOrderId: fill.id,
+      onchainTradeId,
+      offchainOrderId,
       onchainDirection: openingDirection,
       offchainDirection: closingDirection,
       shares: fmtDecimal(matchedShares),
@@ -731,38 +751,6 @@ const matchFillAgainstLots = (
   }
 
   return remaining
-}
-
-const recordUnmatchedOffchain = (book: SymbolBook, fill: Fill, shares: Decimal): void => {
-  const notional = shares.mul(fill.price)
-  book.summary.unmatchedOffchainFillCount += 1
-
-  if (fill.direction === 'Buy') {
-    book.summary.unmatchedOffchainBuyShares = book.summary.unmatchedOffchainBuyShares.plus(shares)
-    book.summary.unmatchedOffchainBuyNotionalUsd =
-      book.summary.unmatchedOffchainBuyNotionalUsd.plus(notional)
-    book.unmatchedOffchainLongLots.push({
-      tradeId: fill.id,
-      side: 'long',
-      remainingShares: shares,
-      price: fill.price,
-      openedAt: fill.executedAt,
-      openedRowid: fill.rowid
-    })
-    return
-  }
-
-  book.summary.unmatchedOffchainSellShares = book.summary.unmatchedOffchainSellShares.plus(shares)
-  book.summary.unmatchedOffchainSellNotionalUsd =
-    book.summary.unmatchedOffchainSellNotionalUsd.plus(notional)
-  book.unmatchedOffchainShortLots.push({
-    tradeId: fill.id,
-    side: 'short',
-    remainingShares: shares,
-    price: fill.price,
-    openedAt: fill.executedAt,
-    openedRowid: fill.rowid
-  })
 }
 
 const finalizeLots = (summary: SummaryAcc, lots: Lot[], markPrice: Decimal | undefined): void => {
@@ -800,8 +788,6 @@ const finalizeBook = (
   const markPrice = markPrices.get(symbol)
   finalizeLots(book.summary, book.longLots, markPrice)
   finalizeLots(book.summary, book.shortLots, markPrice)
-  finalizeLots(book.summary, book.unmatchedOffchainLongLots, markPrice)
-  finalizeLots(book.summary, book.unmatchedOffchainShortLots, markPrice)
 
   for (const [tradeId, matchedShares] of book.matchedOnchainShares) {
     const originalShares = book.originalOnchainShares.get(tradeId)

@@ -48,7 +48,11 @@ const sampleRows: SqlSampleStatsRow[] = [
   }
 ]
 
-const onchainSell = (rowid: number, price = '10'): SqlPositionEventRow => ({
+const onchainSell = (
+  rowid: number,
+  price = '10',
+  timestamp = '2026-05-15T10:00:00Z'
+): SqlPositionEventRow => ({
   rowid,
   symbol: 'RKLB',
   event_type: 'PositionEvent::OnChainOrderFilled',
@@ -57,7 +61,7 @@ const onchainSell = (rowid: number, price = '10'): SqlPositionEventRow => ({
       amount: '1',
       direction: 'Sell',
       price_usdc: price,
-      block_timestamp: '2026-05-15T10:00:00Z',
+      block_timestamp: timestamp,
       trade_id: {
         tx_hash: `0x${String(rowid)}`,
         log_index: 0
@@ -256,24 +260,54 @@ describe('buildPnlResponseFromSqlRows', () => {
     expect(report.warnings).toEqual(
       expect.arrayContaining([
         expect.stringContaining(
-          'Allocation note: 1 offchain fills are outside the matched onchain replay'
+          'Allocation note: 1 offchain fills opened offchain-origin inventory'
         ),
         expect.stringContaining('Reconciliation note: replayed open lots differ from position_view')
       ])
     )
     expect(report.warnings.some((warning) => warning.includes('no open opposite-side'))).toBe(false)
     expect(report.warnings.some((warning) => warning.includes('PnL audit warning'))).toBe(false)
-    expect(report.summary.unmatchedOffchainFillCount).toBe(1)
-    expect(report.summary.unmatchedOffchainShares).toBe('1')
+    expect(report.summary.unmatchedOffchainFillCount).toBe(0)
+    expect(report.summary.unmatchedOffchainShares).toBe('0')
     expect(report.summary.openLongShares).toBe('1')
     expect(report.symbols).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           symbol: 'RKLB',
-          unmatchedOffchainFillCount: 1,
-          unmatchedOffchainShares: '1',
+          unmatchedOffchainFillCount: 0,
+          unmatchedOffchainShares: '0',
           openLongShares: '1'
         })
+      ])
+    )
+  })
+
+  it('carries offchain-origin inventory until later fills close it', () => {
+    const report = buildPnlResponseFromSqlRows(
+      [
+        offchainBuy(1, '2026-05-15T10:01:00Z', '8'),
+        onchainSell(2, '10', '2026-05-15T10:02:00Z')
+      ],
+      positionRows,
+      sampleRows,
+      baseQuery
+    )
+
+    expect(report.summary.totalPnlUsd).toBe('2')
+    expect(report.summary.directionalImbalanceExcessPnlUsd).toBe('2')
+    expect(report.summary.unmatchedOffchainShares).toBe('0')
+    expect(report.summary.openLongShares).toBe('0')
+    expect(report.entries[0]).toEqual(
+      expect.objectContaining({
+        openingVenue: 'offchain',
+        closingVenue: 'onchain',
+        pnlBucket: 'directional_exposure',
+        realizedPnlUsd: '2'
+      })
+    )
+    expect(report.warnings).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining('offchain fills opened offchain-origin inventory')
       ])
     )
   })
