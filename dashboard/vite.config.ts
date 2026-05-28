@@ -5,7 +5,12 @@ import { defineConfig } from 'vite'
 declare const process: {
   env: Record<string, string | undefined>
 }
-const backendPort = process.env['BACKEND_PORT'] ?? '8001'
+const nonEmptyEnv = (key: string): string | undefined => {
+  const value = process.env[key]?.trim()
+  return value !== undefined && value !== '' ? value : undefined
+}
+
+const backendPort = nonEmptyEnv('PUBLIC_BACKEND_PORT') ?? nonEmptyEnv('BACKEND_PORT') ?? '8001'
 const configuredBackendUrl = process.env['PUBLIC_BACKEND_API_URL']?.trim()
 const backendUrl =
   configuredBackendUrl !== undefined && configuredBackendUrl !== ''
