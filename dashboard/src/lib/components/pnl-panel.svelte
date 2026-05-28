@@ -846,33 +846,17 @@
     rows: { key: string; label: string; segments: RawBarSegment[] }[]
   ): AreaLayout => {
     const cumulativeByKey = new Map<string, number>()
-    const stackedRows = rows.map((row) => {
-      let positiveCursor = 0
-      let negativeCursor = 0
-
-      return {
-        key: row.key,
-        label: row.label,
-        segments: row.segments.map((segment) => {
-          const cumulative = (cumulativeByKey.get(segment.key) ?? 0) + segment.value
-          cumulativeByKey.set(segment.key, cumulative)
-
-          if (cumulative >= 0) {
-            const y0Value = positiveCursor
-            const y1Value = positiveCursor + cumulative
-            positiveCursor = y1Value
-            return { ...segment, cumulative, y0Value, y1Value }
-          }
-
-          const y0Value = negativeCursor
-          const y1Value = negativeCursor + cumulative
-          negativeCursor = y1Value
-          return { ...segment, cumulative, y0Value, y1Value }
-        })
-      }
-    })
-    const allValues = stackedRows.flatMap((row) =>
-      row.segments.flatMap((segment) => [segment.y0Value, segment.y1Value])
+    const cumulativeRows = rows.map((row) => ({
+      key: row.key,
+      label: row.label,
+      segments: row.segments.map((segment) => {
+        const cumulative = (cumulativeByKey.get(segment.key) ?? 0) + segment.value
+        cumulativeByKey.set(segment.key, cumulative)
+        return { ...segment, cumulative }
+      })
+    }))
+    const allValues = cumulativeRows.flatMap((row) =>
+      row.segments.map((segment) => segment.cumulative)
     )
     const min = Math.min(0, ...allValues)
     const max = Math.max(0, ...allValues)
@@ -885,12 +869,13 @@
       rows.length <= 1 ? barPadX + plotWidth / 2 : barPadX + (index / xDenominator) * plotWidth
     const keys = [...new Set(rows.flatMap((row) => row.segments.map((segment) => segment.key)))]
     const layers = keys.map((key) => {
-      const points = stackedRows.map((row, rowIndex) => {
+      const points = cumulativeRows.map((row, rowIndex) => {
         const segment = row.segments.find((candidate) => candidate.key === key)
+        const cumulative = segment?.cumulative ?? 0
         return {
           x: xFor(rowIndex),
-          y0: yFor(segment?.y0Value ?? 0),
-          y1: yFor(segment?.y1Value ?? 0)
+          y0: yFor(0),
+          y1: yFor(cumulative)
         }
       })
       const top = points.map((point) => `${point.x.toFixed(1)},${point.y1.toFixed(1)}`)
@@ -1543,10 +1528,10 @@
         <section class="overflow-hidden rounded-xl border bg-card/40">
           <div class="flex flex-wrap items-center justify-between gap-2 border-b px-3 py-2">
             <div>
-              <div class="text-sm font-semibold">Cumulative PnL Area by Asset</div>
+              <div class="text-sm font-semibold">Cumulative PnL by Asset</div>
               <div class="text-xs text-muted-foreground">
-                Stacked cumulative PnL on the y-axis using the same assets and streams as the asset
-                bar chart.
+                Cumulative PnL on the y-axis using the same assets and streams as the asset bar
+                chart.
               </div>
             </div>
             <div class="flex flex-wrap items-center gap-2 text-xs">
@@ -1631,10 +1616,10 @@
         <section class="overflow-hidden rounded-xl border bg-card/40">
           <div class="flex flex-wrap items-center justify-between gap-2 border-b px-3 py-2">
             <div>
-              <div class="text-sm font-semibold">Cumulative PnL Area by PnL-Stream</div>
+              <div class="text-sm font-semibold">Cumulative PnL by PnL-Stream</div>
               <div class="text-xs text-muted-foreground">
-                Stacked cumulative PnL on the y-axis using the same assets and streams as the stream
-                bar chart.
+                Cumulative PnL on the y-axis using the same assets and streams as the stream bar
+                chart.
               </div>
             </div>
             <div class="flex flex-wrap items-center gap-2 text-xs">
