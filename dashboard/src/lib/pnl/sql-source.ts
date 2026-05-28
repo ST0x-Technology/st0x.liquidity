@@ -118,6 +118,7 @@ type PositionReplayDelta = {
 
 const ATTRIBUTION_METHOD = 'direct_sql_position_fill_replay_fifo'
 const COUNTER_TRADE_THRESHOLD_SECONDS = 300
+const DATASSETTE_DEFAULT_MAX_RETURNED_ROWS = 1000
 const ZERO = new Decimal(0)
 
 const ATTRIBUTION_WARNING =
@@ -187,9 +188,14 @@ const globalOrigin = (): string => {
 export const buildSqlApiUrl = (baseUrl: string, sql: string): string => {
   const url = new URL(baseUrl, globalOrigin())
   url.searchParams.set('sql', sql)
-  url.searchParams.set('_shape', 'array')
+  url.searchParams.set('_shape', 'objects')
   url.searchParams.set('_size', 'max')
   return url.toString()
+}
+
+type DatasetteRowsResponse<Row> = {
+  rows?: unknown
+  truncated?: boolean
 }
 
 const fetchSqlRows = async <Row>(baseUrl: string, sql: string): Promise<Row[]> => {
@@ -201,12 +207,20 @@ const fetchSqlRows = async <Row>(baseUrl: string, sql: string): Promise<Row[]> =
     throw new Error(`SQL endpoint HTTP ${String(response.status)}`)
   }
 
-  const rows = (await response.json()) as unknown
-  if (!Array.isArray(rows)) {
-    throw new Error('SQL endpoint returned a non-array response')
+  const body = (await response.json()) as DatasetteRowsResponse<Row>
+  if (!Array.isArray(body.rows)) {
+    throw new Error('SQL endpoint returned a response without rows')
   }
 
-  return rows as Row[]
+  if (body.truncated === true) {
+    throw new Error('SQL endpoint truncated the result set; refusing to render partial PnL')
+  }
+
+  if (body.truncated === undefined && body.rows.length >= DATASSETTE_DEFAULT_MAX_RETURNED_ROWS) {
+    throw new Error('SQL endpoint may have truncated the result set; refusing to render partial PnL')
+  }
+
+  return body.rows as Row[]
 }
 
 const positionEventsSql = (symbols: Set<string>): string => `

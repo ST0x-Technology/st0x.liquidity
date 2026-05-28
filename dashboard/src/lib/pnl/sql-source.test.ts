@@ -89,7 +89,7 @@ describe('buildSqlApiUrl', () => {
     )
 
     expect(url).toBe(
-      'http://host:8081/st0x-hedge.json?sql=SELECT+symbol%2C+net_position+FROM+position_view&_shape=array&_size=max'
+      'http://host:8081/st0x-hedge.json?sql=SELECT+symbol%2C+net_position+FROM+position_view&_shape=objects&_size=max'
     )
   })
 
@@ -101,7 +101,7 @@ describe('buildSqlApiUrl', () => {
     })
 
     expect(buildSqlApiUrl('/__pnl_sql', 'SELECT 1')).toBe(
-      'http://localhost:5174/__pnl_sql?sql=SELECT+1&_shape=array&_size=max'
+      'http://localhost:5174/__pnl_sql?sql=SELECT+1&_shape=objects&_size=max'
     )
   })
 })
