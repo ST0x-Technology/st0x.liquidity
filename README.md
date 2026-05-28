@@ -364,14 +364,36 @@ Pass `-i <path>` to use a different key.
 **Deployment** (requires SSH key for host access and terraform state
 decryption):
 
-| Command         | Usage                               | Notes                                               |
-| --------------- | ----------------------------------- | --------------------------------------------------- |
-| `deployAll`     | `nix run .#deployAll`               | Deploy system config + all services                 |
-| `deployNixos`   | `nix run .#deployNixos`             | Deploy NixOS system config only                     |
-| `deployService` | `nix run .#deployService <profile>` | Deploy a single service (`st0x-hedge`, `datasette`) |
-| `remote`        | `nix run .#remote [-- <cmd>]`       | SSH into production host                            |
-| `secret`        | `nix run .#secret <file.age>`       | Edit an encrypted config, then re-encrypt all       |
-| `bootstrap`     | `nix run .#bootstrap`               | One-time NixOS install on a new host                |
+| Command                  | Usage                                   | Notes                                         |
+| ------------------------ | --------------------------------------- | --------------------------------------------- |
+| `prodDeployAll`          | `nix run .#prodDeployAll`               | Deploy prod system config + all services      |
+| `prodDeployNixos`        | `nix run .#prodDeployNixos`             | Deploy prod NixOS system config only          |
+| `prodDeployNixosBoot`    | `nix run .#prodDeployNixosBoot`         | Register prod NixOS config for next boot      |
+| `prodDeployService`      | `nix run .#prodDeployService <profile>` | Deploy a single prod service                  |
+| `stagingDeployAll`       | `nix run .#stagingDeployAll`            | Deploy staging system config + all services   |
+| `stagingDeployNixosBoot` | `nix run .#stagingDeployNixosBoot`      | Register staging NixOS config for next boot   |
+| `remote`                 | `nix run .#remote [-- <cmd>]`           | SSH into production host                      |
+| `secret`                 | `nix run .#secret <file.age>`           | Edit an encrypted config, then re-encrypt all |
+| `bootstrap`              | `nix run .#bootstrap`                   | One-time NixOS install on a new host          |
+
+The deploy workflows also expose a `broker-migration` mode for the one-time
+`dbus` to `dbus-broker` migration. Use that mode when a NixOS change must be
+registered for next boot instead of live-switched: it boot-deploys the system
+profile, reboots the host, waits for SSH over Tailscale, verifies `dbus-broker`,
+then runs the normal full deploy to reactivate service profiles. This keeps the
+host on the current NixOS default instead of carrying a permanent override back
+to classic `dbus`.
+
+To run the production migration:
+
+1. Draft the release tag from `master`.
+2. Open the **Deploy to Production** GitHub Actions workflow.
+3. Click **Run workflow**.
+4. Enter the release tag.
+5. Set `mode` to `broker-migration`.
+6. Start the workflow and wait for the final `Deploy all profiles after reboot`
+   step to pass.
+7. Use the default `all` mode for future production deploys.
 
 **Infrastructure** (requires SSH key for terraform state decryption):
 

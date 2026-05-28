@@ -340,6 +340,10 @@ in
     };
   };
 
+  # The system bus implementation cannot be live-switched safely. Deploy this
+  # change with deploy-rs --boot and a reboot, not a normal switch.
+  services.dbus.implementation = "broker";
+
   environment.systemPackages = with pkgs; [
     bat
     curl

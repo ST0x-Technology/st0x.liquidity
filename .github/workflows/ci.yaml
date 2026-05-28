@@ -72,6 +72,7 @@ jobs:
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
 
       - uses: DeterminateSystems/magic-nix-cache-action@main
+        continue-on-error: true
 
       - name: Cache cargo artifacts
         uses: actions/cache@v4
@@ -142,6 +143,9 @@ jobs:
             accept-flake-config = true
             fallback = true
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
+      - name: deploy migration invariants
+        run: ./scripts/validate-deploy-migration.sh
 
       - name: pre-commit hooks
         run: nix develop .#ci-hooks -c pre-commit run --all-files

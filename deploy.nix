@@ -185,6 +185,7 @@ in
           mkDeployScript =
             name:
             {
+              extraDeployFlags ? "",
               prelude ? "",
               target,
             }:
@@ -194,7 +195,7 @@ in
               text = ''
                 ${deployPreamble}
                 ${prelude}
-                deploy ${deployFlags} ''${ssh_flag:+"$ssh_flag"} ${target} \
+                deploy ${deployFlags} ${extraDeployFlags} ''${ssh_flag:+"$ssh_flag"} ${target} \
                   -- ${nixFlags} "$@"
               '';
             };
@@ -202,6 +203,11 @@ in
         in
         {
           "${env}DeployNixos" = mkDeployScript "${env}-deploy-nixos" {
+            target = ".#${nodeName}.system";
+          };
+
+          "${env}DeployNixosBoot" = mkDeployScript "${env}-deploy-nixos-boot" {
+            extraDeployFlags = "--boot";
             target = ".#${nodeName}.system";
           };
 

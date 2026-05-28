@@ -7,6 +7,14 @@ on:
         description: "Git tag to deploy (must be on master)"
         required: true
         type: string
+      mode:
+        description: "Deployment mode"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - broker-migration
 
 permissions:
   contents: read
@@ -48,6 +56,7 @@ jobs:
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
 
       - uses: DeterminateSystems/magic-nix-cache-action@main
+        continue-on-error: true
 
       - name: Connect to Tailscale
         uses: tailscale/github-action@v4
@@ -66,11 +75,72 @@ jobs:
           chmod 700 ~/.ssh
           echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
+          ssh-keygen -R "$DEPLOY_HOST" >/dev/null 2>&1 || true
+          echo "$DEPLOY_HOST $(nix eval --raw --file keys.nix keys.host-prod)" >> ~/.ssh/known_hosts
 
       - name: Warm up Tailscale tunnel
-        run: tailscale ping --c 1 "$DEPLOY_HOST"
+        run: |
+          for attempt in {1..6}; do
+            if tailscale ping --c 1 "$DEPLOY_HOST"; then
+              exit 0
+            fi
+            echo "Tailscale ping failed on attempt $attempt; retrying..."
+            sleep 5
+          done
+          tailscale status
+          exit 1
 
       - name: Deploy
+        if: ${{ inputs.mode == 'all' }}
+        run: nix run .#prodDeployAll
+
+      - name: Deploy NixOS system for next boot
+        if: ${{ inputs.mode == 'broker-migration' }}
+        run: nix run .#prodDeployNixosBoot
+
+      - name: Record current boot ID
+        if: ${{ inputs.mode == 'broker-migration' }}
+        run: |
+          pre_reboot_boot_id=$(ssh -o BatchMode=yes root@"$DEPLOY_HOST" 'cat /proc/sys/kernel/random/boot_id')
+          if [ -z "$pre_reboot_boot_id" ]; then
+            echo "Failed to read pre-reboot boot ID" >&2
+            exit 1
+          fi
+          printf 'PRE_REBOOT_BOOT_ID=%s\n' "$pre_reboot_boot_id" >> "$GITHUB_ENV"
+
+      - name: Reboot production host
+        if: ${{ inputs.mode == 'broker-migration' }}
+        run: ssh -o BatchMode=yes -o ConnectTimeout=10 root@"$DEPLOY_HOST" 'systemctl reboot' || true
+
+      - name: Wait for production host
+        if: ${{ inputs.mode == 'broker-migration' }}
+        run: |
+          for attempt in {1..60}; do
+            current_boot_id=$(ssh -o BatchMode=yes -o ConnectTimeout=5 root@"$DEPLOY_HOST" 'cat /proc/sys/kernel/random/boot_id' 2>/dev/null || true)
+            if [ -n "$current_boot_id" ] && [ "$current_boot_id" != "$PRE_REBOOT_BOOT_ID" ]; then
+              exit 0
+            fi
+            echo "Host has not returned on a new boot after attempt $attempt; retrying..."
+            sleep 10
+          done
+          tailscale status
+          exit 1
+
+      - name: Verify dbus-broker migration
+        if: ${{ inputs.mode == 'broker-migration' }}
+        run: |
+          ssh -o BatchMode=yes root@"$DEPLOY_HOST" '
+            set -eu
+            systemctl is-active --quiet dbus-broker.service
+            failed_units=$(systemctl --failed --no-legend --plain)
+            if [ -n "$failed_units" ]; then
+              echo "$failed_units" >&2
+              exit 1
+            fi
+          '
+
+      - name: Deploy all profiles after reboot
+        if: ${{ inputs.mode == 'broker-migration' }}
         run: nix run .#prodDeployAll
 
       - name: Cleanup SSH
