@@ -120,7 +120,7 @@
     counterTradePnlUsd: 'Counter-trade',
     onchainNettingPnlUsd: 'On-chain netting',
     directionalInventoryBaselinePnlUsd: 'Baseline drift',
-    directionalImbalanceExcessPnlUsd: 'Directional excess'
+    directionalImbalanceExcessPnlUsd: 'Directional realized'
   }
   const streamColors: Record<PnlStreamKey, string> = {
     counterTradePnlUsd: '#38bdf8',
@@ -143,23 +143,23 @@
     {
       label: 'Baseline drift PnL',
       formula: 'sum(frozen_start_qty * (bucket_end_mark - bucket_start_mark))',
-      note: 'This isolates the mark-to-market move of inventory that already existed at the start of the displayed bucket.'
+      note: 'Requires historical portfolio and mark snapshots; currently reported as zero.'
     },
     {
-      label: 'Directional excess PnL',
-      formula: 'sum(excess_open_qty * (bucket_end_mark - exposure_open_mark) * side_sign)',
-      note: 'Used for dangling or late-countered exposure beyond the normal balanced inventory threshold.'
+      label: 'Directional realized PnL',
+      formula: 'sum((close_price - open_price) * matched_qty * side_sign)',
+      note: 'Realized closed-lot PnL for delayed or offchain-origin exposure.'
     },
     {
-      label: 'Directional total PnL',
+      label: 'Directional realized total',
       formula: 'baseline_drift_pnl + directional_excess_pnl',
-      note: 'This is the full directional component before adding realized counter-trade and on-chain netting PnL.'
+      note: 'Baseline drift is zero until historical snapshots are persisted.'
     },
     {
-      label: 'Total PnL',
+      label: 'Realized gross PnL',
       formula:
         'counter_trade_pnl + onchain_netting_pnl + baseline_drift_pnl + directional_excess_pnl',
-      note: 'Bars are non-cumulative. Weekly and monthly bars sum the day-level buckets inside that displayed period.'
+      note: 'Gross realized replay by close date; costs, financing, and unrealized NAV drift are not included.'
     }
   ]
 
@@ -1142,7 +1142,7 @@
         >
       </div>
       <span class="text-muted-foreground">
-        Showing {fromDate.current} to {toDate.current} as {timeBuckets.length}
+        Showing realized close dates {fromDate.current} to {toDate.current} as {timeBuckets.length}
         {cadenceLabel} non-cumulative buckets. Cash values treat USD and USDC 1:1; portfolio percentage
         return is not shown because historical NAV is not persisted.
       </span>
@@ -1221,7 +1221,7 @@
 
       <div class="grid gap-3 md:grid-cols-2 xl:grid-cols-6">
         <div class="rounded-lg border bg-card/60 p-3">
-          <div class="text-xs text-muted-foreground">Total PnL</div>
+          <div class="text-xs text-muted-foreground">Realized Gross PnL</div>
           <div class="mt-1 font-mono text-xl font-semibold {pnlColor(summary.totalPnlUsd)}">
             {fmtSignedUsd(summary.totalPnlUsd)}
           </div>
@@ -1248,7 +1248,7 @@
         </div>
 
         <div class="rounded-lg border bg-card/60 p-3">
-          <div class="text-xs text-muted-foreground">Directional Excess PnL</div>
+          <div class="text-xs text-muted-foreground">Directional Realized PnL</div>
           <div
             class="mt-1 font-mono text-xl font-semibold {pnlColor(
               summary.directionalImbalanceExcessPnlUsd
@@ -1257,7 +1257,7 @@
             {fmtSignedUsd(summary.directionalImbalanceExcessPnlUsd)}
           </div>
           <div class="mt-1 text-xs text-muted-foreground">
-            Uncountered or delayed hedge exposure
+            Closed delayed or offchain-origin exposure
           </div>
         </div>
 
@@ -1270,11 +1270,11 @@
           >
             {fmtSignedUsd(summary.directionalInventoryBaselinePnlUsd)}
           </div>
-          <div class="mt-1 text-xs text-muted-foreground">Start-of-window inventory move</div>
+          <div class="mt-1 text-xs text-muted-foreground">Requires historical snapshots</div>
         </div>
 
         <div class="rounded-lg border bg-card/60 p-3">
-          <div class="text-xs text-muted-foreground">Directional Total PnL</div>
+          <div class="text-xs text-muted-foreground">Directional Realized Total</div>
           <div
             class="mt-1 font-mono text-xl font-semibold {pnlColor(
               summary.directionalExposurePnlUsd
@@ -1290,16 +1290,12 @@
         </div>
 
         <div class="rounded-lg border bg-card/60 p-3">
-          <div class="text-xs text-muted-foreground">Unmatched Counter Trades</div>
-          <div
-            class="mt-1 font-mono text-xl font-semibold {summary.unmatchedOffchainFillCount > 0
-              ? 'text-amber-300'
-              : 'text-muted-foreground'}"
-          >
-            {fmtShares(summary.unmatchedOffchainShares)}
+          <div class="text-xs text-muted-foreground">Open Replay Inventory</div>
+          <div class="mt-1 font-mono text-xl font-semibold text-muted-foreground">
+            {fmtShares(summary.inventoryDriftShares)}
           </div>
           <div class="mt-1 font-mono text-xs text-muted-foreground">
-            {fmtUsd(summary.unmatchedOffchainNotionalUsd)}
+            cost basis {fmtUsd(summary.inventoryDriftUsd)}
           </div>
         </div>
       </div>
@@ -1719,10 +1715,10 @@
               <Table.Header>
                 <Table.Row>
                   <Table.Head>Asset</Table.Head>
-                  <Table.Head class="text-right">Total</Table.Head>
+                  <Table.Head class="text-right">Realized</Table.Head>
                   <Table.Head class="text-right">Counter</Table.Head>
                   <Table.Head class="text-right">On-chain</Table.Head>
-                  <Table.Head class="text-right">Excess</Table.Head>
+                  <Table.Head class="text-right">Directional</Table.Head>
                   <Table.Head class="text-right">Baseline Drift</Table.Head>
                   <Table.Head class="text-right">Lots</Table.Head>
                 </Table.Row>

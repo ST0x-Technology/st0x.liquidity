@@ -125,9 +125,9 @@ const SAFE_SQL_SYMBOL = /^[A-Za-z0-9._-]+$/u
 const ZERO = new Decimal(0)
 
 const ATTRIBUTION_WARNING =
-  'PnL source: rows are read from the deployed SQL JSON endpoint. Fills are ordered by execution timestamp and replayed through per-symbol FIFO inventory lots for accounting and attribution; explicit offchain_order_id -> onchain_trade_ids parentage is not currently persisted.'
+  'PnL source: realized gross replay from the deployed SQL JSON endpoint. Fills are ordered by execution timestamp and replayed through per-symbol FIFO inventory lots for accounting and attribution; explicit offchain_order_id -> onchain_trade_ids parentage is not currently persisted.'
 const BASELINE_WARNING =
-  'Baseline drift is reported as zero in the deployed view because historical portfolio state and price/NAV snapshots are not currently persisted. Realized replay buckets are computed from persisted fills.'
+  'Displayed PnL is realized gross PnL by lot close date. Baseline drift, net costs, and true period/NAV PnL require historical portfolio/mark snapshots plus fee and financing data; those are not currently persisted, so baseline drift is zero.'
 
 const emptySummary = (): SummaryAcc => ({
   counterTradePnlUsd: new Decimal(0),
