@@ -70,14 +70,19 @@ const onchainSell = (
   })
 })
 
-const offchainBuy = (rowid: number, timestamp: string, price = '8'): SqlPositionEventRow => ({
+const offchainBuy = (
+  rowid: number,
+  timestamp: string,
+  price = '8',
+  shares = '1'
+): SqlPositionEventRow => ({
   rowid,
   symbol: 'RKLB',
   event_type: 'PositionEvent::OffChainOrderFilled',
   payload: {
     OffChainOrderFilled: {
       offchain_order_id: `alpaca-${String(rowid)}`,
-      shares_filled: '1',
+      shares_filled: shares,
       direction: 'Buy',
       price,
       broker_timestamp: timestamp
@@ -336,6 +341,46 @@ describe('buildPnlResponseFromSqlRows', () => {
     expect(report.warnings).toEqual(
       expect.arrayContaining([
         expect.stringContaining('offchain fills opened offchain-origin inventory')
+      ])
+    )
+  })
+
+  it('splits offchain overshoots between counter-trade close and carried inventory', () => {
+    const report = buildPnlResponseFromSqlRows(
+      [
+        onchainSell(1, '10', '2026-05-15T10:00:00Z'),
+        offchainBuy(2, '2026-05-15T10:01:00Z', '8', '2'),
+        onchainSell(3, '11', '2026-05-15T10:02:00Z')
+      ],
+      positionRows,
+      sampleRows,
+      baseQuery
+    )
+
+    expect(report.summary.totalPnlUsd).toBe('5')
+    expect(report.summary.counterTradePnlUsd).toBe('2')
+    expect(report.summary.directionalImbalanceExcessPnlUsd).toBe('3')
+    expect(report.summary.realizedPnlUsd).toBe('5')
+    expect(report.summary.openLongShares).toBe('0')
+    expect(report.summary.openShortShares).toBe('0')
+    expect(report.summary.unmatchedOffchainShares).toBe('0')
+    expect(report.entries).toHaveLength(2)
+    expect(report.entries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          openingVenue: 'onchain',
+          closingVenue: 'offchain',
+          shares: '1',
+          pnlBucket: 'counter_trade',
+          realizedPnlUsd: '2'
+        }),
+        expect.objectContaining({
+          openingVenue: 'offchain',
+          closingVenue: 'onchain',
+          shares: '1',
+          pnlBucket: 'directional_exposure',
+          realizedPnlUsd: '3'
+        })
       ])
     )
   })
