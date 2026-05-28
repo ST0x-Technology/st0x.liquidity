@@ -135,6 +135,26 @@ describe('buildPnlResponseFromSqlRows', () => {
     expect(report.entries[0]?.delayedCounterTrade).toBe(false)
   })
 
+  it('replays fills by execution timestamp rather than event rowid', () => {
+    const report = buildPnlResponseFromSqlRows(
+      [offchainBuy(1, '2026-05-15T10:01:00Z', '8'), onchainSell(2, '10')],
+      positionRows,
+      sampleRows,
+      baseQuery
+    )
+
+    expect(report.summary.counterTradePnlUsd).toBe('2')
+    expect(report.summary.directionalImbalanceExcessPnlUsd).toBe('0')
+    expect(report.entries[0]).toEqual(
+      expect.objectContaining({
+        openingRowid: 2,
+        closingRowid: 1,
+        pnlBucket: 'counter_trade',
+        realizedPnlUsd: '2'
+      })
+    )
+  })
+
   it('classifies late broker fills as directional exposure', () => {
     const report = buildPnlResponseFromSqlRows(
       [onchainSell(1, '10'), offchainBuy(2, '2026-05-15T10:06:01Z', '8')],

@@ -125,7 +125,7 @@ const SAFE_SQL_SYMBOL = /^[A-Za-z0-9._-]+$/u
 const ZERO = new Decimal(0)
 
 const ATTRIBUTION_WARNING =
-  'PnL source: rows are read from the deployed SQL JSON endpoint. Fills are replayed through per-symbol FIFO inventory lots for accounting and attribution; explicit offchain_order_id -> onchain_trade_ids parentage is not currently persisted.'
+  'PnL source: rows are read from the deployed SQL JSON endpoint. Fills are ordered by execution timestamp and replayed through per-symbol FIFO inventory lots for accounting and attribution; explicit offchain_order_id -> onchain_trade_ids parentage is not currently persisted.'
 const BASELINE_WARNING =
   'Baseline drift is reported as zero in the deployed view because historical portfolio state and price/NAV snapshots are not currently persisted. Realized replay buckets are computed from persisted fills.'
 
@@ -336,6 +336,54 @@ const directionField = (payload: Record<string, unknown>, key: string): Directio
   if (value === 'sell') return 'Sell'
   return null
 }
+
+const positionEventReplayTimestamp = (row: SqlPositionEventRow): string | null => {
+  const payload = parsePayload(row.payload)
+  if (payload === null) return null
+
+  if (row.event_type === 'PositionEvent::OnChainOrderFilled') {
+    const filled = nestedRecord(payload, 'OnChainOrderFilled')
+    return filled === null ? null : textField(filled, 'block_timestamp')
+  }
+
+  if (row.event_type === 'PositionEvent::OffChainOrderFilled') {
+    const filled = nestedRecord(payload, 'OffChainOrderFilled')
+    return filled === null ? null : textField(filled, 'broker_timestamp')
+  }
+
+  if (row.event_type === 'PositionEvent::OffChainOrderPlaced') {
+    const placed = nestedRecord(payload, 'OffChainOrderPlaced')
+    return placed === null ? null : textField(placed, 'placed_at')
+  }
+
+  return null
+}
+
+const orderedPositionEvents = (
+  rows: SqlPositionEventRow[],
+  warnings: string[]
+): SqlPositionEventRow[] =>
+  [...rows]
+    .map((row) => {
+      const timestamp = positionEventReplayTimestamp(row)
+      const parsed = timestamp === null ? Number.NaN : Date.parse(timestamp)
+      const hasTimestamp = Number.isFinite(parsed)
+      if (timestamp !== null && !hasTimestamp) {
+        warnings.push(
+          `PnL audit note: invalid replay timestamp for ${row.symbol} row ${String(row.rowid)}; using event row order`
+        )
+      }
+
+      return {
+        row,
+        timestampMs: hasTimestamp ? parsed : Number.POSITIVE_INFINITY
+      }
+    })
+    .sort((left, right) => {
+      if (left.timestampMs !== right.timestampMs) return left.timestampMs - right.timestampMs
+      return left.row.rowid - right.row.rowid
+    })
+    .map(({ row }) => row)
 
 const dateKey = (iso: string): string => iso.slice(0, 10)
 
@@ -1222,7 +1270,7 @@ export const buildPnlResponseFromSqlRows = (
   const unmatchedOffchainAllocations: UnmatchedOffchainAllocation[] = []
   const positionReplayDeltas: PositionReplayDelta[] = []
 
-  for (const row of [...eventRows].sort((left, right) => left.rowid - right.rowid)) {
+  for (const row of orderedPositionEvents(eventRows, warnings)) {
     if (!isSafeSqlSymbol(row.symbol)) {
       warnings.push(`Skipped unsafe position event symbol in SQL PnL response: ${row.symbol}`)
       continue
