@@ -112,6 +112,8 @@
     presetStartForRange('1w', initialAvailableStartDate, initialAvailableEndDate)
   )
   const toDate = reactive(initialAvailableEndDate)
+  const dateRangeKey = (from: string, to: string): string => `${from}:${to}`
+  let lastRequestedDateRangeKey: string | null = null
   let fetchSeq = 0
 
   const streamLabels: Record<PnlStreamKey, string> = {
@@ -420,14 +422,17 @@
 
     loading.update(() => true)
     error.update(() => null)
+    const requestFromDate = fromDate.current
+    const requestToDate = toDate.current
+    lastRequestedDateRangeKey = dateRangeKey(requestFromDate, requestToDate)
 
     try {
       const data = await fetchPnlReport({
         limit: PNL_ENTRY_LIMIT,
         offset: 0,
         symbols: selectedSymbols.current,
-        fromDate: fromDate.current,
-        toDate: toDate.current,
+        fromDate: requestFromDate,
+        toDate: requestToDate,
         dayFilter: dayFilter.current
       })
 
@@ -538,11 +543,12 @@
     const nextTo =
       selectedPreset.current === 'custom' ? clampDate(toDate.current) : availableEndDate
 
-    if (nextFrom === fromDate.current && nextTo === toDate.current) return
+    const nextRangeKey = dateRangeKey(nextFrom, nextTo)
+    if (nextRangeKey === dateRangeKey(fromDate.current, toDate.current)) return
 
     fromDate.update(() => nextFrom)
     toDate.update(() => nextTo)
-    void fetchPnl()
+    if (nextRangeKey !== lastRequestedDateRangeKey) void fetchPnl()
   })
 
   onMount(() => {
