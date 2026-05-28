@@ -45,6 +45,7 @@ export type SqlSampleStatsRow = {
 type Direction = 'Buy' | 'Sell'
 type LotSide = 'long' | 'short'
 type PnlBucket = 'counter_trade' | 'onchain_netting' | 'directional_exposure'
+type SqlSymbolColumn = 'aggregate_id' | 'symbol'
 
 type Fill = {
   rowid: number
@@ -119,6 +120,7 @@ const ATTRIBUTION_METHOD = 'direct_sql_position_fill_replay_fifo'
 const COUNTER_TRADE_THRESHOLD_SECONDS = 300
 const DATASSETTE_DEFAULT_MAX_RETURNED_ROWS = 1000
 const SQL_FETCH_TIMEOUT_MS = 30000
+const SAFE_SQL_SYMBOL = /^[A-Za-z0-9._-]+$/u
 const ZERO = new Decimal(0)
 
 const ATTRIBUTION_WARNING =
@@ -164,11 +166,17 @@ const emptyBook = (): SymbolBook => ({
   summary: emptySummary()
 })
 
+const isSafeSqlSymbol = (symbol: string): boolean => SAFE_SQL_SYMBOL.test(symbol)
+
 const sqlString = (value: string): string => `'${value.replaceAll("'", "''")}'`
 
-const symbolPredicate = (symbols: Set<string>, column: string): string => {
+const symbolPredicate = (symbols: Set<string>, column: SqlSymbolColumn): string => {
   if (symbols.size === 0) return ''
-  return ` AND ${column} IN (${[...symbols].map(sqlString).join(',')})`
+
+  const safeSymbols = [...symbols].filter(isSafeSqlSymbol)
+  if (safeSymbols.length === 0) return ' AND 1 = 0'
+
+  return ` AND ${column} IN (${safeSymbols.map(sqlString).join(',')})`
 }
 
 const globalOrigin = (): string => {
@@ -389,6 +397,15 @@ const positionReplayDeltaText = (deltas: PositionReplayDelta[]): string | null =
     .join('; ')
 
   return `Reconciliation note: replayed open lots differ from position_view for ${String(deltas.length)} symbols (${details}). This means the persisted Position fill events available to the dashboard do not fully reconstruct the current projected position for those symbols.`
+}
+
+const appendInvalidQuerySymbols = (warnings: string[], symbols: Set<string>): void => {
+  const invalidSymbols = [...symbols].filter((symbol) => !isSafeSqlSymbol(symbol))
+  if (invalidSymbols.length === 0) return
+
+  warnings.push(
+    `Skipped ${String(invalidSymbols.length)} invalid symbol filters in SQL PnL query: ${invalidSymbols.join(', ')}`
+  )
 }
 
 const appendReplayDiagnostics = (
@@ -1086,6 +1103,11 @@ const parsePositionView = (
   const symbols = new Set<string>()
 
   for (const row of rows) {
+    if (!isSafeSqlSymbol(row.symbol)) {
+      warnings.push(`Skipped unsafe position_view symbol in SQL PnL response: ${row.symbol}`)
+      continue
+    }
+
     symbols.add(row.symbol)
 
     if (row.last_price_usdc !== null) {
@@ -1113,20 +1135,26 @@ const parseCount = (value: number | string | null | undefined): number => {
   return Number.isFinite(parsed) ? parsed : 0
 }
 
-const buildSampleStats = (rows: SqlSampleStatsRow[]): PnlSampleStats => {
-  const symbols: PnlSampleSymbolStats[] = rows.map((row) => {
+const buildSampleStats = (rows: SqlSampleStatsRow[], warnings: string[]): PnlSampleStats => {
+  const symbols: PnlSampleSymbolStats[] = []
+  for (const row of rows) {
+    if (!isSafeSqlSymbol(row.symbol)) {
+      warnings.push(`Skipped unsafe sample stats symbol in SQL PnL response: ${row.symbol}`)
+      continue
+    }
+
     const onchainFillCount = parseCount(row.onchain_fill_count)
     const offchainFillCount = parseCount(row.offchain_fill_count)
 
-    return {
+    symbols.push({
       symbol: row.symbol,
       firstAt: row.first_at,
       lastAt: row.last_at,
       onchainFillCount,
       offchainFillCount,
       totalFillCount: onchainFillCount + offchainFillCount
-    }
-  })
+    })
+  }
 
   const firstAt =
     symbols
@@ -1157,18 +1185,24 @@ export const buildPnlResponseFromSqlRows = (
   query: SqlPnlQuery
 ): PnlResponse => {
   const warnings = [ATTRIBUTION_WARNING, BASELINE_WARNING]
+  appendInvalidQuerySymbols(warnings, query.symbols)
   const {
     markPrices,
     positionNets,
     symbols: positionSymbols
   } = parsePositionView(positionRows, warnings)
-  const sampleStats = buildSampleStats(sampleRows)
+  const sampleStats = buildSampleStats(sampleRows, warnings)
   const books = new Map<string, SymbolBook>()
   const entries: PnlEntry[] = []
   const unmatchedOffchainAllocations: UnmatchedOffchainAllocation[] = []
   const positionReplayDeltas: PositionReplayDelta[] = []
 
   for (const row of [...eventRows].sort((left, right) => left.rowid - right.rowid)) {
+    if (!isSafeSqlSymbol(row.symbol)) {
+      warnings.push(`Skipped unsafe position event symbol in SQL PnL response: ${row.symbol}`)
+      continue
+    }
+
     const book = getBook(books, row.symbol)
 
     if (row.event_type === 'PositionEvent::OnChainOrderFilled') {

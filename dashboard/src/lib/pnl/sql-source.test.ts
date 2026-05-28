@@ -189,6 +189,53 @@ describe('buildPnlResponseFromSqlRows', () => {
     })
   })
 
+  it('drops unsafe symbols from SQL replay rows and warnings', () => {
+    const report = buildPnlResponseFromSqlRows(
+      [
+        {
+          ...onchainSell(1, '10'),
+          symbol: "RKLB'); DROP TABLE events; --"
+        },
+        onchainSell(2, '10'),
+        offchainBuy(3, '2026-05-15T10:01:00Z', '8')
+      ],
+      [
+        ...positionRows,
+        {
+          symbol: "BAD';--",
+          net_position: '0',
+          last_updated: '2026-05-15T10:01:00Z',
+          last_price_usdc: '1'
+        }
+      ],
+      [
+        ...sampleRows,
+        {
+          symbol: "BAD';--",
+          onchain_fill_count: 1,
+          offchain_fill_count: 1,
+          first_at: '2026-05-15T10:00:00Z',
+          last_at: '2026-05-15T10:01:00Z'
+        }
+      ],
+      {
+        ...baseQuery,
+        symbols: new Set(["RKLB'); DROP TABLE events; --"])
+      }
+    )
+
+    expect(report.summary.counterTradePnlUsd).toBe('2')
+    expect(report.symbolUniverse).toEqual(['RKLB', 'SPYM'])
+    expect(report.warnings).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining('Skipped 1 invalid symbol filters'),
+        expect.stringContaining('Skipped unsafe position_view symbol'),
+        expect.stringContaining('Skipped unsafe sample stats symbol'),
+        expect.stringContaining('Skipped unsafe position event symbol')
+      ])
+    )
+  })
+
   it('summarizes replay diagnostics without raw per-fill allocation warnings', () => {
     const report = buildPnlResponseFromSqlRows(
       [offchainBuy(1, '2026-05-15T10:01:00Z', '8')],
