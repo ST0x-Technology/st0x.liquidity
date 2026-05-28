@@ -295,12 +295,18 @@ describe('buildPnlResponseFromSqlRows', () => {
 
     expect(report.summary.totalPnlUsd).toBe('2')
     expect(report.summary.directionalImbalanceExcessPnlUsd).toBe('2')
+    expect(report.summary.onchainNotionalUsd).toBe('10')
+    expect(report.summary.offchainNotionalUsd).toBe('8')
     expect(report.summary.unmatchedOffchainShares).toBe('0')
     expect(report.summary.openLongShares).toBe('0')
     expect(report.entries[0]).toEqual(
       expect.objectContaining({
         openingVenue: 'offchain',
         closingVenue: 'onchain',
+        onchainDirection: 'sell',
+        offchainDirection: 'buy',
+        onchainPriceUsdc: '10',
+        offchainPriceUsd: '8',
         pnlBucket: 'directional_exposure',
         realizedPnlUsd: '2'
       })

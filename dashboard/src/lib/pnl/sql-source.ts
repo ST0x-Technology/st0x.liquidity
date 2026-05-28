@@ -422,6 +422,14 @@ const appendReplayDiagnostics = (
 const directionLabel = (direction: Direction): string => (direction === 'Buy' ? 'buy' : 'sell')
 const lotSideToOnchainDirection = (side: LotSide): string => (side === 'long' ? 'buy' : 'sell')
 
+const addVenueNotional = (summary: SummaryAcc, venue: Venue, notional: Decimal): void => {
+  if (venue === 'onchain') {
+    summary.onchainNotionalUsd = summary.onchainNotionalUsd.plus(notional)
+  } else {
+    summary.offchainNotionalUsd = summary.offchainNotionalUsd.plus(notional)
+  }
+}
+
 const addRealizedPnl = (summary: SummaryAcc, bucket: PnlBucket, value: Decimal): void => {
   if (bucket === 'counter_trade') {
     summary.counterTradePnlUsd = summary.counterTradePnlUsd.plus(value)
@@ -686,12 +694,8 @@ const matchFillAgainstLots = (
 
     addRealizedPnl(summary, effectiveBucket, realizedPnl)
     summary.matchedShares = summary.matchedShares.plus(matchedShares)
-    summary.onchainNotionalUsd = summary.onchainNotionalUsd.plus(openingNotional)
-    if (effectiveBucket === 'onchain_netting') {
-      summary.onchainNotionalUsd = summary.onchainNotionalUsd.plus(closingNotional)
-    } else {
-      summary.offchainNotionalUsd = summary.offchainNotionalUsd.plus(closingNotional)
-    }
+    addVenueNotional(summary, frontLot.openedVenue, openingNotional)
+    addVenueNotional(summary, fill.venue, closingNotional)
     summary.matchedLotCount += 1
 
     if (frontLot.openedVenue === 'onchain') {
@@ -703,6 +707,18 @@ const matchFillAgainstLots = (
     const closingDirection = directionLabel(fill.direction)
     const openingPriceText = fmtDecimal(frontLot.price)
     const closingPriceText = fmtDecimal(fill.price)
+    const onchainDirection =
+      frontLot.openedVenue === 'onchain'
+        ? openingDirection
+        : fill.venue === 'onchain'
+          ? closingDirection
+          : ''
+    const offchainDirection =
+      frontLot.openedVenue === 'offchain'
+        ? openingDirection
+        : fill.venue === 'offchain'
+          ? closingDirection
+          : ''
     const onchainTradeId =
       frontLot.openedVenue === 'onchain'
         ? frontLot.tradeId
@@ -714,6 +730,18 @@ const matchFillAgainstLots = (
         ? frontLot.tradeId
         : fill.venue === 'offchain'
           ? fill.id
+          : ''
+    const onchainPriceText =
+      frontLot.openedVenue === 'onchain'
+        ? openingPriceText
+        : fill.venue === 'onchain'
+          ? closingPriceText
+          : ''
+    const offchainPriceText =
+      frontLot.openedVenue === 'offchain'
+        ? openingPriceText
+        : fill.venue === 'offchain'
+          ? closingPriceText
           : ''
 
     entries.push({
@@ -734,11 +762,11 @@ const matchFillAgainstLots = (
       closingPriceUsd: closingPriceText,
       onchainTradeId,
       offchainOrderId,
-      onchainDirection: openingDirection,
-      offchainDirection: closingDirection,
+      onchainDirection,
+      offchainDirection,
       shares: fmtDecimal(matchedShares),
-      onchainPriceUsdc: openingPriceText,
-      offchainPriceUsd: closingPriceText,
+      onchainPriceUsdc: onchainPriceText,
+      offchainPriceUsd: offchainPriceText,
       spreadUsd: fmtDecimal(spread),
       realizedPnlUsd: fmtDecimal(realizedPnl),
       elapsedSeconds,
@@ -979,6 +1007,11 @@ const entryBucketToStream = (bucket: string): PnlStreamKey | null => {
   return null
 }
 
+const entryVenue = (value: string): Venue | null => {
+  if (value === 'onchain' || value === 'offchain') return value
+  return null
+}
+
 const summaryFromEntries = (
   entries: PnlEntry[]
 ): { summary: PnlSummary; symbols: PnlSymbolSummary[] } => {
@@ -994,21 +1027,21 @@ const summaryFromEntries = (
     const pnl = new Decimal(entry.realizedPnlUsd)
 
     summary.matchedShares = summary.matchedShares.plus(shares)
-    summary.onchainNotionalUsd = summary.onchainNotionalUsd.plus(openingNotional)
+    const openingVenue = entryVenue(entry.openingVenue)
+    const closingVenue = entryVenue(entry.closingVenue)
+    if (openingVenue !== null) addVenueNotional(summary, openingVenue, openingNotional)
+    if (closingVenue !== null) addVenueNotional(summary, closingVenue, closingNotional)
     summary.matchedLotCount += 1
 
     if (entry.pnlBucket === 'counter_trade') {
       summary.counterTradePnlUsd = summary.counterTradePnlUsd.plus(pnl)
       summary.realizedPnlUsd = summary.realizedPnlUsd.plus(pnl)
-      summary.offchainNotionalUsd = summary.offchainNotionalUsd.plus(closingNotional)
     } else if (entry.pnlBucket === 'onchain_netting') {
       summary.onchainNettingPnlUsd = summary.onchainNettingPnlUsd.plus(pnl)
       summary.realizedPnlUsd = summary.realizedPnlUsd.plus(pnl)
-      summary.onchainNotionalUsd = summary.onchainNotionalUsd.plus(closingNotional)
     } else if (entry.pnlBucket === 'directional_exposure') {
       summary.directionalImbalanceExcessPnlUsd = summary.directionalImbalanceExcessPnlUsd.plus(pnl)
       summary.directionalExposurePnlUsd = summary.directionalExposurePnlUsd.plus(pnl)
-      summary.offchainNotionalUsd = summary.offchainNotionalUsd.plus(closingNotional)
     }
   }
 
