@@ -1,5 +1,4 @@
 import Decimal from 'decimal.js'
-import { FETCH_TIMEOUT_MS } from '$lib/time'
 import type {
   PnlEntry,
   PnlResponse,
@@ -119,6 +118,7 @@ type PositionReplayDelta = {
 const ATTRIBUTION_METHOD = 'direct_sql_position_fill_replay_fifo'
 const COUNTER_TRADE_THRESHOLD_SECONDS = 300
 const DATASSETTE_DEFAULT_MAX_RETURNED_ROWS = 1000
+const SQL_FETCH_TIMEOUT_MS = 30000
 const ZERO = new Decimal(0)
 
 const ATTRIBUTION_WARNING =
@@ -200,7 +200,7 @@ type DatasetteRowsResponse<Row> = {
 
 const fetchSqlRows = async <Row>(baseUrl: string, sql: string): Promise<Row[]> => {
   const response = await fetch(buildSqlApiUrl(baseUrl, sql), {
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+    signal: AbortSignal.timeout(SQL_FETCH_TIMEOUT_MS)
   })
 
   if (!response.ok) {
@@ -225,7 +225,7 @@ const fetchSqlRows = async <Row>(baseUrl: string, sql: string): Promise<Row[]> =
 
 const positionEventsSql = (symbols: Set<string>): string => `
 SELECT rowid, aggregate_id AS symbol, event_type, payload
-FROM events NOT INDEXED
+FROM events
 WHERE aggregate_type = 'Position'
   AND event_type IN (
     'PositionEvent::OnChainOrderFilled',
@@ -261,7 +261,7 @@ SELECT
     json_extract(payload, '$.OnChainOrderFilled.block_timestamp'),
     json_extract(payload, '$.OffChainOrderFilled.broker_timestamp')
   )) AS last_at
-FROM events NOT INDEXED
+FROM events
 WHERE aggregate_type = 'Position'
   AND event_type IN (
     'PositionEvent::OnChainOrderFilled',
