@@ -145,6 +145,3 @@ jobs:
 
       - name: pre-commit hooks
         run: nix develop .#ci-hooks -c pre-commit run --all-files
-
-      - name: patch-rain-math-float script tests
-        run: nix build .#test-patch-rain-math-float

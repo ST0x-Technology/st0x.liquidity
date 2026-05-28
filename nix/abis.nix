@@ -19,7 +19,6 @@ let
       src = sources.forge-std;
     };
     rainMathFloat = import ./rain-math-float.nix {
-      inherit mkAbi;
       src = sources.rain-math-float;
     };
     rainOrderbook = import ./rain-orderbook.nix {

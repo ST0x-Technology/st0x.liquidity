@@ -25,8 +25,6 @@ let
 
 in
 {
-  inherit defaultBuild defaultInstall;
-
   mkAbi =
     {
       pname,
