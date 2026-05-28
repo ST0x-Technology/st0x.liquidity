@@ -7,9 +7,9 @@ import type {
   PnlStreamKey,
   PnlSummary,
   PnlSymbolSummary,
-  SyntheticPnlWindow,
-  SyntheticPnlWindowSymbol
-} from './types'
+  PnlWindow,
+  PnlWindowSymbol
+} from './report'
 
 export type SqlPnlQuery = {
   limit: number
@@ -127,7 +127,7 @@ const ZERO = new Decimal(0)
 const ATTRIBUTION_WARNING =
   'PnL source: realized gross replay from the deployed SQL JSON endpoint. Fills are ordered by execution timestamp and replayed through per-symbol FIFO inventory lots for accounting and attribution; explicit offchain_order_id -> onchain_trade_ids parentage is not currently persisted.'
 const BASELINE_WARNING =
-  'Displayed PnL is realized gross PnL by lot close date. Baseline drift, net costs, and true period/NAV PnL require historical portfolio/mark snapshots plus fee and financing data; those are not currently persisted, so baseline drift is zero.'
+  'Displayed PnL is realized gross PnL by lot close date from persisted fills only. Baseline drift, percentage return, true period/NAV PnL, and cost-inclusive PnL require a persisted portfolio state vector plus price vector over time, cash-flow events, fees, and financing data; those are not currently persisted, so baseline drift is zero.'
 
 const emptySummary = (): SummaryAcc => ({
   counterTradePnlUsd: new Decimal(0),
@@ -1094,7 +1094,7 @@ const summaryFromEntries = (
   return { summary: summaryToDto(total), symbols }
 }
 
-const buildWindows = (entries: PnlEntry[], symbols: string[]): SyntheticPnlWindow[] => {
+const buildWindows = (entries: PnlEntry[], symbols: string[]): PnlWindow[] => {
   const byDate = new Map<string, PnlEntry[]>()
 
   for (const entry of entries) {
@@ -1110,7 +1110,7 @@ const buildWindows = (entries: PnlEntry[], symbols: string[]): SyntheticPnlWindo
   return [...byDate.entries()]
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([date, dayEntries]) => {
-      const rows: SyntheticPnlWindowSymbol[] = symbols.map((symbol) => {
+      const rows: PnlWindowSymbol[] = symbols.map((symbol) => {
         const values: Record<PnlStreamKey, Decimal> = {
           counterTradePnlUsd: new Decimal(0),
           onchainNettingPnlUsd: new Decimal(0),

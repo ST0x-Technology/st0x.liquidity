@@ -8,16 +8,17 @@
   import { reactive } from '$lib/frp.svelte'
   import { formatUtc } from '$lib/time'
   import { fetchPnlReport } from '$lib/pnl/api'
-  import { STREAM_KEYS, syntheticPnlDashboard } from '$lib/pnl/synthetic'
+  import { STREAM_KEYS } from '$lib/pnl/report'
+  import { syntheticPnlDashboard } from '$lib/pnl/synthetic'
   import type {
     PnlEntry,
     PnlResponse,
     PnlStreamKey,
     PnlSummary,
     PnlSymbolSummary,
-    SyntheticPnlWindow,
-    SyntheticPnlWindowSymbol
-  } from '$lib/pnl/types'
+    PnlWindow,
+    PnlWindowSymbol
+  } from '$lib/pnl/report'
 
   type RangePreset = '1w' | '1m' | 'ytd' | '1y' | 'all' | 'custom'
 
@@ -217,7 +218,7 @@
     unmatchedOffchainFillCount: 0
   })
 
-  const addWindowSymbol = (target: PnlSymbolSummary, row: SyntheticPnlWindowSymbol): void => {
+  const addWindowSymbol = (target: PnlSymbolSummary, row: PnlWindowSymbol): void => {
     const counter = Number(target.counterTradePnlUsd) + Number(row.counterTradePnlUsd)
     const onchain = Number(target.onchainNettingPnlUsd) + Number(row.onchainNettingPnlUsd)
     const baseline =
@@ -238,7 +239,7 @@
     target.inventoryDriftUsd = target.directionalInventoryBaselinePnlUsd
   }
 
-  const syntheticWindowsForCurrentFilter = (): SyntheticPnlWindow[] =>
+  const syntheticWindowsForCurrentFilter = (): PnlWindow[] =>
     syntheticPnlDashboard.windows.filter(
       (window) => matchesDayFilter(window.isWeekend) && matchesDateRange(dateKey(window.startAt))
     )
@@ -651,7 +652,7 @@
   type BucketWindow = {
     key: string
     label: string
-    windows: SyntheticPnlWindow[]
+    windows: PnlWindow[]
   }
 
   type RawBarSegment = {
@@ -735,7 +736,7 @@
     return isoDate(date)
   }
 
-  const bucketKeyFor = (window: SyntheticPnlWindow, cadence: BucketCadence): string => {
+  const bucketKeyFor = (window: PnlWindow, cadence: BucketCadence): string => {
     const key = dateKey(window.startAt)
     if (cadence === 'month') return key.slice(0, 7)
     if (cadence === 'week') return startOfWeek(key)
@@ -761,7 +762,7 @@
     return key.slice(5)
   }
 
-  const bucketWindows = (windows: SyntheticPnlWindow[], cadence: BucketCadence): BucketWindow[] => {
+  const bucketWindows = (windows: PnlWindow[], cadence: BucketCadence): BucketWindow[] => {
     const buckets = new Map<string, BucketWindow>()
 
     for (const window of windows) {
@@ -783,7 +784,7 @@
   }
 
   const windowValueForSymbol = (
-    window: SyntheticPnlWindow,
+    window: PnlWindow,
     symbol: string,
     streams: PnlStreamKey[]
   ): number => {

@@ -1,16 +1,11 @@
-import type {
-  PnlEntry,
-  PnlResponse,
-  PnlStreamKey,
-  PnlSummary,
-  PnlSymbolSummary,
-  SyntheticPnlDashboard,
-  SyntheticPnlDataset,
-  SyntheticPnlFill,
-  SyntheticPnlMark,
-  SyntheticPnlWindow,
-  SyntheticPnlWindowSymbol,
-} from './types'
+import {
+  type PnlEntry,
+  type PnlResponse,
+  type PnlSummary,
+  type PnlSymbolSummary,
+  type PnlWindow,
+  type PnlWindowSymbol,
+} from './report'
 
 type AssetScenario = {
   symbol: string
@@ -26,6 +21,37 @@ type SyntheticOptions = {
   onchainFillsPerAssetDay?: number
 }
 
+export type SyntheticPnlDashboard = {
+  report: PnlResponse
+  windows: PnlWindow[]
+}
+
+export type SyntheticPnlFill = {
+  rowid: number
+  fillId: string
+  symbol: string
+  venue: 'onchain' | 'offchain'
+  direction: 'Buy' | 'Sell'
+  shares: string
+  priceUsd: string
+  executedAt: string
+}
+
+export type SyntheticPnlMark = {
+  symbol: string
+  timestamp: string
+  priceUsd: string
+}
+
+export type SyntheticPnlDataset = {
+  generatedAt: string
+  startAt: string
+  endAt: string
+  symbols: string[]
+  fills: SyntheticPnlFill[]
+  marks: SyntheticPnlMark[]
+}
+
 const DEFAULT_ASSETS: AssetScenario[] = [
   { symbol: 'RKLB', basePrice: '22.40', dailyDriftBps: 18, volatilityBps: 95 },
   { symbol: 'SGOV', basePrice: '100.72', dailyDriftBps: 1, volatilityBps: 6 },
@@ -38,13 +64,6 @@ const DEFAULT_DASHBOARD_START_AT = '2025-01-01T13:30:00.000Z'
 const DEFAULT_DASHBOARD_DAYS = 500
 const MS_PER_MINUTE = 60_000
 const MS_PER_DAY = 24 * 60 * MS_PER_MINUTE
-const STREAM_KEYS: PnlStreamKey[] = [
-  'counterTradePnlUsd',
-  'onchainNettingPnlUsd',
-  'directionalInventoryBaselinePnlUsd',
-  'directionalImbalanceExcessPnlUsd',
-]
-
 const priceText = (value: number): string => value.toFixed(4).replace(/\.?0+$/u, '')
 const shareText = (value: number): string => value.toFixed(9).replace(/\.?0+$/u, '')
 const moneyText = (value: number): string => value.toFixed(2).replace(/\.?0+$/u, '')
@@ -208,7 +227,7 @@ const dailyPnl = (
   assetIndex: number,
   day: number,
   isWeekend: boolean,
-): SyntheticPnlWindowSymbol => {
+): PnlWindowSymbol => {
   const capitalScale = Number(asset.basePrice) * (asset.symbol === 'SGOV' ? 0.25 : 1)
   const quality = 1 + signedNoise((assetIndex + 1) * 17 + day * 31) * 0.35
   const counterTrade = isWeekend
@@ -267,7 +286,7 @@ const emptySummary = (): PnlSummary => ({
 
 const addSummaryStreams = (
   target: PnlSummary,
-  row: SyntheticPnlWindowSymbol,
+  row: PnlWindowSymbol,
 ): void => {
   const counter = Number(target.counterTradePnlUsd) + Number(row.counterTradePnlUsd)
   const onchain = Number(target.onchainNettingPnlUsd) + Number(row.onchainNettingPnlUsd)
@@ -287,7 +306,7 @@ const addSummaryStreams = (
 
 const addSymbolStreams = (
   target: PnlSymbolSummary,
-  row: SyntheticPnlWindowSymbol,
+  row: PnlWindowSymbol,
 ): void => {
   const counter = Number(target.counterTradePnlUsd) + Number(row.counterTradePnlUsd)
   const onchain = Number(target.onchainNettingPnlUsd) + Number(row.onchainNettingPnlUsd)
@@ -384,7 +403,7 @@ export const generateSyntheticPnlDashboard = (
   const startAt = new Date(options.startAt ?? DEFAULT_DASHBOARD_START_AT)
   const days = options.days ?? DEFAULT_DASHBOARD_DAYS
   const assets = options.assets ?? DEFAULT_ASSETS
-  const windows: SyntheticPnlWindow[] = []
+  const windows: PnlWindow[] = []
   const summary = emptySummary()
   const symbols = new Map<string, PnlSymbolSummary>()
   const entries: PnlEntry[] = []
@@ -492,4 +511,3 @@ export const generateSyntheticPnlDashboard = (
 }
 
 export const syntheticPnlDashboard = generateSyntheticPnlDashboard()
-export { STREAM_KEYS }

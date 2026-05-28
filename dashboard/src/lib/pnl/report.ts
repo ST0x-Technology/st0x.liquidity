@@ -74,19 +74,6 @@ export type PnlEntry = {
   attributionMethod: string
 }
 
-export type PnlResponse = {
-  attributionMethod: string
-  warnings: string[]
-  sampleStats?: PnlSampleStats
-  summary: PnlSummary
-  symbols: PnlSymbolSummary[]
-  symbolUniverse?: string[]
-  entries: PnlEntry[]
-  total: number
-  hasMore: boolean
-  windows?: SyntheticPnlWindow[]
-}
-
 export type PnlSampleSymbolStats = {
   symbol: string
   firstAt: string | null
@@ -112,7 +99,14 @@ export type PnlStreamKey =
   | 'directionalInventoryBaselinePnlUsd'
   | 'directionalImbalanceExcessPnlUsd'
 
-export type SyntheticPnlWindowSymbol = {
+export const STREAM_KEYS: PnlStreamKey[] = [
+  'counterTradePnlUsd',
+  'onchainNettingPnlUsd',
+  'directionalInventoryBaselinePnlUsd',
+  'directionalImbalanceExcessPnlUsd'
+]
+
+export type PnlWindowSymbol = {
   symbol: string
   counterTradePnlUsd: string
   onchainNettingPnlUsd: string
@@ -122,43 +116,25 @@ export type SyntheticPnlWindowSymbol = {
   totalPnlUsd: string
 }
 
-export type SyntheticPnlWindow = {
+export type PnlWindow = {
   windowId: string
   startAt: string
   endAt: string
   label: string
   isWeekend: boolean
   granularity: 'day'
-  symbols: SyntheticPnlWindowSymbol[]
+  symbols: PnlWindowSymbol[]
 }
 
-export type SyntheticPnlDashboard = {
-  report: PnlResponse
-  windows: SyntheticPnlWindow[]
-}
-
-export type SyntheticPnlFill = {
-  rowid: number
-  fillId: string
-  symbol: string
-  venue: 'onchain' | 'offchain'
-  direction: 'Buy' | 'Sell'
-  shares: string
-  priceUsd: string
-  executedAt: string
-}
-
-export type SyntheticPnlMark = {
-  symbol: string
-  timestamp: string
-  priceUsd: string
-}
-
-export type SyntheticPnlDataset = {
-  generatedAt: string
-  startAt: string
-  endAt: string
-  symbols: string[]
-  fills: SyntheticPnlFill[]
-  marks: SyntheticPnlMark[]
+export type PnlResponse = {
+  attributionMethod: string
+  warnings: string[]
+  sampleStats?: PnlSampleStats
+  summary: PnlSummary
+  symbols: PnlSymbolSummary[]
+  symbolUniverse?: string[]
+  entries: PnlEntry[]
+  total: number
+  hasMore: boolean
+  windows?: PnlWindow[]
 }

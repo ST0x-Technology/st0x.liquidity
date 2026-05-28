@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
+import { STREAM_KEYS } from './report'
 import {
-  STREAM_KEYS,
   generateSyntheticPnlDashboard,
   generateSyntheticPnlDataset,
 } from './synthetic'

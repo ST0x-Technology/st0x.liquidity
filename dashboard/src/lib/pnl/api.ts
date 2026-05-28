@@ -1,7 +1,7 @@
 import { getApiBaseUrl, getPnlSqlApiUrl } from '$lib/env'
 import { FETCH_TIMEOUT_MS } from '$lib/time'
 import { fetchPnlReportFromSql } from '$lib/pnl/sql-source'
-import type { PnlResponse } from '$lib/pnl/types'
+import type { PnlResponse } from '$lib/pnl/report'
 
 export type PnlQuery = {
   limit: number
