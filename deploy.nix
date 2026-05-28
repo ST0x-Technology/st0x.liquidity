@@ -92,10 +92,18 @@ let
     profilePath = "${profileBase}/${name}";
   };
 
+  # `hostname` here is an eval-time placeholder that keeps the flake pure.
+  # The real SSH target is the public IPv4 resolved from terraform state
+  # at deploy time and injected via deploy-rs's runtime `--hostname`
+  # override (see `deployPreamble`).
   mkNode =
-    { env, nixosConfig }:
     {
-      hostname = builtins.getEnv "DEPLOY_HOST";
+      env,
+      nixosConfig,
+      tailscaleMagicDnsName,
+    }:
+    {
+      hostname = tailscaleMagicDnsName;
       sshUser = "root";
       user = "root";
 
@@ -125,6 +133,8 @@ in
           name = cfg.nodeName;
           value = mkNode {
             inherit env;
+            inherit (cfg) tailscaleMagicDnsName;
+
             nixosConfig = self.nixosConfigurations.${cfg.nodeName};
           };
         }
@@ -150,7 +160,7 @@ in
         else
           "--debug-logs --skip-checks --remote-build";
 
-      nixFlags = "--impure --accept-flake-config --extra-experimental-features 'nix-command flakes'";
+      nixFlags = "--accept-flake-config --extra-experimental-features 'nix-command flakes'";
 
       mkEnvDeployScripts =
         env:
@@ -165,7 +175,6 @@ in
               echo "Using pre-set DEPLOY_HOST=$host_ip"
             else
               ${envInfraPkgs.resolveIp}
-              export DEPLOY_HOST="$host_ip"
             fi
 
             # Pin the host key from keys.nix so SSH verifies it during
@@ -196,8 +205,9 @@ in
               text = ''
                 ${deployPreamble}
                 ${prelude}
-                deploy ${deployFlags} ${extraDeployFlags} ''${ssh_flag:+"$ssh_flag"} ${target} \
-                  -- ${nixFlags} "$@"
+                deploy ${deployFlags} ${extraDeployFlags} --hostname "$host_ip" \
+                  ''${ssh_flag:+"$ssh_flag"} "$@" ${target} \
+                  -- ${nixFlags}
               '';
             };
 
