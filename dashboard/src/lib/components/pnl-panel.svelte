@@ -336,7 +336,6 @@
   }
 
   const aggregateSummary = (symbols: PnlSymbolSummary[]): PnlSummary => {
-    const base = syntheticPnlDashboard.report.summary
     const sums = symbols.reduce(
       (acc, row) => ({
         counterTradePnlUsd: acc.counterTradePnlUsd + Number(row.counterTradePnlUsd),
@@ -370,7 +369,6 @@
     const realized = sums.counterTradePnlUsd + sums.onchainNettingPnlUsd
 
     return {
-      ...base,
       counterTradePnlUsd: moneyText(sums.counterTradePnlUsd),
       onchainNettingPnlUsd: moneyText(sums.onchainNettingPnlUsd),
       directionalInventoryBaselinePnlUsd: moneyText(sums.directionalInventoryBaselinePnlUsd),
@@ -378,10 +376,14 @@
       directionalExposurePnlUsd: moneyText(directional),
       realizedPnlUsd: moneyText(realized),
       totalPnlUsd: moneyText(realized + directional),
+      inventoryDriftShares: '0',
       inventoryDriftUsd: moneyText(sums.directionalInventoryBaselinePnlUsd),
+      openLongShares: '0',
+      openShortShares: '0',
       matchedLotCount: sums.matchedLotCount,
       onchainFillCount: sums.onchainFillCount,
       offchainFillCount: sums.offchainFillCount,
+      openLotCount: 0,
       unmatchedOffchainFillCount: sums.unmatchedOffchainFillCount,
       matchedShares: moneyText(sums.matchedShares),
       onchainNotionalUsd: moneyText(sums.matchedShares * 42),
