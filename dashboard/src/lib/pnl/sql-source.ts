@@ -247,8 +247,7 @@ const positionViewSql = (symbols: Set<string>): string => `
 SELECT
   symbol,
   net_position,
-  last_updated,
-  json_extract(payload, '$.Live.last_price_usdc') AS last_price_usdc
+  last_updated
 FROM position_view
 WHERE symbol IS NOT NULL
   ${symbolPredicate(symbols, 'symbol')}
@@ -830,7 +829,7 @@ const matchFillAgainstLots = (
   return remaining
 }
 
-const finalizeLots = (summary: SummaryAcc, lots: Lot[], markPrice: Decimal | undefined): void => {
+const finalizeLots = (summary: SummaryAcc, lots: Lot[]): void => {
   for (const lot of lots) {
     const notional = lot.remainingShares.mul(lot.price)
 
@@ -842,14 +841,6 @@ const finalizeLots = (summary: SummaryAcc, lots: Lot[], markPrice: Decimal | und
       summary.openShortNotionalUsd = summary.openShortNotionalUsd.plus(notional)
     }
 
-    if (markPrice !== undefined) {
-      const spread = lot.side === 'long' ? markPrice.minus(lot.price) : lot.price.minus(markPrice)
-      const directionalPnl = lot.remainingShares.mul(spread)
-      summary.directionalImbalanceExcessPnlUsd =
-        summary.directionalImbalanceExcessPnlUsd.plus(directionalPnl)
-      summary.directionalExposurePnlUsd = summary.directionalExposurePnlUsd.plus(directionalPnl)
-    }
-
     summary.openLotCount += 1
   }
 }
@@ -857,14 +848,12 @@ const finalizeLots = (summary: SummaryAcc, lots: Lot[], markPrice: Decimal | und
 const finalizeBook = (
   symbol: string,
   book: SymbolBook,
-  markPrices: Map<string, Decimal>,
   positionNets: Map<string, Decimal>,
   warnings: string[],
   positionReplayDeltas: PositionReplayDelta[]
 ): void => {
-  const markPrice = markPrices.get(symbol)
-  finalizeLots(book.summary, book.longLots, markPrice)
-  finalizeLots(book.summary, book.shortLots, markPrice)
+  finalizeLots(book.summary, book.longLots)
+  finalizeLots(book.summary, book.shortLots)
 
   for (const [tradeId, matchedShares] of book.matchedOnchainShares) {
     const originalShares = book.originalOnchainShares.get(tradeId)
@@ -1170,8 +1159,7 @@ const buildWindows = (entries: PnlEntry[], symbols: string[]): SyntheticPnlWindo
 const parsePositionView = (
   rows: SqlPositionViewRow[],
   warnings: string[]
-): { markPrices: Map<string, Decimal>; positionNets: Map<string, Decimal>; symbols: string[] } => {
-  const markPrices = new Map<string, Decimal>()
+): { positionNets: Map<string, Decimal>; symbols: string[] } => {
   const positionNets = new Map<string, Decimal>()
   const symbols = new Set<string>()
 
@@ -1183,14 +1171,6 @@ const parsePositionView = (
 
     symbols.add(row.symbol)
 
-    if (row.last_price_usdc !== null) {
-      try {
-        markPrices.set(row.symbol, new Decimal(row.last_price_usdc))
-      } catch {
-        warnings.push(`Skipped malformed mark price for ${row.symbol}: ${row.last_price_usdc}`)
-      }
-    }
-
     if (row.net_position !== null) {
       try {
         positionNets.set(row.symbol, new Decimal(row.net_position))
@@ -1200,7 +1180,7 @@ const parsePositionView = (
     }
   }
 
-  return { markPrices, positionNets, symbols: [...symbols].sort() }
+  return { positionNets, symbols: [...symbols].sort() }
 }
 
 const parseCount = (value: number | string | null | undefined): number => {
@@ -1260,7 +1240,6 @@ export const buildPnlResponseFromSqlRows = (
   const warnings = [ATTRIBUTION_WARNING, BASELINE_WARNING]
   appendInvalidQuerySymbols(warnings, query.symbols)
   const {
-    markPrices,
     positionNets,
     symbols: positionSymbols
   } = parsePositionView(positionRows, warnings)
@@ -1293,7 +1272,7 @@ export const buildPnlResponseFromSqlRows = (
   const fullTotal = emptySummary()
   const replaySymbols: PnlSymbolSummary[] = []
   for (const [symbol, book] of books) {
-    finalizeBook(symbol, book, markPrices, positionNets, warnings, positionReplayDeltas)
+    finalizeBook(symbol, book, positionNets, warnings, positionReplayDeltas)
     addSummary(fullTotal, book.summary)
     replaySymbols.push(symbolSummaryToDto(symbol, book.summary))
   }
