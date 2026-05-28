@@ -613,8 +613,6 @@ const applyOffchainFill = (
   warnings: string[],
   unmatchedOffchainAllocations: UnmatchedOffchainAllocation[]
 ): void => {
-  book.summary.offchainFillCount += 1
-
   if (book.seenOffchainFillIds.has(fill.id)) {
     warnings.push(
       `PnL audit error: duplicate offchain fill ${fill.id} for ${fill.symbol} was skipped`
@@ -623,6 +621,7 @@ const applyOffchainFill = (
   }
 
   book.seenOffchainFillIds.add(fill.id)
+  book.summary.offchainFillCount += 1
   const sourceLots = fill.direction === 'Buy' ? book.shortLots : book.longLots
   const remaining = matchFillAgainstLots(
     fill,
