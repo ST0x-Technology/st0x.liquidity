@@ -353,7 +353,7 @@ mod tests {
 
     use st0x_event_sorcery::StoreBuilder;
     use st0x_execution::{
-        Direction, ExecutionError, FractionalShares, MockExecutor, Positive, Symbol,
+        ClientOrderId, Direction, ExecutionError, FractionalShares, MockExecutor, Positive, Symbol,
     };
     use st0x_float_macro::float;
 
@@ -485,6 +485,7 @@ mod tests {
                     shares,
                     direction,
                     executor: order_executor,
+                    client_order_id: ClientOrderId::new(offchain_order_id.to_string()).unwrap(),
                 },
             )
             .await
