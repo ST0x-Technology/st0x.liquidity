@@ -196,11 +196,13 @@
             };
           })
           abis
+          abiEnvs
           abiEnv
           ;
 
         rust = pkgs.callPackage ./rust.nix {
           inherit craneLib abiEnv;
+          rainMathFloatAbiEnv = abiEnvs.rainMathFloat;
           rainMathFloat = rain-math-float;
         };
       in
@@ -492,17 +494,14 @@
             # CI hooks: pre-commit invokes hook tools by absolute /nix/store
             # path, so they must be realized. rainix's rust-shell includes
             # pre-commit + all linter packages (deadnix/nil/nixfmt/statix/
-            # taplo/yamlfmt/shellcheck/deno) without the heavy default closure.
-            ci-hooks = pkgs.mkShell (
-              {
-                shellHook = ''
-                  ${rustShell.shellHook}
-                  ${rainMathFloatLink}
-                '';
-                inherit (rustShell) buildInputs;
-              }
-              // abiEnv
-            );
+            # taplo/yamlfmt/shellcheck/deno) without the backend ABI closure.
+            ci-hooks = pkgs.mkShell {
+              shellHook = ''
+                ${rustShell.shellHook}
+                ${rainMathFloatLink}
+              '';
+              inherit (rustShell) buildInputs;
+            };
           };
       }
     );

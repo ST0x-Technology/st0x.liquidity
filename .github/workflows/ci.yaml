@@ -15,8 +15,78 @@ permissions:
   contents: read
 
 jobs:
+  nix-source-cache:
+    name: nix source cache
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure Git fetch fail-fast
+        run: |
+          git config --global http.lowSpeedLimit 524288
+          git config --global http.lowSpeedTime 60
+
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            accept-flake-config = true
+            fallback = true
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Restore Nix source cache
+        id: nix-source-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            .tmp/nix-ci-cache
+            .tmp/nix-ci-cache-paths.txt
+          key: nix-source-abi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/*.nix') }}
+
+      - name: Populate Nix source cache
+        if: steps.nix-source-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+
+          cache_dir="$GITHUB_WORKSPACE/.tmp/nix-ci-cache"
+          archive_json="$GITHUB_WORKSPACE/.tmp/nix-ci-cache-flake-archive.json"
+          abi_outputs="$GITHUB_WORKSPACE/.tmp/nix-ci-cache-abi-outputs.txt"
+          paths_file="$GITHUB_WORKSPACE/.tmp/nix-ci-cache-paths.txt"
+
+          mkdir -p "$cache_dir"
+
+          retry() {
+            for attempt in 1 2 3; do
+              if "$@"; then
+                return 0
+              fi
+
+              if [ "$attempt" = 3 ]; then
+                return 1
+              fi
+
+              sleep "$((attempt * 15))"
+            done
+          }
+
+          retry bash -c 'nix flake archive --json --to "$1" . > "$2"' \
+            _ "file://$cache_dir" "$archive_json"
+
+          jq -r '[.. | objects | select(has("path")) | .path] | unique | .[]' \
+            "$archive_json" > "$paths_file"
+
+          retry bash -c 'nix build --no-link --print-out-paths .#forgeStd .#rainOrderbook .#pyth > "$1"' \
+            _ "$abi_outputs"
+
+          retry bash -c 'xargs nix copy --to "$1" < "$2"' \
+            _ "file://$cache_dir" "$abi_outputs"
+
+          xargs nix path-info -r < "$abi_outputs" >> "$paths_file"
+          sort -u "$paths_file" -o "$paths_file"
+
   backend-validation:
     name: backend ${{ matrix.name }}
+    needs: nix-source-cache
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 60
     strategy:
@@ -64,6 +134,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Configure Git fetch fail-fast
+        run: |
+          git config --global http.lowSpeedLimit 524288
+          git config --global http.lowSpeedTime 60
+
       - uses: DeterminateSystems/nix-installer-action@main
         with:
           extra-conf: |
@@ -73,6 +148,23 @@ jobs:
 
       - uses: DeterminateSystems/magic-nix-cache-action@main
         continue-on-error: true
+
+      - name: Restore Nix source cache
+        id: nix-source-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .tmp/nix-ci-cache
+            .tmp/nix-ci-cache-paths.txt
+          key: nix-source-abi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/*.nix') }}
+          fail-on-cache-miss: true
+
+      - name: Import Nix source cache
+        run: |
+          nix copy \
+            --from "file://$GITHUB_WORKSPACE/.tmp/nix-ci-cache" \
+            --no-check-sigs \
+            --stdin < "$GITHUB_WORKSPACE/.tmp/nix-ci-cache-paths.txt"
 
       - name: Cache cargo artifacts
         uses: actions/cache@v4
@@ -107,6 +199,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Configure Git fetch fail-fast
+        run: |
+          git config --global http.lowSpeedLimit 524288
+          git config --global http.lowSpeedTime 60
+
       - uses: DeterminateSystems/nix-installer-action@main
         with:
           extra-conf: |
@@ -136,6 +233,11 @@ jobs:
     runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
+
+      - name: Configure Git fetch fail-fast
+        run: |
+          git config --global http.lowSpeedLimit 524288
+          git config --global http.lowSpeedTime 60
 
       - uses: DeterminateSystems/nix-installer-action@main
         with:

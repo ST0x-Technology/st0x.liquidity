@@ -60,5 +60,6 @@ let
 in
 {
   abis = builtins.mapAttrs (_: feature: feature.abi) features;
+  abiEnvs = envs;
   abiEnv = mergedEnv;
 }

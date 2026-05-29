@@ -2,6 +2,7 @@
   pkgs,
   craneLib,
   abiEnv,
+  rainMathFloatAbiEnv,
   rainMathFloat,
 }:
 
@@ -38,6 +39,7 @@ let
   };
 
   fullSrc = withRainMathFloat "st0x-src" cleanedSrc;
+  eventSorceryHash = "sha256-bpj3QE2z2F8RLH4O++5gor1SrDFGf23CnzGgATUE5OQ=";
 
   # Vendor cargo deps with git dependency hashes
   baseVendorDir = craneLib.vendorCargoDeps {
@@ -47,7 +49,7 @@ let
       "git+https://github.com/rainlanguage/rain.error#3d2ed70fb2f7c6156706846e10f163d1e493a8d3" =
         "sha256-dDsvRkrGXhfoFunvk6fwP+12fSsjiWYoxz/CzVVGpHA=";
       "git+https://github.com/ST0x-Technology/event-sorcery.git?branch=docs/examples#262d12b3f797a0b7445ee62d846119d3d7110dc7" =
-        "sha256-bpj3QE2z2F8RLH4O++5gor1SrDFGf23CnzGgATUE5OQ=";
+        eventSorceryHash;
       "git+https://github.com/rainlanguage/rain.wasm?rev=06990d85a0b7c55378a1c8cca4dd9e2bc34a596a#06990d85a0b7c55378a1c8cca4dd9e2bc34a596a" =
         "sha256-MkuPc9mWAmry5Yzjph4/IbaIvjevFUerji1lipLUK4g=";
     };
@@ -63,9 +65,11 @@ let
   sqliteEsRev = builtins.head (builtins.match ".*#([a-f0-9]+)" sqliteEsPackage.source);
 
   sqliteEsMigrations =
-    builtins.fetchGit {
-      url = "https://github.com/ST0x-Technology/event-sorcery";
+    pkgs.fetchFromGitHub {
+      owner = "ST0x-Technology";
+      repo = "event-sorcery";
       rev = sqliteEsRev;
+      hash = eventSorceryHash;
     }
     + "/migrations";
 
@@ -118,6 +122,10 @@ let
   # exercising any tests the matrix doesn't already cover.
   commonArgs = depsArgs // abiEnv // { doCheck = false; };
 
+  # DTO only needs rain-math-float's ABI env through its Float dependency; keep
+  # dashboard builds from realizing backend contract ABIs.
+  dtoArgs = depsArgs // rainMathFloatAbiEnv // { doCheck = false; };
+
   # Build only dependencies (cached separately from source changes).
   # Crane's mkDummySrc internally strips to manifests + dummy crate roots,
   # so we feed it fullSrc rather than pre-stripping ourselves -- our prior
@@ -131,7 +139,8 @@ in
   # source at crates/dto/default.nix; rust.nix only supplies shared crane
   # infra.
   st0x-dto = import ./crates/dto {
-    inherit craneLib commonArgs cargoArtifacts;
+    inherit craneLib cargoArtifacts;
+    commonArgs = dtoArgs;
   };
 
   # Server binary for deployment
