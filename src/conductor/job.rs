@@ -343,6 +343,7 @@ pub enum JobKind {
     WrappedEquityRecovery,
     CheckPositions,
     TransferUsdcToHedging,
+    TransferUsdcToMarketMaking,
 }
 
 /// Job execution error. Wraps the concrete `Job::Error` type at
@@ -379,6 +380,7 @@ pub struct FailureInjector {
     wrapped_equity_recovery: Arc<Mutex<InjectionState>>,
     check_positions: Arc<Mutex<InjectionState>>,
     transfer_usdc_to_hedging: Arc<Mutex<InjectionState>>,
+    transfer_usdc_to_market_making: Arc<Mutex<InjectionState>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -413,6 +415,7 @@ impl FailureInjector {
             wrapped_equity_recovery: Arc::new(Mutex::new(InjectionState::Idle)),
             check_positions: Arc::new(Mutex::new(InjectionState::Idle)),
             transfer_usdc_to_hedging: Arc::new(Mutex::new(InjectionState::Idle)),
+            transfer_usdc_to_market_making: Arc::new(Mutex::new(InjectionState::Idle)),
         }
     }
 
@@ -459,6 +462,7 @@ impl FailureInjector {
             JobKind::WrappedEquityRecovery => &self.wrapped_equity_recovery,
             JobKind::CheckPositions => &self.check_positions,
             JobKind::TransferUsdcToHedging => &self.transfer_usdc_to_hedging,
+            JobKind::TransferUsdcToMarketMaking => &self.transfer_usdc_to_market_making,
         };
 
         match mutex.lock() {

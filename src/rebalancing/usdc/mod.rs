@@ -10,8 +10,9 @@ mod manager;
 pub(crate) mod mock;
 
 pub(crate) use job::{
-    ResumeBaseToAlpaca, TransferUsdcToHedging, TransferUsdcToHedgingCtx,
-    TransferUsdcToHedgingJobQueue,
+    ResumeAlpacaToBase, ResumeBaseToAlpaca, TransferUsdcToHedging, TransferUsdcToHedgingCtx,
+    TransferUsdcToHedgingJobQueue, TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
+    TransferUsdcToMarketMakingJobQueue,
 };
 pub(crate) use manager::{CrossVenueCashTransfer, u256_to_usdc};
 
@@ -92,6 +93,13 @@ pub(crate) enum UsdcTransferError {
         id: UsdcRebalanceId,
         withdrawn: alloy::primitives::U256,
         requested: alloy::primitives::U256,
+    },
+    #[error(
+        "USDC rebalance {id} Withdrawing has non-Alpaca withdrawal ref; \
+         AlpacaToBase always records the Alpaca transfer ID"
+    )]
+    WithdrawalRefMustBeAlpacaId {
+        id: crate::usdc_rebalance::UsdcRebalanceId,
     },
 }
 

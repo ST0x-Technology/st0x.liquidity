@@ -60,7 +60,7 @@ use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::position_check::{CheckPositionsJobQueue, bootstrap_check_positions};
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
-use crate::rebalancing::usdc::TransferUsdcToHedgingCtx;
+use crate::rebalancing::usdc::{TransferUsdcToHedgingCtx, TransferUsdcToMarketMakingCtx};
 use crate::rebalancing::{
     RebalancerServices, RebalancingCqrsFrameworks, RebalancingSchedulers, RebalancingService,
     RebalancingServiceConfig,
@@ -209,6 +209,7 @@ impl Conductor {
             mint_store,
             redemption_store,
             transfer_usdc_to_hedging_ctx,
+            transfer_usdc_to_market_making_ctx,
         } = PositionAndRebalancing::setup(
             rebalancing,
             &ctx,
@@ -352,6 +353,8 @@ impl Conductor {
             .usdc_check_scheduler(schedulers.usdc)
             .transfer_usdc_to_hedging_queue(schedulers.transfer_usdc_to_hedging)
             .maybe_transfer_usdc_to_hedging_ctx(transfer_usdc_to_hedging_ctx)
+            .transfer_usdc_to_market_making_queue(schedulers.transfer_usdc_to_market_making)
+            .maybe_transfer_usdc_to_market_making_ctx(transfer_usdc_to_market_making_ctx)
             .maybe_rebalancing_service(rebalancing_service)
             .seed_vault_registry_queue(seed_vault_registry_queue)
             .seed_vault_registry_ctx(seed_vault_registry_ctx)
@@ -643,6 +646,7 @@ struct RebalancingInfrastructure {
     mint_store: Arc<Store<TokenizedEquityMint>>,
     redemption_store: Arc<Store<EquityRedemption>>,
     transfer_usdc_to_hedging_ctx: Arc<TransferUsdcToHedgingCtx>,
+    transfer_usdc_to_market_making_ctx: Arc<TransferUsdcToMarketMakingCtx>,
 }
 
 /// Shared infrastructure dependencies needed to spawn rebalancing.
@@ -675,6 +679,7 @@ struct PositionAndRebalancing {
     mint_store: Option<Arc<Store<TokenizedEquityMint>>>,
     redemption_store: Option<Arc<Store<EquityRedemption>>>,
     transfer_usdc_to_hedging_ctx: Option<Arc<TransferUsdcToHedgingCtx>>,
+    transfer_usdc_to_market_making_ctx: Option<Arc<TransferUsdcToMarketMakingCtx>>,
 }
 
 impl PositionAndRebalancing {
@@ -731,6 +736,7 @@ impl PositionAndRebalancing {
                 mint_store: Some(infra.mint_store),
                 redemption_store: Some(infra.redemption_store),
                 transfer_usdc_to_hedging_ctx: Some(infra.transfer_usdc_to_hedging_ctx),
+                transfer_usdc_to_market_making_ctx: Some(infra.transfer_usdc_to_market_making_ctx),
             })
         } else {
             let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
@@ -758,6 +764,7 @@ impl PositionAndRebalancing {
                 mint_store: None,
                 redemption_store: None,
                 transfer_usdc_to_hedging_ctx: None,
+                transfer_usdc_to_market_making_ctx: None,
             })
         }
     }
@@ -939,6 +946,10 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             timeout: rebalancing_ctx.transfer_attempt_timeout,
         });
 
+        let transfer_usdc_to_market_making_ctx = Arc::new(TransferUsdcToMarketMakingCtx {
+            transfer: spawned.resume_alpaca_to_base,
+        });
+
         Ok(RebalancingInfrastructure {
             position: built.position,
             position_projection: built.position_projection,
@@ -952,6 +963,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             mint_store,
             redemption_store,
             transfer_usdc_to_hedging_ctx,
+            transfer_usdc_to_market_making_ctx,
         })
     })
 }
