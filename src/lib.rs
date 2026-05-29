@@ -59,6 +59,8 @@ mod trading;
 #[cfg(feature = "mock")]
 pub use tokenization::mock_api;
 mod tokenized_equity_mint;
+#[cfg(test)]
+mod unwrapped_equity_recovery;
 mod usdc_rebalance;
 mod vault_registry;
 mod wrapped_equity_recovery;
