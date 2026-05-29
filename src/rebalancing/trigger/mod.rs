@@ -37,6 +37,7 @@ use crate::tokenized_equity_mint::{
 };
 use crate::usdc_rebalance::{
     RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent, UsdcRebalanceId,
+    interrupted_usdc_rebalance_ids,
 };
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 use crate::wrapped_equity_recovery::aggregate::WrappedEquityRecoveryId;
@@ -103,6 +104,8 @@ pub(crate) enum RebalancingServiceError {
         tracked_quantity: FractionalShares,
         actual_quantity: FractionalShares,
     },
+    #[error(transparent)]
+    Sqlx(#[from] sqlx::Error),
 }
 
 /// Why loading a token address from the vault registry failed.
@@ -447,6 +450,12 @@ pub(crate) struct RebalancingService {
     timed_out_mints: Arc<RwLock<HashMap<IssuerRequestId, DateTime<Utc>>>>,
     timed_out_redemptions: Arc<RwLock<HashMap<RedemptionAggregateId, DateTime<Utc>>>>,
     timed_out_usdc_rebalances: Arc<RwLock<HashMap<UsdcRebalanceId, DateTime<Utc>>>>,
+    /// Ids of post-burn-stuck USDC rebalances already logged by the timeout
+    /// sweep. A preserved post-burn entry is intentionally never removed from
+    /// `usdc_tracking` (so a late success can still settle) and its
+    /// `last_progress_at` never advances, so every sweep re-selects it. This
+    /// set deduplicates the error log to once per stuck transfer.
+    post_burn_timeout_logged: Arc<RwLock<HashSet<UsdcRebalanceId>>>,
     mint_event_sync: Arc<Mutex<()>>,
     redemption_event_sync: Arc<Mutex<()>>,
     usdc_event_sync: Arc<Mutex<()>>,
@@ -468,6 +477,18 @@ type EquityInventoryUpdate = Box<
 >;
 
 const TIMEOUT_TOMBSTONE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+
+#[derive(Debug)]
+enum UsdcTimeoutCleanup {
+    Cleared {
+        tracking: usdc::UsdcRebalanceTracking,
+        elapsed: Duration,
+    },
+    PreservedPostBurn {
+        tracking: usdc::UsdcRebalanceTracking,
+        elapsed: Duration,
+    },
+}
 
 impl RebalancingService {
     pub(crate) fn new(
@@ -506,6 +527,7 @@ impl RebalancingService {
             timed_out_mints: Arc::new(RwLock::new(HashMap::new())),
             timed_out_redemptions: Arc::new(RwLock::new(HashMap::new())),
             timed_out_usdc_rebalances: Arc::new(RwLock::new(HashMap::new())),
+            post_burn_timeout_logged: Arc::new(RwLock::new(HashSet::new())),
             mint_event_sync: Arc::new(Mutex::new(())),
             redemption_event_sync: Arc::new(Mutex::new(())),
             usdc_event_sync: Arc::new(Mutex::new(())),
@@ -760,21 +782,49 @@ impl RebalancingService {
         };
 
         for id in timed_out_ids {
-            let Some((tracking, elapsed)) = self.cleanup_timed_out_usdc_rebalance(&id, now).await?
-            else {
+            let Some(cleanup) = self.cleanup_timed_out_usdc_rebalance(&id, now).await? else {
                 continue;
             };
 
-            error!(
-                target: "rebalance",
-                aggregate_id = %id,
-                direction = ?tracking.direction,
-                stage = %tracking.stage,
-                ?elapsed,
-                "USDC transfer timed out; clearing trigger guard and inventory inflight"
-            );
+            match cleanup {
+                UsdcTimeoutCleanup::Cleared { tracking, elapsed } => {
+                    error!(
+                        target: "rebalance",
+                        aggregate_id = %id,
+                        direction = ?tracking.direction,
+                        stage = %tracking.stage,
+                        ?elapsed,
+                        "USDC transfer timed out; clearing trigger guard and inventory inflight"
+                    );
 
-            self.clear_usdc_in_progress();
+                    self.clear_usdc_in_progress();
+                }
+                UsdcTimeoutCleanup::PreservedPostBurn { tracking, elapsed } => {
+                    self.usdc_in_progress.store(true, Ordering::SeqCst);
+
+                    // The preserved entry keeps its original `last_progress_at`,
+                    // so every subsequent sweep re-selects it. Log once per stuck
+                    // transfer to avoid flooding the error stream until manual
+                    // recovery. UsdcRebalanceId is never reused, so a logged id
+                    // never needs clearing.
+                    let first_log = self
+                        .post_burn_timeout_logged
+                        .write()
+                        .await
+                        .insert(id.clone());
+
+                    if first_log {
+                        error!(
+                            target: "rebalance",
+                            aggregate_id = %id,
+                            direction = ?tracking.direction,
+                            stage = %tracking.stage,
+                            ?elapsed,
+                            "USDC transfer timed out after CCTP burn; preserving trigger guard and inventory inflight"
+                        );
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -919,7 +969,7 @@ impl RebalancingService {
         &self,
         id: &UsdcRebalanceId,
         now: DateTime<Utc>,
-    ) -> Result<Option<(usdc::UsdcRebalanceTracking, Duration)>, RebalancingServiceError> {
+    ) -> Result<Option<UsdcTimeoutCleanup>, RebalancingServiceError> {
         let _event_sync_guard = self.usdc_event_sync.lock().await;
         let mut tracking_guard = self.usdc_tracking.write().await;
         let Some(tracking) = tracking_guard.get(id).cloned() else {
@@ -933,6 +983,13 @@ impl RebalancingService {
 
         if elapsed < self.config.transfer_timeout {
             return Ok(None);
+        }
+
+        if tracking.is_post_burn() {
+            return Ok(Some(UsdcTimeoutCleanup::PreservedPostBurn {
+                tracking,
+                elapsed,
+            }));
         }
 
         let mut inventory = self.inventory.write().await;
@@ -949,7 +1006,7 @@ impl RebalancingService {
         tracking_guard.remove(id);
         drop(tracking_guard);
 
-        Ok(Some((tracking, elapsed)))
+        Ok(Some(UsdcTimeoutCleanup::Cleared { tracking, elapsed }))
     }
 
     async fn mint_timed_out(&self, id: &IssuerRequestId) -> bool {
@@ -1089,6 +1146,7 @@ impl RebalancingService {
         use RebalancingServiceError::{
             EquityTrigger, Float, MissingUsdcBridgedAmount, MissingUsdcTrackingContext, Projection,
             RedemptionUnwrappedExceedsTracked, SettledUsdcExceedsInitiatedAmount, SharesConversion,
+            Sqlx,
         };
 
         self.expire_stuck_operations_with_logging().await;
@@ -1102,7 +1160,8 @@ impl RebalancingService {
             | MissingUsdcTrackingContext { .. }
             | MissingUsdcBridgedAmount { .. }
             | SettledUsdcExceedsInitiatedAmount { .. }
-            | RedemptionUnwrappedExceedsTracked { .. }) => {
+            | RedemptionUnwrappedExceedsTracked { .. }
+            | Sqlx(_)) => {
                 return Err(other);
             }
         };
@@ -1997,6 +2056,78 @@ impl RebalancingService {
     /// Clears the in-progress flag for USDC rebalancing.
     pub(crate) fn clear_usdc_in_progress(&self) {
         self.usdc_in_progress.store(false, Ordering::SeqCst);
+    }
+
+    /// Reconstructs the single-rebalance guard (`usdc_in_progress`) from durable
+    /// `UsdcRebalance` event state on startup.
+    ///
+    /// The guard is in-memory and resets to `false` on restart. Without this, a
+    /// restart between a post-burn `BridgingFailed` (or any unsettled in-flight
+    /// rebalance) and settlement would let the next imbalance check dispatch a
+    /// fresh CCTP burn against funds CCTP has already burned. Re-asserting the
+    /// guard when any aggregate is in a guard-holding state blocks new USDC
+    /// rebalancing until the stuck transfer settles or an operator recovers it.
+    ///
+    /// Guard-only by design: USDC bridges have no resume/recheck path, so no
+    /// settlement events arrive post-restart, and reconstructing inventory
+    /// inflight (which risks double-counting against re-hydrated available
+    /// balances) would be dead state. See ADR 2.
+    pub(crate) async fn recover_usdc_guard(
+        &self,
+        pool: &SqlitePool,
+        usdc_store: &Store<UsdcRebalance>,
+    ) -> Result<(), RebalancingServiceError> {
+        let candidate_ids = interrupted_usdc_rebalance_ids(pool).await?;
+
+        let mut held_ids = Vec::new();
+        let mut unresolved_ids = Vec::new();
+        for id in candidate_ids {
+            match usdc_store.load(&id).await {
+                Ok(Some(entity)) => {
+                    if entity.holds_rebalance_guard() {
+                        held_ids.push(id);
+                    }
+                }
+                // The id came from the event log, so a missing or unreplayable
+                // aggregate is an inconsistency we cannot classify. Fail safe:
+                // hold the guard so a possibly-post-burn rebalance can never be
+                // re-burned, and surface it for operators. Blocking is the safe
+                // direction; the alternative is the re-burn this guards against.
+                // A single bad aggregate must not abort recovery for the rest,
+                // so we do not propagate -- only the query's I/O error does.
+                Ok(None) => {
+                    error!(
+                        target: "rebalance",
+                        %id,
+                        "USDC rebalance candidate missing from store on startup; holding guard defensively"
+                    );
+                    unresolved_ids.push(id);
+                }
+                Err(error) => {
+                    error!(
+                        target: "rebalance",
+                        %id, ?error,
+                        "Failed to load USDC rebalance candidate on startup; holding guard defensively"
+                    );
+                    unresolved_ids.push(id);
+                }
+            }
+        }
+
+        if held_ids.is_empty() && unresolved_ids.is_empty() {
+            return Ok(());
+        }
+
+        self.usdc_in_progress.store(true, Ordering::SeqCst);
+        error!(
+            target: "rebalance",
+            held = ?held_ids,
+            unresolved = ?unresolved_ids,
+            "Reconstructed USDC in-progress guard for unsettled rebalances on startup; \
+             new USDC rebalancing is blocked until they settle or are recovered"
+        );
+
+        Ok(())
     }
 
     pub(crate) async fn recover_mint_state(
@@ -6835,30 +6966,18 @@ mod tests {
                 ],
             },
             Scenario {
-                name: "bridging_failed_after_initiated",
+                name: "bridging_failed_before_burn",
                 events: vec![
                     make_usdc_conversion_initiated(RebalanceDirection::AlpacaToBase, usdc(400)),
                     make_usdc_conversion_confirmed(RebalanceDirection::AlpacaToBase, usdc(399)),
                     make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(399)),
                     make_usdc_withdrawal_confirmed(),
-                    make_usdc_bridging_initiated(),
-                    make_usdc_bridging_failed(),
+                    make_usdc_pre_burn_bridging_failed(),
                 ],
             },
-            Scenario {
-                name: "deposit_failed_after_initiated",
-                events: vec![
-                    make_usdc_conversion_initiated(RebalanceDirection::AlpacaToBase, usdc(400)),
-                    make_usdc_conversion_confirmed(RebalanceDirection::AlpacaToBase, usdc(399)),
-                    make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(399)),
-                    make_usdc_withdrawal_confirmed(),
-                    make_usdc_bridging_initiated(),
-                    make_usdc_bridge_attestation_received(),
-                    make_usdc_bridged_with_amounts(usdc(398), usdc(1)),
-                    make_usdc_deposit_initiated(),
-                    make_usdc_deposit_failed(),
-                ],
-            },
+            // NOTE: a post-burn `deposit_failed` no longer cancels -- it is
+            // post-mint and preserves inflight + the guard. That behavior is
+            // covered by `post_burn_deposit_failure_preserves_inflight_and_guard`.
         ];
 
         for scenario in scenarios {
@@ -6903,40 +7022,18 @@ mod tests {
                 ],
             },
             Scenario {
-                name: "bridging_failed_after_initiated",
+                name: "bridging_failed_before_burn",
                 events: vec![
                     make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(400)),
                     make_usdc_withdrawal_confirmed(),
-                    make_usdc_bridging_initiated(),
-                    make_usdc_bridging_failed(),
+                    make_usdc_pre_burn_bridging_failed(),
                 ],
             },
-            Scenario {
-                name: "deposit_failed_after_initiated",
-                events: vec![
-                    make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(400)),
-                    make_usdc_withdrawal_confirmed(),
-                    make_usdc_bridging_initiated(),
-                    make_usdc_bridge_attestation_received(),
-                    make_usdc_bridged_with_amounts(usdc(399), usdc(1)),
-                    make_usdc_deposit_initiated(),
-                    make_usdc_deposit_failed(),
-                ],
-            },
-            Scenario {
-                name: "conversion_failed_after_deposit",
-                events: vec![
-                    make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(400)),
-                    make_usdc_withdrawal_confirmed(),
-                    make_usdc_bridging_initiated(),
-                    make_usdc_bridge_attestation_received(),
-                    make_usdc_bridged_with_amounts(usdc(399), usdc(1)),
-                    make_usdc_deposit_initiated(),
-                    make_usdc_deposit_confirmed(RebalanceDirection::BaseToAlpaca),
-                    make_usdc_conversion_initiated(RebalanceDirection::BaseToAlpaca, usdc(399)),
-                    make_usdc_conversion_failed(),
-                ],
-            },
+            // NOTE: post-burn failures no longer cancel -- they are post-mint and
+            // preserve inflight + the guard. `deposit_failed` is covered by
+            // `post_burn_deposit_failure_preserves_inflight_and_guard`, and the
+            // BaseToAlpaca post-deposit `conversion_failed` by
+            // `post_deposit_conversion_failure_preserves_inflight_and_guard`.
         ];
 
         for scenario in scenarios {
@@ -6963,6 +7060,381 @@ mod tests {
             assert_usdc_inventory_balances(&trigger, usdc(900), Usdc::ZERO, usdc(100), Usdc::ZERO)
                 .await;
         }
+    }
+
+    #[tokio::test]
+    async fn alpaca_to_base_post_burn_bridging_failure_preserves_inflight_and_guard() {
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(100), usdc(900))
+            .with_withdrawable_cash_cents(90_000);
+        let (reactor, mut receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_conversion_initiated(RebalanceDirection::AlpacaToBase, usdc(400)),
+            )
+            .await
+            .unwrap();
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_conversion_confirmed(RebalanceDirection::AlpacaToBase, usdc(399)),
+            )
+            .await
+            .unwrap();
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(399)),
+            )
+            .await
+            .unwrap();
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_withdrawal_confirmed())
+            .await
+            .unwrap();
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_bridging_initiated())
+            .await
+            .unwrap();
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_bridging_failed())
+            .await
+            .unwrap();
+
+        // A post-burn failure must preserve the last successful stage
+        // (BridgingInitiated), not advance to a failure stage:
+        // `UsdcRebalanceStage::from_event` returns None for BridgingFailed.
+        assert_usdc_tracking_state(
+            &trigger,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            usdc(399),
+            None,
+            usdc::UsdcRebalanceStage::BridgingInitiated,
+        )
+        .await;
+        assert_usdc_inventory_balances(&trigger, usdc(100), Usdc::ZERO, usdc(501), usdc(399)).await;
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "post-burn bridge failure must keep the USDC guard set"
+        );
+        assert_eq!(
+            trigger.inventory.read().await.active_usdc_rebalance(),
+            Some(&id),
+            "post-burn bridge failure must keep the active rebalance ID"
+        );
+
+        UsdcRebalancingCheck.perform(&trigger).await.unwrap();
+        assert!(
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+            "post-burn bridge failure must block immediate re-burns"
+        );
+    }
+
+    #[tokio::test]
+    async fn base_to_alpaca_post_burn_bridging_failure_preserves_inflight_and_guard() {
+        let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
+        let (reactor, mut receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(400)),
+            )
+            .await
+            .unwrap();
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_withdrawal_confirmed())
+            .await
+            .unwrap();
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_bridging_initiated())
+            .await
+            .unwrap();
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_bridging_failed())
+            .await
+            .unwrap();
+
+        // A post-burn failure must preserve the last successful stage
+        // (BridgingInitiated), not advance to a failure stage:
+        // `UsdcRebalanceStage::from_event` returns None for BridgingFailed.
+        assert_usdc_tracking_state(
+            &trigger,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            None,
+            usdc::UsdcRebalanceStage::BridgingInitiated,
+        )
+        .await;
+        assert_usdc_inventory_balances(&trigger, usdc(500), usdc(400), usdc(100), Usdc::ZERO).await;
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "post-burn bridge failure must keep the USDC guard set"
+        );
+        assert_eq!(
+            trigger.inventory.read().await.active_usdc_rebalance(),
+            Some(&id),
+            "post-burn bridge failure must keep the active rebalance ID"
+        );
+
+        UsdcRebalancingCheck.perform(&trigger).await.unwrap();
+        assert!(
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+            "post-burn bridge failure must block immediate re-burns"
+        );
+    }
+
+    /// Exercises the defensive fallback branch of `post_burn_failure`: the
+    /// `BridgingFailed` event carries no `burn_tx_hash`, but the tracked stage
+    /// is `BridgingInitiated`, so `is_post_burn()` must still classify it as
+    /// post-burn and preserve the guard.
+    ///
+    /// This (hashless event + post-burn stage) combination is NOT reachable via
+    /// the real command path -- `FailBridging` from `Bridging`/`Attested` always
+    /// emits `burn_tx_hash: Some`. The fallback is defense-in-depth for the live
+    /// event stream. The startup recovery path (`holds_rebalance_guard`)
+    /// deliberately keys only on `burn_tx_hash.is_some()` because the persisted
+    /// aggregate state always carries the hash for a post-burn failure, so the
+    /// two paths agree on every command-reachable state.
+    #[tokio::test]
+    async fn bridging_failure_without_burn_hash_preserved_via_tracking_stage() {
+        let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
+        let (reactor, mut receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(400)),
+            )
+            .await
+            .unwrap();
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_withdrawal_confirmed())
+            .await
+            .unwrap();
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_bridging_initiated())
+            .await
+            .unwrap();
+        // burn_tx_hash: None -- only the tracked BridgingInitiated stage marks
+        // this as post-burn.
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_pre_burn_bridging_failed())
+            .await
+            .unwrap();
+
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "stage-fallback must classify a hashless post-burn failure as post-burn and keep the guard"
+        );
+        assert_eq!(
+            trigger.inventory.read().await.active_usdc_rebalance(),
+            Some(&id),
+            "stage-fallback post-burn failure must keep the active rebalance ID"
+        );
+
+        UsdcRebalancingCheck.perform(&trigger).await.unwrap();
+        assert!(
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+            "stage-fallback post-burn failure must block immediate re-burns"
+        );
+    }
+
+    /// A deposit failure happens after the CCTP mint, so the funds are post-burn
+    /// and unreconcilable. It must preserve inflight and the guard (not Clear),
+    /// the same as a post-burn bridge failure.
+    #[tokio::test]
+    async fn post_burn_deposit_failure_preserves_inflight_and_guard() {
+        let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
+        let (reactor, mut receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        for event in [
+            make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(400)),
+            make_usdc_withdrawal_confirmed(),
+            make_usdc_bridging_initiated(),
+            make_usdc_bridge_attestation_received(),
+            make_usdc_bridged(),
+            make_usdc_deposit_initiated(),
+            make_usdc_deposit_failed(),
+        ] {
+            harness
+                .receive::<UsdcRebalance>(id.clone(), event)
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "post-burn deposit failure must preserve in-flight tracking"
+        );
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "post-burn deposit failure must keep the USDC guard set"
+        );
+        assert_eq!(
+            trigger.inventory.read().await.active_usdc_rebalance(),
+            Some(&id),
+            "post-burn deposit failure must keep the active rebalance ID"
+        );
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .usdc_inflight(Venue::MarketMaking),
+            Some(usdc(400)),
+            "post-burn deposit failure must preserve source inflight"
+        );
+
+        UsdcRebalancingCheck.perform(&trigger).await.unwrap();
+        assert!(
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+            "post-burn deposit failure must block immediate re-burns"
+        );
+    }
+
+    /// For BaseToAlpaca the conversion is the post-deposit USDC->USD leg, so a
+    /// `ConversionFailed` there is post-mint: it must preserve inflight + the
+    /// guard, even though `ConversionInitiated` resets the tracked stage to a
+    /// pre-burn-looking value.
+    #[tokio::test]
+    async fn post_deposit_conversion_failure_preserves_inflight_and_guard() {
+        let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
+        let (reactor, mut receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        for event in [
+            make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(400)),
+            make_usdc_withdrawal_confirmed(),
+            make_usdc_bridging_initiated(),
+            make_usdc_bridge_attestation_received(),
+            make_usdc_bridged(),
+            make_usdc_deposit_initiated(),
+            make_usdc_deposit_confirmed(RebalanceDirection::BaseToAlpaca),
+            make_usdc_conversion_initiated(RebalanceDirection::BaseToAlpaca, usdc(399)),
+            make_usdc_conversion_failed(),
+        ] {
+            harness
+                .receive::<UsdcRebalance>(id.clone(), event)
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "post-deposit conversion failure must preserve in-flight tracking"
+        );
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "post-deposit conversion failure must keep the USDC guard set"
+        );
+        assert_eq!(
+            trigger.inventory.read().await.active_usdc_rebalance(),
+            Some(&id),
+            "post-deposit conversion failure must keep the active rebalance ID"
+        );
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .usdc_inflight(Venue::MarketMaking),
+            Some(usdc(400)),
+            "post-deposit conversion failure must preserve source inflight"
+        );
+
+        UsdcRebalancingCheck.perform(&trigger).await.unwrap();
+        assert!(
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+            "post-deposit conversion failure must block immediate re-burns"
+        );
+    }
+
+    /// A transfer that times out while stalled at a post-mint stage (here
+    /// `DepositInitiated`) is also post-burn: the timeout sweep must preserve it,
+    /// not reconcile to source and clear the guard (which would re-open a re-burn
+    /// of already-burned funds).
+    #[tokio::test]
+    async fn timed_out_post_mint_usdc_rebalance_preserves_guard_and_inflight() {
+        let now = Utc::now();
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(900), usdc(100))
+            .update_usdc(
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, usdc(400)),
+                now,
+            )
+            .unwrap();
+        let (reactor, mut receiver) = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+        let trigger = reactor.clone();
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::BaseToAlpaca,
+                initiated_amount: usdc(400),
+                bridged_amount_received: Some(usdc(399)),
+                stage: usdc::UsdcRebalanceStage::DepositInitiated,
+                last_progress_at: now - ChronoDuration::minutes(31),
+            },
+        );
+
+        trigger.check_and_trigger_usdc().await;
+
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "post-mint USDC timeout must preserve in-flight tracking"
+        );
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "post-mint USDC timeout must keep the guard set"
+        );
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .usdc_inflight(Venue::MarketMaking),
+            Some(usdc(400)),
+            "post-mint USDC timeout must preserve source inflight"
+        );
+        assert!(
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+            "post-mint USDC timeout must not allow another rebalance dispatch"
+        );
     }
 
     #[tokio::test]
@@ -7336,6 +7808,15 @@ mod tests {
         }
     }
 
+    fn make_usdc_pre_burn_bridging_failed() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::BridgingFailed {
+            burn_tx_hash: None,
+            cctp_nonce: None,
+            reason: "Burn failed".to_string(),
+            failed_at: Utc::now(),
+        }
+    }
+
     fn make_usdc_deposit_confirmed(direction: RebalanceDirection) -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::DepositConfirmed {
             direction,
@@ -7676,6 +8157,265 @@ mod tests {
         assert!(
             !trigger.usdc_tracking.read().await.contains_key(&id),
             "late terminal events must not recreate timed-out USDC tracking"
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_post_burn_usdc_rebalance_preserves_guard_and_inflight() {
+        let now = Utc::now();
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(100), usdc(900))
+            .with_withdrawable_cash_cents(90_000)
+            .update_usdc(
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, usdc(400)),
+                now,
+            )
+            .unwrap();
+        let (reactor, mut receiver) = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+        let trigger = reactor.clone();
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::AlpacaToBase,
+                initiated_amount: usdc(400),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                last_progress_at: now - ChronoDuration::minutes(31),
+            },
+        );
+
+        trigger.check_and_trigger_usdc().await;
+
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "post-burn USDC timeout must preserve in-flight tracking"
+        );
+        assert!(
+            !trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "post-burn USDC timeout must not tombstone late events"
+        );
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "post-burn USDC timeout must keep the guard set"
+        );
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_inflight(Venue::Hedging),
+            Some(usdc(400)),
+            "post-burn USDC timeout must preserve source inflight"
+        );
+        drop(inventory);
+
+        assert!(
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+            "post-burn USDC timeout must not allow another rebalance dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_burn_usdc_timeout_logs_once_across_sweeps() {
+        let now = Utc::now();
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(100), usdc(900))
+            .with_withdrawable_cash_cents(90_000)
+            .update_usdc(
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, usdc(400)),
+                now,
+            )
+            .unwrap();
+        let (reactor, _receiver) = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+        let trigger = reactor.clone();
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::AlpacaToBase,
+                initiated_amount: usdc(400),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                last_progress_at: now - ChronoDuration::minutes(31),
+            },
+        );
+
+        // The preserved entry is re-selected on every sweep. We assert on the
+        // dedup set (`post_burn_timeout_logged`) rather than captured logs: the
+        // `error!` is gated directly on this set's `insert` returning true, so a
+        // single retained entry across sweeps is a faithful proxy for "logged
+        // exactly once".
+        trigger.check_and_trigger_usdc().await;
+        assert!(
+            trigger.post_burn_timeout_logged.read().await.contains(&id),
+            "first sweep must record the stuck id for log deduplication"
+        );
+
+        trigger.check_and_trigger_usdc().await;
+        trigger.check_and_trigger_usdc().await;
+        assert_eq!(
+            trigger.post_burn_timeout_logged.read().await.len(),
+            1,
+            "subsequent sweeps must not re-log: the dedup set stays at one entry"
+        );
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "the entry must remain preserved across sweeps"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_usdc_guard_reasserts_guard_for_post_burn_bridging_failure() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let burn_tx =
+            fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000aa");
+
+        // Persist a history that ends in a post-burn bridge failure.
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: usdc(400),
+                    withdrawal: TransferRef::OnchainTx(burn_tx),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .await
+            .unwrap();
+        store
+            .send(&id, UsdcRebalanceCommand::InitiateBridging { burn_tx })
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "mint reverted".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // A fresh service has the guard cleared, as a restarted process would.
+        let (service, _receiver) = make_trigger_with_inventory(InventoryView::default()).await;
+        assert!(
+            !service.usdc_in_progress.load(Ordering::SeqCst),
+            "guard must start clear, simulating a fresh process"
+        );
+
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert!(
+            service.usdc_in_progress.load(Ordering::SeqCst),
+            "post-burn bridge failure must re-assert the USDC guard on startup"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_usdc_guard_leaves_guard_clear_for_pre_burn_failure() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let withdrawal =
+            fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000cc");
+
+        // A pre-burn bridge failure (FailBridging from WithdrawalComplete) carries
+        // no burn hash and reconciles to source, so it must not hold the guard.
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: usdc(400),
+                    withdrawal: TransferRef::OnchainTx(withdrawal),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "usdc-to-u256 conversion error".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let (service, _receiver) = make_trigger_with_inventory(InventoryView::default()).await;
+
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert!(
+            !service.usdc_in_progress.load(Ordering::SeqCst),
+            "pre-burn bridge failure must not hold the USDC guard on startup"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_usdc_guard_holds_defensively_when_candidate_cannot_load() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        // Persist a guard-relevant event that cannot originate an aggregate (the
+        // first event must be ConversionInitiated/Initiated). The candidate
+        // query returns this id, but Store::load replays to None -- exactly the
+        // store/event inconsistency the recovery must fail safe on.
+        let event = UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash: fixed_bytes!(
+                "0x00000000000000000000000000000000000000000000000000000000000000aa"
+            ),
+            burned_at: Utc::now(),
+        };
+        let payload = serde_json::to_string(&event).unwrap();
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+             VALUES ('UsdcRebalance', ?, 0, 'UsdcRebalanceEvent::BridgingInitiated', '1.0', ?, '{}')",
+        )
+        .bind(id.to_string())
+        .bind(payload)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            store.load(&id).await.unwrap().is_none(),
+            "an unoriginated first event must not load into an aggregate"
+        );
+
+        let (service, _receiver) = make_trigger_with_inventory(InventoryView::default()).await;
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert!(
+            service.usdc_in_progress.load(Ordering::SeqCst),
+            "an unloadable guard-relevant candidate must hold the guard defensively"
         );
     }
 
@@ -10467,7 +11207,10 @@ mod tests {
                 direction: RebalanceDirection::BaseToAlpaca,
                 initiated_amount: usdc(700),
                 bridged_amount_received: None,
-                stage: usdc::UsdcRebalanceStage::DepositConfirmed,
+                // Pre-burn stage: a stalled withdrawal still reconciles to source
+                // and tombstones on timeout (post-burn stages preserve instead,
+                // covered by timed_out_post_mint_usdc_rebalance_*).
+                stage: usdc::UsdcRebalanceStage::WithdrawalConfirmed,
                 last_progress_at: now - ChronoDuration::minutes(40),
             },
         );
@@ -10542,7 +11285,10 @@ mod tests {
                 direction: RebalanceDirection::BaseToAlpaca,
                 initiated_amount: usdc(700),
                 bridged_amount_received: None,
-                stage: usdc::UsdcRebalanceStage::DepositConfirmed,
+                // Pre-burn stage: a stalled withdrawal still reconciles to source
+                // and tombstones on timeout (post-burn stages preserve instead,
+                // covered by timed_out_post_mint_usdc_rebalance_*).
+                stage: usdc::UsdcRebalanceStage::WithdrawalConfirmed,
                 last_progress_at: now - ChronoDuration::minutes(40),
             },
         );

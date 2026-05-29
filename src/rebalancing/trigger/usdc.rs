@@ -63,6 +63,32 @@ impl UsdcRebalanceTracking {
         }
     }
 
+    /// Whether the CCTP burn has irreversibly committed the funds. Past the
+    /// burn the funds are no longer on the source venue, so a failure or timeout
+    /// must NOT reconcile inflight back to source and must keep the guard.
+    ///
+    /// Defined per direction as "not a pre-burn stage", so any future stage
+    /// defaults to post-burn (the safe, re-burn-blocking direction):
+    /// - `AlpacaToBase` converts USD->USDC *before* withdrawing, so its
+    ///   conversion stages are pre-burn; the burn begins at `BridgingInitiated`.
+    /// - `BaseToAlpaca`'s only conversion is the *post-deposit* USDC->USD leg
+    ///   (post-mint), so every stage except the pre-bridge withdrawal is
+    ///   post-burn -- including the conversion stages, even though
+    ///   `ConversionInitiated` resets the tracked stage after the deposit.
+    pub(super) fn is_post_burn(&self) -> bool {
+        use UsdcRebalanceStage::*;
+
+        match self.direction {
+            RebalanceDirection::AlpacaToBase => !matches!(
+                self.stage,
+                ConversionInitiated | ConversionConfirmed | Initiated | WithdrawalConfirmed
+            ),
+            RebalanceDirection::BaseToAlpaca => {
+                !matches!(self.stage, Initiated | WithdrawalConfirmed)
+            }
+        }
+    }
+
     fn track_progress(&mut self, event: &UsdcRebalanceEvent) {
         let Some(stage) = UsdcRebalanceStage::from_event(event) else {
             return;
@@ -74,6 +100,13 @@ impl UsdcRebalanceTracking {
         self.stage = stage;
         self.last_progress_at = last_progress_at;
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UsdcTerminalAction {
+    NotTerminal,
+    Clear,
+    PreservePostBurn,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -471,21 +504,30 @@ impl RebalancingService {
             return Ok(());
         }
 
-        self.apply_usdc_rebalance_event(&id, &event).await?;
+        let terminal_action = self.usdc_terminal_action(&id, &event).await;
+        self.apply_usdc_rebalance_event(&id, &event, terminal_action)
+            .await?;
 
-        let is_terminal = Self::is_terminal_usdc_rebalance_event(&event);
+        let is_clearable_terminal = terminal_action == UsdcTerminalAction::Clear;
         {
             let mut inventory = self.inventory.write().await;
-            *inventory = if is_terminal {
+            *inventory = if is_clearable_terminal {
                 inventory.clone().clear_active_usdc_rebalance()
             } else {
                 inventory.clone().set_active_usdc_rebalance(id.clone())
             };
         }
-        if is_terminal {
+        if is_clearable_terminal {
             self.usdc_tracking.write().await.remove(&id);
             self.clear_usdc_in_progress();
             debug!(target: "rebalance", "Cleared USDC in-progress flag after rebalance terminal event");
+        } else if terminal_action == UsdcTerminalAction::PreservePostBurn {
+            self.usdc_in_progress.store(true, Ordering::SeqCst);
+            warn!(
+                target: "rebalance",
+                id = %id,
+                "Preserving USDC in-progress guard after post-burn bridge failure"
+            );
         }
 
         drop(event_sync_guard);
@@ -493,7 +535,7 @@ impl RebalancingService {
         // A terminal USDC transfer cleared the in-progress claim, so we
         // cancel any pre-rebalance checks and push a fresh one against
         // the post-rebalance inventory.
-        if is_terminal {
+        if is_clearable_terminal {
             self.equity_scheduler.cancel_pending().await;
             self.usdc_scheduler.cancel_pending().await;
             self.usdc_scheduler.enqueue_check().await;
@@ -502,10 +544,62 @@ impl RebalancingService {
         Ok(())
     }
 
+    async fn usdc_terminal_action(
+        &self,
+        id: &UsdcRebalanceId,
+        event: &UsdcRebalanceEvent,
+    ) -> UsdcTerminalAction {
+        if !Self::is_terminal_usdc_rebalance_event(event) {
+            return UsdcTerminalAction::NotTerminal;
+        }
+
+        if self.post_burn_failure(id, event).await {
+            UsdcTerminalAction::PreservePostBurn
+        } else {
+            UsdcTerminalAction::Clear
+        }
+    }
+
+    /// Whether a terminal failure event happened after the CCTP burn, so its
+    /// funds cannot be reconciled to source and the guard must be kept.
+    async fn post_burn_failure(&self, id: &UsdcRebalanceId, event: &UsdcRebalanceEvent) -> bool {
+        use UsdcRebalanceEvent::*;
+
+        // A recorded burn hash proves post-burn even if tracking was lost.
+        if matches!(
+            event,
+            BridgingFailed {
+                burn_tx_hash: Some(_),
+                ..
+            }
+        ) {
+            return true;
+        }
+
+        // Every terminal failure is post-burn iff the tracked transfer is past
+        // the burn. `is_post_burn` is direction-aware, so a BaseToAlpaca
+        // post-deposit `ConversionFailed` (post-mint) is correctly preserved
+        // while an AlpacaToBase pre-withdrawal `ConversionFailed` clears.
+        // Terminal successes fall through to `false` and settle normally.
+        match event {
+            WithdrawalFailed { .. }
+            | BridgingFailed { .. }
+            | DepositFailed { .. }
+            | ConversionFailed { .. } => self
+                .usdc_tracking
+                .read()
+                .await
+                .get(id)
+                .is_some_and(UsdcRebalanceTracking::is_post_burn),
+            _ => false,
+        }
+    }
+
     async fn apply_usdc_rebalance_event(
         &self,
         id: &UsdcRebalanceId,
         event: &UsdcRebalanceEvent,
+        terminal_action: UsdcTerminalAction,
     ) -> Result<(), RebalancingServiceError> {
         use UsdcRebalanceEvent::*;
 
@@ -560,15 +654,39 @@ impl RebalancingService {
             } => {
                 self.complete_alpaca_to_base_deposit(id).await?;
             }
-            WithdrawalFailed { .. }
-            | BridgingFailed { .. }
-            | DepositFailed { .. }
-            | ConversionFailed { .. } => {
+            // Withdrawal failure is always pre-burn -> reconcile to source.
+            WithdrawalFailed { .. } => {
                 self.cancel_tracked_usdc_rebalance(id).await?;
+            }
+            // These failures may be pre- or post-burn (BridgingFailed by burn
+            // stage; ConversionFailed by direction -- BaseToAlpaca's conversion
+            // is post-deposit; DepositFailed is always post-mint). The classifier
+            // decides: preserve post-burn, otherwise reconcile to source.
+            BridgingFailed { .. } | DepositFailed { .. } | ConversionFailed { .. } => {
+                if terminal_action == UsdcTerminalAction::PreservePostBurn {
+                    // Preservation is achieved by NOT cancelling: the tracking
+                    // entry, guard, and active id are all kept by the caller. This
+                    // call only surfaces a diagnostic if tracking is absent.
+                    self.warn_if_post_burn_tracking_missing(id).await;
+                } else {
+                    self.cancel_tracked_usdc_rebalance(id).await?;
+                }
             }
         }
 
         Ok(())
+    }
+
+    async fn warn_if_post_burn_tracking_missing(&self, id: &UsdcRebalanceId) {
+        if self.usdc_tracking.read().await.contains_key(id) {
+            return;
+        }
+
+        warn!(
+            target: "rebalance",
+            id = %id,
+            "Post-burn bridge failure had no USDC tracking context to preserve"
+        );
     }
 
     async fn track_initiated_usdc_rebalance(
@@ -2039,5 +2157,51 @@ mod tests {
         ));
         assert_eq!(entry.stage, UsdcRebalanceStage::DepositConfirmed);
         assert_eq!(entry.last_progress_at, ts(0));
+    }
+
+    #[test]
+    fn is_post_burn_is_direction_aware() {
+        use RebalanceDirection::{AlpacaToBase, BaseToAlpaca};
+        use UsdcRebalanceStage::*;
+
+        let tracking = |direction, stage| UsdcRebalanceTracking {
+            direction,
+            initiated_amount: Usdc::new(float!(400.0)),
+            bridged_amount_received: None,
+            stage,
+            last_progress_at: ts(0),
+        };
+
+        // Stages from BridgingInitiated through DepositConfirmed are post-burn
+        // for both directions.
+        for stage in [
+            BridgingInitiated,
+            BridgeAttestationReceived,
+            Bridged,
+            DepositInitiated,
+            DepositConfirmed,
+        ] {
+            assert!(tracking(AlpacaToBase, stage).is_post_burn(), "A2B {stage}");
+            assert!(tracking(BaseToAlpaca, stage).is_post_burn(), "B2A {stage}");
+        }
+
+        // Withdrawal stages are pre-burn for both directions.
+        for stage in [Initiated, WithdrawalConfirmed] {
+            assert!(!tracking(AlpacaToBase, stage).is_post_burn(), "A2B {stage}");
+            assert!(!tracking(BaseToAlpaca, stage).is_post_burn(), "B2A {stage}");
+        }
+
+        // Conversion stages differ by direction: AlpacaToBase converts before the
+        // withdrawal (pre-burn); BaseToAlpaca converts after the deposit (post-mint).
+        for stage in [ConversionInitiated, ConversionConfirmed] {
+            assert!(
+                !tracking(AlpacaToBase, stage).is_post_burn(),
+                "A2B {stage} (pre-withdrawal conversion) must be pre-burn"
+            );
+            assert!(
+                tracking(BaseToAlpaca, stage).is_post_burn(),
+                "B2A {stage} (post-deposit conversion) must be post-burn"
+            );
+        }
     }
 }

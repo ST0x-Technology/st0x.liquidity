@@ -853,6 +853,10 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         )
         .await?;
 
+        rebalancing_service
+            .recover_usdc_guard(&deps.pool, &built.usdc)
+            .await?;
+
         let frameworks = RebalancingCqrsFrameworks {
             mint: built.mint,
             redemption: built.redemption,
