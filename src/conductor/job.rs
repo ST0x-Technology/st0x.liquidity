@@ -314,6 +314,7 @@ pub enum JobKind {
     CheckPositions,
     MockBroker,
     TransferUsdcToHedging,
+    TransferUsdcToMarketMaking,
 }
 
 /// Job execution error. Wraps the concrete `Job::Error` type at
@@ -351,6 +352,7 @@ pub struct FailureInjector {
     check_positions: Arc<Mutex<InjectionState>>,
     mock_broker: Arc<Mutex<InjectionState>>,
     transfer_usdc_to_hedging: Arc<Mutex<InjectionState>>,
+    transfer_usdc_to_market_making: Arc<Mutex<InjectionState>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -386,6 +388,7 @@ impl FailureInjector {
             check_positions: Arc::new(Mutex::new(InjectionState::Idle)),
             mock_broker: Arc::new(Mutex::new(InjectionState::Idle)),
             transfer_usdc_to_hedging: Arc::new(Mutex::new(InjectionState::Idle)),
+            transfer_usdc_to_market_making: Arc::new(Mutex::new(InjectionState::Idle)),
         }
     }
 
@@ -433,6 +436,7 @@ impl FailureInjector {
             JobKind::CheckPositions => &self.check_positions,
             JobKind::MockBroker => &self.mock_broker,
             JobKind::TransferUsdcToHedging => &self.transfer_usdc_to_hedging,
+            JobKind::TransferUsdcToMarketMaking => &self.transfer_usdc_to_market_making,
         };
 
         match mutex.lock() {

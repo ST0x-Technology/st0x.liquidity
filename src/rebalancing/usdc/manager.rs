@@ -22,7 +22,7 @@ use super::UsdcTransferError;
 use crate::alpaca_wallet::{
     AlpacaTransferId, AlpacaWalletService, TokenSymbol, Transfer, TransferStatus,
 };
-use crate::onchain::raindex::{RaindexService, RaindexVaultId, USDC_BASE};
+use crate::onchain::raindex::{Raindex, RaindexService, RaindexVaultId, USDC_BASE};
 use crate::rebalancing::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
 use crate::usdc_rebalance::{
     RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
@@ -258,6 +258,269 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
     /// On errors, sends appropriate `Fail*` command to transition
     /// aggregate to failed state.
     #[instrument(target = "rebalance", skip(self), fields(%id, %amount), level = tracing::Level::DEBUG)]
+    pub(crate) async fn resume_alpaca_to_base(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+    ) -> Result<(), UsdcTransferError> {
+        let state = self.cqrs.load(id).await?;
+
+        info!(
+            target: "rebalance",
+            ?state,
+            "Resuming Alpaca->Base transfer from aggregate state",
+        );
+
+        match state {
+            None => self.execute_alpaca_to_base(id, amount).await,
+
+            Some(UsdcRebalance::Converting {
+                direction: RebalanceDirection::AlpacaToBase,
+                ..
+            }) => {
+                self.cqrs
+                    .send(
+                        id,
+                        UsdcRebalanceCommand::FailConversion {
+                            reason: "resume from Converting state requires manual \
+                                     reconciliation: broker order ID not persisted"
+                                .into(),
+                        },
+                    )
+                    .await?;
+                Err(UsdcTransferError::ResumeIndeterminateConversion { id: id.clone() })
+            }
+
+            Some(UsdcRebalance::ConversionComplete {
+                direction: RebalanceDirection::AlpacaToBase,
+                filled_amount,
+                ..
+            }) => {
+                self.continue_alpaca_to_base_from_conversion_complete(id, filled_amount)
+                    .await
+            }
+
+            Some(UsdcRebalance::Withdrawing {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                withdrawal_ref,
+                ..
+            }) => {
+                let TransferRef::AlpacaId(transfer_id) = withdrawal_ref else {
+                    return Err(UsdcTransferError::WithdrawalRefMustBeAlpacaId { id: id.clone() });
+                };
+
+                self.poll_and_confirm_withdrawal(id, &transfer_id).await?;
+                self.continue_alpaca_to_base_from_withdrawal_complete(id, amount)
+                    .await
+            }
+
+            Some(UsdcRebalance::WithdrawalComplete {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                ..
+            }) => {
+                self.continue_alpaca_to_base_from_withdrawal_complete(id, amount)
+                    .await
+            }
+
+            Some(
+                UsdcRebalance::Bridging {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount,
+                    burn_tx_hash,
+                    ..
+                }
+                | UsdcRebalance::Attested {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount,
+                    burn_tx_hash,
+                    ..
+                },
+            ) => {
+                self.continue_alpaca_to_base_from_bridging(id, amount, burn_tx_hash)
+                    .await
+            }
+
+            Some(UsdcRebalance::Bridged {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount_received,
+                ..
+            }) => {
+                self.continue_alpaca_to_base_from_bridged(id, amount_received)
+                    .await
+            }
+
+            Some(UsdcRebalance::DepositInitiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                deposit_ref,
+                ..
+            }) => {
+                // Re-verify the persisted deposit tx on chain before
+                // transitioning to `DepositConfirmed`. The aggregate
+                // records the deposit hash at `InitiateDeposit` time,
+                // but a process restart between that event and the
+                // confirmation can land on a chain where the tx has
+                // been reorged out, dropped, or never mined. Trusting
+                // the persisted state alone would mark the rebalance
+                // complete while the funds aren't actually deposited.
+                let TransferRef::OnchainTx(deposit_tx) = deposit_ref else {
+                    return Err(UsdcTransferError::DepositRefMustBeOnchain { id: id.clone() });
+                };
+                self.raindex.confirm_tx(deposit_tx).await?;
+                self.confirm_deposit(id).await
+            }
+
+            Some(UsdcRebalance::DepositConfirmed {
+                direction: RebalanceDirection::AlpacaToBase,
+                ..
+            }) => Ok(()),
+
+            Some(
+                UsdcRebalance::Converting {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    ..
+                }
+                | UsdcRebalance::ConversionComplete {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    ..
+                }
+                | UsdcRebalance::Withdrawing {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    ..
+                }
+                | UsdcRebalance::WithdrawalComplete {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    ..
+                }
+                | UsdcRebalance::Bridging {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    ..
+                }
+                | UsdcRebalance::Attested {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    ..
+                }
+                | UsdcRebalance::Bridged {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    ..
+                }
+                | UsdcRebalance::DepositInitiated {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    ..
+                }
+                | UsdcRebalance::DepositConfirmed {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    ..
+                },
+            ) => Err(UsdcTransferError::ResumeDirectionMismatch {
+                id: id.clone(),
+                direction: RebalanceDirection::BaseToAlpaca,
+            }),
+
+            // `WithdrawalSubmitting`/`BridgingSubmitting` are crash-safe
+            // submission states produced only by the Base->Alpaca flow (on-chain
+            // vault withdrawal and burn-on-Base). The Alpaca->Base flow withdraws
+            // off-chain and burns via `InitiateBridging` straight to `Bridging`,
+            // so it never enters these states -- reaching one here means the
+            // aggregate belongs to the other direction.
+            Some(
+                UsdcRebalance::WithdrawalSubmitting { direction, .. }
+                | UsdcRebalance::BridgingSubmitting { direction, .. },
+            ) => Err(UsdcTransferError::ResumeDirectionMismatch {
+                id: id.clone(),
+                direction,
+            }),
+
+            Some(
+                UsdcRebalance::WithdrawalFailed { .. }
+                | UsdcRebalance::BridgingFailed { .. }
+                | UsdcRebalance::DepositFailed { .. }
+                | UsdcRebalance::ConversionFailed { .. },
+            ) => Err(UsdcTransferError::PreviouslyFailedAggregate { id: id.clone() }),
+        }
+    }
+
+    /// Drives an Alpaca->Base transfer from `ConversionComplete` through to
+    /// terminal: withdraw -> burn -> attestation -> mint -> vault deposit.
+    async fn continue_alpaca_to_base_from_conversion_complete(
+        &self,
+        id: &UsdcRebalanceId,
+        filled_amount: Usdc,
+    ) -> Result<(), UsdcTransferError> {
+        let transfer = self.initiate_alpaca_withdrawal(id, filled_amount).await?;
+
+        self.poll_and_confirm_withdrawal(id, &transfer.id).await?;
+        self.continue_alpaca_to_base_from_withdrawal_complete(id, filled_amount)
+            .await
+    }
+
+    /// Drives an Alpaca->Base transfer from `WithdrawalComplete` through to
+    /// terminal: burn -> attestation -> mint -> vault deposit.
+    async fn continue_alpaca_to_base_from_withdrawal_complete(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+    ) -> Result<(), UsdcTransferError> {
+        let burn_amount = match usdc_to_u256(amount) {
+            Ok(burn_amount) => burn_amount,
+            Err(error) => {
+                warn!(target: "rebalance", %error, "USDC to U256 conversion failed after withdrawal");
+                self.cqrs
+                    .send(
+                        id,
+                        UsdcRebalanceCommand::FailBridging {
+                            reason: format!("USDC conversion failed: {error}"),
+                        },
+                    )
+                    .await?;
+                return Err(error);
+            }
+        };
+
+        let burn_receipt = self.execute_cctp_burn(id, burn_amount).await?;
+
+        self.continue_alpaca_to_base_from_bridging(id, amount, burn_receipt.tx)
+            .await
+    }
+
+    /// Drives an Alpaca->Base transfer from `Bridging`/`Attested` through to
+    /// terminal. Re-polls the Circle attestation (idempotent for completed
+    /// attestations) so we obtain a fresh [`AttestationResponse`] suitable
+    /// for [`Bridge::mint`].
+    async fn continue_alpaca_to_base_from_bridging(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        burn_tx_hash: TxHash,
+    ) -> Result<(), UsdcTransferError> {
+        let burn_receipt = BurnReceipt {
+            tx: burn_tx_hash,
+            amount: usdc_to_u256(amount)?,
+        };
+
+        let attestation_response = self.poll_attestation(id, &burn_receipt).await?;
+        let mint_receipt = self.execute_cctp_mint(id, attestation_response).await?;
+
+        self.continue_alpaca_to_base_from_bridged(id, u256_to_usdc(mint_receipt.amount)?)
+            .await
+    }
+
+    /// Drives an Alpaca->Base transfer from `Bridged` to terminal: vault
+    /// deposit + `ConfirmDeposit`.
+    async fn continue_alpaca_to_base_from_bridged(
+        &self,
+        id: &UsdcRebalanceId,
+        amount_received: Usdc,
+    ) -> Result<(), UsdcTransferError> {
+        let amount_u256 = usdc_to_u256(amount_received)?;
+
+        self.deposit_to_vault(id, amount_u256).await?;
+        self.confirm_deposit(id).await?;
+
+        Ok(())
+    }
+
     pub(crate) async fn execute_alpaca_to_base(
         &self,
         id: &UsdcRebalanceId,
@@ -597,40 +860,18 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
         Ok(())
     }
 
-    /// Resumes (or starts) a Base->Alpaca transfer from the aggregate's current
-    /// state.
-    ///
-    /// Loads the [`UsdcRebalance`] aggregate via [`Store::load`] and dispatches
-    /// on state to the appropriate phase. This single entry point handles both
-    /// the fresh-start case (aggregate doesn't exist yet) and any in-progress
-    /// state after a crash. Designed to be called from an apalis job so retries
-    /// drive a stalled aggregate to terminal without re-issuing completed
-    /// phases.
-    ///
-    /// # Resume semantics
-    ///
-    /// - `None` (no events yet): start from vault withdrawal.
-    /// - `Withdrawing`: vault withdrawal is synchronous (waits for block
-    ///   inclusion before sending `Initiate`), so only a crash between
-    ///   `Initiate` and `ConfirmWithdrawal` lands the aggregate here. Send
-    ///   `ConfirmWithdrawal` and continue.
-    /// - `WithdrawalComplete`: resume from CCTP burn.
-    /// - `Bridging` / `Attested`: resume from attestation polling. The Circle
-    ///   API is idempotent for completed attestations, so the `Attested` case
-    ///   just re-polls to get a fresh `AttestationResponse` (the aggregate
-    ///   stores attestation bytes and nonce but not the full message envelope
-    ///   needed by [`Bridge::mint`], so re-polling is cheaper than extending
-    ///   the bridge API).
-    /// - `Bridged`: resume from Alpaca deposit initiation.
-    /// - `DepositInitiated`: deposit already recorded; resume from polling
-    ///   Alpaca.
-    /// - `DepositConfirmed` (BaseToAlpaca): resume from USDC->USD conversion.
-    /// - `Converting`: indeterminate after crash (broker order ID is not
-    ///   persisted); emit `FailConversion` and return error so operator can
-    ///   reconcile manually.
-    /// - `ConversionComplete`: terminal success; no-op.
-    /// - Terminal failure states: return [`UsdcTransferError::PreviouslyFailedAggregate`]
-    ///   so the operator sees that automated recovery cannot help.
+    /// Non-obvious points the match body below cannot express on its own:
+    /// - `Attested` re-polls rather than reconstructing an `AttestationResponse`
+    ///   because the aggregate stores attestation bytes + nonce but not the
+    ///   full message envelope [`Bridge::mint`] needs; Circle's API is
+    ///   idempotent for completed attestations so the cost is negligible.
+    /// - `Converting` is unrecoverable: the aggregate persists the correlation
+    ///   UUID but not the broker order ID, so a polling-based resume cannot
+    ///   identify the order. Operator reconciles manually.
+    /// - `Withdrawing` only happens on a crash between `Initiate` and
+    ///   `ConfirmWithdrawal`; the vault withdrawal is synchronous (waits for
+    ///   block inclusion before `Initiate`), so `ConfirmWithdrawal` is always
+    ///   safe to send.
     #[instrument(target = "rebalance", skip(self), fields(%id, %amount), level = tracing::Level::DEBUG)]
     pub(crate) async fn resume_base_to_alpaca(
         &self,
@@ -1495,6 +1736,83 @@ mod tests {
         let endpoint = anvil.endpoint();
         let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
         (anvil, endpoint, private_key)
+    }
+
+    /// Advances an aggregate through the full Alpaca->Base lifecycle up
+    /// to (but not past) `DepositInitiated`, persisting the supplied
+    /// `deposit_tx` as the on-chain reference for the vault deposit.
+    async fn advance_to_deposit_initiated_alpaca_to_base(
+        cqrs: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        deposit_tx: TxHash,
+    ) {
+        let burn_tx =
+            fixed_bytes!("0xaaaa000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0xaaaa111111111111111111111111111111111111111111111111111111111111");
+
+        cqrs.send(
+            id,
+            UsdcRebalanceCommand::InitiateConversion {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                order_id: Uuid::new_v4(),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            id,
+            UsdcRebalanceCommand::ConfirmConversion {
+                filled_amount: amount,
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            id,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .await
+            .unwrap();
+        cqrs.send(id, UsdcRebalanceCommand::InitiateBridging { burn_tx })
+            .await
+            .unwrap();
+        cqrs.send(
+            id,
+            UsdcRebalanceCommand::ReceiveAttestation {
+                attestation: vec![0x01],
+                cctp_nonce: 12345,
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            id,
+            UsdcRebalanceCommand::ConfirmBridging {
+                mint_tx,
+                amount_received: amount,
+                fee_collected: usdc("0"),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            id,
+            UsdcRebalanceCommand::InitiateDeposit {
+                deposit: TransferRef::OnchainTx(deposit_tx),
+            },
+        )
+        .await
+        .unwrap();
     }
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
@@ -3604,6 +3922,65 @@ mod tests {
         assert!(
             matches!(final_state, UsdcRebalance::ConversionComplete { .. }),
             "Expected ConversionComplete after resume from Bridged, got: {final_state:?}",
+        );
+    }
+
+    /// Hypothesis: resuming `resume_alpaca_to_base` from `DepositInitiated`
+    /// must re-verify the persisted on-chain deposit tx (status +
+    /// configured confirmation depth) before transitioning to
+    /// `DepositConfirmed`. A reorg, mempool drop, or partially-mined tx
+    /// observed at the time of `InitiateDeposit` can later be invalid
+    /// when the process restarts; advancing solely from persisted state
+    /// would mark the rebalance complete while the deposit isn't on
+    /// chain. The handler must surface the unverified tx as an error so
+    /// the worker retries instead of silently confirming.
+    #[tokio::test]
+    async fn resume_alpaca_to_base_from_deposit_initiated_reverifies_deposit_tx() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, private_key) = setup_anvil();
+
+        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(wallet).await;
+        let cqrs = create_test_store_instance().await;
+
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            market_maker_wallet,
+            TEST_VAULT_ID,
+        );
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        // A persisted deposit tx that never landed on chain (reorged out,
+        // dropped, or never mined): the live anvil node has no record of it, so
+        // `confirm_tx` cannot confirm it. Resume must surface that as an error
+        // rather than blindly transitioning the aggregate to complete. If the
+        // handler skipped re-verification, confirm would not run and the resume
+        // would return `Ok` -- so the error result guards that regression.
+        let deposit_tx =
+            fixed_bytes!("0xdddd000000000000000000000000000000000000000000000000000000000001");
+
+        advance_to_deposit_initiated_alpaca_to_base(&cqrs, &id, amount, deposit_tx).await;
+
+        let result = manager.resume_alpaca_to_base(&id, amount).await;
+
+        assert!(
+            result.is_err(),
+            "Resume must surface the unverified deposit as an error, got Ok: {result:?}"
+        );
+
+        let final_state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(final_state, UsdcRebalance::DepositInitiated { .. }),
+            "Aggregate must remain in `DepositInitiated` when the deposit tx \
+             cannot be confirmed; got: {final_state:?}"
         );
     }
 }

@@ -44,8 +44,8 @@ use crate::position::{Position, PositionCommand, TradeId};
 use crate::rebalancing::equity::mock::MockCrossVenueEquityTransfer;
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, Equity, EquityTransferServices};
 use crate::rebalancing::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
-use crate::rebalancing::usdc::TransferUsdcToHedging;
 use crate::rebalancing::usdc::mock::MockUsdcRebalance;
+use crate::rebalancing::usdc::{TransferUsdcToHedging, TransferUsdcToMarketMaking};
 use crate::rebalancing::{
     Rebalancer, RebalancingSchedulers, RebalancingService, RebalancingServiceConfig,
     TriggeredOperation, drain_pending_jobs,
@@ -316,6 +316,55 @@ enum Imbalance<'a> {
         onchain: Usdc,
         offchain: Usdc,
     },
+}
+
+/// Direction of a USDC transfer enqueued by the trigger, recovered from the
+/// apalis Jobs table for assertion in integration tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnqueuedUsdcOperation {
+    AlpacaToBase { amount: Usdc },
+    BaseToAlpaca { amount: Usdc },
+}
+
+/// Drains every pending USDC transfer row (both directions) from the apalis
+/// Jobs table, marks them Done, and returns them in `run_at` order.
+async fn drain_pending_usdc_transfer_jobs(pool: &SqlitePool) -> Vec<EnqueuedUsdcOperation> {
+    let to_hedging_type = std::any::type_name::<TransferUsdcToHedging>();
+    let to_market_making_type = std::any::type_name::<TransferUsdcToMarketMaking>();
+
+    let rows: Vec<(String, Vec<u8>, String)> = sqlx::query_as(
+        "SELECT id, job, job_type FROM Jobs \
+         WHERE status = 'Pending' AND (job_type = ? OR job_type = ?) \
+         ORDER BY run_at",
+    )
+    .bind(to_hedging_type)
+    .bind(to_market_making_type)
+    .fetch_all(pool)
+    .await
+    .expect("query pending USDC transfer jobs");
+
+    let mut operations = Vec::with_capacity(rows.len());
+    for (row_id, payload, job_type) in rows {
+        let operation = if job_type == to_hedging_type {
+            let job: TransferUsdcToHedging =
+                serde_json::from_slice(&payload).expect("deserialize TransferUsdcToHedging");
+            EnqueuedUsdcOperation::BaseToAlpaca { amount: job.amount }
+        } else {
+            let job: TransferUsdcToMarketMaking =
+                serde_json::from_slice(&payload).expect("deserialize TransferUsdcToMarketMaking");
+            EnqueuedUsdcOperation::AlpacaToBase { amount: job.amount }
+        };
+
+        sqlx::query("UPDATE Jobs SET status = 'Done' WHERE id = ?")
+            .bind(&row_id)
+            .execute(pool)
+            .await
+            .expect("mark drained USDC transfer job Done");
+
+        operations.push(operation);
+    }
+
+    operations
 }
 
 async fn build_imbalanced_inventory(imbalance: Imbalance<'_>) {
@@ -976,10 +1025,9 @@ async fn equity_onchain_imbalance_triggers_redemption() {
     );
 }
 
-/// Verifies USDC rebalancing dispatch: a USDC imbalance triggers the
-/// RebalancingService to send a UsdcAlpacaToBase operation through the channel
-/// to the Rebalancer, which dispatches to the USDC manager. Uses mocked managers
-/// since the real USDC flow requires CCTP bridge and vault transactions.
+/// Verifies USDC rebalancing dispatch: a USDC imbalance for the Alpaca->Base
+/// direction enqueues a `TransferUsdcToMarketMaking` apalis job with the
+/// expected amount. No work flows through the Rebalancer mpsc channel.
 #[tokio::test]
 async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
     let pool = setup_test_db().await;
@@ -999,7 +1047,7 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
     })
     .await;
 
-    let (sender, receiver) = mpsc::channel(10);
+    let (sender, _receiver) = mpsc::channel(10);
 
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
     let wrapper = Arc::new(MockWrapper::new());
@@ -1015,46 +1063,51 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
         RebalancingSchedulers::new(&pool),
     );
 
-    let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
-    let usdc = Arc::new(MockUsdcRebalance::new());
-
-    let rebalancer = Rebalancer::new(
-        Arc::clone(&mock_equity) as _,
-        mock_equity as _,
-        Arc::clone(&usdc) as _,
-        usdc.clone() as _,
-        receiver,
-        Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
-        Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        tokio_util::sync::CancellationToken::new(),
-    );
-
     trigger.check_and_trigger_usdc().await;
 
-    // Close the channel so the rebalancer exits after processing.
-    drop(trigger);
+    let job_type = std::any::type_name::<TransferUsdcToMarketMaking>();
 
-    rebalancer.run().await;
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM Jobs \
+         WHERE status = 'Pending' AND job_type = ?",
+    )
+    .bind(job_type)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
 
     assert_eq!(
-        usdc.alpaca_to_base_calls(),
-        1,
-        "Expected USDC manager to be called once for alpaca_to_base"
+        pending, 1,
+        "Expected exactly one pending TransferUsdcToMarketMaking job"
     );
 
-    let call = usdc
-        .last_alpaca_to_base_call()
-        .expect("Expected a captured call");
+    let payload: Vec<u8> = sqlx::query_scalar(
+        "SELECT job FROM Jobs \
+         WHERE status = 'Pending' AND job_type = ?",
+    )
+    .bind(job_type)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let job: TransferUsdcToMarketMaking =
+        serde_json::from_slice(&payload).expect("deserialize TransferUsdcToMarketMaking");
     assert_eq!(
-        call.amount,
+        job.amount,
         Usdc::new(float!(400)),
         "Expected excess of $400 (target $500 - actual $100)"
     );
 
+    let opposite: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?")
+            .bind(std::any::type_name::<TransferUsdcToHedging>())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
     assert_eq!(
-        usdc.base_to_alpaca_calls(),
-        0,
-        "base_to_alpaca should not have been called"
+        opposite, 0,
+        "Base->Alpaca queue should not have been touched"
     );
 }
 
@@ -1080,7 +1133,7 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
     })
     .await;
 
-    let (sender, receiver) = mpsc::channel(10);
+    let (sender, _receiver) = mpsc::channel(10);
 
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
     let wrapper = Arc::new(MockWrapper::new());
@@ -1096,25 +1149,7 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
         RebalancingSchedulers::new(&pool),
     );
 
-    let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
-    let usdc = Arc::new(MockUsdcRebalance::new());
-
-    let rebalancer = Rebalancer::new(
-        Arc::clone(&mock_equity) as _,
-        mock_equity as _,
-        Arc::clone(&usdc) as _,
-        usdc.clone() as _,
-        receiver,
-        Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
-        Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        tokio_util::sync::CancellationToken::new(),
-    );
-
     trigger.check_and_trigger_usdc().await;
-
-    drop(trigger);
-
-    rebalancer.run().await;
 
     // Base->Alpaca is dispatched via the TransferUsdcToHedging apalis job
     // queue, not the Rebalancer mpsc channel. Assert exactly one pending row
@@ -1152,15 +1187,16 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
         "Expected excess of $400 (actual $900 - target $500)"
     );
 
+    let opposite: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?")
+            .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
     assert_eq!(
-        usdc.base_to_alpaca_calls(),
-        0,
-        "Rebalancer mpsc path should not be exercised for Base->Alpaca anymore",
-    );
-    assert_eq!(
-        usdc.alpaca_to_base_calls(),
-        0,
-        "alpaca_to_base should not have been called"
+        opposite, 0,
+        "Alpaca->Base queue should not have been touched"
     );
 }
 
@@ -1302,40 +1338,33 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
     // ratio stays balanced (500/500) despite the reserve.
     service.check_and_trigger_usdc().await;
 
-    let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
-    let usdc = Arc::new(MockUsdcRebalance::new());
-
-    let rebalancer = Rebalancer::new(
-        Arc::clone(&mock_equity) as _,
-        mock_equity as _,
-        Arc::clone(&usdc) as _,
-        usdc.clone() as _,
-        receiver,
-        Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
-        Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        tokio_util::sync::CancellationToken::new(),
-    );
-
-    // Drop all Arc clones holding the trigger so the mpsc channel closes
-    // and rebalancer.run() terminates after processing queued operations.
-    // The reactor (which wraps the trigger) is also held by the snapshot
-    // store's reactor list.
+    // Drop trigger holders so subsequent assertions read final queue state.
     drop(service);
     drop(snapshot_store);
     drop(polling_service);
+    drop(receiver);
 
-    rebalancer.run().await;
+    let to_hedging: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?")
+            .bind(std::any::type_name::<TransferUsdcToHedging>())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    let to_market_making: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?")
+            .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
     assert_eq!(
-        usdc.base_to_alpaca_calls(),
-        0,
+        to_hedging, 0,
         "Gross offchain cash is used for the rebalancing ratio, so a $300 \
          reserve must not trigger base_to_alpaca on a balanced 500/500 split"
     );
-
     assert_eq!(
-        usdc.alpaca_to_base_calls(),
-        0,
+        to_market_making, 0,
         "alpaca_to_base should not have been called"
     );
 }
@@ -1677,7 +1706,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         disabled_assets: HashSet::new(),
     };
 
-    let (sender, mut receiver) = mpsc::channel(10);
+    let (sender, _receiver) = mpsc::channel(10);
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
     let wrapper = Arc::new(MockWrapper::new());
 
@@ -1694,17 +1723,14 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
 
     // Cycle 1: excess = 450, capped to 100
     trigger.check_and_trigger_usdc().await;
-    let op1 = receiver.try_recv().expect("First trigger should fire");
-    match op1 {
-        TriggeredOperation::UsdcAlpacaToBase { amount } => {
-            assert_eq!(
-                amount,
-                Usdc::new(float!(100)),
-                "First transfer capped to $100"
-            );
-        }
-        _ => panic!("Expected UsdcAlpacaToBase, got {op1:?}"),
-    }
+    let cycle1 = drain_pending_usdc_transfer_jobs(&pool).await;
+    assert_eq!(
+        cycle1.as_slice(),
+        [EnqueuedUsdcOperation::AlpacaToBase {
+            amount: Usdc::new(float!(100))
+        }],
+        "First transfer capped to $100",
+    );
     trigger.clear_usdc_in_progress();
 
     // Simulate first transfer: 150 onchain, 850 offchain = 15% ratio
@@ -1719,17 +1745,14 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
 
     // Cycle 2: excess = 350, capped to 100
     trigger.check_and_trigger_usdc().await;
-    let op2 = receiver.try_recv().expect("Second trigger should fire");
-    match op2 {
-        TriggeredOperation::UsdcAlpacaToBase { amount } => {
-            assert_eq!(
-                amount,
-                Usdc::new(float!(100)),
-                "Second transfer capped to $100"
-            );
-        }
-        _ => panic!("Expected UsdcAlpacaToBase, got {op2:?}"),
-    }
+    let cycle2 = drain_pending_usdc_transfer_jobs(&pool).await;
+    assert_eq!(
+        cycle2.as_slice(),
+        [EnqueuedUsdcOperation::AlpacaToBase {
+            amount: Usdc::new(float!(100))
+        }],
+        "Second transfer capped to $100",
+    );
     trigger.clear_usdc_in_progress();
 
     // Simulate second transfer: 250 onchain, 750 offchain = 25% ratio
@@ -1744,17 +1767,14 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
 
     // Cycle 3: excess = 250, capped to 100
     trigger.check_and_trigger_usdc().await;
-    let op3 = receiver.try_recv().expect("Third trigger should fire");
-    match op3 {
-        TriggeredOperation::UsdcAlpacaToBase { amount } => {
-            assert_eq!(
-                amount,
-                Usdc::new(float!(100)),
-                "Third transfer capped to $100"
-            );
-        }
-        _ => panic!("Expected UsdcAlpacaToBase, got {op3:?}"),
-    }
+    let cycle3 = drain_pending_usdc_transfer_jobs(&pool).await;
+    assert_eq!(
+        cycle3.as_slice(),
+        [EnqueuedUsdcOperation::AlpacaToBase {
+            amount: Usdc::new(float!(100))
+        }],
+        "Third transfer capped to $100",
+    );
     trigger.clear_usdc_in_progress();
 
     // Simulate third transfer: 350 onchain, 650 offchain = 35% ratio
@@ -1769,10 +1789,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
 
     trigger.check_and_trigger_usdc().await;
     assert!(
-        matches!(
-            receiver.try_recv().unwrap_err(),
-            mpsc::error::TryRecvError::Empty
-        ),
+        drain_pending_usdc_transfer_jobs(&pool).await.is_empty(),
         "Balanced inventory should not trigger"
     );
 }
@@ -1817,7 +1834,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
         disabled_assets: HashSet::new(),
     };
 
-    let (sender, mut receiver) = mpsc::channel(10);
+    let (sender, _receiver) = mpsc::channel(10);
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
     let wrapper = Arc::new(MockWrapper::new());
 
@@ -1834,27 +1851,18 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
 
     // First trigger fires: excess = 400, capped to 100
     trigger.check_and_trigger_usdc().await;
-    let op1 = receiver
-        .try_recv()
-        .expect("First trigger should produce an operation");
-    match op1 {
-        TriggeredOperation::UsdcAlpacaToBase { amount } => {
-            assert_eq!(
-                amount,
-                Usdc::new(float!(100)),
-                "First transfer capped to $100"
-            );
-        }
-        _ => panic!("Expected UsdcAlpacaToBase, got {op1:?}"),
-    }
+    assert_eq!(
+        drain_pending_usdc_transfer_jobs(&pool).await.as_slice(),
+        [EnqueuedUsdcOperation::AlpacaToBase {
+            amount: Usdc::new(float!(100))
+        }],
+        "First transfer capped to $100",
+    );
 
     // Without clearing in_progress, second trigger is blocked
     trigger.check_and_trigger_usdc().await;
     assert!(
-        matches!(
-            receiver.try_recv().unwrap_err(),
-            mpsc::error::TryRecvError::Empty
-        ),
+        drain_pending_usdc_transfer_jobs(&pool).await.is_empty(),
         "In-progress guard should block second trigger"
     );
 
@@ -1863,19 +1871,13 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
 
     // Trigger fires again: same inventory, same excess = 400, capped to 100
     trigger.check_and_trigger_usdc().await;
-    let op2 = receiver
-        .try_recv()
-        .expect("After clearing in_progress, trigger should fire again");
-    match op2 {
-        TriggeredOperation::UsdcAlpacaToBase { amount } => {
-            assert_eq!(
-                amount,
-                Usdc::new(float!(100)),
-                "Retry transfer also capped to $100"
-            );
-        }
-        _ => panic!("Expected UsdcAlpacaToBase, got {op2:?}"),
-    }
+    assert_eq!(
+        drain_pending_usdc_transfer_jobs(&pool).await.as_slice(),
+        [EnqueuedUsdcOperation::AlpacaToBase {
+            amount: Usdc::new(float!(100))
+        }],
+        "Retry transfer also capped to $100",
+    );
 }
 
 /// Tests that threshold configuration controls trigger sensitivity: the same
@@ -1967,7 +1969,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
         })
         .await;
 
-        let (sender, mut receiver) = mpsc::channel(10);
+        let (sender, _receiver) = mpsc::channel(10);
         let tight_config = RebalancingServiceConfig {
             equity: ImbalanceThreshold {
                 target: float!(0.5),
@@ -2005,21 +2007,14 @@ async fn threshold_config_controls_trigger_sensitivity() {
         trigger.check_and_trigger_usdc().await;
         drop(trigger);
 
-        let operation = receiver
-            .try_recv()
-            .expect("Tight threshold (40%-60%) should trigger at 35% onchain ratio");
-
         // Excess = target_onchain - actual_onchain = 500 - 350 = $150
-        match operation {
-            TriggeredOperation::UsdcAlpacaToBase { amount } => {
-                assert_eq!(
-                    amount,
-                    Usdc::new(float!(150)),
-                    "Excess should be $150 (target $500 - actual $350)"
-                );
-            }
-            _ => panic!("Expected UsdcAlpacaToBase operation"),
-        }
+        assert_eq!(
+            drain_pending_usdc_transfer_jobs(&pool).await.as_slice(),
+            [EnqueuedUsdcOperation::AlpacaToBase {
+                amount: Usdc::new(float!(150))
+            }],
+            "Tight threshold (40%-60%) should trigger at 35% onchain ratio with $150 excess",
+        );
     }
 }
 
