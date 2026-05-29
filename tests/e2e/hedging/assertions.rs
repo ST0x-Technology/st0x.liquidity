@@ -35,6 +35,10 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
     deployment_block: u64,
     assets: AssetsConfig,
     execution_threshold_override: Option<st0x_hedge::ExecutionThreshold>,
+    /// Override the WebSocket RPC URL the bot connects to. Default is
+    /// `chain.ws_endpoint()`. Used by chaos tests to route the bot
+    /// through a fault-injecting proxy.
+    ws_rpc_url_override: Option<url::Url>,
 ) -> anyhow::Result<Ctx> {
     let broker_ctx = BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
         api_key: TEST_API_KEY.to_owned(),
@@ -46,9 +50,14 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
         counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
     });
 
+    let ws_rpc_url = match ws_rpc_url_override {
+        Some(url) => url,
+        None => chain.ws_endpoint()?,
+    };
+
     Ctx::for_test()
         .database_url(db_path.display().to_string())
-        .ws_rpc_url(chain.ws_endpoint()?)
+        .ws_rpc_url(ws_rpc_url)
         .orderbook(chain.orderbook)
         .deployment_block(deployment_block)
         .broker(broker_ctx)
