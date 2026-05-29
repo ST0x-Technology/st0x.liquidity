@@ -2515,3 +2515,226 @@ async fn active_mint_in_tokens_wrapped_recovers_into_raindex_vault() -> anyhow::
     bot.abort();
     Ok(())
 }
+
+/// Base->Alpaca crash-recovery hypothesis: the system survives a crash mid
+/// USDC transfer.
+///
+/// Setup runs a Base->Alpaca USDC rebalance, kills the bot after
+/// `BridgingInitiated` (vault withdrawal done, CCTP burn submitted, USDC not
+/// yet on Ethereum), and restarts a fresh conductor against the same SQLite
+/// db_path. The assertions require that the same UsdcRebalance aggregate
+/// reaches `ConversionConfirmed` without forking into a second aggregate or
+/// emitting any *Failed events.
+///
+/// The test fails on the current mpsc-driven Rebalancer (the in-flight
+/// transfer dies with the bot and never resumes), and passes once the
+/// Base->Alpaca direction is durably handled by the TransferUsdcToHedging
+/// apalis job.
+#[test_log::test(tokio::test)]
+async fn interrupted_usdc_base_to_alpaca_resumes_after_restart() -> anyhow::Result<()> {
+    let onchain_price = float!(158.39);
+    let broker_fill_price = float!(155.00);
+    let amount_per_trade = float!(7.5);
+
+    let infra = TestInfra::start(
+        vec![("AAPL", broker_fill_price)],
+        vec![("AAPL", float!(7.5))],
+    )
+    .await?;
+    let cctp = CctpInfra::start(&infra).await?;
+
+    let usdc_amount: U256 = parse_units("145000", 6)?.into();
+    let usdc_vault_id = infra.base_chain.create_usdc_vault(usdc_amount).await?;
+    infra.base_chain.set_owner_usdc_balance(U256::ZERO).await?;
+
+    let mut prepared_orders = Vec::new();
+    for _ in 0..3 {
+        prepared_orders.push(
+            infra
+                .base_chain
+                .setup_order()
+                .symbol("AAPL")
+                .amount(amount_per_trade)
+                .price(onchain_price)
+                .direction(TakeDirection::SellEquity)
+                .usdc_vault_id(usdc_vault_id)
+                .call()
+                .await?,
+        );
+    }
+
+    let eth_deposit_provider = alloy::providers::ProviderBuilder::new()
+        .connect(&cctp.ethereum_endpoint)
+        .await?;
+    let _deposit_watcher = infra
+        .broker_service
+        .start_deposit_watcher(eth_deposit_provider, USDC_ETHEREUM, infra.base_chain.owner)
+        .await?;
+
+    let current_block = infra.base_chain.provider.get_block_number().await?;
+    let reserved = Positive::new(Usd::new(float!(3000)))?;
+    let ctx1 = build_usdc_rebalancing_ctx()
+        .base_chain(&infra.base_chain)
+        .ethereum_endpoint(&cctp.ethereum_endpoint)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .equity_tokens(&infra.equity_addresses)
+        .usdc_vault_id(usdc_vault_id)
+        .cctp(cctp.cctp_overrides())
+        .reserved(reserved)
+        .wrapped_equity_recovery(OperationMode::Disabled)
+        .call()?;
+    let mut bot1 = spawn_bot(ctx1);
+
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    for (index, prepared) in prepared_orders.iter().enumerate() {
+        let _ = infra.base_chain.take_prepared_order(prepared).await?;
+        if index + 1 < prepared_orders.len() {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
+
+    // Wait for the bot to advance the aggregate past the vault withdrawal
+    // into the CCTP bridge phase. From here on the job's idempotent resume
+    // path is the only thing that can reach ConversionConfirmed.
+    poll_for_events_with_timeout(
+        &mut bot1,
+        &infra.db_path,
+        "UsdcRebalanceEvent::BridgingInitiated",
+        1,
+        Duration::from_secs(120),
+    )
+    .await;
+
+    let pool = connect_db(&infra.db_path).await?;
+    let events_before_restart = fetch_events_by_type(&pool, "UsdcRebalance").await?;
+    let resumed_aggregate_id = aggregate_id_for_event(
+        &events_before_restart,
+        "UsdcRebalanceEvent::BridgingInitiated",
+    );
+    pool.close().await;
+
+    bot1.abort();
+    let _ = bot1.await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let ctx2 = build_usdc_rebalancing_ctx()
+        .base_chain(&infra.base_chain)
+        .ethereum_endpoint(&cctp.ethereum_endpoint)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .equity_tokens(&infra.equity_addresses)
+        .usdc_vault_id(usdc_vault_id)
+        .cctp(cctp.cctp_overrides())
+        .reserved(reserved)
+        .wrapped_equity_recovery(OperationMode::Disabled)
+        .call()?;
+    let mut bot2 = spawn_bot(ctx2);
+
+    poll_for_events_with_timeout(
+        &mut bot2,
+        &infra.db_path,
+        "UsdcRebalanceEvent::ConversionConfirmed",
+        1,
+        Duration::from_secs(180),
+    )
+    .await;
+
+    let pool = connect_db(&infra.db_path).await?;
+    let events_after_restart = fetch_events_by_type(&pool, "UsdcRebalance").await?;
+
+    // Load-bearing assertion: the resumed transfer must NOT re-issue the
+    // vault withdrawal. The pre-712 Rebalancer-mpsc path detects the
+    // still-out-of-balance inventory on restart and triggers a fresh
+    // UsdcRebalance aggregate, which fires `WithdrawalConfirmed` a second
+    // time. The apalis-job path re-enters the existing aggregate at its
+    // last persisted state and never re-issues the withdrawal.
+    let withdrawal_confirmed_count = events_after_restart
+        .iter()
+        .filter(|event| event.event_type == "UsdcRebalanceEvent::WithdrawalConfirmed")
+        .count();
+    assert_eq!(
+        withdrawal_confirmed_count, 1,
+        "Expected exactly one WithdrawalConfirmed event across the full run \
+         (one per UsdcRebalance lifecycle); got {withdrawal_confirmed_count}. \
+         More than one means the bot started a fresh transfer instead of \
+         resuming the interrupted one, which means the apalis durability \
+         contract isn't holding.",
+    );
+
+    // Apalis-driven resume produces a Done TransferUsdcToHedging row
+    // in the Jobs table whose serialized payload references the same
+    // aggregate id that BridgingInitiated was emitted under. Asserted via
+    // string match on job_type so the test can sit downstack of the PR
+    // that introduces the type and still fail to compile-time-reference
+    // it.
+    let raw_rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
+        "SELECT job_type, job FROM Jobs \
+         WHERE job_type LIKE '%TransferUsdcToHedging%' \
+         AND status = 'Done'",
+    )
+    .fetch_all(&pool)
+    .await?;
+    pool.close().await;
+
+    let successful_job_rows: Vec<(String, String)> = raw_rows
+        .into_iter()
+        .map(|(job_type, job)| (job_type, String::from_utf8_lossy(&job).into_owned()))
+        .collect();
+
+    assert!(
+        !successful_job_rows.is_empty(),
+        "Expected at least one Done TransferUsdcToHedging row in \
+         the Jobs table after restart; the apalis-job-row durability \
+         contract is the only mechanism that produces such a row. None \
+         found, which means the resume happened via some other path \
+         (Rebalancer-mpsc + inventory poller) -- exactly the pre-712 \
+         behaviour this test must reject.",
+    );
+    assert!(
+        successful_job_rows
+            .iter()
+            .any(|(_, job)| job.contains(resumed_aggregate_id.as_str())),
+        "Expected the Done TransferUsdcToHedging row to reference \
+         the resumed_aggregate_id ({resumed_aggregate_id}). Job rows \
+         found: {successful_job_rows:?}",
+    );
+
+    assert_single_clean_aggregate(
+        &events_after_restart,
+        &[
+            "WithdrawalFailed",
+            "BridgingFailed",
+            "DepositFailed",
+            "ConversionFailed",
+        ],
+    );
+    assert_event_subsequence(
+        &events_after_restart,
+        &[
+            "UsdcRebalanceEvent::Initiated",
+            "UsdcRebalanceEvent::WithdrawalConfirmed",
+            "UsdcRebalanceEvent::BridgingInitiated",
+            "UsdcRebalanceEvent::BridgeAttestationReceived",
+            "UsdcRebalanceEvent::Bridged",
+            "UsdcRebalanceEvent::DepositInitiated",
+            "UsdcRebalanceEvent::DepositConfirmed",
+            "UsdcRebalanceEvent::ConversionInitiated",
+            "UsdcRebalanceEvent::ConversionConfirmed",
+        ],
+    );
+    assert_eq!(
+        aggregate_id_for_event(
+            &events_after_restart,
+            "UsdcRebalanceEvent::ConversionConfirmed",
+        ),
+        resumed_aggregate_id,
+        "Expected the interrupted UsdcRebalance aggregate to complete after restart",
+    );
+
+    bot2.abort();
+    Ok(())
+}
