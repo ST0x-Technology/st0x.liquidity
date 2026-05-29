@@ -264,6 +264,7 @@ mod tests {
                     .unwrap(),
                     direction: st0x_execution::Direction::Sell,
                     executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: st0x_execution::ClientOrderId::new(id.to_string()).unwrap(),
                 },
             )
             .await

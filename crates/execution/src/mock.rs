@@ -255,7 +255,7 @@ impl TryIntoExecutor for MockExecutorCtx {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Direction, FractionalShares, Positive, Symbol};
+    use crate::{ClientOrderId, Direction, FractionalShares, Positive, Symbol};
 
     fn shares(value: &str) -> FractionalShares {
         FractionalShares::new(Float::parse(value.to_string()).unwrap())
@@ -293,6 +293,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: positive_shares("10"),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::new("test-mock-place-market-order-success").unwrap(),
         };
 
         let placement = executor.place_market_order(order).await.unwrap();
@@ -310,6 +311,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: positive_shares("10"),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::new("test-mock-place-market-order-failure").unwrap(),
         };
 
         assert!(matches!(
@@ -424,6 +426,8 @@ mod tests {
                 symbol: Symbol::new("AAPL").unwrap(),
                 shares: positive_shares("2"),
                 direction: Direction::Sell,
+                client_order_id: ClientOrderId::new("test-mock-preflight-sell-without-inventory")
+                    .unwrap(),
             })
             .await
             .unwrap();
@@ -456,6 +460,8 @@ mod tests {
                 symbol: Symbol::new("AAPL").unwrap(),
                 shares: positive_shares("20"),
                 direction: Direction::Sell,
+                client_order_id: ClientOrderId::new("test-mock-preflight-partial-sell-capped")
+                    .unwrap(),
             })
             .await
             .unwrap();
@@ -493,6 +499,8 @@ mod tests {
                 symbol: Symbol::new("AAPL").unwrap(),
                 shares: positive_shares("5"),
                 direction: Direction::Sell,
+                client_order_id: ClientOrderId::new("test-mock-preflight-sell-zero-inventory")
+                    .unwrap(),
             })
             .await
             .unwrap();
@@ -523,6 +531,8 @@ mod tests {
                 symbol: Symbol::new("AAPL").unwrap(),
                 shares: positive_shares("2"),
                 direction: Direction::Buy,
+                client_order_id: ClientOrderId::new("test-mock-preflight-buy-without-cash")
+                    .unwrap(),
             })
             .await
             .unwrap();
@@ -546,6 +556,8 @@ mod tests {
                     symbol: Symbol::new("AAPL").unwrap(),
                     shares: positive_shares("2"),
                     direction: Direction::Buy,
+                    client_order_id: ClientOrderId::new("test-mock-preflight-error-when-should-fail")
+                        .unwrap(),
                 })
                 .await
                 .unwrap_err(),

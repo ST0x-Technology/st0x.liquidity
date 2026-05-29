@@ -15,7 +15,7 @@ use tracing::{debug, error, warn};
 
 use st0x_config::Ctx;
 use st0x_event_sorcery::Projection;
-use st0x_execution::{CounterTradePreflight, Executor, MarketOrder, Symbol};
+use st0x_execution::{ClientOrderId, CounterTradePreflight, Executor, MarketOrder, Symbol};
 
 use crate::conductor::clamp_shares_to_reservation;
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
@@ -149,6 +149,7 @@ where
             executor: ready.executor,
             threshold: self.ctx.execution_threshold,
             offchain_order_id: OffchainOrderId::new(),
+            last_failed_offchain_order_id: ready.last_failed_offchain_order_id,
         };
 
         let mut queue = self.hedge_queue.clone();
@@ -165,6 +166,9 @@ where
             symbol: ready.symbol.clone(),
             shares: ready.shares,
             direction: ready.direction,
+            // Preflight only; this id is never sent to the broker. Use a
+            // fresh value so callers cannot mistake it for a real key.
+            client_order_id: ClientOrderId::from_prefixed_uuid("preflight-", uuid::Uuid::new_v4()),
         };
 
         match self.executor.preflight_counter_trade(order).await {

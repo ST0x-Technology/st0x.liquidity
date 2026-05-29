@@ -14,8 +14,9 @@ use st0x_event_sorcery::{Store, StoreBuilder};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::alpaca_broker_api::{AlpacaLimitOrder, AlpacaLimitPrice};
 use st0x_execution::{
-    Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder, MockExecutor,
-    MockExecutorCtx, OrderPlacement, OrderState, Positive, Symbol, TimeInForce, TryIntoExecutor,
+    ClientOrderId, Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder,
+    MockExecutor, MockExecutorCtx, OrderPlacement, OrderState, Positive, Symbol, TimeInForce,
+    TryIntoExecutor,
 };
 
 use crate::offchain::order::{
@@ -264,6 +265,10 @@ async fn execute_market_order<W: Write>(
         symbol: request.symbol.clone(),
         shares: request.shares,
         direction: request.direction,
+        // Manual CLI placement; generate a fresh idempotency key so an
+        // operator-issued retry cannot accidentally dedupe against an
+        // unrelated earlier placement.
+        client_order_id: ClientOrderId::from_prefixed_uuid("cli-", uuid::Uuid::new_v4()),
     };
 
     execute_broker_order(ctx, pool, market_order, time_in_force, stdout).await
@@ -528,6 +533,7 @@ pub(super) async fn process_found_trade<W: Write>(
                 shares: params.shares,
                 direction: params.direction,
                 executor: params.executor,
+                client_order_id: ClientOrderId::from_uuid(offchain_order_id.as_uuid()),
             },
         )
         .await
@@ -789,16 +795,23 @@ mod tests {
         });
 
         let order_mock = server.mock(|when, then| {
+            // `json_body_includes` lets the broker-side `client_order_id`
+            // (a fresh UUID per CLI invocation) pass through unchecked;
+            // the bot-issued idempotency key is asserted by the chaos
+            // tests, not these placement happy-path tests.
             when.method(httpmock::Method::POST)
                 .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
-                .json_body(json!({
-                    "symbol": symbol,
-                    "qty": quantity,
-                    "side": side,
-                    "type": "market",
-                    "time_in_force": "day",
-                    "extended_hours": false
-                }));
+                .json_body_includes(
+                    json!({
+                        "symbol": symbol,
+                        "qty": quantity,
+                        "side": side,
+                        "type": "market",
+                        "time_in_force": "day",
+                        "extended_hours": false
+                    })
+                    .to_string(),
+                );
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({

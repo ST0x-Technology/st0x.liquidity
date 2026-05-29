@@ -15,6 +15,12 @@ pub(crate) struct ExecutionCtx {
     pub(crate) direction: Direction,
     pub(crate) shares: Positive<FractionalShares>,
     pub(crate) executor: SupportedExecutor,
+    /// If the previous placement attempt for this position failed, the
+    /// position aggregate stashes its `OffchainOrderId` here so we can
+    /// reuse it as the broker-side `client_order_id` and let the broker
+    /// dedupe a duplicate submission whose first response was lost in
+    /// flight. `None` means this is a fresh attempt with no prior anchor.
+    pub(crate) last_failed_offchain_order_id: Option<crate::offchain::order::OffchainOrderId>,
 }
 
 /// Checks whether a position is ready for offchain execution.
@@ -65,6 +71,7 @@ pub(crate) async fn check_execution_readiness<E: Executor>(
         direction,
         shares,
         executor: executor_type,
+        last_failed_offchain_order_id: position.last_failed_offchain_order_id,
     }))
 }
 
@@ -143,6 +150,7 @@ pub(crate) async fn check_all_positions<E: Executor>(
                 direction,
                 shares,
                 executor: executor_type,
+                last_failed_offchain_order_id: position.last_failed_offchain_order_id,
             });
         }
     }

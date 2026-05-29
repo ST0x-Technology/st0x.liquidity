@@ -30,8 +30,8 @@ use st0x_event_sorcery::{
 };
 use st0x_evm::Wallet;
 use st0x_execution::{
-    CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason, ExecutionError,
-    Executor, FractionalShares, MarketOrder, Symbol, TryIntoExecutor,
+    ClientOrderId, CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason,
+    ExecutionError, Executor, FractionalShares, MarketOrder, Symbol, TryIntoExecutor,
 };
 
 use crate::alpaca_wallet::AlpacaWalletService;
@@ -1661,10 +1661,14 @@ async fn preflight_counter_trade_submission<E: Executor>(
 where
     TradeAccountingError: From<E::Error>,
 {
+    // Preflight does not submit; the client_order_id is irrelevant for the
+    // check but the type requires it. Use a fresh value so callers cannot
+    // accidentally reuse it as a real placement key.
     let order = MarketOrder {
         symbol: execution.symbol.clone(),
         shares: execution.shares,
         direction: execution.direction,
+        client_order_id: ClientOrderId::from_prefixed_uuid("preflight-", uuid::Uuid::new_v4()),
     };
 
     match executor.preflight_counter_trade(order).await? {
@@ -1689,6 +1693,10 @@ async fn place_offchain_order(
     execution: &ExecutionCtx,
     cqrs: &TradeProcessingCqrs,
 ) -> Result<Option<OffchainOrderId>, TradeAccountingError> {
+    // Always mint a fresh OffchainOrderId for the new aggregate — the
+    // prior aggregate may be in `Failed` state and cannot be revived. The
+    // broker-side dedupe relies on `last_failed_offchain_order_id` being
+    // reused as `client_order_id`, not on aggregate identity.
     let offchain_order_id = OffchainOrderId::new();
 
     if !execute_place_offchain_order(execution, cqrs, offchain_order_id).await {
@@ -1838,11 +1846,17 @@ async fn execute_create_offchain_order(
     cqrs: &TradeProcessingCqrs,
     offchain_order_id: OffchainOrderId,
 ) {
+    // Prefer the stashed last-failed id so retries dedupe at the broker;
+    // fall back to the freshly-minted aggregate id on a first attempt.
+    let client_order_id_source = execution
+        .last_failed_offchain_order_id
+        .unwrap_or(offchain_order_id);
     let command = OffchainOrderCommand::Place {
         symbol: execution.symbol.clone(),
         shares: execution.shares,
         direction: execution.direction,
         executor: execution.executor,
+        client_order_id: ClientOrderId::from_uuid(client_order_id_source.as_uuid()),
     };
 
     match cqrs.offchain_order.send(&offchain_order_id, command).await {
@@ -1952,6 +1966,7 @@ where
             shares: execution.shares,
             direction: execution.direction,
             executor: execution.executor,
+            client_order_id: ClientOrderId::from_uuid(offchain_order_id.as_uuid()),
         };
 
         let place_result = offchain_order.send(&offchain_order_id, command).await;
@@ -4587,6 +4602,8 @@ mod tests {
                     shares,
                     direction: Direction::Sell,
                     executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: ClientOrderId::new(offchain_order_id.to_string())
+                        .expect("OffchainOrderId UUID string is non-empty"),
                 },
             )
             .await
@@ -4776,6 +4793,8 @@ mod tests {
                     shares,
                     direction: Direction::Sell,
                     executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: ClientOrderId::new(offchain_order_id.to_string())
+                        .expect("OffchainOrderId UUID string is non-empty"),
                 },
             )
             .await
@@ -4870,6 +4889,8 @@ mod tests {
                     shares,
                     direction: Direction::Sell,
                     executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: ClientOrderId::new(offchain_order_id.to_string())
+                        .expect("OffchainOrderId UUID string is non-empty"),
                 },
             )
             .await
@@ -4962,6 +4983,7 @@ mod tests {
             direction: Direction::Sell,
             shares,
             executor: st0x_execution::SupportedExecutor::DryRun,
+            last_failed_offchain_order_id: None,
         }
     }
 

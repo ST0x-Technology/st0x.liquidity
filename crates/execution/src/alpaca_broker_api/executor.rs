@@ -359,8 +359,8 @@ mod tests {
     };
     use crate::alpaca_broker_api::order::AlpacaLimitPrice;
     use crate::{
-        CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason, Direction,
-        FractionalShares, Positive, Usd,
+        ClientOrderId, CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason,
+        Direction, FractionalShares, Positive, Usd,
     };
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
@@ -710,6 +710,7 @@ mod tests {
                 symbol: Symbol::new("AAPL").unwrap(),
                 shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
                 direction: Direction::Buy,
+                client_order_id: ClientOrderId::new("test-preflight-insufficient-bp").unwrap(),
             })
             .await
             .unwrap();
@@ -754,6 +755,7 @@ mod tests {
                 symbol: Symbol::new("AAPL").unwrap(),
                 shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
                 direction: Direction::Buy,
+                client_order_id: ClientOrderId::new("test-preflight-unsettled-proceeds").unwrap(),
             })
             .await
             .unwrap();
@@ -851,6 +853,7 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::new("test-place-market-order-inactive-asset").unwrap(),
         };
 
         let result = executor.place_market_order(order).await;
@@ -885,6 +888,8 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::new("test-place-market-order-non-tradable-asset")
+                .unwrap(),
         };
 
         let result = executor.place_market_order(order).await;
@@ -919,6 +924,7 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::new("test-place-market-order-active-tradable").unwrap(),
         };
 
         let result = executor.place_market_order(order).await;
@@ -977,6 +983,7 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::new("test-asset-cache-order-1").unwrap(),
         };
         executor.place_market_order(order1).await.unwrap();
 
@@ -988,6 +995,7 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::new("test-asset-cache-order-2").unwrap(),
         };
         executor.place_market_order(order2).await.unwrap();
 
@@ -1053,6 +1061,7 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::new("test-asset-cache-ttl-order-1").unwrap(),
         };
         executor.place_market_order(order1).await.unwrap();
 
@@ -1067,6 +1076,7 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::new("test-asset-cache-ttl-order-2").unwrap(),
         };
         executor.place_market_order(order2).await.unwrap();
 

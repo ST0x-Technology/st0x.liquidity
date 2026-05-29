@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use st0x_event_sorcery::{AggregateError, LifecycleError, Store};
-use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
+use st0x_execution::{
+    ClientOrderId, Direction, FractionalShares, Positive, SupportedExecutor, Symbol,
+};
 
 use crate::conductor::job::{Job, JobQueue, Label};
 use crate::offchain::order::{
@@ -45,6 +47,14 @@ pub(crate) struct PlaceHedge {
     pub(crate) executor: SupportedExecutor,
     pub(crate) threshold: ExecutionThreshold,
     pub(crate) offchain_order_id: OffchainOrderId,
+    /// If a prior placement attempt for this position failed, the
+    /// position aggregate stashed its `OffchainOrderId` so the next
+    /// attempt can reuse it as the broker-side `client_order_id`. The
+    /// broker dedupes when both attempts arrive with the same key. `None`
+    /// means this is a fresh attempt and `offchain_order_id` is used as
+    /// the broker key instead.
+    #[serde(default)]
+    pub(crate) last_failed_offchain_order_id: Option<OffchainOrderId>,
 }
 
 /// Recovery path for the `PendingExecution` rejection. The previous attempt
@@ -146,6 +156,15 @@ impl Job<HedgeCtx> for PlaceHedge {
             Err(error) => return Err(error.into()),
         }
 
+        // Prefer the position's last-failed-attempt id so a retry across
+        // a fresh `PlaceHedge` enqueue (after a transient 5xx) shares the
+        // same broker-side `client_order_id` as the original attempt.
+        // Fall back to the current aggregate id for the first attempt.
+        let client_order_id_source = self
+            .last_failed_offchain_order_id
+            .unwrap_or(self.offchain_order_id);
+        let client_order_id = ClientOrderId::from_uuid(client_order_id_source.as_uuid());
+
         ctx.offchain_order
             .send(
                 &self.offchain_order_id,
@@ -154,6 +173,7 @@ impl Job<HedgeCtx> for PlaceHedge {
                     shares: self.shares,
                     direction: self.direction,
                     executor: self.executor,
+                    client_order_id,
                 },
             )
             .await?;
@@ -317,6 +337,7 @@ mod tests {
             executor: SupportedExecutor::DryRun,
             threshold: ExecutionThreshold::whole_share(),
             offchain_order_id: OffchainOrderId::new(),
+            last_failed_offchain_order_id: None,
         }
     }
 

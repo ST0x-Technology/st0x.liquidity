@@ -120,6 +120,7 @@ pub(super) struct OrderRequest {
     pub order_type: &'static str,
     pub time_in_force: &'static str,
     pub extended_hours: bool,
+    pub client_order_id: String,
 }
 
 /// Order request for placing limit orders.
@@ -335,6 +336,7 @@ pub(super) async fn place_market_order(
         time_in_force: time_in_force.as_api_str(),
         // Alpaca only allows extended_hours=true for limit orders, not market orders
         extended_hours: false,
+        client_order_id: market_order.client_order_id.as_str().to_owned(),
     };
 
     let response = client.place_order(&request).await?;
@@ -577,6 +579,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::ClientOrderId;
     use crate::alpaca_broker_api::auth::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
     };
@@ -649,7 +652,8 @@ mod tests {
                     "side": "buy",
                     "type": "market",
                     "time_in_force": "day",
-                    "extended_hours": false
+                    "extended_hours": false,
+                    "client_order_id": "test-place-market-order-buy"
                 }));
             then.status(200)
                 .header("content-type", "application/json")
@@ -668,6 +672,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(100))).unwrap(),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::new("test-place-market-order-buy").unwrap(),
         };
 
         let placement = place_market_order(&client, market_order, TimeInForce::Day)
@@ -695,7 +700,8 @@ mod tests {
                     "side": "sell",
                     "type": "market",
                     "time_in_force": "day",
-                    "extended_hours": false
+                    "extended_hours": false,
+                    "client_order_id": "test-place-market-order-sell"
                 }));
             then.status(200)
                 .header("content-type", "application/json")
@@ -714,6 +720,7 @@ mod tests {
             symbol: Symbol::new("TSLA").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(50))).unwrap(),
             direction: Direction::Sell,
+            client_order_id: ClientOrderId::new("test-place-market-order-sell").unwrap(),
         };
 
         let placement = place_market_order(&client, market_order, TimeInForce::Day)
@@ -1181,7 +1188,8 @@ mod tests {
                     "side": "sell",
                     "type": "market",
                     "time_in_force": "day",
-                    "extended_hours": false
+                    "extended_hours": false,
+                    "client_order_id": "test-truncates-18-decimal-quantity-to-9"
                 }));
             then.status(200)
                 .header("content-type", "application/json")
@@ -1203,6 +1211,7 @@ mod tests {
             symbol: Symbol::new("RKLB").unwrap(),
             shares: Positive::new(FractionalShares::new(onchain_shares)).unwrap(),
             direction: Direction::Sell,
+            client_order_id: ClientOrderId::new("test-truncates-18-decimal-quantity-to-9").unwrap(),
         };
 
         let placement = place_market_order(&client, market_order, TimeInForce::Day)
@@ -1233,6 +1242,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(tiny)).unwrap(),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::new("test-tiny-shares-below-precision").unwrap(),
         };
 
         let err = place_market_order(&client, market_order, TimeInForce::Day)
