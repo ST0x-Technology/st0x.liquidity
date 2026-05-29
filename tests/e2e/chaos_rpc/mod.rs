@@ -34,7 +34,6 @@ use crate::poll::{poll_for_events_with_timeout, spawn_bot};
 /// reconciliation) so the empty response is detected as unauthoritative
 /// and retried.
 #[test_log::test(tokio::test)]
-#[ignore = "un-ignored and made to pass by the immediate upstack #716 (feat/chaos-ws-proxy-impl)"]
 async fn transient_empty_get_logs_during_backfill_does_not_drop_events() -> anyhow::Result<()> {
     let equity_symbol = "AAPL";
     let onchain_price = float!(155.00);
