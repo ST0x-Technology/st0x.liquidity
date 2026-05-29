@@ -71,7 +71,7 @@ pub use test_contracts::{
 use std::mem::size_of;
 use std::time::Duration;
 
-use alloy::primitives::{Address, Bytes, FixedBytes, TxHash, U256, address};
+use alloy::primitives::{Address, B256, Bytes, FixedBytes, TxHash, U256, address};
 use alloy::sol;
 use async_trait::async_trait;
 use backon::Retryable;
@@ -178,35 +178,13 @@ pub struct AttestationResponse {
     /// Circle's attestation signature for the message.
     /// Required to prove the burn happened and authorize minting.
     attestation: Bytes,
-    /// The real CCTP nonce pre-validated as u64 at construction time.
-    validated_nonce: u64,
-}
-
-impl AttestationResponse {
-    /// Constructs an `AttestationResponse`, validating that the 32-byte
-    /// nonce fits in a u64 at construction time rather than deferring to
-    /// runtime.
-    fn new(message: Bytes, attestation: Bytes, nonce: FixedBytes<32>) -> Result<Self, CctpError> {
-        let bytes: &[u8; 32] = nonce.as_ref();
-        let (padding, value) = bytes.split_at(bytes.len() - size_of::<u64>());
-
-        if padding.iter().any(|&b| b != 0) {
-            return Err(CctpError::NonceOverflow { nonce });
-        }
-
-        let validated_nonce = u64::from_be_bytes(value.try_into()?);
-
-        Ok(Self {
-            message,
-            attestation,
-            validated_nonce,
-        })
-    }
+    /// The real 32-byte CCTP V2 nonce extracted from the attested message.
+    nonce: B256,
 }
 
 impl crate::Attestation for AttestationResponse {
-    fn nonce(&self) -> u64 {
-        self.validated_nonce
+    fn nonce(&self) -> B256 {
+        self.nonce
     }
 
     fn as_bytes(&self) -> &[u8] {
@@ -321,10 +299,6 @@ pub enum CctpError {
     HexDecode(#[from] alloy::hex::FromHexError),
     #[error("Fee value parse error: {0}")]
     FeeValueParse(#[from] std::num::ParseIntError),
-    #[error("Nonce exceeds u64: upper 24 bytes are non-zero")]
-    NonceOverflow { nonce: FixedBytes<32> },
-    #[error("Slice conversion error: {0}")]
-    SliceConversion(#[from] std::array::TryFromSliceError),
 }
 
 /// Errors specific to attestation polling from Circle's API.
@@ -561,7 +535,11 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
 
         let nonce = extract_nonce_from_message(&message)?;
 
-        AttestationResponse::new(message, attestation, nonce)
+        Ok(AttestationResponse {
+            message,
+            attestation,
+            nonce,
+        })
     }
 
     /// Burns USDC on the source chain for the given bridge direction.

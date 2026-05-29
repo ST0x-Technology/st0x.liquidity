@@ -65,7 +65,7 @@
 //!
 //! [`AlpacaWalletService`]: crate::alpaca_wallet::AlpacaWalletService
 
-use alloy::primitives::TxHash;
+use alloy::primitives::{B256, TxHash};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -214,7 +214,7 @@ pub(crate) enum UsdcRebalanceCommand {
     /// The cctp_nonce is extracted from the attested message (not the burn tx, which has placeholder).
     ReceiveAttestation {
         attestation: Vec<u8>,
-        cctp_nonce: u64,
+        cctp_nonce: B256,
     },
     /// Confirm the CCTP mint transaction. Valid only from `Attested` state.
     /// Includes actual amounts from the MintAndWithdraw event for accurate inventory tracking.
@@ -290,7 +290,7 @@ pub(crate) enum UsdcRebalanceEvent {
     /// The cctp_nonce is extracted from the attested message (the real nonce, not the placeholder).
     BridgeAttestationReceived {
         attestation: Vec<u8>,
-        cctp_nonce: u64,
+        cctp_nonce: B256,
         attested_at: DateTime<Utc>,
     },
     /// CCTP mint transaction confirmed on destination chain.
@@ -306,7 +306,7 @@ pub(crate) enum UsdcRebalanceEvent {
     /// Bridging failed. Preserves burn data when available for debugging.
     BridgingFailed {
         burn_tx_hash: Option<TxHash>,
-        cctp_nonce: Option<u64>,
+        cctp_nonce: Option<B256>,
         reason: String,
         failed_at: DateTime<Utc>,
     },
@@ -425,7 +425,7 @@ pub(crate) enum UsdcRebalance {
         direction: RebalanceDirection,
         amount: Usdc,
         burn_tx_hash: TxHash,
-        cctp_nonce: u64,
+        cctp_nonce: B256,
         attestation: Vec<u8>,
         initiated_at: DateTime<Utc>,
         attested_at: DateTime<Utc>,
@@ -449,7 +449,7 @@ pub(crate) enum UsdcRebalance {
         direction: RebalanceDirection,
         amount: Usdc,
         burn_tx_hash: Option<TxHash>,
-        cctp_nonce: Option<u64>,
+        cctp_nonce: Option<B256>,
         reason: String,
         initiated_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
@@ -698,7 +698,12 @@ impl EventSourced for UsdcRebalance {
 
     const AGGREGATE_TYPE: &'static str = "UsdcRebalance";
     const PROJECTION: Nil = Nil;
-    const SCHEMA_VERSION: u64 = 1;
+    // v2: cctp_nonce widened from u64 to B256 (full CCTP V2 nonce) in the
+    // Attested/BridgingFailed state variants. Bumped to clear stale snapshots
+    // so they rebuild from events. No event upcaster needed: persisted events
+    // only ever stored cctp_nonce=null (the nonce bug prevented any successful
+    // attestation), which deserializes unchanged into Option<B256>.
+    const SCHEMA_VERSION: u64 = 2;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use UsdcRebalanceEvent::*;
@@ -1294,7 +1299,7 @@ impl UsdcRebalance {
     fn transition_receive_attestation(
         &self,
         attestation: Vec<u8>,
-        cctp_nonce: u64,
+        cctp_nonce: B256,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {
@@ -1487,6 +1492,14 @@ mod tests {
 
     use super::*;
     use st0x_float_macro::float;
+
+    /// Realistic CCTP V2 nonce with non-zero upper bytes -- the actual nonce
+    /// from a prod burn that the old u64 validation rejected. Regression guard
+    /// against forcing a 32-byte nonce into a u64.
+    const TEST_CCTP_NONCE: B256 =
+        fixed_bytes!("0xa01ca42d9082e926a81dc287d973a8f072dfa1b20a4fbf7b20f3abda1b376278");
+    const OTHER_CCTP_NONCE: B256 =
+        fixed_bytes!("0x524cd90eb8dffcb29fcc163aa8258d84e6cc25abc0b4700d704936812ee39824");
 
     #[tokio::test]
     async fn test_initiate_alpaca_to_base() {
@@ -1938,7 +1951,7 @@ mod tests {
             ])
             .when(UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: attestation.clone(),
-                cctp_nonce: 12345,
+                cctp_nonce: TEST_CCTP_NONCE,
             })
             .await
             .events();
@@ -1961,7 +1974,7 @@ mod tests {
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01, 0x02],
-                cctp_nonce: 12345,
+                cctp_nonce: TEST_CCTP_NONCE,
             })
             .await
             .then_expect_error();
@@ -1985,7 +1998,7 @@ mod tests {
             }])
             .when(UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01, 0x02],
-                cctp_nonce: 12345,
+                cctp_nonce: TEST_CCTP_NONCE,
             })
             .await
             .then_expect_error();
@@ -2014,7 +2027,7 @@ mod tests {
             ])
             .when(UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01, 0x02],
-                cctp_nonce: 12345,
+                cctp_nonce: TEST_CCTP_NONCE,
             })
             .await
             .then_expect_error();
@@ -2044,7 +2057,7 @@ mod tests {
             ])
             .when(UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01, 0x02],
-                cctp_nonce: 12345,
+                cctp_nonce: TEST_CCTP_NONCE,
             })
             .await
             .then_expect_error();
@@ -2078,13 +2091,13 @@ mod tests {
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
-                    cctp_nonce: 12345,
+                    cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
                 },
             ])
             .when(UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x03, 0x04],
-                cctp_nonce: 99999,
+                cctp_nonce: OTHER_CCTP_NONCE,
             })
             .await
             .then_expect_error();
@@ -2120,7 +2133,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02, 0x03, 0x04],
-                    cctp_nonce: 12345,
+                    cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
                 },
             ])
@@ -2269,7 +2282,7 @@ mod tests {
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
-        let cctp_nonce = 12345u64;
+        let cctp_nonce = TEST_CCTP_NONCE;
 
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
@@ -2387,7 +2400,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
-                    cctp_nonce: 12345,
+                    cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -2438,7 +2451,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
-                    cctp_nonce: 12345,
+                    cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -2528,7 +2541,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
-                    cctp_nonce: 12345,
+                    cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -2585,7 +2598,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
-                    cctp_nonce: 12345,
+                    cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -2637,7 +2650,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
-                    cctp_nonce: 12345,
+                    cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
                 },
             ])
@@ -2681,7 +2694,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
-                    cctp_nonce: 12345,
+                    cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -2732,7 +2745,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
-                    cctp_nonce: 12345,
+                    cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -2780,7 +2793,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
-                    cctp_nonce: 12345,
+                    cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -2843,7 +2856,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
-                    cctp_nonce: 12345,
+                    cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -2902,7 +2915,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0xAB, 0xCD, 0xEF],
-                    cctp_nonce: 12345,
+                    cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -2954,7 +2967,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x11, 0x22, 0x33, 0x44],
-                    cctp_nonce: 67890,
+                    cctp_nonce: OTHER_CCTP_NONCE,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -3061,7 +3074,7 @@ mod tests {
             ])
             .when(UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01],
-                cctp_nonce: 12345,
+                cctp_nonce: TEST_CCTP_NONCE,
             })
             .await
             .then_expect_error();
@@ -3139,7 +3152,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01],
-                    cctp_nonce: 12345,
+                    cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -3192,7 +3205,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01],
-                    cctp_nonce: 12345,
+                    cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -3248,7 +3261,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01],
-                    cctp_nonce: 12345,
+                    cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -3565,7 +3578,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01],
-                    cctp_nonce: 12345,
+                    cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -3631,7 +3644,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01],
-                    cctp_nonce: 12345,
+                    cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -3703,7 +3716,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01],
-                    cctp_nonce: 12345,
+                    cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -3764,7 +3777,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01],
-                    cctp_nonce: 12345,
+                    cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -3831,7 +3844,7 @@ mod tests {
             },
             UsdcRebalanceEvent::BridgeAttestationReceived {
                 attestation: vec![0x01],
-                cctp_nonce: 12345,
+                cctp_nonce: TEST_CCTP_NONCE,
                 attested_at: withdrawal_confirmed_at + chrono::Duration::seconds(15),
             },
             UsdcRebalanceEvent::Bridged {
@@ -4209,7 +4222,7 @@ mod tests {
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(1500)),
             burn_tx_hash: burn_tx,
-            cctp_nonce: 42,
+            cctp_nonce: TEST_CCTP_NONCE,
             attestation: vec![0xAA, 0xBB],
             initiated_at,
             attested_at,

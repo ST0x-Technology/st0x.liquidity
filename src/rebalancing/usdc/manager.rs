@@ -948,7 +948,7 @@ mod tests {
             id,
             UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01],
-                cctp_nonce: 99999,
+                cctp_nonce: B256::left_padding_from(&99999u64.to_be_bytes()),
             },
         )
         .await
@@ -1831,7 +1831,7 @@ mod tests {
             &id,
             UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01],
-                cctp_nonce: 12345,
+                cctp_nonce: B256::left_padding_from(&12345u64.to_be_bytes()),
             },
         )
         .await

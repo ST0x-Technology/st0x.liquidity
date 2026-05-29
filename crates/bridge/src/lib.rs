@@ -4,7 +4,7 @@
 //! The default (no features) build ships only the trait and shared domain types.
 //! Enable the `cctp` feature for the Circle CCTP V2 implementation.
 
-use alloy::primitives::{Address, TxHash, U256};
+use alloy::primitives::{Address, B256, TxHash, U256};
 use async_trait::async_trait;
 
 #[cfg(feature = "cctp")]
@@ -43,8 +43,8 @@ pub struct MintReceipt {
 
 /// Attestation data required to mint on the destination chain.
 pub trait Attestation: Send + Sync {
-    /// Returns the nonce for this attestation.
-    fn nonce(&self) -> u64;
+    /// Returns the 32-byte CCTP V2 nonce for this attestation.
+    fn nonce(&self) -> B256;
 
     /// Returns the raw attestation bytes.
     fn as_bytes(&self) -> &[u8];

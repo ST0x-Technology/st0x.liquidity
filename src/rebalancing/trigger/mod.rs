@@ -2835,7 +2835,7 @@ pub(crate) async fn drain_pending_jobs(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, TxHash, U256, address, fixed_bytes};
+    use alloy::primitives::{Address, B256, TxHash, U256, address, fixed_bytes};
     use async_trait::async_trait;
     use chrono::{Duration as ChronoDuration, Utc};
     use rain_math_float::Float;
@@ -7306,7 +7306,7 @@ mod tests {
     fn make_usdc_bridge_attestation_received() -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::BridgeAttestationReceived {
             attestation: vec![1, 2, 3, 4],
-            cctp_nonce: 42,
+            cctp_nonce: B256::left_padding_from(&42u64.to_be_bytes()),
             attested_at: Utc::now(),
         }
     }
@@ -7330,7 +7330,7 @@ mod tests {
     fn make_usdc_bridging_failed() -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::BridgingFailed {
             burn_tx_hash: Some(TxHash::random()),
-            cctp_nonce: Some(12345),
+            cctp_nonce: Some(B256::left_padding_from(&12345u64.to_be_bytes())),
             reason: "Attestation timeout".to_string(),
             failed_at: Utc::now(),
         }
@@ -8139,7 +8139,7 @@ mod tests {
                 &id,
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: vec![1, 2, 3],
-                    cctp_nonce: 12345,
+                    cctp_nonce: B256::left_padding_from(&12345u64.to_be_bytes()),
                 },
             )
             .await
@@ -8225,7 +8225,7 @@ mod tests {
                 &id,
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: vec![1, 2, 3],
-                    cctp_nonce: 67890,
+                    cctp_nonce: B256::left_padding_from(&67890u64.to_be_bytes()),
                 },
             )
             .await
@@ -8522,7 +8522,7 @@ mod tests {
                 &id,
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: vec![1, 2, 3],
-                    cctp_nonce: 99999,
+                    cctp_nonce: B256::left_padding_from(&99999u64.to_be_bytes()),
                 },
             )
             .await

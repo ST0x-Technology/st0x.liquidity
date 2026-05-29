@@ -952,7 +952,7 @@ pub(crate) async fn drain_pending_usdc_jobs(service: &Arc<RebalancingService>) -
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::TxHash;
+    use alloy::primitives::{B256, TxHash};
     use chrono::TimeZone;
     use tokio::sync::broadcast;
     use uuid::Uuid;
@@ -1541,7 +1541,7 @@ mod tests {
     fn bridge_attestation_received_event() -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::BridgeAttestationReceived {
             attestation: vec![],
-            cctp_nonce: 0,
+            cctp_nonce: B256::ZERO,
             attested_at: ts(105),
         }
     }
