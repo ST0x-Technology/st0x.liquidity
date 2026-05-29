@@ -6,8 +6,6 @@
 
 mod job;
 mod manager;
-#[cfg(test)]
-pub(crate) mod mock;
 
 pub(crate) use job::{
     ResumeAlpacaToBase, ResumeBaseToAlpaca, TransferUsdcToHedging, TransferUsdcToHedgingCtx,

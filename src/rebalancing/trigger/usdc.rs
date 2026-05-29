@@ -10,12 +10,20 @@ use tracing::{debug, trace, warn};
 
 use st0x_finance::{Usd, Usdc};
 
-use super::{RebalancingService, RebalancingServiceError, TriggeredOperation};
+use super::{RebalancingService, RebalancingServiceError};
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::inventory::{
     BroadcastingInventory, Imbalance, ImbalanceThreshold, Inventory, TransferOp, Venue,
 };
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceEvent, UsdcRebalanceId};
+
+/// Dispatch decision returned by [`check_imbalance_and_build_operation`].
+/// The trigger maps each variant to the corresponding apalis job queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UsdcRebalanceOperation {
+    AlpacaToBase { amount: Usdc },
+    BaseToAlpaca { amount: Usdc },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UsdcTrackingEvent {
@@ -238,14 +246,15 @@ impl Drop for InProgressGuard {
 
 /// Checks inventory for USDC imbalance and returns the appropriate bridging operation.
 ///
-/// Returns `UsdcAlpacaToBase` if there's too much USDC in Alpaca that needs to be bridged to Base,
-/// or `UsdcBaseToAlpaca` if there's too much USDC on Base that needs to be bridged to Alpaca.
+/// Returns `UsdcRebalanceOperation::AlpacaToBase` if there's too much USDC in
+/// Alpaca that needs to be bridged to Base, or `BaseToAlpaca` if there's too
+/// much USDC on Base that needs to be bridged to Alpaca.
 pub(super) async fn check_imbalance_and_build_operation(
     threshold: &ImbalanceThreshold,
     inventory: &Arc<BroadcastingInventory>,
     usdc_limit: Option<Usdc>,
     reserved: Option<Usd>,
-) -> Result<TriggeredOperation, UsdcTriggerSkip> {
+) -> Result<UsdcRebalanceOperation, UsdcTriggerSkip> {
     let imbalance_check = {
         let inventory = inventory.read().await;
         let imbalance = inventory
@@ -371,7 +380,7 @@ pub(super) async fn check_imbalance_and_build_operation(
                 );
                 Err(UsdcTriggerSkip::BelowMinimumWithdrawal { excess: capped })
             } else {
-                Ok(TriggeredOperation::UsdcAlpacaToBase { amount: capped })
+                Ok(UsdcRebalanceOperation::AlpacaToBase { amount: capped })
             }
         }
         Imbalance::TooMuchOnchain { excess } => {
@@ -400,7 +409,7 @@ pub(super) async fn check_imbalance_and_build_operation(
                 return Err(UsdcTriggerSkip::NoImbalance);
             }
 
-            Ok(TriggeredOperation::UsdcBaseToAlpaca { amount })
+            Ok(UsdcRebalanceOperation::BaseToAlpaca { amount })
         }
     }
 }
@@ -1077,7 +1086,7 @@ mod tests {
         let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
 
         assert!(
-            matches!(result, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if !amount.inner().lt(float!(51)).unwrap_or(true)),
+            matches!(result, Ok(UsdcRebalanceOperation::AlpacaToBase { amount }) if !amount.inner().lt(float!(51)).unwrap_or(true)),
             "Expected UsdcAlpacaToBase with amount >= 51, got {result:?}"
         );
     }
@@ -1101,7 +1110,7 @@ mod tests {
         let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
 
         assert!(
-            matches!(result, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount == Usdc::new(float!(51))),
+            matches!(result, Ok(UsdcRebalanceOperation::AlpacaToBase { amount }) if amount == Usdc::new(float!(51))),
             "Expected UsdcAlpacaToBase with amount = 51, got {result:?}"
         );
     }
@@ -1125,7 +1134,7 @@ mod tests {
         let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
 
         assert!(
-            matches!(result, Ok(TriggeredOperation::UsdcBaseToAlpaca { amount }) if amount == Usdc::new(float!(40))),
+            matches!(result, Ok(UsdcRebalanceOperation::BaseToAlpaca { amount }) if amount == Usdc::new(float!(40))),
             "Expected UsdcBaseToAlpaca with amount = 40 (no minimum for deposits), got {result:?}"
         );
     }
@@ -1147,7 +1156,7 @@ mod tests {
             check_imbalance_and_build_operation(&threshold, &inventory, usdc_limit, None).await;
 
         assert!(
-            matches!(result, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
+            matches!(result, Ok(UsdcRebalanceOperation::AlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
             "Operational limit should cap USDC transfer to 100, got {result:?}"
         );
     }
@@ -1172,7 +1181,7 @@ mod tests {
         let first =
             check_imbalance_and_build_operation(&threshold, &inventory, usdc_limit, None).await;
         assert!(
-            matches!(first, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
+            matches!(first, Ok(UsdcRebalanceOperation::AlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
             "First transfer capped to 100, got {first:?}"
         );
 
@@ -1208,7 +1217,7 @@ mod tests {
             check_imbalance_and_build_operation(&threshold, &partially_resolved, usdc_limit, None)
                 .await;
         assert!(
-            matches!(third, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
+            matches!(third, Ok(UsdcRebalanceOperation::AlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
             "Remaining imbalance triggers another capped transfer, got {third:?}"
         );
     }
@@ -1323,7 +1332,7 @@ mod tests {
         .await;
 
         assert!(
-            matches!(result, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
+            matches!(result, Ok(UsdcRebalanceOperation::AlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
             "Expected reserve-adjusted withdrawable capacity to cap transfer to 100, got {result:?}"
         );
     }
@@ -1434,7 +1443,7 @@ mod tests {
         let after =
             check_imbalance_and_build_operation(&threshold, &inventory, None, reserved).await;
         assert!(
-            matches!(after, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
+            matches!(after, Ok(UsdcRebalanceOperation::AlpacaToBase { amount }) if amount == Usdc::new(float!(100))),
             "Post-recovery trigger must dispatch the reserve-aware capped transfer, got {after:?}"
         );
     }
@@ -1493,7 +1502,7 @@ mod tests {
         .await;
 
         assert!(
-            matches!(result, Ok(TriggeredOperation::UsdcBaseToAlpaca { amount }) if amount == Usdc::new(float!(400))),
+            matches!(result, Ok(UsdcRebalanceOperation::BaseToAlpaca { amount }) if amount == Usdc::new(float!(400))),
             "Expected Base-to-Alpaca transfer to ignore reserve and withdrawable cash, got {result:?}"
         );
     }

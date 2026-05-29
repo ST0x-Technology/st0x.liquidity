@@ -3,18 +3,15 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use st0x_execution::{FractionalShares, Symbol};
-use st0x_finance::Usdc;
 
 use super::equity::{Equity, MintTransferError, RedemptionError};
 use super::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
 use super::trigger::TriggeredOperation;
-use super::usdc::UsdcTransferError;
 
 /// Type-erased equity transfer (hedging -> market-making).
 type EquityToMarketMaking = dyn CrossVenueTransfer<HedgingVenue, MarketMakingVenue, Asset = Equity, Error = MintTransferError>;
@@ -22,22 +19,15 @@ type EquityToMarketMaking = dyn CrossVenueTransfer<HedgingVenue, MarketMakingVen
 /// Type-erased equity transfer (market-making -> hedging).
 type EquityToHedging = dyn CrossVenueTransfer<MarketMakingVenue, HedgingVenue, Asset = Equity, Error = RedemptionError>;
 
-/// Type-erased USDC transfer (hedging -> market-making).
-type UsdcToMarketMaking = dyn CrossVenueTransfer<HedgingVenue, MarketMakingVenue, Asset = Usdc, Error = UsdcTransferError>;
-
-/// Type-erased USDC transfer (market-making -> hedging).
-type UsdcToHedging = dyn CrossVenueTransfer<MarketMakingVenue, HedgingVenue, Asset = Usdc, Error = UsdcTransferError>;
-
-/// Receives triggered rebalancing operations and routes them to the
-/// appropriate cross-venue transfer implementation.
+/// Receives triggered equity rebalancing operations and routes them to the
+/// appropriate cross-venue transfer implementation. USDC rebalances no
+/// longer flow through this channel — they're enqueued as apalis jobs
+/// directly from the trigger.
 pub(crate) struct Rebalancer {
     equity_to_mm: Arc<EquityToMarketMaking>,
     equity_to_hedging: Arc<EquityToHedging>,
-    usdc_to_mm: Arc<UsdcToMarketMaking>,
-    usdc_to_hedging: Arc<UsdcToHedging>,
     receiver: mpsc::Receiver<TriggeredOperation>,
     equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
-    usdc_in_progress: Arc<AtomicBool>,
     shutdown_token: CancellationToken,
 }
 
@@ -45,21 +35,15 @@ impl Rebalancer {
     pub(crate) fn new(
         equity_to_mm: Arc<EquityToMarketMaking>,
         equity_to_hedging: Arc<EquityToHedging>,
-        usdc_to_mm: Arc<UsdcToMarketMaking>,
-        usdc_to_hedging: Arc<UsdcToHedging>,
         receiver: mpsc::Receiver<TriggeredOperation>,
         equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
-        usdc_in_progress: Arc<AtomicBool>,
         shutdown_token: CancellationToken,
     ) -> Self {
         Self {
             equity_to_mm,
             equity_to_hedging,
-            usdc_to_mm,
-            usdc_to_hedging,
             receiver,
             equity_in_progress,
-            usdc_in_progress,
             shutdown_token,
         }
     }
@@ -103,20 +87,6 @@ impl Rebalancer {
                 symbol, quantity, ..
             } => {
                 self.execute_redemption(symbol, quantity).await;
-            }
-
-            TriggeredOperation::UsdcAlpacaToBase { amount } => {
-                if let Err(error) = self.usdc_to_mm.transfer(amount).await {
-                    error!(target: "rebalance", ?error, %amount, "USDC transfer to market-making venue failed");
-                    self.clear_usdc_in_progress();
-                }
-            }
-
-            TriggeredOperation::UsdcBaseToAlpaca { amount } => {
-                if let Err(error) = self.usdc_to_hedging.transfer(amount).await {
-                    error!(target: "rebalance", ?error, %amount, "USDC transfer to hedging venue failed");
-                    self.clear_usdc_in_progress();
-                }
             }
         }
     }
@@ -172,15 +142,6 @@ impl Rebalancer {
             "Cleared equity in-progress flag after transfer failure"
         );
     }
-
-    fn clear_usdc_in_progress(&self) {
-        self.usdc_in_progress.store(false, Ordering::SeqCst);
-
-        warn!(
-            target: "rebalance",
-            "Cleared USDC in-progress flag after transfer failure"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -192,24 +153,17 @@ mod tests {
 
     use super::*;
     use crate::rebalancing::equity::mock::MockCrossVenueEquityTransfer;
-    use crate::rebalancing::usdc::mock::MockUsdcRebalance;
     use st0x_float_macro::float;
 
-    async fn execute(
-        operations: Vec<TriggeredOperation>,
-    ) -> (Arc<MockCrossVenueEquityTransfer>, Arc<MockUsdcRebalance>) {
+    async fn execute(operations: Vec<TriggeredOperation>) -> Arc<MockCrossVenueEquityTransfer> {
         let equity = Arc::new(MockCrossVenueEquityTransfer::new());
-        let usdc = Arc::new(MockUsdcRebalance::new());
         let (sender, receiver) = mpsc::channel(10);
 
         let rebalancer = Rebalancer::new(
             Arc::clone(&equity) as Arc<EquityToMarketMaking>,
             Arc::clone(&equity) as Arc<EquityToHedging>,
-            Arc::clone(&usdc) as Arc<UsdcToMarketMaking>,
-            Arc::clone(&usdc) as Arc<UsdcToHedging>,
             receiver,
             Arc::new(std::sync::RwLock::new(HashSet::new())),
-            Arc::new(AtomicBool::new(false)),
             CancellationToken::new(),
         );
 
@@ -220,12 +174,12 @@ mod tests {
         drop(sender);
         rebalancer.run().await;
 
-        (equity, usdc)
+        equity
     }
 
     #[tokio::test]
     async fn execute_mint_calls_equity_to_market_making() {
-        let (equity, usdc) = execute(vec![TriggeredOperation::Mint {
+        let equity = execute(vec![TriggeredOperation::Mint {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(10)),
         }])
@@ -233,13 +187,11 @@ mod tests {
 
         assert_eq!(equity.mint_calls(), 1);
         assert_eq!(equity.redeem_calls(), 0);
-        assert_eq!(usdc.alpaca_to_base_calls(), 0);
-        assert_eq!(usdc.base_to_alpaca_calls(), 0);
     }
 
     #[tokio::test]
     async fn execute_redemption_calls_equity_to_hedging() {
-        let (equity, usdc) = execute(vec![TriggeredOperation::Redemption {
+        let equity = execute(vec![TriggeredOperation::Redemption {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(float!(50)),
             wrapped_token: address!("0x1234567890123456789012345678901234567890"),
@@ -249,39 +201,11 @@ mod tests {
 
         assert_eq!(equity.mint_calls(), 0);
         assert_eq!(equity.redeem_calls(), 1);
-        assert_eq!(usdc.alpaca_to_base_calls(), 0);
-        assert_eq!(usdc.base_to_alpaca_calls(), 0);
-    }
-
-    #[tokio::test]
-    async fn execute_usdc_alpaca_to_base_calls_usdc_to_market_making() {
-        let (equity, usdc) = execute(vec![TriggeredOperation::UsdcAlpacaToBase {
-            amount: Usdc::new(float!(1000)),
-        }])
-        .await;
-
-        assert_eq!(equity.mint_calls(), 0);
-        assert_eq!(equity.redeem_calls(), 0);
-        assert_eq!(usdc.alpaca_to_base_calls(), 1);
-        assert_eq!(usdc.base_to_alpaca_calls(), 0);
-    }
-
-    #[tokio::test]
-    async fn execute_usdc_base_to_alpaca_calls_usdc_to_hedging() {
-        let (equity, usdc) = execute(vec![TriggeredOperation::UsdcBaseToAlpaca {
-            amount: Usdc::new(float!(2000)),
-        }])
-        .await;
-
-        assert_eq!(equity.mint_calls(), 0);
-        assert_eq!(equity.redeem_calls(), 0);
-        assert_eq!(usdc.alpaca_to_base_calls(), 0);
-        assert_eq!(usdc.base_to_alpaca_calls(), 1);
     }
 
     #[tokio::test]
     async fn run_processes_multiple_operations() {
-        let (equity, usdc) = execute(vec![
+        let equity = execute(vec![
             TriggeredOperation::Mint {
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(float!(10)),
@@ -296,19 +220,11 @@ mod tests {
                 wrapped_token: address!("0x1234567890123456789012345678901234567890"),
                 unwrapped_token: address!("0xabcdef0123456789abcdef0123456789abcdef01"),
             },
-            TriggeredOperation::UsdcAlpacaToBase {
-                amount: Usdc::new(float!(500)),
-            },
-            TriggeredOperation::UsdcBaseToAlpaca {
-                amount: Usdc::new(float!(300)),
-            },
         ])
         .await;
 
         assert_eq!(equity.mint_calls(), 2);
         assert_eq!(equity.redeem_calls(), 1);
-        assert_eq!(usdc.alpaca_to_base_calls(), 1);
-        assert_eq!(usdc.base_to_alpaca_calls(), 1);
     }
 
     #[tokio::test]
@@ -355,23 +271,18 @@ mod tests {
     async fn pre_receipt_mint_failure_clears_guard() {
         let symbol = Symbol::new("AAPL").unwrap();
         let equity_in_progress = Arc::new(std::sync::RwLock::new(HashSet::from([symbol.clone()])));
-        let usdc_in_progress = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = mpsc::channel(10);
 
         let failing_mint = Arc::new(FailingMintTransfer {
             error: std::sync::Mutex::new(Some(make_pre_receipt_error())),
         });
         let equity = Arc::new(MockCrossVenueEquityTransfer::new());
-        let usdc = Arc::new(MockUsdcRebalance::new());
 
         let rebalancer = Rebalancer::new(
             failing_mint,
             Arc::clone(&equity) as Arc<EquityToHedging>,
-            Arc::clone(&usdc) as Arc<UsdcToMarketMaking>,
-            Arc::clone(&usdc) as Arc<UsdcToHedging>,
             receiver,
             Arc::clone(&equity_in_progress),
-            usdc_in_progress,
             CancellationToken::new(),
         );
 
@@ -396,23 +307,18 @@ mod tests {
     async fn post_receipt_mint_failure_keeps_guard() {
         let symbol = Symbol::new("AAPL").unwrap();
         let equity_in_progress = Arc::new(std::sync::RwLock::new(HashSet::from([symbol.clone()])));
-        let usdc_in_progress = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = mpsc::channel(10);
 
         let failing_mint = Arc::new(FailingMintTransfer {
             error: std::sync::Mutex::new(Some(make_post_receipt_error())),
         });
         let equity = Arc::new(MockCrossVenueEquityTransfer::new());
-        let usdc = Arc::new(MockUsdcRebalance::new());
 
         let rebalancer = Rebalancer::new(
             failing_mint,
             Arc::clone(&equity) as Arc<EquityToHedging>,
-            Arc::clone(&usdc) as Arc<UsdcToMarketMaking>,
-            Arc::clone(&usdc) as Arc<UsdcToHedging>,
             receiver,
             Arc::clone(&equity_in_progress),
-            usdc_in_progress,
             CancellationToken::new(),
         );
 

@@ -820,7 +820,6 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         ));
 
         let equity_in_progress = Arc::clone(&rebalancing_service.equity_in_progress);
-        let usdc_in_progress = Arc::clone(&rebalancing_service.usdc_in_progress);
 
         let broadcaster = Arc::new(Broadcaster::new(deps.event_sender, deps.pool.clone()));
         let manifest = QueryManifest::new(rebalancing_service.clone(), broadcaster);
@@ -910,7 +909,6 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             operation_receiver,
             frameworks,
             equity_in_progress,
-            Arc::clone(&usdc_in_progress),
         );
 
         let transfer_usdc_to_hedging_ctx = Arc::new(TransferUsdcToHedgingCtx {
