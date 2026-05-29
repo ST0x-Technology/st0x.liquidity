@@ -39,7 +39,6 @@ let
   };
 
   fullSrc = withRainMathFloat "st0x-src" cleanedSrc;
-  eventSorceryHash = "sha256-bpj3QE2z2F8RLH4O++5gor1SrDFGf23CnzGgATUE5OQ=";
 
   # Vendor cargo deps with git dependency hashes
   baseVendorDir = craneLib.vendorCargoDeps {
@@ -48,8 +47,8 @@ let
     outputHashes = {
       "git+https://github.com/rainlanguage/rain.error#3d2ed70fb2f7c6156706846e10f163d1e493a8d3" =
         "sha256-dDsvRkrGXhfoFunvk6fwP+12fSsjiWYoxz/CzVVGpHA=";
-      "git+https://github.com/ST0x-Technology/event-sorcery.git?branch=docs/examples#262d12b3f797a0b7445ee62d846119d3d7110dc7" =
-        eventSorceryHash;
+      "git+https://github.com/ST0x-Technology/event-sorcery.git?rev=1557172049c8a43add209a86c7d809e89a5fbc82#1557172049c8a43add209a86c7d809e89a5fbc82" =
+        "sha256-GkQaR+cp09NJBarrz8VeJV/6DVFz+EhMsu2y8jP0Uck=";
       "git+https://github.com/rainlanguage/rain.wasm?rev=06990d85a0b7c55378a1c8cca4dd9e2bc34a596a#06990d85a0b7c55378a1c8cca4dd9e2bc34a596a" =
         "sha256-MkuPc9mWAmry5Yzjph4/IbaIvjevFUerji1lipLUK4g=";
     };
@@ -65,11 +64,9 @@ let
   sqliteEsRev = builtins.head (builtins.match ".*#([a-f0-9]+)" sqliteEsPackage.source);
 
   sqliteEsMigrations =
-    pkgs.fetchFromGitHub {
-      owner = "ST0x-Technology";
-      repo = "event-sorcery";
+    builtins.fetchGit {
+      url = "https://github.com/ST0x-Technology/event-sorcery";
       rev = sqliteEsRev;
-      hash = eventSorceryHash;
     }
     + "/migrations";
 

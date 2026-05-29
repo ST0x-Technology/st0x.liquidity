@@ -2627,6 +2627,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "event-sorcery"
+version = "0.1.0"
+source = "git+https://github.com/ST0x-Technology/event-sorcery.git?rev=1557172049c8a43add209a86c7d809e89a5fbc82#1557172049c8a43add209a86c7d809e89a5fbc82"
+dependencies = [
+ "async-trait",
+ "cqrs-es",
+ "serde",
+ "serde_json",
+ "sqlite-es",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3434,7 +3450,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "system-configuration 0.7.0",
  "tokio",
  "tower-service",
@@ -5056,7 +5072,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -5093,7 +5109,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -6556,7 +6572,7 @@ dependencies = [
 [[package]]
 name = "sqlite-es"
 version = "0.1.0"
-source = "git+https://github.com/ST0x-Technology/event-sorcery.git?branch=docs%2Fexamples#262d12b3f797a0b7445ee62d846119d3d7110dc7"
+source = "git+https://github.com/ST0x-Technology/event-sorcery.git?rev=1557172049c8a43add209a86c7d809e89a5fbc82#1557172049c8a43add209a86c7d809e89a5fbc82"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6807,21 +6823,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "st0x-event-sorcery"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "cqrs-es",
- "serde",
- "serde_json",
- "sqlite-es",
- "sqlx",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "st0x-evm"
 version = "0.1.0"
 dependencies = [
@@ -6873,7 +6874,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
- "sqlite-es",
  "sqlx",
  "st0x-dto",
  "st0x-finance",
@@ -6942,6 +6942,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "clap",
+ "event-sorcery",
  "flate2",
  "futures-util",
  "httpmock",
@@ -6962,11 +6963,9 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
- "sqlite-es",
  "sqlx",
  "st0x-bridge",
  "st0x-dto",
- "st0x-event-sorcery",
  "st0x-evm",
  "st0x-execution",
  "st0x-finance",

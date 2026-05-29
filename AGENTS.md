@@ -627,11 +627,22 @@ assignments is useless; test actual behavior like
      are done
   4. Reserve `--workspace` variants for the final verification pass
 - **Final verification before handing over** (skip if only
-  documentation/markdown files were changed). Run full workspace checks in this
-  order to fail fast:
+  documentation/markdown files were changed). The simplest path is
+  `nix run .#ci` -- it enters the right dev shells (`ci-backend`,
+  `ci-dashboard`) and runs the full check matrix end-to-end: backend
+  `cargo check` (with and without `--all-features`), `cargo nextest run`,
+  `cargo clippy`, `cargo fmt --check`, plus the dashboard's `bun.nix` freshness
+  check, DTO regeneration, lint, and `svelte-check`. This is what local
+  verification should look like before pushing, and what CI mirrors.
+
+  If you need to break it down for iteration (e.g. only the backend changed),
+  run the individual steps from inside the corresponding shell:
   1. `cargo check --workspace` - catches compilation errors across all crates
   2. `cargo nextest run --workspace --all-features` - full test suite including
-     e2e
+     e2e. **Spawns anvil** for CCTP integration tests; only the `ci-backend`
+     shell exposes the foundry binary needed for this. Run via
+     `nix develop .#ci-backend -c cargo nextest run ...`, not the default dev
+     shell.
   3. `cargo clippy --workspace --all-targets --all-features` - full linting
   4. `cargo fmt` - always run last to ensure clean formatting
   5. **Diff review** - after all checks pass, review staged changes and revert
