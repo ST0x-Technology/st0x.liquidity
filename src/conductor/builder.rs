@@ -21,6 +21,7 @@ use super::exit::MonitorTaskError;
 #[cfg(any(test, feature = "test-support"))]
 use super::job::FailureInjector;
 use super::job::{FAIL_STOP_RECOVERY_TIMEOUT, build_supervised_worker};
+use super::monitor::executor_maintenance::ExecutorMaintenance;
 use super::monitor::inventory::InventoryMonitor;
 use super::monitor::order_fills::OrderFillMonitor;
 use super::monitor::positions::PositionMonitor;
@@ -51,7 +52,9 @@ use crate::trading::offchain::hedge::{HedgeCtx, HedgeJobQueue, PlaceHedge};
 use crate::trading::onchain::trade_accountant::{
     AccountForDexTrade, AccountantCtx, DexTradeAccountingJobQueue, TradeAccountingError,
 };
-use crate::vault_registry::VaultRegistry;
+use crate::vault_registry::{
+    SeedVaultRegistry, SeedVaultRegistryCtx, SeedVaultRegistryJobQueue, VaultRegistry,
+};
 
 pub(crate) struct CqrsFrameworks {
     pub(crate) onchain_trade: Arc<Store<OnChainTrade>>,
@@ -93,8 +96,9 @@ pub(crate) fn spawn<Prov, Exec>(
     equity_check_scheduler: EquityRebalancingCheckScheduler,
     usdc_check_scheduler: UsdcRebalancingCheckScheduler,
     rebalancing_service: Option<Arc<RebalancingService>>,
+    seed_vault_registry_queue: SeedVaultRegistryJobQueue,
+    seed_vault_registry_ctx: Arc<SeedVaultRegistryCtx>,
     job_cleanup: JoinHandle<()>,
-    executor_maintenance: Option<JoinHandle<()>>,
     rebalancer: Option<JoinHandle<()>>,
     rebalancer_shutdown_token: CancellationToken,
 ) -> Conductor
@@ -106,7 +110,6 @@ where
 {
     info!("Starting conductor orchestration");
 
-    log_optional_task_status("executor maintenance", executor_maintenance.is_some());
     log_optional_task_status("rebalancer", rebalancer.is_some());
 
     let order_owner = context.ctx.order_owner();
@@ -220,6 +223,8 @@ where
         poll_status_queue: poll_status_queue.clone(),
     };
 
+    let maintenance_interval = context.executor.maintenance_interval();
+
     let accountant_ctx = Arc::new(AccountantCtx {
         orderbook: context.ctx.evm.orderbook,
         ctx: context.ctx.clone(),
@@ -228,7 +233,7 @@ where
         evm: ReadOnlyEvm::new(context.provider),
         cqrs: trade_cqrs,
         vault_registry: context.frameworks.vault_registry,
-        executor: context.executor,
+        executor: context.executor.clone(),
         pool: context.pool.clone(),
         job_queue: job_queue.clone(),
     });
@@ -247,16 +252,25 @@ where
     // In test builds, use aggressive timeouts so a flaky WebSocket doesn't
     // stall e2e tests for ~13 minutes of exponential backoff.
     let is_test = cfg!(any(test, feature = "test-support"));
-    let supervisor = SupervisorBuilder::default()
+    let mut supervisor_builder = SupervisorBuilder::default()
         .with_max_restart_attempts(if is_test { 2 } else { 10 })
         .with_max_backoff_exponent(if is_test { 2 } else { 8 })
         .with_base_restart_delay(std::time::Duration::from_secs(1))
         .with_dead_tasks_threshold(Some(0.0))
         .with_task("order-fill-monitor", order_fill_monitor)
         .with_task("position-monitor", position_monitor)
-        .with_task("inventory-monitor", inventory_monitor)
-        .build()
-        .run();
+        .with_task("inventory-monitor", inventory_monitor);
+
+    log_optional_task_status("executor maintenance", maintenance_interval.is_some());
+
+    if let Some(interval) = maintenance_interval {
+        supervisor_builder = supervisor_builder.with_task(
+            "executor-maintenance",
+            ExecutorMaintenance::new(context.executor, interval),
+        );
+    }
+
+    let supervisor = supervisor_builder.build().run();
 
     let monitor = MonitorWiring {
         accountant_ctx,
@@ -265,6 +279,7 @@ where
         reconcile_ctx,
         rejection_ctx,
         rebalancing_check_ctx: rebalancing_service,
+        seed_vault_registry_ctx,
         job_queue,
         hedge_queue,
         backfill_queue,
@@ -274,6 +289,7 @@ where
         equity_check_scheduler,
         usdc_check_scheduler,
         apalis_shutdown_token,
+        seed_vault_registry_queue,
         #[cfg(any(test, feature = "test-support"))]
         failure_injector: context.failure_injector,
     }
@@ -282,7 +298,6 @@ where
     Conductor {
         supervisor,
         monitor,
-        executor_maintenance,
         rebalancer,
         rebalancer_shutdown_token,
         job_cleanup,
@@ -308,6 +323,7 @@ where
     reconcile_ctx: Arc<ReconcileOrderFillCtx>,
     rejection_ctx: Arc<HandleOrderRejectionCtx>,
     rebalancing_check_ctx: Option<Arc<RebalancingService>>,
+    seed_vault_registry_ctx: Arc<SeedVaultRegistryCtx>,
     job_queue: DexTradeAccountingJobQueue,
     hedge_queue: HedgeJobQueue,
     backfill_queue: BackfillJobQueue,
@@ -317,6 +333,7 @@ where
     equity_check_scheduler: EquityRebalancingCheckScheduler,
     usdc_check_scheduler: UsdcRebalancingCheckScheduler,
     apalis_shutdown_token: CancellationToken,
+    seed_vault_registry_queue: SeedVaultRegistryJobQueue,
     #[cfg(any(test, feature = "test-support"))]
     failure_injector: FailureInjector,
 }
@@ -336,6 +353,7 @@ where
             reconcile_ctx,
             rejection_ctx,
             rebalancing_check_ctx,
+            seed_vault_registry_ctx,
             job_queue,
             hedge_queue,
             backfill_queue,
@@ -345,6 +363,7 @@ where
             equity_check_scheduler,
             usdc_check_scheduler,
             apalis_shutdown_token,
+            seed_vault_registry_queue,
             #[cfg(any(test, feature = "test-support"))]
             failure_injector,
         } = self;
@@ -363,6 +382,8 @@ where
         let failure_injector_for_equity_rebalancing_check = failure_injector.clone();
         #[cfg(any(test, feature = "test-support"))]
         let failure_injector_for_usdc_rebalancing_check = failure_injector.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let failure_injector_for_seed_vault_registry = failure_injector.clone();
         let failure_notify = Arc::new(tokio::sync::Notify::new());
         let failure_notify_for_hedge = failure_notify.clone();
         let failure_notify_for_backfill = failure_notify.clone();
@@ -371,6 +392,7 @@ where
         let failure_notify_for_rejection = failure_notify.clone();
         let failure_notify_for_equity_rebalancing_check = failure_notify.clone();
         let failure_notify_for_usdc_rebalancing_check = failure_notify.clone();
+        let failure_notify_for_seed_vault_registry = failure_notify.clone();
         let failure_notify_for_select = failure_notify.clone();
 
         let fail_stop = CircuitBreakerConfig::default()
@@ -383,6 +405,7 @@ where
         let fail_stop_for_rejection = fail_stop.clone();
         let fail_stop_for_equity_rebalancing_check = fail_stop.clone();
         let fail_stop_for_usdc_rebalancing_check = fail_stop.clone();
+        let fail_stop_for_seed_vault_registry = fail_stop.clone();
 
         let accountant_ctx_for_backfill = accountant_ctx.clone();
 
@@ -459,6 +482,18 @@ where
                         failure_notify_for_rejection.clone(),
                         #[cfg(any(test, feature = "test-support"))]
                         failure_injector_for_rejection.clone(),
+                    )
+                })
+                .register(move |index| {
+                    build_supervised_worker!(
+                        ::<SeedVaultRegistryCtx, SeedVaultRegistry>,
+                        index,
+                        seed_vault_registry_queue.clone(),
+                        seed_vault_registry_ctx.clone(),
+                        fail_stop_for_seed_vault_registry.clone(),
+                        failure_notify_for_seed_vault_registry.clone(),
+                        #[cfg(any(test, feature = "test-support"))]
+                        failure_injector_for_seed_vault_registry.clone(),
                     )
                 });
 

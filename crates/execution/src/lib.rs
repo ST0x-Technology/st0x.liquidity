@@ -6,7 +6,7 @@ use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Display};
 use std::sync::LazyLock;
-use tokio::task::JoinHandle;
+use std::time::Duration;
 use tracing::{debug, info};
 
 pub(crate) use st0x_float_serde::{
@@ -159,11 +159,26 @@ pub trait Executor: Send + Sync + 'static {
     /// This is needed for converting database-stored order IDs back to executor types
     fn parse_order_id(&self, order_id_str: &str) -> Result<Self::OrderId, Self::Error>;
 
-    /// Run executor-specific maintenance tasks (token refresh, connection health, etc.)
-    /// Returns None if no maintenance needed, Some(handle) if maintenance task spawned
-    /// Tasks should run indefinitely and be aborted by the caller when shutdown is needed
-    /// Errors are logged inside the task and do not propagate to the caller
-    async fn run_executor_maintenance(&self) -> Option<JoinHandle<()>>;
+    /// Tick interval for executor-specific background maintenance work
+    /// (token refresh, connection health, etc.).
+    ///
+    /// Returning `None` means this executor has no maintenance work; the
+    /// conductor skips registering the supervised maintenance task entirely.
+    /// Returning `Some(interval)` causes the conductor to register a
+    /// supervised task that calls [`maintenance_tick`](Self::maintenance_tick)
+    /// on every tick.
+    fn maintenance_interval(&self) -> Option<Duration> {
+        None
+    }
+
+    /// One iteration of executor maintenance. Invoked by the supervised
+    /// maintenance task on every [`maintenance_interval`](Self::maintenance_interval)
+    /// tick. Transient errors are logged by the supervisor wrapper and do not
+    /// halt the loop; a panic inside this method is caught by task-supervisor
+    /// and triggers a restart.
+    async fn maintenance_tick(&self) -> Result<(), Self::Error> {
+        Ok(())
+    }
 
     /// Fetches current inventory (positions and cash balance) from the broker.
     ///

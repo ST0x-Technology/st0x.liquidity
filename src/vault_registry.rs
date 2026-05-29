@@ -14,11 +14,18 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Arc;
 use thiserror::Error;
+use tracing::{debug, info};
 
 use st0x_execution::Symbol;
 
-use st0x_event_sorcery::{DomainEvent, EventSourced, Never, Projection, Table};
+use st0x_event_sorcery::{DomainEvent, EventSourced, Never, Projection, SendError, Store, Table};
+
+#[cfg(any(test, feature = "test-support"))]
+use crate::conductor::job::JobKind;
+use crate::conductor::job::{Job, JobQueue, Label};
+use crate::config::{Ctx, CtxError};
 
 /// Typed identifier for VaultRegistry aggregates, keyed by
 /// orderbook and owner address pair.
@@ -442,6 +449,155 @@ impl DomainEvent for VaultRegistryEvent {
 
     fn event_version(&self) -> String {
         "1.0".to_string()
+    }
+}
+
+/// A single equity vault to seed from config.
+#[derive(Debug, Clone)]
+pub(crate) struct EquityVaultSeed {
+    pub(crate) token: Address,
+    pub(crate) vault_id: B256,
+    pub(crate) symbol: Symbol,
+}
+
+/// Apalis job that seeds the [`VaultRegistry`] aggregate from config.
+///
+/// Stateless payload: the registry id, store handle, and seed list all
+/// live in [`SeedVaultRegistryCtx`]. Carries no data so the job survives
+/// restarts without serializing config (which is reloaded at startup).
+///
+/// Idempotent: each seed command is a no-op if the vault is already
+/// registered with the same id (see [`VaultRegistry::transition`]).
+/// Re-running the job after a partial failure replays only the missing
+/// seeds.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct SeedVaultRegistry;
+
+pub(crate) type SeedVaultRegistryJobQueue = JobQueue<SeedVaultRegistry>;
+
+/// Bundled dependencies for [`SeedVaultRegistry`].
+///
+/// Only constructable via [`Self::from_config`], which performs the
+/// pre-flight config validation. Holding an instance of this type is
+/// proof that validation succeeded -- callers cannot bypass the check
+/// by hand-rolling the fields.
+pub(crate) struct SeedVaultRegistryCtx {
+    vault_registry: Arc<Store<VaultRegistry>>,
+    id: VaultRegistryId,
+    equity_seeds: Vec<EquityVaultSeed>,
+    usdc_vault_ids: Vec<B256>,
+}
+
+impl SeedVaultRegistryCtx {
+    /// Builds a seeding context from configuration.
+    ///
+    /// Validates that every rebalancing-enabled equity has at least
+    /// one configured `vault_id`. Returns [`CtxError::MissingEquityVaultId`]
+    /// if any rebalancing-enabled equity lacks a vault, so config errors
+    /// fail fast at construction rather than being retried by apalis.
+    pub(crate) fn from_config(
+        vault_registry: Arc<Store<VaultRegistry>>,
+        ctx: &Ctx,
+    ) -> Result<Self, CtxError> {
+        for (symbol, equity_config) in &ctx.assets.equities.symbols {
+            if equity_config.vault_ids.is_empty() && ctx.is_rebalancing_enabled(symbol) {
+                return Err(CtxError::MissingEquityVaultId {
+                    symbol: symbol.clone(),
+                });
+            }
+        }
+
+        let id = VaultRegistryId {
+            orderbook: ctx.evm.orderbook,
+            owner: ctx.order_owner(),
+        };
+
+        let equity_seeds = ctx
+            .assets
+            .equities
+            .symbols
+            .iter()
+            .flat_map(|(symbol, equity_config)| {
+                equity_config
+                    .vault_ids
+                    .iter()
+                    .map(move |vault_id| EquityVaultSeed {
+                        token: equity_config.tokenized_equity_derivative,
+                        vault_id: *vault_id,
+                        symbol: symbol.clone(),
+                    })
+            })
+            .collect();
+
+        let usdc_vault_ids = ctx
+            .assets
+            .cash
+            .as_ref()
+            .map(|cash| cash.vault_ids.clone())
+            .unwrap_or_default();
+
+        Ok(Self {
+            vault_registry,
+            id,
+            equity_seeds,
+            usdc_vault_ids,
+        })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SeedVaultRegistryError {
+    #[error("VaultRegistry command failed: {0}")]
+    VaultRegistry(#[from] SendError<VaultRegistry>),
+}
+
+impl Job<SeedVaultRegistryCtx> for SeedVaultRegistry {
+    type Output = ();
+    type Error = SeedVaultRegistryError;
+
+    const WORKER_NAME: &'static str = "seed-vault-registry-worker";
+    #[cfg(any(test, feature = "test-support"))]
+    const JOB_KIND: JobKind = JobKind::SeedVaultRegistry;
+
+    fn label(&self) -> Label {
+        Label::new("SeedVaultRegistry")
+    }
+
+    async fn perform(&self, ctx: &SeedVaultRegistryCtx) -> Result<Self::Output, Self::Error> {
+        for seed in &ctx.equity_seeds {
+            debug!(
+                symbol = %seed.symbol,
+                vault_id = %seed.vault_id,
+                token = %seed.token,
+                "Seeding equity vault from config",
+            );
+
+            ctx.vault_registry
+                .send(
+                    &ctx.id,
+                    VaultRegistryCommand::SeedEquityVaultFromConfig {
+                        token: seed.token,
+                        vault_id: seed.vault_id,
+                        symbol: seed.symbol.clone(),
+                    },
+                )
+                .await?;
+        }
+
+        for vault_id in &ctx.usdc_vault_ids {
+            info!(%vault_id, "Seeding USDC vault from config");
+
+            ctx.vault_registry
+                .send(
+                    &ctx.id,
+                    VaultRegistryCommand::SeedUsdcVaultFromConfig {
+                        vault_id: *vault_id,
+                    },
+                )
+                .await?;
+        }
+
+        Ok(())
     }
 }
 
@@ -1011,6 +1167,270 @@ mod tests {
             counter.load(Ordering::SeqCst),
             1,
             "Reactor should only see events emitted after construction, not historical ones"
+        );
+    }
+
+    fn test_usdc_vault_id() -> B256 {
+        b256!("0x0000000000000000000000000000000000000000000000000000000000000002")
+    }
+
+    /// Builds a [`Ctx`] populated with the seeding fixtures defined at
+    /// the top of this module so [`SeedVaultRegistryCtx::from_config`]
+    /// can exercise the production construction path.
+    fn ctx_with_seeded_assets() -> Ctx {
+        use crate::config::tests::create_test_ctx_with_order_owner;
+        use crate::config::{
+            AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, OperationMode,
+        };
+        use std::collections::HashMap;
+
+        let mut symbols = HashMap::new();
+        symbols.insert(
+            test_symbol(),
+            EquityAssetConfig {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: TEST_TOKEN,
+                vault_ids: vec![TEST_VAULT_ID],
+                trading: OperationMode::Disabled,
+                rebalancing: OperationMode::Enabled,
+                operational_limit: None,
+            },
+        );
+
+        Ctx {
+            assets: AssetsConfig {
+                equities: EquitiesConfig {
+                    operational_limit: None,
+                    symbols,
+                },
+                cash: Some(CashAssetConfig {
+                    vault_ids: vec![test_usdc_vault_id()],
+                    rebalancing: OperationMode::Disabled,
+                    operational_limit: None,
+                    reserved: None,
+                }),
+            },
+            ..create_test_ctx_with_order_owner(TEST_OWNER)
+        }
+    }
+
+    async fn seed_ctx_from(pool: sqlx::SqlitePool, ctx: &Ctx) -> Arc<SeedVaultRegistryCtx> {
+        let (store, _projection) = StoreBuilder::<VaultRegistry>::new(pool)
+            .build(())
+            .await
+            .unwrap();
+
+        Arc::new(SeedVaultRegistryCtx::from_config(store, ctx).unwrap())
+    }
+
+    async fn loaded_registry(store: &Store<VaultRegistry>, id: &VaultRegistryId) -> VaultRegistry {
+        store
+            .load(id)
+            .await
+            .unwrap()
+            .expect("registry should be initialized after seeding")
+    }
+
+    #[tokio::test]
+    async fn from_config_rejects_missing_vault_id() {
+        use crate::config::tests::create_test_ctx_with_order_owner;
+        use crate::config::{AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
+        use std::collections::HashMap;
+
+        // Two equities with rebalancing enabled: one has a vault_id, one
+        // does not. The smart constructor must reject before any state
+        // is built, leaving callers with no way to skip the check.
+        let mut symbols = HashMap::new();
+        symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            EquityAssetConfig {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: Address::ZERO,
+                vault_ids: vec![TEST_VAULT_ID],
+                trading: OperationMode::Disabled,
+                rebalancing: OperationMode::Enabled,
+                operational_limit: None,
+            },
+        );
+        symbols.insert(
+            Symbol::new("TSLA").unwrap(),
+            EquityAssetConfig {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: Address::ZERO,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Disabled,
+                rebalancing: OperationMode::Enabled,
+                operational_limit: None,
+            },
+        );
+
+        let ctx = Ctx {
+            assets: AssetsConfig {
+                equities: EquitiesConfig {
+                    operational_limit: None,
+                    symbols,
+                },
+                cash: None,
+            },
+            ..create_test_ctx_with_order_owner(Address::ZERO)
+        };
+
+        let pool = setup_test_db().await;
+        let (store, _projection) = StoreBuilder::<VaultRegistry>::new(pool)
+            .build(())
+            .await
+            .unwrap();
+
+        let error = SeedVaultRegistryCtx::from_config(store, &ctx)
+            .err()
+            .expect("should fail when vault_id is missing for TSLA");
+
+        assert!(
+            matches!(&error, CtxError::MissingEquityVaultId { symbol } if symbol.to_string() == "TSLA"),
+            "expected MissingEquityVaultId for TSLA, got: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn perform_seeds_configured_equity_and_usdc_vaults() {
+        let pool = setup_test_db().await;
+        let ctx = ctx_with_seeded_assets();
+        let seed_ctx = seed_ctx_from(pool, &ctx).await;
+
+        SeedVaultRegistry.perform(&seed_ctx).await.unwrap();
+
+        let registry = loaded_registry(&seed_ctx.vault_registry, &seed_ctx.id).await;
+
+        assert_eq!(
+            registry.primary_vault_id_by_token(TEST_TOKEN),
+            Some(TEST_VAULT_ID),
+            "equity vault should be seeded as primary for the token",
+        );
+        assert_eq!(
+            registry.primary_usdc_vault_id(),
+            Some(test_usdc_vault_id()),
+            "usdc vault should be seeded as primary",
+        );
+    }
+
+    #[tokio::test]
+    async fn perform_is_idempotent_across_reruns() {
+        let pool = setup_test_db().await;
+        let ctx = ctx_with_seeded_assets();
+        let seed_ctx = seed_ctx_from(pool, &ctx).await;
+
+        SeedVaultRegistry.perform(&seed_ctx).await.unwrap();
+        // Re-running with the same seeds must be a no-op: the transition
+        // function returns `vec![]` for already-seeded vaults, so no
+        // duplicate events accrue.
+        SeedVaultRegistry.perform(&seed_ctx).await.unwrap();
+
+        let registry = loaded_registry(&seed_ctx.vault_registry, &seed_ctx.id).await;
+        assert_eq!(
+            registry.all_vault_ids_by_token(TEST_TOKEN),
+            vec![TEST_VAULT_ID]
+        );
+    }
+
+    async fn job_attempts_for_seed(pool: &sqlx::SqlitePool) -> i64 {
+        use sqlx::Row;
+        let queue_name = std::any::type_name::<SeedVaultRegistry>();
+        sqlx::query("SELECT attempts FROM Jobs WHERE job_type = ?")
+            .bind(queue_name)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+            .get::<i64, _>("attempts")
+    }
+
+    // Proves the gap is closed: enqueuing a SeedVaultRegistry job and
+    // forcing the job to fail (via the FailureInjector armed for this
+    // JobKind, which short-circuits before reaching the aggregate
+    // command) results in apalis retrying the job before halting. The
+    // `attempts` column on the Jobs row shows >1 when retries actually
+    // happened.
+    #[tokio::test]
+    async fn enqueued_job_retries_on_aggregate_command_failure() {
+        use apalis::layers::WorkerBuilderExt;
+        use apalis::layers::retry::RetryPolicy;
+        use apalis::prelude::{Monitor, WorkerBuilder};
+        use apalis_core::worker::event::Event;
+        use apalis_core::worker::ext::circuit_breaker::{
+            CircuitBreaker, config::CircuitBreakerConfig,
+        };
+        use apalis_core::worker::ext::event_listener::EventListenerExt;
+        use std::time::Duration;
+
+        use crate::conductor::job::{
+            FAIL_STOP_RECOVERY_TIMEOUT, FailureInjector, JobKind, JobQueue, work,
+        };
+        use crate::conductor::setup_apalis_tables;
+
+        let pool = setup_test_db().await;
+        setup_apalis_tables(&pool).await.unwrap();
+
+        let ctx = ctx_with_seeded_assets();
+        let seed_ctx = seed_ctx_from(pool.clone(), &ctx).await;
+
+        let mut queue: JobQueue<SeedVaultRegistry> = JobQueue::new(&pool);
+        queue.push(SeedVaultRegistry).await.unwrap();
+
+        let injector = FailureInjector::new();
+        injector.arm(JobKind::SeedVaultRegistry);
+
+        let queue_for_worker = queue.clone();
+        let ctx_for_worker = seed_ctx.clone();
+        let injector_for_worker = injector.clone();
+
+        let monitor_handle = tokio::spawn(async move {
+            let monitor = Monitor::new()
+                .should_restart(|_ctx, _error, _attempt| false)
+                .register(move |index| {
+                    let fail_stop = CircuitBreakerConfig::default()
+                        .with_failure_threshold(1)
+                        .with_recovery_timeout(FAIL_STOP_RECOVERY_TIMEOUT);
+
+                    WorkerBuilder::new(format!("seed-vault-registry-test-{index}"))
+                        .backend(queue_for_worker.clone().into_storage())
+                        .data(ctx_for_worker.clone())
+                        .data(injector_for_worker.clone())
+                        .data(JobKind::SeedVaultRegistry)
+                        .concurrency(1)
+                        .retry(RetryPolicy::retries(3))
+                        .break_circuit_with(fail_stop)
+                        .on_event(|ctx, event| {
+                            if let Event::Error(_) = event {
+                                let _ = ctx.stop();
+                            }
+                        })
+                        .build(work::<SeedVaultRegistryCtx, SeedVaultRegistry>)
+                });
+
+            monitor.run().await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), monitor_handle)
+            .await
+            .expect("Monitor should halt within 5s after retries exhaust")
+            .expect("Monitor task should not panic")
+            .ok();
+
+        let attempts = job_attempts_for_seed(&pool).await;
+        assert!(
+            attempts > 1,
+            "Job should have been retried at least once; attempts={attempts}",
+        );
+
+        // The retries never produced events because every attempt was
+        // injected to fail before reaching the aggregate command.
+        assert!(
+            seed_ctx
+                .vault_registry
+                .load(&seed_ctx.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "registry must remain empty when every retry attempt failed",
         );
     }
 }

@@ -474,6 +474,11 @@
                     packages.secret
                     packages.rekey
                     packages.ci
+                    # foundry exposes anvil for cargo tests that spawn a local
+                    # EVM (e.g. cctp + hedging e2e). Pinned rainix doesn't ship
+                    # it in rust-shell, so add it here so cargo nextest from
+                    # the default shell mirrors the ci-backend shell.
+                    foundryBin
                   ]
                   ++ builtins.attrValues infraPkgs.packages
                   ++ builtins.attrValues deployScripts
