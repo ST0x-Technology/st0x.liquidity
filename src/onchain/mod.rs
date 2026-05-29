@@ -81,6 +81,19 @@ pub(crate) enum OnChainError {
     MarketHoursCheck(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("Failed to push job into queue: {0}")]
     JobQueue(#[from] crate::conductor::job::QueuePushError),
+    /// The RPC node answered an `eth_getLogs` for a block range it has
+    /// not finished indexing -- the node's reported tip is behind the
+    /// requested `to_block`. Returning this error lets the retry loop
+    /// reissue the request so a load-balancer routes to a different
+    /// upstream node that has caught up.
+    #[error(
+        "RPC node tip {observed_tip} is behind the requested to_block \
+         {required_tip}; the getLogs response cannot be trusted"
+    )]
+    NodeLaggingBehindRequest {
+        observed_tip: u64,
+        required_tip: u64,
+    },
 }
 
 pub(crate) const USDC_ETHEREUM: Address = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
