@@ -23,6 +23,7 @@ use st0x_event_sorcery::{
 use st0x_execution::{FractionalShares, Positive, SharesBlockchain, SharesConversionError, Symbol};
 use st0x_finance::{HasZero, Usd, Usdc};
 
+use self::usdc::UsdcRebalanceOperation;
 use crate::conductor::job::QueuePushError;
 use crate::equity_redemption::{
     EquityRedemption, EquityRedemptionCommand, EquityRedemptionEvent, RedemptionAggregateId,
@@ -423,10 +424,6 @@ pub(crate) enum TriggeredOperation {
         /// Unwrapped (underlying) token address for sending to Alpaca.
         unwrapped_token: Address,
     },
-    /// Move USDC from Alpaca to Base (too much offchain).
-    UsdcAlpacaToBase { amount: Usdc },
-    /// Move USDC from Base to Alpaca (too much onchain).
-    UsdcBaseToAlpaca { amount: Usdc },
 }
 
 /// Service that folds CQRS events into rebalancing state and
@@ -2011,15 +2008,12 @@ impl RebalancingService {
             return;
         };
 
-        let dispatched = match &operation {
-            TriggeredOperation::UsdcBaseToAlpaca { amount } => {
-                self.enqueue_transfer_usdc_to_hedging(*amount).await
+        let dispatched = match operation {
+            UsdcRebalanceOperation::BaseToAlpaca { amount } => {
+                self.enqueue_transfer_usdc_to_hedging(amount).await
             }
-            TriggeredOperation::UsdcAlpacaToBase { amount } => {
-                self.enqueue_transfer_usdc_to_market_making(*amount).await
-            }
-            TriggeredOperation::Mint { .. } | TriggeredOperation::Redemption { .. } => {
-                self.try_send_operation(&operation, "usdc")
+            UsdcRebalanceOperation::AlpacaToBase { amount } => {
+                self.enqueue_transfer_usdc_to_market_making(amount).await
             }
         };
 
@@ -4867,11 +4861,11 @@ mod tests {
 
     /// Drains every pending USDC transfer row (both directions) from the
     /// service's Jobs table and returns them parsed as
-    /// [`TriggeredOperation`]. Marking rows `Done` lets repeated trigger
+    /// [`UsdcRebalanceOperation`]. Marking rows `Done` lets repeated trigger
     /// cycles in the same test see fresh state.
     async fn take_pending_usdc_transfer_jobs(
         service: &RebalancingService,
-    ) -> Vec<TriggeredOperation> {
+    ) -> Vec<UsdcRebalanceOperation> {
         let pool = service.transfer_usdc_to_hedging_queue.pool().clone();
         let to_hedging_type = std::any::type_name::<TransferUsdcToHedging>();
         let to_mm_type = std::any::type_name::<TransferUsdcToMarketMaking>();
@@ -4892,11 +4886,11 @@ mod tests {
             let operation = if job_type == to_hedging_type {
                 let job: TransferUsdcToHedging =
                     serde_json::from_slice(&payload).expect("deserialize TransferUsdcToHedging");
-                TriggeredOperation::UsdcBaseToAlpaca { amount: job.amount }
+                UsdcRebalanceOperation::BaseToAlpaca { amount: job.amount }
             } else {
                 let job: TransferUsdcToMarketMaking = serde_json::from_slice(&payload)
                     .expect("deserialize TransferUsdcToMarketMaking");
-                TriggeredOperation::UsdcAlpacaToBase { amount: job.amount }
+                UsdcRebalanceOperation::AlpacaToBase { amount: job.amount }
             };
 
             sqlx::query("UPDATE Jobs SET status = 'Done' WHERE id = ?")
@@ -6644,7 +6638,7 @@ mod tests {
         assert!(
             matches!(
                 pending.as_slice(),
-                [TriggeredOperation::UsdcAlpacaToBase { .. }],
+                [UsdcRebalanceOperation::AlpacaToBase { .. }],
             ),
             "TooMuchOffchain (100/900) should enqueue an AlpacaToBase transfer, got {pending:?}"
         );
@@ -7992,7 +7986,7 @@ mod tests {
         assert!(
             matches!(
                 triggered.as_slice(),
-                [TriggeredOperation::UsdcAlpacaToBase { .. }]
+                [UsdcRebalanceOperation::AlpacaToBase { .. }]
             ),
             "USDC timeout should allow the next trigger cycle to proceed, got {triggered:?}"
         );
@@ -9340,7 +9334,7 @@ mod tests {
         // the lower bound. The system should move USDC from Alpaca to Base.
         usdc_operations
             .iter()
-            .find(|op| matches!(op, TriggeredOperation::UsdcAlpacaToBase { .. }))
+            .find(|op| matches!(op, UsdcRebalanceOperation::AlpacaToBase { .. }))
             .unwrap_or_else(|| {
                 panic!(
                     "Expected AlpacaToBase (onchain USDC too low after buy), \
@@ -11499,7 +11493,7 @@ mod tests {
         assert!(
             matches!(
                 dispatched.as_slice(),
-                [TriggeredOperation::UsdcAlpacaToBase { .. }],
+                [UsdcRebalanceOperation::AlpacaToBase { .. }],
             ),
             "Expected AlpacaToBase, got {dispatched:?}"
         );

@@ -3,7 +3,6 @@
 use alloy::primitives::Address;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -132,7 +131,6 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
         operation_receiver: mpsc::Receiver<TriggeredOperation>,
         frameworks: RebalancingCqrsFrameworks,
         equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
-        usdc_in_progress: Arc<AtomicBool>,
     ) -> SpawnedRebalancer {
         let equity = Arc::new(CrossVenueEquityTransfer::new(
             self.raindex.clone(),
@@ -154,18 +152,15 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
         ));
 
         let resume_base_to_alpaca: Arc<dyn ResumeBaseToAlpaca> = usdc.clone();
-        let resume_alpaca_to_base: Arc<dyn ResumeAlpacaToBase> = usdc.clone();
+        let resume_alpaca_to_base: Arc<dyn ResumeAlpacaToBase> = usdc;
 
         let shutdown_token = CancellationToken::new();
 
         let rebalancer = Rebalancer::new(
             Arc::clone(&equity) as _,
             equity as _,
-            Arc::clone(&usdc) as _,
-            usdc as _,
             operation_receiver,
             equity_in_progress,
-            usdc_in_progress,
             shutdown_token.clone(),
         );
 
@@ -448,7 +443,6 @@ mod tests {
             rx,
             frameworks,
             Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
         let handle = spawned.handle;
 

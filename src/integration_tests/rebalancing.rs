@@ -44,7 +44,6 @@ use crate::position::{Position, PositionCommand, TradeId};
 use crate::rebalancing::equity::mock::MockCrossVenueEquityTransfer;
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, Equity, EquityTransferServices};
 use crate::rebalancing::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
-use crate::rebalancing::usdc::mock::MockUsdcRebalance;
 use crate::rebalancing::usdc::{TransferUsdcToHedging, TransferUsdcToMarketMaking};
 use crate::rebalancing::{
     Rebalancer, RebalancingSchedulers, RebalancingService, RebalancingServiceConfig,
@@ -629,16 +628,12 @@ async fn equity_offchain_imbalance_triggers_mint() {
     });
 
     let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
-    let mock_usdc = Arc::new(MockUsdcRebalance::new());
 
     let rebalancer = Rebalancer::new(
         equity_transfer as _,
         mock_equity as _,
-        Arc::clone(&mock_usdc) as _,
-        mock_usdc as _,
         receiver,
         Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
-        Arc::new(std::sync::atomic::AtomicBool::new(false)),
         tokio_util::sync::CancellationToken::new(),
     );
 
@@ -846,15 +841,11 @@ async fn equity_onchain_imbalance_triggers_redemption() {
     seed_vault_registry(&pool, &symbol, token_address).await;
 
     let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
-    let usdc = Arc::new(MockUsdcRebalance::new());
     let rebalancer = Rebalancer::new(
         Arc::clone(&mock_equity) as _,
         equity_transfer as _,
-        Arc::clone(&usdc) as _,
-        usdc as _,
         receiver,
         Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
-        Arc::new(std::sync::atomic::AtomicBool::new(false)),
         tokio_util::sync::CancellationToken::new(),
     );
 
@@ -1571,16 +1562,12 @@ async fn mint_api_failure_produces_rejected_event() {
     });
 
     let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
-    let mock_usdc = Arc::new(MockUsdcRebalance::new());
 
     let rebalancer = Rebalancer::new(
         equity_transfer as _,
         mock_equity as _,
-        Arc::clone(&mock_usdc) as _,
-        mock_usdc as _,
         receiver,
         Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
-        Arc::new(std::sync::atomic::AtomicBool::new(false)),
         tokio_util::sync::CancellationToken::new(),
     );
 

@@ -5,7 +5,6 @@
 //! execute USDC transfers between Alpaca and Base.
 
 use alloy::primitives::{Address, TxHash, U256};
-use async_trait::async_trait;
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
@@ -23,7 +22,6 @@ use crate::alpaca_wallet::{
     AlpacaTransferId, AlpacaWalletService, TokenSymbol, Transfer, TransferStatus,
 };
 use crate::onchain::raindex::{Raindex, RaindexService, RaindexVaultId, USDC_BASE};
-use crate::rebalancing::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
 use crate::usdc_rebalance::{
     RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
 };
@@ -1669,36 +1667,6 @@ pub(crate) fn u256_to_usdc(amount: U256) -> Result<Usdc, UsdcTransferError> {
     Ok(Usdc::new(Float::from_fixed_decimal(amount, 6)?))
 }
 
-/// Alpaca -> Base (hedging -> market-making): convert USD to USDC,
-/// withdraw, bridge via CCTP, deposit to vault.
-#[async_trait]
-impl<Chain: Wallet> CrossVenueTransfer<HedgingVenue, MarketMakingVenue>
-    for CrossVenueCashTransfer<Chain>
-{
-    type Asset = Usdc;
-    type Error = UsdcTransferError;
-
-    async fn transfer(&self, asset: Self::Asset) -> Result<(), Self::Error> {
-        let id = UsdcRebalanceId(Uuid::new_v4());
-        self.execute_alpaca_to_base(&id, asset).await
-    }
-}
-
-/// Base -> Alpaca (market-making -> hedging): withdraw from vault,
-/// bridge via CCTP, deposit USDC, convert to USD.
-#[async_trait]
-impl<Chain: Wallet> CrossVenueTransfer<MarketMakingVenue, HedgingVenue>
-    for CrossVenueCashTransfer<Chain>
-{
-    type Asset = Usdc;
-    type Error = UsdcTransferError;
-
-    async fn transfer(&self, asset: Self::Asset) -> Result<(), Self::Error> {
-        let id = UsdcRebalanceId(Uuid::new_v4());
-        self.execute_base_to_alpaca(&id, asset).await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use alloy::node_bindings::{Anvil, AnvilInstance};
@@ -1732,7 +1700,6 @@ mod tests {
     use super::*;
     use crate::alpaca_wallet::{AlpacaTransferId, AlpacaWalletClient, AlpacaWalletError};
     use crate::onchain::raindex::RaindexService;
-    use crate::rebalancing::usdc::mock::MockUsdcRebalance;
     use crate::usdc_rebalance::{RebalanceDirection, TransferRef, UsdcRebalanceError};
     use crate::vault_registry::VaultRegistry;
     use st0x_finance::UsdcConversionError;
@@ -2115,91 +2082,6 @@ mod tests {
                     "created_at": "2024-01-15T10:30:00Z"
                 }));
         })
-    }
-
-    #[test]
-    fn mock_tracks_call_counts() {
-        let mock = MockUsdcRebalance::new();
-        assert_eq!(mock.alpaca_to_base_calls(), 0);
-        assert_eq!(mock.base_to_alpaca_calls(), 0);
-    }
-
-    #[tokio::test]
-    async fn mock_alpaca_to_base_increments_count() {
-        let mock = Arc::new(MockUsdcRebalance::new());
-
-        CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(&*mock, usdc("1000"))
-            .await
-            .unwrap();
-
-        assert_eq!(mock.alpaca_to_base_calls(), 1);
-        assert_eq!(mock.base_to_alpaca_calls(), 0);
-    }
-
-    #[tokio::test]
-    async fn mock_base_to_alpaca_increments_count() {
-        let mock = Arc::new(MockUsdcRebalance::new());
-
-        CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(&*mock, usdc("2000"))
-            .await
-            .unwrap();
-
-        assert_eq!(mock.alpaca_to_base_calls(), 0);
-        assert_eq!(mock.base_to_alpaca_calls(), 1);
-    }
-
-    #[tokio::test]
-    async fn mock_captures_last_alpaca_to_base_call() {
-        let mock = Arc::new(MockUsdcRebalance::new());
-        let amount = usdc("5000.50");
-
-        CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(&*mock, amount)
-            .await
-            .unwrap();
-
-        let last = mock.last_alpaca_to_base_call().unwrap();
-        assert_eq!(last.amount, amount);
-    }
-
-    #[tokio::test]
-    async fn mock_captures_last_base_to_alpaca_call() {
-        let mock = Arc::new(MockUsdcRebalance::new());
-        let amount = usdc("7500.25");
-
-        CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(&*mock, amount)
-            .await
-            .unwrap();
-
-        let last = mock.last_base_to_alpaca_call().unwrap();
-        assert_eq!(last.amount, amount);
-    }
-
-    #[tokio::test]
-    async fn failing_mock_returns_error_for_alpaca_to_base() {
-        let mock = Arc::new(MockUsdcRebalance::failing_alpaca_to_base());
-
-        let result =
-            CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(&*mock, usdc("100"))
-                .await;
-
-        assert!(matches!(
-            result,
-            Err(UsdcTransferError::WithdrawalFailed { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn failing_mock_returns_error_for_base_to_alpaca() {
-        let mock = Arc::new(MockUsdcRebalance::failing_base_to_alpaca());
-
-        let result =
-            CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(&*mock, usdc("100"))
-                .await;
-
-        assert!(matches!(
-            result,
-            Err(UsdcTransferError::DepositFailed { .. })
-        ));
     }
 
     #[test]
