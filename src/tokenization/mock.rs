@@ -76,6 +76,7 @@ pub(crate) struct MockTokenizer {
     completion_outcome: Option<MockCompletionOutcome>,
     verification_outcome: MockVerificationOutcome,
     should_fail_send: bool,
+    should_fail_list_pending: bool,
     last_issuer_request_id: Mutex<Option<IssuerRequestId>>,
     pending_requests: Vec<TokenizationRequest>,
     /// Override the token_symbol in completed mint responses.
@@ -95,6 +96,7 @@ impl MockTokenizer {
             completion_outcome: None,
             verification_outcome: MockVerificationOutcome::Success,
             should_fail_send: false,
+            should_fail_list_pending: false,
             last_issuer_request_id: Mutex::new(None),
             token_symbol_behavior: MockTokenSymbolBehavior::Default,
             fees_override: None,
@@ -129,6 +131,11 @@ impl MockTokenizer {
 
     pub(crate) fn with_send_failure(mut self) -> Self {
         self.should_fail_send = true;
+        self
+    }
+
+    pub(crate) fn with_list_pending_failure(mut self) -> Self {
+        self.should_fail_list_pending = true;
         self
     }
 
@@ -341,6 +348,13 @@ impl Tokenizer for MockTokenizer {
     }
 
     async fn list_pending_requests(&self) -> Result<Vec<TokenizationRequest>, TokenizerError> {
+        if self.should_fail_list_pending {
+            return Err(TokenizerError::Alpaca(AlpacaTokenizationError::ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: "mock list_pending_requests failure".to_string(),
+            }));
+        }
+
         Ok(self
             .pending_requests
             .iter()

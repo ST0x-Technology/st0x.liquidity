@@ -1228,6 +1228,7 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
         positions: vec![],
         usd_balance_cents: 50_000,
         cash_buying_power_cents: Some(50_000),
+        alpaca_usdc: None,
         cash_withdrawable_cents: None,
     });
 

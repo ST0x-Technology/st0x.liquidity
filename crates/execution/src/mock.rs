@@ -366,6 +366,7 @@ mod tests {
             }],
             usd_balance_cents: 5_000_000,
             cash_buying_power_cents: Some(5_000_000),
+            alpaca_usdc: None,
             cash_withdrawable_cents: None,
         };
 
@@ -403,6 +404,7 @@ mod tests {
             positions: vec![],
             usd_balance_cents: 10_000,
             cash_buying_power_cents: Some(10_000),
+            alpaca_usdc: None,
             cash_withdrawable_cents: None,
         };
 
@@ -418,6 +420,7 @@ mod tests {
             positions: vec![],
             usd_balance_cents: 50_000,
             cash_buying_power_cents: Some(50_000),
+            alpaca_usdc: None,
             cash_withdrawable_cents: None,
         });
 
@@ -449,6 +452,7 @@ mod tests {
             }],
             usd_balance_cents: 50_000,
             cash_buying_power_cents: Some(50_000),
+            alpaca_usdc: None,
             cash_withdrawable_cents: None,
         });
 
@@ -485,6 +489,7 @@ mod tests {
             }],
             usd_balance_cents: 50_000,
             cash_buying_power_cents: Some(50_000),
+            alpaca_usdc: None,
             cash_withdrawable_cents: None,
         });
 
@@ -513,6 +518,7 @@ mod tests {
                 positions: vec![],
                 usd_balance_cents: 10_000,
                 cash_buying_power_cents: Some(10_000),
+                alpaca_usdc: None,
                 cash_withdrawable_cents: None,
             })
             .with_preflight_price(float!(100));

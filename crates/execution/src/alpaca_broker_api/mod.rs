@@ -169,6 +169,9 @@ pub enum AlpacaBrokerApiError {
     #[error("Invalid symbol in position: {0}")]
     InvalidSymbol(#[from] crate::EmptySymbolError),
 
+    #[error("Alpaca USDCUSD position is missing the required total quantity (qty) field")]
+    MissingPositionQuantity,
+
     #[error(
         "Order quantity {shares} is below Alpaca's \
          {max_decimals}-decimal-place precision"

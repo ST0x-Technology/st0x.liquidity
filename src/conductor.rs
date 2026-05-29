@@ -185,7 +185,6 @@ impl Conductor {
             rebalancer,
             rebalancer_shutdown_token,
             wallet_polling,
-            alpaca_wallet,
             tokenizer,
             service: rebalancing_service,
             recovery_transfer,
@@ -255,7 +254,6 @@ impl Conductor {
             frameworks,
             pool,
             wallet_polling,
-            alpaca_wallet,
             tokenizer,
             shutdown_token: shutdown_token.clone(),
             #[cfg(any(test, feature = "test-support"))]
@@ -562,7 +560,6 @@ struct RebalancingInfrastructure {
     snapshot: Arc<Store<InventorySnapshot>>,
     rebalancer: JoinHandle<()>,
     rebalancer_shutdown_token: CancellationToken,
-    alpaca_wallet: Arc<AlpacaWalletService>,
     tokenizer: Arc<dyn Tokenizer>,
     service: Arc<RebalancingService>,
     recovery_transfer: Arc<CrossVenueEquityTransfer>,
@@ -591,7 +588,6 @@ struct PositionAndRebalancing {
     rebalancer: Option<JoinHandle<()>>,
     rebalancer_shutdown_token: CancellationToken,
     wallet_polling: Option<crate::inventory::WalletPollingCtx>,
-    alpaca_wallet: Option<Arc<AlpacaWalletService>>,
     tokenizer: Option<Arc<dyn Tokenizer>>,
     service: Option<Arc<RebalancingService>>,
     recovery_transfer: Option<Arc<CrossVenueEquityTransfer>>,
@@ -644,7 +640,6 @@ impl PositionAndRebalancing {
                 rebalancer: Some(infra.rebalancer),
                 rebalancer_shutdown_token: infra.rebalancer_shutdown_token,
                 wallet_polling: Some(wallet_polling),
-                alpaca_wallet: Some(infra.alpaca_wallet),
                 tokenizer: Some(infra.tokenizer),
                 service: Some(infra.service),
                 recovery_transfer: Some(infra.recovery_transfer),
@@ -668,7 +663,6 @@ impl PositionAndRebalancing {
                 rebalancer: None,
                 rebalancer_shutdown_token: CancellationToken::new(),
                 wallet_polling: None,
-                alpaca_wallet: None,
                 tokenizer: None,
                 service: None,
                 recovery_transfer: None,
@@ -904,7 +898,6 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             snapshot: built.snapshot,
             rebalancer: handle,
             rebalancer_shutdown_token,
-            alpaca_wallet,
             tokenizer,
             service: rebalancing_service,
             recovery_transfer,
@@ -2796,6 +2789,7 @@ mod tests {
             positions: vec![],
             usd_balance_cents: 100_000,
             cash_buying_power_cents: Some(100_000),
+            alpaca_usdc: None,
             cash_withdrawable_cents: None,
         });
 
@@ -2854,6 +2848,7 @@ mod tests {
             }],
             usd_balance_cents: 100_000,
             cash_buying_power_cents: Some(100_000),
+            alpaca_usdc: None,
             cash_withdrawable_cents: None,
         });
 
@@ -2917,6 +2912,7 @@ mod tests {
             }],
             usd_balance_cents: 100_000,
             cash_buying_power_cents: Some(100_000),
+            alpaca_usdc: None,
             cash_withdrawable_cents: None,
         });
 
@@ -3154,6 +3150,7 @@ mod tests {
                 positions: vec![],
                 usd_balance_cents: 10_000,
                 cash_buying_power_cents: Some(1_000_000),
+                alpaca_usdc: None,
                 cash_withdrawable_cents: None,
             })
             .with_preflight_price(float!(100));
@@ -3218,6 +3215,7 @@ mod tests {
                 }],
                 usd_balance_cents: 15_000,
                 cash_buying_power_cents: Some(15_000),
+                alpaca_usdc: None,
                 cash_withdrawable_cents: None,
             })
             .with_preflight_price(float!(100));
@@ -3282,6 +3280,7 @@ mod tests {
             }],
             usd_balance_cents: 100_000,
             cash_buying_power_cents: Some(100_000),
+            alpaca_usdc: None,
             cash_withdrawable_cents: None,
         });
 
@@ -3377,6 +3376,7 @@ mod tests {
                 positions: vec![],
                 usd_balance_cents: 15_000,
                 cash_buying_power_cents: Some(15_000),
+                alpaca_usdc: None,
                 cash_withdrawable_cents: None,
             })
             .with_preflight_price(float!(100));

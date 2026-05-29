@@ -1,7 +1,7 @@
 //! Alpaca Broker API crypto wallet client for USDC deposits and withdrawals.
 //!
 //! This module integrates with the wallet endpoints of the Alpaca Broker API,
-//! supporting USDC balance checks, deposits, and withdrawals.
+//! supporting USDC deposit address lookup, deposits, and withdrawals.
 //!
 //! # Authentication
 //!
@@ -41,8 +41,8 @@ pub(crate) use whitelist::{TravelRuleInfo, WhitelistEntry, WhitelistStatus};
 
 /// Service facade for Alpaca crypto wallet operations.
 ///
-/// Provides a high-level API for balance checks, deposits, withdrawals, and
-/// transfer polling.
+/// Provides a high-level API for deposit address lookup, deposits, withdrawals,
+/// and transfer polling.
 pub(crate) struct AlpacaWalletService {
     client: Arc<AlpacaWalletClient>,
     polling_config: PollingConfig,
@@ -146,15 +146,6 @@ impl AlpacaWalletService {
         network: &Network,
     ) -> Result<Address, AlpacaWalletError> {
         self.client.get_wallet_address(asset, network).await
-    }
-
-    /// Gets the Alpaca account balance for the given token.
-    pub(crate) async fn get_asset_balance(
-        &self,
-        asset: &TokenSymbol,
-        network: &Network,
-    ) -> Result<Usdc, AlpacaWalletError> {
-        self.client.get_asset_balance(asset, network).await
     }
 
     pub(crate) async fn create_whitelist_entry(

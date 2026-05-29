@@ -749,9 +749,9 @@ fn register_positions_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>
         when.method(GET)
             .path(format!("/v1/trading/accounts/{TEST_ACCOUNT_ID}/positions"));
         then.respond_with(move |_request: &HttpMockRequest| {
-            let result: Result<Vec<Value>, rain_math_float::FloatError> = {
+            let result = (|| -> Result<Vec<Value>, rain_math_float::FloatError> {
                 let state = lock(&state);
-                state
+                let mut positions = state
                     .account
                     .positions
                     .values()
@@ -761,7 +761,7 @@ fn register_positions_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>
                             .lt(Float::from_raw(alloy::primitives::B256::ZERO))?;
                         let side = if is_neg { "short" } else { "long" };
                         let abs_qty = pos.quantity.abs()?;
-                        Ok(json!({
+                        Ok::<Value, rain_math_float::FloatError>(json!({
                             "symbol": pos.symbol,
                             "qty_available": format_float_with_fallback(&abs_qty),
                             "market_value": format_float_with_fallback(&pos.market_value),
@@ -769,8 +769,30 @@ fn register_positions_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>
                             "avg_entry_price": "0",
                         }))
                     })
-                    .collect()
-            };
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                let usdc_balance = state
+                    .wallet_balances
+                    .get("USDC")
+                    .copied()
+                    .unwrap_or_else(|| float!(0));
+                drop(state);
+
+                if !usdc_balance.is_zero()? {
+                    positions.push(json!({
+                        "symbol": "USDCUSD",
+                        "qty_available": format_float_with_fallback(&usdc_balance),
+                        "qty": format_float_with_fallback(&usdc_balance),
+                        "market_value": format_float_with_fallback(&usdc_balance),
+                        "side": "long",
+                        "asset_class": "crypto",
+                        "exchange": "CRYPTO",
+                        "avg_entry_price": "1",
+                    }));
+                }
+
+                Ok(positions)
+            })();
 
             match result {
                 Ok(positions) => json_response(200, &Value::Array(positions)),
@@ -1369,25 +1391,13 @@ fn register_wallet_get_endpoint(server: &MockServer, state: &Arc<Mutex<MockState
                     );
                 }
 
-                let (deposit_addr, balance) = {
-                    let state = lock(&state);
-                    (
-                        state.alpaca_deposit_address.clone(),
-                        state
-                            .wallet_balances
-                            .get(asset)
-                            .copied()
-                            .unwrap_or_else(|| float!(0)),
-                    )
-                };
+                let deposit_addr = lock(&state).alpaca_deposit_address.clone();
 
                 return json_response(
                     200,
                     &json!({
                         "asset_id": "00000000-0000-0000-0000-000000000000",
-                        "asset": asset,
                         "address": deposit_addr,
-                        "balance": format_float_with_fallback(&balance),
                         "created_at": "2025-01-01T00:00:00Z"
                     }),
                 );

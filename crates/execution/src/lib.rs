@@ -32,7 +32,7 @@ pub use order::{MarketOrder, OrderPlacement, OrderState, OrderStatus, OrderUpdat
 
 pub use st0x_finance::{
     EmptySymbolError, FractionalShares, HasZero, NotPositive, Positive, Symbol, ToWholeSharesError,
-    Usd,
+    Usd, Usdc,
 };
 
 /// Extension trait for U256 conversions on `FractionalShares`.
@@ -299,6 +299,11 @@ pub struct EquityPosition {
 #[derive(Debug, Clone)]
 pub struct Inventory {
     pub positions: Vec<EquityPosition>,
+    /// USDC held at Alpaca after USD/USDC conversion and before withdrawal.
+    /// `None` when the executor does not model an Alpaca USDC venue (e.g.
+    /// `MockExecutor`); a reporting executor uses `Some(Usdc::ZERO)` for a zero
+    /// balance so the snapshot is still emitted.
+    pub alpaca_usdc: Option<Usdc>,
     pub usd_balance_cents: i64,
     /// Cash buying power available for equity hedges -- Alpaca's `cash`
     /// field, which includes unsettled T+1 equity-sale proceeds and excludes
