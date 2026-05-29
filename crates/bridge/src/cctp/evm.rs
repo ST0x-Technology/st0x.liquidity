@@ -1,6 +1,8 @@
 //! Single-chain CCTP operations.
 
-use alloy::primitives::{Address, Bytes, FixedBytes, U256};
+use alloy::primitives::{Address, B256, Bytes, FixedBytes, U256};
+use alloy::providers::Provider;
+use alloy::rpc::types::Filter;
 use alloy::sol;
 use alloy::sol_types::SolEvent;
 use tracing::{info, trace};
@@ -175,6 +177,91 @@ impl<W: Wallet> CctpEndpoint<W> {
             amount: mint_event.amount,
             fee_collected: mint_event.feeCollected,
         })
+    }
+
+    /// Returns the receipt of an already-executed mint for `nonce`, or `None` if
+    /// the nonce has not been consumed on this chain yet.
+    ///
+    /// Crash recovery uses this before re-minting: `receiveMessage` reverts on an
+    /// already-used nonce, so when the mint already landed (process died after the
+    /// mint confirmed but before the `Bridged` event committed) we reconstruct the
+    /// receipt from the on-chain `MessageReceived`/`MintAndWithdraw` events instead
+    /// of re-submitting. The `MessageReceived` event carries the nonce as its second
+    /// indexed topic, so a topic filter pinpoints the originating transaction. The
+    /// log query is unbounded because this is a rare recovery path with no cheap
+    /// block bound; if a provider range-limits it, the error propagates and the
+    /// resume is retried on the next restart with the aggregate left resumable.
+    pub(super) async fn find_existing_mint<Registry: IntoErrorRegistry>(
+        &self,
+        nonce: B256,
+    ) -> Result<Option<MintReceipt>, CctpError> {
+        let used = self
+            .wallet
+            .call::<Registry, _>(
+                self.message_transmitter_address,
+                MessageTransmitterV2::usedNoncesCall(nonce),
+            )
+            .await?;
+
+        if used.is_zero() {
+            return Ok(None);
+        }
+
+        let filter = Filter::new()
+            .address(self.message_transmitter_address)
+            .event_signature(MessageTransmitterV2::MessageReceived::SIGNATURE_HASH)
+            .topic2(nonce);
+
+        let tx_hash = self
+            .wallet
+            .provider()
+            .get_logs(&filter)
+            .await?
+            .iter()
+            .find_map(|log| log.transaction_hash)
+            .ok_or(CctpError::MintReceiveLogNotFound { nonce })?;
+
+        let receipt = self
+            .wallet
+            .provider()
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .ok_or(CctpError::MintAndWithdrawEventNotFound)?;
+
+        // `receiveMessage` processes a single CCTP message, so its receipt carries
+        // exactly one MintAndWithdraw -- the one for this nonce. Taking the first is
+        // correct for the bot's single-message receives.
+        let mint_event = receipt
+            .inner
+            .logs()
+            .iter()
+            .find_map(|log| TokenMessengerV2::MintAndWithdraw::decode_log(log.as_ref()).ok())
+            .ok_or(CctpError::MintAndWithdrawEventNotFound)?;
+
+        info!(
+            target: "bridge",
+            %tx_hash,
+            amount = %mint_event.amount,
+            fee_collected = %mint_event.feeCollected,
+            "Recovered existing CCTP mint for already-consumed nonce"
+        );
+
+        Ok(Some(MintReceipt {
+            tx: tx_hash,
+            amount: mint_event.amount,
+            fee_collected: mint_event.feeCollected,
+        }))
+    }
+
+    /// Returns `holder`'s balance of this chain's USDC token.
+    pub(super) async fn usdc_balance<Registry: IntoErrorRegistry>(
+        &self,
+        holder: Address,
+    ) -> Result<U256, CctpError> {
+        Ok(self
+            .wallet
+            .call::<Registry, _>(self.usdc_address, IERC20::balanceOfCall { account: holder })
+            .await?)
     }
 
     #[cfg(test)]

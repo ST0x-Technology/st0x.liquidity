@@ -6619,6 +6619,282 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recover_usdc_rebalance_state_restores_deposit_initiated_tracking() {
+        let inventory = InventoryView::default().with_usdc(usdc(100), usdc(900));
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let initiated_at = Utc::now();
+
+        let state = UsdcRebalance::DepositInitiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            initiated_amount: usdc(500),
+            amount: usdc(499),
+            burn_tx_hash: TxHash::random(),
+            mint_tx_hash: TxHash::random(),
+            deposit_ref: TransferRef::OnchainTx(TxHash::random()),
+            initiated_at,
+            deposit_initiated_at: initiated_at + ChronoDuration::seconds(30),
+        };
+
+        trigger
+            .recover_usdc_rebalance_state(&id, &state)
+            .await
+            .unwrap();
+
+        assert_usdc_tracking_state(
+            &trigger,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            usdc(500),
+            Some(usdc(499)),
+            usdc::UsdcRebalanceStage::DepositInitiated,
+        )
+        .await;
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(inventory.active_usdc_rebalance(), Some(&id));
+        assert_eq!(inventory.usdc_available(Venue::Hedging), Some(usdc(400)));
+        assert_eq!(inventory.usdc_inflight(Venue::Hedging), Some(usdc(500)));
+        drop(inventory);
+        assert!(trigger.usdc_in_progress.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn recover_usdc_rebalance_state_restores_bridging_tracking() {
+        let inventory = InventoryView::default().with_usdc(usdc(100), usdc(900));
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let initiated_at = Utc::now();
+
+        let state = UsdcRebalance::Bridging {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: usdc(500),
+            burn_tx_hash: TxHash::random(),
+            initiated_at,
+            burned_at: initiated_at + ChronoDuration::seconds(30),
+        };
+
+        trigger
+            .recover_usdc_rebalance_state(&id, &state)
+            .await
+            .unwrap();
+
+        assert_usdc_tracking_state(
+            &trigger,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            usdc(500),
+            None,
+            usdc::UsdcRebalanceStage::BridgingInitiated,
+        )
+        .await;
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(inventory.active_usdc_rebalance(), Some(&id));
+        assert_eq!(inventory.usdc_available(Venue::Hedging), Some(usdc(400)));
+        assert_eq!(inventory.usdc_inflight(Venue::Hedging), Some(usdc(500)));
+        drop(inventory);
+        assert!(trigger.usdc_in_progress.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn recover_usdc_rebalance_state_restores_attested_tracking() {
+        let inventory = InventoryView::default().with_usdc(usdc(100), usdc(900));
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let initiated_at = Utc::now();
+
+        let state = UsdcRebalance::Attested {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: usdc(500),
+            burn_tx_hash: TxHash::random(),
+            cctp_nonce: B256::random(),
+            message: vec![0u8; 44],
+            attestation: vec![0x01],
+            initiated_at,
+            attested_at: initiated_at + ChronoDuration::seconds(30),
+        };
+
+        trigger
+            .recover_usdc_rebalance_state(&id, &state)
+            .await
+            .unwrap();
+
+        assert_usdc_tracking_state(
+            &trigger,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            usdc(500),
+            None,
+            usdc::UsdcRebalanceStage::BridgeAttestationReceived,
+        )
+        .await;
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(inventory.active_usdc_rebalance(), Some(&id));
+        assert_eq!(inventory.usdc_available(Venue::Hedging), Some(usdc(400)));
+        assert_eq!(inventory.usdc_inflight(Venue::Hedging), Some(usdc(500)));
+        drop(inventory);
+        assert!(trigger.usdc_in_progress.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn recover_usdc_rebalance_state_restores_bridged_tracking_base_to_alpaca() {
+        // BaseToAlpaca sources from the market-making venue, so seed it with the
+        // balance and assert the Start lands on MarketMaking, not Hedging.
+        let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let initiated_at = Utc::now();
+
+        let state = UsdcRebalance::Bridged {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: usdc(500),
+            amount_received: usdc(499),
+            fee_collected: usdc(1),
+            burn_tx_hash: TxHash::random(),
+            mint_tx_hash: TxHash::random(),
+            initiated_at,
+            minted_at: initiated_at + ChronoDuration::seconds(30),
+        };
+
+        trigger
+            .recover_usdc_rebalance_state(&id, &state)
+            .await
+            .unwrap();
+
+        assert_usdc_tracking_state(
+            &trigger,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(500),
+            Some(usdc(499)),
+            usdc::UsdcRebalanceStage::Bridged,
+        )
+        .await;
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(inventory.active_usdc_rebalance(), Some(&id));
+        assert_eq!(
+            inventory.usdc_available(Venue::MarketMaking),
+            Some(usdc(400))
+        );
+        assert_eq!(
+            inventory.usdc_inflight(Venue::MarketMaking),
+            Some(usdc(500))
+        );
+        drop(inventory);
+        assert!(trigger.usdc_in_progress.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn recover_usdc_rebalance_state_restores_base_to_alpaca_deposit_confirmed() {
+        // BaseToAlpaca DepositConfirmed is non-terminal: the post-deposit conversion
+        // still runs, so recovery must re-track it (guard + inflight) from MarketMaking.
+        let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let initiated_at = Utc::now();
+
+        let state = UsdcRebalance::DepositConfirmed {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: usdc(499),
+            burn_tx_hash: TxHash::random(),
+            mint_tx_hash: TxHash::random(),
+            initiated_at,
+            deposit_confirmed_at: initiated_at + ChronoDuration::seconds(30),
+        };
+
+        trigger
+            .recover_usdc_rebalance_state(&id, &state)
+            .await
+            .unwrap();
+
+        assert_usdc_tracking_state(
+            &trigger,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(499),
+            Some(usdc(499)),
+            usdc::UsdcRebalanceStage::DepositConfirmed,
+        )
+        .await;
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(inventory.active_usdc_rebalance(), Some(&id));
+        assert_eq!(
+            inventory.usdc_available(Venue::MarketMaking),
+            Some(usdc(401))
+        );
+        assert_eq!(
+            inventory.usdc_inflight(Venue::MarketMaking),
+            Some(usdc(499))
+        );
+        drop(inventory);
+        assert!(trigger.usdc_in_progress.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn recover_usdc_rebalance_state_skips_alpaca_to_base_deposit_confirmed() {
+        // AlpacaToBase DepositConfirmed is terminal -> recovery must NOT re-track it.
+        let inventory = InventoryView::default().with_usdc(usdc(100), usdc(900));
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let initiated_at = Utc::now();
+
+        let state = UsdcRebalance::DepositConfirmed {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: usdc(499),
+            burn_tx_hash: TxHash::random(),
+            mint_tx_hash: TxHash::random(),
+            initiated_at,
+            deposit_confirmed_at: initiated_at + ChronoDuration::seconds(30),
+        };
+
+        trigger
+            .recover_usdc_rebalance_state(&id, &state)
+            .await
+            .unwrap();
+
+        assert!(!trigger.usdc_tracking.read().await.contains_key(&id));
+        assert!(!trigger.usdc_in_progress.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn recover_usdc_rebalance_state_skips_duplicate_recovery() {
+        let inventory = InventoryView::default().with_usdc(usdc(100), usdc(900));
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let initiated_at = Utc::now();
+
+        let state = UsdcRebalance::Bridging {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: usdc(500),
+            burn_tx_hash: TxHash::random(),
+            initiated_at,
+            burned_at: initiated_at + ChronoDuration::seconds(30),
+        };
+
+        trigger
+            .recover_usdc_rebalance_state(&id, &state)
+            .await
+            .unwrap();
+        // A second recovery for the same id must not re-apply the inflight Start.
+        trigger
+            .recover_usdc_rebalance_state(&id, &state)
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        let available = inventory.usdc_available(Venue::Hedging);
+        let inflight = inventory.usdc_inflight(Venue::Hedging);
+        drop(inventory);
+
+        assert_eq!(available, Some(usdc(400)));
+        assert_eq!(inflight, Some(usdc(500)));
+    }
+
+    #[tokio::test]
     async fn alpaca_to_base_usdc_lifecycle_tracks_started_and_cleared_inflight() {
         let inventory = InventoryView::default().with_usdc(usdc(100), usdc(900));
         let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
@@ -7777,6 +8053,7 @@ mod tests {
 
     fn make_usdc_bridge_attestation_received() -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::BridgeAttestationReceived {
+            message: vec![0; 44],
             attestation: vec![1, 2, 3, 4],
             cctp_nonce: B256::left_padding_from(&42u64.to_be_bytes()),
             attested_at: Utc::now(),
@@ -8878,6 +9155,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::ReceiveAttestation {
+                    message: vec![0; 44],
                     attestation: vec![1, 2, 3],
                     cctp_nonce: B256::left_padding_from(&12345u64.to_be_bytes()),
                 },
@@ -8964,6 +9242,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::ReceiveAttestation {
+                    message: vec![0; 44],
                     attestation: vec![1, 2, 3],
                     cctp_nonce: B256::left_padding_from(&67890u64.to_be_bytes()),
                 },
@@ -9261,6 +9540,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::ReceiveAttestation {
+                    message: vec![0; 44],
                     attestation: vec![1, 2, 3],
                     cctp_nonce: B256::left_padding_from(&99999u64.to_be_bytes()),
                 },

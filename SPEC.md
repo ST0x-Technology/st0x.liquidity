@@ -1660,7 +1660,8 @@ enum UsdcRebalance {
         direction: RebalanceDirection,
         amount: Usdc,
         burn_tx_hash: TxHash,
-        cctp_nonce: u64,
+        cctp_nonce: B256,
+        message: Vec<u8>,
         attestation: Vec<u8>,
         initiated_at: DateTime<Utc>,
         attested_at: DateTime<Utc>,
@@ -1677,7 +1678,7 @@ enum UsdcRebalance {
         direction: RebalanceDirection,
         amount: Usdc,
         burn_tx_hash: Option<TxHash>,
-        cctp_nonce: Option<u64>,
+        cctp_nonce: Option<B256>,
         reason: String,
         initiated_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
@@ -1740,7 +1741,7 @@ enum UsdcRebalanceCommand {
 
     // Bridging commands
     InitiateBridging { burn_tx: TxHash },
-    ReceiveAttestation { attestation: Vec<u8>, cctp_nonce: u64 },
+    ReceiveAttestation { message: Vec<u8>, attestation: Vec<u8>, cctp_nonce: B256 },
     ConfirmBridging { mint_tx: TxHash },
     FailBridging { reason: String },
 
@@ -1780,8 +1781,9 @@ enum UsdcRebalanceEvent {
     // Bridging events (cctp_nonce comes from attestation, not burn tx)
     BridgingInitiated { burn_tx_hash: TxHash, burned_at: DateTime<Utc> },
     BridgeAttestationReceived {
+        message: Vec<u8>,
         attestation: Vec<u8>,
-        cctp_nonce: u64,
+        cctp_nonce: B256,
         attested_at: DateTime<Utc>,
     },
     Bridged {
@@ -1844,7 +1846,9 @@ enum BridgeStage { Burn, Attestation, Mint }
   logs
 - Attestation must be retrieved by polling Circle's REST API (~13 sec finality,
   no websocket option available)
-- Bridge mint transaction requires valid attestation
+- Bridge mint transaction requires both the attested CCTP message bytes and the
+  Circle attestation signature; both must be persisted before minting so the
+  transfer can resume after restart
 - Bridge mint transaction must be confirmed before destination deposit
 - Destination deposit must be confirmed to complete rebalancing (for
   AlpacaToBase) or before post-deposit conversion (for BaseToAlpaca)

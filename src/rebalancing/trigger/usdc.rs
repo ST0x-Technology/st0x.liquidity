@@ -15,7 +15,9 @@ use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::inventory::{
     BroadcastingInventory, Imbalance, ImbalanceThreshold, Inventory, TransferOp, Venue,
 };
-use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceEvent, UsdcRebalanceId};
+use crate::usdc_rebalance::{
+    RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent, UsdcRebalanceId,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UsdcTrackingEvent {
@@ -46,6 +48,94 @@ pub(super) struct UsdcRebalanceTracking {
 }
 
 impl UsdcRebalanceTracking {
+    fn from_recovered_state(entity: &UsdcRebalance) -> Option<Self> {
+        match entity {
+            UsdcRebalance::Bridging {
+                direction,
+                amount,
+                burned_at,
+                ..
+            } => Some(Self {
+                direction: direction.clone(),
+                initiated_amount: *amount,
+                bridged_amount_received: None,
+                stage: UsdcRebalanceStage::BridgingInitiated,
+                last_progress_at: *burned_at,
+            }),
+            UsdcRebalance::Attested {
+                direction,
+                amount,
+                attested_at,
+                ..
+            } => Some(Self {
+                direction: direction.clone(),
+                initiated_amount: *amount,
+                bridged_amount_received: None,
+                stage: UsdcRebalanceStage::BridgeAttestationReceived,
+                last_progress_at: *attested_at,
+            }),
+            UsdcRebalance::Bridged {
+                direction,
+                amount,
+                amount_received,
+                minted_at,
+                ..
+            } => Some(Self {
+                direction: direction.clone(),
+                initiated_amount: *amount,
+                bridged_amount_received: Some(*amount_received),
+                stage: UsdcRebalanceStage::Bridged,
+                last_progress_at: *minted_at,
+            }),
+            UsdcRebalance::DepositInitiated {
+                direction,
+                initiated_amount,
+                amount,
+                deposit_initiated_at,
+                ..
+            } => Some(Self {
+                direction: direction.clone(),
+                initiated_amount: *initiated_amount,
+                bridged_amount_received: Some(*amount),
+                stage: UsdcRebalanceStage::DepositInitiated,
+                last_progress_at: *deposit_initiated_at,
+            }),
+            // BaseToAlpaca: DepositConfirmed is non-terminal (post-deposit USDC->USD
+            // conversion still pending), so it must stay tracked through the resumed
+            // conversion. The aggregate dropped the pre-bridge `initiated_amount` at
+            // this stage, so we track the post-bridge `amount` (USDC received) -- the
+            // figure the resumed conversion and its terminal settle both reference.
+            UsdcRebalance::DepositConfirmed {
+                direction: direction @ RebalanceDirection::BaseToAlpaca,
+                amount,
+                deposit_confirmed_at,
+                ..
+            } => Some(Self {
+                direction: direction.clone(),
+                initiated_amount: *amount,
+                bridged_amount_received: Some(*amount),
+                stage: UsdcRebalanceStage::DepositConfirmed,
+                last_progress_at: *deposit_confirmed_at,
+            }),
+            // Non-resumable states carry no in-flight bridge to re-track. Listed
+            // explicitly (rather than a wildcard) so a new mid-flight variant forces
+            // a compile-time decision about whether recovery must track it.
+            // AlpacaToBase DepositConfirmed is terminal, hence non-recoverable here.
+            UsdcRebalance::Converting { .. }
+            | UsdcRebalance::ConversionComplete { .. }
+            | UsdcRebalance::ConversionFailed { .. }
+            | UsdcRebalance::Withdrawing { .. }
+            | UsdcRebalance::WithdrawalComplete { .. }
+            | UsdcRebalance::WithdrawalFailed { .. }
+            | UsdcRebalance::BridgingFailed { .. }
+            | UsdcRebalance::DepositConfirmed {
+                direction: RebalanceDirection::AlpacaToBase,
+                ..
+            }
+            | UsdcRebalance::DepositFailed { .. } => None,
+        }
+    }
+
     pub(super) fn source_venue(&self) -> Venue {
         match self.direction {
             RebalanceDirection::AlpacaToBase => Venue::Hedging,
@@ -487,6 +577,56 @@ fn truncate_for_transfer(amount: Usdc) -> Result<Usdc, FloatError> {
 }
 
 impl RebalancingService {
+    pub(crate) async fn recover_usdc_rebalance_state(
+        &self,
+        id: &UsdcRebalanceId,
+        entity: &UsdcRebalance,
+    ) -> Result<(), RebalancingServiceError> {
+        let Some(tracking) = UsdcRebalanceTracking::from_recovered_state(entity) else {
+            debug!(
+                target: "rebalance",
+                %id,
+                state = ?entity,
+                "Skipping recovery for non-resumable USDC rebalance state"
+            );
+            return Ok(());
+        };
+
+        // Idempotent recovery: if this rebalance is already tracked, the inflight
+        // Start was already applied for it this run. Re-applying it (e.g. if the
+        // same id were recovered twice) would double-count in-flight USDC, so skip.
+        if self.usdc_tracking.read().await.contains_key(id) {
+            warn!(
+                target: "rebalance",
+                %id,
+                "USDC rebalance already tracked; skipping duplicate state recovery"
+            );
+            return Ok(());
+        }
+
+        let now = Utc::now();
+        let update = Inventory::transfer(
+            tracking.source_venue(),
+            TransferOp::Start,
+            tracking.initiated_amount,
+        );
+
+        let mut inventory = self.inventory.write().await;
+        *inventory = inventory
+            .clone()
+            .update_usdc(update, now)?
+            .set_active_usdc_rebalance(id.clone());
+        drop(inventory);
+
+        self.usdc_tracking
+            .write()
+            .await
+            .insert(id.clone(), tracking);
+        self.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        Ok(())
+    }
+
     pub(super) async fn on_usdc_rebalance(
         &self,
         id: UsdcRebalanceId,
@@ -1658,6 +1798,7 @@ mod tests {
 
     fn bridge_attestation_received_event() -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::BridgeAttestationReceived {
+            message: vec![0; 44],
             attestation: vec![],
             cctp_nonce: B256::ZERO,
             attested_at: ts(105),

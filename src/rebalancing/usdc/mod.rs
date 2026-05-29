@@ -34,6 +34,10 @@ pub(crate) enum UsdcTransferError {
     Vault(#[from] RaindexError),
     #[error("Aggregate error: {0}")]
     Aggregate(Box<SendError<crate::usdc_rebalance::UsdcRebalance>>),
+    #[error("USDC rebalance aggregate {id} not found")]
+    AggregateNotFound {
+        id: crate::usdc_rebalance::UsdcRebalanceId,
+    },
     #[error("Withdrawal failed with terminal status: {status}")]
     WithdrawalFailed { status: String },
     #[error("Deposit failed with terminal status: {status}")]
@@ -51,6 +55,12 @@ pub(crate) enum UsdcTransferError {
          filled_quantity is missing"
     )]
     MissingFilledQuantity { order_id: uuid::Uuid },
+    #[error(
+        "vault deposit skipped: wallet holds {available} USDC but {required} is required -- the \
+         minted USDC already left the wallet (deposit already landed pre-crash); leaving the \
+         rebalance resumable for operator review rather than double-depositing"
+    )]
+    DepositFundsAlreadyMoved { available: Usdc, required: Usdc },
 }
 
 impl From<SendError<crate::usdc_rebalance::UsdcRebalance>> for UsdcTransferError {

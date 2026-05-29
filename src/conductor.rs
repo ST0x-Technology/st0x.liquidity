@@ -60,6 +60,7 @@ use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::position_check::{CheckPositionsJobQueue, bootstrap_check_positions};
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
+use crate::rebalancing::usdc::CrossVenueCashTransfer;
 use crate::rebalancing::{
     RebalancerServices, RebalancingCqrsFrameworks, RebalancingSchedulers, RebalancingService,
     RebalancingServiceConfig,
@@ -70,6 +71,7 @@ use crate::tokenization::alpaca::AlpacaTokenizationService;
 use crate::tokenized_equity_mint::{TokenizedEquityMint, interrupted_mint_ids};
 use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::trade_accountant::{DexTradeAccountingJobQueue, TradeAccountingError};
+use crate::usdc_rebalance::{UsdcRebalance, UsdcRebalanceId, resumable_usdc_rebalance_ids};
 use crate::vault_registry::{
     SeedVaultRegistry, SeedVaultRegistryCtx, SeedVaultRegistryJobQueue, VaultRegistry,
     VaultRegistryCommand, VaultRegistryId,
@@ -857,12 +859,6 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             .recover_usdc_guard(&deps.pool, &built.usdc)
             .await?;
 
-        let frameworks = RebalancingCqrsFrameworks {
-            mint: built.mint,
-            redemption: built.redemption,
-            usdc: built.usdc,
-        };
-
         let alpaca_wallet = Arc::new(AlpacaWalletService::new(
             alpaca_auth.base_url().to_string(),
             alpaca_auth.account_id,
@@ -889,6 +885,26 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             .as_ref()
             .and_then(|cash| cash.vault_ids.first().copied())
             .ok_or(CtxError::MissingCashVaultId)?;
+
+        let recovery_cash_transfer = Arc::new(services.usdc_transfer(
+            market_maker_wallet,
+            RaindexVaultId(usdc_vault_id),
+            built.usdc.clone(),
+        ));
+
+        recover_interrupted_usdc_rebalance_aggregates(
+            &deps.pool,
+            &rebalancing_service,
+            &recovery_cash_transfer,
+            built.usdc.clone(),
+        )
+        .await?;
+
+        let frameworks = RebalancingCqrsFrameworks {
+            mint: built.mint,
+            redemption: built.redemption,
+            usdc: built.usdc,
+        };
 
         let mint_store = frameworks.mint.clone();
         let redemption_store = frameworks.redemption.clone();
@@ -991,6 +1007,62 @@ async fn recover_interrupted_tokenization_aggregates(
     resume_interrupted_transfers(transfer, &interrupted_mints, &interrupted_redemptions).await;
 
     Ok(())
+}
+
+async fn recover_interrupted_usdc_rebalance_aggregates<Chain: Wallet>(
+    pool: &SqlitePool,
+    rebalancing_service: &RebalancingService,
+    transfer: &CrossVenueCashTransfer<Chain>,
+    usdc_store: Arc<Store<UsdcRebalance>>,
+) -> anyhow::Result<()> {
+    let interrupted_rebalances = resumable_usdc_rebalance_ids(pool).await?;
+
+    for id in &interrupted_rebalances {
+        let Some(rebalance) = usdc_store.load(id).await? else {
+            // Skip rather than abort startup: the resume pass below is non-fatal
+            // per id, so a single missing aggregate should not block the whole
+            // server from coming up. resume_usdc_rebalance also surfaces this as
+            // AggregateNotFound and skips it.
+            warn!(
+                target: "rebalance",
+                %id,
+                "Interrupted USDC rebalance aggregate missing from store; skipping recovery"
+            );
+            continue;
+        };
+
+        rebalancing_service
+            .recover_usdc_rebalance_state(id, &rebalance)
+            .await?;
+    }
+
+    resume_interrupted_usdc_rebalances(transfer, &interrupted_rebalances).await;
+
+    Ok(())
+}
+
+async fn resume_interrupted_usdc_rebalances<Chain: Wallet>(
+    transfer: &CrossVenueCashTransfer<Chain>,
+    interrupted_rebalances: &[UsdcRebalanceId],
+) {
+    let mut failed_rebalances = 0usize;
+
+    for id in interrupted_rebalances {
+        failed_rebalances += usize::from(
+            transfer
+                .resume_usdc_rebalance(id)
+                .await
+                .inspect_err(|error| {
+                    error!(%id, ?error, "Failed to resume USDC rebalance -- skipping");
+                })
+                .is_err(),
+        );
+    }
+
+    info!(
+        count = interrupted_rebalances.len(),
+        failed_rebalances, "Interrupted USDC rebalance resume completed"
+    );
 }
 
 async fn resume_interrupted_transfers(

@@ -111,6 +111,23 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
         })
     }
 
+    pub(crate) fn usdc_transfer(
+        &self,
+        market_maker_wallet: Address,
+        usdc_vault_id: RaindexVaultId,
+        usdc_store: Arc<Store<UsdcRebalance>>,
+    ) -> CrossVenueCashTransfer<Chain> {
+        CrossVenueCashTransfer::new(
+            self.broker.clone(),
+            self.wallet.clone(),
+            self.cctp.clone(),
+            self.raindex.clone(),
+            usdc_store,
+            market_maker_wallet,
+            usdc_vault_id,
+        )
+    }
+
     /// Spawns the rebalancer as a background task.
     ///
     /// All CQRS frameworks are created in the conductor and passed here to
@@ -125,6 +142,9 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
         equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
         usdc_in_progress: Arc<AtomicBool>,
     ) -> (JoinHandle<()>, CancellationToken) {
+        let usdc =
+            Arc::new(self.usdc_transfer(market_maker_wallet, usdc_vault_id, frameworks.usdc));
+
         let equity = Arc::new(CrossVenueEquityTransfer::new(
             self.raindex.clone(),
             self.tokenizer,
@@ -132,16 +152,6 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
             market_maker_wallet,
             frameworks.mint,
             frameworks.redemption,
-        ));
-
-        let usdc = Arc::new(CrossVenueCashTransfer::new(
-            self.broker,
-            self.wallet,
-            self.cctp,
-            self.raindex,
-            frameworks.usdc,
-            market_maker_wallet,
-            usdc_vault_id,
         ));
 
         let shutdown_token = CancellationToken::new();

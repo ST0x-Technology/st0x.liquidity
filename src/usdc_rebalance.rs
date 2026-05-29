@@ -215,6 +215,7 @@ pub(crate) enum UsdcRebalanceCommand {
     /// Record the Circle attestation. Valid only from `Bridging` state.
     /// The cctp_nonce is extracted from the attested message (not the burn tx, which has placeholder).
     ReceiveAttestation {
+        message: Vec<u8>,
         attestation: Vec<u8>,
         cctp_nonce: B256,
     },
@@ -291,6 +292,8 @@ pub(crate) enum UsdcRebalanceEvent {
     /// Circle attestation received. Enables minting on destination chain.
     /// The cctp_nonce is extracted from the attested message (the real nonce, not the placeholder).
     BridgeAttestationReceived {
+        #[serde(default)]
+        message: Vec<u8>,
         attestation: Vec<u8>,
         cctp_nonce: B256,
         attested_at: DateTime<Utc>,
@@ -428,6 +431,8 @@ pub(crate) enum UsdcRebalance {
         amount: Usdc,
         burn_tx_hash: TxHash,
         cctp_nonce: B256,
+        #[serde(default)]
+        message: Vec<u8>,
         attestation: Vec<u8>,
         initiated_at: DateTime<Utc>,
         attested_at: DateTime<Utc>,
@@ -459,6 +464,9 @@ pub(crate) enum UsdcRebalance {
     /// Deposit to destination has been initiated
     DepositInitiated {
         direction: RebalanceDirection,
+        /// Original source amount moved into the cross-venue transfer.
+        initiated_amount: Usdc,
+        /// Actual amount minted on the destination chain after CCTP fees.
         amount: Usdc,
         burn_tx_hash: TxHash,
         mint_tx_hash: TxHash,
@@ -798,6 +806,60 @@ pub(crate) async fn interrupted_usdc_rebalance_ids(
         .collect())
 }
 
+/// Returns USDC rebalance aggregate IDs whose latest event is resumable after a
+/// restart -- the ones [`recover_interrupted_usdc_rebalance_aggregates`] drives to
+/// completion. This is narrower than [`interrupted_usdc_rebalance_ids`], which
+/// returns the broader candidate set for in-progress *guard* reassertion.
+pub(crate) async fn resumable_usdc_rebalance_ids(
+    pool: &SqlitePool,
+) -> Result<Vec<UsdcRebalanceId>, sqlx::Error> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "WITH latest AS ( \
+             SELECT aggregate_id, MAX(sequence) AS max_seq \
+             FROM events \
+             WHERE aggregate_type = 'UsdcRebalance' \
+             GROUP BY aggregate_id \
+         ) \
+         SELECT latest.aggregate_id \
+         FROM events last_ev \
+         INNER JOIN latest \
+             ON last_ev.aggregate_id = latest.aggregate_id \
+            AND last_ev.sequence = latest.max_seq \
+         WHERE last_ev.aggregate_type = 'UsdcRebalance' \
+           AND ( \
+               last_ev.event_type IN ( \
+                   'UsdcRebalanceEvent::BridgingInitiated', \
+                   'UsdcRebalanceEvent::BridgeAttestationReceived', \
+                   'UsdcRebalanceEvent::Bridged', \
+                   'UsdcRebalanceEvent::DepositInitiated' \
+               ) \
+               OR ( \
+                   last_ev.event_type = 'UsdcRebalanceEvent::DepositConfirmed' \
+                   AND json_extract(last_ev.payload, '$.DepositConfirmed.direction') = 'BaseToAlpaca' \
+               ) \
+           ) \
+         ORDER BY latest.aggregate_id",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            UsdcRebalanceId::from_str(&row).map_err(|error| sqlx::Error::Decode(Box::new(error)))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn cctp_message_with_nonce_for_test(nonce: B256) -> Vec<u8> {
+    const NONCE_INDEX: usize = 12;
+    const MESSAGE_LENGTH: usize = 44;
+
+    let mut message = vec![0; MESSAGE_LENGTH];
+    message[NONCE_INDEX..MESSAGE_LENGTH].copy_from_slice(nonce.as_slice());
+    message
+}
+
 #[async_trait]
 impl EventSourced for UsdcRebalance {
     type Id = UsdcRebalanceId;
@@ -814,7 +876,9 @@ impl EventSourced for UsdcRebalance {
     // so they rebuild from events. No event upcaster needed: persisted events
     // only ever stored cctp_nonce=null (the nonce bug prevented any successful
     // attestation), which deserializes unchanged into Option<B256>.
-    const SCHEMA_VERSION: u64 = 2;
+    // v3: Attested now persists full attested message bytes, and
+    // DepositInitiated retains the original initiated amount for recovery.
+    const SCHEMA_VERSION: u64 = 3;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use UsdcRebalanceEvent::*;
@@ -975,6 +1039,7 @@ impl EventSourced for UsdcRebalance {
 
             (
                 BridgeAttestationReceived {
+                    message,
                     attestation,
                     cctp_nonce,
                     attested_at,
@@ -991,6 +1056,7 @@ impl EventSourced for UsdcRebalance {
                 amount: *amount,
                 burn_tx_hash: *burn_tx_hash,
                 cctp_nonce: *cctp_nonce,
+                message: message.clone(),
                 attestation: attestation.clone(),
                 initiated_at: *initiated_at,
                 attested_at: *attested_at,
@@ -1063,6 +1129,7 @@ impl EventSourced for UsdcRebalance {
                 },
                 Self::Bridged {
                     direction,
+                    amount,
                     amount_received,
                     burn_tx_hash,
                     mint_tx_hash,
@@ -1071,6 +1138,7 @@ impl EventSourced for UsdcRebalance {
                 },
             ) => Self::DepositInitiated {
                 direction: direction.clone(),
+                initiated_amount: *amount,
                 amount: *amount_received,
                 burn_tx_hash: *burn_tx_hash,
                 mint_tx_hash: *mint_tx_hash,
@@ -1086,6 +1154,7 @@ impl EventSourced for UsdcRebalance {
                 },
                 Self::DepositInitiated {
                     direction,
+                    initiated_amount: _,
                     amount,
                     burn_tx_hash,
                     mint_tx_hash,
@@ -1210,9 +1279,10 @@ impl EventSourced for UsdcRebalance {
             FailWithdrawal { reason } => self.transition_fail_withdrawal(reason),
             InitiateBridging { burn_tx } => self.transition_initiate_bridging(burn_tx),
             ReceiveAttestation {
+                message,
                 attestation,
                 cctp_nonce,
-            } => self.transition_receive_attestation(attestation, cctp_nonce),
+            } => self.transition_receive_attestation(message, attestation, cctp_nonce),
             ConfirmBridging {
                 mint_tx,
                 amount_received,
@@ -1409,6 +1479,7 @@ impl UsdcRebalance {
 
     fn transition_receive_attestation(
         &self,
+        message: Vec<u8>,
         attestation: Vec<u8>,
         cctp_nonce: B256,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
@@ -1421,6 +1492,7 @@ impl UsdcRebalance {
             | Self::WithdrawalComplete { .. }
             | Self::WithdrawalFailed { .. } => Err(UsdcRebalanceError::BridgingNotInitiated),
             Self::Bridging { .. } => Ok(vec![BridgeAttestationReceived {
+                message,
                 attestation,
                 cctp_nonce,
                 attested_at: Utc::now(),
@@ -1612,6 +1684,117 @@ mod tests {
         fixed_bytes!("0xa01ca42d9082e926a81dc287d973a8f072dfa1b20a4fbf7b20f3abda1b376278");
     const OTHER_CCTP_NONCE: B256 =
         fixed_bytes!("0x524cd90eb8dffcb29fcc163aa8258d84e6cc25abc0b4700d704936812ee39824");
+
+    async fn insert_usdc_event(
+        pool: &SqlitePool,
+        aggregate_id: &str,
+        sequence: i64,
+        event_type: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+             VALUES ('UsdcRebalance', ?, ?, ?, '1.0', '{}', '{}')",
+        )
+        .bind(aggregate_id)
+        .bind(sequence)
+        .bind(event_type)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn resumable_usdc_rebalance_ids_returns_resumable_bridge_states() {
+        let pool = crate::test_utils::setup_test_db().await;
+
+        for (id, event_type) in [
+            (
+                "00000000-0000-0000-0000-000000000001",
+                "UsdcRebalanceEvent::BridgingInitiated",
+            ),
+            (
+                "00000000-0000-0000-0000-000000000002",
+                "UsdcRebalanceEvent::BridgeAttestationReceived",
+            ),
+            (
+                "00000000-0000-0000-0000-000000000003",
+                "UsdcRebalanceEvent::Bridged",
+            ),
+            (
+                "00000000-0000-0000-0000-000000000004",
+                "UsdcRebalanceEvent::DepositInitiated",
+            ),
+        ] {
+            insert_usdc_event(&pool, id, 0, "UsdcRebalanceEvent::Initiated").await;
+            insert_usdc_event(&pool, id, 1, event_type).await;
+        }
+
+        insert_usdc_event(
+            &pool,
+            "00000000-0000-0000-0000-000000000005",
+            0,
+            "UsdcRebalanceEvent::Initiated",
+        )
+        .await;
+        insert_usdc_event(
+            &pool,
+            "00000000-0000-0000-0000-000000000005",
+            1,
+            "UsdcRebalanceEvent::DepositConfirmed",
+        )
+        .await;
+
+        let result = resumable_usdc_rebalance_ids(&pool).await.unwrap();
+
+        assert_eq!(
+            result,
+            vec![
+                UsdcRebalanceId::from_str("00000000-0000-0000-0000-000000000001").unwrap(),
+                UsdcRebalanceId::from_str("00000000-0000-0000-0000-000000000002").unwrap(),
+                UsdcRebalanceId::from_str("00000000-0000-0000-0000-000000000003").unwrap(),
+                UsdcRebalanceId::from_str("00000000-0000-0000-0000-000000000004").unwrap(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn resumable_usdc_rebalance_ids_includes_base_to_alpaca_deposit_confirmed_only() {
+        let pool = crate::test_utils::setup_test_db().await;
+
+        let insert_deposit_confirmed = |id: &'static str, direction: &'static str| {
+            let pool = pool.clone();
+            async move {
+                insert_usdc_event(&pool, id, 0, "UsdcRebalanceEvent::Initiated").await;
+                let payload = format!(
+                    "{{\"DepositConfirmed\":{{\"direction\":\"{direction}\",\
+                     \"deposit_confirmed_at\":\"2026-05-29T00:00:00Z\"}}}}"
+                );
+                sqlx::query(
+                    "INSERT INTO events \
+                     (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+                     VALUES ('UsdcRebalance', ?, 1, 'UsdcRebalanceEvent::DepositConfirmed', '1.0', ?, '{}')",
+                )
+                .bind(id)
+                .bind(payload)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+
+        // BaseToAlpaca DepositConfirmed is non-terminal (conversion pending) -> resumable.
+        insert_deposit_confirmed("00000000-0000-0000-0000-0000000000b2", "BaseToAlpaca").await;
+        // AlpacaToBase DepositConfirmed is terminal -> excluded.
+        insert_deposit_confirmed("00000000-0000-0000-0000-0000000000a2", "AlpacaToBase").await;
+
+        let result = resumable_usdc_rebalance_ids(&pool).await.unwrap();
+
+        assert_eq!(
+            result,
+            vec![UsdcRebalanceId::from_str("00000000-0000-0000-0000-0000000000b2").unwrap()]
+        );
+    }
 
     #[tokio::test]
     async fn test_initiate_alpaca_to_base() {
@@ -2043,6 +2226,7 @@ mod tests {
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let message = cctp_message_with_nonce_for_test(TEST_CCTP_NONCE);
         let attestation = vec![0x01, 0x02, 0x03, 0x04];
 
         let events = TestHarness::<UsdcRebalance>::with(())
@@ -2062,6 +2246,7 @@ mod tests {
                 },
             ])
             .when(UsdcRebalanceCommand::ReceiveAttestation {
+                message: message.clone(),
                 attestation: attestation.clone(),
                 cctp_nonce: TEST_CCTP_NONCE,
             })
@@ -2070,6 +2255,7 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         let UsdcRebalanceEvent::BridgeAttestationReceived {
+            message: event_message,
             attestation: event_attestation,
             ..
         } = &events[0]
@@ -2077,7 +2263,54 @@ mod tests {
             panic!("Expected BridgeAttestationReceived event");
         };
 
+        assert_eq!(*event_message, message);
         assert_eq!(*event_attestation, attestation);
+    }
+
+    #[test]
+    fn replay_attestation_received_restores_message_bytes() {
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let burn_tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let message = cctp_message_with_nonce_for_test(TEST_CCTP_NONCE);
+        let attestation = vec![0x01, 0x02, 0x03, 0x04];
+
+        let entity = replay::<UsdcRebalance>(vec![
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc::new(float!(1000.00)),
+                withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::WithdrawalConfirmed {
+                confirmed_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::BridgingInitiated {
+                burn_tx_hash,
+                burned_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::BridgeAttestationReceived {
+                message: message.clone(),
+                attestation: attestation.clone(),
+                cctp_nonce: TEST_CCTP_NONCE,
+                attested_at: Utc::now(),
+            },
+        ])
+        .unwrap();
+
+        let Some(UsdcRebalance::Attested {
+            message: replayed_message,
+            attestation: replayed_attestation,
+            cctp_nonce,
+            ..
+        }) = entity
+        else {
+            panic!("Expected Attested state");
+        };
+
+        assert_eq!(replayed_message, message);
+        assert_eq!(replayed_attestation, attestation);
+        assert_eq!(cctp_nonce, TEST_CCTP_NONCE);
     }
 
     #[tokio::test]
@@ -2085,6 +2318,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::ReceiveAttestation {
+                message: vec![0; 44],
                 attestation: vec![0x01, 0x02],
                 cctp_nonce: TEST_CCTP_NONCE,
             })
@@ -2109,6 +2343,7 @@ mod tests {
                 initiated_at: Utc::now(),
             }])
             .when(UsdcRebalanceCommand::ReceiveAttestation {
+                message: vec![0; 44],
                 attestation: vec![0x01, 0x02],
                 cctp_nonce: TEST_CCTP_NONCE,
             })
@@ -2138,6 +2373,7 @@ mod tests {
                 },
             ])
             .when(UsdcRebalanceCommand::ReceiveAttestation {
+                message: vec![0; 44],
                 attestation: vec![0x01, 0x02],
                 cctp_nonce: TEST_CCTP_NONCE,
             })
@@ -2168,6 +2404,7 @@ mod tests {
                 },
             ])
             .when(UsdcRebalanceCommand::ReceiveAttestation {
+                message: vec![0; 44],
                 attestation: vec![0x01, 0x02],
                 cctp_nonce: TEST_CCTP_NONCE,
             })
@@ -2202,12 +2439,14 @@ mod tests {
                     burned_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
+                    message: vec![0; 44],
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
                 },
             ])
             .when(UsdcRebalanceCommand::ReceiveAttestation {
+                message: vec![0; 44],
                 attestation: vec![0x03, 0x04],
                 cctp_nonce: OTHER_CCTP_NONCE,
             })
@@ -2244,6 +2483,7 @@ mod tests {
                     burned_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
+                    message: vec![0; 44],
                     attestation: vec![0x01, 0x02, 0x03, 0x04],
                     cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
@@ -2412,6 +2652,7 @@ mod tests {
                     burned_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
+                    message: vec![0; 44],
                     attestation: vec![0x01, 0x02],
                     cctp_nonce,
                     attested_at: Utc::now(),
@@ -2511,6 +2752,7 @@ mod tests {
                     burned_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
+                    message: vec![0; 44],
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
@@ -2562,6 +2804,7 @@ mod tests {
                     burned_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
+                    message: vec![0; 44],
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
@@ -2652,6 +2895,7 @@ mod tests {
                     burned_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
+                    message: vec![0; 44],
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
@@ -2709,6 +2953,7 @@ mod tests {
                     burned_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
+                    message: vec![0; 44],
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
@@ -2761,6 +3006,7 @@ mod tests {
                     burned_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
+                    message: vec![0; 44],
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
@@ -2805,6 +3051,7 @@ mod tests {
                     burned_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
+                    message: vec![0; 44],
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
@@ -2856,6 +3103,7 @@ mod tests {
                     burned_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
+                    message: vec![0; 44],
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
@@ -2904,6 +3152,7 @@ mod tests {
                     burned_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
+                    message: vec![0; 44],
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
@@ -2967,6 +3216,7 @@ mod tests {
                     burned_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
+                    message: vec![0; 44],
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
@@ -3026,6 +3276,7 @@ mod tests {
                     burned_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
+                    message: vec![0; 44],
                     attestation: vec![0xAB, 0xCD, 0xEF],
                     cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
@@ -3078,6 +3329,7 @@ mod tests {
                     burned_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
+                    message: vec![0; 44],
                     attestation: vec![0x11, 0x22, 0x33, 0x44],
                     cctp_nonce: OTHER_CCTP_NONCE,
                     attested_at: Utc::now(),
@@ -3185,6 +3437,7 @@ mod tests {
                 },
             ])
             .when(UsdcRebalanceCommand::ReceiveAttestation {
+                message: vec![0; 44],
                 attestation: vec![0x01],
                 cctp_nonce: TEST_CCTP_NONCE,
             })
@@ -3263,6 +3516,7 @@ mod tests {
                     burned_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
+                    message: vec![0; 44],
                     attestation: vec![0x01],
                     cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
@@ -3316,6 +3570,7 @@ mod tests {
                     burned_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
+                    message: vec![0; 44],
                     attestation: vec![0x01],
                     cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
@@ -3372,6 +3627,7 @@ mod tests {
                     burned_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
+                    message: vec![0; 44],
                     attestation: vec![0x01],
                     cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
@@ -3689,6 +3945,7 @@ mod tests {
                     burned_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
+                    message: vec![0; 44],
                     attestation: vec![0x01],
                     cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
@@ -3755,6 +4012,7 @@ mod tests {
                     burned_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
+                    message: vec![0; 44],
                     attestation: vec![0x01],
                     cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
@@ -3827,6 +4085,7 @@ mod tests {
                     burned_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
+                    message: vec![0; 44],
                     attestation: vec![0x01],
                     cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
@@ -3888,6 +4147,7 @@ mod tests {
                     burned_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::BridgeAttestationReceived {
+                    message: vec![0; 44],
                     attestation: vec![0x01],
                     cctp_nonce: TEST_CCTP_NONCE,
                     attested_at: Utc::now(),
@@ -3955,6 +4215,7 @@ mod tests {
                 burned_at: withdrawal_confirmed_at,
             },
             UsdcRebalanceEvent::BridgeAttestationReceived {
+                message: vec![0; 44],
                 attestation: vec![0x01],
                 cctp_nonce: TEST_CCTP_NONCE,
                 attested_at: withdrawal_confirmed_at + chrono::Duration::seconds(15),
@@ -4335,6 +4596,7 @@ mod tests {
             amount: Usdc::new(float!(1500)),
             burn_tx_hash: burn_tx,
             cctp_nonce: TEST_CCTP_NONCE,
+            message: cctp_message_with_nonce_for_test(TEST_CCTP_NONCE),
             attestation: vec![0xAA, 0xBB],
             initiated_at,
             attested_at,
@@ -4401,6 +4663,7 @@ mod tests {
             fixed_bytes!("0x000000000000000000000000000000000000000000000000000000000000000b");
         let state = UsdcRebalance::DepositInitiated {
             direction: RebalanceDirection::BaseToAlpaca,
+            initiated_amount: Usdc::new(float!(3001)),
             amount: Usdc::new(float!(3000)),
             burn_tx_hash: burn_tx,
             mint_tx_hash: mint_tx,
@@ -4483,6 +4746,7 @@ mod tests {
                 amount,
                 burn_tx_hash: BURN_TX,
                 cctp_nonce: TEST_CCTP_NONCE,
+                message: vec![],
                 attestation: vec![],
                 initiated_at: now,
                 attested_at: now,
@@ -4505,6 +4769,7 @@ mod tests {
         assert!(
             DepositInitiated {
                 direction: AlpacaToBase,
+                initiated_amount: amount,
                 amount,
                 burn_tx_hash: BURN_TX,
                 mint_tx_hash: MINT_TX,

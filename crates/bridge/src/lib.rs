@@ -31,7 +31,7 @@ pub struct BurnReceipt {
 }
 
 /// Receipt from minting USDC on the destination chain.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct MintReceipt {
     /// Transaction hash of the mint transaction
     pub tx: TxHash,
@@ -45,6 +45,9 @@ pub struct MintReceipt {
 pub trait Attestation: Send + Sync {
     /// Returns the 32-byte CCTP V2 nonce for this attestation.
     fn nonce(&self) -> B256;
+
+    /// Returns the raw CCTP message bytes attested by Circle.
+    fn message_bytes(&self) -> &[u8];
 
     /// Returns the raw attestation bytes.
     fn as_bytes(&self) -> &[u8];
