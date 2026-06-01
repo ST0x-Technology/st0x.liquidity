@@ -24,7 +24,6 @@ use st0x_execution::{FractionalShares, Positive, SharesBlockchain, SharesConvers
 use st0x_finance::{HasZero, Usd, Usdc};
 
 use self::usdc::UsdcRebalanceOperation;
-use crate::conductor::job::QueuePushError;
 use crate::equity_redemption::{
     EquityRedemption, EquityRedemptionCommand, EquityRedemptionEvent, RedemptionAggregateId,
 };
@@ -41,6 +40,10 @@ use crate::rebalancing::usdc::{
 };
 use crate::tokenized_equity_mint::{
     IssuerRequestId, TokenizedEquityMint, TokenizedEquityMintCommand, TokenizedEquityMintEvent,
+};
+use crate::unwrapped_equity_recovery::aggregate::UnwrappedEquityRecoveryId;
+use crate::unwrapped_equity_recovery::{
+    UnwrappedEquityRecoveryJob, UnwrappedEquityRecoveryJobQueue,
 };
 use crate::usdc_rebalance::{
     RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent, UsdcRebalanceId,
@@ -60,6 +63,7 @@ pub(crate) struct RebalancingSchedulers {
     pub(crate) equity: EquityRebalancingCheckScheduler,
     pub(crate) usdc: UsdcRebalancingCheckScheduler,
     pub(crate) wrapped_equity_recovery: WrappedEquityRecoveryJobQueue,
+    pub(crate) unwrapped_equity_recovery: UnwrappedEquityRecoveryJobQueue,
     pub(crate) transfer_usdc_to_hedging: TransferUsdcToHedgingJobQueue,
     pub(crate) transfer_usdc_to_market_making: TransferUsdcToMarketMakingJobQueue,
 }
@@ -70,6 +74,7 @@ impl RebalancingSchedulers {
             equity: EquityRebalancingCheckScheduler::new(pool),
             usdc: UsdcRebalancingCheckScheduler::new(pool),
             wrapped_equity_recovery: WrappedEquityRecoveryJobQueue::new(pool),
+            unwrapped_equity_recovery: UnwrappedEquityRecoveryJobQueue::new(pool),
             transfer_usdc_to_hedging: TransferUsdcToHedgingJobQueue::new(pool),
             transfer_usdc_to_market_making: TransferUsdcToMarketMakingJobQueue::new(pool),
         }
@@ -443,6 +448,7 @@ pub(crate) struct RebalancingService {
     pub(super) equity_scheduler: EquityRebalancingCheckScheduler,
     pub(super) usdc_scheduler: UsdcRebalancingCheckScheduler,
     pub(super) wrapped_equity_recovery_queue: WrappedEquityRecoveryJobQueue,
+    pub(super) unwrapped_equity_recovery_queue: UnwrappedEquityRecoveryJobQueue,
     /// Queues for the USDC transfer apalis jobs that drive each rebalancing
     /// direction. `check_and_trigger_usdc` enqueues into one of these
     /// directly rather than dispatching through the `Rebalancer` mpsc channel.
@@ -498,6 +504,7 @@ impl RebalancingService {
             equity: equity_scheduler,
             usdc: usdc_scheduler,
             wrapped_equity_recovery: wrapped_equity_recovery_queue,
+            unwrapped_equity_recovery: unwrapped_equity_recovery_queue,
             transfer_usdc_to_hedging: transfer_usdc_to_hedging_queue,
             transfer_usdc_to_market_making: transfer_usdc_to_market_making_queue,
         } = schedulers;
@@ -515,6 +522,7 @@ impl RebalancingService {
             equity_scheduler,
             usdc_scheduler,
             wrapped_equity_recovery_queue,
+            unwrapped_equity_recovery_queue,
             transfer_usdc_to_hedging_queue,
             transfer_usdc_to_market_making_queue,
             mint_tracking: Arc::new(RwLock::new(HashMap::new())),
@@ -1355,6 +1363,79 @@ impl RebalancingService {
                     }
                 }
             }
+            // Unwrapped equity (tSTOCK) in the bot wallet triggers a
+            // recovery dispatch per symbol with a positive balance.
+            // Gated per-symbol on `wrapped_equity_recovery` -- the same
+            // config flag covers both detection paths since they share
+            // the same "auto-recover misplaced equity" intent.
+            BaseWalletUnwrappedEquity { balances, .. } => {
+                for (symbol, amount) in balances {
+                    if *amount == FractionalShares::ZERO {
+                        continue;
+                    }
+                    if !self.is_wrapped_equity_recovery_enabled(symbol) {
+                        continue;
+                    }
+                    let mut queue = self.unwrapped_equity_recovery_queue.clone();
+                    let job_type = std::any::type_name::<UnwrappedEquityRecoveryJob>();
+                    let symbol_pattern = format!("%{symbol}%");
+                    // Status-scoped dedup, mirroring the wrapped path: only a
+                    // non-terminal row blocks a re-enqueue. apalis's
+                    // `ON CONFLICT(job_type, idempotency_key) DO NOTHING` never
+                    // surfaces a unique-violation, and its index spans all
+                    // statuses, so an idempotency key would silently wedge a
+                    // symbol behind its own `Done` row until the hourly cleanup
+                    // -- starving the next-poll re-dispatch the guard-contention
+                    // skip relies on.
+                    let existing: Result<(i64,), _> = sqlx::query_as(
+                        "SELECT COUNT(*) FROM Jobs \
+                         WHERE job_type = ? \
+                         AND status IN ('Pending', 'Queued', 'Running') \
+                         AND job LIKE ?",
+                    )
+                    .bind(job_type)
+                    .bind(&symbol_pattern)
+                    .fetch_one(queue.pool())
+                    .await;
+
+                    match existing {
+                        Ok((count,)) if count > 0 => {
+                            debug!(
+                                target: "rebalance",
+                                %symbol, %count,
+                                "Skipped UnwrappedEquityRecoveryJob enqueue: a non-terminal \
+                                 row for this symbol already exists",
+                            );
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            warn!(
+                                target: "rebalance",
+                                %symbol, %error,
+                                "Failed to query existing UnwrappedEquityRecoveryJob rows; \
+                                 skipping enqueue to avoid duplicates",
+                            );
+                            continue;
+                        }
+                    }
+
+                    let recovery_id = UnwrappedEquityRecoveryId(uuid::Uuid::new_v4());
+                    if let Err(error) = queue
+                        .push(UnwrappedEquityRecoveryJob {
+                            symbol: symbol.clone(),
+                            recovery_id: recovery_id.clone(),
+                        })
+                        .await
+                    {
+                        warn!(
+                            target: "rebalance",
+                            %symbol, %recovery_id, ?error,
+                            "Failed to enqueue UnwrappedEquityRecoveryJob",
+                        );
+                    }
+                }
+            }
             // Wallet-read USDC events update `inflight_cash` for
             // visibility but don't drive triggers here.
             // Suppression-aware re-triggering will be added once
@@ -1362,7 +1443,6 @@ impl RebalancingService {
             EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
             | AlpacaUsdc { .. }
-            | BaseWalletUnwrappedEquity { .. }
             // Buying power is display-only and doesn't feed any rebalance
             // decision.
             | OffchainCashBuyingPower { .. }
@@ -2115,7 +2195,7 @@ impl RebalancingService {
                 true
             }
 
-            Err(QueuePushError(error)) => {
+            Err(error) => {
                 warn!(
                     target: "rebalance",
                     %error,
@@ -2192,7 +2272,7 @@ impl RebalancingService {
                 true
             }
 
-            Err(QueuePushError(error)) => {
+            Err(error) => {
                 warn!(
                     target: "rebalance",
                     %error,

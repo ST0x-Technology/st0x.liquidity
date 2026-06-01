@@ -71,6 +71,10 @@ use crate::tokenization::alpaca::AlpacaTokenizationService;
 use crate::tokenized_equity_mint::{TokenizedEquityMint, interrupted_mint_ids};
 use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::trade_accountant::{DexTradeAccountingJobQueue, TradeAccountingError};
+use crate::unwrapped_equity_recovery::{
+    UnwrappedEquityRecovery, UnwrappedEquityRecoveryCtx, UnwrappedEquityRecoveryJobQueue,
+    UnwrappedEquityRecoveryServices,
+};
 use crate::vault_registry::{
     SeedVaultRegistry, SeedVaultRegistryCtx, SeedVaultRegistryJobQueue, VaultRegistry,
     VaultRegistryCommand, VaultRegistryId,
@@ -206,6 +210,7 @@ impl Conductor {
             service: rebalancing_service,
             recovery_transfer,
             wrapped_equity_recovery_store,
+            unwrapped_equity_recovery_store,
             mint_store,
             redemption_store,
             transfer_usdc_to_hedging_ctx,
@@ -256,15 +261,34 @@ impl Conductor {
         let rejection_queue = HandleOrderRejectionJobQueue::new(&pool);
 
         let wrapped_equity_recovery_queue = WrappedEquityRecoveryJobQueue::new(&pool);
+        let unwrapped_equity_recovery_queue = UnwrappedEquityRecoveryJobQueue::new(&pool);
 
         let wrapped_equity_recovery_ctx = match (
             wrapped_equity_recovery_store,
+            rebalancing_service.clone(),
+            mint_store.clone(),
+            redemption_store.clone(),
+        ) {
+            (Some(store), Some(service), Some(mint_store), Some(redemption_store)) => {
+                Some(Arc::new(WrappedEquityRecoveryCtx {
+                    inventory: inventory.clone(),
+                    store,
+                    mint_store,
+                    redemption_store,
+                    equity_in_progress: service.equity_in_progress.clone(),
+                }))
+            }
+            _ => None,
+        };
+
+        let unwrapped_equity_recovery_ctx = match (
+            unwrapped_equity_recovery_store,
             rebalancing_service.clone(),
             mint_store,
             redemption_store,
         ) {
             (Some(store), Some(service), Some(mint_store), Some(redemption_store)) => {
-                Some(Arc::new(WrappedEquityRecoveryCtx {
+                Some(Arc::new(UnwrappedEquityRecoveryCtx {
                     inventory: inventory.clone(),
                     store,
                     mint_store,
@@ -321,6 +345,8 @@ impl Conductor {
             .check_positions_queue(check_positions_queue)
             .wrapped_equity_recovery_queue(wrapped_equity_recovery_queue)
             .maybe_wrapped_equity_recovery_ctx(wrapped_equity_recovery_ctx)
+            .unwrapped_equity_recovery_queue(unwrapped_equity_recovery_queue)
+            .maybe_unwrapped_equity_recovery_ctx(unwrapped_equity_recovery_ctx)
             .equity_check_scheduler(schedulers.equity)
             .usdc_check_scheduler(schedulers.usdc)
             .transfer_usdc_to_hedging_queue(schedulers.transfer_usdc_to_hedging)
@@ -615,6 +641,7 @@ struct RebalancingInfrastructure {
     service: Arc<RebalancingService>,
     recovery_transfer: Arc<CrossVenueEquityTransfer>,
     wrapped_equity_recovery_store: Arc<Store<WrappedEquityRecovery>>,
+    unwrapped_equity_recovery_store: Arc<Store<UnwrappedEquityRecovery>>,
     mint_store: Arc<Store<TokenizedEquityMint>>,
     redemption_store: Arc<Store<EquityRedemption>>,
     transfer_usdc_to_hedging_ctx: Arc<TransferUsdcToHedgingCtx>,
@@ -648,6 +675,7 @@ struct PositionAndRebalancing {
     service: Option<Arc<RebalancingService>>,
     recovery_transfer: Option<Arc<CrossVenueEquityTransfer>>,
     wrapped_equity_recovery_store: Option<Arc<Store<WrappedEquityRecovery>>>,
+    unwrapped_equity_recovery_store: Option<Arc<Store<UnwrappedEquityRecovery>>>,
     mint_store: Option<Arc<Store<TokenizedEquityMint>>>,
     redemption_store: Option<Arc<Store<EquityRedemption>>>,
     transfer_usdc_to_hedging_ctx: Option<Arc<TransferUsdcToHedgingCtx>>,
@@ -705,6 +733,7 @@ impl PositionAndRebalancing {
                 service: Some(infra.service),
                 recovery_transfer: Some(infra.recovery_transfer),
                 wrapped_equity_recovery_store: Some(infra.wrapped_equity_recovery_store),
+                unwrapped_equity_recovery_store: Some(infra.unwrapped_equity_recovery_store),
                 mint_store: Some(infra.mint_store),
                 redemption_store: Some(infra.redemption_store),
                 transfer_usdc_to_hedging_ctx: Some(infra.transfer_usdc_to_hedging_ctx),
@@ -733,6 +762,7 @@ impl PositionAndRebalancing {
                 service: None,
                 recovery_transfer: None,
                 wrapped_equity_recovery_store: None,
+                unwrapped_equity_recovery_store: None,
                 mint_store: None,
                 redemption_store: None,
                 transfer_usdc_to_hedging_ctx: None,
@@ -857,6 +887,16 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
                 })
                 .await?;
 
+        let unwrapped_equity_recovery_store =
+            StoreBuilder::<UnwrappedEquityRecovery>::new(deps.pool.clone())
+                .build(UnwrappedEquityRecoveryServices {
+                    raindex: raindex_service.clone(),
+                    wrapper: wrapper.clone(),
+                    transfer: recovery_transfer.clone(),
+                    wallet: base_wallet.address(),
+                })
+                .await?;
+
         recover_interrupted_tokenization_aggregates(
             &deps.pool,
             &rebalancing_service,
@@ -929,6 +969,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             service: rebalancing_service,
             recovery_transfer,
             wrapped_equity_recovery_store,
+            unwrapped_equity_recovery_store,
             mint_store,
             redemption_store,
             transfer_usdc_to_hedging_ctx,

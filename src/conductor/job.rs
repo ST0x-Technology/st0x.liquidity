@@ -78,8 +78,10 @@ pub(crate) struct JobQueue<Task>(Storage<Task>);
 /// Wrapping [`TaskSinkError`] keeps the failure chain typed so callers can
 /// `#[from]` it into their own error enums instead of boxing.
 #[derive(Debug, thiserror::Error)]
-#[error("Failed to enqueue apalis job: {0}")]
-pub(crate) struct QueuePushError(#[from] pub(crate) TaskSinkError<sqlx::Error>);
+pub(crate) enum QueuePushError {
+    #[error("failed to enqueue apalis job: {0}")]
+    Sink(#[from] TaskSinkError<sqlx::Error>),
+}
 
 impl<Task> Clone for JobQueue<Task> {
     fn clone(&self) -> Self {
@@ -311,6 +313,7 @@ pub enum JobKind {
     UsdcRebalancingCheck,
     SeedVaultRegistry,
     WrappedEquityRecovery,
+    UnwrappedEquityRecovery,
     CheckPositions,
     MockBroker,
     TransferUsdcToHedging,
@@ -349,6 +352,7 @@ pub struct FailureInjector {
     usdc_rebalancing_check: Arc<Mutex<InjectionState>>,
     seed_vault_registry: Arc<Mutex<InjectionState>>,
     wrapped_equity_recovery: Arc<Mutex<InjectionState>>,
+    unwrapped_equity_recovery: Arc<Mutex<InjectionState>>,
     check_positions: Arc<Mutex<InjectionState>>,
     mock_broker: Arc<Mutex<InjectionState>>,
     transfer_usdc_to_hedging: Arc<Mutex<InjectionState>>,
@@ -385,6 +389,7 @@ impl FailureInjector {
             usdc_rebalancing_check: Arc::new(Mutex::new(InjectionState::Idle)),
             seed_vault_registry: Arc::new(Mutex::new(InjectionState::Idle)),
             wrapped_equity_recovery: Arc::new(Mutex::new(InjectionState::Idle)),
+            unwrapped_equity_recovery: Arc::new(Mutex::new(InjectionState::Idle)),
             check_positions: Arc::new(Mutex::new(InjectionState::Idle)),
             mock_broker: Arc::new(Mutex::new(InjectionState::Idle)),
             transfer_usdc_to_hedging: Arc::new(Mutex::new(InjectionState::Idle)),
@@ -433,6 +438,7 @@ impl FailureInjector {
             JobKind::UsdcRebalancingCheck => &self.usdc_rebalancing_check,
             JobKind::SeedVaultRegistry => &self.seed_vault_registry,
             JobKind::WrappedEquityRecovery => &self.wrapped_equity_recovery,
+            JobKind::UnwrappedEquityRecovery => &self.unwrapped_equity_recovery,
             JobKind::CheckPositions => &self.check_positions,
             JobKind::MockBroker => &self.mock_broker,
             JobKind::TransferUsdcToHedging => &self.transfer_usdc_to_hedging,
@@ -604,6 +610,38 @@ mod tests {
                 InjectionState::Armed
             ),
             "WrappedEquityRecovery state should remain Armed when an unrelated kind is queried",
+        );
+    }
+
+    #[test]
+    fn failure_injector_unwrapped_equity_recovery_isolated() {
+        let injector = FailureInjector::new();
+
+        injector.arm(JobKind::UnwrappedEquityRecovery);
+        assert!(
+            injector.is_armed(JobKind::UnwrappedEquityRecovery),
+            "UnwrappedEquityRecovery should report armed after arm()",
+        );
+        assert!(
+            !injector.is_armed(JobKind::UnwrappedEquityRecovery),
+            "Second check should auto-disarm UnwrappedEquityRecovery",
+        );
+
+        injector.arm(JobKind::UnwrappedEquityRecovery);
+        assert!(
+            !injector.is_armed(JobKind::WrappedEquityRecovery),
+            "Arming UnwrappedEquityRecovery must not arm WrappedEquityRecovery",
+        );
+        assert!(
+            !injector.is_armed(JobKind::OrderFill),
+            "Arming UnwrappedEquityRecovery must not arm OrderFill",
+        );
+        assert!(
+            matches!(
+                &*injector.lock_state(JobKind::UnwrappedEquityRecovery),
+                InjectionState::Armed
+            ),
+            "UnwrappedEquityRecovery state should remain Armed when an unrelated kind is queried",
         );
     }
 

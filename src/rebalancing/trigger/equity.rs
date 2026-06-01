@@ -11,7 +11,7 @@ use tracing::{debug, trace, warn};
 use st0x_execution::{FractionalShares, Positive, Symbol};
 
 use super::{RebalancingService, TokenAddressError, TriggeredOperation};
-use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
+use crate::conductor::job::{Job, JobQueue, Label};
 use crate::inventory::{
     BroadcastingInventory, EquityImbalanceError, Imbalance, ImbalanceThreshold,
 };
@@ -256,7 +256,7 @@ impl EquityRebalancingCheckScheduler {
     /// re-trigger.
     pub(super) async fn enqueue_check(&self, symbol: Symbol) {
         let mut queue = self.queue.clone();
-        if let Err(QueuePushError(error)) = queue.push(EquityRebalancingCheck { symbol }).await {
+        if let Err(error) = queue.push(EquityRebalancingCheck { symbol }).await {
             warn!(target: "rebalance", %error, "Failed to enqueue EquityRebalancingCheck job");
         }
     }
