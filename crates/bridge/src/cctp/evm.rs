@@ -22,6 +22,18 @@ sol!(
     IERC20, env!("ST0X_IERC20_ABI")
 );
 
+/// Number of `eth_getLogs` scans that must agree a burn is absent before a
+/// resume re-issues an irreversible burn. Defends against a single load-balanced
+/// RPC node lagging and returning a false-empty result.
+const SCAN_ATTEMPTS: u32 = 5;
+
+/// Backoff between scan retries; different load-balanced nodes may answer each.
+const SCAN_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Blocks the chain head must be past `from_block` before an empty scan is
+/// trusted as a true absence (the burn lands at/after `from_block`).
+const SCAN_FINALITY_MARGIN: u64 = 2;
+
 /// Single-chain CCTP endpoint with contract instances for cross-chain operations.
 ///
 /// The wallet's provider is used for read-only view calls (e.g. allowance
@@ -140,39 +152,68 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// after `from_block`, returning the transaction hash of the most recent
     /// match.
     ///
-    /// Used for crash-safe burn recovery: a transfer records the chain head
-    /// before submitting the burn, so on resume this detects an already-
-    /// submitted burn instead of re-burning (which would burn USDC twice with at
-    /// most one mint). Matches on `(depositor, amount)` -- CCTP burns are exact,
-    /// and the single-in-flight invariant guarantees the newest match at/after
-    /// the captured chain head is the resuming transfer's burn.
+    /// Crash-safe burn recovery: a transfer records the chain head before the
+    /// burn, so on resume this detects an already-submitted burn instead of
+    /// re-burning (which would burn USDC twice with at most one mint). Matches on
+    /// `(depositor, amount, destinationDomain, mintRecipient)` so an adopted burn
+    /// is provably this transfer's -- not merely a same-amount burn from the same
+    /// wallet to a different destination.
+    ///
+    /// Returns `Ok(None)` ONLY when the queried node is confirmations-deep past
+    /// `from_block` and repeated scans agree the burn is absent; a node that may
+    /// be lagging (the dRPC load-balancing hazard) yields a retryable
+    /// [`CctpError::ScanInconclusive`] instead, so the caller never re-burns off a
+    /// single stale empty `eth_getLogs`.
     pub(super) async fn find_recent_burn(
         &self,
         amount: U256,
+        dest_domain: u32,
+        recipient: Address,
         from_block: u64,
     ) -> Result<Option<TxHash>, CctpError> {
         let depositor = self.wallet.address();
+        let mint_recipient = FixedBytes::<32>::left_padding_from(recipient.as_slice());
         let filter = Filter::new()
             .from_block(from_block)
             .address(self.token_messenger_address)
             .event_signature(TokenMessengerV2::DepositForBurn::SIGNATURE_HASH);
 
-        let logs = self.wallet.provider().get_logs(&filter).await?;
+        for attempt in 1..=SCAN_ATTEMPTS {
+            let logs = self.wallet.provider().get_logs(&filter).await?;
 
-        for log in logs.iter().rev() {
-            let decoded = log.log_decode::<TokenMessengerV2::DepositForBurn>()?;
-            let event = decoded.data();
+            for log in logs.iter().rev() {
+                let decoded = log.log_decode::<TokenMessengerV2::DepositForBurn>()?;
+                let event = decoded.data();
 
-            if event.depositor == depositor
-                && event.amount == amount
-                && let Some(tx_hash) = log.transaction_hash
-            {
-                debug!(target: "bridge", %tx_hash, from_block, "Found existing burn during resume");
-                return Ok(Some(tx_hash));
+                if event.depositor == depositor
+                    && event.amount == amount
+                    && event.destinationDomain == dest_domain
+                    && event.mintRecipient == mint_recipient
+                    && let Some(tx_hash) = log.transaction_hash
+                {
+                    debug!(target: "bridge", %tx_hash, from_block, "Found existing burn during resume");
+                    return Ok(Some(tx_hash));
+                }
+            }
+
+            // A single empty eth_getLogs from a load-balanced node is not
+            // authoritative (dRPC lag). Only conclude a true absence once the head
+            // is confirmations-deep past from_block AND repeated scans agree; else
+            // retry, and if still inconclusive return a retryable error so the
+            // caller never re-burns off a stale empty result.
+            let head = self.wallet.provider().get_block_number().await?;
+            let caught_up = head >= from_block.saturating_add(SCAN_FINALITY_MARGIN);
+
+            if caught_up && attempt == SCAN_ATTEMPTS {
+                return Ok(None);
+            }
+
+            if attempt < SCAN_ATTEMPTS {
+                tokio::time::sleep(SCAN_RETRY_BACKOFF).await;
             }
         }
 
-        Ok(None)
+        Err(CctpError::ScanInconclusive { from_block })
     }
 
     /// Scans for a `MintAndWithdraw` event minting to `recipient` strictly after

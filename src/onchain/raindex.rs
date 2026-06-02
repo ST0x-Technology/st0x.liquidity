@@ -606,7 +606,11 @@ mod tests {
     use proptest::prelude::*;
     use tracing_test::traced_test;
 
+    use alloy::providers::mock::Asserter;
+    use serde_json::json;
+
     use st0x_evm::NoOpErrorRegistry;
+    use st0x_evm::ReadOnlyEvm;
     use st0x_evm::Wallet;
     use st0x_evm::local::RawPrivateKeyWallet;
 
@@ -778,6 +782,76 @@ mod tests {
             vault_registry_projection,
             owner,
         )
+    }
+
+    /// Empty vault-registry projection for scan tests that never load the
+    /// registry (`find_recent_withdrawal` only reads logs).
+    async fn empty_vault_registry_projection() -> Arc<VaultRegistryProjection> {
+        let pool = crate::test_utils::setup_test_db().await;
+        let (_store, projection) = StoreBuilder::<VaultRegistry>::new(pool)
+            .build(())
+            .await
+            .unwrap();
+        projection
+    }
+
+    #[tokio::test]
+    async fn find_recent_withdrawal_is_inconclusive_when_node_lags() {
+        let asserter = Asserter::new();
+        let from_block = 100u64;
+        // Every scan attempt sees an empty get_logs and a head BELOW from_block --
+        // a lagging load-balanced node. The scan must NOT report absence (which
+        // would let the caller re-withdraw and double-spend); it must surface a
+        // retryable error so the resume re-runs instead.
+        for _ in 0..SCAN_ATTEMPTS {
+            asserter.push_success(&json!([]));
+            asserter.push_success(&json!("0x32")); // head = 50 < from_block
+        }
+
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let service = RaindexService::new(
+            ReadOnlyEvm::new(provider),
+            Address::ZERO,
+            empty_vault_registry_projection().await,
+            Address::ZERO,
+        );
+
+        let error = service
+            .find_recent_withdrawal(USDC_BASE, TEST_VAULT_ID, from_block)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, RaindexError::ScanInconclusive { from_block: fb } if fb == from_block),
+            "lagging node must yield retryable ScanInconclusive, got: {error:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn find_recent_withdrawal_is_none_when_caught_up_and_absent() {
+        let asserter = Asserter::new();
+        let from_block = 100u64;
+        // Empty get_logs corroborated across every attempt, with a head well past
+        // from_block: the withdrawal is genuinely absent, so re-issuing is safe.
+        for _ in 0..SCAN_ATTEMPTS {
+            asserter.push_success(&json!([]));
+            asserter.push_success(&json!("0x200")); // head = 512 >> from_block
+        }
+
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let service = RaindexService::new(
+            ReadOnlyEvm::new(provider),
+            Address::ZERO,
+            empty_vault_registry_projection().await,
+            Address::ZERO,
+        );
+
+        let result = service
+            .find_recent_withdrawal(USDC_BASE, TEST_VAULT_ID, from_block)
+            .await
+            .unwrap();
+
+        assert_eq!(result, None);
     }
 
     #[tokio::test]
