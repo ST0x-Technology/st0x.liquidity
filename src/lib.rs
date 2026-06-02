@@ -41,6 +41,7 @@ mod offchain;
 mod onchain;
 mod onchain_trade;
 mod position;
+mod position_check;
 mod rebalancing;
 mod shares;
 mod symbol;
@@ -74,6 +75,13 @@ pub use inventory::ImbalanceThreshold;
 pub use offchain::order::{OffchainOrder, OffchainOrderId};
 #[cfg(any(test, feature = "test-support"))]
 pub use position::Position;
+/// Returns the apalis job type identifier for the `CheckPositions` job,
+/// for use in tests when querying or asserting against the persistent job
+/// queue (the `Jobs.job_type` column).
+#[cfg(any(test, feature = "test-support"))]
+pub fn check_positions_job_type() -> &'static str {
+    std::any::type_name::<position_check::CheckPositions>()
+}
 #[cfg(any(test, feature = "test-support"))]
 pub use rebalancing::{RebalancingCtx, RebalancingCtxError, UsdcRebalancing};
 #[cfg(any(test, feature = "test-support"))]

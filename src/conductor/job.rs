@@ -311,6 +311,7 @@ pub enum JobKind {
     UsdcRebalancingCheck,
     SeedVaultRegistry,
     WrappedEquityRecovery,
+    CheckPositions,
 }
 
 /// Job execution error. Wraps the concrete `Job::Error` type at
@@ -345,6 +346,7 @@ pub struct FailureInjector {
     usdc_rebalancing_check: Arc<Mutex<InjectionState>>,
     seed_vault_registry: Arc<Mutex<InjectionState>>,
     wrapped_equity_recovery: Arc<Mutex<InjectionState>>,
+    check_positions: Arc<Mutex<InjectionState>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -377,6 +379,7 @@ impl FailureInjector {
             usdc_rebalancing_check: Arc::new(Mutex::new(InjectionState::Idle)),
             seed_vault_registry: Arc::new(Mutex::new(InjectionState::Idle)),
             wrapped_equity_recovery: Arc::new(Mutex::new(InjectionState::Idle)),
+            check_positions: Arc::new(Mutex::new(InjectionState::Idle)),
         }
     }
 
@@ -421,6 +424,7 @@ impl FailureInjector {
             JobKind::UsdcRebalancingCheck => &self.usdc_rebalancing_check,
             JobKind::SeedVaultRegistry => &self.seed_vault_registry,
             JobKind::WrappedEquityRecovery => &self.wrapped_equity_recovery,
+            JobKind::CheckPositions => &self.check_positions,
         };
 
         match mutex.lock() {

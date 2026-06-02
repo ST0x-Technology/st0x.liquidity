@@ -658,9 +658,9 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
 
     // Crash recovery may produce slightly more or fewer jobs than the
     // reference run. More jobs come from re-running backfill on restart
-    // and the PositionMonitor enqueueing extra PlaceHedge jobs during
-    // recovery (idempotent — the aggregate rejects duplicates via
-    // PendingExecution). Fewer jobs come from the duplicate-trade
+    // and the CheckPositions scan enqueueing extra PlaceHedge jobs
+    // during recovery (idempotent -- the aggregate rejects duplicates
+    // via PendingExecution). Fewer jobs come from the duplicate-trade
     // shortcut in `process_queued_trade`: a trade already processed
     // before the crash skips PollOrderStatus / ReconcileOrderFill
     // enqueuing on the second pass. Bound the delta in both directions
@@ -668,8 +668,8 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
     // differences.
     //
     // `MAX_JOB_DELTA` is a safety margin, not an empirically measured
-    // bound. Bidirectional ±4 catches gross re-enqueue regressions while
-    // tolerating the legitimate ±1-3 spread observed during development.
+    // bound. Bidirectional +/-4 catches gross re-enqueue regressions while
+    // tolerating the legitimate +/-1-3 spread observed during development.
     // Revisit if recovery timing or backfill/monitor cadence changes -- a
     // sudden spike past 4 indicates duplicate enqueueing, a drop below
     // -4 indicates skipped recovery work.
@@ -752,7 +752,7 @@ async fn market_hours_transitions() -> anyhow::Result<()> {
         .call()
         .await?;
 
-    // Wait for onchain trade processing (no offchain order — market closed)
+    // Wait for onchain trade processing (no offchain order -- market closed)
     poll_for_events(&mut bot, &infra.db_path, "OnChainTradeEvent::Filled", 1).await;
 
     let pool = connect_db(&infra.db_path).await?;
