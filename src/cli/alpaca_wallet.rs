@@ -622,7 +622,7 @@ pub(super) async fn alpaca_convert_command<W: Write>(
     writeln!(stdout, "   Placing market order...")?;
 
     let order = executor
-        .convert_usdc_usd(amount_exact, conversion_direction)
+        .convert_usdc_usd(amount_exact, conversion_direction, uuid::Uuid::new_v4())
         .await?;
 
     writeln!(stdout, "Conversion completed successfully!")?;

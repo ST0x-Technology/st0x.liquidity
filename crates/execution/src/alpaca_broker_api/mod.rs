@@ -54,8 +54,8 @@ pub use auth::{AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerA
 pub use executor::AlpacaBrokerApi;
 pub use journal::{JournalResponse, JournalStatus};
 pub use order::{
-    AlpacaLimitOrder, AlpacaLimitPrice, ConversionDirection, CryptoOrderResponse,
-    ParseAlpacaLimitPriceError,
+    AlpacaLimitOrder, AlpacaLimitPrice, ConversionDirection, CryptoOrderOutcome,
+    CryptoOrderResponse, ParseAlpacaLimitPriceError,
 };
 
 impl fmt::Display for TimeInForce {

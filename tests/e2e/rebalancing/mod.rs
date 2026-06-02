@@ -1024,9 +1024,10 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
 /// transfer from Base to Alpaca via CCTP bridge.
 ///
 /// Expected CQRS event flow:
-/// - `UsdcRebalance`: Initiated -> WithdrawalConfirmed -> BridgingInitiated
-///   -> BridgeAttestationReceived -> Bridged -> DepositInitiated
-///   -> DepositConfirmed -> ConversionInitiated -> ConversionConfirmed
+/// - `UsdcRebalance`: WithdrawalSubmitting -> Initiated -> WithdrawalConfirmed
+///   -> BridgingSubmitting -> BridgingInitiated -> BridgeAttestationReceived
+///   -> Bridged -> DepositInitiated -> DepositConfirmed -> ConversionInitiated
+///   -> ConversionConfirmed
 ///
 /// Infrastructure: Same as `usdc_imbalance_triggers_alpaca_to_base` but the
 /// Raindex USDC vault is pre-funded so the bot can withdraw from it.
