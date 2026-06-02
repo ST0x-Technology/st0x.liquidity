@@ -55,6 +55,9 @@ use crate::trading::onchain::trade_accountant::{
 use crate::vault_registry::{
     SeedVaultRegistry, SeedVaultRegistryCtx, SeedVaultRegistryJobQueue, VaultRegistry,
 };
+use crate::wrapped_equity_recovery::{
+    WrappedEquityRecoveryCtx, WrappedEquityRecoveryJob, WrappedEquityRecoveryJobQueue,
+};
 
 pub(crate) struct CqrsFrameworks {
     pub(crate) onchain_trade: Arc<Store<OnChainTrade>>,
@@ -93,6 +96,8 @@ pub(crate) fn spawn<Prov, Exec>(
     poll_status_queue: PollOrderStatusJobQueue,
     reconcile_queue: ReconcileOrderFillJobQueue,
     rejection_queue: HandleOrderRejectionJobQueue,
+    wrapped_equity_recovery_queue: WrappedEquityRecoveryJobQueue,
+    wrapped_equity_recovery_ctx: Option<Arc<WrappedEquityRecoveryCtx>>,
     equity_check_scheduler: EquityRebalancingCheckScheduler,
     usdc_check_scheduler: UsdcRebalancingCheckScheduler,
     rebalancing_service: Option<Arc<RebalancingService>>,
@@ -286,6 +291,8 @@ where
         poll_status_queue,
         reconcile_queue,
         rejection_queue,
+        wrapped_equity_recovery_queue,
+        wrapped_equity_recovery_ctx,
         equity_check_scheduler,
         usdc_check_scheduler,
         apalis_shutdown_token,
@@ -330,6 +337,8 @@ where
     poll_status_queue: PollOrderStatusJobQueue,
     reconcile_queue: ReconcileOrderFillJobQueue,
     rejection_queue: HandleOrderRejectionJobQueue,
+    wrapped_equity_recovery_queue: WrappedEquityRecoveryJobQueue,
+    wrapped_equity_recovery_ctx: Option<Arc<WrappedEquityRecoveryCtx>>,
     equity_check_scheduler: EquityRebalancingCheckScheduler,
     usdc_check_scheduler: UsdcRebalancingCheckScheduler,
     apalis_shutdown_token: CancellationToken,
@@ -345,6 +354,7 @@ where
     TradeAccountingError: From<Exec::Error>,
     crate::offchain::order::JobError: From<Exec::Error>,
 {
+    #[allow(clippy::too_many_lines)]
     fn spawn_apalis_monitor(self) -> JoinHandle<Result<(), MonitorTaskError>> {
         let Self {
             accountant_ctx,
@@ -360,6 +370,8 @@ where
             poll_status_queue,
             reconcile_queue,
             rejection_queue,
+            wrapped_equity_recovery_queue,
+            wrapped_equity_recovery_ctx,
             equity_check_scheduler,
             usdc_check_scheduler,
             apalis_shutdown_token,
@@ -384,6 +396,8 @@ where
         let failure_injector_for_usdc_rebalancing_check = failure_injector.clone();
         #[cfg(any(test, feature = "test-support"))]
         let failure_injector_for_seed_vault_registry = failure_injector.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let failure_injector_for_wrapped_equity_recovery = failure_injector.clone();
         let failure_notify = Arc::new(tokio::sync::Notify::new());
         let failure_notify_for_hedge = failure_notify.clone();
         let failure_notify_for_backfill = failure_notify.clone();
@@ -393,6 +407,7 @@ where
         let failure_notify_for_equity_rebalancing_check = failure_notify.clone();
         let failure_notify_for_usdc_rebalancing_check = failure_notify.clone();
         let failure_notify_for_seed_vault_registry = failure_notify.clone();
+        let failure_notify_for_wrapped_equity_recovery = failure_notify.clone();
         let failure_notify_for_select = failure_notify.clone();
 
         let fail_stop = CircuitBreakerConfig::default()
@@ -406,6 +421,7 @@ where
         let fail_stop_for_equity_rebalancing_check = fail_stop.clone();
         let fail_stop_for_usdc_rebalancing_check = fail_stop.clone();
         let fail_stop_for_seed_vault_registry = fail_stop.clone();
+        let fail_stop_for_wrapped_equity_recovery = fail_stop.clone();
 
         let accountant_ctx_for_backfill = accountant_ctx.clone();
 
@@ -531,6 +547,16 @@ where
                 monitor
             };
 
+            let apalis_monitor = register_wrapped_equity_recovery_worker(
+                apalis_monitor,
+                wrapped_equity_recovery_ctx,
+                wrapped_equity_recovery_queue,
+                fail_stop_for_wrapped_equity_recovery,
+                failure_notify_for_wrapped_equity_recovery,
+                #[cfg(any(test, feature = "test-support"))]
+                failure_injector_for_wrapped_equity_recovery,
+            );
+
             let is_draining = apalis_shutdown_token.clone();
 
             let shutdown_signal = async {
@@ -567,4 +593,38 @@ fn log_optional_task_status(task_name: &str, is_configured: bool) {
     } else {
         debug!("{task_name} not configured", task_name = task_name);
     }
+}
+
+/// Conditionally registers the wrapped-equity recovery worker against the
+/// apalis monitor. Extracted because this is the only `Option`-gated worker
+/// registration and inlining the let-else + debug log keeps
+/// `spawn_apalis_monitor` over the cognitive-complexity limit.
+fn register_wrapped_equity_recovery_worker(
+    monitor: Monitor,
+    recovery_ctx: Option<Arc<WrappedEquityRecoveryCtx>>,
+    recovery_queue: WrappedEquityRecoveryJobQueue,
+    fail_stop: CircuitBreakerConfig,
+    failure_notify: Arc<tokio::sync::Notify>,
+    #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
+) -> Monitor {
+    let Some(recovery_ctx) = recovery_ctx else {
+        debug!(
+            "Wrapped-equity recovery worker not registered: rebalancing disabled \
+             (no recovery ctx). Detected wtSTOCK on the bot wallet will not be recovered."
+        );
+        return monitor;
+    };
+
+    monitor.register(move |index| {
+        build_supervised_worker!(
+            ::<WrappedEquityRecoveryCtx, WrappedEquityRecoveryJob>,
+            index,
+            recovery_queue.clone(),
+            recovery_ctx.clone(),
+            fail_stop.clone(),
+            failure_notify.clone(),
+            #[cfg(any(test, feature = "test-support"))]
+            failure_injector.clone(),
+        )
+    })
 }

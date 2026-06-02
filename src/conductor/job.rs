@@ -310,6 +310,7 @@ pub enum JobKind {
     EquityRebalancingCheck,
     UsdcRebalancingCheck,
     SeedVaultRegistry,
+    WrappedEquityRecovery,
 }
 
 /// Job execution error. Wraps the concrete `Job::Error` type at
@@ -343,6 +344,7 @@ pub struct FailureInjector {
     equity_rebalancing_check: Arc<Mutex<InjectionState>>,
     usdc_rebalancing_check: Arc<Mutex<InjectionState>>,
     seed_vault_registry: Arc<Mutex<InjectionState>>,
+    wrapped_equity_recovery: Arc<Mutex<InjectionState>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -374,6 +376,7 @@ impl FailureInjector {
             equity_rebalancing_check: Arc::new(Mutex::new(InjectionState::Idle)),
             usdc_rebalancing_check: Arc::new(Mutex::new(InjectionState::Idle)),
             seed_vault_registry: Arc::new(Mutex::new(InjectionState::Idle)),
+            wrapped_equity_recovery: Arc::new(Mutex::new(InjectionState::Idle)),
         }
     }
 
@@ -417,6 +420,7 @@ impl FailureInjector {
             JobKind::EquityRebalancingCheck => &self.equity_rebalancing_check,
             JobKind::UsdcRebalancingCheck => &self.usdc_rebalancing_check,
             JobKind::SeedVaultRegistry => &self.seed_vault_registry,
+            JobKind::WrappedEquityRecovery => &self.wrapped_equity_recovery,
         };
 
         match mutex.lock() {
@@ -553,6 +557,38 @@ mod tests {
             "arming OrderFill should not affect Hedge"
         );
         assert!(injector.is_armed(JobKind::OrderFill));
+    }
+
+    #[test]
+    fn failure_injector_wrapped_equity_recovery_isolated() {
+        let injector = FailureInjector::new();
+
+        injector.arm(JobKind::WrappedEquityRecovery);
+        assert!(
+            injector.is_armed(JobKind::WrappedEquityRecovery),
+            "WrappedEquityRecovery should report armed after arm()",
+        );
+        assert!(
+            !injector.is_armed(JobKind::WrappedEquityRecovery),
+            "Second check should auto-disarm WrappedEquityRecovery",
+        );
+
+        injector.arm(JobKind::WrappedEquityRecovery);
+        assert!(
+            !injector.is_armed(JobKind::OrderFill),
+            "Arming WrappedEquityRecovery must not arm OrderFill",
+        );
+        assert!(
+            !injector.is_armed(JobKind::Hedge),
+            "Arming WrappedEquityRecovery must not arm Hedge",
+        );
+        assert!(
+            matches!(
+                &*injector.lock_state(JobKind::WrappedEquityRecovery),
+                InjectionState::Armed
+            ),
+            "WrappedEquityRecovery state should remain Armed when an unrelated kind is queried",
+        );
     }
 
     #[test]

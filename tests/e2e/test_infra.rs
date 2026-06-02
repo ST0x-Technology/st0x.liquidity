@@ -112,6 +112,7 @@ impl<P> TestInfra<P> {
                     vault_ids: Vec::new(),
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Disabled,
+                    wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
                 };
                 let Ok(symbol_key) = Symbol::new(symbol.clone()) else {

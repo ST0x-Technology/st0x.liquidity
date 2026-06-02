@@ -1903,6 +1903,236 @@ Base to Alpaca:
 - **Total rebalancing time**: Dominated by Alpaca deposit/withdrawal (~minutes)
   rather than bridge time
 
+#### Wrapped Equity Recovery
+
+**Purpose**: Automatically return wrapped equity tokens (wtSTOCK) found in the
+bot wallet on Base to a venue that participates in market making, without
+operator intervention. Wallet wtSTOCK arises whenever the normal transfer flow
+fails to deliver to its destination -- a `TokenizedEquityMint` stalled after
+wrapping but before depositing into Raindex, an `EquityRedemption` stalled after
+withdrawing from Raindex but before unwrapping, or tokens arrived at the wallet
+without any matching in-flight transfer (external deposit, prior-process crash
+after compaction).
+
+The mechanism has three components:
+
+1. **Detection** — the inventory polling job already reads ERC-20 balances on
+   the bot wallet. When it observes a non-zero wtSTOCK balance it emits
+   `InventorySnapshotEvent::BaseWalletWrappedEquity { balances }`; the
+   rebalancing reactor consumes that event and enqueues one
+   `WrappedEquityRecoveryJob { symbol }` per symbol with a positive balance.
+2. **Dispatch** — the recovery job inspects `InventoryView` and chooses one of
+   three paths based on whether an active mint or redemption owns the symbol's
+   in-flight slot.
+3. **Audit** — a `WrappedEquityRecovery` aggregate records every recovery
+   attempt, the dispatch decision, the side-effecting steps for the orphan path,
+   and the terminal outcome.
+
+##### Recovery Paths
+
+```mermaid
+flowchart TD
+    Detect[BaseWalletWrappedEquity observed]
+    Detect --> CheckMint{InventoryView.active_mints<br/>has symbol?}
+    CheckMint -- yes --> ResumeMint[resume_mint mint_id]
+    CheckMint -- no --> CheckRedemption{InventoryView.active_redemptions<br/>has symbol?}
+    CheckRedemption -- yes --> ResumeRedemption[resume_redemption id]
+    CheckRedemption -- no --> Orphan[Raindex submit_deposit]
+    ResumeMint --> Done[wtSTOCK back in Raindex vault]
+    ResumeRedemption --> Done2[wtSTOCK unwrapped + sent to broker]
+    Orphan --> Confirm[confirm deposit tx]
+    Confirm --> Done
+```
+
+- **Active mint** -- the wtSTOCK belongs to a `TokenizedEquityMint` that reached
+  `TokensWrapped` but never deposited. The dispatcher loads the aggregate via
+  the ID stored in `InventoryView.active_mints[symbol]` and calls
+  `CrossVenueEquityTransfer::resume_mint`; the existing mint flow drives it to
+  `DepositedIntoRaindex`.
+- **Active redemption** -- the wtSTOCK belongs to an `EquityRedemption` that
+  reached `WithdrawnFromRaindex` but never unwrapped. The dispatcher loads it
+  via `InventoryView.active_redemptions[symbol]` and calls `resume_redemption`;
+  the redemption flow continues through unwrap and send.
+- **Orphan deposit** -- no aggregate owns the symbol's in-flight slot, so the
+  wallet wtSTOCK is unused liquidity. The market-making venue is the closest
+  place to redeploy it (no broker round-trip), so the dispatcher resolves the
+  wrapped-token address via `Wrapper::lookup_derivative`, looks up the Raindex
+  vault, submits a deposit, and waits for confirmation.
+
+A symbol can only be in one in-flight transfer at a time; an `InventoryView`
+that reports both an active mint and an active redemption for the same symbol is
+a corrupt-state signal. The dispatcher refuses to choose between them: it emits
+`FailRecovery` with a reason that names both aggregate IDs and surfaces the
+conflict to the operator instead of silently picking one path.
+
+##### Concurrency
+
+The job claims the same `equity_in_progress` guard the normal rebalancing
+trigger uses. If another task is already driving the symbol's transfer the
+recovery job logs at debug and exits without writing an aggregate; the next
+polling tick re-evaluates. This keeps recovery dispatch from racing the
+mint/redemption tasks already driven by apalis.
+
+##### Idempotency
+
+Each polled `BaseWalletWrappedEquity` snapshot triggers a fresh
+`WrappedEquityRecoveryJob`. If the previous recovery already drained the wallet
+the next job sees an empty balance and exits without writing an aggregate. If
+the previous recovery is still running the `equity_in_progress` guard ensures
+the new job exits.
+
+##### WrappedEquityRecovery Aggregate
+
+The audit trail AND the actor for recovery side effects. Persists one aggregate
+instance per detection-and-dispatch attempt -- multiple recoveries for the same
+symbol are independent aggregates, keyed by `WrappedEquityRecoveryId(Uuid)`.
+
+`Services = WrappedEquityRecoveryServices { raindex: Arc<dyn Raindex>,
+wrapper: Arc<dyn Wrapper>, transfer: Arc<CrossVenueEquityTransfer> }`
+-- each command handler that needs an external side effect (orphan deposit
+submit/confirm, mint resume, redemption resume) calls the corresponding service
+inside the handler and emits the resulting event only on success. This mirrors
+`TokenizedEquityMint` and `EquityRedemption` (both use `EquityTransferServices`
+the same way) and keeps the audit trail tight: no event is recorded for a side
+effect that didn't actually happen.
+
+The job's responsibility is purely orchestration -- read `InventoryView`, pick a
+dispatch path, and send the command sequence: `Detect`, then exactly one of
+`DispatchToMint`, `DispatchToRedemption`, or
+`SubmitOrphanDeposit +
+ConfirmOrphanDeposit`. The dispatch-success and
+orphan-deposit states are themselves terminal, so no separate completion command
+is needed. The job does not call services directly.
+
+The underlying `TokenizedEquityMint` / `EquityRedemption` aggregate continues to
+own the active-transfer paths' physical work and its own event stream; this
+aggregate records the dispatch decision (after `resume_*` returns Ok) and, for
+the orphan path, captures the resulting tx hash.
+
+###### State Flow
+
+```mermaid
+stateDiagram-v2
+    [*] --> Detected: Detect (records symbol + shares)
+    Detected --> DispatchedToMint: DispatchToMint (active mint found)
+    Detected --> DispatchedToRedemption: DispatchToRedemption (active redemption found)
+    Detected --> OrphanDepositSubmitted: SubmitOrphanDeposit (no active transfer)
+    OrphanDepositSubmitted --> OrphanDeposited: ConfirmOrphanDeposit
+    DispatchedToMint --> [*]
+    DispatchedToRedemption --> [*]
+    OrphanDeposited --> [*]
+    Detected --> Failed: FailRecovery
+    OrphanDepositSubmitted --> Failed: FailRecovery
+```
+
+The dispatch-success states (`DispatchedToMint`, `DispatchedToRedemption`,
+`OrphanDeposited`) are themselves terminal -- they already encode which path
+succeeded and with which `mint_id` / `redemption_id` / `tx_hash`. No separate
+`Completed` state is needed.
+
+- `Detect` is the initialization command and records the trigger (symbol,
+  wrapped share quantity, detected_at). The job sends it as soon as it observes
+  a non-zero balance for the symbol. No services are invoked.
+- `DispatchToMint { mint_id }` / `DispatchToRedemption { redemption_id }`: the
+  handler calls `services.transfer.resume_mint(mint_id)` (or
+  `resume_redemption`) and emits the corresponding `DispatchedTo*` event only
+  after `resume_*` returns Ok. The audit trail for the actual deposit/unwrap
+  lives on the underlying mint/redemption aggregate's event stream; this
+  aggregate records the dispatch decision. The resulting state is
+  terminal-success for the path.
+- `SubmitOrphanDeposit` (no params): the handler resolves the wrapped-token
+  address via `services.wrapper.lookup_derivative(symbol)`, looks up the Raindex
+  vault, calls `services.raindex.submit_deposit(...)`, and emits
+  `OrphanDepositSubmitted { vault_deposit_tx_hash }` with the returned hash. The
+  event is emitted iff the deposit was actually submitted on-chain. Records the
+  tx hash so a process crash between submit and confirm resumes from the
+  persisted hash on retry.
+- `ConfirmOrphanDeposit` (no params): the handler reads `vault_deposit_tx_hash`
+  from the current `OrphanDepositSubmitted` state, calls
+  `services.raindex.confirm_tx(tx_hash)`, and emits `OrphanDeposited` with the
+  same hash. Requires the configured number of confirmations. The resulting
+  state is terminal-success.
+- `FailRecovery { reason }`: explicit failure from any non-terminal state.
+  Records the reason for downstream investigation. Service-call failures inside
+  the dispatch handlers also emit `RecoveryFailed` (consistent with
+  `TokenizedEquityMint`'s `MintAcceptanceFailed` pattern) so failures remain
+  first-class events.
+
+###### States
+
+```rust
+enum WrappedEquityRecovery {
+    Detected { symbol, shares, detected_at },
+    DispatchedToMint { symbol, shares, detected_at, mint_id, dispatched_at },        // terminal
+    DispatchedToRedemption {                                                          // terminal
+        symbol, shares, detected_at, redemption_id, dispatched_at,
+    },
+    OrphanDepositSubmitted {
+        symbol, shares, detected_at, vault_deposit_tx_hash, submitted_at,
+    },
+    OrphanDeposited {                                                                 // terminal
+        symbol, shares, detected_at, vault_deposit_tx_hash, submitted_at, deposited_at,
+    },
+    Failed { symbol, shares, reason, failed_at },                                     // terminal
+}
+```
+
+###### Commands
+
+```rust
+enum WrappedEquityRecoveryCommand {
+    Detect { symbol, shares },
+    DispatchToMint { mint_id },                // services.transfer.resume_mint
+    DispatchToRedemption { redemption_id },    // services.transfer.resume_redemption
+    SubmitOrphanDeposit,                       // services.{wrapper,raindex}.*
+    ConfirmOrphanDeposit,                      // services.raindex.confirm_tx
+    FailRecovery { reason },
+}
+```
+
+###### Events
+
+```rust
+enum WrappedEquityRecoveryEvent {
+    Detected { symbol, shares, detected_at },
+    DispatchedToMint { mint_id, dispatched_at },
+    DispatchedToRedemption { redemption_id, dispatched_at },
+    OrphanDepositSubmitted { vault_deposit_tx_hash, submitted_at },
+    OrphanDeposited { vault_deposit_tx_hash, deposited_at },
+    RecoveryFailed { reason, failed_at },
+}
+```
+
+###### Business Rules
+
+- `Detect` only initializes; subsequent `Detect` commands on a live aggregate
+  are rejected.
+- `DispatchToMint` / `DispatchToRedemption` / `SubmitOrphanDeposit` are only
+  valid from `Detected` and are mutually exclusive -- at most one is dispatched
+  per recovery.
+- `ConfirmOrphanDeposit` is only valid from `OrphanDepositSubmitted` and only
+  succeeds after the confirmation count required by the onchain config.
+- All dispatch handlers run their side effect inside the command handler so the
+  success event is emitted iff the side effect actually completed. Service
+  failures are recorded as `RecoveryFailed`.
+- `DispatchedToMint`, `DispatchedToRedemption`, `OrphanDeposited`, and `Failed`
+  are terminal states.
+
+###### Job-level Idempotency
+
+The recovery job carries its `WrappedEquityRecoveryId` in the apalis payload
+(generated by the reactor when pushing). On retry, apalis re-runs `perform` with
+the same payload, so the job re-targets the same aggregate; the framework
+reloads its current state and the next command in the sequence picks up where
+the prior attempt stopped (e.g., if `SubmitOrphanDeposit` succeeded but
+`ConfirmOrphanDeposit` crashed before persisting, the retry skips submit and
+goes straight to confirm).
+
+This is at-least-once for side effects: a crash between `submit_deposit`
+returning and the `OrphanDepositSubmitted` event persisting will still re-submit
+on retry. The aggregate-level guarantee is that no terminal event is recorded
+for a side effect that didn't actually succeed.
+
 #### Rebalancing Triggers
 
 ##### Inventory Tracking

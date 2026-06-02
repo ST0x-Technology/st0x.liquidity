@@ -14,6 +14,7 @@ pub(crate) use usdc::{
 pub(crate) struct RebalancingSchedulers {
     pub(crate) equity: EquityRebalancingCheckScheduler,
     pub(crate) usdc: UsdcRebalancingCheckScheduler,
+    pub(crate) wrapped_equity_recovery: WrappedEquityRecoveryJobQueue,
 }
 
 impl RebalancingSchedulers {
@@ -21,6 +22,7 @@ impl RebalancingSchedulers {
         Self {
             equity: EquityRebalancingCheckScheduler::new(pool),
             usdc: UsdcRebalancingCheckScheduler::new(pool),
+            wrapped_equity_recovery: WrappedEquityRecoveryJobQueue::new(pool),
         }
     }
 }
@@ -62,6 +64,8 @@ use crate::usdc_rebalance::{
     RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent, UsdcRebalanceId,
 };
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
+use crate::wrapped_equity_recovery::aggregate::WrappedEquityRecoveryId;
+use crate::wrapped_equity_recovery::{WrappedEquityRecoveryJob, WrappedEquityRecoveryJobQueue};
 use crate::wrapper::{Wrapper, WrapperError};
 
 /// Why the rebalancing trigger reactor failed.
@@ -609,6 +613,7 @@ pub(crate) struct RebalancingService {
     wrapper: Arc<dyn Wrapper>,
     pub(super) equity_scheduler: EquityRebalancingCheckScheduler,
     pub(super) usdc_scheduler: UsdcRebalancingCheckScheduler,
+    pub(super) wrapped_equity_recovery_queue: WrappedEquityRecoveryJobQueue,
     /// Tracks symbol/quantity for in-flight mints. The initial `MintRequested`
     /// event carries this data; follow-up events don't.
     mint_tracking: Arc<RwLock<HashMap<IssuerRequestId, MintTracking>>>,
@@ -658,6 +663,7 @@ impl RebalancingService {
         let RebalancingSchedulers {
             equity: equity_scheduler,
             usdc: usdc_scheduler,
+            wrapped_equity_recovery: wrapped_equity_recovery_queue,
         } = schedulers;
         Self {
             config,
@@ -672,6 +678,7 @@ impl RebalancingService {
             wrapper,
             equity_scheduler,
             usdc_scheduler,
+            wrapped_equity_recovery_queue,
             mint_tracking: Arc::new(RwLock::new(HashMap::new())),
             redemption_tracking: Arc::new(RwLock::new(HashMap::new())),
             usdc_tracking: Arc::new(RwLock::new(HashMap::new())),
@@ -1397,6 +1404,71 @@ impl RebalancingService {
             OnchainUsdc { .. } | OffchainUsd { .. } | OffchainCashWithdrawable { .. } => {
                 self.usdc_scheduler.enqueue_check().await;
             }
+            // Wrapped equity in the bot wallet (outside Raindex) triggers
+            // a recovery dispatch job per symbol with a positive balance.
+            // Gated on the per-symbol `wrapped_equity_recovery` config so
+            // tests that pre-stage wallet wtSTOCK (e.g. for orderbook
+            // mechanics) can opt out.
+            BaseWalletWrappedEquity { balances, .. } => {
+                for (symbol, amount) in balances {
+                    if *amount == FractionalShares::ZERO {
+                        continue;
+                    }
+                    if !self.is_wrapped_equity_recovery_enabled(symbol) {
+                        continue;
+                    }
+                    let mut queue = self.wrapped_equity_recovery_queue.clone();
+                    let job_type = std::any::type_name::<WrappedEquityRecoveryJob>();
+                    let symbol_pattern = format!("%{symbol}%");
+                    let existing: Result<(i64,), _> = sqlx::query_as(
+                        "SELECT COUNT(*) FROM Jobs \
+                         WHERE job_type = ? \
+                         AND status IN ('Pending', 'Queued', 'Running') \
+                         AND job LIKE ?",
+                    )
+                    .bind(job_type)
+                    .bind(&symbol_pattern)
+                    .fetch_one(queue.pool())
+                    .await;
+
+                    match existing {
+                        Ok((count,)) if count > 0 => {
+                            debug!(
+                                target: "rebalance",
+                                %symbol, %count,
+                                "Skipped WrappedEquityRecoveryJob enqueue: a non-terminal \
+                                 row for this symbol already exists",
+                            );
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            warn!(
+                                target: "rebalance",
+                                %symbol, %error,
+                                "Failed to query existing WrappedEquityRecoveryJob rows; \
+                                 skipping enqueue to avoid duplicates",
+                            );
+                            continue;
+                        }
+                    }
+
+                    let recovery_id = WrappedEquityRecoveryId(uuid::Uuid::new_v4());
+                    if let Err(error) = queue
+                        .push(WrappedEquityRecoveryJob {
+                            symbol: symbol.clone(),
+                            recovery_id: recovery_id.clone(),
+                        })
+                        .await
+                    {
+                        warn!(
+                            target: "rebalance",
+                            %symbol, %recovery_id, ?error,
+                            "Failed to enqueue WrappedEquityRecoveryJob",
+                        );
+                    }
+                }
+            }
             // Wallet-read USDC events update `inflight_cash` for
             // visibility but don't drive triggers here.
             // Suppression-aware re-triggering will be added once
@@ -1405,7 +1477,6 @@ impl RebalancingService {
             | BaseWalletUsdc { .. }
             | AlpacaUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
-            | BaseWalletWrappedEquity { .. }
             // Buying power is display-only and doesn't feed any rebalance
             // decision.
             | OffchainCashBuyingPower { .. }
@@ -1911,6 +1982,21 @@ impl RebalancingService {
             } => FractionalShares::from_u256_18_decimals(*unwrapped_amount),
             Completed { .. } | Failed { .. } => Ok(FractionalShares::ZERO),
         }
+    }
+
+    fn is_wrapped_equity_recovery_enabled(&self, symbol: &Symbol) -> bool {
+        if self.config.disabled_assets.contains(symbol) {
+            return false;
+        }
+
+        self.config
+            .assets
+            .equities
+            .symbols
+            .get(symbol)
+            .is_some_and(|config| {
+                config.wrapped_equity_recovery == crate::config::OperationMode::Enabled
+            })
     }
 
     /// Checks inventory for equity imbalance and triggers operation if needed.

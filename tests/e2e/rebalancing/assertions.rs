@@ -207,6 +207,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
     cash_vault_id: B256,
     usdc_rebalancing: UsdcRebalancing,
     cash_rebalancing: OperationMode,
+    wrapped_equity_recovery: OperationMode,
     redemption_wallet: Address,
 ) -> anyhow::Result<Ctx> {
     let alpaca_auth = AlpacaBrokerApiCtx {
@@ -231,6 +232,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
                     vault_ids: equity_vault_ids.get(symbol).copied().into_iter().collect(),
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Enabled,
+                    wrapped_equity_recovery,
                     operational_limit: None,
                 },
             ))
@@ -289,6 +291,7 @@ pub(crate) fn build_usdc_rebalancing_ctx<BP>(
     usdc_vault_id: B256,
     cctp: CctpOverrides,
     reserved: Option<Positive<Usd>>,
+    wrapped_equity_recovery: OperationMode,
 ) -> anyhow::Result<Ctx>
 where
     BP: Provider + Clone,
@@ -315,6 +318,7 @@ where
                     vault_ids: Vec::new(),
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Disabled,
+                    wrapped_equity_recovery,
                     operational_limit: None,
                 },
             ))

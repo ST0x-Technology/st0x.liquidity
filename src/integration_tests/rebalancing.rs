@@ -134,6 +134,7 @@ fn test_trigger_config() -> RebalancingServiceConfig {
                         vault_ids: Vec::new(),
                         trading: OperationMode::Disabled,
                         rebalancing: OperationMode::Enabled,
+                        wrapped_equity_recovery: OperationMode::Disabled,
                         operational_limit: None,
                     },
                 )]),

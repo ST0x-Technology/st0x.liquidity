@@ -7,6 +7,7 @@ hyperdx.service_name = "st0x-hedge-e2e"
 [assets.equities.EXAMPLE]
 trading = "enabled"
 rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
 tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 

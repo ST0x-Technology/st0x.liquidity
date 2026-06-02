@@ -57,6 +57,7 @@ mod vault_registry;
 pub mod wallet;
 #[cfg(not(any(test, feature = "test-support")))]
 pub(crate) mod wallet;
+mod wrapped_equity_recovery;
 mod wrapper;
 
 pub use telemetry::{FileLogGuard, TelemetryError, TelemetryGuard, mk_env_filter, setup_tracing};
