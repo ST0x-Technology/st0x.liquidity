@@ -747,10 +747,11 @@ async fn full_system() -> anyhow::Result<()> {
     let pool = connect_db(&infra.db_path).await?;
     let usdc_events = count_events(&pool, "UsdcRebalance").await?;
     assert!(
-        usdc_events >= 9,
-        "USDC rebalance should emit at least Initiated + WithdrawalConfirmed + \
-         BridgingInitiated + BridgeAttestationReceived + Bridged + DepositInitiated + \
-         DepositConfirmed + ConversionInitiated + ConversionConfirmed, got {usdc_events}",
+        usdc_events >= 11,
+        "USDC rebalance should emit at least WithdrawalSubmitting + Initiated + \
+         WithdrawalConfirmed + BridgingSubmitting + BridgingInitiated + \
+         BridgeAttestationReceived + Bridged + DepositInitiated + DepositConfirmed + \
+         ConversionInitiated + ConversionConfirmed, got {usdc_events}",
     );
     pool.close().await;
 

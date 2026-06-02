@@ -2387,6 +2387,7 @@ mod tests {
             .unwrap();
 
         let other_recipient = address!("0x000000000000000000000000000000000000dEaD");
+
         assert_eq!(
             bridge
                 .find_recent_mint(BridgeDirection::BaseToEthereum, other_recipient, from_block)
@@ -2412,6 +2413,7 @@ mod tests {
             .destination_block(BridgeDirection::BaseToEthereum)
             .await
             .unwrap();
+
         assert_eq!(
             bridge
                 .find_recent_mint(BridgeDirection::BaseToEthereum, recipient, head_above_mint)
@@ -2443,5 +2445,95 @@ mod tests {
             assert!(!receipt.tx.is_zero(), "Burn {i}: tx hash should be set");
             assert_eq!(receipt.amount, amount, "Burn {i}: amount should match");
         }
+    }
+
+    #[tokio::test]
+    async fn find_recent_burn_returns_tx_of_real_burn() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+        let recipient = bridge.ethereum.owner();
+        let amount = U256::from(25_000_000u64);
+
+        let base_provider = ProviderBuilder::new()
+            .connect(cctp.base_endpoint.as_str())
+            .await
+            .unwrap();
+        let from_block = base_provider.get_block_number().await.unwrap();
+
+        let receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::BaseToEthereum, amount, recipient)
+            .await
+            .unwrap();
+
+        let found = bridge
+            .find_recent_burn(
+                BridgeDirection::BaseToEthereum,
+                amount,
+                recipient,
+                from_block,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            found,
+            Some(receipt.tx),
+            "scan must return the real burn's tx for the matching amount + recipient",
+        );
+    }
+
+    #[tokio::test]
+    async fn find_recent_burn_returns_none_for_wrong_amount_or_recipient() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+        let recipient = bridge.ethereum.owner();
+        let amount = U256::from(25_000_000u64);
+
+        let base_provider = ProviderBuilder::new()
+            .connect(cctp.base_endpoint.as_str())
+            .await
+            .unwrap();
+        let from_block = base_provider.get_block_number().await.unwrap();
+
+        // Burn a few times to advance the Base head past from_block + the scan
+        // finality margin so the non-matching scans below conclude a true absence.
+        for _ in 0..3 {
+            bridge
+                .burn_internal::<NoOpErrorRegistry>(
+                    BridgeDirection::BaseToEthereum,
+                    amount,
+                    recipient,
+                )
+                .await
+                .unwrap();
+        }
+
+        let other_recipient = address!("0x000000000000000000000000000000000000dEaD");
+        assert_eq!(
+            bridge
+                .find_recent_burn(
+                    BridgeDirection::BaseToEthereum,
+                    U256::from(999u64),
+                    recipient,
+                    from_block,
+                )
+                .await
+                .unwrap(),
+            None,
+            "a burn of a different amount must not be adopted",
+        );
+        assert_eq!(
+            bridge
+                .find_recent_burn(
+                    BridgeDirection::BaseToEthereum,
+                    amount,
+                    other_recipient,
+                    from_block,
+                )
+                .await
+                .unwrap(),
+            None,
+            "a burn to a different mintRecipient must not be adopted",
+        );
     }
 }

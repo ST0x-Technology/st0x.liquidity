@@ -25,6 +25,7 @@ use st0x_finance::Usdc;
 
 use crate::alpaca_wallet::AlpacaWalletError;
 use crate::onchain::raindex::RaindexError;
+use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceId};
 use st0x_finance::UsdcConversionError;
 
 #[derive(Debug, Error)]
@@ -38,7 +39,7 @@ pub(crate) enum UsdcTransferError {
     #[error("Vault error: {0}")]
     Vault(#[from] RaindexError),
     #[error("Aggregate error: {0}")]
-    Aggregate(Box<SendError<crate::usdc_rebalance::UsdcRebalance>>),
+    Aggregate(Box<SendError<UsdcRebalance>>),
     #[error("Withdrawal failed with terminal status: {status}")]
     WithdrawalFailed { status: String },
     #[error("Deposit failed with terminal status: {status}")]
@@ -57,30 +58,30 @@ pub(crate) enum UsdcTransferError {
     )]
     MissingFilledQuantity { order_id: uuid::Uuid },
     #[error(
-        "USDC rebalance {id} cannot resume from Converting state: \
-         broker order ID lost after crash; manual reconciliation required"
+        "USDC rebalance {id} conversion could not be completed on resume \
+         (order not found at Alpaca or terminally failed); failed for \
+         operator reconciliation"
     )]
-    ResumeIndeterminateConversion {
-        id: crate::usdc_rebalance::UsdcRebalanceId,
-    },
+    ResumeIndeterminateConversion { id: UsdcRebalanceId },
+    #[error(
+        "USDC rebalance {id} conversion order is still settling on resume; \
+         retrying so apalis re-checks once it reaches a terminal status"
+    )]
+    ConversionStillSettling { id: UsdcRebalanceId },
     #[error("USDC rebalance {id} cannot resume: aggregate is in terminal failure state")]
-    PreviouslyFailedAggregate {
-        id: crate::usdc_rebalance::UsdcRebalanceId,
-    },
+    PreviouslyFailedAggregate { id: UsdcRebalanceId },
     #[error(
         "USDC rebalance {id} DepositInitiated has non-onchain deposit ref; \
          BaseToAlpaca always records the mint tx as OnchainTx"
     )]
-    DepositRefMustBeOnchain {
-        id: crate::usdc_rebalance::UsdcRebalanceId,
-    },
+    DepositRefMustBeOnchain { id: UsdcRebalanceId },
     #[error(
         "USDC rebalance {id} cannot resume via Base->Alpaca entrypoint: \
          aggregate direction is {direction:?}"
     )]
     ResumeDirectionMismatch {
-        id: crate::usdc_rebalance::UsdcRebalanceId,
-        direction: crate::usdc_rebalance::RebalanceDirection,
+        id: UsdcRebalanceId,
+        direction: RebalanceDirection,
     },
     #[error(
         "USDC rebalance {id} adopted a withdrawal that realized {withdrawn} but \
@@ -88,14 +89,14 @@ pub(crate) enum UsdcTransferError {
          than burning more than was withdrawn"
     )]
     AdoptedWithdrawalAmountMismatch {
-        id: crate::usdc_rebalance::UsdcRebalanceId,
+        id: UsdcRebalanceId,
         withdrawn: alloy::primitives::U256,
         requested: alloy::primitives::U256,
     },
 }
 
-impl From<SendError<crate::usdc_rebalance::UsdcRebalance>> for UsdcTransferError {
-    fn from(error: SendError<crate::usdc_rebalance::UsdcRebalance>) -> Self {
+impl From<SendError<UsdcRebalance>> for UsdcTransferError {
+    fn from(error: SendError<UsdcRebalance>) -> Self {
         Self::Aggregate(Box::new(error))
     }
 }

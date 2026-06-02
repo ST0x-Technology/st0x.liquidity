@@ -207,6 +207,33 @@ impl AlpacaBrokerApiClient {
         self.get(&url).await
     }
 
+    /// Get a crypto order by its client_order_id. Returns `None` if Alpaca has no
+    /// such order (404) -- i.e. it was never placed.
+    pub(crate) async fn get_crypto_order_by_client_order_id(
+        &self,
+        client_order_id: Uuid,
+    ) -> Result<Option<CryptoOrderResponse>, AlpacaBrokerApiError> {
+        let url = format!(
+            "{}/v1/trading/accounts/{}/orders:by_client_order_id?client_order_id={}",
+            self.base_url, self.account_id, client_order_id
+        );
+
+        debug!(
+            "Fetching crypto order by client_order_id {} from {}",
+            client_order_id, url
+        );
+
+        match self.get::<CryptoOrderResponse>(&url).await {
+            Ok(order) => Ok(Some(order)),
+            Err(AlpacaBrokerApiError::ApiError { status, .. })
+                if status == reqwest::StatusCode::NOT_FOUND =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Create a security journal (JNLS) to transfer equities between accounts.
     pub(crate) async fn create_journal(
         &self,

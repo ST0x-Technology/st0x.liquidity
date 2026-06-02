@@ -771,6 +771,22 @@ impl RebalancingService {
         };
 
         for id in timed_out_ids {
+            // A timed-out transfer whose apalis row is still in flight is NOT
+            // abandoned: the job will resume and may have an irreversible on-chain
+            // withdraw/burn already submitted. Skip the cleanup entirely so we
+            // neither clear the in-progress guard / inventory inflight nor mark it
+            // timed-out (which would make the reactor ignore its eventual terminal
+            // event and latch the guard forever). Let apalis drive it to terminal.
+            if self.transfer_usdc_to_hedging_in_flight().await {
+                warn!(
+                    target: "rebalance",
+                    aggregate_id = %id,
+                    "USDC transfer exceeded its timeout but its apalis row is still in \
+                     flight; deferring cleanup to the job rather than clearing the guard"
+                );
+                continue;
+            }
+
             let Some((tracking, elapsed)) = self.cleanup_timed_out_usdc_rebalance(&id, now).await?
             else {
                 continue;
@@ -789,6 +805,38 @@ impl RebalancingService {
         }
 
         Ok(())
+    }
+
+    /// Returns true if a `TransferUsdcToHedging` apalis row is still non-terminal
+    /// (Pending/Queued/Running). The timeout sweeper must not clear the
+    /// `usdc_in_progress` guard while such a row exists: the resuming job may have
+    /// an irreversible withdraw/burn already submitted, and clearing the guard
+    /// would let a second transfer touch the same vault/wallet. On query failure
+    /// the safe default is to report "in flight" so automation stays latched.
+    async fn transfer_usdc_to_hedging_in_flight(&self) -> bool {
+        let job_type = std::any::type_name::<TransferUsdcToHedging>();
+        let existing: Result<Option<(String,)>, _> = sqlx::query_as(
+            "SELECT id FROM Jobs \
+             WHERE job_type = ? \
+             AND status IN ('Pending', 'Queued', 'Running') \
+             LIMIT 1",
+        )
+        .bind(job_type)
+        .fetch_optional(self.transfer_usdc_to_hedging_queue.pool())
+        .await;
+
+        match existing {
+            Ok(row) => row.is_some(),
+            Err(error) => {
+                warn!(
+                    target: "rebalance",
+                    %error,
+                    "Failed to query in-flight TransferUsdcToHedging rows during timeout \
+                     sweep; keeping the in-progress guard latched to avoid re-arming"
+                );
+                true
+            }
+        }
     }
 
     async fn retire_stale_suppression_and_collect_active_symbols(
@@ -7823,6 +7871,70 @@ mod tests {
         assert!(
             !trigger.usdc_tracking.read().await.contains_key(&id),
             "late terminal events must not recreate timed-out USDC tracking"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_does_not_clear_guard_while_transfer_job_in_flight() {
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(100), usdc(900))
+            .with_withdrawable_cash_cents(90_000)
+            .update_usdc(
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, usdc(400)),
+                Utc::now(),
+            )
+            .unwrap();
+        let (trigger, _receiver) = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        // A Base->Alpaca transfer whose apalis row is still in flight: a crash mid
+        // withdraw/burn leaves the aggregate at a *Submitting state with an
+        // irreversible effect possibly already submitted, and apalis will resume.
+        let mut queue = trigger.transfer_usdc_to_hedging_queue.clone();
+        queue
+            .push(TransferUsdcToHedging {
+                id: id.clone(),
+                amount: usdc(400),
+            })
+            .await
+            .unwrap();
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::BaseToAlpaca,
+                initiated_amount: usdc(400),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::Initiated,
+                last_progress_at: Utc::now() - ChronoDuration::minutes(31),
+            },
+        );
+
+        trigger.check_and_trigger_usdc().await;
+
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "timeout must NOT clear the in-progress guard while the apalis transfer \
+             job is in flight -- an irreversible withdraw/burn may be pending and \
+             clearing would let a second transfer touch the same vault/wallet",
+        );
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "timeout must not drop tracking for an in-flight transfer",
+        );
+        assert!(
+            !trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "timeout must not mark an in-flight transfer timed-out (the reactor would \
+             then ignore its terminal event and latch the guard forever)",
         );
     }
 

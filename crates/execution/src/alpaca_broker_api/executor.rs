@@ -249,8 +249,11 @@ impl AlpacaBrokerApi {
         &self,
         amount: Float,
         direction: ConversionDirection,
+        client_order_id: Uuid,
     ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
-        let order = super::order::convert_usdc_usd(&self.client, amount, direction).await?;
+        let order =
+            super::order::convert_usdc_usd(&self.client, amount, direction, client_order_id)
+                .await?;
 
         info!(
             order_id = %order.id,
@@ -260,6 +263,18 @@ impl AlpacaBrokerApi {
         );
 
         super::order::poll_crypto_order_until_filled(&self.client, order.id).await
+    }
+
+    /// Looks up a previously-placed conversion order by its `client_order_id`
+    /// (the correlation UUID recorded before placement), for crash-safe resume.
+    /// Returns the current snapshot, or `None` if the order never reached Alpaca.
+    pub async fn find_conversion_order(
+        &self,
+        client_order_id: Uuid,
+    ) -> Result<Option<CryptoOrderResponse>, AlpacaBrokerApiError> {
+        self.client
+            .get_crypto_order_by_client_order_id(client_order_id)
+            .await
     }
 
     /// Journal (transfer) equities from the configured account to a
