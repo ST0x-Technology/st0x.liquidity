@@ -37,8 +37,6 @@ use super::aggregate::{
     WrappedEquityRecovery, WrappedEquityRecoveryCommand, WrappedEquityRecoveryError,
     WrappedEquityRecoveryId,
 };
-#[cfg(any(test, feature = "test-support"))]
-use crate::conductor::job::JobKind;
 use crate::conductor::job::{Job, JobQueue, Label};
 use crate::equity_redemption::{EquityRedemption, RedemptionAggregateId};
 use crate::inventory::BroadcastingInventory;
@@ -152,7 +150,8 @@ impl Job<WrappedEquityRecoveryCtx> for WrappedEquityRecoveryJob {
     const WORKER_NAME: &'static str = "wrapped-equity-recovery-worker";
 
     #[cfg(any(test, feature = "test-support"))]
-    const JOB_KIND: JobKind = JobKind::WrappedEquityRecovery;
+    const JOB_KIND: crate::conductor::job::JobKind =
+        crate::conductor::job::JobKind::WrappedEquityRecovery;
 
     fn label(&self) -> Label {
         Label::new(format!(

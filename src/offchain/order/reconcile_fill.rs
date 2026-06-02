@@ -17,8 +17,6 @@ use st0x_event_sorcery::Store;
 use st0x_execution::ExecutorOrderId;
 use st0x_finance::Usd;
 
-#[cfg(any(test, feature = "test-support"))]
-use crate::conductor::job::JobKind;
 use crate::conductor::job::{Job, JobQueue, Label};
 use crate::offchain::order::{JobError, OffchainOrder, OffchainOrderCommand, OffchainOrderId};
 use crate::position::{Position, PositionCommand};
@@ -45,8 +43,10 @@ impl Job<ReconcileOrderFillCtx> for ReconcileOrderFill {
     type Error = JobError;
 
     const WORKER_NAME: &'static str = "reconcile-order-fill-worker";
+
     #[cfg(any(test, feature = "test-support"))]
-    const JOB_KIND: JobKind = JobKind::ReconcileOrderFill;
+    const JOB_KIND: crate::conductor::job::JobKind =
+        crate::conductor::job::JobKind::ReconcileOrderFill;
 
     fn label(&self) -> Label {
         Label::new(format!("ReconcileOrderFill:{}", self.offchain_order_id))
@@ -148,7 +148,7 @@ mod tests {
     use crate::offchain::order::{noop_order_placer, noop_placed_shares};
     use crate::position::TradeId;
     use crate::test_utils::{OnchainTradeBuilder, setup_test_db};
-    use crate::threshold::ExecutionThreshold;
+    use st0x_config::ExecutionThreshold;
 
     struct TestInfra {
         ctx: ReconcileOrderFillCtx,

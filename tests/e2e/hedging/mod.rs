@@ -14,7 +14,7 @@ use rain_math_float::Float;
 use st0x_execution::alpaca_broker_api::OrderStatus;
 use st0x_float_macro::float;
 #[cfg(feature = "test-support")]
-use st0x_hedge::{FailureInjector, JobKind};
+use st0x_hedge::FailureInjector;
 
 use self::assertions::*;
 use crate::poll::poll_for_all_jobs_done;
@@ -1502,7 +1502,7 @@ async fn job_failure_halts_bot() -> anyhow::Result<()> {
     let infra = TestInfra::start(vec![("AAPL", broker_fill_price)], vec![]).await?;
 
     let current_block = infra.base_chain.provider.get_block_number().await?;
-    let mut ctx = build_ctx()
+    let ctx = build_ctx()
         .chain(&infra.base_chain)
         .broker(&infra.broker_service)
         .db_path(&infra.db_path)
@@ -1511,8 +1511,7 @@ async fn job_failure_halts_bot() -> anyhow::Result<()> {
         .call()?;
 
     let injector = FailureInjector::new();
-    ctx.failure_injector = injector.clone();
-    let mut bot = spawn_bot(ctx);
+    let mut bot = crate::poll::spawn_bot_with_injector(ctx, injector.clone());
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -1535,7 +1534,7 @@ async fn job_failure_halts_bot() -> anyhow::Result<()> {
     pool.close().await;
 
     // Arm the injector, then submit a second trade
-    injector.arm(JobKind::OrderFill);
+    injector.arm(st0x_hedge::JobKind::OrderFill);
 
     infra
         .base_chain

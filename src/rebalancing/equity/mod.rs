@@ -1542,8 +1542,9 @@ mod tests {
     use st0x_execution::{FractionalShares, Symbol};
     use st0x_float_macro::float;
 
+    use st0x_config::{AssetsConfig, EquitiesConfig};
+
     use super::*;
-    use crate::config::{AssetsConfig, EquitiesConfig};
     use crate::inventory::{
         BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, Venue,
     };

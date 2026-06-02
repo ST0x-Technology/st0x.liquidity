@@ -18,8 +18,8 @@ use crate::alpaca_wallet::{
     WhitelistStatus,
 };
 use crate::bindings::IERC20;
-use crate::config::{BrokerCtx, Ctx};
 use crate::onchain::{USDC_ETHEREUM, USDC_ETHEREUM_SEPOLIA};
+use st0x_config::{BrokerCtx, Ctx};
 
 pub(super) async fn alpaca_deposit_command<Registry: IntoErrorRegistry, W: Write>(
     stdout: &mut W,
@@ -714,11 +714,11 @@ mod tests {
 
     use super::*;
     use crate::cli::ConvertDirection;
-    use crate::config::{AssetsConfig, EquitiesConfig, LogLevel, TradingMode};
     use crate::inventory::ImbalanceThreshold;
-    use crate::onchain::EvmCtx;
-    use crate::rebalancing::RebalancingCtx;
-    use crate::threshold::ExecutionThreshold;
+    use st0x_config::EvmCtx;
+    use st0x_config::ExecutionThreshold;
+    use st0x_config::RebalancingCtx;
+    use st0x_config::{AssetsConfig, EquitiesConfig, LogLevel, TradingMode};
     use st0x_float_macro::float;
 
     fn create_ctx_without_alpaca() -> Ctx {
@@ -752,8 +752,6 @@ mod tests {
             travel_rule: None,
             rest_api: None,
             redemption_wallet: None,
-            #[cfg(feature = "test-support")]
-            failure_injector: crate::conductor::job::FailureInjector::new(),
         }
     }
 
@@ -837,14 +835,12 @@ mod tests {
                     .call(),
             )),
             order_owner: Address::ZERO,
-            wallet: Some(crate::wallet::OnchainWalletCtx::stub()),
+            wallet: Some(st0x_config::OnchainWalletCtx::stub()),
             wallet_meta: None,
             execution_threshold: ExecutionThreshold::whole_share(),
             travel_rule: None,
             rest_api: None,
             redemption_wallet: Some(Address::ZERO),
-            #[cfg(feature = "test-support")]
-            failure_injector: crate::conductor::job::FailureInjector::new(),
         }
     }
 

@@ -18,9 +18,9 @@ use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 use tracing::{error, info};
 
+use st0x_config::Ctx;
 use st0x_execution::{FractionalShares, SharesBlockchain};
 
-use crate::config::Ctx;
 use crate::dashboard::transfer_loader::TransferKind;
 use crate::equity_redemption::{EquityRedemptionEvent, RedemptionAggregateId};
 use crate::rebalancing::RebalancingService;
@@ -1456,8 +1456,9 @@ pub(crate) fn routes() -> Vec<Route> {
 mod tests {
     use rocket::local::asynchronous::Client;
 
+    use st0x_config::{RestApiCtx, create_test_ctx_with_order_owner};
+
     use super::*;
-    use crate::config::tests::create_test_ctx_with_order_owner;
 
     #[test]
     fn routes_include_recheck_transfer_endpoint() {
@@ -2071,7 +2072,7 @@ mod tests {
     #[tokio::test]
     async fn raindex_orders_returns_unavailable_when_upstream_unreachable() {
         let mut ctx = create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
-        ctx.rest_api = Some(crate::config::RestApiCtx::unauthenticated(
+        ctx.rest_api = Some(RestApiCtx::unauthenticated(
             "http://127.0.0.1:1".to_string(),
         ));
 
@@ -2130,9 +2131,7 @@ mod tests {
         });
 
         let mut ctx = create_test_ctx_with_order_owner(owner);
-        ctx.rest_api = Some(crate::config::RestApiCtx::unauthenticated(
-            mock_server.base_url(),
-        ));
+        ctx.rest_api = Some(RestApiCtx::unauthenticated(mock_server.base_url()));
 
         let rocket = rocket::build()
             .mount("/", routes![raindex_orders])
@@ -2179,9 +2178,7 @@ mod tests {
         });
 
         let mut ctx = create_test_ctx_with_order_owner(owner);
-        ctx.rest_api = Some(crate::config::RestApiCtx::unauthenticated(
-            mock_server.base_url(),
-        ));
+        ctx.rest_api = Some(RestApiCtx::unauthenticated(mock_server.base_url()));
 
         let rocket = rocket::build()
             .mount("/", routes![raindex_orders])
@@ -2231,9 +2228,7 @@ mod tests {
         });
 
         let mut ctx = create_test_ctx_with_order_owner(owner);
-        ctx.rest_api = Some(crate::config::RestApiCtx::unauthenticated(
-            mock_server.base_url(),
-        ));
+        ctx.rest_api = Some(RestApiCtx::unauthenticated(mock_server.base_url()));
 
         let rocket = rocket::build()
             .mount("/", routes![raindex_orders])
@@ -2267,9 +2262,7 @@ mod tests {
         });
 
         let mut ctx = create_test_ctx_with_order_owner(owner);
-        ctx.rest_api = Some(crate::config::RestApiCtx::unauthenticated(
-            mock_server.base_url(),
-        ));
+        ctx.rest_api = Some(RestApiCtx::unauthenticated(mock_server.base_url()));
 
         let rocket = rocket::build()
             .mount("/", routes![raindex_orders])

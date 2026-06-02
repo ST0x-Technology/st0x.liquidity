@@ -17,7 +17,7 @@ use tracing::{error, info, warn};
 use st0x_dto::Statement;
 use st0x_execution::MockExecutorCtx;
 
-use crate::config::{BrokerCtx, Ctx};
+use st0x_config::{BrokerCtx, Ctx};
 
 /// How long to wait for in-flight work to drain before force-aborting.
 /// Outer timeout for the entire graceful shutdown sequence. Must exceed
@@ -33,7 +33,6 @@ pub mod bindings;
 pub(crate) mod bindings;
 pub mod cli;
 mod conductor;
-pub mod config;
 pub(crate) mod dashboard;
 mod equity_redemption;
 mod inventory;
@@ -45,8 +44,6 @@ mod position_check;
 mod rebalancing;
 mod shares;
 mod symbol;
-pub mod telemetry;
-mod threshold;
 mod tokenization;
 mod trading;
 #[cfg(feature = "mock")]
@@ -54,23 +51,11 @@ pub use tokenization::mock_api;
 mod tokenized_equity_mint;
 mod usdc_rebalance;
 mod vault_registry;
-#[cfg(any(test, feature = "test-support"))]
-pub mod wallet;
-#[cfg(not(any(test, feature = "test-support")))]
-pub(crate) mod wallet;
 mod wrapped_equity_recovery;
 mod wrapper;
 
-pub use telemetry::{FileLogGuard, TelemetryError, TelemetryGuard, mk_env_filter, setup_tracing};
+pub use st0x_config::{FileLogGuard, TelemetryError, TelemetryGuard, mk_env_filter, setup_tracing};
 
-#[cfg(feature = "test-support")]
-pub use conductor::job::{FailureInjector, JobKind};
-#[cfg(any(test, feature = "test-support"))]
-pub use config::TradingMode;
-#[cfg(any(test, feature = "test-support"))]
-pub use config::{AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, OperationMode};
-#[cfg(any(test, feature = "test-support"))]
-pub use inventory::ImbalanceThreshold;
 #[cfg(any(test, feature = "test-support"))]
 pub use offchain::order::{OffchainOrder, OffchainOrderId};
 #[cfg(any(test, feature = "test-support"))]
@@ -83,9 +68,19 @@ pub fn check_positions_job_type() -> &'static str {
     std::any::type_name::<position_check::CheckPositions>()
 }
 #[cfg(any(test, feature = "test-support"))]
-pub use rebalancing::{RebalancingCtx, RebalancingCtxError, UsdcRebalancing};
+pub use conductor::job::{FailureInjector, JobKind};
 #[cfg(any(test, feature = "test-support"))]
-pub use threshold::ExecutionThreshold;
+pub use st0x_config::ExecutionThreshold;
+#[cfg(any(test, feature = "test-support"))]
+pub use st0x_config::TradingMode;
+#[cfg(any(test, feature = "test-support"))]
+pub use st0x_config::{
+    AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, OperationMode,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use st0x_config::{ImbalanceThreshold, RebalancingCtx, RebalancingCtxError, UsdcRebalancing};
+#[cfg(feature = "test-support")]
+pub use trading::onchain::trade_accountant::AccountForDexTrade;
 
 #[cfg(test)]
 mod integration_tests;
@@ -102,6 +97,32 @@ pub async fn run_bot_session(ctx: Ctx) -> anyhow::Result<()> {
 pub async fn run_bot_session_with_event_channel(
     ctx: Ctx,
     event_sender: broadcast::Sender<Statement>,
+) -> anyhow::Result<()> {
+    run_bot_session_inner(
+        ctx,
+        event_sender,
+        #[cfg(any(test, feature = "test-support"))]
+        FailureInjector::new(),
+    )
+    .await
+}
+
+/// Like [`run_bot_session_with_event_channel`] but accepts a caller-supplied
+/// [`FailureInjector`] so e2e tests can arm specific job types.
+#[cfg(any(test, feature = "test-support"))]
+#[tracing::instrument(skip_all, target = "startup", level = tracing::Level::INFO)]
+pub async fn run_bot_session_with_injector(
+    ctx: Ctx,
+    event_sender: broadcast::Sender<Statement>,
+    failure_injector: FailureInjector,
+) -> anyhow::Result<()> {
+    run_bot_session_inner(ctx, event_sender, failure_injector).await
+}
+
+async fn run_bot_session_inner(
+    ctx: Ctx,
+    event_sender: broadcast::Sender<Statement>,
+    #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> anyhow::Result<()> {
     let pool = ctx.get_sqlite_pool().await?;
     sqlx::migrate!().set_ignore_missing(true).run(&pool).await?;
@@ -128,6 +149,8 @@ pub async fn run_bot_session_with_event_channel(
         inventory,
         shutdown_token.clone(),
         recovery_cell,
+        #[cfg(any(test, feature = "test-support"))]
+        failure_injector,
     )));
 
     await_shutdown(server_task, bot_task, shutdown_token).await?;
@@ -335,6 +358,7 @@ async fn run_conductor_session(
     inventory: Arc<inventory::BroadcastingInventory>,
     shutdown_token: CancellationToken,
     recovery_cell: Arc<tokio::sync::OnceCell<api::RecoveryHandle>>,
+    #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> anyhow::Result<()> {
     let result = match ctx.broker.clone() {
         BrokerCtx::DryRun => {
@@ -347,6 +371,8 @@ async fn run_conductor_session(
                 inventory,
                 shutdown_token,
                 recovery_cell,
+                #[cfg(any(test, feature = "test-support"))]
+                failure_injector,
             ))
             .await
         }
@@ -360,6 +386,8 @@ async fn run_conductor_session(
                 inventory,
                 shutdown_token,
                 recovery_cell,
+                #[cfg(any(test, feature = "test-support"))]
+                failure_injector,
             ))
             .await
         }
@@ -382,7 +410,7 @@ mod tests {
     use alloy::primitives::address;
 
     use super::*;
-    use crate::config::tests::create_test_ctx_with_order_owner;
+    use st0x_config::create_test_ctx_with_order_owner;
 
     // `Ctx::load_files` parses `orderbook` into `Address`, so runtime tests
     // only exercise already-validated addresses. Invalid orderbook input is
@@ -421,6 +449,7 @@ mod tests {
             create_test_inventory(),
             CancellationToken::new(),
             Arc::new(tokio::sync::OnceCell::new()),
+            FailureInjector::new(),
         ))
         .await
         .unwrap_err();
@@ -513,6 +542,7 @@ mod tests {
             create_test_inventory(),
             CancellationToken::new(),
             Arc::new(tokio::sync::OnceCell::new()),
+            FailureInjector::new(),
         ))
         .await
         .unwrap_err();

@@ -21,11 +21,11 @@ pub enum ExecutionThreshold {
 }
 
 impl ExecutionThreshold {
-    pub(crate) fn shares(value: Positive<FractionalShares>) -> Self {
+    pub fn shares(value: Positive<FractionalShares>) -> Self {
         Self::Shares(value)
     }
 
-    pub(crate) fn dollar_value(value: Usdc) -> Result<Self, InvalidThresholdError> {
+    pub fn dollar_value(value: Usdc) -> Result<Self, InvalidThresholdError> {
         if value.is_negative().map_err(InvalidThresholdError::Float)? {
             return Err(InvalidThresholdError::NegativeDollarValue(value));
         }
@@ -37,9 +37,14 @@ impl ExecutionThreshold {
         Ok(Self::DollarValue(value))
     }
 
-    #[cfg(test)]
-    pub(crate) fn whole_share() -> Self {
-        Self::Shares(Positive::new(FractionalShares::new(st0x_float_macro::float!(1))).unwrap())
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn whole_share() -> Self {
+        // float!(1) is a compile-time positive constant, so Positive::new
+        // cannot fail at runtime here.
+        #[allow(clippy::unwrap_used)]
+        let positive = Positive::new(FractionalShares::new(st0x_float_macro::float!(1))).unwrap();
+
+        Self::Shares(positive)
     }
 }
 
@@ -58,25 +63,10 @@ mod tests {
     use proptest::prelude::*;
     use rain_math_float::Float;
 
-    use super::*;
+    use st0x_finance::proptest::arb_float;
     use st0x_float_macro::float;
 
-    fn arb_float() -> impl Strategy<Value = Float> {
-        (any::<i64>(), 0u32..=10).prop_filter_map(
-            "Float::parse must succeed",
-            |(mantissa, scale)| {
-                let divisor = 10i64.checked_pow(scale).unwrap_or(1);
-                let integer_part = mantissa / divisor;
-                let frac_part = (mantissa % divisor).unsigned_abs();
-
-                let value_str = format!(
-                    "{integer_part}.{frac_part:0>width$}",
-                    width = scale as usize
-                );
-                Float::parse(value_str).ok()
-            },
-        )
-    }
+    use super::*;
 
     proptest! {
         #[test]

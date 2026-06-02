@@ -21,18 +21,20 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{broadcast, mpsc};
 
 use rain_math_float::Float;
+use st0x_config::{
+    AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, ExecutionThreshold,
+    OperationMode,
+};
 use st0x_dto::Statement;
 use st0x_event_sorcery::{Store, StoreBuilder, test_store};
 use st0x_execution::{
     Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor, Symbol,
 };
 use st0x_finance::{Usd, Usdc};
+use st0x_float_macro::float;
 
 use super::{ExpectedEvent, assert_events, fetch_events};
 use crate::bindings::{IERC20, TestERC20};
-use crate::config::{
-    AssetsConfig, CashAssetConfig, EquitiesConfig, EquityAssetConfig, OperationMode,
-};
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId};
 use crate::inventory::{BroadcastingInventory, ImbalanceThreshold, InventoryView, Venue};
 use crate::offchain::order::OffchainOrderId;
@@ -48,7 +50,6 @@ use crate::rebalancing::{
     TriggeredOperation, drain_pending_jobs,
 };
 use crate::test_utils::setup_test_db;
-use crate::threshold::ExecutionThreshold;
 use crate::tokenization::Tokenizer;
 use crate::tokenization::alpaca::tests::{
     TEST_REDEMPTION_WALLET, create_test_service_from_mock, setup_anvil, tokenization_mint_path,
@@ -58,7 +59,6 @@ use crate::tokenization::mock::MockTokenizer;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryId};
 use crate::wrapper::mock::MockWrapper;
-use st0x_float_macro::float;
 
 const TEST_ORDERBOOK: Address = address!("0x0000000000000000000000000000000000000001");
 const TEST_ORDER_OWNER: Address = address!("0x0000000000000000000000000000000000000002");

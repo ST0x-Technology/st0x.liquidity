@@ -1,21 +1,16 @@
 //! USDC-specific trigger types and logic.
 
 use std::sync::Arc;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
 use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
-
-use st0x_float_macro::float;
 use tracing::{debug, trace, warn};
 
 use st0x_finance::{Usd, Usdc};
 
 use super::{RebalancingService, RebalancingServiceError, TriggeredOperation};
-#[cfg(any(test, feature = "test-support"))]
-use crate::conductor::job::JobKind;
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::inventory::{
     BroadcastingInventory, Imbalance, ImbalanceThreshold, Inventory, TransferOp, Venue,
@@ -173,11 +168,7 @@ impl UsdcRebalanceStage {
     }
 }
 
-/// Minimum USDC amount for Alpaca withdrawals.
-/// Alpaca requires $50 USD minimum, but due to USDC/USD spread (~17bps observed in live tests),
-/// we use $51 to ensure we always meet the minimum after conversion slippage.
-pub(crate) static ALPACA_MINIMUM_WITHDRAWAL: LazyLock<Usdc> =
-    LazyLock::new(|| Usdc::new(float!(51)));
+pub(crate) use st0x_config::ALPACA_MINIMUM_WITHDRAWAL;
 
 /// Maximum decimal places for rebalanceable USDC token amounts.
 const USDC_TRANSFER_MAX_DECIMAL_PLACES: u8 = 6;
@@ -865,8 +856,10 @@ impl Job<RebalancingService> for UsdcRebalancingCheck {
     type Error = UsdcRebalancingCheckJobError;
 
     const WORKER_NAME: &'static str = "usdc-rebalancing-check-worker";
+
     #[cfg(any(test, feature = "test-support"))]
-    const JOB_KIND: JobKind = JobKind::UsdcRebalancingCheck;
+    const JOB_KIND: crate::conductor::job::JobKind =
+        crate::conductor::job::JobKind::UsdcRebalancingCheck;
 
     fn label(&self) -> Label {
         Label::new("UsdcRebalancingCheck")

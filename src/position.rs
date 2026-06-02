@@ -12,16 +12,15 @@ use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+use st0x_config::ExecutionThreshold;
+use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
 use st0x_execution::{
     Direction, ExecutorOrderId, FractionalShares, HasZero, Positive, SupportedExecutor, Symbol,
 };
 use st0x_finance::{Usd, Usdc};
 use st0x_float_serde::{DebugFloat, DebugOptionFloat};
 
-use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
-
 use crate::offchain::order::OffchainOrderId;
-use crate::threshold::ExecutionThreshold;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Position {

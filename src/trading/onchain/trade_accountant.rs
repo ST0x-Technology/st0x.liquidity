@@ -24,13 +24,13 @@ use crate::conductor::job::{Job, JobQueue, Label};
 use crate::conductor::{
     TradeProcessingCqrs, VaultDiscoveryCtx, discover_vaults_for_trade, process_queued_trade,
 };
-use crate::config::Ctx;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::{RaindexTradeEvent, TradeValidationError};
 use crate::onchain::{OnChainError, OnchainTrade};
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
 use crate::vault_registry::VaultRegistry;
+use st0x_config::Ctx;
 
 /// Persistent job queue for DEX trade accounting.
 pub(crate) type DexTradeAccountingJobQueue = JobQueue<AccountForDexTrade>;
@@ -39,7 +39,7 @@ pub(crate) type DexTradeAccountingJobQueue = JobQueue<AccountForDexTrade>;
 /// It's the unified mechanism for processing both backfilled events as well as
 /// live events from the monitor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct AccountForDexTrade {
+pub struct AccountForDexTrade {
     /// Raindex trade event with block inclusion metadata
     pub(crate) trade: EmittedOnChain<RaindexTradeEvent>,
 }
@@ -68,6 +68,7 @@ where
     type Error = TradeAccountingError;
 
     const WORKER_NAME: &'static str = "order-fill-worker";
+
     #[cfg(any(test, feature = "test-support"))]
     const JOB_KIND: crate::conductor::job::JobKind = crate::conductor::job::JobKind::OrderFill;
 
@@ -249,12 +250,12 @@ mod tests {
     use crate::bindings::IOrderBookV6::{
         ClearConfigV2, SignedContextV1, TakeOrderConfigV4, TakeOrderV3 as TakeOrderV3Event,
     };
-    use crate::config::tests::create_test_ctx_with_order_owner;
     use crate::offchain::order::OffchainOrder;
     use crate::onchain_trade::OnChainTrade;
     use crate::position::Position;
     use crate::test_utils::{get_test_log, get_test_order, setup_test_db};
-    use crate::threshold::ExecutionThreshold;
+    use st0x_config::ExecutionThreshold;
+    use st0x_config::create_test_ctx_with_order_owner;
 
     fn test_job() -> AccountForDexTrade {
         let log = get_test_log();

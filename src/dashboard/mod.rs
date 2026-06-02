@@ -8,14 +8,13 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{info, trace, warn};
 
+use st0x_config::{ExecutionThreshold, OperationMode};
 use st0x_dto::{CurrentState, Statement};
 use st0x_event_sorcery::{load_all_ids, load_entity};
 use st0x_finance::Positive;
 
-use crate::config::OperationMode;
 use crate::inventory::BroadcastingInventory;
 use crate::position::Position;
-use crate::threshold::ExecutionThreshold;
 
 mod event;
 mod trade_loader;
@@ -110,7 +109,7 @@ pub(crate) fn routes() -> Vec<Route> {
     routes![ws_endpoint]
 }
 
-pub(crate) fn settings_from_ctx(ctx: &crate::config::Ctx) -> st0x_dto::Settings {
+pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
     let (equity_target, equity_deviation, usdc_target, usdc_deviation) =
         ctx.rebalancing_ctx().map_or_else(
             |_| (0.5, 0.2, None, None),
@@ -172,13 +171,13 @@ pub(crate) fn settings_from_ctx(ctx: &crate::config::Ctx) -> st0x_dto::Settings 
         .collect();
 
     let trading_mode = match &ctx.trading_mode {
-        crate::config::TradingMode::Standalone => "standalone",
-        crate::config::TradingMode::Rebalancing(_) => "rebalancing",
+        st0x_config::TradingMode::Standalone => "standalone",
+        st0x_config::TradingMode::Rebalancing(_) => "rebalancing",
     };
 
     let broker = match &ctx.broker {
-        crate::config::BrokerCtx::AlpacaBrokerApi(_) => "alpaca",
-        crate::config::BrokerCtx::DryRun => "dry_run",
+        st0x_config::BrokerCtx::AlpacaBrokerApi(_) => "alpaca",
+        st0x_config::BrokerCtx::DryRun => "dry_run",
     };
 
     let cash_reserved = ctx

@@ -3,9 +3,9 @@
 use alloy::primitives::Address;
 use std::io::Write;
 
+use st0x_config::Ctx;
 use st0x_execution::{FractionalShares, Positive, SharesBlockchain, Symbol};
 
-use crate::config::Ctx;
 use crate::wrapper::{Wrapper, WrapperService};
 
 pub(super) async fn wrap_equity_command<Writer: Write>(
@@ -135,11 +135,11 @@ mod tests {
         unwrap_equity_command, unwrap_equity_with_wrapper, wrap_equity_command,
         wrap_equity_with_wrapper,
     };
-    use crate::config::{AssetsConfig, BrokerCtx, Ctx, EquitiesConfig, LogLevel, TradingMode};
-    use crate::onchain::EvmCtx;
     use crate::test_utils::positive_shares;
-    use crate::threshold::ExecutionThreshold;
     use crate::wrapper::mock::MockWrapper;
+    use st0x_config::EvmCtx;
+    use st0x_config::ExecutionThreshold;
+    use st0x_config::{AssetsConfig, BrokerCtx, Ctx, EquitiesConfig, LogLevel, TradingMode};
 
     fn create_ctx_without_rebalancing() -> Ctx {
         Ctx {
@@ -172,8 +172,6 @@ mod tests {
             travel_rule: None,
             rest_api: None,
             redemption_wallet: None,
-            #[cfg(feature = "test-support")]
-            failure_injector: crate::conductor::job::FailureInjector::new(),
         }
     }
 

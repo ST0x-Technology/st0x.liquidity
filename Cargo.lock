@@ -1061,6 +1061,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "apalis-workflow"
+version = "0.1.0-rc.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9392c07db462a5c0befec5d6685a37d9ec2424a244b7e7e021208c5c9544cef0"
+dependencies = [
+ "apalis-core",
+ "futures",
+ "petgraph",
+ "serde",
+ "thiserror 2.0.18",
+ "tower",
+ "tracing",
+ "ulid",
+]
+
+[[package]]
 name = "apca"
 version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2742,6 +2758,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fixedbitset"
+version = "0.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
+
+[[package]]
 name = "flate2"
 version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3450,7 +3472,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "system-configuration 0.7.0",
  "tokio",
  "tower-service",
@@ -4714,6 +4736,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "petgraph"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8701b58ea97060d5e5b155d383a69952a60943f0e6dfe30b04c287beb0b27455"
+dependencies = [
+ "fixedbitset",
+ "hashbrown 0.15.5",
+ "indexmap 2.14.0",
+ "serde",
+ "serde_derive",
+]
+
+[[package]]
 name = "pharos"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5072,7 +5107,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -5109,7 +5144,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -6805,6 +6840,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "st0x-config"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "alloy-primitives",
+ "async-trait",
+ "bon",
+ "clap",
+ "itertools 0.14.0",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "proptest",
+ "rain-math-float",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "st0x-bridge",
+ "st0x-evm",
+ "st0x-execution",
+ "st0x-finance",
+ "st0x-float-macro",
+ "st0x-float-serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml 0.9.12+spec-1.1.0",
+ "tracing",
+ "tracing-appender",
+ "tracing-opentelemetry",
+ "tracing-subscriber 0.3.23",
+ "url",
+]
+
+[[package]]
 name = "st0x-dto"
 version = "0.1.0"
 dependencies = [
@@ -6934,6 +7005,7 @@ dependencies = [
  "apalis-core",
  "apalis-cron",
  "apalis-sqlite",
+ "apalis-workflow",
  "approx",
  "async-trait",
  "backon",
@@ -6965,6 +7037,7 @@ dependencies = [
  "serial_test",
  "sqlx",
  "st0x-bridge",
+ "st0x-config",
  "st0x-dto",
  "st0x-evm",
  "st0x-execution",

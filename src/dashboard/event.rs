@@ -309,7 +309,7 @@ mod tests {
 
         let symbol = Symbol::new("AAPL").unwrap();
         let now = chrono::Utc::now();
-        let threshold = crate::threshold::ExecutionThreshold::Shares(
+        let threshold = st0x_config::ExecutionThreshold::Shares(
             st0x_execution::Positive::new(st0x_execution::FractionalShares::new(
                 st0x_float_macro::float!(1),
             ))

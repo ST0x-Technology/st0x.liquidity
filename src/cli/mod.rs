@@ -12,19 +12,19 @@ mod wrapper;
 use alloy::primitives::{Address, B256, TxHash};
 use alloy::providers::{ProviderBuilder, WsConnect};
 use clap::{Parser, Subcommand, ValueEnum};
+use rain_math_float::Float;
 use sqlx::SqlitePool;
 use std::io::Write;
 use std::sync::Arc;
 use tracing::info;
 
-use rain_math_float::Float;
+use st0x_config::{Ctx, Env};
 use st0x_event_sorcery::Projection;
 use st0x_evm::OpenChainErrorRegistry;
 use st0x_execution::alpaca_broker_api::AlpacaLimitPrice;
 use st0x_execution::{AlpacaAccountId, Direction, FractionalShares, Positive, Symbol, TimeInForce};
 use st0x_finance::Usdc;
 
-use crate::config::{Ctx, Env};
 use crate::offchain::order::{OffchainOrder, OffchainOrderId, OrderPlacer};
 use crate::position::Position;
 use crate::symbol::cache::SymbolCache;
@@ -1287,10 +1287,10 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::config::{AssetsConfig, BrokerCtx, EquitiesConfig, LogLevel, TradingMode};
-    use crate::onchain::EvmCtx;
     use crate::test_utils::{positive_shares, setup_test_db};
-    use crate::threshold::ExecutionThreshold;
+    use st0x_config::EvmCtx;
+    use st0x_config::ExecutionThreshold;
+    use st0x_config::{AssetsConfig, BrokerCtx, EquitiesConfig, LogLevel, TradingMode};
 
     fn create_test_ctx() -> Ctx {
         Ctx {
@@ -1323,8 +1323,6 @@ mod tests {
             travel_rule: None,
             rest_api: None,
             redemption_wallet: None,
-            #[cfg(feature = "test-support")]
-            failure_injector: crate::conductor::job::FailureInjector::new(),
         }
     }
 

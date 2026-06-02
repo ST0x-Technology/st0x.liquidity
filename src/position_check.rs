@@ -13,14 +13,12 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tracing::{debug, error, warn};
 
+use st0x_config::Ctx;
 use st0x_event_sorcery::Projection;
 use st0x_execution::{CounterTradePreflight, Executor, MarketOrder, Symbol};
 
 use crate::conductor::clamp_shares_to_reservation;
-#[cfg(any(test, feature = "test-support"))]
-use crate::conductor::job::JobKind;
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
-use crate::config::Ctx;
 use crate::equity_redemption::symbols_with_active_transfers;
 use crate::offchain::order::OffchainOrderId;
 use crate::onchain::accumulator::{ExecutionCtx, check_execution_readiness};
@@ -75,8 +73,9 @@ where
     type Error = CheckPositionsError;
 
     const WORKER_NAME: &'static str = "check-positions-worker";
+
     #[cfg(any(test, feature = "test-support"))]
-    const JOB_KIND: JobKind = JobKind::CheckPositions;
+    const JOB_KIND: crate::conductor::job::JobKind = crate::conductor::job::JobKind::CheckPositions;
 
     fn label(&self) -> Label {
         Label::new("CheckPositions")
@@ -248,15 +247,15 @@ mod tests {
     };
     use st0x_float_macro::float;
 
+    use st0x_config::{
+        AssetsConfig, EquitiesConfig, EquityAssetConfig, ExecutionThreshold, OperationMode,
+        create_test_ctx_with_order_owner,
+    };
+
     use super::*;
     use crate::conductor::setup_apalis_tables;
-    use crate::config::{
-        AssetsConfig, EquitiesConfig, EquityAssetConfig, OperationMode,
-        tests::create_test_ctx_with_order_owner,
-    };
     use crate::position::{PositionCommand, TradeId};
     use crate::test_utils::setup_test_db;
-    use crate::threshold::ExecutionThreshold;
 
     async fn build_ctx(
         pool: SqlitePool,

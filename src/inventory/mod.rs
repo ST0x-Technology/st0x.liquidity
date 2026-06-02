@@ -7,6 +7,8 @@ pub(crate) mod snapshot;
 mod venue_balance;
 pub(crate) mod view;
 
+pub(crate) use st0x_config::ImbalanceThreshold;
+
 pub(crate) use broadcasting::BroadcastingInventory;
 #[cfg(test)]
 pub(crate) use polling::PollerError;
@@ -17,7 +19,6 @@ pub(crate) use polling::{
 pub(crate) use projection::InventoryProjection;
 pub(crate) use snapshot::{InventorySnapshot, InventorySnapshotId};
 pub(crate) use venue_balance::InventoryError;
-pub use view::ImbalanceThreshold;
 pub(crate) use view::{
     EquityImbalanceError, Imbalance, Inventory, InventoryView, InventoryViewError, Operator,
     TransferOp, Venue,

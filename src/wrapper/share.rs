@@ -6,12 +6,12 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use tracing::info;
 
+use st0x_config::EquityAssetConfig;
 use st0x_evm::{IntoErrorRegistry, OpenChainErrorRegistry, Wallet};
 use st0x_execution::Symbol;
 
 use super::{UnderlyingPerWrapped, Wrapper, WrapperError};
 use crate::bindings::{IERC20, IERC4626};
-use crate::config::EquityAssetConfig;
 
 /// One unit with 18 decimals for ratio queries.
 const RATIO_QUERY_AMOUNT: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
@@ -267,8 +267,8 @@ mod tests {
     use st0x_execution::Symbol;
 
     use super::*;
-    use crate::config::{EquityAssetConfig, OperationMode};
     use crate::test_utils::StubWallet;
+    use st0x_config::{EquityAssetConfig, OperationMode};
 
     fn test_asset_config() -> EquityAssetConfig {
         EquityAssetConfig {

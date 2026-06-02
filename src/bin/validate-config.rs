@@ -6,7 +6,7 @@
 
 use clap::Parser;
 
-use st0x_hedge::config::{Ctx, Env};
+use st0x_config::{Ctx, Env};
 
 fn main() -> std::process::ExitCode {
     let Env { config, secrets } = Env::parse();
