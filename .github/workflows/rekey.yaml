@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   tf-rekey:
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:

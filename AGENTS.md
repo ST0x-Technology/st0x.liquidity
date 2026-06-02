@@ -74,6 +74,9 @@ permission to do the obvious corrective work.
   already told you what to do wastes their time and signals you weren't
   listening. Only stop and ask when you are actually blocked on a decision the
   user must make, not as a polite checkpoint.
+- **When you need user input, use the structured input prompt your tooling
+  exposes -- not prose at the end of a long response.** Wall-of-text questions
+  get missed. Batch all open decisions in one prompt, not a trickle.
 
 ## Planning Hierarchy
 
@@ -136,6 +139,8 @@ An epic is a roadmap subsection grouping related issues toward a single goal.
   progresses.
 - Clear completed tasks from the active list so the remaining work is always
   obvious.
+- **Questions awaiting user answers are tasks: track them.** Untracked prose
+  questions get lost when the user replies about something else.
 
 ### While implementing
 
@@ -270,24 +275,19 @@ binary).
 
 **CRITICAL: If Rust build fails with sqlx macro errors like "unable to open
 database file" or "(code: 14)", run `sqlx db reset -y` to fix the database.**
-This is the proper solution - NEVER try workarounds like
-`DATABASE_URL=sqlite://:memory:` or other hacks.
+NEVER use workarounds like `DATABASE_URL=sqlite://:memory:`.
 
-**CRITICAL: NEVER manually create migration files.** Always use
-`sqlx migrate add
-<migration_name>` to create migrations. This ensures proper
-timestamping and sequencing.
+**CRITICAL: NEVER manually create migration files.** Use
+`sqlx migrate add <migration_name>` for proper timestamping and sequencing.
 
-**CRITICAL: New worktrees require database setup.** When working in a new git
-worktree, you will encounter sqlx compile errors like "unable to open database
-file". Fix this by running `sqlx db reset -y` to create and migrate the local
-database before running any cargo commands.
+**CRITICAL: New worktrees require database setup.** A new worktree will hit sqlx
+compile errors like "unable to open database file". Run `sqlx db reset -y` to
+create and migrate the local database before any cargo commands.
 
 ### Dependency Management
 
-**CRITICAL: NEVER manually edit `Cargo.toml` to add dependencies.** Always use
-`cargo add <crate_name>` to add dependencies. This ensures proper version
-resolution and feature selection.
+**CRITICAL: NEVER manually edit `Cargo.toml` to add dependencies.** Use
+`cargo add <crate_name>` for proper version resolution and feature selection.
 
 - `cargo add <crate_name>` - Add a dependency to the current crate
 - `cargo add <crate_name> --dev` - Add a dev-dependency
@@ -350,6 +350,25 @@ convention -- new generated paths should not extend that list.
 - When handling clippy errors about function lengths or cognitive complexity,
   don't split up the functions more than necessary to get below the limit.
   Instead ask the user if we can add a clippy allow for that error.
+
+### Push policy
+
+master is protected (PR + CI + 2 approvals), so mistakes can't publish to
+master. For feature branches, push is part of the work.
+
+- **Default: `gt ss`** to submit the whole stack. Plain `git push` leaves
+  restacked descendants stale.
+- **In-flight CI:** pushing cancels in-progress CI; hold if you don't want it
+  restarted.
+- **Shared stacks:** `gt ss` would clobber upstack work; use `gt submit` on
+  current + downstack only. If unsure, ask.
+
+### Commit message hygiene
+
+Set the message at `gt create` time. After that, use `gt modify` without `-m` so
+the existing message stays. If amended work has different scope than the
+branch's message, it belongs on a different branch -- don't rewrite the message
+to absorb it.
 
 ### Updating ROADMAP.md
 
@@ -610,12 +629,6 @@ reviewing code that uses configuration instead of reading secrets directly.
     input regardless of surrounding bytes)
   - Numeric operations where edge cases are hard to enumerate manually
 
-#### Writing Meaningful Tests
-
-Tests must verify application logic, not language features. Testing struct field
-assignments is useless; test actual behavior like
-`config.calculate_next_poll_delay()` returning expected values.
-
 ### Workflow Best Practices
 
 - **Incremental verification during development** -- scope checks to the package
@@ -626,23 +639,19 @@ assignments is useless; test actual behavior like
   3. `cargo clippy -p <crate>` only after all substantive edits to that crate
      are done
   4. Reserve `--workspace` variants for the final verification pass
-- **Final verification before handing over** (skip if only
-  documentation/markdown files were changed). The simplest path is
-  `nix run .#ci` -- it enters the right dev shells (`ci-backend`,
-  `ci-dashboard`) and runs the full check matrix end-to-end: backend
-  `cargo check` (with and without `--all-features`), `cargo nextest run`,
-  `cargo clippy`, `cargo fmt --check`, plus the dashboard's `bun.nix` freshness
-  check, DTO regeneration, lint, and `svelte-check`. This is what local
-  verification should look like before pushing, and what CI mirrors.
+- **Final verification before handing over** (skip for doc-only changes):
+  `nix run .#ci` enters the right dev shells (`ci-backend`, `ci-dashboard`) and
+  runs the full matrix end-to-end -- backend `cargo check` (with and without
+  `--all-features`), `cargo nextest run`, `cargo clippy`, `cargo fmt --check`,
+  plus dashboard `bun.nix` freshness check, DTO regeneration, lint,
+  `svelte-check`. Mirrors CI.
 
-  If you need to break it down for iteration (e.g. only the backend changed),
-  run the individual steps from inside the corresponding shell:
-  1. `cargo check --workspace` - catches compilation errors across all crates
-  2. `cargo nextest run --workspace --all-features` - full test suite including
-     e2e. **Spawns anvil** for CCTP integration tests; only the `ci-backend`
-     shell exposes the foundry binary needed for this. Run via
-     `nix develop .#ci-backend -c cargo nextest run ...`, not the default dev
-     shell.
+  For iteration (e.g. backend-only), run individual steps in the corresponding
+  shell:
+  1. `cargo check --workspace`
+  2. `cargo nextest run --workspace --all-features` -- spawns anvil for CCTP
+     integration tests; only the `ci-backend` shell exposes the foundry binary.
+     Run via `nix develop .#ci-backend -c cargo nextest run ...`.
   3. `cargo clippy --workspace --all-targets --all-features` - full linting
   4. `cargo fmt` - always run last to ensure clean formatting
   5. **Diff review** - after all checks pass, review staged changes and revert
