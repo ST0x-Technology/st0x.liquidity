@@ -2360,9 +2360,6 @@ async fn wrapped_equity_in_bot_wallet_recovers_into_raindex() -> anyhow::Result<
 /// records the full orphan sequence `Detected -> OrphanWrapSubmitted ->
 /// OrphanWrapped -> OrphanDepositSubmitted -> OrphanDeposited`.
 #[test_log::test(tokio::test)]
-#[ignore = "TTDD red state: nothing enqueues UnwrappedEquityRecoveryJob until the rebalancing \
-            reactor trigger lands upstack; feat/unwrapped-equity-recovery-trigger removes this \
-            ignore"]
 async fn unwrapped_equity_in_bot_wallet_recovers_into_raindex() -> anyhow::Result<()> {
     let onchain_price = float!("150.00");
     let broker_fill_price = float!("150.00");

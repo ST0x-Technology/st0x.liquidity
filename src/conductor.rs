@@ -197,6 +197,23 @@ where
     Ok(())
 }
 
+async fn requeue_backfill_orphans(backfill_queue: &BackfillJobQueue) -> anyhow::Result<()> {
+    let count = backfill_queue
+        .requeue_orphaned()
+        .await
+        .context("failed to re-queue orphaned backfill jobs at startup")?;
+
+    if count > 0 {
+        info!(
+            target: "backfill",
+            count,
+            "Re-queued orphaned backfill range job(s) for crash-safe resume",
+        );
+    }
+
+    Ok(())
+}
+
 impl Conductor {
     pub(crate) async fn run<E>(
         executor_ctx: impl TryIntoExecutor<Executor = E>,
@@ -308,26 +325,7 @@ impl Conductor {
                 .await?;
         }
 
-        // The backfill queue has the same orphan hazard. `OrderFillMonitor`
-        // skips enqueuing while `backfill_queue.has_in_flight()` is true, and a
-        // `BackfillRange` row left `Running`/`Queued` by a dead process never
-        // ages out (the worker name is deterministic), so the poller would stop
-        // ingesting on-chain events indefinitely. Reset orphans before the
-        // monitor spawns -- backfill is core ingestion, always wired, so this is
-        // unconditional. Fail startup fast if the reset fails rather than coming
-        // up with event ingestion silently wedged.
-        let backfill_orphans = backfill_queue
-            .requeue_orphaned()
-            .await
-            .context("failed to re-queue orphaned backfill jobs at startup")?;
-
-        if backfill_orphans > 0 {
-            info!(
-                target: "backfill",
-                count = backfill_orphans,
-                "Re-queued orphaned backfill range job(s) for crash-safe resume",
-            );
-        }
+        requeue_backfill_orphans(&backfill_queue).await?;
 
         // Hydrate the in-memory InventoryView from persisted snapshot
         // state so the runtime projection has the same data as the
@@ -335,6 +333,9 @@ impl Conductor {
         // no events (unchanged values are deduplicated), leaving the
         // view empty and potentially causing incorrect rebalancing.
         hydrate_inventory_from_snapshot(&pool, &inventory).await;
+        if let Some(service) = &rebalancing_service {
+            service.enqueue_recovery_for_current_wallet_balances().await;
+        }
 
         let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer(executor.clone()));
 
@@ -378,6 +379,8 @@ impl Conductor {
                     mint_store,
                     redemption_store,
                     equity_in_progress: service.equity_in_progress.clone(),
+                    queue: wrapped_equity_recovery_queue.clone(),
+                    reschedule_interval: Duration::from_secs(ctx.inventory_poll_interval),
                 }))
             }
             _ => None,
