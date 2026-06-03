@@ -7,6 +7,7 @@
     getSimulateRev,
     getSimulateBackendPort,
     getSimulateSourceId,
+    isDashboardMockMode,
   } from '$lib/env'
   import { formatUtcClock, FETCH_TIMEOUT_MS } from '$lib/time'
   import { reactive } from '$lib/frp.svelte'
@@ -57,6 +58,12 @@
   const now = reactive(new Date())
 
   const fetchHealth = async () => {
+    if (isDashboardMockMode()) {
+      health.update(() => ({ gitCommit: 'mock', uptimeSeconds: 0 }))
+      botReachable.update(() => true)
+      return
+    }
+
     try {
       const baseUrl = getApiBaseUrl()
       const response = await fetch(`${baseUrl}/health`, {

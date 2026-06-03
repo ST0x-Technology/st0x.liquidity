@@ -8,14 +8,18 @@
   import TransferPanel from '$lib/components/transfer-panel.svelte'
   import LogPanel from '$lib/components/log-panel.svelte'
   import OrdersPanel from '$lib/components/orders-panel.svelte'
-  import { getWebSocketUrl } from '$lib/env'
+  import PnlPanel from '$lib/components/pnl-panel.svelte'
+  import { getWebSocketUrl, isDashboardMockMode } from '$lib/env'
   import { reactive } from '$lib/frp.svelte'
   import { createWebSocket, type WebSocketConnection } from '$lib/websocket'
 
   const queryClient = useQueryClient()
   const ws = reactive<WebSocketConnection | null>(null)
+  const mockMode = isDashboardMockMode()
 
   onMount(() => {
+    if (mockMode) return
+
     ws.update(() => createWebSocket(getWebSocketUrl(), queryClient))
     ws.current?.connect()
 
@@ -24,7 +28,7 @@
     }
   })
 
-  const connectionState = $derived(ws.current?.state ?? 'disconnected')
+  const connectionState = $derived(mockMode ? 'connected' : (ws.current?.state ?? 'disconnected'))
   const errorContext = $derived(ws.current?.error ?? null)
 
   let countdown = $state(0)
@@ -40,10 +44,12 @@
       countdown = Math.max(0, countdown - 1)
     }, 1000)
 
-    return () => { clearInterval(interval); }
+    return () => {
+      clearInterval(interval)
+    }
   })
 
-  type Tab = 'dashboard' | 'orders' | 'logs'
+  type Tab = 'dashboard' | 'orders' | 'pnl' | 'logs'
   type MobilePanel = 'inventory' | 'trades' | 'transfers'
 
   const activeTab = reactive<Tab>('dashboard')
@@ -57,36 +63,69 @@
 </script>
 
 <div class="flex h-screen flex-col bg-background">
-  <HeaderBar
-    connectionStatus={connectionState === 'error' ? 'disconnected' : connectionState}
-  />
+  <HeaderBar connectionStatus={connectionState === 'error' ? 'disconnected' : connectionState} />
 
   {#if errorContext}
     <div
       class="mx-2 mt-2 rounded-md border border-destructive bg-destructive/10
         px-4 py-2 text-sm text-destructive md:mx-4"
     >
-      Connection error. Reconnecting in {countdown}s
-      (attempt {errorContext.attempts})...
+      Connection error. Reconnecting in {countdown}s (attempt {errorContext.attempts})...
     </div>
   {/if}
 
   <!-- Mobile nav: panel tabs + logs -->
   <nav class="flex shrink-0 gap-1 overflow-x-auto border-b bg-card/50 px-2 md:hidden">
     {#if activeTab.current === 'dashboard'}
-      <button class={mobilePanelClass('inventory')} onclick={() => { mobilePanel.update(() => 'inventory'); }}>Inventory</button>
-      <button class={mobilePanelClass('trades')} onclick={() => { mobilePanel.update(() => 'trades'); }}>Trades</button>
-      <button class={mobilePanelClass('transfers')} onclick={() => { mobilePanel.update(() => 'transfers'); }}>Transfers</button>
+      <button
+        class={mobilePanelClass('inventory')}
+        onclick={() => {
+          mobilePanel.update(() => 'inventory')
+        }}>Inventory</button
+      >
+      <button
+        class={mobilePanelClass('trades')}
+        onclick={() => {
+          mobilePanel.update(() => 'trades')
+        }}>Trades</button
+      >
+      <button
+        class={mobilePanelClass('transfers')}
+        onclick={() => {
+          mobilePanel.update(() => 'transfers')
+        }}>Transfers</button
+      >
     {/if}
     <button
-      class="relative whitespace-nowrap px-3 py-2 text-sm font-medium transition-colors {activeTab.current === 'orders' ? 'text-foreground after:absolute after:bottom-0 after:left-0 after:right-0 after:h-0.5 after:bg-primary' : 'text-muted-foreground hover:text-foreground'}"
-      onclick={() => { activeTab.update((tab) => tab === 'orders' ? 'dashboard' : 'orders'); }}
+      class="relative whitespace-nowrap px-3 py-2 text-sm font-medium transition-colors {activeTab.current ===
+      'orders'
+        ? 'text-foreground after:absolute after:bottom-0 after:left-0 after:right-0 after:h-0.5 after:bg-primary'
+        : 'text-muted-foreground hover:text-foreground'}"
+      onclick={() => {
+        activeTab.update((tab) => (tab === 'orders' ? 'dashboard' : 'orders'))
+      }}
     >
       Orders
     </button>
     <button
-      class="relative whitespace-nowrap px-3 py-2 text-sm font-medium transition-colors {activeTab.current === 'logs' ? 'text-foreground after:absolute after:bottom-0 after:left-0 after:right-0 after:h-0.5 after:bg-primary' : 'text-muted-foreground hover:text-foreground'}"
-      onclick={() => { activeTab.update((tab) => tab === 'logs' ? 'dashboard' : 'logs'); }}
+      class="relative whitespace-nowrap px-3 py-2 text-sm font-medium transition-colors {activeTab.current ===
+      'pnl'
+        ? 'text-foreground after:absolute after:bottom-0 after:left-0 after:right-0 after:h-0.5 after:bg-primary'
+        : 'text-muted-foreground hover:text-foreground'}"
+      onclick={() => {
+        activeTab.update((tab) => (tab === 'pnl' ? 'dashboard' : 'pnl'))
+      }}
+    >
+      PnL
+    </button>
+    <button
+      class="relative whitespace-nowrap px-3 py-2 text-sm font-medium transition-colors {activeTab.current ===
+      'logs'
+        ? 'text-foreground after:absolute after:bottom-0 after:left-0 after:right-0 after:h-0.5 after:bg-primary'
+        : 'text-muted-foreground hover:text-foreground'}"
+      onclick={() => {
+        activeTab.update((tab) => (tab === 'logs' ? 'dashboard' : 'logs'))
+      }}
     >
       Logs
     </button>
@@ -96,21 +135,36 @@
   <nav class="hidden shrink-0 gap-1 border-b bg-card/50 px-4 md:flex">
     <button
       class={desktopTabClass(activeTab.current === 'dashboard')}
-      onclick={() => { activeTab.update(() => 'dashboard'); }}
+      onclick={() => {
+        activeTab.update(() => 'dashboard')
+      }}
     >
       Dashboard
     </button>
 
     <button
       class={desktopTabClass(activeTab.current === 'orders')}
-      onclick={() => { activeTab.update(() => 'orders'); }}
+      onclick={() => {
+        activeTab.update(() => 'orders')
+      }}
     >
       Orders
     </button>
 
     <button
+      class={desktopTabClass(activeTab.current === 'pnl')}
+      onclick={() => {
+        activeTab.update(() => 'pnl')
+      }}
+    >
+      PnL
+    </button>
+
+    <button
       class={desktopTabClass(activeTab.current === 'logs')}
-      onclick={() => { activeTab.update(() => 'logs'); }}
+      onclick={() => {
+        activeTab.update(() => 'logs')
+      }}
     >
       Logs
     </button>
@@ -142,6 +196,10 @@
   {:else if activeTab.current === 'orders'}
     <main class="flex-1 overflow-hidden p-2 md:p-4">
       <OrdersPanel />
+    </main>
+  {:else if activeTab.current === 'pnl'}
+    <main class="flex-1 overflow-hidden p-2 md:p-4">
+      <PnlPanel />
     </main>
   {:else}
     <main class="flex-1 overflow-hidden p-2 md:p-4">

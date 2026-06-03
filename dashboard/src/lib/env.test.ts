@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { getWebSocketUrl, getExplorerTxUrl } from './env'
+import { getWebSocketUrl, getExplorerTxUrl, getPnlSqlApiUrl } from './env'
 
 const mockEnv = { current: {} as Record<string, string | undefined> }
 
@@ -89,6 +89,24 @@ describe('getWebSocketUrl', () => {
 
     expect(getWebSocketUrl()).toBe('ws://localhost:8002/api/ws')
   })
+
+  it('uses the dev proxy websocket path when a backend API URL is configured', () => {
+    mockEnv.current = { PUBLIC_BACKEND_API_URL: 'https://backend.example.com' }
+    Object.defineProperty(globalThis, 'window', {
+      value: {
+        location: {
+          hostname: 'localhost',
+          port: '5173',
+          host: 'localhost:5173',
+          protocol: 'http:'
+        }
+      },
+      writable: true,
+      configurable: true
+    })
+
+    expect(getWebSocketUrl()).toBe('ws://localhost:5173/api/ws')
+  })
 })
 
 describe('getExplorerTxUrl', () => {
@@ -110,5 +128,75 @@ describe('getExplorerTxUrl', () => {
     mockEnv.current = { PUBLIC_EXPLORER_URL: '  https://arbiscan.io  ' }
 
     expect(getExplorerTxUrl('0xabc123')).toBe('https://arbiscan.io/tx/0xabc123')
+  })
+})
+
+describe('getPnlSqlApiUrl', () => {
+  beforeEach(() => {
+    mockEnv.current = {}
+    Object.defineProperty(globalThis, 'window', {
+      value: {
+        location: {
+          hostname: 'example.com',
+          port: '80',
+          host: 'example.com',
+          protocol: 'https:'
+        }
+      },
+      writable: true,
+      configurable: true
+    })
+  })
+
+  it('returns null when no SQL source is configured', () => {
+    expect(getPnlSqlApiUrl()).toBeNull()
+  })
+
+  it('returns trimmed SQL source URL when configured', () => {
+    mockEnv.current = {
+      PUBLIC_PNL_SQL_API_URL: '  http://example.com:8081/st0x-hedge.json  '
+    }
+
+    expect(getPnlSqlApiUrl()).toBe('http://example.com:8081/st0x-hedge.json')
+  })
+
+  it('uses the dev proxy for absolute SQL URLs during local development', () => {
+    Object.defineProperty(globalThis, 'window', {
+      value: {
+        location: {
+          hostname: 'localhost',
+          port: '5173',
+          host: 'localhost:5173',
+          protocol: 'http:'
+        }
+      },
+      writable: true,
+      configurable: true
+    })
+    mockEnv.current = {
+      PUBLIC_PNL_SQL_API_URL: 'http://example.com:8081/st0x-hedge.json'
+    }
+
+    expect(getPnlSqlApiUrl()).toBe('/__pnl_sql')
+  })
+
+  it('uses the dev proxy for 127.0.0.1 local development URLs', () => {
+    Object.defineProperty(globalThis, 'window', {
+      value: {
+        location: {
+          hostname: '127.0.0.1',
+          port: '5174',
+          host: '127.0.0.1:5174',
+          protocol: 'http:'
+        }
+      },
+      writable: true,
+      configurable: true
+    })
+    mockEnv.current = {
+      PUBLIC_PNL_SQL_API_URL: 'http://example.com:8081/st0x-hedge.json'
+    }
+
+    expect(getPnlSqlApiUrl()).toBe('/__pnl_sql')
   })
 })
