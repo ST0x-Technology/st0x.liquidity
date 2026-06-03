@@ -20,9 +20,8 @@ use crate::assert::{assert_broker_state, assert_cqrs_state};
 pub(crate) use crate::base_chain::TakeDirection;
 use crate::base_chain::{self, TakeOrderResult};
 pub(crate) use crate::poll::{
-    DEFAULT_POLL_TIMEOUT_SECS, connect_db, count_done_jobs, count_events, count_jobs,
-    poll_for_aggregate_events_containing, poll_for_events, sleep_or_crash, spawn_bot,
-    wait_for_processing,
+    DEFAULT_POLL_TIMEOUT_SECS, connect_db, count_events, poll_for_aggregate_events_containing,
+    poll_for_events, sleep_or_crash, spawn_bot, wait_for_processing,
 };
 pub(crate) use crate::test_infra::TestInfra;
 
@@ -35,10 +34,10 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
     deployment_block: u64,
     assets: AssetsConfig,
     execution_threshold_override: Option<st0x_hedge::ExecutionThreshold>,
-    /// Override the WebSocket RPC URL the bot connects to. Default is
-    /// `chain.ws_endpoint()`. Used by chaos tests to route the bot
+    /// Override the HTTP RPC URL the bot connects to. Default is
+    /// `chain.endpoint()`. Used by chaos tests to route the bot
     /// through a fault-injecting proxy.
-    ws_rpc_url_override: Option<url::Url>,
+    rpc_url_override: Option<url::Url>,
 ) -> anyhow::Result<Ctx> {
     let broker_ctx = BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
         api_key: TEST_API_KEY.to_owned(),
@@ -50,14 +49,14 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
         counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
     });
 
-    let ws_rpc_url = match ws_rpc_url_override {
+    let rpc_url = match rpc_url_override {
         Some(url) => url,
-        None => chain.ws_endpoint()?,
+        None => chain.endpoint().parse()?,
     };
 
     Ctx::for_test()
         .database_url(db_path.display().to_string())
-        .ws_rpc_url(ws_rpc_url)
+        .rpc_url(rpc_url)
         .orderbook(chain.orderbook)
         .deployment_block(deployment_block)
         .broker(broker_ctx)

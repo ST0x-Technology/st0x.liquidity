@@ -452,7 +452,7 @@ mod tests {
     async fn test_backfill_start_block_uses_deployment_block_without_checkpoint() {
         let pool = setup_test_db().await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
             required_confirmations: 0,
@@ -467,7 +467,7 @@ mod tests {
     async fn test_backfill_start_block_resumes_after_checkpoint() {
         let pool = setup_test_db().await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
             required_confirmations: 0,
@@ -484,7 +484,7 @@ mod tests {
     async fn test_backfill_start_block_respects_deployment_block_floor() {
         let pool = setup_test_db().await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
             required_confirmations: 0,
@@ -510,7 +510,7 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
@@ -539,7 +539,7 @@ mod tests {
         let pool = setup_test_db().await;
         let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
@@ -575,7 +575,7 @@ mod tests {
         let pool = setup_test_db().await;
         let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
@@ -609,7 +609,7 @@ mod tests {
     async fn test_save_backfill_checkpoint_is_monotonic() {
         let pool = setup_test_db().await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
@@ -728,7 +728,7 @@ mod tests {
         let job_queue = setup_job_queue(&pool).await;
         let order = get_test_order();
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
@@ -794,7 +794,7 @@ mod tests {
         let job_queue = setup_job_queue(&pool).await;
         let order = get_test_order();
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
@@ -861,7 +861,7 @@ mod tests {
         let pool = setup_test_db().await;
         let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
@@ -960,7 +960,7 @@ mod tests {
         let pool = setup_test_db().await;
         let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
@@ -1000,7 +1000,7 @@ mod tests {
         let pool = setup_test_db().await;
         let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
             required_confirmations: 0,
@@ -1081,7 +1081,7 @@ mod tests {
         let job_queue = setup_job_queue(&pool).await;
         let order = get_test_order();
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
@@ -1133,7 +1133,7 @@ mod tests {
         let pool = setup_test_db().await;
         let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1000,
             required_confirmations: 0,
@@ -1174,7 +1174,7 @@ mod tests {
         let pool = setup_test_db().await;
         let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 500,
             required_confirmations: 0,
@@ -1216,7 +1216,7 @@ mod tests {
         let job_queue = setup_job_queue(&pool).await;
         let order = get_test_order();
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
@@ -1259,7 +1259,7 @@ mod tests {
         let pool = setup_test_db().await;
         let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
@@ -1296,7 +1296,7 @@ mod tests {
         let job_queue = setup_job_queue(&pool).await;
         let order = get_test_order();
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
@@ -1387,7 +1387,7 @@ mod tests {
         let job_queue = setup_job_queue(&pool).await;
         let order = get_test_order();
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
@@ -1433,7 +1433,7 @@ mod tests {
         let pool = setup_test_db().await;
         let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
@@ -1469,7 +1469,7 @@ mod tests {
         let pool = setup_test_db().await;
         let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
@@ -1509,7 +1509,7 @@ mod tests {
         let pool = setup_test_db().await;
         let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
@@ -1557,7 +1557,7 @@ mod tests {
         let pool = setup_test_db().await;
         let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
@@ -1615,7 +1615,7 @@ mod tests {
         let job_queue = setup_job_queue(&pool).await;
         let order = get_test_order();
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
@@ -1662,7 +1662,7 @@ mod tests {
         let pool = setup_test_db().await;
         let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 42,
             required_confirmations: 0,
@@ -1695,7 +1695,7 @@ mod tests {
         let pool = setup_test_db().await;
         let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
@@ -1747,7 +1747,7 @@ mod tests {
         let pool = setup_test_db().await;
         let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
@@ -1793,7 +1793,7 @@ mod tests {
         let pool = setup_test_db().await;
         let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
@@ -1825,7 +1825,7 @@ mod tests {
         let pool = setup_test_db().await;
         let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
@@ -1884,7 +1884,7 @@ mod tests {
         let pool = setup_test_db().await;
         let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
@@ -1938,7 +1938,7 @@ mod tests {
         let pool = setup_test_db().await;
         let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
@@ -1980,7 +1980,7 @@ mod tests {
         let pool = setup_test_db().await;
         let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 100,
             required_confirmations: 0,
@@ -2009,7 +2009,7 @@ mod tests {
         let pool = setup_test_db().await;
         let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 0,
@@ -2087,7 +2087,7 @@ mod tests {
         let pool = setup_test_db().await;
         let job_queue = setup_job_queue(&pool).await;
         let evm_ctx = EvmCtx {
-            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 50,
             required_confirmations: 0,

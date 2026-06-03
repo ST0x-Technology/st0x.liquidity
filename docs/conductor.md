@@ -27,9 +27,10 @@ The `Clone` bound enables restart semantics: the supervisor stores the original
 instance and clones it for each attempt. Owned fields reset on restart; fields
 behind `Arc` survive across restarts.
 
-**Key design pattern**: create ephemeral resources (WebSocket connections, HTTP
-clients) INSIDE `run()`, not as struct fields. Each restart establishes fresh
-connections automatically.
+**Key design pattern**: create ephemeral, connection-bound resources INSIDE
+`run()`, not as struct fields, so each restart establishes them fresh. Cheaply
+cloneable, reconnect-tolerant handles (e.g. an HTTP provider) may be held as
+owned fields -- they reset to the stored clone on restart.
 
 ### Supervisor lifecycle
 
@@ -47,21 +48,30 @@ SupervisorBuilder::default()
 
 ### OrderFillMonitor
 
-Defined in `src/conductor/order_fill_monitor.rs`. Subscribes to
-ClearV3/TakeOrderV3 WebSocket streams and pushes each event into the
-`DexTradeAccountingJobQueue` as an `AccountForDexTrade` job.
+Defined in `src/conductor/monitor/order_fills.rs`. Drives continuous HTTP
+`eth_getLogs` ingestion of `ClearV3`/`TakeOrderV3` fills. It is a supervised
+interval task: every `order_fill_poll_interval` seconds it reads the chain tip,
+derives a cutoff at `tip - required_confirmations`, and enqueues a
+`BackfillRange` job for `(checkpoint+1, cutoff)`. The `backfill-worker` fetches
+the logs and pushes an `AccountForDexTrade` job per fill, advancing the
+persisted checkpoint only on success.
 
 ```rust
-struct OrderFillMonitor {
-    ws_url: Url,
-    orderbook: Address,
-    job_queue: DexTradeAccountingJobQueue,
+struct OrderFillMonitor<P> {
+    evm_ctx: EvmCtx,
+    backfill_queue: BackfillJobQueue,
+    pool: SqlitePool,
+    provider: P,
+    poll_interval: Duration,
 }
 ```
 
-The WebSocket connection is created inside `run()`. On disconnect or error,
-`run()` returns `Err(...)`, the supervisor restarts the task, and a fresh
-connection is established.
+There is no WebSocket and no live subscription. A previous range still in flight
+is skipped (the checkpoint has not advanced, so re-enqueuing would re-scan the
+same blocks). Transient per-tick errors are logged and swallowed; the loop
+retries on the next tick, and the supervisor restarts only on a panic. This
+replaces the former WS `.watch()` filter polling -- see the module docstring for
+why `eth_subscribe`/`subscribe_logs` was also rejected.
 
 ## One-shot jobs (apalis + Job trait)
 
@@ -236,15 +246,16 @@ executor, CQRS frameworks, execution threshold, wallet polling config).
 ## Startup sequencing
 
 ```
-Phase 1 (parallel):  connect_ws | setup_cqrs | setup_apalis_tables
+Phase 1 (parallel):  connect_http | setup_cqrs | setup_apalis_tables
 Phase 2 (parallel):  get_cutoff_block | seed_vaults | setup_rebalancing
 Phase 3 (sequential): backfill checkpoint gap to job queue
 Phase 4:              builder::spawn() starts the runtime
 ```
 
-The trade accounting worker starts only after backfill completes. The WS
-subscription is established in phase 1, so no events are missed -- they buffer
-until the monitor starts.
+The trade accounting worker starts only after the initial backfill completes.
+Ingestion is a checkpoint-driven `eth_getLogs` poll, not a live subscription, so
+no events are missed across downtime: the monitor always resumes from the
+persisted checkpoint and re-scans any gap.
 
 Backfill reads the last successful checkpoint from SQLite. The configured
 `deployment_block` seeds only the first run; subsequent runs start at

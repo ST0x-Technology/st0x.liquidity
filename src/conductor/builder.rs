@@ -244,7 +244,7 @@ where
         ctx: context.ctx.clone(),
         cache: context.cache,
         feed_id_cache: FeedIdCache::default(),
-        evm: ReadOnlyEvm::new(context.provider),
+        evm: ReadOnlyEvm::new(context.provider.clone()),
         cqrs: trade_cqrs,
         vault_registry: context.frameworks.vault_registry,
         executor: context.executor.clone(),
@@ -257,13 +257,14 @@ where
 
     let order_fill_monitor = OrderFillMonitor::new(
         context.ctx.evm.clone(),
-        job_queue.clone(),
         backfill_queue.clone(),
         context.pool,
+        context.provider,
+        std::time::Duration::from_secs(context.ctx.order_fill_poll_interval),
     );
 
     // Fail-fast: exit if any supervised task dies, relying on systemd restart for recovery.
-    // In test builds, use aggressive timeouts so a flaky WebSocket doesn't
+    // In test builds, use aggressive timeouts so a transient RPC failure doesn't
     // stall e2e tests for ~13 minutes of exponential backoff.
     let is_test = cfg!(any(test, feature = "test-support"));
     let mut supervisor_builder = SupervisorBuilder::default()

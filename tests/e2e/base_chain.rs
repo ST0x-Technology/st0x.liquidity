@@ -16,7 +16,6 @@ use alloy::sol;
 use alloy::sol_types::SolEvent as _;
 use rain_math_float::Float;
 use std::collections::HashMap;
-use url::Url;
 
 use st0x_evm::test_chain::{evm_mapping_slot, solidity_short_string};
 use st0x_hedge::bindings::IOrderBookV6::{self, TakeOrderV3};
@@ -251,11 +250,6 @@ impl BaseChain<()> {
 
 #[bon::bon]
 impl<P: Provider + Clone> BaseChain<P> {
-    /// Returns the WebSocket endpoint URL for the Anvil node.
-    pub fn ws_endpoint(&self) -> anyhow::Result<Url> {
-        Ok(self.anvil.ws_endpoint().parse()?)
-    }
-
     /// Mines `count` empty blocks.
     pub async fn mine_blocks(&self, count: u64) -> anyhow::Result<()> {
         for _ in 0..count {

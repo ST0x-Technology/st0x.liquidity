@@ -8,7 +8,7 @@ mod manifest;
 pub(crate) mod monitor;
 
 use alloy::primitives::Address;
-use alloy::providers::{ProviderBuilder, WsConnect};
+use alloy::providers::{Provider, ProviderBuilder};
 use anyhow::Context;
 use apalis::prelude::Status;
 use chrono::Utc;
@@ -155,11 +155,19 @@ impl Conductor {
     {
         let executor = executor_ctx.try_into_executor().await?;
 
-        let ws = WsConnect::new(ctx.evm.ws_rpc_url.as_str());
-        let provider = ProviderBuilder::new()
-            .connect_ws(ws)
+        // Single HTTP transport: drives continuous eth_getLogs fill polling
+        // (via the OrderFillMonitor + backfill worker) and all read-only
+        // contract calls. No WebSocket -- see `monitor::order_fills`.
+        let provider = ProviderBuilder::new().connect_http(ctx.evm.rpc_url.clone());
+
+        // The HTTP transport connects lazily, so probe it once at startup to
+        // fail fast on a misconfigured or unreachable RPC rather than only
+        // surfacing it as repeated poll-loop retries. systemd's bounded
+        // restart loop handles a genuinely-down endpoint from here.
+        provider
+            .get_block_number()
             .await
-            .context("failed to connect websocket provider")?;
+            .context("failed to reach RPC endpoint at startup")?;
         let cache = SymbolCache::default();
 
         setup_apalis_tables(&pool).await?;
@@ -248,6 +256,27 @@ impl Conductor {
                     "Re-queued orphaned Base->Alpaca transfer job(s) for crash-safe resume",
                 );
             }
+        }
+
+        // The backfill queue has the same orphan hazard. `OrderFillMonitor`
+        // skips enqueuing while `backfill_queue.has_in_flight()` is true, and a
+        // `BackfillRange` row left `Running`/`Queued` by a dead process never
+        // ages out (the worker name is deterministic), so the poller would stop
+        // ingesting on-chain events indefinitely. Reset orphans before the
+        // monitor spawns -- backfill is core ingestion, always wired, so this is
+        // unconditional. Fail startup fast if the reset fails rather than coming
+        // up with event ingestion silently wedged.
+        let backfill_orphans = backfill_queue
+            .requeue_orphaned()
+            .await
+            .context("failed to re-queue orphaned backfill jobs at startup")?;
+
+        if backfill_orphans > 0 {
+            info!(
+                target: "backfill",
+                count = backfill_orphans,
+                "Re-queued orphaned backfill range job(s) for crash-safe resume",
+            );
         }
 
         // Hydrate the in-memory InventoryView from persisted snapshot

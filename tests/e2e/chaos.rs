@@ -1,25 +1,31 @@
-//! WebSocket-level chaos proxy for the e2e Anvil provider.
+//! HTTP-level chaos proxy for the e2e Anvil provider.
 //!
-//! Sits between the bot's `ws_rpc_url` and the real Anvil node. Forwards
+//! Sits between the bot's `rpc_url` and the real Anvil node. Forwards
 //! JSON-RPC traffic by default; when configured, returns empty
 //! `eth_getLogs` results that model load-balancer inconsistency where
 //! one node in the upstream pool is behind on indexing.
+//!
+//! The bot ingests fills over a single HTTP transport (continuous
+//! `eth_getLogs` polling), so each JSON-RPC request and its response are
+//! one HTTP round-trip -- the request already carries its `method`, so
+//! perturbation is decided per request without tracking ids across
+//! frames.
 //!
 //! Used by the chaos test suite to validate the bot's recovery paths
 //! against adversarial RPC behaviour without modifying the production
 //! code paths. Additional behaviours (drop, error, stall) land
 //! alongside the chaos sub-issues that need them.
 
-use futures_util::{SinkExt, StreamExt};
-use serde_json::Value;
-use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::net::{TcpListener, TcpStream};
+
+use axum::Router;
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::response::{IntoResponse, Response};
+use reqwest::Client;
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, accept_async, connect_async, tungstenite::protocol::Message,
-};
-use tracing::{debug, warn};
+use tracing::warn;
 use url::Url;
 
 /// Active behaviour the chaos proxy applies to JSON-RPC requests
@@ -49,46 +55,56 @@ pub(crate) struct ChaosConfig {
 
 type SharedConfig = Arc<Mutex<Option<ChaosConfig>>>;
 
-/// Per-connection map of in-flight JSON-RPC request id to the method that
-/// produced it, so the response interceptor knows which method's chaos
-/// config to consult when a response arrives.
-type PendingMethods = Arc<Mutex<HashMap<String, String>>>;
+/// Axum handler state: the mutable chaos config plus what's needed to
+/// forward un-perturbed requests to the real Anvil node.
+#[derive(Clone)]
+struct ProxyState {
+    config: SharedConfig,
+    upstream: Url,
+    client: Client,
+}
 
-/// Spawned proxy. Holds the listening port and a handle the test can use
-/// to mutate the active [`ChaosConfig`] mid-run.
+/// Spawned proxy. Holds the listening endpoint and a handle the test can
+/// use to mutate the active [`ChaosConfig`] mid-run.
 #[derive(Debug)]
 pub(crate) struct ChaosProxy {
-    /// `ws://127.0.0.1:<port>` the bot should connect to instead of the
+    /// `http://127.0.0.1:<port>` the bot should connect to instead of the
     /// real Anvil endpoint.
     pub endpoint: Url,
     /// Shared mutable config; `None` means transparent forwarding.
     config: SharedConfig,
-    /// Accept loop's handle. Aborted on drop so the proxy dies with its
+    /// Serve loop's handle. Aborted on drop so the proxy dies with its
     /// parent test.
-    listener_task: tokio::task::AbortHandle,
+    server_task: tokio::task::AbortHandle,
 }
 
 impl ChaosProxy {
-    /// Spawn a chaos proxy in front of `upstream_ws` and start listening
-    /// on a free local port. The proxy keeps running until the returned
-    /// handle is dropped.
-    pub(crate) async fn start(upstream_ws: Url) -> anyhow::Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
+    /// Spawn a chaos proxy in front of `upstream` (the real Anvil HTTP
+    /// endpoint) and start listening on a free local port. The proxy
+    /// keeps running until the returned handle is dropped.
+    pub(crate) async fn start(upstream: Url) -> anyhow::Result<Self> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
-        let endpoint: Url = format!("ws://127.0.0.1:{port}").parse()?;
+        let endpoint: Url = format!("http://127.0.0.1:{port}").parse()?;
 
         let config: SharedConfig = Arc::new(Mutex::new(None));
+        let state = ProxyState {
+            config: config.clone(),
+            upstream,
+            client: Client::new(),
+        };
 
-        let upstream = upstream_ws.clone();
-        let task_config = config.clone();
+        let app = Router::new().fallback(handle_rpc).with_state(state);
         let handle = tokio::spawn(async move {
-            accept_loop(listener, upstream, task_config).await;
+            if let Err(error) = axum::serve(listener, app).await {
+                warn!(?error, "chaos proxy server stopped");
+            }
         });
 
         Ok(Self {
             endpoint,
             config,
-            listener_task: handle.abort_handle(),
+            server_task: handle.abort_handle(),
         })
     }
 
@@ -109,192 +125,140 @@ impl ChaosProxy {
 
 impl Drop for ChaosProxy {
     fn drop(&mut self) {
-        self.listener_task.abort();
+        self.server_task.abort();
     }
 }
 
-async fn accept_loop(listener: TcpListener, upstream_ws: Url, config: SharedConfig) {
-    loop {
-        let (stream, _peer) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(error) => {
-                warn!(?error, "chaos proxy accept failed");
-                continue;
+/// Single JSON-RPC POST handler. Anvil requests are single objects (one
+/// method per HTTP call); batched arrays are handled element-wise so each
+/// sub-request is perturbed or forwarded independently.
+async fn handle_rpc(State(state): State<ProxyState>, body: Bytes) -> Response {
+    let Ok(parsed) = serde_json::from_slice::<Value>(&body) else {
+        // Not JSON we understand -- forward the raw bytes verbatim.
+        return forward_raw(&state, body).await;
+    };
+
+    let response = match parsed {
+        Value::Array(requests) => {
+            let mut responses = Vec::with_capacity(requests.len());
+            for request in requests {
+                responses.push(process_one(&state, request).await);
             }
-        };
-
-        let upstream = upstream_ws.clone();
-        let conn_config = config.clone();
-        tokio::spawn(async move {
-            if let Err(error) = handle_connection(stream, upstream, conn_config).await {
-                warn!(?error, "chaos proxy connection ended with error");
-            }
-        });
-    }
-}
-
-async fn handle_connection(
-    client_stream: TcpStream,
-    upstream_ws: Url,
-    config: SharedConfig,
-) -> anyhow::Result<()> {
-    let client_ws = accept_async(client_stream).await?;
-    let (upstream_ws_conn, _response) = connect_async(upstream_ws.as_str()).await?;
-
-    let (client_sink, client_stream) = client_ws.split();
-    let (upstream_sink, upstream_stream) = upstream_ws_conn.split();
-    let pending: PendingMethods = Arc::new(Mutex::new(HashMap::new()));
-
-    let client_to_upstream =
-        forward_client_to_upstream(client_stream, upstream_sink, pending.clone());
-    let upstream_to_client =
-        forward_upstream_to_client(upstream_stream, client_sink, pending, config);
-
-    tokio::select! {
-        () = client_to_upstream => {}
-        () = upstream_to_client => {}
-    }
-
-    Ok(())
-}
-
-async fn forward_client_to_upstream(
-    mut client_stream: futures_util::stream::SplitStream<WebSocketStream<TcpStream>>,
-    mut upstream_sink: futures_util::stream::SplitSink<
-        WebSocketStream<MaybeTlsStream<TcpStream>>,
-        Message,
-    >,
-    pending: PendingMethods,
-) {
-    while let Some(frame) = client_stream.next().await {
-        let frame = match frame {
-            Ok(frame) => frame,
-            Err(error) => {
-                debug!(?error, "client->upstream stream ended");
-                break;
-            }
-        };
-
-        if let Message::Text(ref text) = frame {
-            record_pending_method(text, &pending).await;
+            Value::Array(responses)
         }
+        single => process_one(&state, single).await,
+    };
 
-        if upstream_sink.send(frame).await.is_err() {
-            break;
-        }
-    }
+    json_response(&response)
 }
 
-async fn forward_upstream_to_client(
-    mut upstream_stream: futures_util::stream::SplitStream<
-        WebSocketStream<MaybeTlsStream<TcpStream>>,
-    >,
-    mut client_sink: futures_util::stream::SplitSink<WebSocketStream<TcpStream>, Message>,
-    pending: PendingMethods,
-    config: SharedConfig,
-) {
-    while let Some(frame) = upstream_stream.next().await {
-        let frame = match frame {
-            Ok(frame) => frame,
-            Err(error) => {
-                debug!(?error, "upstream->client stream ended");
-                break;
-            }
-        };
+/// Decide a single JSON-RPC request: synthesize a perturbed response when
+/// the active chaos config matches, otherwise forward it upstream.
+async fn process_one(state: &ProxyState, request: Value) -> Value {
+    let id = request.get("id").cloned().unwrap_or(Value::Null);
+    let method = request
+        .get("method")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
 
-        let outgoing = match frame {
-            Message::Text(text) => Message::Text(
-                perturb_if_matching(text.to_string(), &pending, &config)
-                    .await
-                    .into(),
-            ),
-            other => other,
-        };
-
-        if client_sink.send(outgoing).await.is_err() {
-            break;
-        }
+    if let Some(method) = method
+        && let Some(perturbed) = perturb(state, &method, &id).await
+    {
+        return perturbed;
     }
+
+    forward_one(state, &request).await.unwrap_or_else(|error| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32603, "message": error.to_string() },
+        })
+    })
 }
 
-/// On the client->upstream path: parse a JSON-RPC request frame and
-/// remember its id->method mapping so the response path can check the
-/// chaos config against the method.
-async fn record_pending_method(text: &str, pending: &PendingMethods) {
-    let Ok(json) = serde_json::from_str::<Value>(text) else {
-        return;
-    };
-    let (Some(id), Some(method)) = (json.get("id"), json.get("method").and_then(Value::as_str))
-    else {
-        return;
-    };
-    let id_key = id.to_string();
-    pending.lock().await.insert(id_key, method.to_owned());
-}
+/// Returns a synthesized response if the active chaos config perturbs this
+/// method, or `None` to forward.
+async fn perturb(state: &ProxyState, method: &str, id: &Value) -> Option<Value> {
+    let mut guard = state.config.lock().await;
 
-/// On the upstream->client path: if this response corresponds to a
-/// method targeted by the active chaos config, apply the configured
-/// behaviour to the response body before forwarding.
-async fn perturb_if_matching(
-    text: String,
-    pending: &PendingMethods,
-    config: &SharedConfig,
-) -> String {
-    let Ok(mut json) = serde_json::from_str::<Value>(&text) else {
-        return text;
-    };
-    let Some(id) = json.get("id").cloned() else {
-        return text;
-    };
-    let id_key = id.to_string();
+    let result = match guard.as_mut() {
+        None => None,
+        Some(cfg) => {
+            // Drain the paired stale-tip queue first: each perturbed
+            // `getLogs` owes one stale `eth_blockNumber` so the bot's
+            // read-after-write tip check fires. Draining before the budget
+            // check keeps the two counters from desyncing when `getLogs`
+            // budget exhausts mid-batch while a paired tip is still owed.
+            let is_paired_tip = method == "eth_blockNumber"
+                && cfg.method == "eth_getLogs"
+                && matches!(cfg.behaviour, ChaosBehaviour::EmptyResult)
+                && cfg.pending_stale_tips > 0;
 
-    let method = pending.lock().await.remove(&id_key);
-    let Some(method) = method else {
-        return text;
-    };
-
-    let mut guard = config.lock().await;
-    let Some(cfg) = guard.as_mut() else {
-        return text;
-    };
-
-    // For `EmptyResult` chaos on `eth_getLogs`, each perturbed `getLogs`
-    // queues a paired stale `eth_blockNumber` (so the bot's
-    // read-after-write tip check actually fires). Drain that queue
-    // before checking whether new perturbations are still in budget --
-    // otherwise the counters can desync when `getLogs` budget exhausts
-    // mid-batch while a paired tip is still owed.
-    let is_paired_tip = method == "eth_blockNumber"
-        && cfg.method == "eth_getLogs"
-        && matches!(cfg.behaviour, ChaosBehaviour::EmptyResult)
-        && cfg.pending_stale_tips > 0;
-    if is_paired_tip {
-        if let Some(obj) = json.as_object_mut() {
-            obj.insert("result".to_owned(), Value::String("0x0".to_owned()));
-            obj.remove("error");
-        }
-        cfg.pending_stale_tips -= 1;
-        drop(guard);
-        return serde_json::to_string(&json).unwrap_or(text);
-    }
-
-    if cfg.method != method || cfg.remaining == 0 {
-        return text;
-    }
-
-    match cfg.behaviour {
-        ChaosBehaviour::EmptyResult => {
-            if let Some(obj) = json.as_object_mut() {
-                obj.insert("result".to_owned(), Value::Array(Vec::new()));
-                obj.remove("error");
+            if is_paired_tip {
+                cfg.pending_stale_tips -= 1;
+                Some(json!({ "jsonrpc": "2.0", "id": id, "result": "0x0" }))
+            } else if cfg.method == method && cfg.remaining > 0 {
+                match cfg.behaviour {
+                    ChaosBehaviour::EmptyResult => {
+                        cfg.remaining -= 1;
+                        // Queue a stale tip for the next `eth_blockNumber`.
+                        cfg.pending_stale_tips += 1;
+                        Some(json!({ "jsonrpc": "2.0", "id": id, "result": [] }))
+                    }
+                }
+            } else {
+                None
             }
         }
-    }
-    cfg.remaining -= 1;
-    // Queue a stale tip for the next `eth_blockNumber` so the bot's
-    // read-after-write check fires for this perturbed `getLogs`.
-    cfg.pending_stale_tips += 1;
+    };
+
     drop(guard);
+    result
+}
 
-    serde_json::to_string(&json).unwrap_or(text)
+/// Forward a single parsed JSON-RPC request to the upstream node and
+/// return its response body.
+async fn forward_one(state: &ProxyState, request: &Value) -> anyhow::Result<Value> {
+    let response = state
+        .client
+        .post(state.upstream.clone())
+        .json(request)
+        .send()
+        .await?;
+    Ok(response.json::<Value>().await?)
+}
+
+/// Forward an opaque (non-JSON) body verbatim and relay the raw response.
+async fn forward_raw(state: &ProxyState, body: Bytes) -> Response {
+    match state
+        .client
+        .post(state.upstream.clone())
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+    {
+        Ok(response) => {
+            let bytes = response.bytes().await.unwrap_or_default();
+            ([(reqwest::header::CONTENT_TYPE, "application/json")], bytes).into_response()
+        }
+        Err(error) => {
+            warn!(?error, "chaos proxy failed to forward raw request");
+            (
+                axum::http::StatusCode::BAD_GATEWAY,
+                "chaos proxy upstream error",
+            )
+                .into_response()
+        }
+    }
+}
+
+fn json_response(value: &Value) -> Response {
+    match serde_json::to_vec(value) {
+        Ok(bytes) => ([(reqwest::header::CONTENT_TYPE, "application/json")], bytes).into_response(),
+        Err(error) => {
+            warn!(?error, "chaos proxy failed to serialize response");
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }

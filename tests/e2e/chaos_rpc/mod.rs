@@ -16,23 +16,22 @@ use crate::hedging::assertions::*;
 use crate::poll::{poll_for_events_with_timeout, spawn_bot};
 
 /// Top-level hypothesis: a SellEquity onchain trade observed
-/// only in the bot's initial `eth_getLogs` backfill window still produces
-/// `OffchainOrderEvent::Filled` even when the first batch of backfill
+/// only in the bot's initial `eth_getLogs` poll window still produces
+/// `OffchainOrderEvent::Filled` even when the first batch of `getLogs`
 /// responses come back empty -- the load-balancer-inconsistency case.
 ///
-/// Scenario: the take fires *before* the bot is up. When the bot starts,
-/// its initial backfill from `deployment_block` to chain head is the
-/// only thing that can surface the take -- the WS subscription only
-/// delivers events that happen after the subscribe handshake. The
-/// chaos proxy is armed to return empty `eth_getLogs` results for the
-/// next batches, modelling a load-balancer node that has not finished
-/// indexing the block range covering the take. On master, backfill
-/// trusts the empty response, advances its checkpoint past the
-/// take's block, and `OffchainOrderEvent::Filled` is never reached --
-/// the test times out at `poll_for_events_with_timeout`. The upstack
-/// implementation must add a read-after-write tip check (or equivalent
-/// reconciliation) so the empty response is detected as unauthoritative
-/// and retried.
+/// Scenario: the take fires *before* the bot is up. Ingestion is a
+/// checkpoint-driven `eth_getLogs` poll, so the initial range from
+/// `deployment_block` to the confirmed tip is the only thing that can
+/// surface the take. The chaos proxy is armed to return empty
+/// `eth_getLogs` results for the next batches, modelling a load-balancer
+/// node that has not finished indexing the block range covering the
+/// take. Without the read-after-write tip check, the poller would trust
+/// the empty response, advance its checkpoint past the take's block, and
+/// `OffchainOrderEvent::Filled` would never be reached -- the test would
+/// time out at `poll_for_events_with_timeout`. The tip check detects the
+/// empty response as unauthoritative (the responding node's
+/// `eth_blockNumber` is stale) and retries.
 #[test_log::test(tokio::test)]
 async fn transient_empty_get_logs_during_backfill_does_not_drop_events() -> anyhow::Result<()> {
     let equity_symbol = "AAPL";
@@ -41,7 +40,7 @@ async fn transient_empty_get_logs_during_backfill_does_not_drop_events() -> anyh
     let sell_amount = float!(10.75);
 
     let infra = TestInfra::start(vec![(equity_symbol, broker_fill_price)], vec![]).await?;
-    let chaos = ChaosProxy::start(infra.base_chain.ws_endpoint()?).await?;
+    let chaos = ChaosProxy::start(infra.base_chain.endpoint().parse()?).await?;
 
     let expected_position = ExpectedPosition::builder()
         .symbol(equity_symbol)
@@ -56,10 +55,9 @@ async fn transient_empty_get_logs_during_backfill_does_not_drop_events() -> anyh
 
     let current_block = infra.base_chain.provider.get_block_number().await?;
 
-    // Take the order BEFORE the bot starts. The WS subscribe path will
-    // not deliver this event (it predates the subscription), so the bot
-    // must catch it via `eth_getLogs` backfill -- exactly the path the
-    // chaos proxy targets.
+    // Take the order BEFORE the bot starts. The bot must catch it via
+    // its checkpoint-driven `eth_getLogs` poll from deployment_block --
+    // exactly the path the chaos proxy targets.
     let take_result = infra
         .base_chain
         .take_order()
@@ -83,7 +81,7 @@ async fn transient_empty_get_logs_during_backfill_does_not_drop_events() -> anyh
         .db_path(&infra.db_path)
         .deployment_block(current_block)
         .assets(infra.assets_config())
-        .ws_rpc_url_override(chaos.endpoint.clone())
+        .rpc_url_override(chaos.endpoint.clone())
         .call()?;
     let mut bot = spawn_bot(ctx);
 

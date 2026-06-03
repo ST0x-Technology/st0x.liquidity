@@ -265,7 +265,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
 
     Ctx::for_test()
         .database_url(db_path.display().to_string())
-        .ws_rpc_url(chain.ws_endpoint()?)
+        .rpc_url(chain.endpoint().parse()?)
         .orderbook(chain.orderbook)
         .deployment_block(deployment_block)
         .broker(broker_ctx)
@@ -346,7 +346,7 @@ where
 
     Ctx::for_test()
         .database_url(db_path.display().to_string())
-        .ws_rpc_url(base_chain.ws_endpoint()?)
+        .rpc_url(base_chain.endpoint().parse()?)
         .orderbook(base_chain.orderbook)
         .deployment_block(deployment_block)
         .broker(broker_ctx)

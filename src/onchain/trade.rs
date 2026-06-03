@@ -631,7 +631,7 @@ mod tests {
         let cache = SymbolCache::default();
         let feed_id_cache = FeedIdCache::default();
         let ctx = EvmCtx {
-            ws_rpc_url: "ws://localhost:8545".parse().unwrap(),
+            rpc_url: "http://localhost:8545".parse().unwrap(),
             orderbook: Address::ZERO,
             deployment_block: 0,
             required_confirmations: 0,

@@ -135,7 +135,7 @@ fn build_full_system_ctx<P: Provider + Clone>(
 
     Ctx::for_test()
         .database_url(db_path.display().to_string())
-        .ws_rpc_url(chain.ws_endpoint()?)
+        .rpc_url(chain.endpoint().parse()?)
         .orderbook(chain.orderbook)
         .deployment_block(deployment_block)
         .broker(broker_ctx)
@@ -400,7 +400,7 @@ rebalancing = "enabled"
         r#"hyperdx.api_key = "simulate-failures"
 
 [evm]
-ws_rpc_url = "{ws_rpc_url}"
+rpc_url = "{rpc_url}"
 base_rpc_url = "{base_rpc_url}"
 ethereum_rpc_url = "{ethereum_rpc_url}"
 
@@ -414,7 +414,7 @@ account_id = "{account_id}"
 [wallet]
 private_key = "{private_key:#x}"
 "#,
-        ws_rpc_url = infra.base_chain.ws_endpoint()?,
+        rpc_url = infra.base_chain.endpoint(),
         base_rpc_url = infra.base_chain.endpoint(),
         ethereum_rpc_url = cctp.ethereum_endpoint,
         broker_base_url = infra.broker_service.base_url(),

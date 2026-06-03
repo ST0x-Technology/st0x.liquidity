@@ -200,6 +200,28 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
 
         Ok(result.rows_affected())
     }
+
+    /// Returns whether any job of this queue's task type is still in flight --
+    /// i.e. present in the queue and not in a terminal state. Apalis terminal
+    /// states are `Done`, `Failed`, and `Killed` (mirroring the finished-job
+    /// cleanup); anything else (`Pending`, `Queued`, `Running`) counts as in
+    /// flight.
+    ///
+    /// Used by the order-fill poller to avoid stacking overlapping backfill
+    /// ranges: while a previous range is still being processed the checkpoint
+    /// has not advanced yet, so re-enqueuing would re-scan the same blocks.
+    pub(crate) async fn has_in_flight(&self) -> Result<bool, sqlx::Error> {
+        let job_type = std::any::type_name::<Task>();
+        let in_flight = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM Jobs \
+             WHERE job_type = ? AND status NOT IN ('Done', 'Failed', 'Killed')",
+        )
+        .bind(job_type)
+        .fetch_one(self.pool())
+        .await?;
+
+        Ok(in_flight > 0)
+    }
 }
 
 /// A persistent, retryable unit of work backed by apalis storage.
@@ -569,6 +591,35 @@ mod tests {
     use super::*;
     use crate::conductor::setup_apalis_tables;
     use crate::test_utils::setup_test_db;
+
+    #[tokio::test]
+    async fn has_in_flight_detects_pending_and_ignores_terminal() {
+        let pool = setup_test_db().await;
+        setup_apalis_tables(&pool).await.unwrap();
+        let mut queue = JobQueue::<u32>::new(&pool);
+
+        assert!(
+            !queue.has_in_flight().await.unwrap(),
+            "empty queue has nothing in flight"
+        );
+
+        queue.push(42u32).await.unwrap();
+        assert!(
+            queue.has_in_flight().await.unwrap(),
+            "a pending job counts as in flight"
+        );
+
+        // Drive the row to a terminal state; it must no longer count.
+        sqlx::query("UPDATE Jobs SET status = 'Done' WHERE job_type = ?")
+            .bind(std::any::type_name::<u32>())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !queue.has_in_flight().await.unwrap(),
+            "a Done job is terminal and not in flight"
+        );
+    }
 
     #[test]
     fn failure_injector_not_armed_by_default() {

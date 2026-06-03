@@ -10,7 +10,7 @@ mod vault;
 mod wrapper;
 
 use alloy::primitives::{Address, B256, TxHash};
-use alloy::providers::{ProviderBuilder, WsConnect};
+use alloy::providers::ProviderBuilder;
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use rain_math_float::Float;
 use sqlx::SqlitePool;
@@ -618,7 +618,7 @@ async fn execute_order<W: Write>(
     trading::execute_order_with_writers(request, ctx, pool, stdout).await
 }
 
-/// Commands that don't require a WebSocket provider.
+/// Commands that don't require an RPC provider.
 enum SimpleCommand {
     Buy {
         symbol: Symbol,
@@ -819,7 +819,7 @@ pub async fn seed_mint_at_tokens_wrapped_for_test(
     Ok(())
 }
 
-/// Commands that require a WebSocket provider.
+/// Commands that require an RPC provider.
 enum ProviderCommand {
     ProcessTx {
         tx_hash: TxHash,
@@ -1308,9 +1308,7 @@ async fn run_provider_command<W: Write>(
     stdout: &mut W,
     order_placer: Arc<dyn OrderPlacer>,
 ) -> anyhow::Result<()> {
-    let provider = ProviderBuilder::new()
-        .connect_ws(WsConnect::new(ctx.evm.ws_rpc_url.as_str()))
-        .await?;
+    let provider = ProviderBuilder::new().connect_http(ctx.evm.rpc_url.clone());
 
     match command {
         ProviderCommand::ProcessTx { tx_hash } => {
@@ -1394,7 +1392,7 @@ mod tests {
             server_port: 8080,
             board_port: 8081,
             evm: EvmCtx {
-                ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+                rpc_url: Url::parse("http://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 deployment_block: 1,
                 required_confirmations: 0,
@@ -1403,6 +1401,7 @@ mod tests {
             order_polling_max_jitter: 5,
             position_check_interval: 60,
             inventory_poll_interval: 60,
+            order_fill_poll_interval: 5,
             apalis_finished_job_cleanup_interval_secs: 3600,
             broker: BrokerCtx::DryRun,
             telemetry: None,
@@ -1577,7 +1576,7 @@ mod tests {
 
     #[test]
     fn classify_recheck_transfer_command_as_simple() {
-        // The recheck-transfer command must route without a WebSocket provider:
+        // The recheck-transfer command must route without an RPC provider:
         // it delegates to the running bot's REST API rather than touching chain.
         let command = Commands::RecheckTransfer {
             transfer_type: TransferType::Redemption,
@@ -1945,7 +1944,7 @@ mod tests {
             &secrets_path,
             r#"
                 [evm]
-                ws_rpc_url = "ws://localhost:8545"
+                rpc_url = "http://localhost:8545"
                 base_rpc_url = "https://base.example.com"
                 ethereum_rpc_url = "https://mainnet.infura.io"
 
