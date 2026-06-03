@@ -24,7 +24,6 @@ use st0x_execution::{FractionalShares, Positive, SharesBlockchain, SharesConvers
 use st0x_finance::{HasZero, Usd, Usdc};
 
 use self::usdc::UsdcRebalanceOperation;
-use crate::conductor::job::QueuePushError;
 use crate::equity_redemption::{
     EquityRedemption, EquityRedemptionCommand, EquityRedemptionEvent, RedemptionAggregateId,
 };
@@ -2226,7 +2225,7 @@ impl RebalancingService {
                 true
             }
 
-            Err(QueuePushError(error)) => {
+            Err(error) => {
                 warn!(
                     target: "rebalance",
                     %error,
@@ -2294,7 +2293,7 @@ impl RebalancingService {
                 true
             }
 
-            Err(QueuePushError(error)) => {
+            Err(error) => {
                 warn!(
                     target: "rebalance",
                     %error,

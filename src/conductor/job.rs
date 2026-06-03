@@ -78,8 +78,10 @@ pub(crate) struct JobQueue<Task>(Storage<Task>);
 /// Wrapping [`TaskSinkError`] keeps the failure chain typed so callers can
 /// `#[from]` it into their own error enums instead of boxing.
 #[derive(Debug, thiserror::Error)]
-#[error("Failed to enqueue apalis job: {0}")]
-pub(crate) struct QueuePushError(#[from] pub(crate) TaskSinkError<sqlx::Error>);
+pub(crate) enum QueuePushError {
+    #[error("failed to enqueue apalis job: {0}")]
+    Sink(#[from] TaskSinkError<sqlx::Error>),
+}
 
 impl<Task> Clone for JobQueue<Task> {
     fn clone(&self) -> Self {

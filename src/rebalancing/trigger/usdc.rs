@@ -11,7 +11,7 @@ use tracing::{debug, trace, warn};
 use st0x_finance::{Usd, Usdc};
 
 use super::{RebalancingService, RebalancingServiceError};
-use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
+use crate::conductor::job::{Job, JobQueue, Label};
 use crate::inventory::{
     BroadcastingInventory, Imbalance, ImbalanceThreshold, Inventory, TransferOp, Venue,
 };
@@ -1061,7 +1061,7 @@ impl UsdcRebalancingCheckScheduler {
     /// re-trigger.
     pub(super) async fn enqueue_check(&self) {
         let mut queue = self.queue.clone();
-        if let Err(QueuePushError(error)) = queue.push(UsdcRebalancingCheck).await {
+        if let Err(error) = queue.push(UsdcRebalancingCheck).await {
             warn!(target: "rebalance", %error, "Failed to enqueue UsdcRebalancingCheck job");
         }
     }
