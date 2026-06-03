@@ -2,6 +2,7 @@
 
 use chrono::{Duration, Utc};
 use sqlx::SqlitePool;
+use thiserror::Error;
 use tracing::warn;
 
 use std::fmt::{self, Debug, Display};
@@ -44,15 +45,21 @@ impl Display for TransferKind {
     }
 }
 
+#[derive(Debug, Error)]
+pub(crate) enum InvalidTransferKind {
+    #[error("unknown transfer kind: {0}")]
+    Unknown(String),
+}
+
 impl FromStr for TransferKind {
-    type Err = String;
+    type Err = InvalidTransferKind;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "equity_mint" => Ok(Self::EquityMint),
             "equity_redemption" => Ok(Self::EquityRedemption),
             "usdc_bridge" => Ok(Self::UsdcBridge),
-            other => Err(format!("unknown transfer kind: {other}")),
+            other => Err(InvalidTransferKind::Unknown(other.to_owned())),
         }
     }
 }

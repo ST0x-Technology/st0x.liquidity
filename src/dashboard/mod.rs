@@ -1,10 +1,13 @@
 //! WebSocket-based dashboard for real-time server state streaming.
 
-use futures_util::SinkExt;
-use rocket::{Route, State, get, routes};
-use rocket_ws::{Channel, Message, WebSocket};
+use axum::Router;
+use axum::extract::State;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::response::IntoResponse;
+use axum::routing::get;
+use futures_util::sink::SinkExt;
+use futures_util::stream::{SplitSink, StreamExt};
 use sqlx::SqlitePool;
-use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{info, trace, warn};
 
@@ -13,7 +16,7 @@ use st0x_dto::{CurrentState, Statement};
 use st0x_event_sorcery::{load_all_ids, load_entity};
 use st0x_finance::Positive;
 
-use crate::inventory::BroadcastingInventory;
+use crate::AppState;
 use crate::position::Position;
 
 mod event;
@@ -21,92 +24,117 @@ mod trade_loader;
 pub(crate) mod transfer_loader;
 pub(crate) use event::Broadcaster;
 
-pub(crate) struct Broadcast {
-    pub(crate) sender: broadcast::Sender<Statement>,
+async fn ws_endpoint(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
-pub(crate) struct DashboardState {
-    pub(crate) inventory: Arc<BroadcastingInventory>,
-    pub(crate) pool: SqlitePool,
-    pub(crate) settings: st0x_dto::Settings,
+/// Outcome of attempting to send a serialized message over the socket.
+enum SendOutcome {
+    Sent,
+    SerializeFailed,
+    SocketClosed,
 }
 
-#[get("/ws")]
-fn ws_endpoint<'r>(
-    ws: WebSocket,
-    broadcast: &'r State<Broadcast>,
-    dashboard: &'r State<DashboardState>,
-) -> Channel<'r> {
-    let mut receiver = broadcast.sender.subscribe();
-    let inventory = Arc::clone(&dashboard.inventory);
-    let pool = dashboard.pool.clone();
-    let settings = dashboard.settings.clone();
+async fn send_json(sink: &mut SplitSink<WebSocket, Message>, value: &Statement) -> SendOutcome {
+    let json = match serde_json::to_string(value) {
+        Ok(serialized) => serialized,
+        Err(error) => {
+            warn!(target: "dashboard", %error, "Failed to serialize message");
+            return SendOutcome::SerializeFailed;
+        }
+    };
 
-    ws.channel(move |mut stream| {
-        Box::pin(async move {
-            let inventory_dto = inventory.read().await.to_dto();
-            let transfers = transfer_loader::load_transfers(&pool).await;
-            let trades = trade_loader::load_trades(&pool).await;
-            let positions = load_positions(&pool).await;
+    if let Err(error) = sink.send(Message::Text(json.into())).await {
+        warn!(target: "dashboard", %error, "Failed to send message to client");
+        return SendOutcome::SocketClosed;
+    }
 
-            let state = CurrentState {
-                trades,
-                inventory: inventory_dto,
-                positions,
-                settings,
-                active_transfers: transfers.active,
-                recent_transfers: transfers.recent,
-                warnings: transfers.warnings,
-            };
+    SendOutcome::Sent
+}
 
-            let initial = Statement::CurrentState(Box::new(state));
-            let json = match serde_json::to_string(&initial) {
-                Ok(serialized) => serialized,
-                Err(error) => {
-                    warn!(target: "dashboard", %error, "Failed to serialize initial state");
-                    return Ok(());
-                }
-            };
+async fn handle_socket(socket: WebSocket, state: AppState) {
+    let mut receiver = state.event_sender.subscribe();
+    let (mut sink, mut stream) = socket.split();
 
-            if let Err(error) = stream.send(Message::Text(json)).await {
-                warn!(target: "dashboard", %error, "Failed to send initial state");
-                return Ok(());
+    if !send_initial_state(&mut sink, &state).await {
+        return;
+    }
+
+    tokio::select! {
+        () = stream_broadcasts(&mut sink, &mut receiver) => {}
+        () = drain_client_messages(&mut stream) => {}
+    }
+}
+
+/// Polls the client side of the socket so that Close / Ping / Pong are
+/// observed promptly. Exits when the client closes the socket or sends
+/// nothing more — at which point [`handle_socket`] tears down the send half.
+async fn drain_client_messages(stream: &mut futures_util::stream::SplitStream<WebSocket>) {
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(Message::Close(_)) => break,
+            Ok(_) => {}
+            Err(error) => {
+                warn!(target: "dashboard", %error, "WebSocket receive error");
+                break;
             }
+        }
+    }
+}
+
+async fn send_initial_state(sink: &mut SplitSink<WebSocket, Message>, state: &AppState) -> bool {
+    let inventory_dto = state.inventory.read().await.to_dto();
+    let transfers = transfer_loader::load_transfers(&state.pool).await;
+    let trades = trade_loader::load_trades(&state.pool).await;
+    let positions = load_positions(&state.pool).await;
+
+    let initial = Statement::CurrentState(Box::new(CurrentState {
+        trades,
+        inventory: inventory_dto,
+        positions,
+        settings: state.settings.clone(),
+        active_transfers: transfers.active,
+        recent_transfers: transfers.recent,
+        warnings: transfers.warnings,
+    }));
+
+    match send_json(sink, &initial).await {
+        SendOutcome::Sent => {
             info!(target: "dashboard", "Sent initial state to dashboard client");
-
-            loop {
-                match receiver.recv().await {
-                    Ok(msg) => {
-                        trace!(target: "dashboard", ?msg, "Broadcasting to dashboard client");
-                        let json = match serde_json::to_string(&msg) {
-                            Ok(serialized) => serialized,
-                            Err(error) => {
-                                warn!(target: "dashboard", %error, "Failed to serialize message");
-                                continue;
-                            }
-                        };
-
-                        if let Err(error) = stream.send(Message::Text(json)).await {
-                            warn!(target: "dashboard", %error, "Failed to send message to client");
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!(target: "dashboard", skipped, "Client lagged, skipped messages");
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        break;
-                    }
-                }
-            }
-
-            Ok(())
-        })
-    })
+            true
+        }
+        SendOutcome::SerializeFailed | SendOutcome::SocketClosed => false,
+    }
 }
 
-pub(crate) fn routes() -> Vec<Route> {
-    routes![ws_endpoint]
+async fn stream_broadcasts(
+    sink: &mut SplitSink<WebSocket, Message>,
+    receiver: &mut broadcast::Receiver<Statement>,
+) {
+    loop {
+        match receiver.recv().await {
+            Ok(msg) => {
+                trace!(target: "dashboard", ?msg, "Broadcasting to dashboard client");
+                match send_json(sink, &msg).await {
+                    SendOutcome::Sent => {}
+                    SendOutcome::SerializeFailed | SendOutcome::SocketClosed => break,
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(
+                    target: "dashboard",
+                    skipped,
+                    "Client lagged, closing socket so the client reconnects and refetches state"
+                );
+                break;
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+pub(crate) fn routes() -> Router<AppState> {
+    Router::new().route("/ws", get(ws_endpoint))
 }
 
 pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
@@ -261,17 +289,19 @@ async fn load_positions(pool: &SqlitePool) -> Vec<st0x_dto::Position> {
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::address;
     use futures_util::StreamExt;
     use futures_util::future::join_all;
-    use rocket::config::Config;
-    use rocket::fairing::AdHoc;
     use serde_json::json;
-    use st0x_dto::{Direction, Trade, TradingVenue};
-    use std::sync::Mutex;
-    use tokio::sync::oneshot;
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
     use tokio_tungstenite::connect_async;
 
+    use st0x_dto::{Direction, Trade, TradingVenue};
+
     use super::*;
+    use crate::inventory::{self, BroadcastingInventory};
+    use st0x_config::create_test_ctx_with_order_owner;
 
     fn dummy_fill(symbol: &str) -> Statement {
         Statement::TradeFill(Trade {
@@ -284,69 +314,96 @@ mod tests {
         })
     }
 
+    fn empty_settings() -> st0x_dto::Settings {
+        st0x_dto::Settings {
+            equity_target: 0.5,
+            equity_deviation: 0.2,
+            usdc_target: None,
+            usdc_deviation: None,
+            cash_reserved: None,
+            execution_threshold: "$2".to_string(),
+            assets: Vec::new(),
+            wallet: None,
+            log_level: "Debug".to_string(),
+            server_port: 8001,
+            orderbook: "0x0".to_string(),
+            deployment_block: 0,
+            trading_mode: "standalone".to_string(),
+            broker: "dry_run".to_string(),
+            order_polling_interval: 5,
+            inventory_poll_interval: 15,
+        }
+    }
+
     fn empty_current_state() -> Box<CurrentState> {
         Box::new(CurrentState {
             trades: Vec::new(),
             inventory: st0x_dto::Inventory::empty(),
             positions: Vec::new(),
-            settings: st0x_dto::Settings {
-                equity_target: 0.5,
-                equity_deviation: 0.2,
-                usdc_target: None,
-                usdc_deviation: None,
-                cash_reserved: None,
-                execution_threshold: "$2".to_string(),
-                assets: Vec::new(),
-                wallet: None,
-                log_level: "Debug".to_string(),
-                server_port: 8001,
-                orderbook: "0x0".to_string(),
-                deployment_block: 0,
-                trading_mode: "standalone".to_string(),
-                broker: "dry_run".to_string(),
-                order_polling_interval: 5,
-                inventory_poll_interval: 15,
-            },
+            settings: empty_settings(),
             active_transfers: Vec::new(),
             recent_transfers: Vec::new(),
             warnings: Vec::new(),
         })
     }
 
-    fn create_test_broadcast() -> Broadcast {
+    async fn create_test_state() -> AppState {
         let (sender, _) = broadcast::channel(256);
-        Broadcast { sender }
-    }
-
-    async fn create_test_dashboard_state(
-        event_sender: broadcast::Sender<Statement>,
-    ) -> DashboardState {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
-        DashboardState {
-            inventory: Arc::new(BroadcastingInventory::new(
-                crate::inventory::InventoryView::default(),
-                event_sender,
+
+        AppState {
+            ctx: create_test_ctx_with_order_owner(address!(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             )),
             pool,
-            settings: st0x_dto::Settings {
-                equity_target: 0.5,
-                equity_deviation: 0.2,
-                usdc_target: None,
-                usdc_deviation: None,
-                cash_reserved: None,
-                execution_threshold: "$2".to_string(),
-                assets: Vec::new(),
-                wallet: None,
-                log_level: "Debug".to_string(),
-                server_port: 8001,
-                orderbook: "0x0".to_string(),
-                deployment_block: 0,
-                trading_mode: "standalone".to_string(),
-                broker: "dry_run".to_string(),
-                order_polling_interval: 5,
-                inventory_poll_interval: 15,
-            },
+            event_sender: sender.clone(),
+            inventory: Arc::new(BroadcastingInventory::new(
+                inventory::InventoryView::default(),
+                sender,
+            )),
+            settings: empty_settings(),
+            recovery: Arc::new(tokio::sync::OnceCell::new()),
+            resume_lock: Arc::new(crate::api::ResumeLock(tokio::sync::Mutex::new(()))),
+        }
+    }
+
+    struct TestServer {
+        port: u16,
+        handle: Option<tokio::task::JoinHandle<()>>,
+        event_sender: broadcast::Sender<Statement>,
+        inventory: Arc<BroadcastingInventory>,
+    }
+
+    impl TestServer {
+        async fn shutdown(&mut self) {
+            let Some(handle) = self.handle.take() else {
+                return;
+            };
+            handle.abort();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        }
+    }
+
+    async fn start_test_server() -> TestServer {
+        let state = create_test_state().await;
+        let event_sender = state.event_sender.clone();
+        let inventory = Arc::clone(&state.inventory);
+
+        let app = Router::new().nest("/api", routes()).with_state(state);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        TestServer {
+            port,
+            handle: Some(handle),
+            event_sender,
+            inventory,
         }
     }
 
@@ -356,24 +413,7 @@ mod tests {
             trades: Vec::new(),
             inventory: st0x_dto::Inventory::empty(),
             positions: Vec::new(),
-            settings: st0x_dto::Settings {
-                equity_target: 0.5,
-                equity_deviation: 0.2,
-                usdc_target: None,
-                usdc_deviation: None,
-                cash_reserved: None,
-                execution_threshold: "$2".to_string(),
-                assets: Vec::new(),
-                wallet: None,
-                log_level: "Debug".to_string(),
-                server_port: 8001,
-                orderbook: "0x0".to_string(),
-                deployment_block: 0,
-                trading_mode: "standalone".to_string(),
-                broker: "dry_run".to_string(),
-                order_polling_interval: 5,
-                inventory_poll_interval: 15,
-            },
+            settings: empty_settings(),
             active_transfers: Vec::new(),
             recent_transfers: Vec::new(),
             warnings: Vec::new(),
@@ -398,85 +438,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn broadcast_channel_delivers_messages_to_subscribers() {
-        let broadcast = create_test_broadcast();
-        let mut rx = broadcast.sender.subscribe();
-
-        let sent_msg = Statement::CurrentState(empty_current_state());
-        broadcast
-            .sender
-            .send(sent_msg.clone())
-            .expect("send should succeed");
-
-        let recv_msg = rx.recv().await.expect("receive should succeed");
-        let original_json = serde_json::to_string(&sent_msg).expect("serialization should succeed");
-        let received_json = serde_json::to_string(&recv_msg).expect("serialization should succeed");
-        assert_eq!(original_json, received_json);
-    }
-
-    #[tokio::test]
-    async fn broadcast_supports_multiple_subscribers() {
-        let broadcast = create_test_broadcast();
-        let mut receiver1 = broadcast.sender.subscribe();
-        let mut receiver2 = broadcast.sender.subscribe();
-
-        let msg = Statement::CurrentState(empty_current_state());
-        broadcast.sender.send(msg).expect("send should succeed");
-
-        receiver1
-            .recv()
-            .await
-            .expect("receiver1 should get message");
-        receiver2
-            .recv()
-            .await
-            .expect("receiver2 should get message");
-    }
-
-    #[tokio::test]
-    async fn websocket_routes_returns_one_route() {
-        let route_list = routes();
-        assert_eq!(route_list.len(), 1);
-    }
-
-    #[tokio::test]
     async fn websocket_endpoint_sends_initial_message() {
-        let broadcast = create_test_broadcast();
-        let dashboard_state = create_test_dashboard_state(broadcast.sender.clone()).await;
+        let mut server = start_test_server().await;
+        let url = format!("ws://127.0.0.1:{}/api/ws", server.port);
 
-        let config = Config {
-            port: 0, // Let OS assign a random available port
-            log_level: rocket::config::LogLevel::Off,
-            ..Config::debug_default()
-        };
-
-        let (port_tx, port_rx) = oneshot::channel::<u16>();
-        let port_tx = Mutex::new(Some(port_tx));
-
-        let rocket = rocket::build()
-            .configure(config)
-            .mount("/api", routes())
-            .manage(broadcast)
-            .manage(dashboard_state)
-            .attach(AdHoc::on_liftoff("Port Sender", move |rocket| {
-                Box::pin(async move {
-                    let maybe_tx = port_tx.lock().unwrap().take();
-                    if let Some(tx) = maybe_tx {
-                        let _ = tx.send(rocket.config().port);
-                    }
-                })
-            }));
-
-        let rocket = rocket.ignite().await.expect("ignite failed");
-        let shutdown_handle = rocket.shutdown();
-
-        tokio::spawn(async move {
-            let _ = rocket.launch().await;
-        });
-
-        let port = port_rx.await.expect("failed to receive port");
-
-        let url = format!("ws://127.0.0.1:{port}/api/ws");
         let (mut ws_stream, _response) = connect_async(&url)
             .await
             .expect("WebSocket connection failed");
@@ -494,67 +459,12 @@ mod tests {
         assert!(parsed["data"]["trades"].is_array());
         assert!(parsed["data"]["inventory"].is_object());
 
-        shutdown_handle.notify();
-    }
-
-    struct TestServer {
-        port: u16,
-        shutdown: rocket::Shutdown,
-        broadcast: Broadcast,
-        inventory: Arc<BroadcastingInventory>,
-    }
-
-    async fn start_test_server() -> TestServer {
-        let broadcast = create_test_broadcast();
-        let broadcast_clone = Broadcast {
-            sender: broadcast.sender.clone(),
-        };
-        let dashboard_state = create_test_dashboard_state(broadcast.sender.clone()).await;
-        let inventory = Arc::clone(&dashboard_state.inventory);
-
-        let config = Config {
-            port: 0,
-            log_level: rocket::config::LogLevel::Off,
-            ..Config::debug_default()
-        };
-
-        let (port_tx, port_rx) = oneshot::channel::<u16>();
-        let port_tx = Mutex::new(Some(port_tx));
-
-        let rocket = rocket::build()
-            .configure(config)
-            .mount("/api", routes())
-            .manage(broadcast_clone)
-            .manage(dashboard_state)
-            .attach(AdHoc::on_liftoff("Port Sender", move |rocket| {
-                Box::pin(async move {
-                    let maybe_tx = port_tx.lock().unwrap().take();
-                    if let Some(tx) = maybe_tx {
-                        let _ = tx.send(rocket.config().port);
-                    }
-                })
-            }));
-
-        let rocket = rocket.ignite().await.expect("ignite failed");
-        let shutdown = rocket.shutdown();
-
-        tokio::spawn(async move {
-            let _ = rocket.launch().await;
-        });
-
-        let port = port_rx.await.expect("failed to receive port");
-
-        TestServer {
-            port,
-            shutdown,
-            broadcast,
-            inventory,
-        }
+        server.shutdown().await;
     }
 
     #[tokio::test]
     async fn multiple_concurrent_clients_receive_initial_message() {
-        let server = start_test_server().await;
+        let mut server = start_test_server().await;
         let url = format!("ws://127.0.0.1:{}/api/ws", server.port);
 
         let (mut client1, _) = connect_async(&url)
@@ -588,12 +498,12 @@ mod tests {
             );
         }
 
-        server.shutdown.notify();
+        server.shutdown().await;
     }
 
     #[tokio::test]
     async fn broadcast_message_reaches_connected_clients() {
-        let server = start_test_server().await;
+        let mut server = start_test_server().await;
         let url = format!("ws://127.0.0.1:{}/api/ws", server.port);
 
         let (mut client1, _) = connect_async(&url)
@@ -603,18 +513,14 @@ mod tests {
             .await
             .expect("client2 connection failed");
 
-        // Consume initial messages
         client1.next().await.expect("client1 initial").unwrap();
         client2.next().await.expect("client2 initial").unwrap();
 
-        // Broadcast a fill message
         server
-            .broadcast
-            .sender
+            .event_sender
             .send(dummy_fill("AAPL"))
             .expect("broadcast send");
 
-        // Both clients should receive the broadcast
         let results = join_all([client1.next(), client2.next()]).await;
 
         for (i, result) in results.into_iter().enumerate() {
@@ -634,12 +540,12 @@ mod tests {
             assert_eq!(parsed["data"]["symbol"], "AAPL");
         }
 
-        server.shutdown.notify();
+        server.shutdown().await;
     }
 
     #[tokio::test]
     async fn client_disconnect_does_not_affect_other_clients() {
-        let server = start_test_server().await;
+        let mut server = start_test_server().await;
         let url = format!("ws://127.0.0.1:{}/api/ws", server.port);
 
         let (mut client1, _) = connect_async(&url)
@@ -649,23 +555,17 @@ mod tests {
             .await
             .expect("client2 connection failed");
 
-        // Consume initial messages
         client1.next().await.expect("client1 initial").unwrap();
 
-        // Drop client2 to simulate disconnect
         drop(client2);
 
-        // Give the server a moment to process the disconnect
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-        // Broadcast a message - should still reach client1
         server
-            .broadcast
-            .sender
+            .event_sender
             .send(dummy_fill("TSLA"))
             .expect("broadcast send");
 
-        // client1 should still receive messages
         let msg = client1
             .next()
             .await
@@ -678,33 +578,27 @@ mod tests {
         assert_eq!(parsed["type"], "trade_fill");
         assert_eq!(parsed["data"]["symbol"], "TSLA");
 
-        server.shutdown.notify();
+        server.shutdown().await;
     }
 
     #[tokio::test]
     async fn new_client_receives_initial_not_previous_broadcasts() {
-        let server = start_test_server().await;
+        let mut server = start_test_server().await;
         let url = format!("ws://127.0.0.1:{}/api/ws", server.port);
 
-        // Connect first client to have a receiver
         let (mut client1, _) = connect_async(&url)
             .await
             .expect("client1 connection failed");
 
-        // Consume initial message for client1
         client1.next().await.expect("client1 initial").unwrap();
 
-        // Broadcast a message (client1 will receive it)
         server
-            .broadcast
-            .sender
+            .event_sender
             .send(dummy_fill("MSFT"))
             .expect("broadcast send");
 
-        // Consume the broadcast on client1
         client1.next().await.expect("client1 broadcast").unwrap();
 
-        // Now connect a second client - should get initial, not the old broadcast
         let (mut client2, _) = connect_async(&url)
             .await
             .expect("client2 connection failed");
@@ -723,22 +617,20 @@ mod tests {
             "new client should receive current_state, not previous broadcast"
         );
 
-        server.shutdown.notify();
+        server.shutdown().await;
     }
 
     #[tokio::test]
     async fn inventory_mutation_sends_snapshot_to_websocket_client() {
-        let server = start_test_server().await;
+        let mut server = start_test_server().await;
         let url = format!("ws://127.0.0.1:{}/api/ws", server.port);
 
         let (mut client, _) = connect_async(&url)
             .await
             .expect("WebSocket connection failed");
 
-        // Consume initial message
         client.next().await.expect("initial").unwrap();
 
-        // Mutate inventory through the shared BroadcastingInventory
         {
             let mut guard = server.inventory.write().await;
             *guard = std::mem::take(&mut *guard).with_equity(
@@ -748,7 +640,6 @@ mod tests {
             );
         }
 
-        // Client should receive the snapshot broadcast
         let msg = client
             .next()
             .await
@@ -769,6 +660,6 @@ mod tests {
         assert_eq!(aapl["offchainAvailable"], json!("5"));
         assert_eq!(aapl["offchainInflight"], json!("0"));
 
-        server.shutdown.notify();
+        server.shutdown().await;
     }
 }

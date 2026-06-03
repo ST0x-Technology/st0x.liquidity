@@ -26,7 +26,7 @@
 
 pub(crate) mod assertions;
 
-use alloy::primitives::TxHash;
+use alloy::primitives::{Address, TxHash};
 use rain_math_float::Float;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::collections::HashMap;
@@ -1417,7 +1417,7 @@ async fn pending_requests_filtered_by_wallet() -> anyhow::Result<()> {
     // This simulates another conductor sharing the same Alpaca account.
     // If the bot doesn't filter by wallet, it would see 1000 extra shares
     // of inflight and make incorrect rebalancing decisions.
-    let foreign_wallet = alloy::primitives::Address::random();
+    let foreign_wallet = Address::random();
     infra.tokenization_service.inject_pending_request(
         "AAPL",
         float!("1000"),

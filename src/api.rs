@@ -1,59 +1,41 @@
-//! HTTP API endpoints for health checks, log retrieval, order status,
-//! and transfer recovery.
+//! HTTP API endpoints for health checks, log retrieval, and order status.
 
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::LazyLock;
 
 use alloy::primitives::U256;
+use axum::Json;
+use axum::Router;
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::routing::{get, post};
 use chrono::{DateTime, Utc};
-use rocket::form::{self, FromFormField, ValueField};
-use rocket::http::Status;
-use rocket::request::FromParam;
-use rocket::response::content::RawJson;
-use rocket::serde::json::Json;
-use rocket::serde::{Deserialize, Serialize};
-use rocket::{Route, State, get, post, routes};
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
-use st0x_config::Ctx;
+use st0x_dto::TradingVenue;
 use st0x_execution::{FractionalShares, SharesBlockchain};
 
-use crate::dashboard::transfer_loader::TransferKind;
+use crate::AppState;
+use crate::dashboard::transfer_loader::{InvalidTransferKind, TransferKind};
 use crate::equity_redemption::{EquityRedemptionEvent, RedemptionAggregateId};
 use crate::rebalancing::RebalancingService;
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, RecheckError, RecheckOutcome};
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMintEvent};
 
-impl<'a> FromParam<'a> for TransferKind {
-    type Error = String;
-
-    fn from_param(param: &'a str) -> Result<Self, Self::Error> {
-        param.parse()
-    }
-}
-
 /// Comma-separated filter for transfer kinds in query parameters.
 ///
 /// Parses `"equity_mint,usdc_bridge"` into `vec![EquityMint, UsdcBridge]`.
-struct TransferKindFilter(Vec<TransferKind>);
-
-impl<'v> FromFormField<'v> for TransferKindFilter {
-    fn from_value(field: ValueField<'v>) -> form::Result<'v, Self> {
-        let kinds: Result<Vec<TransferKind>, _> = field
-            .value
-            .split(',')
-            .map(str::trim)
-            .filter(|segment| !segment.is_empty())
-            .map(TransferKind::from_str)
-            .collect();
-
-        kinds
-            .map(TransferKindFilter)
-            .map_err(|error| form::Error::validation(error).into())
-    }
+fn parse_transfer_kind_filter(value: &str) -> Result<Vec<TransferKind>, InvalidTransferKind> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(TransferKind::from_str)
+        .collect()
 }
 
 static STARTED_AT: LazyLock<DateTime<Utc>> = LazyLock::new(Utc::now);
@@ -99,7 +81,7 @@ struct PendingOrderResponse {
 
 /// Where the stranded equity physically sits for a failed transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(crate = "rocket::serde", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 enum StuckLocation {
     /// At the issuer (Alpaca): a mint was accepted but failed before tokens
     /// were received on-chain.
@@ -117,7 +99,7 @@ enum StuckLocation {
 
 /// Why a transfer is stranded, mirroring the terminal failure event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(crate = "rocket::serde", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 enum StuckReason {
     MintAcceptanceFailed,
     WrappingFailed,
@@ -127,7 +109,6 @@ enum StuckReason {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(crate = "rocket::serde")]
 struct StuckTransferInfo {
     #[serde(rename = "stuckAmount")]
     amount: String,
@@ -156,8 +137,7 @@ struct TradeResponse {
     has_more: bool,
 }
 
-#[get("/health")]
-fn health() -> Json<HealthResponse> {
+async fn health() -> Json<HealthResponse> {
     let uptime = Utc::now() - *STARTED_AT;
 
     Json(HealthResponse {
@@ -166,6 +146,17 @@ fn health() -> Json<HealthResponse> {
         git_commit: GIT_COMMIT.to_string(),
         uptime_seconds: uptime.num_seconds(),
     })
+}
+
+#[derive(Deserialize, Default)]
+struct LogsQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+    search: Option<String>,
+    level: Option<String>,
+    target: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
 }
 
 /// Returns log entries with pagination, search, level, and time range
@@ -178,21 +169,11 @@ fn health() -> Json<HealthResponse> {
 /// - `target`: comma-separated domain targets to include (e.g. `hedge,rebalance`)
 /// - `since`: ISO 8601 UTC lower bound (inclusive)
 /// - `until`: ISO 8601 UTC upper bound (inclusive)
-#[get("/logs?<limit>&<offset>&<search>&<level>&<target>&<since>&<until>")]
-fn logs(
-    ctx: &State<Ctx>,
-    limit: Option<usize>,
-    offset: Option<usize>,
-    search: Option<&str>,
-    level: Option<&str>,
-    target: Option<&str>,
-    since: Option<&str>,
-    until: Option<&str>,
-) -> Json<LogResponse> {
-    let limit = limit.unwrap_or(100).min(5000);
-    let offset = offset.unwrap_or(0);
+async fn logs(State(state): State<AppState>, Query(query): Query<LogsQuery>) -> Json<LogResponse> {
+    let limit = query.limit.unwrap_or(100).min(5000);
+    let offset = query.offset.unwrap_or(0);
 
-    let Some(ref log_dir) = ctx.log_dir else {
+    let Some(ref log_dir) = state.ctx.log_dir else {
         return Json(LogResponse {
             entries: Vec::new(),
             total: 0,
@@ -201,25 +182,35 @@ fn logs(
     };
 
     let filter = LogFilter {
-        search_lower: search
-            .filter(|query| !query.is_empty())
+        search_lower: query
+            .search
+            .as_deref()
+            .filter(|val| !val.is_empty())
             .map(str::to_lowercase),
-        levels: level.filter(|lvl| !lvl.is_empty()).map(|lvl| {
-            lvl.split(',')
-                .map(|part| part.trim().to_uppercase())
-                .collect()
-        }),
-        targets: target.filter(|tgt| !tgt.is_empty()).map(|tgt| {
-            tgt.split(',')
-                .map(|part| part.trim().to_lowercase())
-                .collect()
-        }),
-        since: since.and_then(|val| {
+        levels: query
+            .level
+            .as_deref()
+            .filter(|val| !val.is_empty())
+            .map(|val| {
+                val.split(',')
+                    .map(|part| part.trim().to_uppercase())
+                    .collect()
+            }),
+        targets: query
+            .target
+            .as_deref()
+            .filter(|val| !val.is_empty())
+            .map(|val| {
+                val.split(',')
+                    .map(|part| part.trim().to_lowercase())
+                    .collect()
+            }),
+        since: query.since.as_deref().and_then(|val| {
             DateTime::parse_from_rfc3339(val)
                 .ok()
                 .map(|dt| dt.with_timezone(&Utc))
         }),
-        until: until.and_then(|val| {
+        until: query.until.as_deref().and_then(|val| {
             DateTime::parse_from_rfc3339(val)
                 .ok()
                 .map(|dt| dt.with_timezone(&Utc))
@@ -425,14 +416,13 @@ fn extract_log_file_date(entry: &std::fs::DirEntry) -> Option<chrono::NaiveDate>
 }
 
 /// Returns non-terminal offchain orders (Pending, Submitted, PartiallyFilled).
-#[get("/orders/pending")]
-async fn pending_orders(pool: &State<SqlitePool>) -> Json<Vec<PendingOrderResponse>> {
+async fn pending_orders(State(state): State<AppState>) -> Json<Vec<PendingOrderResponse>> {
     let rows: Vec<(String, String, String)> = match sqlx::query_as(
         "SELECT view_id, status, payload FROM offchain_order_view \
          WHERE status IN ('Pending', 'Submitted', 'PartiallyFilled') \
          ORDER BY rowid DESC LIMIT 100",
     )
-    .fetch_all(pool.inner())
+    .fetch_all(&state.pool)
     .await
     {
         Ok(rows) => rows,
@@ -474,44 +464,56 @@ fn parse_pending_order(
     })
 }
 
+#[derive(Deserialize, Default)]
+struct TradesQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+    symbol: Option<String>,
+    venue: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+}
+
 /// Paginated trade history from both onchain and offchain fills.
 ///
 /// Returns newest-first. Supports filtering by symbol, venue, and time range.
-#[get("/trades?<limit>&<offset>&<symbol>&<venue>&<since>&<until>")]
 async fn trades(
-    pool: &State<SqlitePool>,
-    limit: Option<usize>,
-    offset: Option<usize>,
-    symbol: Option<&str>,
-    venue: Option<&str>,
-    since: Option<&str>,
-    until: Option<&str>,
+    State(state): State<AppState>,
+    Query(query): Query<TradesQuery>,
 ) -> Json<TradeResponse> {
-    let limit = limit.unwrap_or(100).min(500);
-    let offset = offset.unwrap_or(0);
+    let limit = query.limit.unwrap_or(100).min(500);
+    let offset = query.offset.unwrap_or(0);
 
-    let since_dt = since.and_then(|val| {
+    let since_dt = query.since.as_deref().and_then(|val| {
         DateTime::parse_from_rfc3339(val)
             .ok()
             .map(|dt| dt.with_timezone(&Utc))
     });
-    let until_dt = until.and_then(|val| {
+    let until_dt = query.until.as_deref().and_then(|val| {
         DateTime::parse_from_rfc3339(val)
             .ok()
             .map(|dt| dt.with_timezone(&Utc))
     });
 
-    let venues = venue.filter(|val| !val.is_empty()).map(|val| {
-        val.split(',')
-            .map(|part| part.trim().to_string())
-            .collect::<Vec<_>>()
-    });
+    let venues = query
+        .venue
+        .as_deref()
+        .filter(|val| !val.is_empty())
+        .map(|val| {
+            val.split(',')
+                .map(|part| part.trim().to_string())
+                .collect::<Vec<_>>()
+        });
 
-    let symbols = symbol.filter(|val| !val.is_empty()).map(|val| {
-        val.split(',')
-            .map(|part| part.trim().to_string())
-            .collect::<Vec<_>>()
-    });
+    let symbols = query
+        .symbol
+        .as_deref()
+        .filter(|val| !val.is_empty())
+        .map(|val| {
+            val.split(',')
+                .map(|part| part.trim().to_string())
+                .collect::<Vec<_>>()
+        });
 
     let trade_filter = TradeFilter {
         symbols,
@@ -520,7 +522,7 @@ async fn trades(
         until: until_dt,
     };
 
-    let mut all_trades = load_trade_rows(pool.inner(), &trade_filter).await;
+    let mut all_trades = load_trade_rows(&state.pool, &trade_filter).await;
     all_trades.sort_by(|lhs, rhs| rhs.filled_at.cmp(&lhs.filled_at));
 
     let total = all_trades.len();
@@ -690,37 +692,47 @@ async fn load_offchain_trade_rows(pool: &SqlitePool, filter: &TradeFilter) -> Ve
         .collect()
 }
 
+#[derive(Deserialize, Default)]
+struct TransfersQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+    kind: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+}
+
 /// Paginated transfer history using event-sourced aggregate replay.
 ///
 /// Replays transfer aggregates to produce proper DTO statuses, then
 /// applies time-range filtering and pagination.
-#[get("/transfers?<limit>&<offset>&<kind>&<since>&<until>")]
 async fn transfers_endpoint(
-    pool: &State<SqlitePool>,
-    limit: Option<usize>,
-    offset: Option<usize>,
-    kind: Option<TransferKindFilter>,
-    since: Option<&str>,
-    until: Option<&str>,
-) -> Result<Json<serde_json::Value>, Status> {
-    let limit = limit.unwrap_or(100).min(500);
-    let offset = offset.unwrap_or(0);
+    State(state): State<AppState>,
+    Query(query): Query<TransfersQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let limit = query.limit.unwrap_or(100).min(500);
+    let offset = query.offset.unwrap_or(0);
 
-    let since_dt = since.and_then(|val| {
+    let since_dt = query.since.as_deref().and_then(|val| {
         DateTime::parse_from_rfc3339(val)
             .ok()
             .map(|dt| dt.with_timezone(&Utc))
     });
-    let until_dt = until.and_then(|val| {
+    let until_dt = query.until.as_deref().and_then(|val| {
         DateTime::parse_from_rfc3339(val)
             .ok()
             .map(|dt| dt.with_timezone(&Utc))
     });
 
-    let kind_filter = kind.map(|filter| filter.0);
+    let kind_filter = match query.kind.as_deref().filter(|val| !val.is_empty()) {
+        Some(value) => Some(parse_transfer_kind_filter(value).map_err(|error| {
+            tracing::warn!(target: "dashboard", %error, "Invalid transfer kind filter");
+            StatusCode::BAD_REQUEST
+        })?),
+        None => None,
+    };
 
     let loaded = crate::dashboard::transfer_loader::load_all_transfer_operations(
-        pool.inner(),
+        &state.pool,
         kind_filter.as_deref(),
     )
     .await;
@@ -766,7 +778,7 @@ async fn transfers_endpoint(
                 %error,
                 "Failed to serialize transfer operation"
             );
-            Status::InternalServerError
+            StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
     let mut response = serde_json::json!({
@@ -787,12 +799,11 @@ async fn transfers_endpoint(
 ///
 /// The frontend uses this to populate the detail modal with tx hashes,
 /// IDs, failure reasons, and other debugging context.
-#[get("/transfers/<kind>/<aggregate_id>/events")]
 async fn transfer_events(
-    pool: &State<SqlitePool>,
-    kind: TransferKind,
-    aggregate_id: &str,
-) -> Option<Json<serde_json::Value>> {
+    State(state): State<AppState>,
+    Path((kind_str, aggregate_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let kind = TransferKind::from_str(&kind_str).map_err(|_| StatusCode::NOT_FOUND)?;
     let aggregate_type = kind.aggregate_type();
 
     let rows: Vec<(String, String, i64)> = match sqlx::query_as(
@@ -802,8 +813,8 @@ async fn transfer_events(
          ORDER BY sequence ASC",
     )
     .bind(aggregate_type)
-    .bind(aggregate_id)
-    .fetch_all(pool.inner())
+    .bind(&aggregate_id)
+    .fetch_all(&state.pool)
     .await
     {
         Ok(rows) => rows,
@@ -815,7 +826,7 @@ async fn transfer_events(
                 %aggregate_id,
                 "Failed to load transfer event history"
             );
-            return None;
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
 
@@ -825,7 +836,7 @@ async fn transfer_events(
         .iter()
         .map(|(event_type, payload, sequence)| {
             let step = event_step(event_type);
-            let inner = event_payload_inner(step, payload);
+            let inner = event_payload_inner(step, payload, *sequence);
 
             serde_json::json!({
                 "step": step,
@@ -835,7 +846,7 @@ async fn transfer_events(
         })
         .collect();
 
-    Some(Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "events": events,
         "stuck": stuck,
     })))
@@ -845,22 +856,26 @@ fn event_step(event_type: &str) -> &str {
     event_type.split("::").last().unwrap_or("Unknown")
 }
 
-fn event_payload_inner(step: &str, payload: &str) -> serde_json::Value {
-    let parsed: serde_json::Value = serde_json::from_str(payload)
-        .inspect_err(|error| {
-            tracing::warn!(
+fn event_payload_inner(step: &str, payload: &str, sequence: i64) -> serde_json::Value {
+    match serde_json::from_str::<serde_json::Value>(payload) {
+        Ok(parsed) => parsed
+            .as_object()
+            .and_then(|obj| obj.get(step).cloned())
+            .unwrap_or(parsed),
+        Err(error) => {
+            warn!(
                 target: "dashboard",
                 %error,
                 step,
+                sequence,
                 "Failed to parse event payload for display"
             );
-        })
-        .unwrap_or_default();
-
-    parsed
-        .as_object()
-        .and_then(|obj| obj.get(step).cloned())
-        .unwrap_or(parsed)
+            serde_json::json!({
+                "parseError": error.to_string(),
+                "sequence": sequence,
+            })
+        }
+    }
 }
 
 fn stuck_transfer_info(
@@ -1052,16 +1067,14 @@ fn shares_from_u256_18_decimal(amount: U256) -> Option<String> {
 /// For onchain trades (Raindex), returns Filled + optional Enriched events.
 /// For offchain trades (Alpaca), returns the full order lifecycle
 /// (Placed -> Submitted -> PartiallyFilled -> Filled/Failed).
-#[get("/trades/<venue>/<aggregate_id>/events")]
 async fn trade_events(
-    pool: &State<SqlitePool>,
-    venue: &str,
-    aggregate_id: &str,
-) -> Option<Json<serde_json::Value>> {
+    State(state): State<AppState>,
+    Path((venue_str, aggregate_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let venue = TradingVenue::from_str(&venue_str).map_err(|_| StatusCode::NOT_FOUND)?;
     let aggregate_type = match venue {
-        "raindex" => "OnChainTrade",
-        "alpaca" | "dry_run" => "OffchainOrder",
-        _ => return None,
+        TradingVenue::Raindex => "OnChainTrade",
+        TradingVenue::Alpaca | TradingVenue::DryRun => "OffchainOrder",
     };
 
     let rows: Vec<(String, String, i64)> = sqlx::query_as(
@@ -1071,21 +1084,25 @@ async fn trade_events(
          ORDER BY sequence ASC",
     )
     .bind(aggregate_type)
-    .bind(aggregate_id)
-    .fetch_all(pool.inner())
+    .bind(&aggregate_id)
+    .fetch_all(&state.pool)
     .await
-    .ok()?;
+    .map_err(|error| {
+        warn!(
+            target: "dashboard",
+            %error,
+            venue = %venue,
+            %aggregate_id,
+            "Failed to load trade event history"
+        );
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let events: Vec<serde_json::Value> = rows
         .into_iter()
         .map(|(event_type, payload, sequence)| {
-            let step = event_type.split("::").last().unwrap_or("Unknown");
-            let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap_or_default();
-
-            let inner = parsed
-                .as_object()
-                .and_then(|obj| obj.get(step).cloned())
-                .unwrap_or(parsed);
+            let step = event_step(&event_type);
+            let inner = event_payload_inner(step, &payload, sequence);
 
             serde_json::json!({
                 "step": step,
@@ -1095,34 +1112,36 @@ async fn trade_events(
         })
         .collect();
 
-    Some(Json(serde_json::json!({ "events": events })))
+    Ok(Json(serde_json::json!({ "events": events })))
 }
 
-fn unavailable_json(reason: &str) -> RawJson<String> {
-    RawJson(
-        serde_json::json!({
-            "unavailable": true,
-            "reason": reason,
-        })
-        .to_string(),
-    )
+fn unavailable_json(reason: &str) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "unavailable": true,
+        "reason": reason,
+    }))
+}
+
+#[derive(Deserialize, Default)]
+struct RaindexOrdersQuery {
+    page: Option<u32>,
+    page_size: Option<u32>,
 }
 
 /// Proxies the bot's active Raindex orders from the st0x REST API.
 /// When `[rest_api]` is not configured, returns an unavailable indicator
 /// so the dashboard can show a friendly message instead of an error.
-#[get("/orders/raindex?<page>&<page_size>")]
 #[allow(clippy::cognitive_complexity)]
 async fn raindex_orders(
-    ctx: &State<Ctx>,
-    page: Option<u32>,
-    page_size: Option<u32>,
-) -> RawJson<String> {
-    let Some(rest_api) = &ctx.rest_api else {
+    State(state): State<AppState>,
+    Query(query): Query<RaindexOrdersQuery>,
+) -> Json<serde_json::Value> {
+    let RaindexOrdersQuery { page, page_size } = query;
+    let Some(rest_api) = &state.ctx.rest_api else {
         return unavailable_json("REST API not configured (simulate mode)");
     };
 
-    let owner = ctx.order_owner();
+    let owner = state.ctx.order_owner();
     let url = format!(
         "{}/v1/orders/owner/{:#x}",
         rest_api.url.trim_end_matches('/'),
@@ -1158,7 +1177,13 @@ async fn raindex_orders(
     }
 
     match response.text().await {
-        Ok(body) => RawJson(body),
+        Ok(body) => match serde_json::from_str(&body) {
+            Ok(value) => Json(value),
+            Err(error) => {
+                tracing::warn!(target: "dashboard", %error, "st0x REST API returned non-JSON body");
+                unavailable_json("REST API returned non-JSON")
+            }
+        },
         Err(error) => {
             tracing::warn!(target: "dashboard", %error, "Failed to read st0x REST API response body");
             unavailable_json("Failed to read REST API response")
@@ -1193,28 +1218,27 @@ struct InterruptedTransfersResponse {
     interrupted_redemptions: Vec<String>,
 }
 
-#[get("/transfers/interrupted")]
 async fn interrupted_transfers(
-    pool: &State<SqlitePool>,
-) -> Result<Json<InterruptedTransfersResponse>, (Status, Json<ErrorResponse>)> {
-    let mints = crate::tokenized_equity_mint::interrupted_mint_ids(pool.inner())
+    State(state): State<AppState>,
+) -> Result<Json<InterruptedTransfersResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let mints = crate::tokenized_equity_mint::interrupted_mint_ids(&state.pool)
         .await
         .map_err(|error| {
             error!(?error, "Failed to query interrupted mints");
             (
-                Status::InternalServerError,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
                     error: "Failed to query interrupted mints".to_string(),
                 }),
             )
         })?;
 
-    let redemptions = crate::equity_redemption::interrupted_redemption_ids(pool.inner())
+    let redemptions = crate::equity_redemption::interrupted_redemption_ids(&state.pool)
         .await
         .map_err(|error| {
             error!(?error, "Failed to query interrupted redemptions");
             (
-                Status::InternalServerError,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
                     error: "Failed to query interrupted redemptions".to_string(),
                 }),
@@ -1236,48 +1260,45 @@ struct ResumeResponse {
     redemptions_failed: usize,
 }
 
-#[post("/transfers/resume")]
 async fn resume_transfers(
-    pool: &State<SqlitePool>,
-    recovery: &State<Arc<tokio::sync::OnceCell<RecoveryHandle>>>,
-    resume_lock: &State<ResumeLock>,
-) -> Result<Json<ResumeResponse>, (Status, Json<ErrorResponse>)> {
-    let _guard = resume_lock.0.try_lock().map_err(|_| {
+    State(state): State<AppState>,
+) -> Result<Json<ResumeResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let _guard = state.resume_lock.0.try_lock().map_err(|_| {
         (
-            Status::Conflict,
+            StatusCode::CONFLICT,
             Json(ErrorResponse {
                 error: "A resume operation is already in progress".to_string(),
             }),
         )
     })?;
 
-    let handle = recovery.get().ok_or_else(|| {
+    let handle = state.recovery.get().ok_or_else(|| {
         (
-            Status::ServiceUnavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {
                 error: "Recovery not ready yet (conductor still starting)".to_string(),
             }),
         )
     })?;
 
-    let mints = crate::tokenized_equity_mint::interrupted_mint_ids(pool.inner())
+    let mints = crate::tokenized_equity_mint::interrupted_mint_ids(&state.pool)
         .await
         .map_err(|error| {
             error!(?error, "Failed to query interrupted mints");
             (
-                Status::InternalServerError,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
                     error: "Failed to query interrupted mints".to_string(),
                 }),
             )
         })?;
 
-    let redemptions = crate::equity_redemption::interrupted_redemption_ids(pool.inner())
+    let redemptions = crate::equity_redemption::interrupted_redemption_ids(&state.pool)
         .await
         .map_err(|error| {
             error!(?error, "Failed to query interrupted redemptions");
             (
-                Status::InternalServerError,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
                     error: "Failed to query interrupted redemptions".to_string(),
                 }),
@@ -1320,7 +1341,7 @@ async fn resume_transfers(
 }
 
 #[derive(Serialize)]
-#[serde(crate = "rocket::serde", rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 struct RecheckResponse {
     outcome: RecheckOutcome,
 }
@@ -1336,26 +1357,31 @@ struct RecheckResponse {
 /// unauthenticated. The `/transfers/*` mutation endpoints need an auth guard
 /// before the listener is exposed beyond the operator network -- tracked as a
 /// follow-up. Until then, deployment must keep the bind address firewalled.
-#[post("/transfers/recheck/<kind>/<id>")]
 async fn recheck_transfer(
-    pool: &State<SqlitePool>,
-    recovery: &State<Arc<tokio::sync::OnceCell<RecoveryHandle>>>,
-    resume_lock: &State<ResumeLock>,
-    kind: TransferKind,
-    id: &str,
-) -> Result<Json<RecheckResponse>, (Status, Json<ErrorResponse>)> {
-    let _guard = resume_lock.0.try_lock().map_err(|_| {
+    State(state): State<AppState>,
+    Path((kind_str, id)): Path<(String, String)>,
+) -> Result<Json<RecheckResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let kind = TransferKind::from_str(&kind_str).map_err(|error| {
         (
-            Status::Conflict,
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Unknown transfer kind: {error}"),
+            }),
+        )
+    })?;
+
+    let _guard = state.resume_lock.0.try_lock().map_err(|_| {
+        (
+            StatusCode::CONFLICT,
             Json(ErrorResponse {
                 error: "A resume or recheck operation is already in progress".to_string(),
             }),
         )
     })?;
 
-    let handle = recovery.get().ok_or_else(|| {
+    let handle = state.recovery.get().ok_or_else(|| {
         (
-            Status::ServiceUnavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {
                 error: "Recovery not ready yet (conductor still starting)".to_string(),
             }),
@@ -1367,8 +1393,8 @@ async fn recheck_transfer(
             handle
                 .transfer
                 .recover_mint(
-                    &IssuerRequestId::new(id),
-                    pool.inner(),
+                    &IssuerRequestId::new(&id),
+                    &state.pool,
                     &handle.rebalancing_service,
                 )
                 .await
@@ -1376,7 +1402,7 @@ async fn recheck_transfer(
         TransferKind::EquityRedemption => {
             let redemption_id = id.parse::<RedemptionAggregateId>().map_err(|error| {
                 (
-                    Status::BadRequest,
+                    StatusCode::BAD_REQUEST,
                     Json(ErrorResponse {
                         error: format!("Invalid redemption ID: {error}"),
                     }),
@@ -1389,7 +1415,7 @@ async fn recheck_transfer(
         }
         TransferKind::UsdcBridge => {
             return Err((
-                Status::BadRequest,
+                StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
                     error: "recheck is not supported for USDC bridges".to_string(),
                 }),
@@ -1417,68 +1443,79 @@ async fn recheck_transfer(
 /// for the not-recoverable variants carry the typed error's message, which only
 /// references aggregate/request ids; internal failures stay generic so they do
 /// not leak internals (the full error is logged at the call site).
-fn recheck_error_response(error: &RecheckError) -> (Status, String) {
+fn recheck_error_response(error: &RecheckError) -> (StatusCode, String) {
     match error {
         RecheckError::NoAcceptedRequest(_)
         | RecheckError::MissingTxHash(_)
-        | RecheckError::MalformedWallet { .. } => (Status::UnprocessableEntity, error.to_string()),
+        | RecheckError::MalformedWallet { .. } => {
+            (StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
+        }
         RecheckError::Tokenizer(_) => (
-            Status::BadGateway,
+            StatusCode::BAD_GATEWAY,
             "Tokenization provider unavailable; retry later".to_string(),
         ),
         RecheckError::Mint(_)
         | RecheckError::Redemption(_)
         | RecheckError::Rebalancing(_)
         | RecheckError::Database(_) => (
-            Status::InternalServerError,
+            StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to recheck transfer".to_string(),
         ),
     }
 }
 
-pub(crate) fn routes() -> Vec<Route> {
-    routes![
-        health,
-        logs,
-        pending_orders,
-        trades,
-        trade_events,
-        transfers_endpoint,
-        transfer_events,
-        raindex_orders,
-        interrupted_transfers,
-        resume_transfers,
-        recheck_transfer
-    ]
+pub(crate) fn routes() -> Router<AppState> {
+    Router::new()
+        .route("/health", get(health))
+        .route("/logs", get(logs))
+        .route("/orders/pending", get(pending_orders))
+        .route("/trades", get(trades))
+        .route("/trades/{venue}/{aggregate_id}/events", get(trade_events))
+        .route("/transfers", get(transfers_endpoint))
+        .route(
+            "/transfers/{kind}/{aggregate_id}/events",
+            get(transfer_events),
+        )
+        .route("/orders/raindex", get(raindex_orders))
+        .route("/transfers/interrupted", get(interrupted_transfers))
+        .route("/transfers/resume", post(resume_transfers))
+        .route("/transfers/recheck/{kind}/{id}", post(recheck_transfer))
 }
 
 #[cfg(test)]
 mod tests {
-    use rocket::local::asynchronous::Client;
+    use std::sync::Arc;
 
-    use st0x_config::{RestApiCtx, create_test_ctx_with_order_owner};
+    use alloy::primitives::Address;
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use sqlx::SqlitePool;
+    use tokio::sync::broadcast;
+    use tower::ServiceExt;
+
+    use st0x_config::{Ctx, RestApiCtx, create_test_ctx_with_order_owner};
 
     use super::*;
+    use crate::dashboard;
+    use crate::inventory::{self, BroadcastingInventory};
 
-    #[test]
-    fn routes_include_recheck_transfer_endpoint() {
-        let recheck_routes: Vec<_> = routes()
-            .into_iter()
-            .filter(|route| {
-                route.method == rocket::http::Method::Post
-                    && route.uri.to_string().contains("/transfers/recheck/")
-            })
-            .collect();
+    async fn empty_app_state(ctx: Ctx) -> AppState {
+        let (sender, _) = broadcast::channel(16);
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
 
-        assert_eq!(
-            recheck_routes.len(),
-            1,
-            "exactly one POST /transfers/recheck route must be wired into routes(), found: {:?}",
-            routes()
-                .iter()
-                .map(|route| format!("{} {}", route.method, route.uri))
-                .collect::<Vec<_>>()
-        );
+        AppState {
+            settings: dashboard::settings_from_ctx(&ctx),
+            ctx,
+            pool,
+            event_sender: sender.clone(),
+            inventory: Arc::new(BroadcastingInventory::new(
+                inventory::InventoryView::default(),
+                sender,
+            )),
+            recovery: Arc::new(tokio::sync::OnceCell::new()),
+            resume_lock: Arc::new(ResumeLock(Mutex::new(()))),
+        }
     }
 
     #[test]
@@ -1800,39 +1837,23 @@ mod tests {
         (event_type.to_string(), payload.to_string(), sequence)
     }
 
-    #[tokio::test]
-    async fn test_health_endpoint() {
-        let ctx = create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
-        let rocket = rocket::build()
-            .mount("/", routes![health, logs])
-            .manage(ctx);
-        let client = Client::tracked(rocket)
+    fn build_app(state: AppState) -> Router {
+        routes().with_state(state)
+    }
+
+    async fn body_to_string(response: axum::response::Response) -> String {
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    async fn get_log_response(app: &Router, uri: &str) -> LogResponse {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
-            .expect("valid rocket instance");
-
-        let response = client.get("/health").dispatch().await;
-        assert_eq!(response.status(), Status::Ok);
-
-        let body = response.into_string().await.expect("response body");
-        let health_response: HealthResponse =
-            serde_json::from_str(&body).expect("valid JSON response");
-
-        assert_eq!(health_response.status, "healthy");
-        assert!(health_response.timestamp <= chrono::Utc::now());
-        assert!(!health_response.git_commit.is_empty());
-        assert!(health_response.uptime_seconds >= 0);
-    }
-
-    fn make_test_rocket(ctx: Ctx) -> rocket::Rocket<rocket::Build> {
-        rocket::build()
-            .mount("/", routes![health, logs])
-            .manage(ctx)
-    }
-
-    async fn get_log_response(client: &Client, uri: &str) -> LogResponse {
-        let response = client.get(uri).dispatch().await;
-        assert_eq!(response.status(), Status::Ok);
-        let body = response.into_string().await.expect("response body");
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_to_string(response).await;
         serde_json::from_str(&body).expect("valid LogResponse JSON")
     }
 
@@ -1845,13 +1866,37 @@ mod tests {
 {"timestamp":"2026-04-20T10:00:02Z","level":"WARN","target":"st0x_hedge","message":"Slow response"}"#;
 
     #[tokio::test]
-    async fn logs_returns_empty_when_no_log_dir() {
-        let ctx = create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
-        let client = Client::tracked(make_test_rocket(ctx))
-            .await
-            .expect("valid rocket instance");
+    async fn test_health_endpoint() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
 
-        let result = get_log_response(&client, "/logs").await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response).await;
+        let health_response: HealthResponse =
+            serde_json::from_str(&body).expect("valid JSON response");
+
+        assert_eq!(health_response.status, "healthy");
+        assert!(health_response.timestamp <= chrono::Utc::now());
+        assert!(!health_response.git_commit.is_empty());
+        assert!(health_response.uptime_seconds >= 0);
+    }
+
+    #[tokio::test]
+    async fn logs_returns_empty_when_no_log_dir() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
+
+        let result = get_log_response(&app, "/logs").await;
         assert!(result.entries.is_empty());
         assert_eq!(result.total, 0);
         assert!(!result.has_more);
@@ -1866,14 +1911,12 @@ mod tests {
             THREE_ENTRY_LOG,
         );
 
-        let mut ctx = create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.log_dir = Some(temp_dir.path().to_str().unwrap().to_string());
 
-        let client = Client::tracked(make_test_rocket(ctx))
-            .await
-            .expect("valid rocket instance");
+        let app = build_app(empty_app_state(ctx).await);
 
-        let result = get_log_response(&client, "/logs").await;
+        let result = get_log_response(&app, "/logs").await;
         assert_eq!(result.entries.len(), 3);
         assert_eq!(result.total, 3);
         assert!(!result.has_more);
@@ -1891,14 +1934,12 @@ mod tests {
             THREE_ENTRY_LOG,
         );
 
-        let mut ctx = create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.log_dir = Some(temp_dir.path().to_str().unwrap().to_string());
 
-        let client = Client::tracked(make_test_rocket(ctx))
-            .await
-            .expect("valid rocket instance");
+        let app = build_app(empty_app_state(ctx).await);
 
-        let result = get_log_response(&client, "/logs?limit=2").await;
+        let result = get_log_response(&app, "/logs?limit=2").await;
         assert_eq!(result.entries.len(), 2);
         assert_eq!(result.total, 3);
         assert!(result.has_more);
@@ -1916,21 +1957,19 @@ mod tests {
             THREE_ENTRY_LOG,
         );
 
-        let mut ctx = create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.log_dir = Some(temp_dir.path().to_str().unwrap().to_string());
 
-        let client = Client::tracked(make_test_rocket(ctx))
-            .await
-            .expect("valid rocket instance");
+        let app = build_app(empty_app_state(ctx).await);
 
         // Page 1: newest 2
-        let page1 = get_log_response(&client, "/logs?limit=2&offset=0").await;
+        let page1 = get_log_response(&app, "/logs?limit=2&offset=0").await;
         assert_eq!(page1.entries.len(), 2);
         assert!(page1.has_more);
         assert_eq!(page1.entries[0]["message"], "Slow response");
 
         // Page 2: older entries
-        let page2 = get_log_response(&client, "/logs?limit=2&offset=2").await;
+        let page2 = get_log_response(&app, "/logs?limit=2&offset=2").await;
         assert_eq!(page2.entries.len(), 1);
         assert!(!page2.has_more);
         assert_eq!(page2.entries[0]["message"], "Bot started");
@@ -1945,14 +1984,12 @@ mod tests {
             THREE_ENTRY_LOG,
         );
 
-        let mut ctx = create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.log_dir = Some(temp_dir.path().to_str().unwrap().to_string());
 
-        let client = Client::tracked(make_test_rocket(ctx))
-            .await
-            .expect("valid rocket instance");
+        let app = build_app(empty_app_state(ctx).await);
 
-        let result = get_log_response(&client, "/logs?search=slow").await;
+        let result = get_log_response(&app, "/logs?search=slow").await;
         assert_eq!(result.entries.len(), 1);
         assert_eq!(result.total, 1);
         assert!(!result.has_more);
@@ -1968,14 +2005,12 @@ mod tests {
             THREE_ENTRY_LOG,
         );
 
-        let mut ctx = create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.log_dir = Some(temp_dir.path().to_str().unwrap().to_string());
 
-        let client = Client::tracked(make_test_rocket(ctx))
-            .await
-            .expect("valid rocket instance");
+        let app = build_app(empty_app_state(ctx).await);
 
-        let result = get_log_response(&client, "/logs?level=INFO,WARN").await;
+        let result = get_log_response(&app, "/logs?level=INFO,WARN").await;
         assert_eq!(result.entries.len(), 2);
         assert_eq!(result.total, 2);
         // Newest first: WARN before INFO
@@ -1992,16 +2027,14 @@ mod tests {
             THREE_ENTRY_LOG,
         );
 
-        let mut ctx = create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.log_dir = Some(temp_dir.path().to_str().unwrap().to_string());
 
-        let client = Client::tracked(make_test_rocket(ctx))
-            .await
-            .expect("valid rocket instance");
+        let app = build_app(empty_app_state(ctx).await);
 
         // Only entries between 10:00:00 and 10:00:01 inclusive
         let result = get_log_response(
-            &client,
+            &app,
             "/logs?since=2026-04-20T10:00:00Z&until=2026-04-20T10:00:01Z",
         )
         .await;
@@ -2025,22 +2058,20 @@ mod tests {
 
         write_test_logs(temp_dir.path(), "st0x-hedge.log.2026-04-20", &log_content);
 
-        let mut ctx = create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.log_dir = Some(temp_dir.path().to_str().unwrap().to_string());
 
-        let client = Client::tracked(make_test_rocket(ctx))
-            .await
-            .expect("valid rocket instance");
+        let app = build_app(empty_app_state(ctx).await);
 
         // Newest first: trade 4, trade 3, trade 2, trade 1, trade 0
-        let page1 = get_log_response(&client, "/logs?search=trade&limit=2").await;
+        let page1 = get_log_response(&app, "/logs?search=trade&limit=2").await;
         assert_eq!(page1.entries.len(), 2);
         assert_eq!(page1.total, 5);
         assert!(page1.has_more);
         assert_eq!(page1.entries[0]["message"], "trade 4");
         assert_eq!(page1.entries[1]["message"], "trade 3");
 
-        let page2 = get_log_response(&client, "/logs?search=trade&limit=2&offset=2").await;
+        let page2 = get_log_response(&app, "/logs?search=trade&limit=2&offset=2").await;
         assert_eq!(page2.entries.len(), 2);
         assert!(page2.has_more);
         assert_eq!(page2.entries[0]["message"], "trade 2");
@@ -2049,20 +2080,23 @@ mod tests {
 
     #[tokio::test]
     async fn raindex_orders_returns_unavailable_when_rest_api_not_configured() {
-        let ctx = create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
         assert!(ctx.rest_api.is_none());
 
-        let rocket = rocket::build()
-            .mount("/", routes![raindex_orders])
-            .manage(ctx);
-        let client = Client::tracked(rocket)
+        let app = build_app(empty_app_state(ctx).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/orders/raindex")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
-            .expect("valid rocket instance");
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
 
-        let response = client.get("/orders/raindex").dispatch().await;
-        assert_eq!(response.status(), Status::Ok);
-
-        let body = response.into_string().await.expect("response body");
+        let body = body_to_string(response).await;
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON response");
 
         assert_eq!(parsed["unavailable"], true);
@@ -2071,22 +2105,25 @@ mod tests {
 
     #[tokio::test]
     async fn raindex_orders_returns_unavailable_when_upstream_unreachable() {
-        let mut ctx = create_test_ctx_with_order_owner(alloy::primitives::Address::ZERO);
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.rest_api = Some(RestApiCtx::unauthenticated(
             "http://127.0.0.1:1".to_string(),
         ));
 
-        let rocket = rocket::build()
-            .mount("/", routes![raindex_orders])
-            .manage(ctx);
-        let client = Client::tracked(rocket)
+        let app = build_app(empty_app_state(ctx).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/orders/raindex")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
-            .expect("valid rocket instance");
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
 
-        let response = client.get("/orders/raindex").dispatch().await;
-        assert_eq!(response.status(), Status::Ok);
-
-        let body = response.into_string().await.expect("response body");
+        let body = body_to_string(response).await;
         let parsed: serde_json::Value =
             serde_json::from_str(&body).expect("response must be valid JSON even on error");
 
@@ -2117,7 +2154,7 @@ mod tests {
             }
         });
 
-        let owner = alloy::primitives::Address::ZERO;
+        let owner = Address::ZERO;
         let expected_path = format!("/v1/orders/owner/{owner:#x}");
 
         mock_server.mock(|when, then| {
@@ -2133,17 +2170,20 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(owner);
         ctx.rest_api = Some(RestApiCtx::unauthenticated(mock_server.base_url()));
 
-        let rocket = rocket::build()
-            .mount("/", routes![raindex_orders])
-            .manage(ctx);
-        let client = Client::tracked(rocket)
+        let app = build_app(empty_app_state(ctx).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/orders/raindex")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
-            .expect("valid rocket instance");
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
 
-        let response = client.get("/orders/raindex").dispatch().await;
-        assert_eq!(response.status(), Status::Ok);
-
-        let body = response.into_string().await.expect("response body");
+        let body = body_to_string(response).await;
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON response");
 
         assert_eq!(parsed["orders"][0]["orderHash"], "0xabcd");
@@ -2164,7 +2204,7 @@ mod tests {
             }
         });
 
-        let owner = alloy::primitives::Address::ZERO;
+        let owner = Address::ZERO;
         let expected_path = format!("/v1/orders/owner/{owner:#x}");
 
         mock_server.mock(|when, then| {
@@ -2180,20 +2220,20 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(owner);
         ctx.rest_api = Some(RestApiCtx::unauthenticated(mock_server.base_url()));
 
-        let rocket = rocket::build()
-            .mount("/", routes![raindex_orders])
-            .manage(ctx);
-        let client = Client::tracked(rocket)
+        let app = build_app(empty_app_state(ctx).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/orders/raindex?page=3&page_size=500")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
-            .expect("valid rocket instance");
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
 
-        let response = client
-            .get("/orders/raindex?page=3&page_size=500")
-            .dispatch()
-            .await;
-        assert_eq!(response.status(), Status::Ok);
-
-        let body = response.into_string().await.expect("response body");
+        let body = body_to_string(response).await;
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON response");
 
         assert_eq!(parsed["pagination"]["page"], 3);
@@ -2214,7 +2254,7 @@ mod tests {
             }
         });
 
-        let owner = alloy::primitives::Address::ZERO;
+        let owner = Address::ZERO;
         let expected_path = format!("/v1/orders/owner/{owner:#x}");
 
         mock_server.mock(|when, then| {
@@ -2230,20 +2270,20 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(owner);
         ctx.rest_api = Some(RestApiCtx::unauthenticated(mock_server.base_url()));
 
-        let rocket = rocket::build()
-            .mount("/", routes![raindex_orders])
-            .manage(ctx);
-        let client = Client::tracked(rocket)
+        let app = build_app(empty_app_state(ctx).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/orders/raindex?page=0&page_size=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
-            .expect("valid rocket instance");
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
 
-        let response = client
-            .get("/orders/raindex?page=0&page_size=0")
-            .dispatch()
-            .await;
-        assert_eq!(response.status(), Status::Ok);
-
-        let body = response.into_string().await.expect("response body");
+        let body = body_to_string(response).await;
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON response");
 
         assert_eq!(parsed["pagination"]["page"], 1);
@@ -2253,7 +2293,7 @@ mod tests {
     #[tokio::test]
     async fn raindex_orders_returns_unavailable_on_upstream_500() {
         let mock_server = httpmock::MockServer::start();
-        let owner = alloy::primitives::Address::ZERO;
+        let owner = Address::ZERO;
 
         mock_server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -2264,17 +2304,20 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(owner);
         ctx.rest_api = Some(RestApiCtx::unauthenticated(mock_server.base_url()));
 
-        let rocket = rocket::build()
-            .mount("/", routes![raindex_orders])
-            .manage(ctx);
-        let client = Client::tracked(rocket)
+        let app = build_app(empty_app_state(ctx).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/orders/raindex")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
-            .expect("valid rocket instance");
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
 
-        let response = client.get("/orders/raindex").dispatch().await;
-        assert_eq!(response.status(), Status::Ok);
-
-        let body = response.into_string().await.expect("response body");
+        let body = body_to_string(response).await;
         let parsed: serde_json::Value =
             serde_json::from_str(&body).expect("response must be valid JSON on upstream error");
 
@@ -2282,75 +2325,77 @@ mod tests {
         assert!(parsed["reason"].as_str().unwrap().contains("error"));
     }
 
-    async fn create_test_pool() -> SqlitePool {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
-        pool
-    }
-
     #[tokio::test]
     async fn interrupted_transfers_returns_empty_on_fresh_db() {
-        let pool = create_test_pool().await;
-        let rocket = rocket::build()
-            .mount("/", routes![interrupted_transfers])
-            .manage(pool);
-        let client = Client::tracked(rocket).await.unwrap();
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
 
-        let response = client.get("/transfers/interrupted").dispatch().await;
-        assert_eq!(response.status(), Status::Ok);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/transfers/interrupted")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
 
-        let body: serde_json::Value =
-            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        let body = body_to_string(response).await;
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
 
-        assert_eq!(body["interruptedMints"], serde_json::json!([]));
-        assert_eq!(body["interruptedRedemptions"], serde_json::json!([]));
+        assert_eq!(parsed["interruptedMints"], serde_json::json!([]));
+        assert_eq!(parsed["interruptedRedemptions"], serde_json::json!([]));
     }
 
     #[tokio::test]
     async fn resume_transfers_returns_503_before_conductor_ready() {
-        let pool = create_test_pool().await;
-        let recovery = Arc::new(tokio::sync::OnceCell::<RecoveryHandle>::new());
-        let rocket = rocket::build()
-            .mount("/", routes![resume_transfers])
-            .manage(pool)
-            .manage(recovery)
-            .manage(ResumeLock(Mutex::new(())));
-        let client = Client::tracked(rocket).await.unwrap();
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
 
-        let response = client.post("/transfers/resume").dispatch().await;
-        assert_eq!(response.status(), Status::ServiceUnavailable);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transfers/resume")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-        let body: serde_json::Value =
-            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        let body = body_to_string(response).await;
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
 
         assert_eq!(
-            body["error"],
+            parsed["error"],
             "Recovery not ready yet (conductor still starting)"
         );
     }
 
     #[tokio::test]
     async fn recheck_transfer_returns_503_before_conductor_ready() {
-        let pool = create_test_pool().await;
-        let recovery = Arc::new(tokio::sync::OnceCell::<RecoveryHandle>::new());
-        let rocket = rocket::build()
-            .mount("/", routes![recheck_transfer])
-            .manage(pool)
-            .manage(recovery)
-            .manage(ResumeLock(Mutex::new(())));
-        let client = Client::tracked(rocket).await.unwrap();
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
 
-        let response = client
-            .post("/transfers/recheck/equity_mint/some-id")
-            .dispatch()
-            .await;
-        assert_eq!(response.status(), Status::ServiceUnavailable);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transfers/recheck/equity_mint/some-id")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-        let body: serde_json::Value =
-            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        let body = body_to_string(response).await;
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
 
         assert_eq!(
-            body["error"],
+            parsed["error"],
             "Recovery not ready yet (conductor still starting)"
         );
     }
@@ -2365,7 +2410,7 @@ mod tests {
         let (status, message) = recheck_error_response(&RecheckError::NoAcceptedRequest(
             IssuerRequestId::new("mint-1"),
         ));
-        assert_eq!(status, Status::UnprocessableEntity);
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(
             message,
             "mint mint-1 has no accepted provider request to re-check"
@@ -2374,16 +2419,14 @@ mod tests {
         let (status, _) = recheck_error_response(&RecheckError::MissingTxHash(
             TokenizationRequestId("tok-1".to_string()),
         ));
-        assert_eq!(status, Status::UnprocessableEntity);
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 
-        let parse_error = "not-an-address"
-            .parse::<alloy::primitives::Address>()
-            .unwrap_err();
+        let parse_error = "not-an-address".parse::<Address>().unwrap_err();
         let (status, _) = recheck_error_response(&RecheckError::MalformedWallet {
             id: IssuerRequestId::new("mint-1"),
             source: parse_error,
         });
-        assert_eq!(status, Status::UnprocessableEntity);
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 
         // Transient upstream provider failure -> 502 so the operator knows to
         // retry, with a generic message that does not leak provider internals.
@@ -2392,13 +2435,13 @@ mod tests {
                 tx_hash: alloy::primitives::TxHash::random(),
             }),
         ));
-        assert_eq!(status, Status::BadGateway);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(message, "Tokenization provider unavailable; retry later");
 
         // Genuinely internal failure -> 500 with a generic body.
         let (status, message) =
             recheck_error_response(&RecheckError::Database(sqlx::Error::RowNotFound));
-        assert_eq!(status, Status::InternalServerError);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(message, "Failed to recheck transfer");
     }
 }

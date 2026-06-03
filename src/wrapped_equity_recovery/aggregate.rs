@@ -570,7 +570,7 @@ async fn confirm_orphan_deposit_or_fail(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{TxHash, fixed_bytes};
+    use alloy::primitives::{Address, TxHash, fixed_bytes};
     use chrono::Utc;
     use rain_math_float::Float;
 
@@ -623,7 +623,7 @@ mod tests {
             raindex.clone(),
             Arc::new(MockTokenizer::new()),
             wrapper.clone(),
-            alloy::primitives::Address::random(),
+            Address::random(),
             mint_store,
             redemption_store,
         ));
@@ -814,7 +814,7 @@ mod tests {
             raindex.clone(),
             Arc::new(MockTokenizer::new()),
             wrapper.clone(),
-            alloy::primitives::Address::random(),
+            Address::random(),
             mint_store,
             redemption_store,
         ));

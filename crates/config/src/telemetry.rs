@@ -122,6 +122,7 @@ impl TelemetryCtx {
         &self,
         log_level: tracing::Level,
         log_dir: Option<&str>,
+        extra_layer: Option<ExtraLayer>,
     ) -> Result<(Option<FileLogGuard>, TelemetryGuard), TelemetryError> {
         let headers = HashMap::from([("authorization".to_string(), self.api_key.clone())]);
 
@@ -176,6 +177,7 @@ impl TelemetryCtx {
                 .with_filter(mk_crate_filter(log_level));
 
             let subscriber = Registry::default()
+                .with(extra_layer)
                 .with(fmt_layer)
                 .with(telemetry_layer)
                 .with(file_layer);
@@ -184,7 +186,10 @@ impl TelemetryCtx {
 
             Some(FileLogGuard { _guard: guard })
         } else {
-            let subscriber = Registry::default().with(fmt_layer).with(telemetry_layer);
+            let subscriber = Registry::default()
+                .with(extra_layer)
+                .with(fmt_layer)
+                .with(telemetry_layer);
 
             tracing::subscriber::set_global_default(subscriber)?;
 
@@ -266,7 +271,17 @@ pub struct FileLogGuard {
     _guard: tracing_appender::non_blocking::WorkerGuard,
 }
 
-pub fn setup_tracing(log_level: &LogLevel, log_dir: Option<&str>) -> Option<FileLogGuard> {
+/// Boxed Layer trait object used to plug in caller-owned extra layers
+/// (e.g. an apalis-board SSE broadcaster) without making `setup_tracing`
+/// generic over them.
+pub type ExtraLayer =
+    Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync + 'static>;
+
+pub fn setup_tracing(
+    log_level: &LogLevel,
+    log_dir: Option<&str>,
+    extra_layer: Option<ExtraLayer>,
+) -> Option<FileLogGuard> {
     let level: tracing::Level = log_level.into();
     let env_filter = mk_env_filter(level);
 
@@ -283,7 +298,10 @@ pub fn setup_tracing(log_level: &LogLevel, log_dir: Option<&str>) -> Option<File
             .compact()
             .with_filter(env_filter);
 
-        let subscriber = Registry::default().with(fmt_layer).with(file_layer);
+        let subscriber = Registry::default()
+            .with(extra_layer)
+            .with(fmt_layer)
+            .with(file_layer);
 
         if tracing::subscriber::set_global_default(subscriber).is_err() {
             eprintln!("Failed to set global subscriber (already set)");
@@ -292,10 +310,15 @@ pub fn setup_tracing(log_level: &LogLevel, log_dir: Option<&str>) -> Option<File
 
         Some(FileLogGuard { _guard: guard })
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
+        let fmt_layer = tracing_subscriber::fmt::layer()
             .compact()
-            .init();
+            .with_filter(env_filter);
+
+        let subscriber = Registry::default().with(extra_layer).with(fmt_layer);
+
+        if tracing::subscriber::set_global_default(subscriber).is_err() {
+            eprintln!("Failed to set global subscriber (already set)");
+        }
 
         None
     }

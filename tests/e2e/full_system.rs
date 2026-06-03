@@ -78,6 +78,7 @@ fn build_full_system_ctx<P: Provider + Clone>(
     rest_api_url: Option<&str>,
     cash_reserved: Option<Positive<Usd>>,
     server_port: u16,
+    board_port: u16,
 ) -> anyhow::Result<Ctx> {
     let alpaca_auth = AlpacaBrokerApiCtx {
         api_key: TEST_API_KEY.to_owned(),
@@ -155,6 +156,7 @@ fn build_full_system_ctx<P: Provider + Clone>(
         })
         .inventory_poll_interval(15)
         .server_port(server_port)
+        .board_port(board_port)
         .maybe_rest_api(
             rest_api_url.map(|url| st0x_config::RestApiCtx::unauthenticated(url.to_string())),
         )
@@ -318,6 +320,7 @@ fn write_simulate_failure_cli_files<P: Provider + Clone>(
     infra: &TestInfra<P>,
     cctp: &CctpInfra,
     server_port: u16,
+    board_port: u16,
     current_block: u64,
     usdc_vault_id: B256,
     equity_vault_ids: &HashMap<String, B256>,
@@ -334,6 +337,7 @@ fn write_simulate_failure_cli_files<P: Provider + Clone>(
 
     let config = format!(
         r#"server_port = {server_port}
+board_port = {board_port}
 log_level = "debug"
 database_url = "{database_url}"
 apalis_finished_job_cleanup_interval_secs = 3600
@@ -580,6 +584,7 @@ async fn full_system() -> anyhow::Result<()> {
         .cash_vault_id(usdc_vault_id)
         .cctp(cctp.cctp_overrides())
         .server_port(8001)
+        .board_port(8002)
         .call()?;
 
     let mut bot = spawn_bot_with_event_channel(ctx, event_sender);
@@ -882,6 +887,7 @@ async fn simulate() -> anyhow::Result<()> {
         .cctp(cctp.cctp_overrides())
         .cash_reserved(Positive::new(Usd::new(float!(25000)))?)
         .server_port(server_port)
+        .board_port(server_port + 1)
         .call()?;
     ctx.log_dir = Some(log_dir.display().to_string());
 
@@ -1080,6 +1086,7 @@ async fn simulate_failures() -> anyhow::Result<()> {
         .cctp(cctp.cctp_overrides())
         .cash_reserved(Positive::new(Usd::new(float!(25000)))?)
         .server_port(server_port)
+        .board_port(server_port + 1)
         .call()?;
     ctx.log_dir = Some(log_dir.display().to_string());
     let cli_ctx = ctx.clone();
@@ -1088,6 +1095,7 @@ async fn simulate_failures() -> anyhow::Result<()> {
         &infra,
         &cctp,
         server_port,
+        server_port + 1,
         current_block,
         usdc_vault_id,
         &equity_vault_ids,
