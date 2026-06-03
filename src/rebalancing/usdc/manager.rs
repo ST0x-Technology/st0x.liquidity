@@ -446,12 +446,38 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
             }
         };
 
+        // Capture the destination (Base) head before minting so a crash before
+        // `ConfirmBridging` resumes by scanning for the already-submitted mint
+        // instead of re-minting, which reverts on the already-used CCTP nonce.
+        // AlpacaToBase has no resume entry point, so a failure here records
+        // `FailBridging` rather than stranding the aggregate in `Bridging`.
+        let mint_scan_from_block = match self
+            .cctp_bridge
+            .destination_block(BridgeDirection::EthereumToBase)
+            .await
+        {
+            Ok(block) => block,
+            Err(error) => {
+                warn!(target: "rebalance", "Destination head lookup failed: {error}");
+                self.cqrs
+                    .send(
+                        id,
+                        UsdcRebalanceCommand::FailBridging {
+                            reason: format!("Destination block lookup failed: {error}"),
+                        },
+                    )
+                    .await?;
+                return Err(UsdcTransferError::Cctp(Box::new(error)));
+            }
+        };
+
         self.cqrs
             .send(
                 id,
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: response.as_bytes().to_vec(),
                     cctp_nonce: response.nonce(),
+                    mint_scan_from_block,
                 },
             )
             .await?;
@@ -699,10 +725,12 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                 direction,
                 amount,
                 burn_tx_hash,
+                mint_scan_from_block,
                 ..
             }) => {
                 Self::require_base_to_alpaca(id, &direction)?;
-                self.continue_from_attested(id, amount, burn_tx_hash).await
+                self.continue_from_attested(id, amount, burn_tx_hash, mint_scan_from_block)
+                    .await
             }
 
             Some(UsdcRebalance::Bridged {
@@ -822,12 +850,23 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
         };
         let attestation_response = self.poll_circle_attestation(id, &burn_receipt).await?;
 
+        // Capture the destination (Ethereum) head before minting so a crash
+        // before `ConfirmBridging` resumes by scanning for the already-submitted
+        // mint (`continue_from_attested`) instead of re-minting, which reverts on
+        // the already-used CCTP nonce.
+        let mint_scan_from_block = self
+            .cctp_bridge
+            .destination_block(BridgeDirection::BaseToEthereum)
+            .await
+            .map_err(|error| UsdcTransferError::Cctp(Box::new(error)))?;
+
         self.cqrs
             .send(
                 id,
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: attestation_response.as_bytes().to_vec(),
                     cctp_nonce: attestation_response.nonce(),
+                    mint_scan_from_block,
                 },
             )
             .await?;
@@ -836,18 +875,54 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
         self.mint_and_continue(id, attestation_response).await
     }
 
-    /// Drives the transfer from `Attested` through to terminal. The attestation
-    /// is already recorded, so this re-polls Circle for a fresh
-    /// [`AttestationResponse`] (the aggregate stores the attestation bytes and
-    /// nonce but not the full message envelope [`Bridge::mint`] needs) WITHOUT
-    /// re-emitting `ReceiveAttestation` -- which the aggregate rejects from
-    /// `Attested`, fail-stopping every retry with the USDC already burned.
+    /// Drives the transfer from `Attested` through to terminal.
+    ///
+    /// The mint may already have been submitted before a crash, so this first
+    /// scans the destination chain (bounded by `mint_scan_from_block`) for an
+    /// already-submitted mint to the market maker wallet and adopts it via
+    /// `ConfirmBridging` -- re-minting would revert on the already-used CCTP
+    /// nonce and fail a transfer whose USDC was in fact minted. When no mint is
+    /// found, it re-polls Circle for a fresh [`AttestationResponse`] (the
+    /// aggregate stores the attestation bytes and nonce but not the full message
+    /// envelope [`Bridge::mint`] needs) and mints, WITHOUT re-emitting
+    /// `ReceiveAttestation` -- which the aggregate rejects from `Attested`.
     async fn continue_from_attested(
         &self,
         id: &UsdcRebalanceId,
         amount: Usdc,
         burn_tx_hash: TxHash,
+        mint_scan_from_block: u64,
     ) -> Result<(), UsdcTransferError> {
+        if let Some(mint_receipt) = self
+            .cctp_bridge
+            .find_recent_mint(
+                BridgeDirection::BaseToEthereum,
+                self.market_maker_wallet,
+                mint_scan_from_block,
+            )
+            .await
+            .map_err(|error| UsdcTransferError::Cctp(Box::new(error)))?
+        {
+            let amount_received = u256_to_usdc(mint_receipt.amount)?;
+
+            info!(target: "rebalance", mint_tx = %mint_receipt.tx, %amount_received, "Adopting already-submitted CCTP mint on resume");
+
+            self.cqrs
+                .send(
+                    id,
+                    UsdcRebalanceCommand::ConfirmBridging {
+                        mint_tx: mint_receipt.tx,
+                        amount_received,
+                        fee_collected: u256_to_usdc(mint_receipt.fee)?,
+                    },
+                )
+                .await?;
+
+            return self
+                .continue_from_bridged(id, amount_received, mint_receipt.tx)
+                .await;
+        }
+
         let burn_receipt = BurnReceipt {
             tx: burn_tx_hash,
             amount: usdc_to_u256(amount)?,
@@ -1298,9 +1373,11 @@ impl<Chain: Wallet> CrossVenueTransfer<MarketMakingVenue, HedgingVenue>
 
 #[cfg(test)]
 mod tests {
-    use alloy::node_bindings::Anvil;
+    use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::{B256, address, b256, fixed_bytes};
     use alloy::providers::ProviderBuilder;
+    use alloy::providers::ext::AnvilApi as _;
+    use alloy::signers::local::PrivateKeySigner;
     use httpmock::prelude::*;
     use reqwest::StatusCode;
     use serde_json::json;
@@ -1315,7 +1392,11 @@ mod tests {
         TimeInForce,
     };
 
-    use st0x_bridge::cctp::{CctpBridge, CctpCtx};
+    use st0x_bridge::Bridge;
+    use st0x_bridge::cctp::{
+        CctpAttestationMock, CctpBridge, CctpCtx, TestMintBurnToken, deploy_cctp_on_chain,
+        link_chains, mint_usdc, set_max_burn_amount,
+    };
     use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder, test_store};
     use st0x_evm::Wallet;
     use st0x_evm::local::RawPrivateKeyWallet;
@@ -1382,6 +1463,7 @@ mod tests {
             UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01],
                 cctp_nonce: 99999,
+                mint_scan_from_block: 100,
             },
         )
         .await
@@ -2265,6 +2347,7 @@ mod tests {
             UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01],
                 cctp_nonce: 12345,
+                mint_scan_from_block: 100,
             },
         )
         .await
@@ -2907,6 +2990,7 @@ mod tests {
             UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01],
                 cctp_nonce: 99_999,
+                mint_scan_from_block: 100,
             },
         )
         .await
@@ -3178,6 +3262,309 @@ mod tests {
                 }
             ),
             "Expected ResumeDirectionMismatch for AlpacaToBase resume, got: {error:?}"
+        );
+    }
+
+    struct DualChainCctp {
+        _base_anvil: AnvilInstance,
+        _ethereum_anvil: AnvilInstance,
+        base_endpoint: String,
+        ethereum_endpoint: String,
+        token_messenger: Address,
+        message_transmitter: Address,
+        bot_key: B256,
+        bot_address: Address,
+        attester_key: B256,
+    }
+
+    /// Deploys CCTP V2 on two fresh Anvil chains (Base + Ethereum), points the
+    /// canonical USDC address at a mint/burn token on both, links them, and
+    /// funds the bot wallet with USDC to burn. Deterministic deploys give
+    /// identical contract addresses on both chains, so one token messenger /
+    /// message transmitter pair drives the bridge.
+    async fn deploy_dual_chain_cctp() -> DualChainCctp {
+        let base_anvil = Anvil::new().spawn();
+        let ethereum_anvil = Anvil::new().chain_id(1u64).spawn();
+        let base_endpoint = base_anvil.endpoint();
+        let ethereum_endpoint = ethereum_anvil.endpoint();
+
+        // Account 0 is the bot wallet (burns/mints); account 1 is the CCTP
+        // deployer, kept distinct to avoid nonce collisions on Base's instant
+        // mining.
+        let bot_key = B256::from_slice(&base_anvil.keys()[0].to_bytes());
+        let deployer_key = B256::from_slice(&base_anvil.keys()[1].to_bytes());
+        let bot_address = PrivateKeySigner::from_bytes(&bot_key).unwrap().address();
+
+        let attester_key = B256::random();
+        let attester_address = PrivateKeySigner::from_bytes(&attester_key)
+            .unwrap()
+            .address();
+
+        // Fund the deployer on Base (Ethereum Anvil pre-funds its own accounts).
+        let base_provider = ProviderBuilder::new()
+            .connect(&base_endpoint)
+            .await
+            .unwrap();
+        let ethereum_provider = ProviderBuilder::new()
+            .connect(&ethereum_endpoint)
+            .await
+            .unwrap();
+        let deployer_address = PrivateKeySigner::from_bytes(&deployer_key)
+            .unwrap()
+            .address();
+        base_provider
+            .anvil_set_balance(deployer_address, U256::from(10).pow(U256::from(20)))
+            .await
+            .unwrap();
+
+        let mut ethereum_cctp =
+            deploy_cctp_on_chain(&ethereum_endpoint, &deployer_key, 0, attester_address)
+                .await
+                .unwrap();
+        let mut base_cctp =
+            deploy_cctp_on_chain(&base_endpoint, &deployer_key, 6, attester_address)
+                .await
+                .unwrap();
+
+        // The bridge uses USDC at the canonical address; place the mint/burn
+        // token bytecode there on both chains so CCTP can mint/burn it.
+        ethereum_provider
+            .anvil_set_code(USDC_ADDRESS, TestMintBurnToken::DEPLOYED_BYTECODE.clone())
+            .await
+            .unwrap();
+        base_provider
+            .anvil_set_code(USDC_ADDRESS, TestMintBurnToken::DEPLOYED_BYTECODE.clone())
+            .await
+            .unwrap();
+        set_max_burn_amount(
+            &ethereum_endpoint,
+            &deployer_key,
+            ethereum_cctp.token_minter,
+            USDC_ADDRESS,
+            U256::from(1_000_000_000_000u64),
+        )
+        .await
+        .unwrap();
+        set_max_burn_amount(
+            &base_endpoint,
+            &deployer_key,
+            base_cctp.token_minter,
+            USDC_ADDRESS,
+            U256::from(1_000_000_000_000u64),
+        )
+        .await
+        .unwrap();
+        ethereum_cctp.usdc = USDC_ADDRESS;
+        base_cctp.usdc = USDC_ADDRESS;
+
+        link_chains(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &deployer_key,
+            &ethereum_cctp,
+            &base_cctp,
+        )
+        .await
+        .unwrap();
+
+        // Fund the bot's Base wallet so it can burn.
+        mint_usdc(
+            &base_endpoint,
+            &deployer_key,
+            USDC_ADDRESS,
+            bot_address,
+            U256::from(1_000_000_000_000u64),
+        )
+        .await
+        .unwrap();
+
+        DualChainCctp {
+            token_messenger: base_cctp.token_messenger,
+            message_transmitter: base_cctp.message_transmitter,
+            base_endpoint,
+            ethereum_endpoint,
+            bot_key,
+            bot_address,
+            attester_key,
+            _base_anvil: base_anvil,
+            _ethereum_anvil: ethereum_anvil,
+        }
+    }
+
+    /// Resume from `Attested` after the CCTP mint already landed on-chain must
+    /// ADOPT that mint (scan + `ConfirmBridging`) rather than re-calling
+    /// `receiveMessage`, which reverts on the already-used nonce and would latch
+    /// a terminal `BridgingFailed` for a transfer whose USDC was in fact minted.
+    ///
+    /// Deterministically reproduces the post-mint crash window (mint on-chain,
+    /// aggregate still `Attested`, `ConfirmBridging` not yet persisted) by
+    /// producing a real mint over dual-chain CCTP, then driving the aggregate to
+    /// `Attested` and resuming. Reaching `ConversionComplete` proves adoption: a
+    /// re-mint would revert on the used nonce and never get past the bridge.
+    #[tokio::test]
+    async fn resume_base_to_alpaca_from_attested_adopts_existing_mint() {
+        let chains = deploy_dual_chain_cctp().await;
+
+        let attestation = CctpAttestationMock::start().await;
+        let _watcher = attestation
+            .start_watcher(
+                ProviderBuilder::new()
+                    .connect(&chains.ethereum_endpoint)
+                    .await
+                    .unwrap(),
+                ProviderBuilder::new()
+                    .connect(&chains.base_endpoint)
+                    .await
+                    .unwrap(),
+                chains.attester_key,
+            )
+            .await
+            .unwrap();
+
+        let cctp_bridge = Arc::new(
+            CctpBridge::try_from_ctx(CctpCtx {
+                usdc_ethereum: USDC_ADDRESS,
+                usdc_base: USDC_ADDRESS,
+                ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
+                base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+                circle_api_base: attestation.base_url(),
+                token_messenger: chains.token_messenger,
+                message_transmitter: chains.message_transmitter,
+            })
+            .unwrap(),
+        );
+
+        // Produce a real on-chain mint to the market maker wallet.
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
+        let amount = usdc("100");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+        let burn_receipt = cctp_bridge
+            .burn(
+                BridgeDirection::BaseToEthereum,
+                amount_u256,
+                market_maker_wallet,
+            )
+            .await
+            .unwrap();
+        let attestation_response = cctp_bridge
+            .poll_attestation(BridgeDirection::BaseToEthereum, burn_receipt.tx)
+            .await
+            .unwrap();
+        // Capture the scan bound where production does -- after attestation,
+        // immediately before minting -- so the adopt window matches the real
+        // flow and a mint that landed earlier would fall outside it.
+        let mint_scan_from_block = cctp_bridge
+            .destination_block(BridgeDirection::BaseToEthereum)
+            .await
+            .unwrap();
+        let mint_receipt = cctp_bridge
+            .mint(BridgeDirection::BaseToEthereum, &attestation_response)
+            .await
+            .unwrap();
+
+        // Build the manager on the same bridge with Alpaca mocked.
+        let server = MockServer::start();
+        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let pool = crate::test_utils::setup_test_db().await;
+        let (_vault_registry_store, vault_registry_projection) =
+            StoreBuilder::<VaultRegistry>::new(pool)
+                .build(())
+                .await
+                .unwrap();
+        let vault_service = RaindexService::new(
+            create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+            ORDERBOOK_ADDRESS,
+            vault_registry_projection,
+            chains.bot_address,
+        );
+        let cqrs = create_test_store_instance().await;
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::clone(&cctp_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            market_maker_wallet,
+            TEST_VAULT_ID,
+        );
+
+        // Drive the aggregate to `Attested`, recording the real burn tx and the
+        // captured scan bound. cctp_nonce is irrelevant to the adopt path.
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount,
+                withdrawal: TransferRef::OnchainTx(burn_receipt.tx),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .await
+            .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::InitiateBridging {
+                burn_tx: burn_receipt.tx,
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ReceiveAttestation {
+                attestation: attestation_response.as_bytes().to_vec(),
+                cctp_nonce: attestation_response.nonce(),
+                mint_scan_from_block,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Downstream Alpaca legs after adoption: deposit detection (by the mint
+        // tx) then the USDC->USD conversion.
+        let _transfers_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([{
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "direction": "INCOMING",
+                    "amount": "100",
+                    "usd_value": "100",
+                    "chain": "ethereum",
+                    "asset": "USDC",
+                    "from_address": "0x0000000000000000000000000000000000000001",
+                    "to_address": "0x1111111111111111111111111111111111111111",
+                    "status": "COMPLETE",
+                    "tx_hash": format!("{:#x}", mint_receipt.tx),
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "network_fee": "0",
+                    "fees": "0"
+                }]));
+        });
+        let _conversion_mock = create_conversion_order_mock(&server, "100");
+        let _get_order_mock = create_get_order_mock(
+            &server,
+            "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "filled",
+            "100",
+        );
+
+        // A re-mint here would revert on the already-used nonce and latch
+        // `BridgingFailed`; reaching `ConversionComplete` proves the mint was
+        // adopted from the chain scan instead.
+        manager.resume_base_to_alpaca(&id, amount).await.unwrap();
+
+        let final_state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(final_state, UsdcRebalance::ConversionComplete { .. }),
+            "Expected ConversionComplete after adopting the existing mint on resume, \
+             got: {final_state:?}"
         );
     }
 }

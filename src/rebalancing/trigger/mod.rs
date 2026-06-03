@@ -7453,6 +7453,7 @@ mod tests {
         UsdcRebalanceEvent::BridgeAttestationReceived {
             attestation: vec![1, 2, 3, 4],
             cctp_nonce: 42,
+            mint_scan_from_block: 100,
             attested_at: Utc::now(),
         }
     }
@@ -8286,6 +8287,7 @@ mod tests {
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: vec![1, 2, 3],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: 100,
                 },
             )
             .await
@@ -8372,6 +8374,7 @@ mod tests {
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: vec![1, 2, 3],
                     cctp_nonce: 67890,
+                    mint_scan_from_block: 100,
                 },
             )
             .await
@@ -8669,6 +8672,7 @@ mod tests {
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: vec![1, 2, 3],
                     cctp_nonce: 99999,
+                    mint_scan_from_block: 100,
                 },
             )
             .await

@@ -1551,6 +1551,7 @@ mod tests {
         UsdcRebalanceEvent::BridgeAttestationReceived {
             attestation: vec![],
             cctp_nonce: 0,
+            mint_scan_from_block: 100,
             attested_at: ts(105),
         }
     }

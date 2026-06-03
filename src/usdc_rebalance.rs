@@ -226,9 +226,12 @@ pub(crate) enum UsdcRebalanceCommand {
     InitiateBridging { burn_tx: TxHash },
     /// Record the Circle attestation. Valid only from `Bridging` state.
     /// The cctp_nonce is extracted from the attested message (not the burn tx, which has placeholder).
+    /// `mint_scan_from_block` is the destination chain head captured before the mint,
+    /// bounding the crash-safe resume scan that adopts an already-submitted mint.
     ReceiveAttestation {
         attestation: Vec<u8>,
         cctp_nonce: u64,
+        mint_scan_from_block: u64,
     },
     /// Confirm the CCTP mint transaction. Valid only from `Attested` state.
     /// Includes actual amounts from the MintAndWithdraw event for accurate inventory tracking.
@@ -316,9 +319,12 @@ pub(crate) enum UsdcRebalanceEvent {
     },
     /// Circle attestation received. Enables minting on destination chain.
     /// The cctp_nonce is extracted from the attested message (the real nonce, not the placeholder).
+    /// `mint_scan_from_block` is the destination chain head captured before the mint,
+    /// persisted so a crash-safe resume scan for an already-submitted mint is bounded.
     BridgeAttestationReceived {
         attestation: Vec<u8>,
         cctp_nonce: u64,
+        mint_scan_from_block: u64,
         attested_at: DateTime<Utc>,
     },
     /// CCTP mint transaction confirmed on destination chain.
@@ -475,6 +481,9 @@ pub(crate) enum UsdcRebalance {
         burn_tx_hash: TxHash,
         cctp_nonce: u64,
         attestation: Vec<u8>,
+        /// Destination chain head captured before the mint, bounding the
+        /// crash-safe resume scan that adopts an already-submitted mint.
+        mint_scan_from_block: u64,
         initiated_at: DateTime<Utc>,
         attested_at: DateTime<Utc>,
     },
@@ -991,6 +1000,7 @@ impl EventSourced for UsdcRebalance {
                 BridgeAttestationReceived {
                     attestation,
                     cctp_nonce,
+                    mint_scan_from_block,
                     attested_at,
                 },
                 Self::Bridging {
@@ -1006,6 +1016,7 @@ impl EventSourced for UsdcRebalance {
                 burn_tx_hash: *burn_tx_hash,
                 cctp_nonce: *cctp_nonce,
                 attestation: attestation.clone(),
+                mint_scan_from_block: *mint_scan_from_block,
                 initiated_at: *initiated_at,
                 attested_at: *attested_at,
             },
@@ -1267,7 +1278,8 @@ impl EventSourced for UsdcRebalance {
             ReceiveAttestation {
                 attestation,
                 cctp_nonce,
-            } => self.transition_receive_attestation(attestation, cctp_nonce),
+                mint_scan_from_block,
+            } => self.transition_receive_attestation(attestation, cctp_nonce, mint_scan_from_block),
             ConfirmBridging {
                 mint_tx,
                 amount_received,
@@ -1558,6 +1570,7 @@ impl UsdcRebalance {
         &self,
         attestation: Vec<u8>,
         cctp_nonce: u64,
+        mint_scan_from_block: u64,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {
@@ -1572,6 +1585,7 @@ impl UsdcRebalance {
             Self::Bridging { .. } => Ok(vec![BridgeAttestationReceived {
                 attestation,
                 cctp_nonce,
+                mint_scan_from_block,
                 attested_at: Utc::now(),
             }]),
             Self::Attested { .. } => Err(UsdcRebalanceError::InvalidCommand {
@@ -2409,6 +2423,7 @@ mod tests {
             .when(UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: attestation.clone(),
                 cctp_nonce: 12345,
+                mint_scan_from_block: 8_675_309,
             })
             .await
             .events();
@@ -2416,6 +2431,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         let UsdcRebalanceEvent::BridgeAttestationReceived {
             attestation: event_attestation,
+            mint_scan_from_block,
             ..
         } = &events[0]
         else {
@@ -2423,6 +2439,49 @@ mod tests {
         };
 
         assert_eq!(*event_attestation, attestation);
+        assert_eq!(
+            *mint_scan_from_block, 8_675_309,
+            "ReceiveAttestation must persist the destination-chain scan bound into the event",
+        );
+    }
+
+    #[test]
+    fn evolve_carries_mint_scan_from_block_into_attested() {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let initiated_at = Utc::now();
+        let bridging = UsdcRebalance::Bridging {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: Usdc::new(float!(1000)),
+            burn_tx_hash: burn_tx,
+            initiated_at,
+            burned_at: initiated_at,
+        };
+
+        let attested = UsdcRebalance::evolve(
+            &bridging,
+            &UsdcRebalanceEvent::BridgeAttestationReceived {
+                attestation: vec![0x01],
+                cctp_nonce: 42,
+                mint_scan_from_block: 8_675_309,
+                attested_at: Utc::now(),
+            },
+        )
+        .unwrap()
+        .expect("Bridging must evolve to Attested on BridgeAttestationReceived");
+
+        let UsdcRebalance::Attested {
+            mint_scan_from_block,
+            ..
+        } = attested
+        else {
+            panic!("expected Attested state");
+        };
+
+        assert_eq!(
+            mint_scan_from_block, 8_675_309,
+            "evolve must carry the scan bound into the Attested state",
+        );
     }
 
     #[tokio::test]
@@ -2432,6 +2491,7 @@ mod tests {
             .when(UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01, 0x02],
                 cctp_nonce: 12345,
+                mint_scan_from_block: 100,
             })
             .await
             .then_expect_error();
@@ -2456,6 +2516,7 @@ mod tests {
             .when(UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01, 0x02],
                 cctp_nonce: 12345,
+                mint_scan_from_block: 100,
             })
             .await
             .then_expect_error();
@@ -2485,6 +2546,7 @@ mod tests {
             .when(UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01, 0x02],
                 cctp_nonce: 12345,
+                mint_scan_from_block: 100,
             })
             .await
             .then_expect_error();
@@ -2515,6 +2577,7 @@ mod tests {
             .when(UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01, 0x02],
                 cctp_nonce: 12345,
+                mint_scan_from_block: 100,
             })
             .await
             .then_expect_error();
@@ -2549,12 +2612,14 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: 100,
                     attested_at: Utc::now(),
                 },
             ])
             .when(UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x03, 0x04],
                 cctp_nonce: 99999,
+                mint_scan_from_block: 100,
             })
             .await
             .then_expect_error();
@@ -2591,6 +2656,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02, 0x03, 0x04],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: 100,
                     attested_at: Utc::now(),
                 },
             ])
@@ -2759,6 +2825,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce,
+                    mint_scan_from_block: 100,
                     attested_at: Utc::now(),
                 },
             ])
@@ -2858,6 +2925,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: 100,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -2909,6 +2977,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: 100,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -2999,6 +3068,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: 100,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -3056,6 +3126,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: 100,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -3108,6 +3179,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: 100,
                     attested_at: Utc::now(),
                 },
             ])
@@ -3152,6 +3224,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: 100,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -3203,6 +3276,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: 100,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -3251,6 +3325,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: 100,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -3314,6 +3389,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: 100,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -3373,6 +3449,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0xAB, 0xCD, 0xEF],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: 100,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -3425,6 +3502,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x11, 0x22, 0x33, 0x44],
                     cctp_nonce: 67890,
+                    mint_scan_from_block: 100,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -3532,6 +3610,7 @@ mod tests {
             .when(UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01],
                 cctp_nonce: 12345,
+                mint_scan_from_block: 100,
             })
             .await
             .then_expect_error();
@@ -3610,6 +3689,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: 100,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -3663,6 +3743,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: 100,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -3719,6 +3800,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: 100,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -4036,6 +4118,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: 100,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -4102,6 +4185,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: 100,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -4174,6 +4258,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: 100,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -4235,6 +4320,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: 100,
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -4302,6 +4388,7 @@ mod tests {
             UsdcRebalanceEvent::BridgeAttestationReceived {
                 attestation: vec![0x01],
                 cctp_nonce: 12345,
+                mint_scan_from_block: 100,
                 attested_at: withdrawal_confirmed_at + chrono::Duration::seconds(15),
             },
             UsdcRebalanceEvent::Bridged {
@@ -4681,6 +4768,7 @@ mod tests {
             burn_tx_hash: burn_tx,
             cctp_nonce: 42,
             attestation: vec![0xAA, 0xBB],
+            mint_scan_from_block: 100,
             initiated_at,
             attested_at,
         };

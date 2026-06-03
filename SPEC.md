@@ -1662,12 +1662,15 @@ enum UsdcRebalance {
         burn_tx_hash: TxHash,
         cctp_nonce: u64,
         attestation: Vec<u8>,
+        mint_scan_from_block: u64,
         initiated_at: DateTime<Utc>,
         attested_at: DateTime<Utc>,
     },
     Bridged {
         direction: RebalanceDirection,
         amount: Usdc,
+        amount_received: Usdc,
+        fee_collected: Usdc,
         burn_tx_hash: TxHash,
         mint_tx_hash: TxHash,
         initiated_at: DateTime<Utc>,
@@ -1714,6 +1717,26 @@ enum UsdcRebalance {
 }
 ```
 
+##### Crash-safe resume
+
+Resuming a transfer after a crash must never re-execute an irreversible on-chain
+action that already succeeded. Each phase records its intent (and the relevant
+chain head) before the action, so resume can scan the chain to adopt an
+already-submitted action instead of re-issuing it:
+
+- `WithdrawalSubmitting` / `BridgingSubmitting`: scan the source chain for an
+  already-submitted withdrawal / burn (`find_recent_withdrawal` /
+  `find_recent_burn`) from the captured head and adopt it rather than
+  withdrawing / burning twice.
+- `Attested`: the CCTP mint is irreversible -- re-calling `receiveMessage`
+  reverts on the already-used nonce, which would otherwise turn a successfully
+  minted transfer into a terminal `BridgingFailed`. Resume must scan the
+  destination chain for the already-submitted mint (`find_recent_mint`, matching
+  the `MintAndWithdraw` event) and adopt it -- recording `ConfirmBridging` with
+  the existing mint tx, amount, and fee -- before attempting a fresh mint. The
+  destination chain head is captured when the attestation is recorded so the
+  scan is bounded.
+
 ##### Commands
 
 ```rust
@@ -1740,8 +1763,8 @@ enum UsdcRebalanceCommand {
 
     // Bridging commands
     InitiateBridging { burn_tx: TxHash },
-    ReceiveAttestation { attestation: Vec<u8>, cctp_nonce: u64 },
-    ConfirmBridging { mint_tx: TxHash },
+    ReceiveAttestation { attestation: Vec<u8>, cctp_nonce: u64, mint_scan_from_block: u64 },
+    ConfirmBridging { mint_tx: TxHash, amount_received: Usdc, fee_collected: Usdc },
     FailBridging { reason: String },
 
     // Deposit commands
@@ -1782,10 +1805,13 @@ enum UsdcRebalanceEvent {
     BridgeAttestationReceived {
         attestation: Vec<u8>,
         cctp_nonce: u64,
+        mint_scan_from_block: u64,
         attested_at: DateTime<Utc>,
     },
     Bridged {
         mint_tx_hash: TxHash,
+        amount_received: Usdc,
+        fee_collected: Usdc,
         minted_at: DateTime<Utc>,
     },
     BridgingFailed {
