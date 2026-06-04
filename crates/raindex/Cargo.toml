@@ -1,0 +1,14 @@
+[package]
+name = "st0x-raindex"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+alloy.workspace = true
+async-trait.workspace = true
+rain-math-float.workspace = true
+st0x-evm.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

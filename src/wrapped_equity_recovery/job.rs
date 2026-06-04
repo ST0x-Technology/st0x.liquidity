@@ -69,10 +69,8 @@ pub(crate) struct WrappedEquityRecoveryCtx {
 pub(crate) enum WrappedEquityRecoveryJobError {
     #[error("recovery aggregate error: {0}")]
     Aggregate(#[from] SendError<WrappedEquityRecovery>),
-
     #[error(transparent)]
     Domain(#[from] WrappedEquityRecoveryError),
-
     #[error(
         "inventory view reports both an active mint ({mint_id}) and active redemption \
          ({redemption_id}) for symbol {symbol} -- aborting recovery"
@@ -82,7 +80,6 @@ pub(crate) enum WrappedEquityRecoveryJobError {
         mint_id: IssuerRequestId,
         redemption_id: RedemptionAggregateId,
     },
-
     #[error(
         "active mint {mint_id} for symbol {symbol} carries quantity {aggregate_shares}, \
          which does not match the wrapped-equity wallet snapshot {snapshot_shares} -- \
@@ -94,7 +91,6 @@ pub(crate) enum WrappedEquityRecoveryJobError {
         snapshot_shares: FractionalShares,
         aggregate_shares: FractionalShares,
     },
-
     #[error(
         "active redemption {redemption_id} for symbol {symbol} carries quantity \
          {aggregate_shares}, which does not match the wrapped-equity wallet snapshot \
@@ -106,13 +102,11 @@ pub(crate) enum WrappedEquityRecoveryJobError {
         snapshot_shares: FractionalShares,
         aggregate_shares: FractionalShares,
     },
-
     #[error("active mint {mint_id} for symbol {symbol} is missing from the mint store")]
     ActiveMintMissing {
         symbol: Symbol,
         mint_id: IssuerRequestId,
     },
-
     #[error(
         "active redemption {redemption_id} for symbol {symbol} is missing from the \
          redemption store"
@@ -121,7 +115,6 @@ pub(crate) enum WrappedEquityRecoveryJobError {
         symbol: Symbol,
         redemption_id: RedemptionAggregateId,
     },
-
     #[error("active mint store error: {0}")]
     ActiveMintAggregate(
         #[from]
@@ -129,7 +122,6 @@ pub(crate) enum WrappedEquityRecoveryJobError {
             st0x_event_sorcery::LifecycleError<crate::tokenized_equity_mint::TokenizedEquityMint>,
         >,
     ),
-
     #[error("active redemption store error: {0}")]
     ActiveRedemptionAggregate(
         #[from]
@@ -137,7 +129,6 @@ pub(crate) enum WrappedEquityRecoveryJobError {
             st0x_event_sorcery::LifecycleError<crate::equity_redemption::EquityRedemption>,
         >,
     ),
-
     #[error("failed to reschedule recovery job after guard contention: {0}")]
     Reschedule(#[from] QueuePushError),
 }

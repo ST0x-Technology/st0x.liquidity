@@ -9,6 +9,7 @@ members = [
   "crates/evm",
   "crates/float-macro",
   "crates/float-serde",
+  "crates/raindex",
 ]
 resolver = "2"
 exclude = ["lib"]
@@ -102,6 +103,7 @@ st0x-finance = { path = "crates/finance" }
 st0x-float-macro = { path = "crates/float-macro" }
 st0x-float-serde = { path = "crates/float-serde" }
 st0x-hedge = { path = "." }
+st0x-raindex = { path = "crates/raindex" }
 temp-env = "0.3.6"
 tempfile = "3.24.0"
 test-log = { version = "0.2.19", features = ["trace"] }
@@ -208,6 +210,7 @@ st0x-execution.workspace = true
 st0x-finance.workspace = true
 st0x-float-macro.workspace = true
 st0x-float-serde.workspace = true
+st0x-raindex.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true

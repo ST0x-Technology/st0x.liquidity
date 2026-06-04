@@ -87,13 +87,10 @@ pub(crate) struct WrappedEquityRecoveryServices {
 pub(crate) enum WrappedEquityRecoveryError {
     #[error("recovery already initialized")]
     AlreadyInitialized,
-
     #[error("recovery not yet initialized; only Detect is valid")]
     Uninitialized,
-
     #[error("command not valid from state {state:?}")]
     InvalidTransition { state: Box<WrappedEquityRecovery> },
-
     #[error("recovery is already in terminal state")]
     Terminal,
 }
