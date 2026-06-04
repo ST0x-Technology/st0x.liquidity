@@ -31,7 +31,7 @@ let
     # system profile always runs first; remaining profiles activate in ascending
     # `order`. Lower numbers go first.
     st0x-hedge = {
-      enabled = true;
+      enabled = false;
       order = 30;
       kind = "st0x";
       package = "st0x-liquidity";

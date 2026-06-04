@@ -98,6 +98,17 @@ impl TokenizationForm for WrappedTokenizedShares {
     }
 }
 
+/// 1:1 tokenized equity minted by the issuer (tTICKER, e.g. tCOIN, tAAPL),
+/// before it is wrapped into the ERC-4626 vault form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OneToOneTokenizedShares;
+
+impl TokenizationForm for OneToOneTokenizedShares {
+    fn prefix() -> &'static str {
+        "t"
+    }
+}
+
 /// A tokenized equity symbol consisting of a tokenization-form
 /// prefix and a base ticker. Parameterized by the form to
 /// distinguish minted (t) from wrapped (wt) symbols at the
@@ -580,6 +591,19 @@ mod tests {
             tokenized_symbol!(WrappedTokenizedShares, "wtGOOG"),
             tokenized_symbol!(WrappedTokenizedShares, "wtTSLA"),
         ];
+    }
+
+    #[test]
+    fn one_to_one_tokenized_shares_uses_t_prefix() {
+        let coin = TokenizedSymbol::<OneToOneTokenizedShares>::parse("tCOIN").unwrap();
+        assert_eq!(coin.to_string(), "tCOIN");
+        assert_eq!(coin.base(), &symbol!("COIN"));
+
+        let err = TokenizedSymbol::<OneToOneTokenizedShares>::parse("COIN").unwrap_err();
+        assert!(matches!(
+            err,
+            OnChainError::Validation(TradeValidationError::NotTokenizedEquity { .. })
+        ));
     }
 
     #[test]

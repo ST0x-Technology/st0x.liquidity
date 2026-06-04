@@ -1,6 +1,7 @@
 //! CLI commands for trading, asset transfers, and authentication.
 
 mod alpaca_wallet;
+mod benchmark;
 mod cctp;
 mod rebalancing;
 mod repair;
@@ -15,6 +16,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use rain_math_float::Float;
 use sqlx::SqlitePool;
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
 
@@ -444,6 +446,26 @@ pub enum Commands {
     /// Useful for debugging tokenization status without creating new requests.
     AlpacaTokenizationRequests,
 
+    /// Benchmark Alpaca tokenization round trips
+    ///
+    /// Runs N round trips (buy -> mint -> redeem -> sell) for a given symbol,
+    /// measuring tokenization and detokenization latency. Produces a TSV
+    /// report file and prints summary statistics.
+    AlpacaBenchmark {
+        /// Stock symbol (e.g., AAPL, TSLA)
+        #[arg(short = 's', long = "symbol")]
+        symbol: Symbol,
+        /// Number of round trips to perform
+        #[arg(short = 'n', long = "round-trips")]
+        round_trips: usize,
+        /// Number of shares per trip (default: 1)
+        #[arg(short = 'q', long = "quantity", value_parser = parse_positive_shares, default_value = "1")]
+        quantity: Positive<FractionalShares>,
+        /// Output file path (default: benchmark-{symbol}-{timestamp}.tsv)
+        #[arg(long = "output")]
+        output: Option<PathBuf>,
+    },
+
     /// Check the status of a broker order by order ID
     OrderStatus {
         /// The broker order ID to check
@@ -635,6 +657,12 @@ enum SimpleCommand {
         destination: AlpacaAccountId,
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
+    },
+    AlpacaBenchmark {
+        symbol: Symbol,
+        round_trips: usize,
+        quantity: Positive<FractionalShares>,
+        output: Option<PathBuf>,
     },
     VaultDeposit {
         amount: Float,
@@ -902,6 +930,17 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             symbol,
             quantity,
         }),
+        Commands::AlpacaBenchmark {
+            symbol,
+            round_trips,
+            quantity,
+            output,
+        } => Ok(SimpleCommand::AlpacaBenchmark {
+            symbol,
+            round_trips,
+            quantity,
+            output,
+        }),
         Commands::AlpacaTokenizationRequests => Err(ProviderCommand::AlpacaTokenizationRequests),
         Commands::ProcessTx { tx_hash } => Err(ProviderCommand::ProcessTx { tx_hash }),
         Commands::TransferUsdc { direction, amount } => {
@@ -1086,6 +1125,15 @@ async fn run_simple_command<W: Write>(
             quantity,
         } => {
             alpaca_wallet::alpaca_journal_command(stdout, destination, symbol, quantity, ctx).await
+        }
+        SimpleCommand::AlpacaBenchmark {
+            symbol,
+            round_trips,
+            quantity,
+            output,
+        } => {
+            benchmark::alpaca_benchmark_command(stdout, symbol, round_trips, quantity, output, ctx)
+                .await
         }
         SimpleCommand::VaultDeposit {
             amount,

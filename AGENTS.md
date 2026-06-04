@@ -665,6 +665,15 @@ reviewing code that uses configuration instead of reading secrets directly.
 - **CRITICAL: Do NOT run `cargo nextest run --workspace` repeatedly.** Use
   `-p <crate>` during iteration; full workspace suite only in final
   verification.
+- **Mandatory refactoring pass**: After getting code working (check + test
+  passing), review ALL new code for useless abstractions before running clippy.
+  Remove: one-liner wrapper functions, traits with a single implementation that
+  just delegate, enum/struct hierarchies that mirror another type 1:1 without
+  adding information, indirection layers that exist "for structure" but carry no
+  semantic meaning. If a function body is a single call/expression, inline it.
+  If an abstraction doesn't make invalid states unrepresentable or decouple
+  independent concerns, delete it. Getting something working is step one; making
+  it not embarrassing is step two.
 
 #### CRITICAL: Quality Control Policy
 
