@@ -18,15 +18,14 @@
     rain-math-float = {
       type = "git";
       url = "https://github.com/rainlanguage/rain.math.float";
-      rev = "5a12bf839bea0ce9528a0e1810d620c44812283a";
+      rev = "e226e5a27125e75208e3e709e1c5eee128bd8b3b";
       flake = false;
     };
 
     rain-orderbook = {
       type = "git";
       url = "https://github.com/rainlanguage/rain.orderbook";
-      rev = "f7bf51ab3db0bac4f8551b91000c69cc5ba0db71";
-      submodules = true;
+      rev = "29219ff36170224786025b5c9e8fef2e460638b3";
       flake = false;
     };
 

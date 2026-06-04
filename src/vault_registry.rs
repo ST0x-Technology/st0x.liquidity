@@ -497,12 +497,12 @@ impl SeedVaultRegistryCtx {
     pub(crate) fn from_config(
         vault_registry: Arc<Store<VaultRegistry>>,
         ctx: &Ctx,
-    ) -> Result<Self, CtxError> {
+    ) -> Result<Self, Box<CtxError>> {
         for (symbol, equity_config) in &ctx.assets.equities.symbols {
             if equity_config.vault_ids.is_empty() && ctx.is_rebalancing_enabled(symbol) {
-                return Err(CtxError::MissingEquityVaultId {
+                return Err(Box::new(CtxError::MissingEquityVaultId {
                     symbol: symbol.clone(),
-                });
+                }));
             }
         }
 
@@ -1292,7 +1292,7 @@ mod tests {
             .expect("should fail when vault_id is missing for TSLA");
 
         assert!(
-            matches!(&error, CtxError::MissingEquityVaultId { symbol } if symbol.to_string() == "TSLA"),
+            matches!(&*error, CtxError::MissingEquityVaultId { symbol } if symbol.to_string() == "TSLA"),
             "expected MissingEquityVaultId for TSLA, got: {error:?}"
         );
     }

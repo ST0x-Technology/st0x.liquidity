@@ -6,7 +6,7 @@ use alloy::rpc::types::Log;
 use st0x_evm::Evm;
 
 use super::OnChainError;
-use crate::bindings::IOrderBookV6::{TakeOrderConfigV4, TakeOrderV3};
+use crate::bindings::IRaindexV6::{TakeOrderConfigV4, TakeOrderV3};
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::{OnchainTrade, OrderFill};
 use crate::symbol::cache::SymbolCache;
@@ -33,7 +33,7 @@ impl OnchainTrade {
             signedContext: _,
         } = event.config;
 
-        // Per IOrderBookV6.sol lines 385-386, TakeOrderV3's `input`/`output` are
+        // Per IRaindexV6.sol lines 385-386, TakeOrderV3's `input`/`output` are
         // "from the perspective of sender" (the taker), NOT the order:
         // - event.input = what taker received = what order GAVE (order's output)
         // - event.output = what taker gave = what order RECEIVED (order's input)
@@ -61,7 +61,7 @@ mod tests {
 
     use super::*;
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
-    use crate::bindings::IOrderBookV6::{SignedContextV1, TakeOrderConfigV4, TakeOrderV3};
+    use crate::bindings::IRaindexV6::{SignedContextV1, TakeOrderConfigV4, TakeOrderV3};
     use crate::onchain::io::WrappedTokenizedShares;
     use crate::onchain::pyth::FeedIdCache;
     use crate::symbol::cache::SymbolCache;
@@ -70,9 +70,9 @@ mod tests {
     use st0x_float_macro::float;
 
     fn create_take_order_event_with_order(
-        order: crate::bindings::IOrderBookV6::OrderV4,
+        order: crate::bindings::IRaindexV6::OrderV4,
     ) -> TakeOrderV3 {
-        // Per IOrderBookV6.sol lines 385-386, input/output are from taker's perspective.
+        // Per IRaindexV6.sol lines 385-386, input/output are from taker's perspective.
         // For a trade where order receives 100 USDC and gives 9 shares:
         // - input = 9 (taker received 9 shares = order gave 9 shares)
         // - output = 100 (taker gave 100 USDC = order received 100 USDC)

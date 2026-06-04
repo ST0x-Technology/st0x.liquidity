@@ -21,7 +21,7 @@ use st0x_evm::Evm;
 use st0x_execution::Executor;
 
 use super::OnChainError;
-use crate::bindings::IOrderBookV6::{ClearV3, TakeOrderV3};
+use crate::bindings::IRaindexV6::{ClearV3, TakeOrderV3};
 use crate::conductor::job::{Job, Label};
 use crate::onchain::trade::RaindexTradeEvent;
 use crate::trading::onchain::inclusion::EmittedOnChain;
@@ -418,7 +418,7 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::bindings::IOrderBookV6;
+    use crate::bindings::IRaindexV6;
     use crate::conductor::setup_apalis_tables;
     use crate::test_utils::{get_test_order, setup_test_db};
     use st0x_config::EvmCtx;
@@ -734,7 +734,7 @@ mod tests {
             required_confirmations: 0,
         };
 
-        let clear_config = IOrderBookV6::ClearConfigV2 {
+        let clear_config = IRaindexV6::ClearConfigV2 {
             aliceInputIOIndex: U256::from(0),
             aliceOutputIOIndex: U256::from(1),
             bobInputIOIndex: U256::from(1),
@@ -743,7 +743,7 @@ mod tests {
             bobBountyVaultId: B256::ZERO,
         };
 
-        let clear_event = IOrderBookV6::ClearV3 {
+        let clear_event = IRaindexV6::ClearV3 {
             sender: address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
             alice: order.clone(),
             bob: order.clone(),
@@ -800,9 +800,9 @@ mod tests {
             required_confirmations: 0,
         };
 
-        let take_event = IOrderBookV6::TakeOrderV3 {
+        let take_event = IRaindexV6::TakeOrderV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
-            config: IOrderBookV6::TakeOrderConfigV4 {
+            config: IRaindexV6::TakeOrderConfigV4 {
                 order: order.clone(),
                 inputIOIndex: U256::from(0),
                 outputIOIndex: U256::from(1),
@@ -868,11 +868,11 @@ mod tests {
         };
 
         let different_order = get_test_order();
-        let clear_event = IOrderBookV6::ClearV3 {
+        let clear_event = IRaindexV6::ClearV3 {
             sender: address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
             alice: different_order.clone(),
             bob: different_order.clone(),
-            clearConfig: IOrderBookV6::ClearConfigV2 {
+            clearConfig: IRaindexV6::ClearConfigV2 {
                 aliceInputIOIndex: U256::from(0),
                 aliceOutputIOIndex: U256::from(1),
                 bobInputIOIndex: U256::from(1),
@@ -882,9 +882,9 @@ mod tests {
             },
         };
 
-        let take_event = IOrderBookV6::TakeOrderV3 {
+        let take_event = IRaindexV6::TakeOrderV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
-            config: IOrderBookV6::TakeOrderConfigV4 {
+            config: IRaindexV6::TakeOrderConfigV4 {
                 order: different_order.clone(),
                 inputIOIndex: U256::from(0),
                 outputIOIndex: U256::from(1),
@@ -1029,13 +1029,13 @@ mod tests {
     }
 
     fn create_test_take_event(
-        order: &IOrderBookV6::OrderV4,
+        order: &IRaindexV6::OrderV4,
         input: U256,
         output: U256,
-    ) -> IOrderBookV6::TakeOrderV3 {
-        IOrderBookV6::TakeOrderV3 {
+    ) -> IRaindexV6::TakeOrderV3 {
+        IRaindexV6::TakeOrderV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
-            config: IOrderBookV6::TakeOrderConfigV4 {
+            config: IRaindexV6::TakeOrderConfigV4 {
                 order: order.clone(),
                 inputIOIndex: U256::from(0),
                 outputIOIndex: U256::from(1),
@@ -1056,7 +1056,7 @@ mod tests {
 
     fn create_test_log(
         orderbook: Address,
-        event: &IOrderBookV6::TakeOrderV3,
+        event: &IRaindexV6::TakeOrderV3,
         block_number: u64,
         tx_hash: FixedBytes<32>,
     ) -> Log {
@@ -1349,8 +1349,8 @@ mod tests {
         assert_eq!(job_count(&pool).await, 2);
     }
 
-    fn create_clear_log(orderbook: Address, order: &IOrderBookV6::OrderV4, tx_hash: TxHash) -> Log {
-        let clear_config = IOrderBookV6::ClearConfigV2 {
+    fn create_clear_log(orderbook: Address, order: &IRaindexV6::OrderV4, tx_hash: TxHash) -> Log {
+        let clear_config = IRaindexV6::ClearConfigV2 {
             aliceInputIOIndex: U256::from(0),
             aliceOutputIOIndex: U256::from(1),
             bobInputIOIndex: U256::from(1),
@@ -1359,7 +1359,7 @@ mod tests {
             bobBountyVaultId: B256::ZERO,
         };
 
-        let clear_event = IOrderBookV6::ClearV3 {
+        let clear_event = IRaindexV6::ClearV3 {
             sender: address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
             alice: order.clone(),
             bob: order.clone(),
@@ -2017,11 +2017,11 @@ mod tests {
 
         let order = get_test_order();
 
-        let clear_event = IOrderBookV6::ClearV3 {
+        let clear_event = IRaindexV6::ClearV3 {
             sender: address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
             alice: order.clone(),
             bob: order.clone(),
-            clearConfig: IOrderBookV6::ClearConfigV2 {
+            clearConfig: IRaindexV6::ClearConfigV2 {
                 aliceInputIOIndex: U256::from(0),
                 aliceOutputIOIndex: U256::from(1),
                 bobInputIOIndex: U256::from(1),

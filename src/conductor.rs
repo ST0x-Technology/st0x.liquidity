@@ -264,10 +264,9 @@ impl Conductor {
                 .await?;
 
         let seed_vault_registry_queue = SeedVaultRegistryJobQueue::new(&pool);
-        let seed_vault_registry_ctx = Arc::new(SeedVaultRegistryCtx::from_config(
-            vault_registry.clone(),
-            &ctx,
-        )?);
+        let seed_vault_registry_ctx = Arc::new(
+            SeedVaultRegistryCtx::from_config(vault_registry.clone(), &ctx).map_err(|err| *err)?,
+        );
 
         // Run the seeding logic inline at startup so downstream wiring
         // (RaindexService, trade accounting, inventory polling) starts
@@ -2245,7 +2244,7 @@ mod tests {
     use st0x_float_macro::float;
 
     use super::*;
-    use crate::bindings::IOrderBookV6::{
+    use crate::bindings::IRaindexV6::{
         ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4, TakeOrderConfigV4, TakeOrderV3,
     };
     use crate::conductor::builder::CqrsFrameworks;

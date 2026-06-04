@@ -19,7 +19,7 @@ use st0x_execution::{Direction, FractionalShares, HasZero};
 use st0x_float_serde::format_float_with_fallback;
 
 use super::pyth::{extract_pyth_price, raw_price_to_pyth_price};
-use crate::bindings::IOrderBookV6::{ClearV3, OrderV4, TakeOrderV3};
+use crate::bindings::IRaindexV6::{ClearV3, OrderV4, TakeOrderV3};
 use crate::onchain::OnChainError;
 use crate::onchain::io::{TokenizedSymbol, TradeDetails, Usdc, WrappedTokenizedShares};
 use crate::onchain::pyth::FeedIdCache;
@@ -432,7 +432,7 @@ mod tests {
     use st0x_evm::ReadOnlyEvm;
 
     use super::*;
-    use crate::bindings::IOrderBookV6;
+    use crate::bindings::IRaindexV6;
     use crate::symbol::cache::SymbolCache;
     use st0x_config::EvmCtx;
     use st0x_float_macro::float;
@@ -657,8 +657,8 @@ mod tests {
         ));
     }
 
-    fn make_io(token: Address, vault_id: B256) -> IOrderBookV6::IOV2 {
-        IOrderBookV6::IOV2 {
+    fn make_io(token: Address, vault_id: B256) -> IRaindexV6::IOV2 {
+        IRaindexV6::IOV2 {
             token,
             vaultId: vault_id,
         }
@@ -666,12 +666,12 @@ mod tests {
 
     fn make_order(
         owner: Address,
-        inputs: Vec<IOrderBookV6::IOV2>,
-        outputs: Vec<IOrderBookV6::IOV2>,
-    ) -> IOrderBookV6::OrderV4 {
-        IOrderBookV6::OrderV4 {
+        inputs: Vec<IRaindexV6::IOV2>,
+        outputs: Vec<IRaindexV6::IOV2>,
+    ) -> IRaindexV6::OrderV4 {
+        IRaindexV6::OrderV4 {
             owner,
-            evaluable: IOrderBookV6::EvaluableV4::default(),
+            evaluable: IRaindexV6::EvaluableV4::default(),
             validInputs: inputs,
             validOutputs: outputs,
             nonce: B256::ZERO,
@@ -764,11 +764,11 @@ mod tests {
             )],
         );
 
-        let event = IOrderBookV6::ClearV3 {
+        let event = IRaindexV6::ClearV3 {
             sender: address!("0x0000000000000000000000000000000000000000"),
             alice,
             bob,
-            clearConfig: IOrderBookV6::ClearConfigV2 {
+            clearConfig: IRaindexV6::ClearConfigV2 {
                 aliceInputIOIndex: uint!(0_U256),
                 aliceOutputIOIndex: uint!(0_U256),
                 bobInputIOIndex: uint!(0_U256),
