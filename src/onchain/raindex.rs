@@ -12,7 +12,10 @@
 //! standard fixed-point amounts (U256) and the float format MUST use rain-math-float.
 
 use alloy::primitives::{Address, B256, TxHash, U256, address};
-use alloy::rpc::types::TransactionReceipt;
+use alloy::providers::Provider;
+use alloy::rpc::types::{Filter, TransactionReceipt};
+use alloy::sol_types::SolEvent;
+use alloy::transports::{RpcError, TransportErrorKind};
 use async_trait::async_trait;
 use rain_math_float::Float;
 use std::sync::Arc;
@@ -26,7 +29,7 @@ use st0x_finance::Usdc;
 use crate::bindings::{IERC20, IOrderBookV6};
 use crate::vault_registry::{VaultRegistry, VaultRegistryId, VaultRegistryProjection};
 
-const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+pub(crate) const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
 const USDC_DECIMALS: u8 = 6;
 
 /// Vault identifier for Rain OrderBook vaults.
@@ -51,7 +54,29 @@ pub(crate) enum RaindexError {
     VaultNotFound(Address),
     #[error("Token not found for symbol {0}")]
     TokenNotFound(Symbol),
+    #[error("RPC transport error: {0}")]
+    RpcTransport(#[from] RpcError<TransportErrorKind>),
+    #[error("ABI decode error: {0}")]
+    SolType(#[from] alloy::sol_types::Error),
+    /// A withdrawal scan could not confirm presence or absence: the queried node
+    /// is not confirmations-deep past `from_block`, so an empty result may be RPC
+    /// lag rather than a true absence. Retryable -- the caller must NOT re-execute
+    /// the irreversible withdraw on this.
+    #[error("withdrawal scan inconclusive: node not caught up past block {from_block}")]
+    ScanInconclusive { from_block: u64 },
 }
+
+/// Number of `eth_getLogs` scans that must agree the effect is absent before a
+/// resume re-executes an irreversible withdraw. Defends against a single
+/// load-balanced RPC node lagging and returning a false-empty result.
+const SCAN_ATTEMPTS: u32 = 5;
+
+/// Backoff between scan retries; different load-balanced nodes may answer each.
+const SCAN_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Blocks the chain head must be past `from_block` before an empty scan is
+/// trusted as a true absence (the on-chain effect lands at/after `from_block`).
+const SCAN_FINALITY_MARGIN: u64 = 2;
 
 /// Service for managing Rain OrderBook vault operations.
 ///
@@ -293,6 +318,82 @@ impl<E: Evm> RaindexService<E> {
             .get_vault_balance::<Registry>(owner, USDC_BASE, vault_id)
             .await?;
         Ok(Usdc::new(exact))
+    }
+
+    /// Scans for a `WithdrawV2` event from this owner's vault at or after
+    /// `from_block`, returning the most recent match's `(tx_hash, withdrawn_amount)`.
+    ///
+    /// Crash-safe withdrawal recovery: a transfer records the chain head before
+    /// the on-chain withdraw, so on resume this detects an already-submitted
+    /// withdrawal and the caller adopts it instead of re-issuing (which would
+    /// double-spend the vault). Matches on `(sender == self.owner, token, vaultId)`
+    /// -- never on amount, so a partial fill is still detected -- and returns the
+    /// actual on-chain `withdrawAmountUint256` so the caller can reconcile a
+    /// partial withdrawal rather than laundering it into a full-amount burn.
+    ///
+    /// Returns `Ok(None)` ONLY when the queried node is confirmations-deep past
+    /// `from_block` and repeated scans agree the effect is absent. A node that may
+    /// be lagging (the dRPC load-balancing hazard AGENTS.md warns about) yields a
+    /// retryable [`RaindexError::ScanInconclusive`] instead, so the caller never
+    /// re-executes the irreversible withdraw off a single stale empty `eth_getLogs`.
+    pub(crate) async fn find_recent_withdrawal(
+        &self,
+        token: Address,
+        vault_id: RaindexVaultId,
+        from_block: u64,
+    ) -> Result<Option<(TxHash, U256)>, RaindexError> {
+        let RaindexVaultId(vault_id) = vault_id;
+        let filter = Filter::new()
+            .from_block(from_block)
+            .address(self.orderbook_address)
+            .event_signature(IOrderBookV6::WithdrawV2::SIGNATURE_HASH);
+
+        for attempt in 1..=SCAN_ATTEMPTS {
+            let logs = self.evm.provider().get_logs(&filter).await?;
+
+            // get_logs returns ascending block order; iterate newest-first so the
+            // most recent matching withdrawal wins -- under single-in-flight that
+            // is this transfer's withdrawal.
+            for log in logs.iter().rev() {
+                let decoded = log.log_decode::<IOrderBookV6::WithdrawV2>()?;
+                let event = decoded.data();
+
+                if event.sender == self.owner
+                    && event.token == token
+                    && event.vaultId == vault_id
+                    && let Some(tx_hash) = log.transaction_hash
+                {
+                    debug!(target: "orderbook", %tx_hash, from_block, "Found existing withdrawal during resume");
+                    return Ok(Some((tx_hash, event.withdrawAmountUint256)));
+                }
+            }
+
+            // No match on this query. A single empty eth_getLogs from a
+            // load-balanced node is not authoritative (the dRPC lag hazard, see
+            // src/onchain/clear.rs). Only conclude a true absence once the head is
+            // confirmations-deep past from_block AND repeated scans agree; else
+            // retry, and if still inconclusive return a retryable error so the
+            // caller never re-withdraws off a stale empty result.
+            let head = self.evm.provider().get_block_number().await?;
+            let caught_up = head >= from_block.saturating_add(SCAN_FINALITY_MARGIN);
+
+            if caught_up && attempt == SCAN_ATTEMPTS {
+                return Ok(None);
+            }
+
+            if attempt < SCAN_ATTEMPTS {
+                tokio::time::sleep(SCAN_RETRY_BACKOFF).await;
+            }
+        }
+
+        Err(RaindexError::ScanInconclusive { from_block })
+    }
+
+    /// Returns the current chain head. Captured before submitting an on-chain
+    /// action so a later [`find_recent_withdrawal`](Self::find_recent_withdrawal)
+    /// scan can bound its search to blocks at or after the action.
+    pub(crate) async fn current_block(&self) -> Result<u64, RaindexError> {
+        Ok(self.evm.provider().get_block_number().await?)
     }
 
     async fn get_vault_balance<Registry: IntoErrorRegistry>(

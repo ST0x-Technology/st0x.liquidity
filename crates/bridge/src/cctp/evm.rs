@@ -1,9 +1,11 @@
 //! Single-chain CCTP operations.
 
-use alloy::primitives::{Address, Bytes, FixedBytes, U256};
+use alloy::primitives::{Address, Bytes, FixedBytes, TxHash, U256};
+use alloy::providers::Provider;
+use alloy::rpc::types::Filter;
 use alloy::sol;
 use alloy::sol_types::SolEvent;
-use tracing::{info, trace};
+use tracing::{debug, info, trace};
 
 #[cfg(test)]
 use st0x_evm::Evm;
@@ -132,6 +134,45 @@ impl<W: Wallet> CctpEndpoint<W> {
             tx: receipt.transaction_hash,
             amount,
         })
+    }
+
+    /// Scans for a `DepositForBurn` event from this endpoint's wallet at or
+    /// after `from_block`, returning the transaction hash of the most recent
+    /// match.
+    ///
+    /// Used for crash-safe burn recovery: a transfer records the chain head
+    /// before submitting the burn, so on resume this detects an already-
+    /// submitted burn instead of re-burning (which would burn USDC twice with at
+    /// most one mint). Matches on `(depositor, amount)` -- CCTP burns are exact,
+    /// and the single-in-flight invariant guarantees the newest match at/after
+    /// the captured chain head is the resuming transfer's burn.
+    pub(super) async fn find_recent_burn(
+        &self,
+        amount: U256,
+        from_block: u64,
+    ) -> Result<Option<TxHash>, CctpError> {
+        let depositor = self.wallet.address();
+        let filter = Filter::new()
+            .from_block(from_block)
+            .address(self.token_messenger_address)
+            .event_signature(TokenMessengerV2::DepositForBurn::SIGNATURE_HASH);
+
+        let logs = self.wallet.provider().get_logs(&filter).await?;
+
+        for log in logs.iter().rev() {
+            let decoded = log.log_decode::<TokenMessengerV2::DepositForBurn>()?;
+            let event = decoded.data();
+
+            if event.depositor == depositor
+                && event.amount == amount
+                && let Some(tx_hash) = log.transaction_hash
+            {
+                debug!(target: "bridge", %tx_hash, from_block, "Found existing burn during resume");
+                return Ok(Some(tx_hash));
+            }
+        }
+
+        Ok(None)
     }
 
     /// Claims USDC on this chain by submitting the attestation.

@@ -26,6 +26,8 @@ pub enum RebalancingCtxError {
     NotAlpacaBroker,
     #[error("rebalancing transfer_timeout_secs must be non-zero")]
     ZeroTransferTimeout,
+    #[error("rebalancing transfer_attempt_timeout_secs must be non-zero")]
+    ZeroTransferAttemptTimeout,
     #[error("invalid wallet config: {0}")]
     WalletConfig(#[from] toml::de::Error),
     #[error(transparent)]
@@ -51,6 +53,11 @@ pub struct RebalancingConfig {
     pub equity: ImbalanceThreshold,
     pub usdc: UsdcRebalancing,
     pub transfer_timeout_secs: u64,
+    /// Per-attempt wall-clock bound for a single Base->Alpaca transfer job
+    /// attempt. A hung RPC is aborted after this so the attempt fails and
+    /// retries rather than wedging forever. Distinct from
+    /// `transfer_timeout_secs`, which is the whole-transfer stall reaper.
+    pub transfer_attempt_timeout_secs: u64,
 }
 
 /// Runtime configuration for rebalancing operations.
@@ -63,6 +70,10 @@ pub struct RebalancingCtx {
     pub equity: ImbalanceThreshold,
     pub usdc: Option<ImbalanceThreshold>,
     pub transfer_timeout: Duration,
+    /// Per-attempt wall-clock bound for a single Base->Alpaca transfer job
+    /// attempt (hung-RPC backstop). See
+    /// [`RebalancingConfig::transfer_attempt_timeout_secs`].
+    pub transfer_attempt_timeout: Duration,
     /// Circle attestation/fee API base URL (test-only override).
     #[cfg(feature = "test-support")]
     pub circle_api_base: String,
@@ -82,6 +93,10 @@ impl RebalancingCtx {
             return Err(RebalancingCtxError::ZeroTransferTimeout);
         }
 
+        if config.transfer_attempt_timeout_secs == 0 {
+            return Err(RebalancingCtxError::ZeroTransferAttemptTimeout);
+        }
+
         let usdc = match config.usdc {
             UsdcRebalancing::Enabled { target, deviation } => {
                 Some(ImbalanceThreshold { target, deviation })
@@ -93,6 +108,7 @@ impl RebalancingCtx {
             equity: config.equity,
             usdc,
             transfer_timeout: Duration::from_secs(config.transfer_timeout_secs),
+            transfer_attempt_timeout: Duration::from_secs(config.transfer_attempt_timeout_secs),
             #[cfg(feature = "test-support")]
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
             #[cfg(feature = "test-support")]
@@ -115,11 +131,13 @@ impl RebalancingCtx {
         equity: ImbalanceThreshold,
         usdc: Option<ImbalanceThreshold>,
         #[builder(default = Duration::from_secs(30 * 60))] transfer_timeout: Duration,
+        #[builder(default = Duration::from_secs(60 * 60))] transfer_attempt_timeout: Duration,
     ) -> Self {
         Self {
             equity,
             usdc,
             transfer_timeout,
+            transfer_attempt_timeout,
             #[cfg(feature = "test-support")]
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
             #[cfg(feature = "test-support")]
@@ -140,6 +158,7 @@ impl RebalancingCtx {
         equity: ImbalanceThreshold,
         usdc: UsdcRebalancing,
         #[builder(default = Duration::from_secs(30 * 60))] transfer_timeout: Duration,
+        #[builder(default = Duration::from_secs(60 * 60))] transfer_attempt_timeout: Duration,
     ) -> Self {
         let usdc = match usdc {
             UsdcRebalancing::Enabled { target, deviation } => {
@@ -152,6 +171,7 @@ impl RebalancingCtx {
             equity,
             usdc,
             transfer_timeout,
+            transfer_attempt_timeout,
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
             token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
             message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
@@ -197,6 +217,7 @@ mod tests {
     fn valid_rebalancing_config_toml() -> &'static str {
         r#"
             transfer_timeout_secs = 1800
+            transfer_attempt_timeout_secs = 3600
 
             [equity]
             target = "0.5"
@@ -222,6 +243,7 @@ mod tests {
         assert!(target.eq(float!(0.5)).unwrap());
         assert!(deviation.eq(float!(0.3)).unwrap());
         assert_eq!(config.transfer_timeout_secs, 1800);
+        assert_eq!(config.transfer_attempt_timeout_secs, 3600);
     }
 
     #[test]
@@ -229,6 +251,7 @@ mod tests {
         let config: RebalancingConfig = toml::from_str(
             r#"
             transfer_timeout_secs = 1800
+            transfer_attempt_timeout_secs = 3600
 
             [equity]
             target = "0.6"
@@ -305,5 +328,53 @@ mod tests {
             error.message().contains("usdc"),
             "Expected missing usdc error, got: {error}"
         );
+    }
+
+    #[test]
+    fn deserialize_missing_transfer_attempt_timeout_secs_fails() {
+        let toml_str = r#"
+            transfer_timeout_secs = 1800
+
+            [equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [usdc]
+            mode = "enabled"
+            target = "0.5"
+            deviation = "0.3"
+        "#;
+
+        let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
+        assert!(
+            error.message().contains("transfer_attempt_timeout_secs"),
+            "Expected missing transfer_attempt_timeout_secs error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn zero_transfer_attempt_timeout_secs_fails_validation() {
+        let config: RebalancingConfig = toml::from_str(
+            r#"
+            transfer_timeout_secs = 1800
+            transfer_attempt_timeout_secs = 0
+
+            [equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [usdc]
+            mode = "enabled"
+            target = "0.5"
+            deviation = "0.3"
+        "#,
+        )
+        .unwrap();
+
+        let error = RebalancingCtx::new(&config).unwrap_err();
+        assert!(matches!(
+            error,
+            RebalancingCtxError::ZeroTransferAttemptTimeout
+        ));
     }
 }

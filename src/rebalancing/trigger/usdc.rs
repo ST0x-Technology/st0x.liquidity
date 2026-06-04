@@ -122,7 +122,11 @@ impl UsdcRebalanceStage {
             Bridged { .. } => Some(Self::Bridged),
             DepositInitiated { .. } => Some(Self::DepositInitiated),
             DepositConfirmed { .. } => Some(Self::DepositConfirmed),
-            ConversionConfirmed { .. }
+            // Transient intent markers: immediately superseded by Initiated /
+            // BridgingInitiated, so they emit no distinct progress stage.
+            WithdrawalSubmitting { .. }
+            | BridgingSubmitting { .. }
+            | ConversionConfirmed { .. }
             | ConversionFailed { .. }
             | WithdrawalFailed { .. }
             | BridgingFailed { .. }
@@ -560,6 +564,11 @@ impl RebalancingService {
             } => {
                 self.complete_alpaca_to_base_deposit(id).await?;
             }
+            // Transient intent markers persisted before the on-chain withdraw /
+            // burn. Detailed stage tracking starts at the subsequent Initiated /
+            // BridgingInitiated; the inventory's active-rebalance claim is set by
+            // the caller on this (first non-terminal) event, so nothing to do here.
+            WithdrawalSubmitting { .. } | BridgingSubmitting { .. } => {}
             WithdrawalFailed { .. }
             | BridgingFailed { .. }
             | DepositFailed { .. }
