@@ -58,12 +58,6 @@ adrs/
 - The kebab name should be terse and decision-shaped (e.g.
   `0002-axum-and-tower.md`, not `0002-web-framework.md`).
 
-  ADRs written before this convention landed (e.g.
-  `1-cash-bp-for-equity-hedges.md`) keep their original filenames — the README
-  rule is "indices are never reused, even if an ADR is superseded," and that
-  applies to filenames too. That earlier ADR sits at index `1`; the first ADR
-  written under this convention is ADR `0002`.
-
 ## ADR template
 
 ```markdown
@@ -120,6 +114,7 @@ decision.
 
 | #                                                       | Title                                                                            | Status   |
 | ------------------------------------------------------- | -------------------------------------------------------------------------------- | -------- |
-| [1](1-cash-bp-for-equity-hedges.md)                     | Use Alpaca `cash` (not `non_marginable_buying_power`) for equity hedge preflight | Accepted |
+| [0001](0001-cash-bp-for-equity-hedges.md)               | Use Alpaca `cash` (not `non_marginable_buying_power`) for equity hedge preflight | Accepted |
 | [0002](0002-axum-and-tower.md)                          | Adopt Axum and lean on Tower for both transport and business logic               | Accepted |
 | [0003](0003-durable-usdc-rebalance-guard-on-restart.md) | Reconstruct the USDC rebalancing guard from persisted state on startup           | Accepted |
+| [0004](0004-typed-identifiers.md)                       | Model identifiers by what determines them; derive the string form                | Accepted |
