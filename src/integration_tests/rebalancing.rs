@@ -39,7 +39,7 @@ use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, Redemp
 use crate::inventory::{BroadcastingInventory, ImbalanceThreshold, InventoryView, Venue};
 use crate::offchain::order::OffchainOrderId;
 use crate::onchain::mock::MockRaindex;
-use crate::onchain::raindex::Raindex;
+use crate::onchain::raindex::{Raindex, RaindexVaultId};
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::rebalancing::equity::mock::MockCrossVenueEquityTransfer;
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, Equity, EquityTransferServices};
@@ -57,6 +57,7 @@ use crate::tokenization::alpaca::tests::{
 };
 use crate::tokenization::mock::MockTokenizer;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
+use crate::vault_lookup::{MockVaultLookup, VaultLookup};
 use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryId};
 use crate::wrapper::mock::MockWrapper;
 
@@ -83,6 +84,17 @@ async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol, token: Address)
     )
     .await
     .unwrap();
+}
+
+fn mock_vault_lookup_for_symbol(symbol: &Symbol, token: Address) -> Arc<dyn VaultLookup> {
+    Arc::new(
+        MockVaultLookup::new()
+            .with_symbol_token(symbol.clone(), token)
+            .with_vault(
+                token,
+                RaindexVaultId(B256::from(keccak256(symbol.to_string().as_bytes()))),
+            ),
+    )
 }
 
 /// Uses Anvil snapshot/revert to discover the deterministic tx_hash that will
@@ -445,6 +457,7 @@ async fn build_imbalanced_inventory(imbalance: Imbalance<'_>) {
 fn build_equity_transfer_with_wrapper(
     pool: &SqlitePool,
     raindex: Arc<dyn crate::onchain::raindex::Raindex>,
+    vault_lookup: Arc<dyn VaultLookup>,
     tokenizer: Arc<dyn Tokenizer>,
     mock_wrapper: MockWrapper,
     wallet: Address,
@@ -453,6 +466,7 @@ fn build_equity_transfer_with_wrapper(
 
     let equity_services = EquityTransferServices {
         raindex: Arc::clone(&raindex),
+        vault_lookup: Arc::clone(&vault_lookup),
         tokenizer: Arc::clone(&tokenizer),
         wrapper: Arc::clone(&wrapper),
     };
@@ -466,6 +480,7 @@ fn build_equity_transfer_with_wrapper(
     ));
     Arc::new(CrossVenueEquityTransfer::new(
         raindex,
+        vault_lookup,
         tokenizer,
         wrapper,
         wallet,
@@ -481,6 +496,7 @@ fn build_equity_transfer_with_wrapper(
 async fn build_equity_transfer_with_service(
     pool: &SqlitePool,
     raindex: Arc<dyn crate::onchain::raindex::Raindex>,
+    vault_lookup: Arc<dyn VaultLookup>,
     tokenizer: Arc<dyn Tokenizer>,
     mock_wrapper: MockWrapper,
     wallet: Address,
@@ -490,6 +506,7 @@ async fn build_equity_transfer_with_service(
 
     let equity_services = EquityTransferServices {
         raindex: Arc::clone(&raindex),
+        vault_lookup: Arc::clone(&vault_lookup),
         tokenizer: Arc::clone(&tokenizer),
         wrapper: Arc::clone(&wrapper),
     };
@@ -508,6 +525,7 @@ async fn build_equity_transfer_with_service(
 
     Arc::new(CrossVenueEquityTransfer::new(
         raindex,
+        vault_lookup,
         tokenizer,
         wrapper,
         wallet,
@@ -591,6 +609,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
     let equity_transfer = build_equity_transfer_with_wrapper(
         &pool,
         raindex,
+        mock_vault_lookup_for_symbol(&symbol, token_address),
         tokenizer,
         mock_wrapper,
         signer.address(),
@@ -824,12 +843,18 @@ async fn equity_onchain_imbalance_triggers_redemption() {
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(
         create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
     );
-    let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new().with_token(token_address));
+    let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
     let wrapper = MockWrapper::new()
         .with_tokenized_shares(token_address)
         .with_wrapped_token(token_address);
-    let equity_transfer =
-        build_equity_transfer_with_wrapper(&pool, raindex, tokenizer, wrapper, Address::ZERO);
+    let equity_transfer = build_equity_transfer_with_wrapper(
+        &pool,
+        raindex,
+        mock_vault_lookup_for_symbol(&symbol, token_address),
+        tokenizer,
+        wrapper,
+        Address::ZERO,
+    );
 
     build_imbalanced_inventory(Imbalance::Equity {
         position_cqrs: &position_cqrs,
@@ -1249,11 +1274,6 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
     // production wiring in QueryManifest::build. Snapshot events from polling
     // flow through the service's on_snapshot, updating the
     // BroadcastingInventory and scheduling follow-up imbalance checks.
-    let (_, vault_registry_projection) = StoreBuilder::<VaultRegistry>::new(pool.clone())
-        .build(())
-        .await
-        .unwrap();
-
     let snapshot_id = InventorySnapshotId {
         orderbook: TEST_ORDERBOOK,
         owner: TEST_ORDER_OWNER,
@@ -1292,7 +1312,6 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
     let raindex_service = Arc::new(RaindexService::new(
         ReadOnlyEvm::new(provider),
         TEST_ORDERBOOK,
-        vault_registry_projection,
         TEST_ORDER_OWNER,
     ));
 
@@ -1551,6 +1570,7 @@ async fn mint_api_failure_produces_rejected_event() {
     let equity_transfer = build_equity_transfer_with_wrapper(
         &pool,
         raindex,
+        mock_vault_lookup_for_symbol(&symbol, token),
         tokenizer,
         MockWrapper::new(),
         Address::ZERO,
@@ -2065,13 +2085,16 @@ async fn mint_accepted_sets_offchain_inflight() {
         create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
     );
     let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
-    let mock_wrapper = MockWrapper::new().with_tokenized_shares(token_address);
+    let mock_wrapper = MockWrapper::new()
+        .with_tokenized_shares(token_address)
+        .with_wrapped_token(token_address);
 
     // Wire mint/redemption stores with trigger so lifecycle events update
     // inflight state through the trigger's Reactor
     let equity_transfer = build_equity_transfer_with_service(
         &pool,
         raindex,
+        mock_vault_lookup_for_symbol(&symbol, token_address),
         tokenizer,
         mock_wrapper,
         signer.address(),
@@ -2260,11 +2283,14 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
         create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
     );
     let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
-    let mock_wrapper = MockWrapper::new().with_tokenized_shares(token_address);
+    let mock_wrapper = MockWrapper::new()
+        .with_tokenized_shares(token_address)
+        .with_wrapped_token(token_address);
 
     let equity_transfer = build_equity_transfer_with_service(
         &pool,
         raindex,
+        mock_vault_lookup_for_symbol(&symbol, token_address),
         tokenizer,
         mock_wrapper,
         signer.address(),
@@ -2412,6 +2438,7 @@ async fn transfer_failed_cancels_redemption_inflight() {
 
     let equity_services = EquityTransferServices {
         raindex: Arc::new(MockRaindex::new()),
+        vault_lookup: mock_vault_lookup_for_symbol(&symbol, token_address),
         tokenizer,
         wrapper: Arc::new(MockWrapper::new()),
     };

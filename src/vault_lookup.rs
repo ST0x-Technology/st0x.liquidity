@@ -5,12 +5,6 @@
 //! here first; later branches can make the chain layer take explicit vault IDs
 //! without knowing about the [`VaultRegistry`] projection.
 
-// Forward-dead in this PR: nothing consumes `VaultLookup` yet. The equity-mint,
-// wrapped-equity-recovery, and equity-redemption flows are routed through it --
-// and this allow is removed -- in the immediate upstack PR (RAI-831, branch
-// refactor/route-vaults-through-vault-lookup).
-#![allow(dead_code)]
-
 use alloy::primitives::Address;
 use async_trait::async_trait;
 #[cfg(test)]
@@ -126,6 +120,7 @@ impl VaultLookup for VaultRegistryLookup {
 pub(crate) struct MockVaultLookup {
     vaults: BTreeMap<Address, RaindexVaultId>,
     tokens: BTreeMap<Symbol, Address>,
+    default_vault: Option<RaindexVaultId>,
 }
 
 #[cfg(test)]
@@ -134,12 +129,8 @@ impl MockVaultLookup {
         Self {
             vaults: BTreeMap::new(),
             tokens: BTreeMap::new(),
+            default_vault: None,
         }
-    }
-
-    pub(crate) fn with_token(mut self, token: Address) -> Self {
-        self.tokens.insert(Symbol::new("AAPL").unwrap(), token);
-        self
     }
 
     pub(crate) fn with_symbol_token(mut self, symbol: Symbol, token: Address) -> Self {
@@ -151,6 +142,11 @@ impl MockVaultLookup {
         self.vaults.insert(token, vault_id);
         self
     }
+
+    pub(crate) fn with_default_vault(mut self, vault_id: RaindexVaultId) -> Self {
+        self.default_vault = Some(vault_id);
+        self
+    }
 }
 
 #[cfg(test)]
@@ -160,6 +156,7 @@ impl VaultLookup for MockVaultLookup {
         self.vaults
             .get(&token)
             .copied()
+            .or(self.default_vault)
             .ok_or(VaultLookupError::VaultNotFound(token))
     }
 
@@ -391,6 +388,17 @@ mod tests {
         assert!(
             matches!(vault_error, VaultLookupError::VaultNotFound(token) if token == OTHER_TOKEN),
             "mock must reject unconfigured tokens, got: {vault_error:?}",
+        );
+
+        let fallback_lookup =
+            MockVaultLookup::new().with_default_vault(RaindexVaultId(TEST_VAULT_ID));
+        assert_eq!(
+            fallback_lookup
+                .vault_id_for_token(OTHER_TOKEN)
+                .await
+                .unwrap(),
+            RaindexVaultId(TEST_VAULT_ID),
+            "explicit fallback is only for tests that are not asserting token-specific lookup",
         );
     }
 }

@@ -36,6 +36,7 @@ use crate::tokenized_equity_mint::{
     IssuerRequestId, TokenizedEquityMint, TokenizedEquityMintCommand,
 };
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceId};
+use crate::vault_lookup::{VaultLookup, VaultRegistryLookup};
 use crate::vault_registry::VaultRegistry;
 use crate::wrapper::{Wrapper, WrapperService};
 use st0x_config::{BrokerCtx, Ctx};
@@ -85,15 +86,17 @@ async fn build_equity_transfer_services(
         ctx.assets.equities.symbols.clone(),
     ));
 
-    let raindex = Arc::new(RaindexService::new(
-        base_caller,
-        ctx.evm.orderbook,
+    let vault_lookup: Arc<dyn VaultLookup> = Arc::new(VaultRegistryLookup::new(
         vault_registry_projection,
+        ctx.evm.orderbook,
         wallet,
     ));
 
+    let raindex = Arc::new(RaindexService::new(base_caller, ctx.evm.orderbook, wallet));
+
     let services = EquityTransferServices {
         raindex: raindex.clone(),
+        vault_lookup: vault_lookup.clone(),
         tokenizer: tokenization_service.clone(),
         wrapper: wrapper.clone(),
     };
@@ -108,6 +111,7 @@ async fn build_equity_transfer_services(
 
     let transfer = CrossVenueEquityTransfer::new(
         raindex,
+        vault_lookup,
         tokenization_service.clone(),
         wrapper,
         wallet,
@@ -404,15 +408,9 @@ async fn run_usdc_transfer<Writer: Write>(
         message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
     })?);
 
-    let (_vault_store, vault_registry_projection) =
-        StoreBuilder::<VaultRegistry>::new(pool.clone())
-            .build(())
-            .await?;
-
     let vault_service = Arc::new(RaindexService::new(
         wallet_ctx.base_wallet().clone(),
         ctx.evm.orderbook,
-        vault_registry_projection,
         owner,
     ));
 

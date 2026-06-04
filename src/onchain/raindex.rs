@@ -18,16 +18,13 @@ use alloy::sol_types::SolEvent;
 use alloy::transports::{RpcError, TransportErrorKind};
 use async_trait::async_trait;
 use rain_math_float::Float;
-use std::sync::Arc;
 use tracing::{debug, info};
 
-use st0x_event_sorcery::ProjectionError;
 use st0x_evm::{Evm, EvmError, IntoErrorRegistry, OpenChainErrorRegistry, Wallet};
-use st0x_execution::{FractionalShares, Symbol};
+use st0x_execution::FractionalShares;
 use st0x_finance::Usdc;
 
 use crate::bindings::{IERC20, IOrderBookV6};
-use crate::vault_registry::{VaultRegistry, VaultRegistryId, VaultRegistryProjection};
 
 pub(crate) const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
 const USDC_DECIMALS: u8 = 6;
@@ -46,14 +43,6 @@ pub(crate) enum RaindexError {
     Float(#[from] rain_math_float::FloatError),
     #[error("Amount cannot be zero")]
     ZeroAmount,
-    #[error("Vault registry not found for aggregate {0}")]
-    RegistryNotFound(VaultRegistryId),
-    #[error(transparent)]
-    Projection(#[from] ProjectionError<VaultRegistry>),
-    #[error("Vault not found for token {0}")]
-    VaultNotFound(Address),
-    #[error("Token not found for symbol {0}")]
-    TokenNotFound(Symbol),
     #[error("RPC transport error: {0}")]
     RpcTransport(#[from] RpcError<TransportErrorKind>),
     #[error("ABI decode error: {0}")]
@@ -77,10 +66,6 @@ impl RaindexError {
             | Self::Contract(_)
             | Self::Float(_)
             | Self::ZeroAmount
-            | Self::RegistryNotFound(_)
-            | Self::Projection(_)
-            | Self::VaultNotFound(_)
-            | Self::TokenNotFound(_)
             | Self::RpcTransport(_)
             | Self::SolType(_)
             | Self::ScanInconclusive { .. } => false,
@@ -102,17 +87,14 @@ const SCAN_FINALITY_MARGIN: u64 = 2;
 
 /// Service for managing Rain OrderBook vault operations.
 ///
-/// Parameterized by [`Evm`] for read operations (balance queries, vault
-/// lookups) and additionally requires [`Wallet`] for write operations
+/// Parameterized by [`Evm`] for read operations (balance queries, withdrawal
+/// scans) and additionally requires [`Wallet`] for write operations
 /// (deposits, withdrawals).
 ///
 /// # Example
 ///
 /// ```ignore
-/// let service = RaindexService::new(wallet, orderbook_address, projection, owner);
-///
-/// // Lookup vault ID for a token (read-only, needs Evm)
-/// let vault_id = service.lookup_vault_id(token_address).await?;
+/// let service = RaindexService::new(wallet, orderbook_address, owner);
 ///
 /// // Submit a USDC deposit to the vault, then confirm it (needs Wallet)
 /// let amount = U256::from(1000) * U256::from(10).pow(U256::from(6)); // 1000 USDC
@@ -121,36 +103,17 @@ const SCAN_FINALITY_MARGIN: u64 = 2;
 /// ```
 pub(crate) struct RaindexService<E: Evm> {
     orderbook_address: Address,
-    vault_registry_projection: Arc<VaultRegistryProjection>,
     evm: E,
     owner: Address,
 }
 
 impl<E: Evm> RaindexService<E> {
-    pub(crate) fn new(
-        evm: E,
-        orderbook: Address,
-        vault_registry_projection: Arc<VaultRegistryProjection>,
-        owner: Address,
-    ) -> Self {
+    pub(crate) fn new(evm: E, orderbook: Address, owner: Address) -> Self {
         Self {
             orderbook_address: orderbook,
-            vault_registry_projection,
             evm,
             owner,
         }
-    }
-
-    async fn load_registry(&self) -> Result<VaultRegistry, RaindexError> {
-        let aggregate_id = VaultRegistryId {
-            orderbook: self.orderbook_address,
-            owner: self.owner,
-        };
-
-        self.vault_registry_projection
-            .load(&aggregate_id)
-            .await?
-            .ok_or(RaindexError::RegistryNotFound(aggregate_id))
     }
 }
 
@@ -450,19 +413,10 @@ impl<E: Evm> RaindexService<E> {
 
 /// Abstraction for Raindex (Rain OrderBook) operations.
 ///
-/// This trait abstracts deposit, withdraw, and vault lookup operations for Raindex,
+/// This trait abstracts deposit and withdraw operations for Raindex,
 /// allowing different implementations (real service, mock) to be used interchangeably.
 #[async_trait]
 pub(crate) trait Raindex: Send + Sync {
-    /// Looks up the vault ID for a given token from the vault registry.
-    async fn lookup_vault_id(&self, token: Address) -> Result<RaindexVaultId, RaindexError>;
-
-    /// Looks up the token address and vault ID for a given symbol from the vault registry.
-    async fn lookup_vault_info(
-        &self,
-        symbol: &Symbol,
-    ) -> Result<(Address, RaindexVaultId), RaindexError>;
-
     /// Withdraws tokens from a Rain OrderBook vault (atomic submit + confirm).
     async fn withdraw(
         &self,
@@ -509,28 +463,6 @@ pub(crate) trait Raindex: Send + Sync {
 
 #[async_trait]
 impl<W: Wallet> Raindex for RaindexService<W> {
-    async fn lookup_vault_id(&self, token: Address) -> Result<RaindexVaultId, RaindexError> {
-        let registry = self.load_registry().await?;
-        registry
-            .primary_vault_id_by_token(token)
-            .map(RaindexVaultId)
-            .ok_or(RaindexError::VaultNotFound(token))
-    }
-
-    async fn lookup_vault_info(
-        &self,
-        symbol: &Symbol,
-    ) -> Result<(Address, RaindexVaultId), RaindexError> {
-        let registry = self.load_registry().await?;
-        let token = registry
-            .token_by_symbol(symbol)
-            .ok_or_else(|| RaindexError::TokenNotFound(symbol.clone()))?;
-        let vault_id = registry
-            .primary_vault_id_by_token(token)
-            .ok_or(RaindexError::VaultNotFound(token))?;
-        Ok((token, RaindexVaultId(vault_id)))
-    }
-
     async fn withdraw(
         &self,
         token: Address,
@@ -645,8 +577,6 @@ mod tests {
     use st0x_evm::ReadOnlyEvm;
     use st0x_evm::Wallet;
     use st0x_evm::local::RawPrivateKeyWallet;
-
-    use st0x_event_sorcery::StoreBuilder;
 
     use super::*;
     use crate::bindings::{IOrderBookV6, OrderBook, TOFUTokenDecimals, TestERC20};
@@ -792,15 +722,9 @@ mod tests {
         "0x0000000000000000000000000000000000000000000000000000000000000001"
     ));
 
-    async fn create_test_raindex_service(
+    fn create_test_raindex_service(
         local_evm: &LocalEvm,
     ) -> RaindexService<RawPrivateKeyWallet<BaseProvider>> {
-        let pool = crate::test_utils::setup_test_db().await;
-        let (_store, vault_registry_projection) = StoreBuilder::<VaultRegistry>::new(pool)
-            .build(())
-            .await
-            .unwrap();
-
         let base_provider =
             ProviderBuilder::new().connect_http(local_evm.anvil.endpoint().parse().unwrap());
 
@@ -808,23 +732,7 @@ mod tests {
 
         let owner = wallet.address();
 
-        RaindexService::new(
-            wallet,
-            local_evm.orderbook_address,
-            vault_registry_projection,
-            owner,
-        )
-    }
-
-    /// Empty vault-registry projection for scan tests that never load the
-    /// registry (`find_recent_withdrawal` only reads logs).
-    async fn empty_vault_registry_projection() -> Arc<VaultRegistryProjection> {
-        let pool = crate::test_utils::setup_test_db().await;
-        let (_store, projection) = StoreBuilder::<VaultRegistry>::new(pool)
-            .build(())
-            .await
-            .unwrap();
-        projection
+        RaindexService::new(wallet, local_evm.orderbook_address, owner)
     }
 
     #[tokio::test]
@@ -841,12 +749,7 @@ mod tests {
         }
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let service = RaindexService::new(
-            ReadOnlyEvm::new(provider),
-            Address::ZERO,
-            empty_vault_registry_projection().await,
-            Address::ZERO,
-        );
+        let service = RaindexService::new(ReadOnlyEvm::new(provider), Address::ZERO, Address::ZERO);
 
         let error = service
             .find_recent_withdrawal(USDC_BASE, TEST_VAULT_ID, from_block)
@@ -871,12 +774,7 @@ mod tests {
         }
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let service = RaindexService::new(
-            ReadOnlyEvm::new(provider),
-            Address::ZERO,
-            empty_vault_registry_projection().await,
-            Address::ZERO,
-        );
+        let service = RaindexService::new(ReadOnlyEvm::new(provider), Address::ZERO, Address::ZERO);
 
         let result = service
             .find_recent_withdrawal(USDC_BASE, TEST_VAULT_ID, from_block)
@@ -930,12 +828,7 @@ mod tests {
         }
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let service = RaindexService::new(
-            ReadOnlyEvm::new(provider),
-            Address::ZERO,
-            empty_vault_registry_projection().await,
-            Address::ZERO,
-        );
+        let service = RaindexService::new(ReadOnlyEvm::new(provider), Address::ZERO, Address::ZERO);
 
         let result = service
             .find_recent_withdrawal(USDC_BASE, TEST_VAULT_ID, from_block)
@@ -959,12 +852,7 @@ mod tests {
         asserter.push_success(&json!([log]));
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let service = RaindexService::new(
-            ReadOnlyEvm::new(provider),
-            Address::ZERO,
-            empty_vault_registry_projection().await,
-            Address::ZERO,
-        );
+        let service = RaindexService::new(ReadOnlyEvm::new(provider), Address::ZERO, Address::ZERO);
 
         let result = service
             .find_recent_withdrawal(USDC_BASE, TEST_VAULT_ID, from_block)
@@ -978,7 +866,7 @@ mod tests {
     async fn deposit_rejects_zero_amount() {
         let local_evm = LocalEvm::new().await.unwrap();
 
-        let service = create_test_raindex_service(&local_evm).await;
+        let service = create_test_raindex_service(&local_evm);
 
         let result = service
             .deposit::<NoOpErrorRegistry>(
@@ -1010,7 +898,7 @@ mod tests {
             .await
             .unwrap();
 
-        let service = create_test_raindex_service(&local_evm).await;
+        let service = create_test_raindex_service(&local_evm);
 
         let vault_balance_before = local_evm
             .get_vault_balance(local_evm.token_address, vault_id.0)
@@ -1065,7 +953,7 @@ mod tests {
             .await
             .unwrap();
 
-        let service = create_test_raindex_service(&local_evm).await;
+        let service = create_test_raindex_service(&local_evm);
 
         let vault_balance_before = local_evm
             .get_vault_balance(local_evm.token_address, vault_id.0)
@@ -1105,7 +993,7 @@ mod tests {
     async fn withdraw_rejects_zero_amount() {
         let local_evm = LocalEvm::new().await.unwrap();
 
-        let service = create_test_raindex_service(&local_evm).await;
+        let service = create_test_raindex_service(&local_evm);
 
         let result = service
             .withdraw(
@@ -1122,7 +1010,7 @@ mod tests {
     #[tokio::test]
     async fn find_recent_withdrawal_returns_tx_and_amount_of_real_withdrawal() {
         let local_evm = LocalEvm::new().await.unwrap();
-        let service = create_test_raindex_service(&local_evm).await;
+        let service = create_test_raindex_service(&local_evm);
 
         let deposit_amount = U256::from(1000) * U256::from(10).pow(U256::from(18));
         local_evm
@@ -1171,7 +1059,7 @@ mod tests {
     #[tokio::test]
     async fn find_recent_withdrawal_returns_none_for_non_matching_vault_or_token() {
         let local_evm = LocalEvm::new().await.unwrap();
-        let service = create_test_raindex_service(&local_evm).await;
+        let service = create_test_raindex_service(&local_evm);
 
         // Capture from_block BEFORE the approve/deposit/withdraw txs so those three
         // blocks advance the head past from_block + SCAN_FINALITY_MARGIN, letting
@@ -1247,7 +1135,7 @@ mod tests {
             .await
             .unwrap();
 
-        let service = create_test_raindex_service(&local_evm).await;
+        let service = create_test_raindex_service(&local_evm);
 
         service
             .deposit::<NoOpErrorRegistry>(
@@ -1283,7 +1171,7 @@ mod tests {
     #[tokio::test]
     async fn get_equity_balance_returns_zero_for_empty_vault() {
         let local_evm = LocalEvm::new().await.unwrap();
-        let service = create_test_raindex_service(&local_evm).await;
+        let service = create_test_raindex_service(&local_evm);
 
         let balance = service
             .get_equity_balance::<NoOpErrorRegistry>(
@@ -1312,7 +1200,7 @@ mod tests {
             .await
             .unwrap();
 
-        let service = create_test_raindex_service(&local_evm).await;
+        let service = create_test_raindex_service(&local_evm);
 
         service
             .deposit::<NoOpErrorRegistry>(
@@ -1356,7 +1244,7 @@ mod tests {
             .await
             .unwrap();
 
-        let service = create_test_raindex_service(&local_evm).await;
+        let service = create_test_raindex_service(&local_evm);
 
         service
             .deposit::<NoOpErrorRegistry>(
@@ -1478,7 +1366,7 @@ mod tests {
             .await
             .unwrap();
 
-        let service = create_test_raindex_service(&local_evm).await;
+        let service = create_test_raindex_service(&local_evm);
 
         // This should succeed - the approve inside deposit() should cover the transferFrom amount
         service

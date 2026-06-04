@@ -666,7 +666,7 @@ fn claim_guard(set: &Arc<RwLock<HashSet<Symbol>>>, symbol: &Symbol) -> Option<In
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, TxHash, U256};
+    use alloy::primitives::{Address, B256, TxHash, U256};
     use chrono::Utc;
     use st0x_float_macro::float;
     use std::collections::BTreeMap;
@@ -678,16 +678,23 @@ mod tests {
     use crate::conductor::setup_apalis_tables;
     use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand};
     use crate::onchain::mock::MockRaindex;
-    use crate::onchain::raindex::Raindex;
+    use crate::onchain::raindex::{Raindex, RaindexVaultId};
     use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
     use crate::tokenization::Tokenizer;
     use crate::tokenization::mock::{MockCompletionOutcome, MockDetectionOutcome, MockTokenizer};
     use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintCommand};
+    use crate::vault_lookup::MockVaultLookup;
     use crate::wrapper::Wrapper;
     use crate::wrapper::mock::MockWrapper;
 
     use super::super::aggregate::UnwrappedEquityRecoveryServices;
     use super::*;
+
+    fn mock_vault_lookup() -> MockVaultLookup {
+        MockVaultLookup::new()
+            .with_vault(Address::ZERO, RaindexVaultId(B256::ZERO))
+            .with_default_vault(RaindexVaultId(B256::ZERO))
+    }
 
     /// Builds a fully-wired recovery ctx around the given inventory view and
     /// in-progress set, with every service backed by a succeeding mock.
@@ -714,6 +721,7 @@ mod tests {
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
         let transfer_services = EquityTransferServices {
             raindex: raindex.clone(),
+            vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: tokenizer.clone(),
             wrapper: wrapper.clone(),
         };
@@ -721,6 +729,7 @@ mod tests {
         let redemption_store = Arc::new(test_store(pool.clone(), transfer_services));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             raindex.clone(),
+            Arc::new(mock_vault_lookup()),
             tokenizer,
             wrapper.clone(),
             Address::random(),
@@ -731,6 +740,7 @@ mod tests {
             pool.clone(),
             UnwrappedEquityRecoveryServices {
                 raindex,
+                vault_lookup: Arc::new(mock_vault_lookup()),
                 wrapper,
                 transfer,
                 wallet: Address::random(),
@@ -783,6 +793,7 @@ mod tests {
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
         let transfer_services = EquityTransferServices {
             raindex: raindex.clone(),
+            vault_lookup: Arc::new(MockVaultLookup::new()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: wrapper.clone(),
         };
@@ -790,6 +801,7 @@ mod tests {
         let redemption_store = Arc::new(test_store(pool.clone(), transfer_services));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             raindex.clone(),
+            Arc::new(MockVaultLookup::new()),
             Arc::new(MockTokenizer::new()),
             wrapper.clone(),
             Address::random(),
@@ -800,6 +812,7 @@ mod tests {
             pool.clone(),
             UnwrappedEquityRecoveryServices {
                 raindex,
+                vault_lookup: Arc::new(MockVaultLookup::new()),
                 wrapper,
                 transfer,
                 wallet: Address::random(),
@@ -861,6 +874,7 @@ mod tests {
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
         let transfer_services = EquityTransferServices {
             raindex: raindex.clone(),
+            vault_lookup: Arc::new(MockVaultLookup::new()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: wrapper.clone(),
         };
@@ -868,6 +882,7 @@ mod tests {
         let redemption_store = Arc::new(test_store(pool.clone(), transfer_services));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             raindex.clone(),
+            Arc::new(MockVaultLookup::new()),
             Arc::new(MockTokenizer::new()),
             wrapper.clone(),
             Address::random(),
@@ -878,6 +893,7 @@ mod tests {
             pool.clone(),
             UnwrappedEquityRecoveryServices {
                 raindex,
+                vault_lookup: Arc::new(MockVaultLookup::new()),
                 wrapper,
                 transfer,
                 wallet: Address::random(),

@@ -46,6 +46,7 @@ use crate::equity_redemption::RedemptionAggregateId;
 use crate::onchain::raindex::Raindex;
 use crate::rebalancing::equity::CrossVenueEquityTransfer;
 use crate::tokenized_equity_mint::{IssuerRequestId, TOKENIZED_EQUITY_DECIMALS};
+use crate::vault_lookup::VaultLookup;
 use crate::wrapper::Wrapper;
 
 /// Aggregate identifier. Each detection creates a fresh UUID; multiple
@@ -73,6 +74,7 @@ impl FromStr for WrappedEquityRecoveryId {
 #[derive(Clone)]
 pub(crate) struct WrappedEquityRecoveryServices {
     pub(crate) raindex: Arc<dyn Raindex>,
+    pub(crate) vault_lookup: Arc<dyn VaultLookup>,
     pub(crate) wrapper: Arc<dyn Wrapper>,
     pub(crate) transfer: Arc<CrossVenueEquityTransfer>,
 }
@@ -501,12 +503,16 @@ async fn submit_orphan_deposit_or_fail(
         }
     };
 
-    let vault_id = match services.raindex.lookup_vault_id(wrapped_token).await {
+    let vault_id = match services
+        .vault_lookup
+        .vault_id_for_token(wrapped_token)
+        .await
+    {
         Ok(id) => id,
         Err(error) => {
-            warn!(target: "rebalance", %symbol, ?error, "Wrapped equity recovery: lookup_vault_id failed");
+            warn!(target: "rebalance", %symbol, ?error, "Wrapped equity recovery: vault_id_for_token failed");
             return Ok(vec![WrappedEquityRecoveryEvent::RecoveryFailed {
-                reason: format!("raindex.lookup_vault_id failed: {error}"),
+                reason: format!("vault_lookup.vault_id_for_token failed: {error}"),
                 failed_at: now,
             }]);
         }
@@ -570,7 +576,7 @@ async fn confirm_orphan_deposit_or_fail(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, TxHash, fixed_bytes};
+    use alloy::primitives::{Address, B256, TxHash, fixed_bytes};
     use chrono::Utc;
     use rain_math_float::Float;
     use uuid::Uuid;
@@ -579,8 +585,10 @@ mod tests {
     use st0x_execution::{FractionalShares, Symbol};
 
     use crate::onchain::mock::MockRaindex;
+    use crate::onchain::raindex::RaindexVaultId;
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::tokenization::mock::MockTokenizer;
+    use crate::vault_lookup::MockVaultLookup;
     use crate::wrapper::mock::MockWrapper;
 
     use super::*;
@@ -595,6 +603,12 @@ mod tests {
 
     fn one_share() -> FractionalShares {
         FractionalShares::new(Float::parse("1".to_string()).unwrap())
+    }
+
+    fn mock_vault_lookup() -> MockVaultLookup {
+        MockVaultLookup::new()
+            .with_vault(Address::ZERO, RaindexVaultId(B256::ZERO))
+            .with_default_vault(RaindexVaultId(B256::ZERO))
     }
 
     fn detected_state() -> WrappedEquityRecovery {
@@ -612,6 +626,7 @@ mod tests {
         sqlx::migrate!().run(&pool).await.unwrap();
         let services = EquityTransferServices {
             raindex: raindex.clone(),
+            vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: wrapper.clone(),
         };
@@ -622,6 +637,7 @@ mod tests {
         let redemption_store = Arc::new(st0x_event_sorcery::test_store(pool, services));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             raindex.clone(),
+            Arc::new(mock_vault_lookup()),
             Arc::new(MockTokenizer::new()),
             wrapper.clone(),
             Address::random(),
@@ -630,6 +646,7 @@ mod tests {
         ));
         WrappedEquityRecoveryServices {
             raindex,
+            vault_lookup: Arc::new(mock_vault_lookup()),
             wrapper,
             transfer,
         }
@@ -803,6 +820,7 @@ mod tests {
         sqlx::migrate!().run(&pool).await.unwrap();
         let inner_services = EquityTransferServices {
             raindex: raindex.clone(),
+            vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: wrapper.clone(),
         };
@@ -813,6 +831,7 @@ mod tests {
         let redemption_store = Arc::new(st0x_event_sorcery::test_store(pool, inner_services));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             raindex.clone(),
+            Arc::new(mock_vault_lookup()),
             Arc::new(MockTokenizer::new()),
             wrapper.clone(),
             Address::random(),
@@ -821,6 +840,7 @@ mod tests {
         ));
         let services = WrappedEquityRecoveryServices {
             raindex,
+            vault_lookup: Arc::new(mock_vault_lookup()),
             wrapper,
             transfer,
         };

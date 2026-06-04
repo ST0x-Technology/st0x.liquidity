@@ -144,6 +144,7 @@ mod tests {
     };
     use crate::test_utils::setup_test_db;
     use crate::tokenization::mock::MockTokenizer;
+    use crate::vault_lookup::MockVaultLookup;
     use crate::vault_registry::{VaultRegistryCommand, VaultRegistryId};
     use crate::wrapper::mock::MockWrapper;
     use st0x_config::{AssetsConfig, EquitiesConfig, ExecutionThreshold};
@@ -197,6 +198,7 @@ mod tests {
 
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(MockVaultLookup::new()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
         };
@@ -245,6 +247,7 @@ mod tests {
         let manifest = QueryManifest::new(rebalancing_service, broadcaster);
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(MockVaultLookup::new()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
         };
@@ -353,6 +356,7 @@ mod tests {
         let manifest = QueryManifest::new(rebalancing_service.clone(), broadcaster);
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(MockVaultLookup::new()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
         };

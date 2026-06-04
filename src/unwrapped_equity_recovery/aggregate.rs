@@ -51,6 +51,7 @@ use crate::equity_redemption::RedemptionAggregateId;
 use crate::onchain::raindex::Raindex;
 use crate::rebalancing::equity::CrossVenueEquityTransfer;
 use crate::tokenized_equity_mint::{IssuerRequestId, TOKENIZED_EQUITY_DECIMALS};
+use crate::vault_lookup::VaultLookup;
 use crate::wrapper::Wrapper;
 
 /// Aggregate identifier. Each detection creates a fresh UUID; multiple
@@ -76,6 +77,7 @@ impl FromStr for UnwrappedEquityRecoveryId {
 #[derive(Clone)]
 pub(crate) struct UnwrappedEquityRecoveryServices {
     pub(crate) raindex: Arc<dyn Raindex>,
+    pub(crate) vault_lookup: Arc<dyn VaultLookup>,
     pub(crate) wrapper: Arc<dyn Wrapper>,
     pub(crate) transfer: Arc<CrossVenueEquityTransfer>,
     /// Bot wallet on Base; the wrap receiver and the address the deposit
@@ -730,12 +732,16 @@ async fn submit_orphan_deposit_or_fail(
         }
     };
 
-    let vault_id = match services.raindex.lookup_vault_id(wrapped_token).await {
+    let vault_id = match services
+        .vault_lookup
+        .vault_id_for_token(wrapped_token)
+        .await
+    {
         Ok(id) => id,
         Err(error) => {
-            warn!(target: "rebalance", %symbol, ?error, "Unwrapped equity recovery: lookup_vault_id failed");
+            warn!(target: "rebalance", %symbol, ?error, "Unwrapped equity recovery: vault_id_for_token failed");
             return Ok(vec![UnwrappedEquityRecoveryEvent::RecoveryFailed {
-                reason: format!("raindex.lookup_vault_id failed: {error}"),
+                reason: format!("vault_lookup.vault_id_for_token failed: {error}"),
                 failed_at: Utc::now(),
             }]);
         }
@@ -817,6 +823,7 @@ mod tests {
     use crate::onchain::raindex::RaindexVaultId;
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::tokenization::mock::MockTokenizer;
+    use crate::vault_lookup::{MockVaultLookup, VaultLookup};
     use crate::wrapper::mock::MockWrapper;
 
     use super::*;
@@ -835,6 +842,12 @@ mod tests {
 
     fn one_share() -> FractionalShares {
         FractionalShares::new(Float::parse("1".to_string()).unwrap())
+    }
+
+    fn mock_vault_lookup() -> MockVaultLookup {
+        MockVaultLookup::new()
+            .with_vault(Address::ZERO, RaindexVaultId(B256::ZERO))
+            .with_default_vault(RaindexVaultId(B256::ZERO))
     }
 
     fn detected() -> UnwrappedEquityRecovery {
@@ -869,10 +882,19 @@ mod tests {
         raindex: Arc<dyn Raindex>,
         wrapper: Arc<dyn Wrapper>,
     ) -> UnwrappedEquityRecoveryServices {
+        services_with_vault_lookup(raindex, wrapper, Arc::new(mock_vault_lookup())).await
+    }
+
+    async fn services_with_vault_lookup(
+        raindex: Arc<dyn Raindex>,
+        wrapper: Arc<dyn Wrapper>,
+        vault_lookup: Arc<dyn VaultLookup>,
+    ) -> UnwrappedEquityRecoveryServices {
         let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
         let services = EquityTransferServices {
             raindex: raindex.clone(),
+            vault_lookup: vault_lookup.clone(),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: wrapper.clone(),
         };
@@ -883,6 +905,7 @@ mod tests {
         let redemption_store = Arc::new(st0x_event_sorcery::test_store(pool, services));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             raindex.clone(),
+            vault_lookup.clone(),
             Arc::new(MockTokenizer::new()),
             wrapper.clone(),
             Address::random(),
@@ -891,6 +914,7 @@ mod tests {
         ));
         UnwrappedEquityRecoveryServices {
             raindex,
+            vault_lookup,
             wrapper,
             transfer,
             wallet: Address::random(),
@@ -1331,9 +1355,11 @@ mod tests {
 
     #[tokio::test]
     async fn submit_orphan_deposit_records_failure_when_vault_lookup_fails() {
-        let services = services_with(
-            Arc::new(MockRaindex::failing_vault_lookup()),
-            Arc::new(MockWrapper::new()),
+        let wrapped_token = Address::random();
+        let services = services_with_vault_lookup(
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new().with_wrapped_token(wrapped_token)),
+            Arc::new(MockVaultLookup::new()),
         )
         .await;
         let events = orphan_wrapped()
@@ -1348,8 +1374,8 @@ mod tests {
             panic!("expected single RecoveryFailed event, got {events:?}");
         };
         assert!(
-            reason.contains("lookup_vault_id failed"),
-            "reason should mention lookup_vault_id; got {reason:?}",
+            reason.contains("vault_lookup.vault_id_for_token failed"),
+            "reason should mention vault lookup failure; got {reason:?}",
         );
     }
 

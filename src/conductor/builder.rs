@@ -72,7 +72,6 @@ pub(crate) struct CqrsFrameworks {
     pub(crate) offchain_order: Arc<Store<OffchainOrder>>,
     pub(crate) offchain_order_projection: Arc<Projection<OffchainOrder>>,
     pub(crate) vault_registry: Arc<Store<VaultRegistry>>,
-    pub(crate) vault_registry_projection: Arc<Projection<VaultRegistry>>,
     pub(crate) snapshot: Arc<Store<InventorySnapshot>>,
 }
 
@@ -135,7 +134,6 @@ where
     let raindex_service = Arc::new(RaindexService::new(
         evm,
         context.ctx.evm.orderbook,
-        context.frameworks.vault_registry_projection.clone(),
         order_owner,
     ));
 
