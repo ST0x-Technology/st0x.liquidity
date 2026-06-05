@@ -34,7 +34,10 @@ use crate::inventory::{
     Operator, PendingRequestOwnership, PendingRequestOwnershipSnapshot, TransferOp, Venue,
 };
 use crate::position::{Position, PositionEvent};
-use crate::rebalancing::usdc::{TransferUsdcToHedging, TransferUsdcToHedgingJobQueue};
+use crate::rebalancing::usdc::{
+    TransferUsdcToHedging, TransferUsdcToHedgingJobQueue, TransferUsdcToMarketMaking,
+    TransferUsdcToMarketMakingJobQueue,
+};
 use crate::tokenized_equity_mint::{
     IssuerRequestId, TokenizedEquityMint, TokenizedEquityMintCommand, TokenizedEquityMintEvent,
 };
@@ -57,6 +60,7 @@ pub(crate) struct RebalancingSchedulers {
     pub(crate) usdc: UsdcRebalancingCheckScheduler,
     pub(crate) wrapped_equity_recovery: WrappedEquityRecoveryJobQueue,
     pub(crate) transfer_usdc_to_hedging: TransferUsdcToHedgingJobQueue,
+    pub(crate) transfer_usdc_to_market_making: TransferUsdcToMarketMakingJobQueue,
 }
 
 impl RebalancingSchedulers {
@@ -66,6 +70,7 @@ impl RebalancingSchedulers {
             usdc: UsdcRebalancingCheckScheduler::new(pool),
             wrapped_equity_recovery: WrappedEquityRecoveryJobQueue::new(pool),
             transfer_usdc_to_hedging: TransferUsdcToHedgingJobQueue::new(pool),
+            transfer_usdc_to_market_making: TransferUsdcToMarketMakingJobQueue::new(pool),
         }
     }
 }
@@ -399,7 +404,9 @@ fn mint_event_tokenization_request_id(
     }
 }
 
-/// Operations triggered by inventory imbalances.
+/// Equity rebalancing operations dispatched through the `Rebalancer` mpsc
+/// channel. USDC rebalances are enqueued directly as apalis jobs from
+/// [`RebalancingService::check_and_trigger_usdc`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TriggeredOperation {
     /// Mint tokenized equity (too much offchain).
@@ -439,10 +446,11 @@ pub(crate) struct RebalancingService {
     pub(super) equity_scheduler: EquityRebalancingCheckScheduler,
     pub(super) usdc_scheduler: UsdcRebalancingCheckScheduler,
     pub(super) wrapped_equity_recovery_queue: WrappedEquityRecoveryJobQueue,
-    /// Queue for `TransferUsdcToHedging` apalis jobs that drive Base->Alpaca
-    /// USDC transfers. Enqueued by `check_and_trigger_usdc` instead of being
-    /// dispatched through the `Rebalancer` mpsc channel.
+    /// Queues for the USDC transfer apalis jobs that drive each rebalancing
+    /// direction. `check_and_trigger_usdc` enqueues into one of these
+    /// directly rather than dispatching through the `Rebalancer` mpsc channel.
     pub(super) transfer_usdc_to_hedging_queue: TransferUsdcToHedgingJobQueue,
+    pub(super) transfer_usdc_to_market_making_queue: TransferUsdcToMarketMakingJobQueue,
     /// Tracks symbol/quantity for in-flight mints. The initial `MintRequested`
     /// event carries this data; follow-up events don't.
     mint_tracking: Arc<RwLock<HashMap<IssuerRequestId, MintTracking>>>,
@@ -494,6 +502,7 @@ impl RebalancingService {
             usdc: usdc_scheduler,
             wrapped_equity_recovery: wrapped_equity_recovery_queue,
             transfer_usdc_to_hedging: transfer_usdc_to_hedging_queue,
+            transfer_usdc_to_market_making: transfer_usdc_to_market_making_queue,
         } = schedulers;
         Self {
             config,
@@ -510,6 +519,7 @@ impl RebalancingService {
             usdc_scheduler,
             wrapped_equity_recovery_queue,
             transfer_usdc_to_hedging_queue,
+            transfer_usdc_to_market_making_queue,
             mint_tracking: Arc::new(RwLock::new(HashMap::new())),
             redemption_tracking: Arc::new(RwLock::new(HashMap::new())),
             usdc_tracking: Arc::new(RwLock::new(HashMap::new())),
@@ -2021,9 +2031,10 @@ impl RebalancingService {
             TriggeredOperation::UsdcBaseToAlpaca { amount } => {
                 self.enqueue_transfer_usdc_to_hedging(*amount).await
             }
-            TriggeredOperation::Mint { .. }
-            | TriggeredOperation::Redemption { .. }
-            | TriggeredOperation::UsdcAlpacaToBase { .. } => {
+            TriggeredOperation::UsdcAlpacaToBase { amount } => {
+                self.enqueue_transfer_usdc_to_market_making(*amount).await
+            }
+            TriggeredOperation::Mint { .. } | TriggeredOperation::Redemption { .. } => {
                 self.try_send_operation(&operation, "usdc")
             }
         };
@@ -2036,17 +2047,44 @@ impl RebalancingService {
         guard.defuse();
     }
 
+    /// Returns the oldest non-terminal USDC transfer job in *either* direction
+    /// (the row id and its age in seconds), if any.
+    ///
+    /// The dedupe gate is deliberately direction-independent. Both directions
+    /// move funds through the same vault and market-maker wallet, and the
+    /// in-memory `usdc_in_progress` guard resets on restart, so an in-flight
+    /// transfer in one direction must also suppress enqueuing a transfer in the
+    /// *other* direction. Querying only one job type would, after a restart, let
+    /// an opposite-direction transfer run concurrently against the same funds --
+    /// churning capital and paying CCTP/withdrawal fees twice.
+    async fn in_flight_usdc_transfer(
+        pool: &sqlx::SqlitePool,
+    ) -> Result<Option<(String, i64)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT id, CAST(strftime('%s', 'now') AS INTEGER) - run_at AS age_secs \
+             FROM Jobs \
+             WHERE job_type IN (?, ?) \
+             AND status IN ('Pending', 'Queued', 'Running') \
+             ORDER BY run_at ASC \
+             LIMIT 1",
+        )
+        .bind(std::any::type_name::<TransferUsdcToHedging>())
+        .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+        .fetch_optional(pool)
+        .await
+    }
+
     /// Enqueues a [`TransferUsdcToHedging`] apalis job for a Base->Alpaca
     /// transfer. Generates a fresh `UsdcRebalanceId` at push time so apalis
     /// retries (and bot restarts that re-pick the job row) hit the same
     /// aggregate. Returns `true` on successful enqueue.
     ///
-    /// Before enqueueing, queries the apalis Jobs table for any
-    /// non-terminal `TransferUsdcToHedging` row. The in-memory
-    /// `usdc_in_progress` guard resets on restart, so without this check a
-    /// crash between `queue.push` and the first persisted `UsdcRebalance`
-    /// event would let the next imbalance check enqueue a second job for
-    /// the same imbalance.
+    /// Before enqueueing, [`Self::in_flight_usdc_transfer`] checks the apalis
+    /// Jobs table for any non-terminal USDC transfer in either direction. The
+    /// in-memory `usdc_in_progress` guard resets on restart, so without this
+    /// check a crash between `queue.push` and the first persisted
+    /// `UsdcRebalance` event would let the next imbalance check enqueue a second
+    /// job for the same imbalance.
     async fn enqueue_transfer_usdc_to_hedging(&self, amount: Usdc) -> bool {
         // A non-terminal row in flight longer than this is treated as likely
         // stuck: the suppression is logged at warn (with the row id and age) so
@@ -2055,21 +2093,8 @@ impl RebalancingService {
         const STUCK_TRANSFER_WARN_AFTER_SECS: i64 = 15 * 60;
 
         let queue = self.transfer_usdc_to_hedging_queue.clone();
-        let job_type = std::any::type_name::<TransferUsdcToHedging>();
 
-        let existing: Result<Option<(String, i64)>, _> = sqlx::query_as(
-            "SELECT id, CAST(strftime('%s', 'now') AS INTEGER) - run_at AS age_secs \
-             FROM Jobs \
-             WHERE job_type = ? \
-             AND status IN ('Pending', 'Queued', 'Running') \
-             ORDER BY run_at ASC \
-             LIMIT 1",
-        )
-        .bind(job_type)
-        .fetch_optional(queue.pool())
-        .await;
-
-        match existing {
+        match Self::in_flight_usdc_transfer(queue.pool()).await {
             Ok(Some((row_id, age_secs))) if age_secs >= STUCK_TRANSFER_WARN_AFTER_SECS => {
                 warn!(
                     target: "rebalance",
@@ -2077,8 +2102,9 @@ impl RebalancingService {
                     age_secs,
                     threshold_secs = STUCK_TRANSFER_WARN_AFTER_SECS,
                     %amount,
-                    "Skipped TransferUsdcToHedging enqueue: in-flight row looks stuck and is \
-                     suppressing new Base->Alpaca rebalances; investigate before it starves hedging",
+                    "Skipped Base->Alpaca USDC transfer enqueue: an in-flight USDC transfer \
+                     (either direction) looks stuck and is suppressing new rebalances; \
+                     investigate before it starves hedging",
                 );
                 return false;
             }
@@ -2088,8 +2114,8 @@ impl RebalancingService {
                     %row_id,
                     age_secs,
                     %amount,
-                    "Skipped TransferUsdcToHedging enqueue: non-terminal row \
-                     already exists; apalis will resume it",
+                    "Skipped Base->Alpaca USDC transfer enqueue: a non-terminal USDC transfer \
+                     (either direction) already exists; apalis will resume it",
                 );
                 return false;
             }
@@ -2098,7 +2124,7 @@ impl RebalancingService {
                 warn!(
                     target: "rebalance",
                     %error,
-                    "Failed to query for existing TransferUsdcToHedging rows; \
+                    "Failed to query for in-flight USDC transfers; \
                      skipping enqueue to avoid double-pushing",
                 );
                 return false;
@@ -2132,6 +2158,74 @@ impl RebalancingService {
                     %error,
                     %amount,
                     "Failed to enqueue TransferUsdcToHedging job",
+                );
+                false
+            }
+        }
+    }
+
+    /// Sibling of [`Self::enqueue_transfer_usdc_to_hedging`] for the
+    /// Alpaca->Base direction.
+    ///
+    /// Mirrors the same persistent dedupe: an in-memory `usdc_in_progress`
+    /// guard resets on restart, so without querying the apalis Jobs table
+    /// a crash between `queue.push` and the first persisted
+    /// `UsdcRebalance` event would let the next imbalance check enqueue a
+    /// second job for the same rebalance.
+    async fn enqueue_transfer_usdc_to_market_making(&self, amount: Usdc) -> bool {
+        let queue = self.transfer_usdc_to_market_making_queue.clone();
+
+        match Self::in_flight_usdc_transfer(queue.pool()).await {
+            Ok(Some((row_id, age_secs))) => {
+                debug!(
+                    target: "rebalance",
+                    %row_id,
+                    age_secs,
+                    %amount,
+                    "Skipped Alpaca->Base USDC transfer enqueue: a non-terminal USDC transfer \
+                     (either direction) already exists; apalis will resume it",
+                );
+                return false;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    target: "rebalance",
+                    %error,
+                    "Failed to query for in-flight USDC transfers; \
+                     skipping enqueue to avoid double-pushing",
+                );
+                return false;
+            }
+        }
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let mut queue = queue;
+
+        let push = queue
+            .push(TransferUsdcToMarketMaking {
+                id: id.clone(),
+                amount,
+            })
+            .await;
+
+        match push {
+            Ok(()) => {
+                debug!(
+                    target: "rebalance",
+                    %id,
+                    %amount,
+                    "Enqueued TransferUsdcToMarketMaking job for Alpaca->Base USDC transfer",
+                );
+                true
+            }
+
+            Err(QueuePushError(error)) => {
+                warn!(
+                    target: "rebalance",
+                    %error,
+                    %amount,
+                    "Failed to enqueue TransferUsdcToMarketMaking job",
                 );
                 false
             }
@@ -4795,6 +4889,52 @@ mod tests {
         .expect("count pending TransferUsdcToHedging jobs")
     }
 
+    /// Drains every pending USDC transfer row (both directions) from the
+    /// service's Jobs table and returns them parsed as
+    /// [`TriggeredOperation`]. Marking rows `Done` lets repeated trigger
+    /// cycles in the same test see fresh state.
+    async fn take_pending_usdc_transfer_jobs(
+        service: &RebalancingService,
+    ) -> Vec<TriggeredOperation> {
+        let pool = service.transfer_usdc_to_hedging_queue.pool().clone();
+        let to_hedging_type = std::any::type_name::<TransferUsdcToHedging>();
+        let to_mm_type = std::any::type_name::<TransferUsdcToMarketMaking>();
+
+        let rows: Vec<(String, Vec<u8>, String)> = sqlx::query_as(
+            "SELECT id, job, job_type FROM Jobs \
+             WHERE status = 'Pending' AND (job_type = ? OR job_type = ?) \
+             ORDER BY run_at",
+        )
+        .bind(to_hedging_type)
+        .bind(to_mm_type)
+        .fetch_all(&pool)
+        .await
+        .expect("query pending USDC transfer jobs");
+
+        let mut operations = Vec::with_capacity(rows.len());
+        for (row_id, payload, job_type) in rows {
+            let operation = if job_type == to_hedging_type {
+                let job: TransferUsdcToHedging =
+                    serde_json::from_slice(&payload).expect("deserialize TransferUsdcToHedging");
+                TriggeredOperation::UsdcBaseToAlpaca { amount: job.amount }
+            } else {
+                let job: TransferUsdcToMarketMaking = serde_json::from_slice(&payload)
+                    .expect("deserialize TransferUsdcToMarketMaking");
+                TriggeredOperation::UsdcAlpacaToBase { amount: job.amount }
+            };
+
+            sqlx::query("UPDATE Jobs SET status = 'Done' WHERE id = ?")
+                .bind(&row_id)
+                .execute(&pool)
+                .await
+                .expect("mark drained USDC transfer job Done");
+
+            operations.push(operation);
+        }
+
+        operations
+    }
+
     async fn make_trigger_with_inventory_and_registry_config(
         inventory: InventoryView,
         symbol: &Symbol,
@@ -6521,14 +6661,20 @@ mod tests {
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        // Verify imbalance triggers before reactor events
+        // Verify imbalance triggers before reactor events. Alpaca->Base is
+        // enqueued as a TransferUsdcToMarketMaking apalis job, not via mpsc.
         trigger.check_and_trigger_usdc().await;
+        let pending = take_pending_usdc_transfer_jobs(&trigger).await;
         assert!(
             matches!(
-                receiver.try_recv(),
-                Ok(TriggeredOperation::UsdcAlpacaToBase { .. })
+                pending.as_slice(),
+                [TriggeredOperation::UsdcAlpacaToBase { .. }],
             ),
-            "TooMuchOffchain (100/900) should trigger UsdcAlpacaToBase before reactor events"
+            "TooMuchOffchain (100/900) should enqueue an AlpacaToBase transfer, got {pending:?}"
+        );
+        assert!(
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+            "Alpaca->Base should not be routed through the Rebalancer mpsc channel"
         );
         trigger.clear_usdc_in_progress();
 
@@ -7817,7 +7963,7 @@ mod tests {
                 Utc::now(),
             )
             .unwrap();
-        let (reactor, mut receiver) = make_trigger_with_inventory_config(
+        let (reactor, _receiver) = make_trigger_with_inventory_config(
             inventory,
             test_config_with_timeout(Duration::from_secs(1)),
         )
@@ -7866,9 +8012,12 @@ mod tests {
         );
         drop(inventory);
 
-        let triggered = receiver.try_recv();
+        let triggered = take_pending_usdc_transfer_jobs(&trigger).await;
         assert!(
-            matches!(triggered, Ok(TriggeredOperation::UsdcAlpacaToBase { .. })),
+            matches!(
+                triggered.as_slice(),
+                [TriggeredOperation::UsdcAlpacaToBase { .. }]
+            ),
             "USDC timeout should allow the next trigger cycle to proceed, got {triggered:?}"
         );
         assert!(
@@ -8048,6 +8197,58 @@ mod tests {
         assert!(
             !trigger.usdc_tracking.read().await.contains_key(&id),
             "timeout must drop tracking once the transfer job is terminal",
+        );
+    }
+
+    #[tokio::test]
+    async fn in_flight_hedging_transfer_blocks_market_making_enqueue() {
+        let (service, _receiver) = make_trigger_with_inventory(InventoryView::default()).await;
+
+        // A Base->Alpaca (hedging) transfer is already in flight.
+        service
+            .transfer_usdc_to_hedging_queue
+            .clone()
+            .push(TransferUsdcToHedging {
+                id: UsdcRebalanceId(Uuid::new_v4()),
+                amount: usdc(100),
+            })
+            .await
+            .unwrap();
+
+        // The opposite-direction enqueue must be suppressed: both directions
+        // move the same funds through the same vault/wallet, and the in-memory
+        // guard resets on restart, so running them concurrently would churn
+        // capital and pay fees twice.
+        let enqueued = service
+            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .await;
+
+        assert!(
+            !enqueued,
+            "an in-flight Base->Alpaca transfer must block enqueuing an Alpaca->Base transfer"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_flight_market_making_transfer_blocks_hedging_enqueue() {
+        let (service, _receiver) = make_trigger_with_inventory(InventoryView::default()).await;
+
+        // An Alpaca->Base (market-making) transfer is already in flight.
+        service
+            .transfer_usdc_to_market_making_queue
+            .clone()
+            .push(TransferUsdcToMarketMaking {
+                id: UsdcRebalanceId(Uuid::new_v4()),
+                amount: usdc(100),
+            })
+            .await
+            .unwrap();
+
+        let enqueued = service.enqueue_transfer_usdc_to_hedging(usdc(100)).await;
+
+        assert!(
+            !enqueued,
+            "an in-flight Alpaca->Base transfer must block enqueuing a Base->Alpaca transfer"
         );
     }
 
@@ -9299,20 +9500,22 @@ mod tests {
             .unwrap();
         drain_pending_jobs(&trigger).await.unwrap();
 
-        let mut operations = Vec::new();
-        while let Ok(operation) = receiver.try_recv() {
-            operations.push(operation);
-        }
+        // Drain the equity mpsc channel; the position-event side of this test
+        // can dispatch equity operations through the rebalancer, but the
+        // assertion below is only about USDC.
+        while receiver.try_recv().is_ok() {}
+
+        let usdc_operations = take_pending_usdc_transfer_jobs(&trigger).await;
 
         // Onchain buy spends USDC onchain, making the onchain ratio drop below
         // the lower bound. The system should move USDC from Alpaca to Base.
-        operations
+        usdc_operations
             .iter()
             .find(|op| matches!(op, TriggeredOperation::UsdcAlpacaToBase { .. }))
             .unwrap_or_else(|| {
                 panic!(
-                    "Expected UsdcAlpacaToBase (onchain USDC too low after buy), \
-                     got operations: {operations:?}"
+                    "Expected AlpacaToBase (onchain USDC too low after buy), \
+                     got operations: {usdc_operations:?}"
                 )
             });
     }
@@ -11458,15 +11661,18 @@ mod tests {
         let inventory = InventoryView::default()
             .with_usdc(usdc(100), usdc(900))
             .with_withdrawable_cash_cents(90_000);
-        let (reactor, mut receiver) = make_trigger_with_inventory(inventory).await;
+        let (reactor, _receiver) = make_trigger_with_inventory(inventory).await;
         let trigger = reactor.clone();
 
         UsdcRebalancingCheck.perform(&trigger).await.unwrap();
 
-        let dispatched = receiver.try_recv().unwrap();
+        let dispatched = take_pending_usdc_transfer_jobs(&trigger).await;
         assert!(
-            matches!(dispatched, TriggeredOperation::UsdcAlpacaToBase { .. }),
-            "Expected UsdcAlpacaToBase, got {dispatched:?}"
+            matches!(
+                dispatched.as_slice(),
+                [TriggeredOperation::UsdcAlpacaToBase { .. }],
+            ),
+            "Expected AlpacaToBase, got {dispatched:?}"
         );
     }
 

@@ -66,6 +66,28 @@ pub(crate) enum RaindexError {
     ScanInconclusive { from_block: u64 },
 }
 
+impl RaindexError {
+    /// `true` if this error reports that a submitted transaction was dropped from
+    /// the mempool and will never mine -- a terminal failure, distinct from a
+    /// still-pending transaction that simply has not confirmed yet.
+    pub(crate) fn is_transaction_dropped(&self) -> bool {
+        match self {
+            Self::Evm(EvmError::TransactionDropped { .. }) => true,
+            Self::Evm(_)
+            | Self::Contract(_)
+            | Self::Float(_)
+            | Self::ZeroAmount
+            | Self::RegistryNotFound(_)
+            | Self::Projection(_)
+            | Self::VaultNotFound(_)
+            | Self::TokenNotFound(_)
+            | Self::RpcTransport(_)
+            | Self::SolType(_)
+            | Self::ScanInconclusive { .. } => false,
+        }
+    }
+}
+
 /// Number of `eth_getLogs` scans that must agree the effect is absent before a
 /// resume re-executes an irreversible withdraw. Defends against a single
 /// load-balanced RPC node lagging and returning a false-empty result.
@@ -92,9 +114,10 @@ const SCAN_FINALITY_MARGIN: u64 = 2;
 /// // Lookup vault ID for a token (read-only, needs Evm)
 /// let vault_id = service.lookup_vault_id(token_address).await?;
 ///
-/// // Deposit USDC to vault (needs Wallet)
+/// // Submit a USDC deposit to the vault, then confirm it (needs Wallet)
 /// let amount = U256::from(1000) * U256::from(10).pow(U256::from(6)); // 1000 USDC
-/// service.deposit_usdc(vault_id, amount).await?;
+/// let deposit_tx = service.submit_deposit_usdc(vault_id, amount).await?;
+/// service.confirm_tx(deposit_tx).await?;
 /// ```
 pub(crate) struct RaindexService<E: Evm> {
     orderbook_address: Address,
@@ -259,20 +282,22 @@ impl<W: Wallet> RaindexService<W> {
         Ok(tx_hash)
     }
 
-    /// Deposits USDC to a Rain OrderBook vault on Base.
+    /// Submits a USDC deposit to a Rain OrderBook vault on Base WITHOUT waiting
+    /// for confirmation, returning the broadcast tx hash.
     ///
-    /// Convenience method that calls `deposit` with the Base USDC address and decimals.
-    ///
-    /// # Parameters
-    ///
-    /// * `vault_id` - Target vault identifier
-    /// * `amount` - Amount of USDC to deposit (in USDC's base units, 6 decimals)
-    pub(crate) async fn deposit_usdc(
+    /// Used by the crash-safe deposit path: the hash is persisted as
+    /// `InitiateDeposit` before confirmation, so a crash during the confirmation
+    /// wait resumes from `DepositInitiated` (re-verifying the recorded tx via
+    /// `confirm_tx`) instead of re-submitting a second deposit.
+    pub(crate) async fn submit_deposit_usdc(
         &self,
         vault_id: RaindexVaultId,
         amount: U256,
     ) -> Result<TxHash, RaindexError> {
-        self.deposit::<OpenChainErrorRegistry>(USDC_BASE, vault_id, amount, USDC_DECIMALS)
+        // `submit_deposit` handles the ERC20 approval before submitting deposit4
+        // (unlike the bare `submit_deposit4_to_vault`), then returns without
+        // confirming.
+        self.submit_deposit(USDC_BASE, vault_id, amount, USDC_DECIMALS)
             .await
     }
 

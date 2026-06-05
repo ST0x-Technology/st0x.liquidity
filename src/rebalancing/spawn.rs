@@ -18,7 +18,7 @@ use st0x_execution::{
 };
 
 use super::equity::CrossVenueEquityTransfer;
-use super::usdc::{CrossVenueCashTransfer, ResumeBaseToAlpaca};
+use super::usdc::{CrossVenueCashTransfer, ResumeAlpacaToBase, ResumeBaseToAlpaca};
 use super::{Rebalancer, TriggeredOperation};
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::equity_redemption::EquityRedemption;
@@ -28,18 +28,6 @@ use crate::tokenization::Tokenizer;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
 use crate::wrapper::WrapperService;
-
-/// Handles to the rebalancer task surfaced by [`RebalancerServices::spawn`].
-///
-/// Holds the spawned task's join handle, its shutdown token, and a
-/// trait-erased reference to the cash transfer so the conductor can build the
-/// `TransferUsdcToHedging` apalis job's ctx without leaking the wallet
-/// `Chain` generic upstream.
-pub(crate) struct SpawnedRebalancer {
-    pub(crate) handle: JoinHandle<()>,
-    pub(crate) shutdown_token: CancellationToken,
-    pub(crate) resume_base_to_alpaca: Arc<dyn ResumeBaseToAlpaca>,
-}
 
 /// Errors that can occur when spawning the rebalancer.
 #[derive(Debug, thiserror::Error)]
@@ -56,6 +44,17 @@ pub(crate) struct RebalancingCqrsFrameworks {
     pub(crate) mint: Arc<Store<TokenizedEquityMint>>,
     pub(crate) redemption: Arc<Store<EquityRedemption>>,
     pub(crate) usdc: Arc<Store<UsdcRebalance>>,
+}
+
+/// Handles surfaced by [`RebalancerServices::spawn`]: the rebalancer task,
+/// its shutdown token, and trait-erased resume entry points for the cash
+/// transfer so the conductor can build apalis job ctxs without leaking the
+/// wallet `Chain` generic upstream.
+pub(crate) struct SpawnedRebalancer {
+    pub(crate) handle: JoinHandle<()>,
+    pub(crate) shutdown_token: CancellationToken,
+    pub(crate) resume_base_to_alpaca: Arc<dyn ResumeBaseToAlpaca>,
+    pub(crate) resume_alpaca_to_base: Arc<dyn ResumeAlpacaToBase>,
 }
 
 /// External service clients for rebalancing operations.
@@ -155,6 +154,7 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
         ));
 
         let resume_base_to_alpaca: Arc<dyn ResumeBaseToAlpaca> = usdc.clone();
+        let resume_alpaca_to_base: Arc<dyn ResumeAlpacaToBase> = usdc.clone();
 
         let shutdown_token = CancellationToken::new();
 
@@ -179,6 +179,7 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
             handle,
             shutdown_token,
             resume_base_to_alpaca,
+            resume_alpaca_to_base,
         }
     }
 }
