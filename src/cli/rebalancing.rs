@@ -31,7 +31,7 @@ use crate::tokenization::{
 use crate::tokenized_equity_mint::{
     IssuerRequestId, TokenizedEquityMint, TokenizedEquityMintCommand,
 };
-use crate::usdc_rebalance::UsdcRebalance;
+use crate::usdc_rebalance::{UsdcRebalance, UsdcRebalanceId};
 use crate::vault_registry::VaultRegistry;
 use crate::wrapper::{Wrapper, WrapperService};
 use st0x_config::{BrokerCtx, Ctx};
@@ -277,21 +277,19 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
 
     writeln!(stdout, "   Transfer may take several minutes...")?;
 
+    let id = UsdcRebalanceId(Uuid::new_v4());
+
     match direction {
         TransferDirection::ToRaindex => {
-            CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
-                &rebalance_manager,
-                amount,
-            )
-            .await?;
+            rebalance_manager
+                .execute_alpaca_to_base(&id, amount)
+                .await?;
             writeln!(stdout, "USDC transfer to Raindex completed successfully")?;
         }
         TransferDirection::ToAlpaca => {
-            CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
-                &rebalance_manager,
-                amount,
-            )
-            .await?;
+            rebalance_manager
+                .execute_base_to_alpaca(&id, amount)
+                .await?;
             writeln!(stdout, "USDC transfer to Alpaca completed successfully")?;
         }
     }

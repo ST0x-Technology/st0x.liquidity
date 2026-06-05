@@ -23,6 +23,7 @@ use st0x_event_sorcery::{
 use st0x_execution::{FractionalShares, Positive, SharesBlockchain, SharesConversionError, Symbol};
 use st0x_finance::{HasZero, Usd, Usdc};
 
+use self::usdc::UsdcRebalanceOperation;
 use crate::conductor::job::QueuePushError;
 use crate::equity_redemption::{
     EquityRedemption, EquityRedemptionCommand, EquityRedemptionEvent, RedemptionAggregateId,
@@ -423,10 +424,6 @@ pub(crate) enum TriggeredOperation {
         /// Unwrapped (underlying) token address for sending to Alpaca.
         unwrapped_token: Address,
     },
-    /// Move USDC from Alpaca to Base (too much offchain).
-    UsdcAlpacaToBase { amount: Usdc },
-    /// Move USDC from Base to Alpaca (too much onchain).
-    UsdcBaseToAlpaca { amount: Usdc },
 }
 
 /// Service that folds CQRS events into rebalancing state and
@@ -787,7 +784,7 @@ impl RebalancingService {
             // neither clear the in-progress guard / inventory inflight nor mark it
             // timed-out (which would make the reactor ignore its eventual terminal
             // event and latch the guard forever). Let apalis drive it to terminal.
-            if self.transfer_usdc_to_hedging_in_flight(&id).await {
+            if self.transfer_in_flight_for_id(&id).await {
                 warn!(
                     target: "rebalance",
                     aggregate_id = %id,
@@ -817,37 +814,48 @@ impl RebalancingService {
         Ok(())
     }
 
-    /// Returns true if a `TransferUsdcToHedging` apalis row for `id` is still
-    /// non-terminal (Pending/Queued/Running). The timeout sweeper must not clear
-    /// the `usdc_in_progress` guard while such a row exists: the resuming job may
-    /// have an irreversible withdraw/burn already submitted, and clearing the guard
-    /// would let a second transfer touch the same vault/wallet.
+    /// Returns true if a USDC transfer apalis row for `id` -- in *either*
+    /// direction -- is still non-terminal (Pending/Queued/Running). The timeout
+    /// sweeper must not clear the `usdc_in_progress` guard while such a row exists:
+    /// the resuming job may have an irreversible withdraw/burn/mint already
+    /// submitted, and clearing the guard would let a second transfer touch the same
+    /// vault/wallet.
     ///
-    /// Scoped to the aggregate `id` (carried in the job payload) so an unrelated
-    /// in-flight transfer never defers this id's cleanup -- decoupling the sweep
-    /// from the single-in-flight invariant. On query/decode failure the safe
-    /// default is to report "in flight" so automation stays latched.
-    async fn transfer_usdc_to_hedging_in_flight(&self, id: &UsdcRebalanceId) -> bool {
-        let job_type = std::any::type_name::<TransferUsdcToHedging>();
+    /// Checks BOTH directions (mirroring [`Self::in_flight_usdc_transfer`]): an
+    /// `AlpacaToBase` rebalance is driven by a `TransferUsdcToMarketMaking` job, so
+    /// checking only the hedging queue would miss it and clear the guard while a
+    /// market-making transfer is still in flight. Scoped to the aggregate `id`
+    /// (carried in the job payload) so an unrelated in-flight transfer never defers
+    /// this id's cleanup. On query/decode failure the safe default is to report
+    /// "in flight" so automation stays latched.
+    async fn transfer_in_flight_for_id(&self, id: &UsdcRebalanceId) -> bool {
+        // Both transfer payloads serialize as `{ id, amount, .. }`; only the id is
+        // needed to scope the sweep, so decode just that field for either direction.
+        #[derive(serde::Deserialize)]
+        struct TransferJobId {
+            id: UsdcRebalanceId,
+        }
+
         let rows: Result<Vec<(Vec<u8>,)>, _> = sqlx::query_as(
             "SELECT job FROM Jobs \
-             WHERE job_type = ? \
+             WHERE job_type IN (?, ?) \
              AND status IN ('Pending', 'Queued', 'Running')",
         )
-        .bind(job_type)
+        .bind(std::any::type_name::<TransferUsdcToHedging>())
+        .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
         .fetch_all(self.transfer_usdc_to_hedging_queue.pool())
         .await;
 
         match rows {
             Ok(rows) => rows.iter().any(|(payload,)| {
-                match serde_json::from_slice::<TransferUsdcToHedging>(payload) {
+                match serde_json::from_slice::<TransferJobId>(payload) {
                     Ok(job) => job.id == *id,
                     Err(error) => {
                         warn!(
                             target: "rebalance",
                             %error,
-                            "Failed to deserialize a non-terminal TransferUsdcToHedging payload \
-                             during timeout sweep; treating as in flight to stay latched"
+                            "Failed to decode a non-terminal USDC transfer payload during \
+                             timeout sweep; treating as in flight to stay latched"
                         );
                         true
                     }
@@ -857,8 +865,8 @@ impl RebalancingService {
                 warn!(
                     target: "rebalance",
                     %error,
-                    "Failed to query in-flight TransferUsdcToHedging rows during timeout \
-                     sweep; keeping the in-progress guard latched to avoid re-arming"
+                    "Failed to query in-flight USDC transfer rows during timeout sweep; \
+                     keeping the in-progress guard latched to avoid re-arming"
                 );
                 true
             }
@@ -2027,15 +2035,12 @@ impl RebalancingService {
             return;
         };
 
-        let dispatched = match &operation {
-            TriggeredOperation::UsdcBaseToAlpaca { amount } => {
-                self.enqueue_transfer_usdc_to_hedging(*amount).await
+        let dispatched = match operation {
+            UsdcRebalanceOperation::BaseToAlpaca { amount } => {
+                self.enqueue_transfer_usdc_to_hedging(amount).await
             }
-            TriggeredOperation::UsdcAlpacaToBase { amount } => {
-                self.enqueue_transfer_usdc_to_market_making(*amount).await
-            }
-            TriggeredOperation::Mint { .. } | TriggeredOperation::Redemption { .. } => {
-                self.try_send_operation(&operation, "usdc")
+            UsdcRebalanceOperation::AlpacaToBase { amount } => {
+                self.enqueue_transfer_usdc_to_market_making(amount).await
             }
         };
 
@@ -4891,11 +4896,11 @@ mod tests {
 
     /// Drains every pending USDC transfer row (both directions) from the
     /// service's Jobs table and returns them parsed as
-    /// [`TriggeredOperation`]. Marking rows `Done` lets repeated trigger
+    /// [`UsdcRebalanceOperation`]. Marking rows `Done` lets repeated trigger
     /// cycles in the same test see fresh state.
     async fn take_pending_usdc_transfer_jobs(
         service: &RebalancingService,
-    ) -> Vec<TriggeredOperation> {
+    ) -> Vec<UsdcRebalanceOperation> {
         let pool = service.transfer_usdc_to_hedging_queue.pool().clone();
         let to_hedging_type = std::any::type_name::<TransferUsdcToHedging>();
         let to_mm_type = std::any::type_name::<TransferUsdcToMarketMaking>();
@@ -4916,11 +4921,11 @@ mod tests {
             let operation = if job_type == to_hedging_type {
                 let job: TransferUsdcToHedging =
                     serde_json::from_slice(&payload).expect("deserialize TransferUsdcToHedging");
-                TriggeredOperation::UsdcBaseToAlpaca { amount: job.amount }
+                UsdcRebalanceOperation::BaseToAlpaca { amount: job.amount }
             } else {
                 let job: TransferUsdcToMarketMaking = serde_json::from_slice(&payload)
                     .expect("deserialize TransferUsdcToMarketMaking");
-                TriggeredOperation::UsdcAlpacaToBase { amount: job.amount }
+                UsdcRebalanceOperation::AlpacaToBase { amount: job.amount }
             };
 
             sqlx::query("UPDATE Jobs SET status = 'Done' WHERE id = ?")
@@ -6668,7 +6673,7 @@ mod tests {
         assert!(
             matches!(
                 pending.as_slice(),
-                [TriggeredOperation::UsdcAlpacaToBase { .. }],
+                [UsdcRebalanceOperation::AlpacaToBase { .. }],
             ),
             "TooMuchOffchain (100/900) should enqueue an AlpacaToBase transfer, got {pending:?}"
         );
@@ -8016,7 +8021,7 @@ mod tests {
         assert!(
             matches!(
                 triggered.as_slice(),
-                [TriggeredOperation::UsdcAlpacaToBase { .. }]
+                [UsdcRebalanceOperation::AlpacaToBase { .. }]
             ),
             "USDC timeout should allow the next trigger cycle to proceed, got {triggered:?}"
         );
@@ -8137,12 +8142,41 @@ mod tests {
             .unwrap();
 
         assert!(
-            trigger.transfer_usdc_to_hedging_in_flight(&id).await,
+            trigger.transfer_in_flight_for_id(&id).await,
             "a non-terminal transfer row for this id must report in flight",
         );
         assert!(
-            !trigger.transfer_usdc_to_hedging_in_flight(&other_id).await,
+            !trigger.transfer_in_flight_for_id(&other_id).await,
             "a transfer row for a different aggregate id must NOT report this id as in flight",
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_in_flight_for_id_checks_market_making_direction() {
+        let (trigger, _receiver) = make_trigger_with_inventory_config(
+            InventoryView::default(),
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        // An Alpaca->Base rebalance is driven by a market-making transfer; the
+        // sweep's in-flight check must see it (bidirectional), not just the hedging
+        // queue -- otherwise it would clear the guard while a market-making transfer
+        // with an irreversible mint/deposit is still in flight.
+        trigger
+            .transfer_usdc_to_market_making_queue
+            .clone()
+            .push(TransferUsdcToMarketMaking {
+                id: id.clone(),
+                amount: usdc(400),
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            trigger.transfer_in_flight_for_id(&id).await,
+            "a non-terminal market-making (Alpaca->Base) transfer row must report this id as in flight",
         );
     }
 
@@ -9511,7 +9545,7 @@ mod tests {
         // the lower bound. The system should move USDC from Alpaca to Base.
         usdc_operations
             .iter()
-            .find(|op| matches!(op, TriggeredOperation::UsdcAlpacaToBase { .. }))
+            .find(|op| matches!(op, UsdcRebalanceOperation::AlpacaToBase { .. }))
             .unwrap_or_else(|| {
                 panic!(
                     "Expected AlpacaToBase (onchain USDC too low after buy), \
@@ -11670,7 +11704,7 @@ mod tests {
         assert!(
             matches!(
                 dispatched.as_slice(),
-                [TriggeredOperation::UsdcAlpacaToBase { .. }],
+                [UsdcRebalanceOperation::AlpacaToBase { .. }],
             ),
             "Expected AlpacaToBase, got {dispatched:?}"
         );

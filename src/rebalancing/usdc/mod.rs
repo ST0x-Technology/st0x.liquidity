@@ -1,13 +1,12 @@
 //! USDC cross-venue transfers between Alpaca and Base.
 //!
-//! [`CrossVenueCashTransfer`] implements [`CrossVenueTransfer`] in both
-//! directions for USDC, handling USD/USDC conversion, withdrawal, CCTP
-//! bridging, and deposit.
+//! [`CrossVenueCashTransfer`] drives USDC transfers in both directions through
+//! direct `execute_alpaca_to_base` / `execute_base_to_alpaca` entry points,
+//! with matching `resume_*` paths for apalis-driven crash recovery. Each
+//! transfer handles USD/USDC conversion, withdrawal, CCTP bridging, and deposit.
 
 mod job;
 mod manager;
-#[cfg(test)]
-pub(crate) mod mock;
 
 pub(crate) use job::{
     ResumeAlpacaToBase, ResumeBaseToAlpaca, TransferUsdcToHedging, TransferUsdcToHedgingCtx,
