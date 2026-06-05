@@ -41,9 +41,9 @@ use uuid::Uuid;
 
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
 use st0x_execution::{FractionalShares, Symbol};
+use st0x_raindex::Raindex;
 
 use crate::equity_redemption::RedemptionAggregateId;
-use crate::onchain::raindex::Raindex;
 use crate::rebalancing::equity::CrossVenueEquityTransfer;
 use crate::tokenized_equity_mint::{IssuerRequestId, TOKENIZED_EQUITY_DECIMALS};
 use crate::vault_lookup::VaultLookup;
@@ -580,9 +580,9 @@ mod tests {
 
     use st0x_event_sorcery::EventSourced;
     use st0x_execution::{FractionalShares, Symbol};
+    use st0x_raindex::RaindexVaultId;
 
     use crate::onchain::mock::MockRaindex;
-    use crate::onchain::raindex::RaindexVaultId;
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::tokenization::mock::MockTokenizer;
     use crate::vault_lookup::MockVaultLookup;

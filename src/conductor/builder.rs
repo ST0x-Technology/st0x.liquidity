@@ -16,6 +16,7 @@ use st0x_event_sorcery::{Projection, Store};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::Executor;
 use st0x_finance::{HasZero, Positive, Usd};
+use st0x_raindex::RaindexService;
 
 use super::Conductor;
 use super::exit::MonitorTaskError;
@@ -37,7 +38,6 @@ use crate::offchain::order::{
 };
 use crate::onchain::backfill::{BackfillJobQueue, BackfillRange};
 use crate::onchain::pyth::FeedIdCache;
-use crate::onchain::raindex::RaindexService;
 use crate::onchain_trade::OnChainTrade;
 use crate::position::Position;
 use crate::position_check::{CheckPositions, CheckPositionsCtx, CheckPositionsJobQueue};

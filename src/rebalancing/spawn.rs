@@ -16,13 +16,13 @@ use st0x_evm::Wallet;
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiError, EmptySymbolError, Executor, Symbol,
 };
+use st0x_raindex::{RaindexService, RaindexVaultId};
 
 use super::equity::CrossVenueEquityTransfer;
 use super::usdc::{CrossVenueCashTransfer, ResumeAlpacaToBase, ResumeBaseToAlpaca};
 use super::{Rebalancer, TriggeredOperation};
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::equity_redemption::EquityRedemption;
-use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::tokenization::Tokenizer;
 use crate::tokenized_equity_mint::TokenizedEquityMint;

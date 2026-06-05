@@ -10,10 +10,10 @@ use st0x_config::Ctx;
 use st0x_evm::{Evm, OpenChainErrorRegistry};
 use st0x_float_macro::float;
 use st0x_float_serde::format_float_with_fallback;
+use st0x_raindex::{Raindex, RaindexService, RaindexVaultId};
 
 use crate::bindings::IERC20;
 use crate::onchain::USDC_BASE;
-use crate::onchain::raindex::{Raindex, RaindexService, RaindexVaultId};
 
 pub(super) struct Deposit {
     pub(super) amount: Float,

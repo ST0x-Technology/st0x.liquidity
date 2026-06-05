@@ -14,6 +14,11 @@ use async_trait::async_trait;
 
 use st0x_evm::EvmError;
 
+#[cfg(feature = "rain")]
+mod service;
+#[cfg(feature = "rain")]
+pub use service::RaindexService;
+
 /// Base USDC token address.
 pub const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
 

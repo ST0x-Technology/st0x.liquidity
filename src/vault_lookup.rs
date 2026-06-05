@@ -1,9 +1,10 @@
 //! Vault resolution over the [`VaultRegistry`] projection.
 //!
-//! Separates "which vault holds this token/symbol" (a registry read) from Rain
-//! OrderBook chain operations. Upstack routing moves registry-backed lookups
-//! here first; later branches can make the chain layer take explicit vault IDs
-//! without knowing about the [`VaultRegistry`] projection.
+//! Separates "which vault holds this token/symbol" (a registry read) from the
+//! Rain OrderBook chain operations in [`st0x_raindex`]. The chain
+//! layer takes an explicit vault id; this module resolves that id from the
+//! [`VaultRegistry`] aggregate so the chain layer never needs the projection
+//! and can live in a standalone crate independent of `st0x-config`.
 
 use alloy::primitives::Address;
 use async_trait::async_trait;
@@ -13,8 +14,8 @@ use std::sync::Arc;
 
 use st0x_event_sorcery::ProjectionError;
 use st0x_execution::Symbol;
+use st0x_raindex::RaindexVaultId;
 
-use crate::onchain::raindex::RaindexVaultId;
 use crate::vault_registry::{VaultRegistry, VaultRegistryId, VaultRegistryProjection};
 
 /// Resolves Raindex vault ids from the [`VaultRegistry`] projection.

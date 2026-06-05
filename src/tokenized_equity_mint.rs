@@ -1968,15 +1968,15 @@ mod tests {
     use std::sync::Arc;
 
     use st0x_event_sorcery::{AggregateError, LifecycleError, TestHarness, TestStore};
+    use st0x_float_macro::float;
+    use st0x_raindex::RaindexVaultId;
 
     use super::*;
     use crate::onchain::mock::MockRaindex;
-    use crate::onchain::raindex::RaindexVaultId;
     use crate::tokenization::Tokenizer;
     use crate::tokenization::mock::{MockMintPollOutcome, MockMintRequestOutcome, MockTokenizer};
     use crate::vault_lookup::MockVaultLookup;
     use crate::wrapper::mock::MockWrapper;
-    use st0x_float_macro::float;
 
     fn mock_vault_lookup() -> MockVaultLookup {
         MockVaultLookup::new().with_default_vault(RaindexVaultId(B256::ZERO))

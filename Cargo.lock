@@ -6298,9 +6298,17 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "async-trait",
+ "proptest",
  "rain-math-float",
+ "serde_json",
  "st0x-evm",
+ "st0x-execution",
+ "st0x-finance",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-test",
+ "url",
 ]
 
 [[package]]
