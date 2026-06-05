@@ -9,13 +9,15 @@ use sqlx::SqlitePool;
 use std::io::Write;
 use std::sync::Arc;
 use tracing::{error, info};
+use uuid::Uuid;
 
 use st0x_event_sorcery::{Store, StoreBuilder};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::alpaca_broker_api::{AlpacaLimitOrder, AlpacaLimitPrice};
 use st0x_execution::{
-    Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder, MockExecutor,
-    MockExecutorCtx, OrderPlacement, OrderState, Positive, Symbol, TimeInForce, TryIntoExecutor,
+    ClientOrderId, Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder,
+    MockExecutor, MockExecutorCtx, OrderPlacement, OrderState, Positive, Symbol, TimeInForce,
+    TryIntoExecutor,
 };
 
 use crate::offchain::order::{
@@ -264,6 +266,10 @@ async fn execute_market_order<W: Write>(
         symbol: request.symbol.clone(),
         shares: request.shares,
         direction: request.direction,
+        // Manual CLI placement; generate a fresh idempotency key so an
+        // operator-issued retry cannot accidentally dedupe against an
+        // unrelated earlier placement.
+        client_order_id: ClientOrderId::cli(Uuid::new_v4()),
     };
 
     execute_broker_order(ctx, pool, market_order, time_in_force, stdout).await
@@ -520,6 +526,19 @@ pub(super) async fn process_found_trade<W: Write>(
         error!(%offchain_order_id, symbol = %params.symbol, "Failed to execute Position::PlaceOffChainOrder: {error}");
     }
 
+    // Reuse a prior failed attempt's stashed OffchainOrderId as the broker-side
+    // idempotency anchor (mirroring the automated `execute_create_offchain_order`
+    // path) so a CLI retry after a transient broker failure dedupes instead of
+    // placing a second order. Fall back to this attempt's id when there is none.
+    let anchor = match position_store.load(&params.symbol).await {
+        Ok(position) => position.and_then(|position| position.last_failed_offchain_order_id),
+        Err(error) => {
+            error!(%offchain_order_id, symbol = %params.symbol, %error, "Failed to load position for the idempotency anchor; placing under a fresh key");
+            None
+        }
+    };
+    let client_order_id_source = anchor.unwrap_or(offchain_order_id);
+
     if let Err(error) = offchain_order_store
         .send(
             &offchain_order_id,
@@ -528,6 +547,7 @@ pub(super) async fn process_found_trade<W: Write>(
                 shares: params.shares,
                 direction: params.direction,
                 executor: params.executor,
+                client_order_id: ClientOrderId::from_uuid(client_order_id_source.as_uuid()),
             },
         )
         .await
@@ -640,6 +660,7 @@ fn display_trade_details<W: Write>(
 mod tests {
     use alloy::primitives::{Address, address};
     use httpmock::MockServer;
+    use regex::Regex;
     use serde_json::json;
     use url::Url;
     use uuid::uuid;
@@ -789,17 +810,32 @@ mod tests {
                 }));
         });
 
+        // The broker-side `client_order_id` is a fresh UUID per CLI invocation,
+        // so its exact value cannot be pinned. Assert the value is a well-formed
+        // CLI idempotency key (`cli-{uuid}`) so a placement can never be issued
+        // with a missing or malformed key (the chaos tests use the broker mock,
+        // not this httpmock, so they do not cover it); `json_body_includes`
+        // covers the static fields.
+        let client_order_id_pattern = Regex::new(
+            r#""client_order_id":"cli-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}""#,
+        )
+        .unwrap();
+
         let order_mock = server.mock(|when, then| {
             when.method(httpmock::Method::POST)
                 .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
-                .json_body(json!({
-                    "symbol": symbol,
-                    "qty": quantity,
-                    "side": side,
-                    "type": "market",
-                    "time_in_force": "day",
-                    "extended_hours": false
-                }));
+                .body_matches(client_order_id_pattern.clone())
+                .json_body_includes(
+                    json!({
+                        "symbol": symbol,
+                        "qty": quantity,
+                        "side": side,
+                        "type": "market",
+                        "time_in_force": "day",
+                        "extended_hours": false
+                    })
+                    .to_string(),
+                );
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({

@@ -8,7 +8,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::alpaca_market_data::AlpacaMarketDataError;
-use crate::{CounterTradeCostError, FractionalShares, Positive, Symbol, Usd};
+use crate::{ClientOrderId, CounterTradeCostError, FractionalShares, Positive, Symbol, Usd};
 
 /// Time-in-force specifies how long an order remains active before it expires.
 ///
@@ -149,6 +149,13 @@ pub enum AlpacaBrokerApiError {
         order_id: Uuid,
         reason: CryptoOrderFailureReason,
     },
+
+    #[error(
+        "Broker rejected client_order_id {client_order_id} as a duplicate (422) but no \
+         order with that id was found on lookup; broker state is inconsistent and the \
+         placement must be retried"
+    )]
+    DuplicateOrderNotFound { client_order_id: ClientOrderId },
 
     #[error("Internal error: calendar was non-empty but iteration returned None")]
     CalendarIterationInvariantViolation,

@@ -9,8 +9,11 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+use st0x_config::ExecutionThreshold;
 use st0x_event_sorcery::{AggregateError, LifecycleError, Store};
-use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
+use st0x_execution::{
+    ClientOrderId, Direction, FractionalShares, Positive, SupportedExecutor, Symbol,
+};
 
 use crate::conductor::job::{Job, JobQueue, Label};
 use crate::offchain::order::{
@@ -18,7 +21,6 @@ use crate::offchain::order::{
 };
 use crate::position::{Position, PositionCommand, PositionError};
 use crate::trading::onchain::trade_accountant::TradeAccountingError;
-use st0x_config::ExecutionThreshold;
 
 /// Persistent job queue for hedge placement.
 pub(crate) type HedgeJobQueue = JobQueue<PlaceHedge>;
@@ -146,6 +148,24 @@ impl Job<HedgeCtx> for PlaceHedge {
             Err(error) => return Err(error.into()),
         }
 
+        // Derive the broker-side `client_order_id` from the *live* position
+        // aggregate, read after `PlaceOffChainOrder` has claimed it -- never
+        // captured at enqueue. If a prior attempt failed, the aggregate holds
+        // its `OffchainOrderId` as the idempotency anchor, so this retry reuses
+        // the same key and the broker dedupes the duplicate submission (a 422
+        // the executor reconciles by adopting the order it already accepted).
+        // Reading it live means a failure recorded *after* this job was enqueued
+        // is still honored, instead of placing under a fresh key and
+        // double-submitting. Falls back to this attempt's own id on the first
+        // try, when no anchor exists yet.
+        let anchor = ctx
+            .position
+            .load(&self.symbol)
+            .await?
+            .and_then(|position| position.last_failed_offchain_order_id);
+        let client_order_id_source = anchor.unwrap_or(self.offchain_order_id);
+        let client_order_id = ClientOrderId::from_uuid(client_order_id_source.as_uuid());
+
         ctx.offchain_order
             .send(
                 &self.offchain_order_id,
@@ -154,6 +174,7 @@ impl Job<HedgeCtx> for PlaceHedge {
                     shares: self.shares,
                     direction: self.direction,
                     executor: self.executor,
+                    client_order_id,
                 },
             )
             .await?;

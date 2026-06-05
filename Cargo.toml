@@ -233,6 +233,7 @@ bon.workspace = true
 httpmock.workspace = true
 proptest.workspace = true
 rain-math-float.workspace = true
+regex = "1.12.3"
 rsa.workspace = true
 serial_test.workspace = true
 st0x-bridge = { workspace = true, features = ["mock"] }

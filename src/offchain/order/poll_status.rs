@@ -351,9 +351,10 @@ mod tests {
     use chrono::Utc;
     use sqlx::SqlitePool;
 
+    use st0x_config::ExecutionThreshold;
     use st0x_event_sorcery::StoreBuilder;
     use st0x_execution::{
-        Direction, ExecutionError, FractionalShares, MockExecutor, Positive, Symbol,
+        ClientOrderId, Direction, ExecutionError, FractionalShares, MockExecutor, Positive, Symbol,
     };
     use st0x_float_macro::float;
 
@@ -362,7 +363,6 @@ mod tests {
     use crate::offchain::order::{OffchainOrderCommand, noop_order_placer};
     use crate::position::{Position, PositionCommand, TradeId};
     use crate::test_utils::{OnchainTradeBuilder, setup_test_db};
-    use st0x_config::ExecutionThreshold;
 
     const TEST_POLL_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -485,6 +485,7 @@ mod tests {
                     shares,
                     direction,
                     executor: order_executor,
+                    client_order_id: ClientOrderId::from_uuid(offchain_order_id.as_uuid()),
                 },
             )
             .await

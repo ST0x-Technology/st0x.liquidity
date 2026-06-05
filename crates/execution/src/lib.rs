@@ -582,6 +582,7 @@ impl Display for ExecutorOrderId {
 mod tests {
     use alloy::primitives::U256;
     use std::str::FromStr;
+    use uuid::Uuid;
 
     use super::*;
 
@@ -907,6 +908,7 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Sell,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         }
     }
 

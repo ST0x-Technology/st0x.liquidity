@@ -126,6 +126,11 @@ pub struct MarketOrder {
     pub symbol: Symbol,
     pub shares: Positive<FractionalShares>,
     pub direction: Direction,
+    /// Forwarded to the broker so that retries of a logically identical
+    /// placement (e.g. apalis re-running a job after a transient 5xx whose
+    /// response was lost in flight) are deduped by the broker rather than
+    /// submitting a second order.
+    pub client_order_id: ClientOrderId,
 }
 
 #[cfg(test)]

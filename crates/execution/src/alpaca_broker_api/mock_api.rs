@@ -102,6 +102,7 @@ struct MockOrder {
     status: OrderStatus,
     poll_count: usize,
     filled_price: Option<Float>,
+    client_order_id: Option<String>,
 }
 
 /// A single calendar entry controlling market open/close times.
@@ -144,6 +145,13 @@ struct MockState {
     wallet_balances: HashMap<String, Float>,
     /// Whitelisted withdrawal addresses.
     whitelisted_addresses: Vec<WhitelistEntry>,
+    /// Number of upcoming `place_order` requests that should be answered
+    /// with a 5xx *after* the order has already been recorded in
+    /// [`MockState::orders`]. Models the adversarial case where the
+    /// broker processes the request but the response is lost in flight:
+    /// any caller-side retry creates a second order even though one
+    /// already exists. Decrements per request until zero.
+    transient_placement_failures_remaining: usize,
 }
 
 /// Status of a whitelisted address.
@@ -305,6 +313,7 @@ impl AlpacaBrokerMock {
             alpaca_deposit_address: String::new(),
             wallet_balances: HashMap::new(),
             whitelisted_addresses: Vec::new(),
+            transient_placement_failures_remaining: 0,
         }));
 
         let server = MockServer::start_async().await;
@@ -336,6 +345,16 @@ impl AlpacaBrokerMock {
     /// Changes the mock mode for subsequent requests.
     pub fn set_mode(&self, mode: MockMode) {
         lock(&self.state).mode = mode;
+    }
+
+    /// Arms the mock to answer the next `count` `place_order` requests
+    /// with a 5xx *after* the order has already been recorded in the
+    /// mock's internal state. Models adversarial broker behaviour where
+    /// the request reaches the upstream and is processed but the
+    /// response is lost in flight; any caller-side retry creates a
+    /// second order with the same intent.
+    pub fn set_transient_placement_failures(&self, count: usize) {
+        lock(&self.state).transient_placement_failures_remaining = count;
     }
 
     /// Sets a per-symbol fill delay: the order stays "new" for
@@ -694,6 +713,7 @@ fn register_endpoints(server: &MockServer, state: &Arc<Mutex<MockState>>) {
     register_latest_trade_endpoint(server, state);
     register_asset_endpoint(server);
     register_order_placement_endpoint(server, state);
+    register_order_by_client_order_id_endpoint(server, state);
     register_order_status_endpoint(server, state);
 }
 
@@ -907,6 +927,7 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
                     );
                 }
             };
+            let client_order_id = body["client_order_id"].as_str().map(str::to_owned);
             let order_id = Uuid::new_v4().to_string();
 
             let mut state = lock(&state);
@@ -919,6 +940,25 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
                 return handle_crypto_order(&mut state, &order_id, &symbol, quantity, side);
             }
 
+            // Real Alpaca rejects a re-used `client_order_id` on an active order
+            // with a 422 ("client_order_id must be unique") rather than deduping
+            // to a 2xx. Mirror that so the executor's recovery path -- look the
+            // order up by client_order_id and adopt it -- is exercised
+            // end-to-end instead of being papered over by a mock-only 200.
+            if let Some(client_id) = client_order_id.as_deref() {
+                let already_recorded = state
+                    .orders
+                    .values()
+                    .any(|order| order.client_order_id.as_deref() == Some(client_id));
+                if already_recorded {
+                    drop(state);
+                    return json_response(
+                        422,
+                        &json!({"message": "client_order_id must be unique"}),
+                    );
+                }
+            }
+
             state.orders.insert(
                 order_id.clone(),
                 MockOrder {
@@ -928,8 +968,19 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
                     status: OrderStatus::New,
                     poll_count: 0,
                     filled_price: None,
+                    client_order_id: client_order_id.clone(),
                 },
             );
+
+            if state.transient_placement_failures_remaining > 0 {
+                state.transient_placement_failures_remaining -= 1;
+                drop(state);
+                return json_response(
+                    503,
+                    &json!({"message": "transient upstream failure (chaos)"}),
+                );
+            }
+
             drop(state);
             json_response(
                 200,
@@ -940,6 +991,7 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
                     "side": side.to_string(),
                     "status": "new",
                     "filled_avg_price": null,
+                    "client_order_id": client_order_id,
                 }),
             )
         });
@@ -1068,6 +1120,7 @@ fn handle_crypto_order(
             status: OrderStatus::Filled,
             poll_count: 0,
             filled_price: Some(fill_price),
+            client_order_id: None,
         },
     );
 
@@ -1083,6 +1136,49 @@ fn handle_crypto_order(
             "created_at": "2025-01-06T12:00:00Z"
         })
     })
+}
+
+fn register_order_by_client_order_id_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {
+    let state = Arc::clone(state);
+    let path = format!("/v1/trading/accounts/{TEST_ACCOUNT_ID}/orders:by_client_order_id");
+
+    server.mock(|when, then| {
+        when.method(GET).path(path.clone());
+        then.respond_with(move |request: &HttpMockRequest| {
+            let Some(client_order_id) = request.uri().query().and_then(|query| {
+                query
+                    .split('&')
+                    .find_map(|pair| pair.strip_prefix("client_order_id=").map(str::to_owned))
+            }) else {
+                return json_response(
+                    400,
+                    &json!({"message": "missing client_order_id query param"}),
+                );
+            };
+
+            let found = lock(&state).orders.iter().find_map(|(id, order)| {
+                (order.client_order_id.as_deref() == Some(client_order_id.as_str())).then(|| {
+                    json!({
+                        "id": id,
+                        "symbol": order.symbol.to_string(),
+                        "qty": format_float_with_fallback(&order.quantity),
+                        "side": order.side.to_string(),
+                        "status": order.status.to_string(),
+                        "filled_avg_price": order
+                            .filled_price
+                            .as_ref()
+                            .map(format_float_with_fallback),
+                        "client_order_id": client_order_id,
+                    })
+                })
+            });
+
+            found.map_or_else(
+                || json_response(404, &json!({"message": "order not found"})),
+                |payload| json_response(200, &payload),
+            )
+        });
+    });
 }
 
 fn register_order_status_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>) {
@@ -1695,6 +1791,7 @@ mod tests {
             alpaca_deposit_address: format!("{:#x}", Address::ZERO),
             wallet_balances: HashMap::new(),
             whitelisted_addresses: vec![],
+            transient_placement_failures_remaining: 0,
         };
 
         let response = handle_crypto_order(
@@ -1739,6 +1836,7 @@ mod tests {
             alpaca_deposit_address: format!("{:#x}", Address::ZERO),
             wallet_balances: HashMap::from([("USDC".to_string(), float!(20))]),
             whitelisted_addresses: vec![],
+            transient_placement_failures_remaining: 0,
         };
 
         let response = handle_crypto_order(
@@ -1790,6 +1888,7 @@ mod tests {
             alpaca_deposit_address: format!("{:#x}", Address::ZERO),
             wallet_balances: HashMap::new(),
             whitelisted_addresses: vec![],
+            transient_placement_failures_remaining: 0,
         };
 
         let response = handle_crypto_order(

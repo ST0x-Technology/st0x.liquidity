@@ -29,6 +29,17 @@ pub struct Position {
     pub accumulated_long: FractionalShares,
     pub accumulated_short: FractionalShares,
     pub pending_offchain_order_id: Option<OffchainOrderId>,
+    /// Idempotency anchor: the `OffchainOrderId` from the last failed
+    /// placement that has not yet been followed by a successful fill.
+    /// Subsequent placement attempts reuse this id as their broker-side
+    /// `client_order_id` so the broker dedupes the duplicate submission
+    /// when the first attempt's response was lost in flight (e.g. 5xx
+    /// after the broker recorded the order).
+    ///
+    /// Cleared on any successful `OffChainOrderFilled` event so the next
+    /// rebalance cycle gets a fresh idempotency key.
+    #[serde(default)]
+    pub last_failed_offchain_order_id: Option<OffchainOrderId>,
     pub threshold: ExecutionThreshold,
     #[serde(
         serialize_with = "st0x_float_serde::serialize_option_float",
@@ -46,6 +57,10 @@ impl std::fmt::Debug for Position {
             .field("accumulated_long", &self.accumulated_long)
             .field("accumulated_short", &self.accumulated_short)
             .field("pending_offchain_order_id", &self.pending_offchain_order_id)
+            .field(
+                "last_failed_offchain_order_id",
+                &self.last_failed_offchain_order_id,
+            )
             .field("threshold", &self.threshold)
             .field("last_price_usdc", &DebugOptionFloat(&self.last_price_usdc))
             .field("last_updated", &self.last_updated)
@@ -79,6 +94,7 @@ impl EventSourced for Position {
                 accumulated_long: FractionalShares::ZERO,
                 accumulated_short: FractionalShares::ZERO,
                 pending_offchain_order_id: None,
+                last_failed_offchain_order_id: None,
                 threshold: *threshold,
                 last_price_usdc: None,
                 last_updated: Some(*initialized_at),
@@ -145,6 +161,9 @@ impl EventSourced for Position {
             } => Ok(Some(Self {
                 net: (entity.net + shares_filled.inner())?,
                 pending_offchain_order_id: None,
+                // Successful fill: drop the failed-attempt anchor so the
+                // next rebalance cycle gets a fresh idempotency key.
+                last_failed_offchain_order_id: None,
                 last_updated: Some(*broker_timestamp),
                 ..entity.clone()
             })),
@@ -157,6 +176,7 @@ impl EventSourced for Position {
             } => Ok(Some(Self {
                 net: (entity.net - shares_filled.inner())?,
                 pending_offchain_order_id: None,
+                last_failed_offchain_order_id: None,
                 last_updated: Some(*broker_timestamp),
                 ..entity.clone()
             })),
@@ -165,8 +185,25 @@ impl EventSourced for Position {
                 offchain_order_id, ..
             } if entity.pending_offchain_order_id != Some(*offchain_order_id) => Ok(None),
 
-            OffChainOrderFailed { failed_at, .. } => Ok(Some(Self {
+            OffChainOrderFailed {
+                offchain_order_id,
+                failed_at,
+                ..
+            } => Ok(Some(Self {
                 pending_offchain_order_id: None,
+                // Stash the failed OID so the next placement attempt can
+                // reuse it as `client_order_id` and let the broker dedupe.
+                //
+                // Preserve the *first* failed anchor across a chain of
+                // failures: the broker recorded the original attempt under
+                // that key, so a later attempt whose own response was also
+                // lost must keep deduping against the original key. Overwriting
+                // with each new OID would point the next retry at a key the
+                // broker never saw, double-submitting the order. Cleared only
+                // by a successful fill.
+                last_failed_offchain_order_id: entity
+                    .last_failed_offchain_order_id
+                    .or(Some(*offchain_order_id)),
                 last_updated: Some(*failed_at),
                 ..entity.clone()
             })),
@@ -1412,15 +1449,17 @@ mod tests {
 
     #[test]
     fn offchain_failed_clears_pending() {
+        use PositionEvent::*;
+
         let offchain_order_id = OffchainOrderId::new();
 
         let position = replay::<Position>(vec![
-            PositionEvent::Initialized {
+            Initialized {
                 symbol: Symbol::new("AAPL").unwrap(),
                 threshold: one_share_threshold(),
                 initialized_at: Utc::now(),
             },
-            PositionEvent::OnChainOrderFilled {
+            OnChainOrderFilled {
                 trade_id: TradeId {
                     tx_hash: TxHash::random(),
                     log_index: 1,
@@ -1431,7 +1470,7 @@ mod tests {
                 block_timestamp: Utc::now(),
                 seen_at: Utc::now(),
             },
-            PositionEvent::OffChainOrderPlaced {
+            OffChainOrderPlaced {
                 offchain_order_id,
                 shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
                 direction: Direction::Sell,
@@ -1442,7 +1481,7 @@ mod tests {
                 },
                 placed_at: Utc::now(),
             },
-            PositionEvent::OffChainOrderFailed {
+            OffChainOrderFailed {
                 offchain_order_id,
                 error: "Market closed".to_string(),
                 failed_at: Utc::now(),
@@ -1456,6 +1495,152 @@ mod tests {
             position.pending_offchain_order_id.is_none(),
             "pending_offchain_order_id should be cleared \
              after OffChainOrderFailed"
+        );
+        assert_eq!(
+            position.last_failed_offchain_order_id,
+            Some(offchain_order_id),
+            "the failed order id should be stashed as the idempotency anchor \
+             so the next placement attempt reuses it as client_order_id"
+        );
+    }
+
+    #[test]
+    fn offchain_failed_preserves_first_failed_anchor() {
+        use PositionEvent::*;
+
+        let first_order_id = OffchainOrderId::new();
+        let second_order_id = OffchainOrderId::new();
+
+        let position = replay::<Position>(vec![
+            Initialized {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold: one_share_threshold(),
+                initialized_at: Utc::now(),
+            },
+            OnChainOrderFilled {
+                trade_id: TradeId {
+                    tx_hash: TxHash::random(),
+                    log_index: 1,
+                },
+                amount: FractionalShares::new(float!(1.5)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp: Utc::now(),
+                seen_at: Utc::now(),
+            },
+            OffChainOrderPlaced {
+                offchain_order_id: first_order_id,
+                shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                direction: Direction::Sell,
+                executor: SupportedExecutor::DryRun,
+                trigger_reason: TriggerReason::SharesThreshold {
+                    net_position_shares: float!(1.5),
+                    threshold_shares: float!(1),
+                },
+                placed_at: Utc::now(),
+            },
+            OffChainOrderFailed {
+                offchain_order_id: first_order_id,
+                error: "Market closed".to_string(),
+                failed_at: Utc::now(),
+            },
+            OffChainOrderPlaced {
+                offchain_order_id: second_order_id,
+                shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                direction: Direction::Sell,
+                executor: SupportedExecutor::DryRun,
+                trigger_reason: TriggerReason::SharesThreshold {
+                    net_position_shares: float!(1.5),
+                    threshold_shares: float!(1),
+                },
+                placed_at: Utc::now(),
+            },
+            OffChainOrderFailed {
+                offchain_order_id: second_order_id,
+                error: "Market closed".to_string(),
+                failed_at: Utc::now(),
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            position.last_failed_offchain_order_id,
+            Some(first_order_id),
+            "a chain of failures must keep the first anchor: the broker \
+             recorded the original attempt under that key, so later retries \
+             must keep deduping against it rather than a key the broker \
+             never saw"
+        );
+    }
+
+    #[test]
+    fn offchain_filled_clears_failed_anchor() {
+        use PositionEvent::*;
+
+        let failed_order_id = OffchainOrderId::new();
+        let retry_order_id = OffchainOrderId::new();
+
+        let position = replay::<Position>(vec![
+            Initialized {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold: one_share_threshold(),
+                initialized_at: Utc::now(),
+            },
+            OnChainOrderFilled {
+                trade_id: TradeId {
+                    tx_hash: TxHash::random(),
+                    log_index: 1,
+                },
+                amount: FractionalShares::new(float!(1.5)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp: Utc::now(),
+                seen_at: Utc::now(),
+            },
+            OffChainOrderPlaced {
+                offchain_order_id: failed_order_id,
+                shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                direction: Direction::Sell,
+                executor: SupportedExecutor::DryRun,
+                trigger_reason: TriggerReason::SharesThreshold {
+                    net_position_shares: float!(1.5),
+                    threshold_shares: float!(1),
+                },
+                placed_at: Utc::now(),
+            },
+            OffChainOrderFailed {
+                offchain_order_id: failed_order_id,
+                error: "Market closed".to_string(),
+                failed_at: Utc::now(),
+            },
+            OffChainOrderPlaced {
+                offchain_order_id: retry_order_id,
+                shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                direction: Direction::Sell,
+                executor: SupportedExecutor::DryRun,
+                trigger_reason: TriggerReason::SharesThreshold {
+                    net_position_shares: float!(1.5),
+                    threshold_shares: float!(1),
+                },
+                placed_at: Utc::now(),
+            },
+            OffChainOrderFilled {
+                offchain_order_id: retry_order_id,
+                shares_filled: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                direction: Direction::Sell,
+                executor_order_id: ExecutorOrderId::new("ORDER-RETRY"),
+                price: Usd::new(float!(150.50)),
+                broker_timestamp: Utc::now(),
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert!(
+            position.last_failed_offchain_order_id.is_none(),
+            "a successful fill must clear the failed-attempt anchor so the \
+             next rebalance cycle starts from a fresh idempotency key"
         );
     }
 
@@ -1597,6 +1782,7 @@ mod tests {
             accumulated_long: FractionalShares::new(float!(1.212)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
+            last_failed_offchain_order_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
@@ -1623,6 +1809,7 @@ mod tests {
             accumulated_long: FractionalShares::ZERO,
             accumulated_short: FractionalShares::new(float!(2.567)),
             pending_offchain_order_id: None,
+            last_failed_offchain_order_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
@@ -1649,6 +1836,7 @@ mod tests {
             accumulated_long: FractionalShares::new(float!(100)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
+            last_failed_offchain_order_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
@@ -1678,6 +1866,7 @@ mod tests {
             accumulated_long: FractionalShares::new(float!(30)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
+            last_failed_offchain_order_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
@@ -1707,6 +1896,7 @@ mod tests {
             accumulated_long: FractionalShares::new(float!(100)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
+            last_failed_offchain_order_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
@@ -1735,6 +1925,7 @@ mod tests {
             accumulated_long: FractionalShares::new(float!(10)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
+            last_failed_offchain_order_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
@@ -1764,6 +1955,7 @@ mod tests {
             accumulated_long: FractionalShares::new(float!(10)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
+            last_failed_offchain_order_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
@@ -1793,6 +1985,7 @@ mod tests {
             accumulated_long: FractionalShares::new(float!(100)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
+            last_failed_offchain_order_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: None,
             last_updated: Some(Utc::now()),
@@ -1872,6 +2065,7 @@ mod tests {
             accumulated_long: FractionalShares::new(float!(120)),
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
+            last_failed_offchain_order_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),

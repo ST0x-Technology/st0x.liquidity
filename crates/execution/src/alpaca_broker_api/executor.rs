@@ -386,8 +386,8 @@ mod tests {
     };
     use crate::alpaca_broker_api::order::AlpacaLimitPrice;
     use crate::{
-        CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason, Direction,
-        FractionalShares, Positive, Usd,
+        ClientOrderId, CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason,
+        Direction, FractionalShares, Positive, Usd,
     };
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
@@ -737,6 +737,7 @@ mod tests {
                 symbol: Symbol::new("AAPL").unwrap(),
                 shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
                 direction: Direction::Buy,
+                client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
             })
             .await
             .unwrap();
@@ -781,6 +782,7 @@ mod tests {
                 symbol: Symbol::new("AAPL").unwrap(),
                 shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
                 direction: Direction::Buy,
+                client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
             })
             .await
             .unwrap();
@@ -878,6 +880,7 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         };
 
         let result = executor.place_market_order(order).await;
@@ -912,6 +915,7 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         };
 
         let result = executor.place_market_order(order).await;
@@ -946,6 +950,7 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         };
 
         let result = executor.place_market_order(order).await;
@@ -1004,6 +1009,7 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         };
         executor.place_market_order(order1).await.unwrap();
 
@@ -1015,6 +1021,7 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         };
         executor.place_market_order(order2).await.unwrap();
 
@@ -1080,6 +1087,7 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         };
         executor.place_market_order(order1).await.unwrap();
 
@@ -1094,6 +1102,7 @@ mod tests {
             ))
             .unwrap(),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         };
         executor.place_market_order(order2).await.unwrap();
 

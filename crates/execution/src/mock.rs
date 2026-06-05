@@ -254,8 +254,10 @@ impl TryIntoExecutor for MockExecutorCtx {
 
 #[cfg(test)]
 mod tests {
+    use uuid::Uuid;
+
     use super::*;
-    use crate::{Direction, FractionalShares, Positive, Symbol};
+    use crate::{ClientOrderId, Direction, FractionalShares, Positive, Symbol};
 
     fn shares(value: &str) -> FractionalShares {
         FractionalShares::new(Float::parse(value.to_string()).unwrap())
@@ -293,6 +295,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: positive_shares("10"),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         };
 
         let placement = executor.place_market_order(order).await.unwrap();
@@ -310,6 +313,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: positive_shares("10"),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         };
 
         assert!(matches!(
@@ -424,6 +428,7 @@ mod tests {
                 symbol: Symbol::new("AAPL").unwrap(),
                 shares: positive_shares("2"),
                 direction: Direction::Sell,
+                client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
             })
             .await
             .unwrap();
@@ -456,6 +461,7 @@ mod tests {
                 symbol: Symbol::new("AAPL").unwrap(),
                 shares: positive_shares("20"),
                 direction: Direction::Sell,
+                client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
             })
             .await
             .unwrap();
@@ -493,6 +499,7 @@ mod tests {
                 symbol: Symbol::new("AAPL").unwrap(),
                 shares: positive_shares("5"),
                 direction: Direction::Sell,
+                client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
             })
             .await
             .unwrap();
@@ -523,6 +530,7 @@ mod tests {
                 symbol: Symbol::new("AAPL").unwrap(),
                 shares: positive_shares("2"),
                 direction: Direction::Buy,
+                client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
             })
             .await
             .unwrap();
@@ -546,6 +554,7 @@ mod tests {
                     symbol: Symbol::new("AAPL").unwrap(),
                     shares: positive_shares("2"),
                     direction: Direction::Buy,
+                    client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
                 })
                 .await
                 .unwrap_err(),

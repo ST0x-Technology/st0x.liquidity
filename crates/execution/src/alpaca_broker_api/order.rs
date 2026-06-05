@@ -120,6 +120,7 @@ pub(super) struct OrderRequest {
     pub order_type: &'static str,
     pub time_in_force: &'static str,
     pub extended_hours: bool,
+    pub client_order_id: ClientOrderId,
 }
 
 /// Order request for placing limit orders.
@@ -344,17 +345,83 @@ pub(super) async fn place_market_order(
         time_in_force: time_in_force.as_api_str(),
         // Alpaca only allows extended_hours=true for limit orders, not market orders
         extended_hours: false,
+        client_order_id: market_order.client_order_id.clone(),
     };
 
-    let response = client.place_order(&request).await?;
+    // Alpaca rejects a re-used `client_order_id` on an active order with a 422
+    // ("client_order_id must be unique"), not a duplicate-tolerant 2xx. That is
+    // not a real failure: it means a prior attempt's 2xx response was lost after
+    // the broker already recorded the order. Reconcile by adopting the order the
+    // broker actually accepted (looked up by `client_order_id`), so the retry is
+    // idempotent instead of failing and leaving the position un-hedged. The
+    // adopted order's quantity is the broker's recorded intent, which may differ
+    // from this attempt's recomputed `placed_shares`; any residual is picked up
+    // by the next position scan.
+    let (order_id, shares) = match client.place_order(&request).await {
+        Ok(response) => (response.id, placed_shares),
+        Err(error) if is_duplicate_client_order_id(&error) => {
+            debug!(
+                client_order_id = %market_order.client_order_id,
+                "Broker rejected duplicate client_order_id; reconciling the order it already accepted"
+            );
+            let existing = client
+                .get_order_by_client_order_id(&market_order.client_order_id)
+                .await?
+                .ok_or_else(|| AlpacaBrokerApiError::DuplicateOrderNotFound {
+                    client_order_id: market_order.client_order_id.clone(),
+                })?;
+            (existing.id, existing.quantity)
+        }
+        Err(error) => return Err(error),
+    };
 
     Ok(OrderPlacement {
-        order_id: response.id.to_string(),
+        order_id: order_id.to_string(),
         symbol: market_order.symbol,
-        shares: placed_shares,
+        shares,
         direction: market_order.direction,
         placed_at: Utc::now(),
     })
+}
+
+/// Alpaca returns a 422 with "client_order_id must be unique" when a placement
+/// re-uses a `client_order_id` already attached to an active order. This is the
+/// recoverable duplicate-submission case (the original 2xx was lost in flight),
+/// distinct from other 422s such as insufficient buying power or invalid order.
+fn is_duplicate_client_order_id(error: &AlpacaBrokerApiError) -> bool {
+    use AlpacaBrokerApiError::*;
+
+    match error {
+        ApiError {
+            status, message, ..
+        } => {
+            *status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
+                && message.contains("client_order_id must be unique")
+        }
+        HttpClient(_)
+        | JsonParse(_)
+        | InvalidHeader(_)
+        | InvalidOrderId(_)
+        | IncompleteFilledOrder { .. }
+        | AccountNotActive { .. }
+        | CryptoOrderFailed { .. }
+        | DuplicateOrderNotFound { .. }
+        | CalendarIterationInvariantViolation
+        | AssetNotActive { .. }
+        | AssetNotTradable { .. }
+        | InvalidLimitPricePrecision { .. }
+        | UsdBalanceConversion(_)
+        | FractionalCents(_)
+        | InvalidSymbol(_)
+        | MissingPositionQuantity
+        | BelowPrecision { .. }
+        | UsdcBelowPrecision { .. }
+        | UsdcPrecisionExceeded { .. }
+        | NotPositive(_)
+        | FloatConversion(_)
+        | LatestTrade(_)
+        | CounterTradeCost(_) => false,
+    }
 }
 
 pub(super) async fn place_limit_order(
@@ -589,6 +656,7 @@ mod tests {
     use uuid::uuid;
 
     use super::*;
+    use crate::ClientOrderId;
     use crate::alpaca_broker_api::auth::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
     };
@@ -681,7 +749,8 @@ mod tests {
                     "side": "buy",
                     "type": "market",
                     "time_in_force": "day",
-                    "extended_hours": false
+                    "extended_hours": false,
+                    "client_order_id": "33333333-3333-4333-8333-333333333333"
                 }));
             then.status(200)
                 .header("content-type", "application/json")
@@ -700,6 +769,9 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(100))).unwrap(),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(uuid!(
+                "33333333-3333-4333-8333-333333333333"
+            )),
         };
 
         let placement = place_market_order(&client, market_order, TimeInForce::Day)
@@ -727,7 +799,8 @@ mod tests {
                     "side": "sell",
                     "type": "market",
                     "time_in_force": "day",
-                    "extended_hours": false
+                    "extended_hours": false,
+                    "client_order_id": "44444444-4444-4444-8444-444444444444"
                 }));
             then.status(200)
                 .header("content-type", "application/json")
@@ -746,6 +819,9 @@ mod tests {
             symbol: Symbol::new("TSLA").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(50))).unwrap(),
             direction: Direction::Sell,
+            client_order_id: ClientOrderId::from_uuid(uuid!(
+                "44444444-4444-4444-8444-444444444444"
+            )),
         };
 
         let placement = place_market_order(&client, market_order, TimeInForce::Day)
@@ -757,6 +833,155 @@ mod tests {
         assert_eq!(placement.symbol.to_string(), "TSLA");
         assert_eq!(placement.shares.inner(), FractionalShares::new(float!(50)));
         assert_eq!(placement.direction, Direction::Sell);
+    }
+
+    #[tokio::test]
+    async fn place_market_order_reconciles_duplicate_client_order_id() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let client_order_uuid = uuid!("66666666-6666-4666-8666-666666666666");
+        let client_order_id = client_order_uuid.to_string();
+        let existing_order_id = "904837e3-3b76-47ec-b432-046db621571b";
+
+        // The broker rejects the re-used client_order_id with a 422 because it
+        // already recorded the original attempt (whose 2xx was lost in flight).
+        let place_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(422)
+                .header("content-type", "application/json")
+                .json_body(json!({"message": "client_order_id must be unique"}));
+        });
+
+        // We reconcile by adopting the order the broker actually accepted.
+        let lookup_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(
+                    "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders:by_client_order_id",
+                )
+                .query_param("client_order_id", client_order_id.as_str());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": existing_order_id,
+                    "symbol": "AAPL",
+                    "qty": "7",
+                    "side": "buy",
+                    "status": "new",
+                    "filled_avg_price": null
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let market_order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            // This attempt's recomputed intent is 10 shares, but the broker
+            // already holds the original 7-share order under this key.
+            shares: Positive::new(FractionalShares::new(float!(10))).unwrap(),
+            direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(client_order_uuid),
+        };
+
+        let placement = place_market_order(&client, market_order, TimeInForce::Day)
+            .await
+            .unwrap();
+
+        place_mock.assert();
+        lookup_mock.assert();
+        // Adopts the broker's recorded order id and its recorded quantity (7),
+        // not this attempt's recomputed 10 shares -- the residual is left for
+        // the next position scan to hedge.
+        assert_eq!(placement.order_id, existing_order_id);
+        assert_eq!(placement.shares.inner(), FractionalShares::new(float!(7)));
+        assert_eq!(placement.direction, Direction::Buy);
+    }
+
+    #[tokio::test]
+    async fn place_market_order_errors_when_duplicate_order_not_found() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let client_order_uuid = uuid!("77777777-7777-4777-8777-777777777777");
+
+        let place_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(422)
+                .header("content-type", "application/json")
+                .json_body(json!({"message": "client_order_id must be unique"}));
+        });
+
+        // The broker reported a duplicate but the lookup finds nothing -- an
+        // inconsistent state that must surface as an error so the job retries.
+        let lookup_mock = server.mock(|when, then| {
+            when.method(GET).path(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders:by_client_order_id",
+            );
+            then.status(404)
+                .header("content-type", "application/json")
+                .json_body(json!({"code": 40_410_000_u64, "message": "order not found"}));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let market_order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(10))).unwrap(),
+            direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(client_order_uuid),
+        };
+
+        let error = place_market_order(&client, market_order, TimeInForce::Day)
+            .await
+            .unwrap_err();
+
+        place_mock.assert();
+        lookup_mock.assert();
+        assert!(
+            matches!(
+                error,
+                AlpacaBrokerApiError::DuplicateOrderNotFound { ref client_order_id }
+                    if client_order_id == &ClientOrderId::from_uuid(client_order_uuid)
+            ),
+            "expected DuplicateOrderNotFound, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn place_market_order_propagates_non_duplicate_422() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        // A 422 that is NOT the duplicate-key case must propagate unchanged and
+        // must not trigger the by-client-order-id reconciliation lookup.
+        let place_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(422)
+                .header("content-type", "application/json")
+                .json_body(json!({"message": "insufficient buying power"}));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let market_order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(10))).unwrap(),
+            direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(uuid!(
+                "88888888-8888-4888-8888-888888888888"
+            )),
+        };
+
+        let error = place_market_order(&client, market_order, TimeInForce::Day)
+            .await
+            .unwrap_err();
+
+        place_mock.assert();
+        assert!(
+            matches!(
+                error,
+                AlpacaBrokerApiError::ApiError { status, .. } if status.as_u16() == 422
+            ),
+            "expected a propagated 422 ApiError, got {error:?}"
+        );
     }
 
     #[tokio::test]
@@ -1215,7 +1440,8 @@ mod tests {
                     "side": "sell",
                     "type": "market",
                     "time_in_force": "day",
-                    "extended_hours": false
+                    "extended_hours": false,
+                    "client_order_id": "55555555-5555-4555-8555-555555555555"
                 }));
             then.status(200)
                 .header("content-type", "application/json")
@@ -1237,6 +1463,9 @@ mod tests {
             symbol: Symbol::new("RKLB").unwrap(),
             shares: Positive::new(FractionalShares::new(onchain_shares)).unwrap(),
             direction: Direction::Sell,
+            client_order_id: ClientOrderId::from_uuid(uuid!(
+                "55555555-5555-4555-8555-555555555555"
+            )),
         };
 
         let placement = place_market_order(&client, market_order, TimeInForce::Day)
@@ -1267,6 +1496,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(tiny)).unwrap(),
             direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         };
 
         let err = place_market_order(&client, market_order, TimeInForce::Day)

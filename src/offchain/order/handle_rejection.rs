@@ -130,7 +130,9 @@ mod tests {
     use chrono::Utc;
 
     use st0x_event_sorcery::StoreBuilder;
-    use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
+    use st0x_execution::{
+        ClientOrderId, Direction, FractionalShares, Positive, SupportedExecutor, Symbol,
+    };
     use st0x_float_macro::float;
 
     use super::*;
@@ -228,6 +230,7 @@ mod tests {
                     shares,
                     direction,
                     executor: SupportedExecutor::DryRun,
+                    client_order_id: ClientOrderId::from_uuid(offchain_order_id.as_uuid()),
                 },
             )
             .await
