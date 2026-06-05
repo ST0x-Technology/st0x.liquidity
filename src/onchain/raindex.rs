@@ -601,17 +601,23 @@ impl<W: Wallet> Raindex for RaindexService<W> {
 mod tests {
     use alloy::network::Ethereum;
     use alloy::node_bindings::{Anvil, AnvilInstance};
+    use alloy::primitives::Log as PrimitiveLog;
     use alloy::primitives::{B256, b256};
     use alloy::providers::Provider;
     use alloy::providers::fillers::{
         BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
     };
     use alloy::providers::{Identity, ProviderBuilder, RootProvider};
+    use alloy::rpc::types::Log;
     use alloy::transports::{RpcError, TransportErrorKind};
     use proptest::prelude::*;
     use tracing_test::traced_test;
 
+    use alloy::providers::mock::Asserter;
+    use serde_json::json;
+
     use st0x_evm::NoOpErrorRegistry;
+    use st0x_evm::ReadOnlyEvm;
     use st0x_evm::Wallet;
     use st0x_evm::local::RawPrivateKeyWallet;
 
@@ -783,6 +789,164 @@ mod tests {
             vault_registry_projection,
             owner,
         )
+    }
+
+    /// Empty vault-registry projection for scan tests that never load the
+    /// registry (`find_recent_withdrawal` only reads logs).
+    async fn empty_vault_registry_projection() -> Arc<VaultRegistryProjection> {
+        let pool = crate::test_utils::setup_test_db().await;
+        let (_store, projection) = StoreBuilder::<VaultRegistry>::new(pool)
+            .build(())
+            .await
+            .unwrap();
+        projection
+    }
+
+    #[tokio::test]
+    async fn find_recent_withdrawal_is_inconclusive_when_node_lags() {
+        let asserter = Asserter::new();
+        let from_block = 100u64;
+        // Every scan attempt sees an empty get_logs and a head BELOW from_block --
+        // a lagging load-balanced node. The scan must NOT report absence (which
+        // would let the caller re-withdraw and double-spend); it must surface a
+        // retryable error so the resume re-runs instead.
+        for _ in 0..SCAN_ATTEMPTS {
+            asserter.push_success(&json!([]));
+            asserter.push_success(&json!("0x32")); // head = 50 < from_block
+        }
+
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let service = RaindexService::new(
+            ReadOnlyEvm::new(provider),
+            Address::ZERO,
+            empty_vault_registry_projection().await,
+            Address::ZERO,
+        );
+
+        let error = service
+            .find_recent_withdrawal(USDC_BASE, TEST_VAULT_ID, from_block)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, RaindexError::ScanInconclusive { from_block: fb } if fb == from_block),
+            "lagging node must yield retryable ScanInconclusive, got: {error:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn find_recent_withdrawal_is_none_when_caught_up_and_absent() {
+        let asserter = Asserter::new();
+        let from_block = 100u64;
+        // Empty get_logs corroborated across every attempt, with a head well past
+        // from_block: the withdrawal is genuinely absent, so re-issuing is safe.
+        for _ in 0..SCAN_ATTEMPTS {
+            asserter.push_success(&json!([]));
+            asserter.push_success(&json!("0x200")); // head = 512 >> from_block
+        }
+
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let service = RaindexService::new(
+            ReadOnlyEvm::new(provider),
+            Address::ZERO,
+            empty_vault_registry_projection().await,
+            Address::ZERO,
+        );
+
+        let result = service
+            .find_recent_withdrawal(USDC_BASE, TEST_VAULT_ID, from_block)
+            .await
+            .unwrap();
+
+        assert_eq!(result, None);
+    }
+
+    /// A `WithdrawV2` from this owner's vault, mined at `block_number`, that
+    /// `find_recent_withdrawal` will see for `(USDC_BASE, TEST_VAULT_ID)`.
+    fn withdraw_log(block_number: u64, withdraw_amount: U256) -> Log {
+        let event = IOrderBookV6::WithdrawV2 {
+            sender: Address::ZERO,
+            token: USDC_BASE,
+            vaultId: TEST_VAULT_ID.0,
+            targetAmount: B256::ZERO,
+            withdrawAmount: B256::ZERO,
+            withdrawAmountUint256: withdraw_amount,
+        };
+
+        Log {
+            inner: PrimitiveLog {
+                address: Address::ZERO,
+                data: event.encode_log_data(),
+            },
+            block_hash: None,
+            block_number: Some(block_number),
+            block_timestamp: None,
+            transaction_hash: Some(b256!(
+                "0x00000000000000000000000000000000000000000000000000000000000000aa"
+            )),
+            transaction_index: None,
+            log_index: None,
+            removed: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn find_recent_withdrawal_excludes_match_at_from_block() {
+        let asserter = Asserter::new();
+        let from_block = 100u64;
+        // A matching withdrawal mined AT from_block belongs to an earlier transfer:
+        // from_block is the head captured *before* this transfer's withdraw, so this
+        // transfer's withdraw can only land strictly after it. Adopting the at-block
+        // log would make the resume skip a withdraw it never issued.
+        let stale = json!([withdraw_log(from_block, U256::from(7u64))]);
+        for _ in 0..SCAN_ATTEMPTS {
+            asserter.push_success(&stale);
+            asserter.push_success(&json!("0x200")); // head = 512 >> from_block
+        }
+
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let service = RaindexService::new(
+            ReadOnlyEvm::new(provider),
+            Address::ZERO,
+            empty_vault_registry_projection().await,
+            Address::ZERO,
+        );
+
+        let result = service
+            .find_recent_withdrawal(USDC_BASE, TEST_VAULT_ID, from_block)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result, None,
+            "a withdrawal mined at from_block must be excluded (strictly-after semantics)",
+        );
+    }
+
+    #[tokio::test]
+    async fn find_recent_withdrawal_adopts_match_after_from_block() {
+        let asserter = Asserter::new();
+        let from_block = 100u64;
+        let amount = U256::from(7u64);
+        let log = withdraw_log(from_block + 1, amount);
+        let expected_tx = log.transaction_hash.unwrap();
+        // The very first scan finds the strictly-after match and adopts it.
+        asserter.push_success(&json!([log]));
+
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let service = RaindexService::new(
+            ReadOnlyEvm::new(provider),
+            Address::ZERO,
+            empty_vault_registry_projection().await,
+            Address::ZERO,
+        );
+
+        let result = service
+            .find_recent_withdrawal(USDC_BASE, TEST_VAULT_ID, from_block)
+            .await
+            .unwrap();
+
+        assert_eq!(result, Some((expected_tx, amount)));
     }
 
     #[tokio::test]

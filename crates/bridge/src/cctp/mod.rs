@@ -301,6 +301,11 @@ pub enum CctpError {
     RpcTransport(#[from] RpcError<TransportErrorKind>),
     #[error("ABI decode error: {0}")]
     SolType(#[from] alloy::sol_types::Error),
+    /// A burn scan could not confirm presence or absence: the queried node is not
+    /// confirmations-deep past `from_block`, so an empty result may be RPC lag
+    /// rather than a true absence. Retryable -- the caller must NOT re-burn on it.
+    #[error("burn scan inconclusive: node not caught up past block {from_block}")]
+    ScanInconclusive { from_block: u64 },
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("Attestation timeout after {attempts} attempts: {source}")]
@@ -671,19 +676,28 @@ where
     }
 
     /// Scans the burn source chain for an already-submitted burn matching
-    /// `amount` at or after `from_block`, for crash-safe resume. Delegates to
-    /// the source endpoint for the given direction.
+    /// `(amount, destinationDomain, recipient)` at or after `from_block`, for
+    /// crash-safe resume. Delegates to the source endpoint for the given
+    /// direction.
     async fn find_recent_burn(
         &self,
         direction: BridgeDirection,
         amount: U256,
+        recipient: Address,
         from_block: u64,
     ) -> Result<Option<TxHash>, Self::Error> {
+        let dest_domain = direction.dest_domain();
         match direction {
             BridgeDirection::EthereumToBase => {
-                self.ethereum.find_recent_burn(amount, from_block).await
+                self.ethereum
+                    .find_recent_burn(amount, dest_domain, recipient, from_block)
+                    .await
             }
-            BridgeDirection::BaseToEthereum => self.base.find_recent_burn(amount, from_block).await,
+            BridgeDirection::BaseToEthereum => {
+                self.base
+                    .find_recent_burn(amount, dest_domain, recipient, from_block)
+                    .await
+            }
         }
     }
 

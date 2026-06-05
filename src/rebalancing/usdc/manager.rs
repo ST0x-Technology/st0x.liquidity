@@ -1138,7 +1138,12 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
     ) -> Result<BurnReceipt, UsdcTransferError> {
         let burn_receipt = match self
             .cctp_bridge
-            .find_recent_burn(BridgeDirection::BaseToEthereum, amount, from_block)
+            .find_recent_burn(
+                BridgeDirection::BaseToEthereum,
+                amount,
+                self.market_maker_wallet,
+                from_block,
+            )
             .await
         {
             Ok(Some(existing_tx)) => {
