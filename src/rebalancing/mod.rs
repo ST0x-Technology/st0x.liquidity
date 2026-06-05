@@ -11,7 +11,7 @@ pub(crate) mod trigger;
 pub(crate) mod usdc;
 
 pub(crate) use rebalancer::Rebalancer;
-pub(crate) use spawn::{RebalancerServices, RebalancingCqrsFrameworks};
+pub(crate) use spawn::{RebalancerServices, RebalancingCqrsFrameworks, to_wrapped_equities};
 #[cfg(test)]
 pub(crate) use trigger::drain_pending_jobs;
 pub(crate) use trigger::{

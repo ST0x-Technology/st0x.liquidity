@@ -33,6 +33,7 @@ use st0x_execution::{
 use st0x_finance::{Usd, Usdc};
 use st0x_float_macro::float;
 use st0x_raindex::{Raindex, RaindexVaultId};
+use st0x_wrapper::MockWrapper;
 
 use super::{ExpectedEvent, assert_events, fetch_events};
 use crate::bindings::{IERC20, TestERC20};
@@ -59,7 +60,6 @@ use crate::tokenization::mock::MockTokenizer;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::vault_lookup::{MockVaultLookup, VaultLookup};
 use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryId};
-use crate::wrapper::mock::MockWrapper;
 
 const TEST_ORDERBOOK: Address = address!("0x0000000000000000000000000000000000000001");
 const TEST_ORDER_OWNER: Address = address!("0x0000000000000000000000000000000000000002");
@@ -462,7 +462,7 @@ fn build_equity_transfer_with_wrapper(
     mock_wrapper: MockWrapper,
     wallet: Address,
 ) -> Arc<CrossVenueEquityTransfer> {
-    let wrapper: Arc<dyn crate::wrapper::Wrapper> = Arc::new(mock_wrapper);
+    let wrapper: Arc<dyn st0x_wrapper::Wrapper> = Arc::new(mock_wrapper);
 
     let equity_services = EquityTransferServices {
         raindex: Arc::clone(&raindex),
@@ -502,7 +502,7 @@ async fn build_equity_transfer_with_service(
     wallet: Address,
     service: &Arc<RebalancingService>,
 ) -> Arc<CrossVenueEquityTransfer> {
-    let wrapper: Arc<dyn crate::wrapper::Wrapper> = Arc::new(mock_wrapper);
+    let wrapper: Arc<dyn st0x_wrapper::Wrapper> = Arc::new(mock_wrapper);
 
     let equity_services = EquityTransferServices {
         raindex: Arc::clone(&raindex),

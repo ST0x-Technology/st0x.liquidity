@@ -14,13 +14,13 @@ use st0x_config::ImbalanceThreshold;
 use st0x_dto::{InFlightCash, InFlightEquity, SymbolInventory, UsdcInventory};
 use st0x_execution::{Direction, FractionalShares, HasZero, Symbol};
 use st0x_finance::{Usd, Usdc};
+use st0x_wrapper::{RatioError, UnderlyingPerWrapped};
 
 use super::snapshot::InventorySnapshotEvent;
 use super::venue_balance::{InventoryError, VenueBalance};
 use crate::equity_redemption::RedemptionAggregateId;
 use crate::tokenized_equity_mint::IssuerRequestId;
 use crate::usdc_rebalance::UsdcRebalanceId;
-use crate::wrapper::{RatioError, UnderlyingPerWrapped};
 
 /// Error type for inventory view operations.
 #[derive(Debug, thiserror::Error)]
@@ -1803,9 +1803,9 @@ mod tests {
     use rain_math_float::Float;
 
     use st0x_finance::Usdc;
+    use st0x_wrapper::RATIO_ONE;
 
     use super::*;
-    use crate::wrapper::RATIO_ONE;
     use st0x_float_macro::float;
 
     fn shares(amount: i64) -> FractionalShares {

@@ -453,6 +453,7 @@ mod tests {
 
     use st0x_event_sorcery::test_store;
     use st0x_raindex::Raindex;
+    use st0x_wrapper::{MockWrapper, Wrapper};
 
     use super::super::aggregate::WrappedEquityRecoveryServices;
     use super::*;
@@ -463,8 +464,6 @@ mod tests {
     use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
     use crate::tokenization::mock::MockTokenizer;
     use crate::vault_lookup::{MockVaultLookup, VaultLookup};
-    use crate::wrapper::Wrapper;
-    use crate::wrapper::mock::MockWrapper;
 
     #[tokio::test]
     async fn guard_contention_reschedules_without_dropping_the_recovery() {

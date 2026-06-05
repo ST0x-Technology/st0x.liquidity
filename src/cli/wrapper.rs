@@ -5,8 +5,9 @@ use std::io::Write;
 
 use st0x_config::Ctx;
 use st0x_execution::{FractionalShares, Positive, Symbol};
+use st0x_wrapper::{Wrapper, WrapperService};
 
-use crate::wrapper::{Wrapper, WrapperService};
+use crate::rebalancing::to_wrapped_equities;
 
 pub(super) async fn wrap_equity_command<Writer: Write>(
     stdout: &mut Writer,
@@ -17,7 +18,10 @@ pub(super) async fn wrap_equity_command<Writer: Write>(
     let wallet_ctx = ctx.wallet()?;
     let base_wallet = wallet_ctx.base_wallet().clone();
     let owner = base_wallet.address();
-    let wrapper = WrapperService::new(base_wallet, ctx.assets.equities.symbols.clone());
+    let wrapper = WrapperService::new(
+        base_wallet,
+        to_wrapped_equities(&ctx.assets.equities.symbols),
+    );
 
     wrap_equity_with_wrapper(stdout, &wrapper, owner, symbol, quantity).await
 }
@@ -78,7 +82,10 @@ pub(super) async fn unwrap_equity_command<Writer: Write>(
     let wallet_ctx = ctx.wallet()?;
     let base_wallet = wallet_ctx.base_wallet().clone();
     let owner = base_wallet.address();
-    let wrapper = WrapperService::new(base_wallet, ctx.assets.equities.symbols.clone());
+    let wrapper = WrapperService::new(
+        base_wallet,
+        to_wrapped_equities(&ctx.assets.equities.symbols),
+    );
 
     unwrap_equity_with_wrapper(stdout, &wrapper, owner, symbol, quantity).await
 }
@@ -130,13 +137,13 @@ mod tests {
     use url::Url;
 
     use st0x_execution::Symbol;
+    use st0x_wrapper::MockWrapper;
 
     use super::{
         unwrap_equity_command, unwrap_equity_with_wrapper, wrap_equity_command,
         wrap_equity_with_wrapper,
     };
     use crate::test_utils::positive_shares;
-    use crate::wrapper::mock::MockWrapper;
     use st0x_config::EvmCtx;
     use st0x_config::ExecutionThreshold;
     use st0x_config::{AssetsConfig, BrokerCtx, Ctx, EquitiesConfig, LogLevel, TradingMode};

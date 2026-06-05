@@ -9,13 +9,13 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, trace, warn};
 
 use st0x_execution::{FractionalShares, Positive, Symbol};
+use st0x_wrapper::{UnderlyingPerWrapped, WrapperError};
 
 use super::{RebalancingService, TokenAddressError, TriggeredOperation};
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::inventory::{
     BroadcastingInventory, EquityImbalanceError, Imbalance, ImbalanceThreshold,
 };
-use crate::wrapper::{UnderlyingPerWrapped, WrapperError};
 
 /// Maximum decimal places for Alpaca tokenization API quantities.
 const ALPACA_QUANTITY_MAX_DECIMAL_PLACES: u8 = 9;
@@ -318,11 +318,11 @@ mod tests {
 
     use st0x_dto::Statement;
     use st0x_execution::FractionalShares;
+    use st0x_wrapper::RATIO_ONE;
 
     use super::*;
     use crate::inventory::view::Operator;
     use crate::inventory::{Inventory, InventoryView, TransferOp, Venue};
-    use crate::wrapper::RATIO_ONE;
     use st0x_float_macro::float;
 
     fn one_to_one_ratio() -> UnderlyingPerWrapped {

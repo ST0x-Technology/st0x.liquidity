@@ -1,17 +1,30 @@
 //! WrapperService implementation for ERC-4626 token wrapping/unwrapping.
+//!
+//! This module and its private `IERC20`/`IERC4626` bindings are gated behind the
+//! `erc4626` feature; the [`Wrapper`](crate::Wrapper) trait and its domain types ship
+//! in the default build.
 
 use alloy::primitives::{Address, TxHash, U256};
+use alloy::sol;
 use alloy::sol_types::SolEvent;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use tracing::info;
 
-use st0x_config::EquityAssetConfig;
 use st0x_evm::{IntoErrorRegistry, OpenChainErrorRegistry, Wallet};
 use st0x_execution::Symbol;
 
-use super::{UnderlyingPerWrapped, Wrapper, WrapperError};
-use crate::bindings::{IERC20, IERC4626};
+use crate::{UnderlyingPerWrapped, WrappedEquity, Wrapper, WrapperError};
+
+sol!(
+    #![sol(all_derives = true, rpc)]
+    IERC20, env!("ST0X_IERC20_ABI")
+);
+
+sol!(
+    #![sol(all_derives = true, rpc)]
+    IERC4626, env!("ST0X_IERC4626_ABI")
+);
 
 /// One unit with 18 decimals for ratio queries.
 const RATIO_QUERY_AMOUNT: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
@@ -20,13 +33,13 @@ const RATIO_QUERY_AMOUNT: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0,
 ///
 /// Uses the wallet's embedded provider for read-only view calls (ratio
 /// queries) and the wallet itself for write transactions (deposit/redeem).
-pub(crate) struct WrapperService<W: Wallet> {
+pub struct WrapperService<W: Wallet> {
     wallet: W,
-    config: HashMap<Symbol, EquityAssetConfig>,
+    config: HashMap<Symbol, WrappedEquity>,
 }
 
 impl<W: Wallet> WrapperService<W> {
-    pub(crate) fn new(wallet: W, config: HashMap<Symbol, EquityAssetConfig>) -> Self {
+    pub fn new(wallet: W, config: HashMap<Symbol, WrappedEquity>) -> Self {
         Self { wallet, config }
     }
 
@@ -48,8 +61,8 @@ impl<W: Wallet> WrapperService<W> {
         Ok(UnderlyingPerWrapped::new(assets_per_share)?)
     }
 
-    /// Gets the asset config for a symbol.
-    pub(crate) fn lookup_equity(&self, symbol: &Symbol) -> Option<&EquityAssetConfig> {
+    /// Gets the configured token pair for a symbol.
+    fn lookup_equity(&self, symbol: &Symbol) -> Option<&WrappedEquity> {
         self.config.get(symbol)
     }
 }
@@ -64,7 +77,7 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
             .lookup_equity(symbol)
             .ok_or_else(|| WrapperError::SymbolNotConfigured(symbol.clone()))?;
 
-        self.get_ratio::<OpenChainErrorRegistry>(asset.tokenized_equity_derivative)
+        self.get_ratio::<OpenChainErrorRegistry>(asset.derivative)
             .await
     }
 
@@ -73,7 +86,7 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
             .lookup_equity(symbol)
             .ok_or_else(|| WrapperError::SymbolNotConfigured(symbol.clone()))?;
 
-        Ok(asset.tokenized_equity)
+        Ok(asset.underlying)
     }
 
     fn lookup_derivative(&self, symbol: &Symbol) -> Result<Address, WrapperError> {
@@ -81,7 +94,7 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
             .lookup_equity(symbol)
             .ok_or_else(|| WrapperError::SymbolNotConfigured(symbol.clone()))?;
 
-        Ok(asset.tokenized_equity_derivative)
+        Ok(asset.derivative)
     }
 
     async fn to_wrapped(
@@ -261,51 +274,108 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::Address;
-    use std::collections::HashMap;
+    use alloy::primitives::Bytes;
+    use alloy::providers::RootProvider;
+    use alloy::rpc::client::RpcClient;
+    use alloy::rpc::types::TransactionReceipt;
+    use std::sync::Arc;
 
-    use st0x_execution::Symbol;
+    use st0x_evm::{Evm, EvmError};
 
     use super::*;
-    use crate::test_utils::StubWallet;
-    use st0x_config::{EquityAssetConfig, OperationMode};
 
-    fn test_asset_config() -> EquityAssetConfig {
-        EquityAssetConfig {
-            tokenized_equity: Address::random(),
-            tokenized_equity_derivative: Address::random(),
-            vault_ids: Vec::new(),
-            trading: OperationMode::Enabled,
-            rebalancing: OperationMode::Disabled,
-            wrapped_equity_recovery: OperationMode::Disabled,
-            operational_limit: None,
+    /// Panicking wallet stub for tests that only exercise config lookups and
+    /// error paths (no real chain connectivity). Provider type matches
+    /// production (`RootProvider`).
+    struct StubWallet {
+        address: Address,
+        provider: RootProvider,
+    }
+
+    impl StubWallet {
+        fn stub(address: Address) -> Arc<dyn Wallet<Provider = RootProvider>> {
+            Arc::new(Self {
+                address,
+                provider: RootProvider::new(
+                    RpcClient::builder().http("http://stub.invalid".parse().unwrap()),
+                ),
+            })
         }
     }
 
-    fn service_with_symbol(symbol: &str, config: EquityAssetConfig) -> WrapperService<impl Wallet> {
+    #[async_trait]
+    impl Evm for StubWallet {
+        type Provider = RootProvider;
+
+        fn provider(&self) -> &RootProvider {
+            &self.provider
+        }
+    }
+
+    #[async_trait]
+    impl Wallet for StubWallet {
+        fn address(&self) -> Address {
+            self.address
+        }
+
+        async fn send_pending(
+            &self,
+            _contract: Address,
+            _calldata: Bytes,
+            _note: &str,
+        ) -> Result<TxHash, EvmError> {
+            panic!(
+                "StubWallet::send_pending called - use a real wallet in tests that need transactions"
+            )
+        }
+
+        async fn await_receipt(&self, _tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
+            panic!(
+                "StubWallet::await_receipt called - use a real wallet in tests that need transactions"
+            )
+        }
+
+        async fn send(
+            &self,
+            _contract: Address,
+            _calldata: Bytes,
+            _note: &str,
+        ) -> Result<TransactionReceipt, EvmError> {
+            panic!("StubWallet::send called - use a real wallet in tests that need transactions")
+        }
+    }
+
+    fn test_equity() -> WrappedEquity {
+        WrappedEquity {
+            underlying: Address::random(),
+            derivative: Address::random(),
+        }
+    }
+
+    fn service_with_symbol(symbol: &str, equity: WrappedEquity) -> WrapperService<impl Wallet> {
         let wallet = StubWallet::stub(Address::random());
         let mut equities = HashMap::new();
-        equities.insert(symbol.parse::<Symbol>().unwrap(), config);
+        equities.insert(symbol.parse::<Symbol>().unwrap(), equity);
         WrapperService::new(wallet, equities)
     }
 
     #[test]
     fn lookup_equity_returns_configured_symbol() {
-        let config = test_asset_config();
-        let expected_tokenized = config.tokenized_equity;
-        let expected_trd = config.tokenized_equity_derivative;
-        let service = service_with_symbol("AAPL", config);
+        let equity = test_equity();
+        let expected_underlying = equity.underlying;
+        let expected_derivative = equity.derivative;
+        let service = service_with_symbol("AAPL", equity);
 
         let result = service.lookup_equity(&"AAPL".parse().unwrap());
 
         assert!(result.is_some());
-        assert_eq!(result.unwrap().tokenized_equity_derivative, expected_trd);
-        assert_eq!(result.unwrap().tokenized_equity, expected_tokenized);
+        assert_eq!(result.unwrap().derivative, expected_derivative);
+        assert_eq!(result.unwrap().underlying, expected_underlying);
     }
 
     #[test]
     fn lookup_equity_returns_none_for_unconfigured() {
-        let service = service_with_symbol("AAPL", test_asset_config());
+        let service = service_with_symbol("AAPL", test_equity());
 
         let result = service.lookup_equity(&"TSLA".parse().unwrap());
 
@@ -314,9 +384,9 @@ mod tests {
 
     #[test]
     fn lookup_derivative_returns_vault_address() {
-        let config = test_asset_config();
-        let expected = config.tokenized_equity_derivative;
-        let service = service_with_symbol("AAPL", config);
+        let equity = test_equity();
+        let expected = equity.derivative;
+        let service = service_with_symbol("AAPL", equity);
 
         let result = service.lookup_derivative(&"AAPL".parse().unwrap()).unwrap();
 
@@ -325,9 +395,9 @@ mod tests {
 
     #[test]
     fn lookup_underlying_returns_underlying_address() {
-        let config = test_asset_config();
-        let expected = config.tokenized_equity;
-        let service = service_with_symbol("AAPL", config);
+        let equity = test_equity();
+        let expected = equity.underlying;
+        let service = service_with_symbol("AAPL", equity);
 
         let result = service.lookup_underlying(&"AAPL".parse().unwrap()).unwrap();
 
@@ -336,7 +406,7 @@ mod tests {
 
     #[test]
     fn lookup_derivative_errors_on_unconfigured_symbol() {
-        let service = service_with_symbol("AAPL", test_asset_config());
+        let service = service_with_symbol("AAPL", test_equity());
 
         let error = service
             .lookup_derivative(&"MSFT".parse().unwrap())
@@ -363,7 +433,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_ratio_for_symbol_errors_on_unconfigured() {
-        let service = service_with_symbol("AAPL", test_asset_config());
+        let service = service_with_symbol("AAPL", test_equity());
 
         let error = service
             .get_ratio_for_symbol(&"XYZ".parse().unwrap())

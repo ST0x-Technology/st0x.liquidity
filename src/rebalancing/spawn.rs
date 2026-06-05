@@ -17,6 +17,7 @@ use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiError, EmptySymbolError, Executor, Symbol,
 };
 use st0x_raindex::{RaindexService, RaindexVaultId};
+use st0x_wrapper::{WrappedEquity, WrapperService};
 
 use super::equity::CrossVenueEquityTransfer;
 use super::usdc::{CrossVenueCashTransfer, ResumeAlpacaToBase, ResumeBaseToAlpaca};
@@ -28,7 +29,6 @@ use crate::tokenization::Tokenizer;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
 use crate::vault_lookup::VaultLookup;
-use crate::wrapper::WrapperService;
 
 /// Errors that can occur when spawning the rebalancer.
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +39,25 @@ pub(crate) enum SpawnRebalancerError {
     Cctp(#[from] Box<CctpError>),
     #[error("failed to create wrapper service: {0}")]
     Wrapper(#[from] EmptySymbolError),
+}
+
+/// Adapts the config-layer equity asset map to the narrow per-symbol token pairs
+/// [`WrapperService`] needs, keeping `st0x-wrapper` independent of `st0x-config`.
+pub(crate) fn to_wrapped_equities(
+    equities: &HashMap<Symbol, EquityAssetConfig>,
+) -> HashMap<Symbol, WrappedEquity> {
+    equities
+        .iter()
+        .map(|(symbol, asset)| {
+            (
+                symbol.clone(),
+                WrappedEquity {
+                    underlying: asset.tokenized_equity,
+                    derivative: asset.tokenized_equity_derivative,
+                },
+            )
+        })
+        .collect()
 }
 
 pub(crate) struct RebalancingCqrsFrameworks {
@@ -107,7 +126,10 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
             .map_err(|error| SpawnRebalancerError::Cctp(Box::new(error)))?,
         );
 
-        let wrapper = Arc::new(WrapperService::new(base_wallet, equities));
+        let wrapper = Arc::new(WrapperService::new(
+            base_wallet,
+            to_wrapped_equities(&equities),
+        ));
 
         Ok(Self {
             broker,
@@ -214,9 +236,40 @@ mod tests {
     use crate::tokenization::alpaca::AlpacaTokenizationService;
     use crate::tokenization::mock::MockTokenizer;
     use crate::vault_lookup::MockVaultLookup;
-    use crate::wrapper::mock::MockWrapper;
-    use st0x_config::{AssetsConfig, EquitiesConfig};
+    use st0x_config::{AssetsConfig, EquitiesConfig, OperationMode};
     use st0x_float_macro::float;
+    use st0x_wrapper::{MockWrapper, WrappedEquity};
+
+    #[test]
+    fn to_wrapped_equities_maps_underlying_and_derivative() {
+        let underlying = Address::random();
+        let derivative = Address::random();
+        let symbol: Symbol = "AAPL".parse().unwrap();
+
+        let mut config = HashMap::new();
+        config.insert(
+            symbol.clone(),
+            EquityAssetConfig {
+                tokenized_equity: underlying,
+                tokenized_equity_derivative: derivative,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
+
+        let wrapped = to_wrapped_equities(&config);
+
+        assert_eq!(
+            wrapped.get(&symbol),
+            Some(&WrappedEquity {
+                underlying,
+                derivative,
+            }),
+        );
+    }
 
     type BaseProvider = FillProvider<
         JoinFill<

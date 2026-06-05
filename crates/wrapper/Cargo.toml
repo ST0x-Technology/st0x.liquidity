@@ -1,0 +1,28 @@
+[package]
+name = "st0x-wrapper"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+erc4626 = ["dep:tracing"]
+mock = []
+
+[dependencies]
+alloy.workspace = true
+async-trait.workspace = true
+st0x-evm.workspace = true
+st0x-execution.workspace = true
+thiserror.workspace = true
+
+# Optional dep gated behind the `erc4626` feature (WrapperService implementation only).
+tracing = { workspace = true, optional = true }
+
+[dev-dependencies]
+alloy-primitives.workspace = true
+rain-math-float.workspace = true
+st0x-float-macro.workspace = true
+tokio = { workspace = true, features = ["full"] }
+
+[lints]
+workspace = true

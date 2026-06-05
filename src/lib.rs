@@ -52,7 +52,6 @@ mod onchain_trade;
 mod position;
 mod position_check;
 mod rebalancing;
-mod shares;
 mod symbol;
 mod tokenization;
 mod trading;
@@ -64,7 +63,6 @@ mod usdc_rebalance;
 mod vault_lookup;
 mod vault_registry;
 mod wrapped_equity_recovery;
-mod wrapper;
 
 pub use st0x_config::{
     ExtraLayer, FileLogGuard, TelemetryError, TelemetryGuard, mk_env_filter, setup_tracing,

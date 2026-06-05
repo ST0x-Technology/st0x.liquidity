@@ -130,6 +130,7 @@ mod tests {
     use st0x_execution::{Direction, FractionalShares, Symbol};
     use st0x_finance::Usdc;
     use st0x_float_macro::float;
+    use st0x_wrapper::MockWrapper;
 
     use super::*;
     use crate::inventory::snapshot::{InventorySnapshotCommand, InventorySnapshotId};
@@ -146,7 +147,6 @@ mod tests {
     use crate::tokenization::mock::MockTokenizer;
     use crate::vault_lookup::MockVaultLookup;
     use crate::vault_registry::{VaultRegistryCommand, VaultRegistryId};
-    use crate::wrapper::mock::MockWrapper;
     use st0x_config::{AssetsConfig, EquitiesConfig, ExecutionThreshold};
 
     fn test_trigger_config() -> RebalancingServiceConfig {

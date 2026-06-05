@@ -2213,12 +2213,12 @@ mod tests {
     use st0x_event_sorcery::{AggregateError, LifecycleError, TestHarness, TestStore, replay};
     use st0x_float_macro::float;
     use st0x_raindex::RaindexVaultId;
+    use st0x_wrapper::MockWrapper;
 
     use super::*;
     use crate::onchain::mock::MockRaindex;
     use crate::tokenization::mock::MockTokenizer;
     use crate::vault_lookup::MockVaultLookup;
-    use crate::wrapper::mock::MockWrapper;
 
     fn mock_vault_lookup() -> MockVaultLookup {
         MockVaultLookup::new().with_default_vault(RaindexVaultId(B256::ZERO))
