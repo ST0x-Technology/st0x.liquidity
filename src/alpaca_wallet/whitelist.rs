@@ -60,7 +60,7 @@ mod tests {
     use alloy::primitives::address;
     use httpmock::prelude::*;
     use serde_json::json;
-    use uuid::uuid;
+    use uuid::{Uuid, uuid};
 
     use st0x_execution::AlpacaAccountId;
 
@@ -352,8 +352,7 @@ mod tests {
         let api_key = std::env::var("ALPACA_BROKER_API_KEY").ok()?;
         let api_secret = std::env::var("ALPACA_BROKER_API_SECRET").ok()?;
         let account_id_str = std::env::var("ALPACA_BROKER_ACCOUNT_ID").ok()?;
-        let account_id =
-            AlpacaAccountId::new(account_id_str.parse::<uuid::Uuid>().expect("valid UUID"));
+        let account_id = AlpacaAccountId::new(account_id_str.parse::<Uuid>().expect("valid UUID"));
 
         Some(AlpacaWalletClient::new(
             "https://broker-api.sandbox.alpaca.markets".to_string(),

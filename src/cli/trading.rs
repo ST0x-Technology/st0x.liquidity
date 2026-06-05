@@ -642,6 +642,7 @@ mod tests {
     use httpmock::MockServer;
     use serde_json::json;
     use url::Url;
+    use uuid::uuid;
 
     use st0x_config::{
         AssetsConfig, BrokerCtx, EquitiesConfig, EvmCtx, ExecutionThreshold, LogLevel, TradingMode,
@@ -652,7 +653,7 @@ mod tests {
     use crate::test_utils::{positive_shares, setup_test_db};
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
-        AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b"));
+        AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
     fn create_base_test_ctx() -> Ctx {
         Ctx {

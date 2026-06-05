@@ -175,6 +175,58 @@ impl<W: Wallet> CctpEndpoint<W> {
         Ok(None)
     }
 
+    /// Scans for a `MintAndWithdraw` event minting to `recipient` strictly after
+    /// `from_block`, returning the receipt of the most recent match.
+    ///
+    /// Used for crash-safe mint recovery: a transfer records the destination
+    /// chain head before submitting the mint, so on resume this detects an
+    /// already-submitted mint instead of re-minting (which reverts on the
+    /// already-used CCTP nonce). The mint is recorded strictly after the captured
+    /// head, so the scan excludes the head block itself -- this bounds the window
+    /// to blocks mined after capture and prevents adopting an earlier mint to the
+    /// same wallet. Matching on `mintRecipient` and `mintToken` plus this bound
+    /// and the single-in-flight invariant (one USDC rebalance at a time) guarantees the
+    /// match is the resuming transfer's mint. The event carries the actual amount
+    /// received and fee collected, so the adopted mint records the same inventory
+    /// figures a fresh mint would.
+    pub(super) async fn find_recent_mint(
+        &self,
+        recipient: Address,
+        from_block: u64,
+    ) -> Result<Option<MintReceipt>, CctpError> {
+        let filter = Filter::new()
+            .from_block(from_block)
+            .address(self.token_messenger_address)
+            .event_signature(TokenMessengerV2::MintAndWithdraw::SIGNATURE_HASH);
+
+        let logs = self.wallet.provider().get_logs(&filter).await?;
+
+        for log in logs.iter().rev() {
+            let decoded = log.log_decode::<TokenMessengerV2::MintAndWithdraw>()?;
+            let event = decoded.data();
+
+            if event.mintRecipient == recipient
+                && event.mintToken == self.usdc_address
+                && log.block_number.is_some_and(|block| block > from_block)
+                && let Some(tx_hash) = log.transaction_hash
+            {
+                debug!(target: "bridge", %tx_hash, from_block, "Found existing mint during resume");
+                return Ok(Some(MintReceipt {
+                    tx: tx_hash,
+                    amount: event.amount,
+                    fee_collected: event.feeCollected,
+                }));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Returns the current head of this endpoint's chain.
+    pub(super) async fn current_block(&self) -> Result<u64, CctpError> {
+        Ok(self.wallet.provider().get_block_number().await?)
+    }
+
     /// Claims USDC on this chain by submitting the attestation.
     ///
     /// Parses the `MintAndWithdraw` event from the transaction receipt to extract

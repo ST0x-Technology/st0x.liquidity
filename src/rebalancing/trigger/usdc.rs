@@ -967,6 +967,7 @@ mod tests {
     use uuid::Uuid;
 
     use st0x_dto::Statement;
+    use st0x_execution::ClientOrderId;
     use st0x_float_macro::float;
 
     use super::*;
@@ -1518,7 +1519,7 @@ mod tests {
         UsdcRebalanceEvent::ConversionInitiated {
             direction,
             amount,
-            order_id: Uuid::nil(),
+            order_id: ClientOrderId::from_uuid(Uuid::nil()),
             initiated_at: ts(101),
         }
     }
@@ -1551,6 +1552,7 @@ mod tests {
         UsdcRebalanceEvent::BridgeAttestationReceived {
             attestation: vec![],
             cctp_nonce: 0,
+            mint_scan_from_block: Some(100),
             attested_at: ts(105),
         }
     }

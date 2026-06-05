@@ -573,6 +573,7 @@ mod tests {
     use alloy::primitives::{Address, TxHash, fixed_bytes};
     use chrono::Utc;
     use rain_math_float::Float;
+    use uuid::Uuid;
 
     use st0x_event_sorcery::EventSourced;
     use st0x_execution::{FractionalShares, Symbol};
@@ -840,7 +841,7 @@ mod tests {
 
     #[test]
     fn id_roundtrips_through_string() {
-        let id = WrappedEquityRecoveryId(uuid::Uuid::new_v4());
+        let id = WrappedEquityRecoveryId(Uuid::new_v4());
         let parsed = id.to_string().parse::<WrappedEquityRecoveryId>().unwrap();
         assert_eq!(id, parsed);
     }

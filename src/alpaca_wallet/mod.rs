@@ -232,7 +232,7 @@ mod tests {
     use httpmock::prelude::*;
     use serde_json::json;
     use std::time::Duration;
-    use uuid::uuid;
+    use uuid::{Uuid, uuid};
 
     use st0x_execution::AlpacaAccountId;
 
@@ -393,7 +393,7 @@ mod tests {
 
         let service = AlpacaWalletService::new_with_client(client, Some(polling_config));
 
-        let transfer_id = uuid::Uuid::new_v4();
+        let transfer_id = Uuid::new_v4();
 
         let status_mock = server.mock(|when, then| {
             when.method(GET)

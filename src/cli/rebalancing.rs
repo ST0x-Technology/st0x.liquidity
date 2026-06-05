@@ -5,6 +5,7 @@ use alloy::providers::Provider;
 use sqlx::SqlitePool;
 use std::io::{self, Write};
 use std::sync::Arc;
+use uuid::Uuid;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 use st0x_event_sorcery::StoreBuilder;
@@ -352,7 +353,7 @@ pub(super) async fn alpaca_tokenize_command<Writer: Write, Prov: Provider + Clon
 
     writeln!(stdout, "   Sending mint request to Alpaca...")?;
 
-    let issuer_request_id = IssuerRequestId::new(uuid::Uuid::new_v4().to_string());
+    let issuer_request_id = IssuerRequestId::new(Uuid::new_v4().to_string());
     let request = tokenization_service
         .request_mint(
             symbol.clone(),

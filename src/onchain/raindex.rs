@@ -320,16 +320,20 @@ impl<E: Evm> RaindexService<E> {
         Ok(Usdc::new(exact))
     }
 
-    /// Scans for a `WithdrawV2` event from this owner's vault at or after
+    /// Scans for a `WithdrawV2` event from this owner's vault strictly after
     /// `from_block`, returning the most recent match's `(tx_hash, withdrawn_amount)`.
     ///
     /// Crash-safe withdrawal recovery: a transfer records the chain head before
     /// the on-chain withdraw, so on resume this detects an already-submitted
     /// withdrawal and the caller adopts it instead of re-issuing (which would
-    /// double-spend the vault). Matches on `(sender == self.owner, token, vaultId)`
-    /// -- never on amount, so a partial fill is still detected -- and returns the
-    /// actual on-chain `withdrawAmountUint256` so the caller can reconcile a
-    /// partial withdrawal rather than laundering it into a full-amount burn.
+    /// double-spend the vault). The head is captured before submitting, so this
+    /// transfer's withdraw lands strictly after `from_block`; the scan excludes the
+    /// `from_block` block itself so an earlier withdrawal from the same vault (which
+    /// matches on the same `(sender, token, vaultId)`) is never adopted. Matches on
+    /// `(sender == self.owner, token, vaultId)` -- never on amount, so a partial
+    /// fill is still detected -- and returns the actual on-chain
+    /// `withdrawAmountUint256` so the caller can reconcile a partial withdrawal
+    /// rather than laundering it into a full-amount burn.
     ///
     /// Returns `Ok(None)` ONLY when the queried node is confirmations-deep past
     /// `from_block` and repeated scans agree the effect is absent. A node that may
@@ -361,6 +365,7 @@ impl<E: Evm> RaindexService<E> {
                 if event.sender == self.owner
                     && event.token == token
                     && event.vaultId == vault_id
+                    && log.block_number.is_some_and(|block| block > from_block)
                     && let Some(tx_hash) = log.transaction_hash
                 {
                     debug!(target: "orderbook", %tx_hash, from_block, "Found existing withdrawal during resume");

@@ -351,7 +351,7 @@ mod tests {
         EquityRedemptionStatus, EquityRedemptionTag, TransferOperation, TransferWarning,
         UsdcBridgeDirection, UsdcBridgeOperation, UsdcBridgeStatus, UsdcBridgeTag,
     };
-    use st0x_execution::{FractionalShares, Symbol};
+    use st0x_execution::{ClientOrderId, FractionalShares, Symbol};
     use st0x_finance::{Id, Usdc};
     use st0x_float_macro::float;
 
@@ -574,7 +574,7 @@ mod tests {
             serde_json::to_value(UsdcRebalanceEvent::ConversionInitiated {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(500)),
-                order_id: usdc_id,
+                order_id: ClientOrderId::from_uuid(usdc_id),
                 initiated_at: one_hour_ago,
             })
             .unwrap(),

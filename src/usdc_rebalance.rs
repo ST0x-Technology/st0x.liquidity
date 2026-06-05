@@ -75,6 +75,7 @@ use uuid::Uuid;
 
 use st0x_dto::{TransferOperation, UsdcBridgeOperation, UsdcBridgeStatus};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
+use st0x_execution::ClientOrderId;
 use st0x_finance::{Id, Usdc};
 
 use crate::alpaca_wallet::AlpacaTransferId;
@@ -182,7 +183,7 @@ pub(crate) enum UsdcRebalanceCommand {
     InitiateConversion {
         direction: RebalanceDirection,
         amount: Usdc,
-        order_id: Uuid,
+        order_id: ClientOrderId,
     },
     /// Confirm successful conversion. Valid only from `Converting` state.
     /// Contains filled_amount for accurate inventory tracking.
@@ -198,7 +199,10 @@ pub(crate) enum UsdcRebalanceCommand {
     /// Converts USDC (deposited via CCTP) to USD buying power for trading.
     /// Valid only from `DepositConfirmed` state.
     /// Amount must match the aggregate's deposit amount for consistency.
-    InitiatePostDepositConversion { order_id: Uuid, amount: Usdc },
+    InitiatePostDepositConversion {
+        order_id: ClientOrderId,
+        amount: Usdc,
+    },
     /// Record the intent to withdraw from source BEFORE the on-chain call.
     /// Captures the chain head (`from_block`) so a crash mid-withdrawal can be
     /// recovered by scanning from that block instead of blindly re-withdrawing
@@ -226,9 +230,12 @@ pub(crate) enum UsdcRebalanceCommand {
     InitiateBridging { burn_tx: TxHash },
     /// Record the Circle attestation. Valid only from `Bridging` state.
     /// The cctp_nonce is extracted from the attested message (not the burn tx, which has placeholder).
+    /// `mint_scan_from_block` is the destination chain head captured before the mint,
+    /// bounding the crash-safe resume scan that adopts an already-submitted mint.
     ReceiveAttestation {
         attestation: Vec<u8>,
         cctp_nonce: u64,
+        mint_scan_from_block: u64,
     },
     /// Confirm the CCTP mint transaction. Valid only from `Attested` state.
     /// Includes actual amounts from the MintAndWithdraw event for accurate inventory tracking.
@@ -261,7 +268,7 @@ pub(crate) enum UsdcRebalanceEvent {
     ConversionInitiated {
         direction: RebalanceDirection,
         amount: Usdc,
-        order_id: Uuid,
+        order_id: ClientOrderId,
         initiated_at: DateTime<Utc>,
     },
     /// Conversion completed successfully.
@@ -316,9 +323,16 @@ pub(crate) enum UsdcRebalanceEvent {
     },
     /// Circle attestation received. Enables minting on destination chain.
     /// The cctp_nonce is extracted from the attested message (the real nonce, not the placeholder).
+    /// `mint_scan_from_block` is the destination chain head captured before the mint,
+    /// persisted so a crash-safe resume scan for an already-submitted mint is bounded.
+    /// It is `None` for events persisted before this field existed: such a resume
+    /// has no bound and must reconcile manually rather than scan from genesis,
+    /// which could adopt an unrelated mint to the same wallet.
     BridgeAttestationReceived {
         attestation: Vec<u8>,
         cctp_nonce: u64,
+        #[serde(default)]
+        mint_scan_from_block: Option<u64>,
         attested_at: DateTime<Utc>,
     },
     /// CCTP mint transaction confirmed on destination chain.
@@ -396,7 +410,7 @@ pub(crate) enum UsdcRebalance {
     Converting {
         direction: RebalanceDirection,
         amount: Usdc,
-        order_id: Uuid,
+        order_id: ClientOrderId,
         initiated_at: DateTime<Utc>,
     },
     /// Conversion has completed, ready for next phase
@@ -413,7 +427,7 @@ pub(crate) enum UsdcRebalance {
     ConversionFailed {
         direction: RebalanceDirection,
         amount: Usdc,
-        order_id: Uuid,
+        order_id: ClientOrderId,
         reason: String,
         initiated_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
@@ -475,6 +489,10 @@ pub(crate) enum UsdcRebalance {
         burn_tx_hash: TxHash,
         cctp_nonce: u64,
         attestation: Vec<u8>,
+        /// Destination chain head captured before the mint, bounding the
+        /// crash-safe resume scan that adopts an already-submitted mint. `None`
+        /// for transfers whose `BridgeAttestationReceived` predates this field.
+        mint_scan_from_block: Option<u64>,
         initiated_at: DateTime<Utc>,
         attested_at: DateTime<Utc>,
     },
@@ -778,7 +796,7 @@ impl EventSourced for UsdcRebalance {
             } => Some(Self::Converting {
                 direction: direction.clone(),
                 amount: *amount,
-                order_id: *order_id,
+                order_id: order_id.clone(),
                 initiated_at: *initiated_at,
             }),
 
@@ -829,7 +847,7 @@ impl EventSourced for UsdcRebalance {
             ) => Self::Converting {
                 direction: direction.clone(),
                 amount: *amount,
-                order_id: *order_id,
+                order_id: order_id.clone(),
                 initiated_at: *initiated_at,
             },
 
@@ -864,7 +882,7 @@ impl EventSourced for UsdcRebalance {
             ) => Self::ConversionFailed {
                 direction: direction.clone(),
                 amount: *amount,
-                order_id: *order_id,
+                order_id: order_id.clone(),
                 reason: reason.clone(),
                 initiated_at: *initiated_at,
                 failed_at: *failed_at,
@@ -991,6 +1009,7 @@ impl EventSourced for UsdcRebalance {
                 BridgeAttestationReceived {
                     attestation,
                     cctp_nonce,
+                    mint_scan_from_block,
                     attested_at,
                 },
                 Self::Bridging {
@@ -1006,6 +1025,7 @@ impl EventSourced for UsdcRebalance {
                 burn_tx_hash: *burn_tx_hash,
                 cctp_nonce: *cctp_nonce,
                 attestation: attestation.clone(),
+                mint_scan_from_block: *mint_scan_from_block,
                 initiated_at: *initiated_at,
                 attested_at: *attested_at,
             },
@@ -1267,7 +1287,8 @@ impl EventSourced for UsdcRebalance {
             ReceiveAttestation {
                 attestation,
                 cctp_nonce,
-            } => self.transition_receive_attestation(attestation, cctp_nonce),
+                mint_scan_from_block,
+            } => self.transition_receive_attestation(attestation, cctp_nonce, mint_scan_from_block),
             ConfirmBridging {
                 mint_tx,
                 amount_received,
@@ -1323,7 +1344,7 @@ impl UsdcRebalance {
 
     fn transition_post_deposit_conversion(
         &self,
-        order_id: Uuid,
+        order_id: ClientOrderId,
         command_amount: Usdc,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
@@ -1558,6 +1579,7 @@ impl UsdcRebalance {
         &self,
         attestation: Vec<u8>,
         cctp_nonce: u64,
+        mint_scan_from_block: u64,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {
@@ -1572,6 +1594,7 @@ impl UsdcRebalance {
             Self::Bridging { .. } => Ok(vec![BridgeAttestationReceived {
                 attestation,
                 cctp_nonce,
+                mint_scan_from_block: Some(mint_scan_from_block),
                 attested_at: Utc::now(),
             }]),
             Self::Attested { .. } => Err(UsdcRebalanceError::InvalidCommand {
@@ -1759,12 +1782,40 @@ impl UsdcRebalance {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::fixed_bytes;
+    use serde_json::{from_value, json};
     use uuid::Uuid;
 
     use st0x_event_sorcery::{LifecycleError, TestHarness, replay};
 
     use super::*;
     use st0x_float_macro::float;
+
+    // An event persisted before `mint_scan_from_block` existed must still
+    // deserialize on replay -- to `None`, not a hard error -- so older aggregates
+    // can be rebuilt after this field was added (the `#[serde(default)]`).
+    #[test]
+    fn bridge_attestation_received_without_mint_scan_from_block_deserializes_to_none() {
+        let old_event = json!({
+            "BridgeAttestationReceived": {
+                "attestation": [1, 2, 3],
+                "cctp_nonce": 42,
+                "attested_at": "2026-01-01T00:00:00Z"
+            }
+        });
+
+        let event: UsdcRebalanceEvent =
+            from_value(old_event).expect("pre-field event must still deserialize");
+
+        let UsdcRebalanceEvent::BridgeAttestationReceived {
+            mint_scan_from_block,
+            ..
+        } = event
+        else {
+            panic!("expected BridgeAttestationReceived");
+        };
+
+        assert_eq!(mint_scan_from_block, None);
+    }
 
     #[tokio::test]
     async fn test_initiate_alpaca_to_base() {
@@ -2409,6 +2460,7 @@ mod tests {
             .when(UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: attestation.clone(),
                 cctp_nonce: 12345,
+                mint_scan_from_block: 8_675_309,
             })
             .await
             .events();
@@ -2416,6 +2468,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         let UsdcRebalanceEvent::BridgeAttestationReceived {
             attestation: event_attestation,
+            mint_scan_from_block,
             ..
         } = &events[0]
         else {
@@ -2423,6 +2476,51 @@ mod tests {
         };
 
         assert_eq!(*event_attestation, attestation);
+        assert_eq!(
+            *mint_scan_from_block,
+            Some(8_675_309),
+            "ReceiveAttestation must persist the destination-chain scan bound into the event",
+        );
+    }
+
+    #[test]
+    fn evolve_carries_mint_scan_from_block_into_attested() {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let initiated_at = Utc::now();
+        let bridging = UsdcRebalance::Bridging {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: Usdc::new(float!(1000)),
+            burn_tx_hash: burn_tx,
+            initiated_at,
+            burned_at: initiated_at,
+        };
+
+        let attested = UsdcRebalance::evolve(
+            &bridging,
+            &UsdcRebalanceEvent::BridgeAttestationReceived {
+                attestation: vec![0x01],
+                cctp_nonce: 42,
+                mint_scan_from_block: Some(8_675_309),
+                attested_at: Utc::now(),
+            },
+        )
+        .unwrap()
+        .expect("Bridging must evolve to Attested on BridgeAttestationReceived");
+
+        let UsdcRebalance::Attested {
+            mint_scan_from_block,
+            ..
+        } = attested
+        else {
+            panic!("expected Attested state");
+        };
+
+        assert_eq!(
+            mint_scan_from_block,
+            Some(8_675_309),
+            "evolve must carry the scan bound into the Attested state",
+        );
     }
 
     #[tokio::test]
@@ -2432,6 +2530,7 @@ mod tests {
             .when(UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01, 0x02],
                 cctp_nonce: 12345,
+                mint_scan_from_block: 100,
             })
             .await
             .then_expect_error();
@@ -2456,6 +2555,7 @@ mod tests {
             .when(UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01, 0x02],
                 cctp_nonce: 12345,
+                mint_scan_from_block: 100,
             })
             .await
             .then_expect_error();
@@ -2485,6 +2585,7 @@ mod tests {
             .when(UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01, 0x02],
                 cctp_nonce: 12345,
+                mint_scan_from_block: 100,
             })
             .await
             .then_expect_error();
@@ -2515,6 +2616,7 @@ mod tests {
             .when(UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01, 0x02],
                 cctp_nonce: 12345,
+                mint_scan_from_block: 100,
             })
             .await
             .then_expect_error();
@@ -2549,12 +2651,14 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
             ])
             .when(UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x03, 0x04],
                 cctp_nonce: 99999,
+                mint_scan_from_block: 100,
             })
             .await
             .then_expect_error();
@@ -2591,6 +2695,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02, 0x03, 0x04],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
             ])
@@ -2759,6 +2864,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce,
+                    mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
             ])
@@ -2858,6 +2964,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -2909,6 +3016,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -2999,6 +3107,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -3056,6 +3165,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -3108,6 +3218,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
             ])
@@ -3152,6 +3263,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -3203,6 +3315,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -3251,6 +3364,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -3314,6 +3428,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -3373,6 +3488,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0xAB, 0xCD, 0xEF],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -3425,6 +3541,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x11, 0x22, 0x33, 0x44],
                     cctp_nonce: 67890,
+                    mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -3532,6 +3649,7 @@ mod tests {
             .when(UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01],
                 cctp_nonce: 12345,
+                mint_scan_from_block: 100,
             })
             .await
             .then_expect_error();
@@ -3610,6 +3728,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -3663,6 +3782,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -3719,6 +3839,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -3748,14 +3869,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_initiate_conversion_from_uninitialized() {
-        let order_id = Uuid::new_v4();
+        let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
 
         let events = TestHarness::<UsdcRebalance>::with(())
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::InitiateConversion {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
-                order_id,
+                order_id: order_id.clone(),
             })
             .await
             .events();
@@ -3778,7 +3899,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_initiate_conversion_twice() {
-        let order_id = Uuid::new_v4();
+        let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
 
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![UsdcRebalanceEvent::ConversionInitiated {
@@ -3790,7 +3911,7 @@ mod tests {
             .when(UsdcRebalanceCommand::InitiateConversion {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(500.00)),
-                order_id: Uuid::new_v4(),
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
             })
             .await
             .then_expect_error();
@@ -3803,7 +3924,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_confirm_conversion_from_converting_state() {
-        let order_id = Uuid::new_v4();
+        let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
         let filled_amount = Usdc::new(float!(998));
 
         let events = TestHarness::<UsdcRebalance>::with(())
@@ -3842,7 +3963,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_confirm_conversion_twice() {
-        let order_id = Uuid::new_v4();
+        let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
 
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
@@ -3872,7 +3993,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fail_conversion_from_converting_state() {
-        let order_id = Uuid::new_v4();
+        let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
 
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![UsdcRebalanceEvent::ConversionInitiated {
@@ -3912,7 +4033,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_fail_already_completed_conversion() {
-        let order_id = Uuid::new_v4();
+        let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
 
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
@@ -3942,7 +4063,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_initiate_withdrawal_after_conversion_complete() {
-        let order_id = Uuid::new_v4();
+        let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let filled_amount = Usdc::new(float!(998));
 
@@ -3974,7 +4095,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_initiate_with_mismatched_amount_from_conversion_complete_fails() {
-        let order_id = Uuid::new_v4();
+        let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let filled_amount = Usdc::new(float!(998));
 
@@ -4016,7 +4137,7 @@ mod tests {
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         let mint_tx =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
-        let order_id = Uuid::new_v4();
+        let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
 
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
@@ -4036,6 +4157,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -4054,7 +4176,7 @@ mod tests {
                 },
             ])
             .when(UsdcRebalanceCommand::InitiatePostDepositConversion {
-                order_id,
+                order_id: order_id.clone(),
                 // Must match deposit amount (amount_received from bridging, not original)
                 amount: Usdc::new(float!(99.99)),
             })
@@ -4102,6 +4224,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -4120,7 +4243,7 @@ mod tests {
                 },
             ])
             .when(UsdcRebalanceCommand::InitiatePostDepositConversion {
-                order_id: Uuid::new_v4(),
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
                 amount: Usdc::new(float!(1000.00)),
             })
             .await
@@ -4137,7 +4260,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::InitiatePostDepositConversion {
-                order_id: Uuid::new_v4(),
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
                 amount: Usdc::new(float!(1000.00)),
             })
             .await
@@ -4174,6 +4297,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -4192,7 +4316,7 @@ mod tests {
                 },
             ])
             .when(UsdcRebalanceCommand::InitiatePostDepositConversion {
-                order_id: Uuid::new_v4(),
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
                 amount: Usdc::new(float!(500.00)),
             })
             .await
@@ -4215,7 +4339,7 @@ mod tests {
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         let mint_tx =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
-        let order_id = Uuid::new_v4();
+        let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
 
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
@@ -4235,6 +4359,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::Bridged {
@@ -4274,7 +4399,7 @@ mod tests {
     #[test]
     fn to_dto_preserves_original_initiated_at_when_post_deposit_conversion_begins() {
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let order_id = Uuid::new_v4();
+        let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
         let original_initiated_at = Utc::now();
         let withdrawal_confirmed_at = original_initiated_at + chrono::Duration::seconds(30);
         let bridged_at = original_initiated_at + chrono::Duration::seconds(90);
@@ -4302,6 +4427,7 @@ mod tests {
             UsdcRebalanceEvent::BridgeAttestationReceived {
                 attestation: vec![0x01],
                 cctp_nonce: 12345,
+                mint_scan_from_block: Some(100),
                 attested_at: withdrawal_confirmed_at + chrono::Duration::seconds(15),
             },
             UsdcRebalanceEvent::Bridged {
@@ -4348,7 +4474,7 @@ mod tests {
     #[test]
     fn to_dto_preserves_original_initiated_at_when_withdrawal_begins_after_conversion() {
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let order_id = Uuid::new_v4();
+        let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
         let original_initiated_at = Utc::now();
         let conversion_completed_at = original_initiated_at + chrono::Duration::seconds(30);
         let state = replay::<UsdcRebalance>(vec![
@@ -4410,7 +4536,7 @@ mod tests {
             UsdcRebalanceEvent::ConversionInitiated {
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
-                order_id: Uuid::new_v4(),
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
                 initiated_at: Utc::now(),
             },
         ])
@@ -4426,7 +4552,7 @@ mod tests {
         let state = UsdcRebalance::Converting {
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(500)),
-            order_id: Uuid::new_v4(),
+            order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
             initiated_at,
         };
 
@@ -4681,6 +4807,7 @@ mod tests {
             burn_tx_hash: burn_tx,
             cctp_nonce: 42,
             attestation: vec![0xAA, 0xBB],
+            mint_scan_from_block: Some(100),
             initiated_at,
             attested_at,
         };

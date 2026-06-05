@@ -337,6 +337,7 @@ mod tests {
     use serde_json::json;
     use st0x_float_macro::float;
     use std::thread;
+    use uuid::uuid;
 
     use super::*;
     use crate::alpaca_broker_api::auth::{
@@ -349,7 +350,7 @@ mod tests {
     };
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
-        AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b"));
+        AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
     #[test]
     fn test_asset_status_deserialize_active() {

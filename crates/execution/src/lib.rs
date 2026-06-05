@@ -28,7 +28,10 @@ pub use alpaca_broker_api::{
 };
 pub use error::PersistenceError;
 pub use mock::{MockExecutor, MockExecutorCtx};
-pub use order::{MarketOrder, OrderPlacement, OrderState, OrderStatus, OrderUpdate};
+pub use order::{
+    ClientOrderId, ClientOrderIdError, MarketOrder, OrderPlacement, OrderState, OrderStatus,
+    OrderUpdate,
+};
 
 pub use st0x_finance::{
     EmptySymbolError, FractionalShares, HasZero, NotPositive, Positive, Symbol, ToWholeSharesError,

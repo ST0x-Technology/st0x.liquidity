@@ -1284,7 +1284,7 @@ impl RebalancingService {
                         }
                     }
 
-                    let recovery_id = WrappedEquityRecoveryId(uuid::Uuid::new_v4());
+                    let recovery_id = WrappedEquityRecoveryId(Uuid::new_v4());
                     if let Err(error) = queue
                         .push(WrappedEquityRecoveryJob {
                             symbol: symbol.clone(),
@@ -2978,7 +2978,9 @@ mod tests {
     use st0x_event_sorcery::{
         EntityList, Never, Reactor, ReactorHarness, TestStore, deps, test_store,
     };
-    use st0x_execution::{Direction, ExecutorOrderId, HasZero, Positive, SupportedExecutor};
+    use st0x_execution::{
+        ClientOrderId, Direction, ExecutorOrderId, HasZero, Positive, SupportedExecutor,
+    };
     use st0x_finance::{Usd, Usdc};
     use st0x_float_macro::float;
 
@@ -7424,7 +7426,7 @@ mod tests {
         UsdcRebalanceEvent::ConversionInitiated {
             direction,
             amount,
-            order_id: Uuid::new_v4(),
+            order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
             initiated_at: Utc::now(),
         }
     }
@@ -7453,6 +7455,7 @@ mod tests {
         UsdcRebalanceEvent::BridgeAttestationReceived {
             attestation: vec![1, 2, 3, 4],
             cctp_nonce: 42,
+            mint_scan_from_block: Some(100),
             attested_at: Utc::now(),
         }
     }
@@ -7861,7 +7864,7 @@ mod tests {
                 UsdcRebalanceEvent::ConversionInitiated {
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: usdc(400),
-                    order_id: Uuid::new_v4(),
+                    order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
                     initiated_at: refreshed_at,
                 },
             )
@@ -7918,7 +7921,7 @@ mod tests {
                 UsdcRebalanceEvent::ConversionInitiated {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: usdc(400),
-                    order_id: Uuid::new_v4(),
+                    order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
                     initiated_at,
                 },
             )
@@ -8286,6 +8289,7 @@ mod tests {
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: vec![1, 2, 3],
                     cctp_nonce: 12345,
+                    mint_scan_from_block: 100,
                 },
             )
             .await
@@ -8337,7 +8341,7 @@ mod tests {
         let store = TestStore::<UsdcRebalance>::with_reactor(Arc::clone(&spy));
 
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let transfer_id = AlpacaTransferId::from(uuid::Uuid::new_v4());
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let tx_hash =
             fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
 
@@ -8372,6 +8376,7 @@ mod tests {
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: vec![1, 2, 3],
                     cctp_nonce: 67890,
+                    mint_scan_from_block: 100,
                 },
             )
             .await
@@ -8421,7 +8426,7 @@ mod tests {
         let store = TestStore::<UsdcRebalance>::with_reactor(Arc::clone(&spy));
 
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let transfer_id = AlpacaTransferId::from(uuid::Uuid::new_v4());
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
         store
             .send(
@@ -8462,7 +8467,7 @@ mod tests {
         let store = TestStore::<UsdcRebalance>::with_reactor(Arc::clone(&spy));
 
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let transfer_id = crate::alpaca_wallet::AlpacaTransferId::from(uuid::Uuid::new_v4());
+        let transfer_id = crate::alpaca_wallet::AlpacaTransferId::from(Uuid::new_v4());
         let tx_hash =
             fixed_bytes!("0x3333333333333333333333333333333333333333333333333333333333333333");
 
@@ -8525,7 +8530,7 @@ mod tests {
                 UsdcRebalanceCommand::InitiateConversion {
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(100)),
-                    order_id: uuid::Uuid::new_v4(),
+                    order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
                 },
             )
             .await
@@ -8669,6 +8674,7 @@ mod tests {
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: vec![1, 2, 3],
                     cctp_nonce: 99999,
+                    mint_scan_from_block: 100,
                 },
             )
             .await
@@ -8708,7 +8714,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::InitiatePostDepositConversion {
-                    order_id: uuid::Uuid::new_v4(),
+                    order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
                     amount: Usdc::new(float!(99.99)),
                 },
             )
@@ -10642,7 +10648,7 @@ mod tests {
                 UsdcRebalanceEvent::ConversionInitiated {
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: usdc(700),
-                    order_id: Uuid::new_v4(),
+                    order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
                     initiated_at: now,
                 },
             )
@@ -10729,7 +10735,7 @@ mod tests {
                     UsdcRebalanceEvent::ConversionInitiated {
                         direction: RebalanceDirection::BaseToAlpaca,
                         amount: usdc(700),
-                        order_id: Uuid::new_v4(),
+                        order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
                         initiated_at: Utc::now(),
                     },
                 )
