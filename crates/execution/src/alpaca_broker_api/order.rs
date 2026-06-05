@@ -7,10 +7,10 @@ use tracing::{debug, trace};
 use uuid::Uuid;
 
 use super::client::AlpacaBrokerApiClient;
-use super::{AlpacaBrokerApiError, TimeInForce};
+use super::{AlpacaBrokerApiError, CryptoOrderFailureReason, TimeInForce};
 use crate::{
-    Direction, FractionalShares, MarketOrder, OrderPlacement, OrderStatus, OrderUpdate, Positive,
-    Symbol, Usd, deserialize_float_from_number_or_string,
+    ClientOrderId, Direction, FractionalShares, MarketOrder, OrderPlacement, OrderStatus,
+    OrderUpdate, Positive, Symbol, Usd, deserialize_float_from_number_or_string,
     deserialize_option_float_from_number_or_string, serialize_float_as_string,
 };
 
@@ -203,6 +203,9 @@ pub(crate) struct CryptoOrderRequest {
     #[serde(rename = "type")]
     pub order_type: &'static str,
     pub time_in_force: &'static str,
+    /// Caller-supplied idempotency/correlation key. Recorded before placement
+    /// so a crashed conversion can be looked up by this key on resume.
+    pub client_order_id: ClientOrderId,
 }
 
 /// Response from a crypto order placement
@@ -231,20 +234,56 @@ pub struct CryptoOrderResponse {
     pub created_at: DateTime<Utc>,
 }
 
+/// Terminal/intermediate decision for a crypto order, exposing the outcome
+/// without leaking the private `BrokerOrderStatus`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CryptoOrderOutcome {
+    Filled,
+    Pending,
+    Failed(CryptoOrderFailureReason),
+}
+
 impl CryptoOrderResponse {
     /// Returns the status as a display-friendly string.
     pub fn status_display(&self) -> &'static str {
+        use BrokerOrderStatus::*;
+
         match self.status {
-            BrokerOrderStatus::Filled => "filled",
-            BrokerOrderStatus::New => "new",
-            BrokerOrderStatus::PendingNew => "pending_new",
-            BrokerOrderStatus::PartiallyFilled => "partially_filled",
-            BrokerOrderStatus::Canceled => "canceled",
-            BrokerOrderStatus::Expired => "expired",
-            BrokerOrderStatus::Rejected => "rejected",
-            BrokerOrderStatus::Accepted => "accepted",
+            Filled => "filled",
+            New => "new",
+            PendingNew => "pending_new",
+            PartiallyFilled => "partially_filled",
+            Canceled => "canceled",
+            Expired => "expired",
+            Rejected => "rejected",
+            Accepted => "accepted",
             _ => "other",
         }
+    }
+
+    /// Classifies the order's current status into a fill/pending/failed outcome,
+    /// consistent with the terminal mapping in `map_broker_status_to_order_status`.
+    ///
+    /// The match is exhaustive (no wildcard) so a newly added Alpaca status forces
+    /// a compile error here rather than silently mapping to `Pending` and retrying
+    /// forever.
+    pub fn classify(&self) -> CryptoOrderOutcome {
+        use BrokerOrderStatus::*;
+
+        let reason = match self.status {
+            Filled => return CryptoOrderOutcome::Filled,
+            New | PendingNew | PartiallyFilled | Accepted | AcceptedForBidding | PendingCancel
+            | PendingReplace | Stopped => return CryptoOrderOutcome::Pending,
+            Canceled => CryptoOrderFailureReason::Canceled,
+            Expired => CryptoOrderFailureReason::Expired,
+            Rejected => CryptoOrderFailureReason::Rejected,
+            DoneForDay => CryptoOrderFailureReason::DoneForDay,
+            Replaced => CryptoOrderFailureReason::Replaced,
+            Suspended => CryptoOrderFailureReason::Suspended,
+            Calculated => CryptoOrderFailureReason::Calculated,
+        };
+
+        CryptoOrderOutcome::Failed(reason)
     }
 }
 
@@ -478,6 +517,7 @@ pub(crate) async fn convert_usdc_usd(
     client: &AlpacaBrokerApiClient,
     amount: Float,
     direction: ConversionDirection,
+    client_order_id: &ClientOrderId,
 ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
     let placed_amount = validate_usdc_amount_for_alpaca_precision(amount)?;
     let side = match direction {
@@ -485,7 +525,7 @@ pub(crate) async fn convert_usdc_usd(
         ConversionDirection::UsdToUsdc => OrderSide::Buy,
     };
 
-    debug!(?side, amount = ?placed_amount, "Placing USDC/USD conversion order");
+    debug!(?side, amount = ?placed_amount, %client_order_id, "Placing USDC/USD conversion order");
 
     let request = CryptoOrderRequest {
         symbol: "USDCUSD".to_string(),
@@ -493,6 +533,7 @@ pub(crate) async fn convert_usdc_usd(
         side,
         order_type: "market",
         time_in_force: "gtc",
+        client_order_id: client_order_id.clone(),
     };
 
     client.place_crypto_order(&request).await
@@ -503,27 +544,29 @@ pub(crate) async fn poll_crypto_order_until_filled(
     client: &AlpacaBrokerApiClient,
     order_id: Uuid,
 ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
+    use BrokerOrderStatus::*;
+
     loop {
         let order = client.get_crypto_order(order_id).await?;
 
         match order.status {
-            BrokerOrderStatus::Filled => return Ok(order),
-            BrokerOrderStatus::Canceled => {
+            Filled => return Ok(order),
+            Canceled => {
                 return Err(AlpacaBrokerApiError::CryptoOrderFailed {
                     order_id,
-                    reason: super::CryptoOrderFailureReason::Canceled,
+                    reason: CryptoOrderFailureReason::Canceled,
                 });
             }
-            BrokerOrderStatus::Expired => {
+            Expired => {
                 return Err(AlpacaBrokerApiError::CryptoOrderFailed {
                     order_id,
-                    reason: super::CryptoOrderFailureReason::Expired,
+                    reason: CryptoOrderFailureReason::Expired,
                 });
             }
-            BrokerOrderStatus::Rejected => {
+            Rejected => {
                 return Err(AlpacaBrokerApiError::CryptoOrderFailed {
                     order_id,
-                    reason: super::CryptoOrderFailureReason::Rejected,
+                    reason: CryptoOrderFailureReason::Rejected,
                 });
             }
             _ => {
@@ -563,6 +606,64 @@ mod tests {
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::Day,
             counter_trade_slippage_bps: crate::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+        }
+    }
+
+    #[test]
+    fn classify_maps_every_broker_status_to_its_outcome() {
+        use crate::alpaca_broker_api::CryptoOrderFailureReason;
+
+        let cases = [
+            ("filled", CryptoOrderOutcome::Filled),
+            ("new", CryptoOrderOutcome::Pending),
+            ("pending_new", CryptoOrderOutcome::Pending),
+            ("partially_filled", CryptoOrderOutcome::Pending),
+            ("accepted", CryptoOrderOutcome::Pending),
+            ("accepted_for_bidding", CryptoOrderOutcome::Pending),
+            ("pending_cancel", CryptoOrderOutcome::Pending),
+            ("pending_replace", CryptoOrderOutcome::Pending),
+            ("stopped", CryptoOrderOutcome::Pending),
+            (
+                "canceled",
+                CryptoOrderOutcome::Failed(CryptoOrderFailureReason::Canceled),
+            ),
+            (
+                "expired",
+                CryptoOrderOutcome::Failed(CryptoOrderFailureReason::Expired),
+            ),
+            (
+                "rejected",
+                CryptoOrderOutcome::Failed(CryptoOrderFailureReason::Rejected),
+            ),
+            (
+                "done_for_day",
+                CryptoOrderOutcome::Failed(CryptoOrderFailureReason::DoneForDay),
+            ),
+            (
+                "replaced",
+                CryptoOrderOutcome::Failed(CryptoOrderFailureReason::Replaced),
+            ),
+            (
+                "suspended",
+                CryptoOrderOutcome::Failed(CryptoOrderFailureReason::Suspended),
+            ),
+            (
+                "calculated",
+                CryptoOrderOutcome::Failed(CryptoOrderFailureReason::Calculated),
+            ),
+        ];
+
+        for (status, expected) in cases {
+            let order: CryptoOrderResponse = serde_json::from_value(json!({
+                "id": "904837e3-3b76-47ec-b432-046db621571b",
+                "symbol": "USDCUSD",
+                "qty": "100",
+                "status": status,
+                "created_at": "2025-01-06T12:00:00Z"
+            }))
+            .unwrap();
+
+            assert_eq!(order.classify(), expected, "status {status} misclassified");
         }
     }
 
@@ -974,6 +1075,9 @@ mod tests {
         let server = MockServer::start();
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
+        let client_order_id =
+            ClientOrderId::from_uuid(uuid!("11111111-1111-4111-8111-111111111111"));
+
         let mock = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
@@ -982,7 +1086,8 @@ mod tests {
                     "qty": "1000.5",
                     "side": "sell",
                     "type": "market",
-                    "time_in_force": "gtc"
+                    "time_in_force": "gtc",
+                    "client_order_id": "11111111-1111-4111-8111-111111111111"
                 }));
             then.status(200)
                 .header("content-type", "application/json")
@@ -1001,9 +1106,14 @@ mod tests {
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let amount = float!(1000.5);
 
-        let order = convert_usdc_usd(&client, amount, ConversionDirection::UsdcToUsd)
-            .await
-            .unwrap();
+        let order = convert_usdc_usd(
+            &client,
+            amount,
+            ConversionDirection::UsdcToUsd,
+            &client_order_id,
+        )
+        .await
+        .unwrap();
 
         mock.assert();
         assert_eq!(order.id.to_string(), "904837e3-3b76-47ec-b432-046db621571b");
@@ -1017,6 +1127,9 @@ mod tests {
         let server = MockServer::start();
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
+        let client_order_id =
+            ClientOrderId::from_uuid(uuid!("22222222-2222-4222-8222-222222222222"));
+
         let mock = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
@@ -1025,7 +1138,8 @@ mod tests {
                     "qty": "500",
                     "side": "buy",
                     "type": "market",
-                    "time_in_force": "gtc"
+                    "time_in_force": "gtc",
+                    "client_order_id": "22222222-2222-4222-8222-222222222222"
                 }));
             then.status(200)
                 .header("content-type", "application/json")
@@ -1044,9 +1158,14 @@ mod tests {
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let amount = float!(500);
 
-        let order = convert_usdc_usd(&client, amount, ConversionDirection::UsdToUsdc)
-            .await
-            .unwrap();
+        let order = convert_usdc_usd(
+            &client,
+            amount,
+            ConversionDirection::UsdToUsdc,
+            &client_order_id,
+        )
+        .await
+        .unwrap();
 
         mock.assert();
         assert_eq!(order.id.to_string(), "61e7b016-9c91-4a97-b912-615c9d365c9d");
@@ -1065,6 +1184,7 @@ mod tests {
             &client,
             float!(1000.1234567),
             ConversionDirection::UsdToUsdc,
+            &ClientOrderId::from_uuid(Uuid::new_v4()),
         )
         .await
         .unwrap_err();

@@ -1095,6 +1095,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn find_recent_withdrawal_returns_tx_and_amount_of_real_withdrawal() {
+        let local_evm = LocalEvm::new().await.unwrap();
+        let service = create_test_raindex_service(&local_evm).await;
+
+        let deposit_amount = U256::from(1000) * U256::from(10).pow(U256::from(18));
+        local_evm
+            .approve_tokens(
+                local_evm.token_address,
+                local_evm.orderbook_address,
+                deposit_amount,
+            )
+            .await
+            .unwrap();
+        service
+            .deposit::<NoOpErrorRegistry>(
+                local_evm.token_address,
+                TEST_VAULT_ID,
+                deposit_amount,
+                TEST_TOKEN_DECIMALS,
+            )
+            .await
+            .unwrap();
+
+        let from_block = service.current_block().await.unwrap();
+
+        let withdraw_amount = U256::from(400) * U256::from(10).pow(U256::from(18));
+        let withdraw_tx = service
+            .withdraw(
+                local_evm.token_address,
+                TEST_VAULT_ID,
+                withdraw_amount,
+                TEST_TOKEN_DECIMALS,
+            )
+            .await
+            .unwrap();
+
+        let found = service
+            .find_recent_withdrawal(local_evm.token_address, TEST_VAULT_ID, from_block)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            found,
+            Some((withdraw_tx, withdraw_amount)),
+            "scan must return the real withdrawal's tx and actual on-chain withdrawn amount",
+        );
+    }
+
+    #[tokio::test]
+    async fn find_recent_withdrawal_returns_none_for_non_matching_vault_or_token() {
+        let local_evm = LocalEvm::new().await.unwrap();
+        let service = create_test_raindex_service(&local_evm).await;
+
+        // Capture from_block BEFORE the approve/deposit/withdraw txs so those three
+        // blocks advance the head past from_block + SCAN_FINALITY_MARGIN, letting
+        // the non-matching scans below conclude a true absence (None) rather than
+        // ScanInconclusive.
+        let from_block = service.current_block().await.unwrap();
+
+        let deposit_amount = U256::from(1000) * U256::from(10).pow(U256::from(18));
+        local_evm
+            .approve_tokens(
+                local_evm.token_address,
+                local_evm.orderbook_address,
+                deposit_amount,
+            )
+            .await
+            .unwrap();
+        service
+            .deposit::<NoOpErrorRegistry>(
+                local_evm.token_address,
+                TEST_VAULT_ID,
+                deposit_amount,
+                TEST_TOKEN_DECIMALS,
+            )
+            .await
+            .unwrap();
+
+        let withdraw_amount = U256::from(400) * U256::from(10).pow(U256::from(18));
+        service
+            .withdraw(
+                local_evm.token_address,
+                TEST_VAULT_ID,
+                withdraw_amount,
+                TEST_TOKEN_DECIMALS,
+            )
+            .await
+            .unwrap();
+
+        let other_vault = RaindexVaultId(b256!(
+            "0x0000000000000000000000000000000000000000000000000000000000000002"
+        ));
+        assert_eq!(
+            service
+                .find_recent_withdrawal(local_evm.token_address, other_vault, from_block)
+                .await
+                .unwrap(),
+            None,
+            "a withdrawal on a different vault must not be adopted",
+        );
+        assert_eq!(
+            service
+                .find_recent_withdrawal(USDC_BASE, TEST_VAULT_ID, from_block)
+                .await
+                .unwrap(),
+            None,
+            "a withdrawal of a different token must not be adopted",
+        );
+    }
+
+    #[tokio::test]
     async fn test_withdraw_succeeds_with_deployed_contract() {
         let local_evm = LocalEvm::new().await.unwrap();
 

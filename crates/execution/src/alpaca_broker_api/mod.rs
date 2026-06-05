@@ -53,8 +53,8 @@ pub use auth::{AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerA
 pub use executor::AlpacaBrokerApi;
 pub use journal::{JournalResponse, JournalStatus};
 pub use order::{
-    AlpacaLimitOrder, AlpacaLimitPrice, ConversionDirection, CryptoOrderResponse,
-    ParseAlpacaLimitPriceError,
+    AlpacaLimitOrder, AlpacaLimitPrice, ConversionDirection, CryptoOrderOutcome,
+    CryptoOrderResponse, ParseAlpacaLimitPriceError,
 };
 
 impl fmt::Display for TimeInForce {
@@ -96,12 +96,20 @@ impl TimeInForce {
     }
 }
 
-/// Terminal failure states for crypto orders
+/// Terminal failure states for crypto orders.
+///
+/// Every non-fill terminal `BrokerOrderStatus` maps to one of these so the
+/// conversion resume path never treats an unexpected terminal status as
+/// still-pending (which would retry forever).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptoOrderFailureReason {
     Canceled,
     Expired,
     Rejected,
+    DoneForDay,
+    Replaced,
+    Suspended,
+    Calculated,
 }
 
 #[derive(Debug, Error)]

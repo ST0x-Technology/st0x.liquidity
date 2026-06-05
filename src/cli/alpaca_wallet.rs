@@ -3,11 +3,12 @@
 
 use alloy::primitives::Address;
 use std::io::Write;
+use uuid::Uuid;
 
 use st0x_evm::{Evm, IntoErrorRegistry, Wallet};
 use st0x_execution::{
-    AlpacaAccountId, AlpacaBrokerApi, ConversionDirection, Executor, FractionalShares, Positive,
-    Symbol,
+    AlpacaAccountId, AlpacaBrokerApi, ClientOrderId, ConversionDirection, Executor,
+    FractionalShares, Positive, Symbol,
 };
 use st0x_finance::Usdc;
 use st0x_float_serde::format_float_with_fallback;
@@ -618,11 +619,12 @@ pub(super) async fn alpaca_convert_command<W: Write>(
     };
 
     let amount_exact = amount.inner();
+    let correlation_id = ClientOrderId::from_uuid(Uuid::new_v4());
 
     writeln!(stdout, "   Placing market order...")?;
 
     let order = executor
-        .convert_usdc_usd(amount_exact, conversion_direction)
+        .convert_usdc_usd(amount_exact, conversion_direction, &correlation_id)
         .await?;
 
     writeln!(stdout, "Conversion completed successfully!")?;
@@ -641,11 +643,11 @@ pub(super) async fn alpaca_convert_command<W: Write>(
             format_float_with_fallback(&price)
         )?;
     }
-    if let Some(filled_qty) = order.filled_quantity {
+    if let Some(filled_quantity) = order.filled_quantity {
         writeln!(
             stdout,
             "   Filled Quantity: {}",
-            format_float_with_fallback(&filled_qty)
+            format_float_with_fallback(&filled_quantity)
         )?;
     }
     if let (Some(price), Some(quantity)) = (order.filled_average_price, order.filled_quantity) {

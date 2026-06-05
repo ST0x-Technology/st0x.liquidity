@@ -13,12 +13,14 @@ use st0x_float_serde::format_float_with_fallback;
 use super::auth::{AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx};
 use super::client::AlpacaBrokerApiClient;
 use super::journal::JournalResponse;
-use super::order::{AlpacaLimitOrder, ConversionDirection, CryptoOrderResponse};
+use super::order::{
+    AlpacaLimitOrder, ConversionDirection, CryptoOrderOutcome, CryptoOrderResponse,
+};
 use super::{AlpacaBrokerApiError, AssetStatus, TimeInForce};
 use crate::{
-    CounterTradePreflight, Direction, Executor, FractionalShares, InventoryResult, MarketOrder,
-    OrderPlacement, OrderState, OrderStatus, Positive, SupportedExecutor, Symbol, TryIntoExecutor,
-    buying_power_counter_trade_preflight, estimate_buffered_cost_cents,
+    ClientOrderId, CounterTradePreflight, Direction, Executor, FractionalShares, InventoryResult,
+    MarketOrder, OrderPlacement, OrderState, OrderStatus, Positive, SupportedExecutor, Symbol,
+    TryIntoExecutor, buying_power_counter_trade_preflight, estimate_buffered_cost_cents,
 };
 
 /// Response from the asset endpoint
@@ -249,8 +251,11 @@ impl AlpacaBrokerApi {
         &self,
         amount: Float,
         direction: ConversionDirection,
+        client_order_id: &ClientOrderId,
     ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
-        let order = super::order::convert_usdc_usd(&self.client, amount, direction).await?;
+        let order =
+            super::order::convert_usdc_usd(&self.client, amount, direction, client_order_id)
+                .await?;
 
         info!(
             order_id = %order.id,
@@ -260,6 +265,42 @@ impl AlpacaBrokerApi {
         );
 
         super::order::poll_crypto_order_until_filled(&self.client, order.id).await
+    }
+
+    /// Looks up a previously-placed conversion order by its `client_order_id`
+    /// (the correlation id recorded before placement), for crash-safe resume.
+    /// Returns the current snapshot, or `None` if the order never reached Alpaca.
+    pub async fn find_conversion_order(
+        &self,
+        client_order_id: &ClientOrderId,
+    ) -> Result<Option<CryptoOrderResponse>, AlpacaBrokerApiError> {
+        self.client
+            .get_crypto_order_by_client_order_id(client_order_id)
+            .await
+    }
+
+    /// Polls a previously-placed conversion order until it reaches a terminal
+    /// state (filled or terminally failed), returning the final snapshot.
+    ///
+    /// Crash-safe resume uses this to await a still-settling conversion -- the
+    /// same wait the original placement performs in `convert_usdc_usd` -- instead
+    /// of failing the job. Failing a healthy-but-slow conversion would burn the
+    /// finite apalis retry budget and risk the timeout sweep clearing the
+    /// in-progress guard while the conversion is still settling.
+    pub async fn poll_conversion_to_terminal(
+        &self,
+        order_id: Uuid,
+    ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
+        loop {
+            let order = self.client.get_crypto_order(order_id).await?;
+
+            match order.classify() {
+                CryptoOrderOutcome::Filled | CryptoOrderOutcome::Failed(_) => return Ok(order),
+                CryptoOrderOutcome::Pending => {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
     }
 
     /// Journal (transfer) equities from the configured account to a

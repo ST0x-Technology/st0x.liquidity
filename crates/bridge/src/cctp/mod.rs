@@ -1326,7 +1326,7 @@ mod tests {
     /// Full CCTP test infrastructure with two chains (simulating Ethereum and Base)
     struct LocalCctp {
         _ethereum_anvil: AnvilInstance,
-        _base_anvil: AnvilInstance,
+        base_anvil: AnvilInstance,
         ethereum_endpoint: String,
         base_endpoint: String,
         ethereum: DeployedCctpChain,
@@ -1432,7 +1432,7 @@ mod tests {
 
             Ok(Self {
                 _ethereum_anvil: ethereum_anvil,
-                _base_anvil: base_anvil,
+                base_anvil,
                 ethereum_endpoint,
                 base_endpoint,
                 ethereum,
@@ -1638,15 +1638,30 @@ mod tests {
             >,
             Box<dyn std::error::Error>,
         > {
+            self.create_bridge_with_key(&self.deployer_key).await
+        }
+
+        /// Builds a bridge whose wallet is `private_key` rather than the deployer.
+        /// Used to simulate a burn submitted by a different depositor so the
+        /// depositor clause in `find_recent_burn`'s predicate can be exercised.
+        async fn create_bridge_with_key(
+            &self,
+            private_key: &B256,
+        ) -> Result<
+            CctpBridge<
+                RawPrivateKeyWallet<impl Provider + Clone + use<>>,
+                RawPrivateKeyWallet<impl Provider + Clone + use<>>,
+            >,
+            Box<dyn std::error::Error>,
+        > {
             let ethereum_provider = ProviderBuilder::new()
                 .connect(&self.ethereum_endpoint)
                 .await?;
 
             let base_provider = ProviderBuilder::new().connect(&self.base_endpoint).await?;
 
-            let ethereum_wallet =
-                RawPrivateKeyWallet::new(&self.deployer_key, ethereum_provider, 1)?;
-            let base_wallet = RawPrivateKeyWallet::new(&self.deployer_key, base_provider, 1)?;
+            let ethereum_wallet = RawPrivateKeyWallet::new(private_key, ethereum_provider, 1)?;
+            let base_wallet = RawPrivateKeyWallet::new(private_key, base_provider, 1)?;
 
             let ethereum = CctpEndpoint::new(
                 self.ethereum.usdc,
@@ -2387,6 +2402,7 @@ mod tests {
             .unwrap();
 
         let other_recipient = address!("0x000000000000000000000000000000000000dEaD");
+
         assert_eq!(
             bridge
                 .find_recent_mint(BridgeDirection::BaseToEthereum, other_recipient, from_block)
@@ -2412,6 +2428,7 @@ mod tests {
             .destination_block(BridgeDirection::BaseToEthereum)
             .await
             .unwrap();
+
         assert_eq!(
             bridge
                 .find_recent_mint(BridgeDirection::BaseToEthereum, recipient, head_above_mint)
@@ -2443,5 +2460,154 @@ mod tests {
             assert!(!receipt.tx.is_zero(), "Burn {i}: tx hash should be set");
             assert_eq!(receipt.amount, amount, "Burn {i}: amount should match");
         }
+    }
+
+    #[tokio::test]
+    async fn find_recent_burn_returns_tx_of_real_burn() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+        let recipient = bridge.ethereum.owner();
+        let amount = U256::from(25_000_000u64);
+
+        let base_provider = ProviderBuilder::new()
+            .connect(cctp.base_endpoint.as_str())
+            .await
+            .unwrap();
+        let from_block = base_provider.get_block_number().await.unwrap();
+
+        let receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::BaseToEthereum, amount, recipient)
+            .await
+            .unwrap();
+
+        let found = bridge
+            .find_recent_burn(
+                BridgeDirection::BaseToEthereum,
+                amount,
+                recipient,
+                from_block,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            found,
+            Some(receipt.tx),
+            "scan must return the real burn's tx for the matching amount + recipient",
+        );
+    }
+
+    #[tokio::test]
+    async fn find_recent_burn_returns_none_for_wrong_amount_or_recipient() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+        let recipient = bridge.ethereum.owner();
+        let amount = U256::from(25_000_000u64);
+
+        let base_provider = ProviderBuilder::new()
+            .connect(cctp.base_endpoint.as_str())
+            .await
+            .unwrap();
+        let from_block = base_provider.get_block_number().await.unwrap();
+
+        // Burn a few times to advance the Base head past from_block + the scan
+        // finality margin so the non-matching scans below conclude a true absence.
+        for _ in 0..3 {
+            bridge
+                .burn_internal::<NoOpErrorRegistry>(
+                    BridgeDirection::BaseToEthereum,
+                    amount,
+                    recipient,
+                )
+                .await
+                .unwrap();
+        }
+
+        let other_recipient = address!("0x000000000000000000000000000000000000dEaD");
+        assert_eq!(
+            bridge
+                .find_recent_burn(
+                    BridgeDirection::BaseToEthereum,
+                    U256::from(999u64),
+                    recipient,
+                    from_block,
+                )
+                .await
+                .unwrap(),
+            None,
+            "a burn of a different amount must not be adopted",
+        );
+        assert_eq!(
+            bridge
+                .find_recent_burn(
+                    BridgeDirection::BaseToEthereum,
+                    amount,
+                    other_recipient,
+                    from_block,
+                )
+                .await
+                .unwrap(),
+            None,
+            "a burn to a different mintRecipient must not be adopted",
+        );
+    }
+
+    #[tokio::test]
+    async fn find_recent_burn_ignores_burn_from_a_different_depositor() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+        let recipient = bridge.ethereum.owner();
+        let amount = U256::from(25_000_000u64);
+
+        let base_provider = ProviderBuilder::new()
+            .connect(cctp.base_endpoint.as_str())
+            .await
+            .unwrap();
+        let from_block = base_provider.get_block_number().await.unwrap();
+
+        // A different EOA burns the same amount to the same recipient on Base.
+        // Depositor is the only field separating it from our own burn, so this
+        // pins the depositor clause in find_recent_burn's predicate: dropping it
+        // would let us adopt another sender's burn and mint against a burn we
+        // never made.
+        let other_key = B256::from_slice(&cctp.base_anvil.keys()[2].to_bytes());
+        let other_address = PrivateKeySigner::from_bytes(&other_key).unwrap().address();
+        LocalCctp::mint_usdc(
+            &cctp.base_endpoint,
+            &cctp.deployer_key,
+            cctp.base.usdc,
+            other_address,
+        )
+        .await
+        .unwrap();
+        let other_bridge = cctp.create_bridge_with_key(&other_key).await.unwrap();
+
+        // Burn a few times so the Base head advances past from_block + the scan
+        // finality margin, so the scan below concludes a true absence rather than
+        // a retryable ScanInconclusive.
+        for _ in 0..3 {
+            other_bridge
+                .burn_internal::<NoOpErrorRegistry>(
+                    BridgeDirection::BaseToEthereum,
+                    amount,
+                    recipient,
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            bridge
+                .find_recent_burn(
+                    BridgeDirection::BaseToEthereum,
+                    amount,
+                    recipient,
+                    from_block,
+                )
+                .await
+                .unwrap(),
+            None,
+            "a burn from a different depositor must not be adopted",
+        );
     }
 }

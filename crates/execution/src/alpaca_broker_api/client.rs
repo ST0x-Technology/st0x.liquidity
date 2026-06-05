@@ -15,7 +15,7 @@ use super::journal::{JournalRequest, JournalResponse};
 use super::order::{
     CryptoOrderRequest, CryptoOrderResponse, LimitOrderRequest, OrderRequest, OrderResponse,
 };
-use crate::{FractionalShares, Positive, Symbol};
+use crate::{ClientOrderId, FractionalShares, Positive, Symbol};
 
 /// Alpaca Broker API HTTP client with Basic authentication
 pub(crate) struct AlpacaBrokerApiClient {
@@ -205,6 +205,39 @@ impl AlpacaBrokerApiClient {
         debug!("Fetching crypto order {} from {}", order_id, url);
 
         self.get(&url).await
+    }
+
+    /// Get a crypto order by its `client_order_id`. Returns `None` only on a 404
+    /// (Alpaca's documented not-found response for this lookup) -- i.e. the order
+    /// was never placed.
+    ///
+    /// Every other error status is propagated rather than mapped to `None`. This is
+    /// deliberate: a transient failure (5xx, rate limit) on an order that WAS placed
+    /// must retry, not be mistaken for "never placed" -- mapping it to `None` would
+    /// wrongly fail a still-settling conversion and lose the converted USDC.
+    pub(crate) async fn get_crypto_order_by_client_order_id(
+        &self,
+        client_order_id: &ClientOrderId,
+    ) -> Result<Option<CryptoOrderResponse>, AlpacaBrokerApiError> {
+        let url = format!(
+            "{}/v1/trading/accounts/{}/orders:by_client_order_id?client_order_id={}",
+            self.base_url, self.account_id, client_order_id
+        );
+
+        debug!(
+            "Fetching crypto order by client_order_id {} from {}",
+            client_order_id, url
+        );
+
+        match self.get::<CryptoOrderResponse>(&url).await {
+            Ok(order) => Ok(Some(order)),
+            Err(AlpacaBrokerApiError::ApiError { status, .. })
+                if status == reqwest::StatusCode::NOT_FOUND =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Create a security journal (JNLS) to transfer equities between accounts.

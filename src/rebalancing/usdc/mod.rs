@@ -58,8 +58,9 @@ pub(crate) enum UsdcTransferError {
     )]
     MissingFilledQuantity { order_id: ClientOrderId },
     #[error(
-        "USDC rebalance {id} cannot resume from Converting state: \
-         broker order ID lost after crash; manual reconciliation required"
+        "USDC rebalance {id} conversion could not be completed on resume \
+         (order not found at Alpaca or terminally failed); failed for \
+         operator reconciliation"
     )]
     ResumeIndeterminateConversion { id: UsdcRebalanceId },
     #[error(
