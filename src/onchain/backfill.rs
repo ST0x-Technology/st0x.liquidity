@@ -282,12 +282,12 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
     let get_clear_logs = move || {
         let provider = provider_clear.clone();
         let filter = clear_filter_clone.clone();
-        async move { provider.get_logs(&filter).await }
+        async move { fetch_logs_with_tip_check(&provider, &filter, batch_end).await }
     };
     let get_take_logs = move || {
         let provider = provider_take.clone();
         let filter = take_filter_clone.clone();
-        async move { provider.get_logs(&filter).await }
+        async move { fetch_logs_with_tip_check(&provider, &filter, batch_end).await }
     };
 
     let (clear_logs, take_logs) = future::try_join(
@@ -365,6 +365,33 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
     Ok(enqueued_count)
 }
 
+/// Wraps `eth_getLogs` with a read-after-write check on the node's tip.
+///
+/// An RPC node behind a load balancer can answer a `getLogs` request
+/// for a block range it has not finished indexing -- the response comes
+/// back empty even though the chain contains events in that range. The
+/// bot would then trust the empty result, advance its checkpoint, and
+/// silently drop those events. Verifying that the responding node's
+/// `eth_blockNumber` is at least `to_block` after the `getLogs` call
+/// catches that case; returning [`OnChainError::NodeLaggingBehindRequest`]
+/// lets the surrounding retry loop reissue the request, which routes
+/// through the load balancer to a node that has caught up.
+async fn fetch_logs_with_tip_check<P: Provider>(
+    provider: &P,
+    filter: &Filter,
+    to_block: u64,
+) -> Result<Vec<alloy::rpc::types::Log>, OnChainError> {
+    let logs = provider.get_logs(filter).await?;
+    let observed_tip = provider.get_block_number().await?;
+    if observed_tip < to_block {
+        return Err(OnChainError::NodeLaggingBehindRequest {
+            observed_tip,
+            required_tip: to_block,
+        });
+    }
+    Ok(logs)
+}
+
 fn generate_batch_ranges(start_block: u64, end_block: u64) -> Vec<(u64, u64)> {
     const BACKFILL_BATCH_SIZE: usize = 1_000;
 
@@ -413,6 +440,12 @@ mod tests {
             .fetch_one(pool)
             .await
             .unwrap()
+    }
+
+    /// Pushes an `eth_blockNumber` response far above any test block range so
+    /// the read-after-write tip check in [`fetch_logs_with_tip_check`] passes.
+    fn push_tip_response(asserter: &Asserter) {
+        asserter.push_success(&serde_json::json!("0xffffffff"));
     }
 
     #[tokio::test]
@@ -471,7 +504,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([])); // clear events
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([])); // take events
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let evm_ctx = EvmCtx {
@@ -733,7 +768,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([clear_log])); // clear events
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([])); // take events
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -799,7 +836,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([])); // clear events (empty)
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([take_log])); // take events
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -896,7 +935,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([clear_log]));
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([take_log]));
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -967,7 +1008,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([])); // clear events
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([])); // take events
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1065,7 +1108,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([take_log2, take_log1]));
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1098,11 +1143,15 @@ mod tests {
 
         // Batch 1: blocks 1000-1999
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
 
         // Batch 2: blocks 2000-2500
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1135,11 +1184,15 @@ mod tests {
 
         // Batch 1: blocks 500-1499
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
 
         // Batch 2: blocks 1500-1900
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1180,7 +1233,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([take_log]));
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1214,7 +1269,9 @@ mod tests {
 
         for _ in 0..3 {
             asserter.push_success(&serde_json::json!([]));
+            push_tip_response(&asserter);
             asserter.push_success(&serde_json::json!([]));
+            push_tip_response(&asserter);
         }
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -1271,7 +1328,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([valid_log, invalid_log]));
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1349,7 +1408,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([clear_log]));
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([take_log]));
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1383,7 +1444,9 @@ mod tests {
         asserter.push_failure_msg("RPC connection error");
         asserter.push_failure_msg("Timeout error");
         asserter.push_success(&serde_json::json!([])); // clear events
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([])); // take events
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1455,8 +1518,10 @@ mod tests {
         let asserter = Asserter::new();
 
         // First batch succeeds
-        asserter.push_success(&serde_json::json!([]));
-        asserter.push_success(&serde_json::json!([]));
+        asserter.push_success(&serde_json::json!([])); // clear logs
+        push_tip_response(&asserter);
+        asserter.push_success(&serde_json::json!([])); // take logs
+        push_tip_response(&asserter);
 
         // Second batch fails completely (after retries)
         // Need double the failures since clear_logs and take_logs retry in parallel
@@ -1519,7 +1584,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([corrupted_log]));
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1566,7 +1633,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([removed_log]));
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1601,7 +1670,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1645,7 +1716,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([])); // clear events
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([take_log])); // take events
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1670,6 +1743,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_enqueue_batch_events_errors_when_node_tip_behind_requested_range() {
+        let pool = setup_test_db().await;
+        let job_queue = setup_job_queue(&pool).await;
+        let evm_ctx = EvmCtx {
+            ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
+            orderbook: address!("0x1111111111111111111111111111111111111111"),
+            deployment_block: 1,
+            required_confirmations: 0,
+        };
+
+        // Both the clear and take fetches succeed at getLogs but observe a tip
+        // (0x32 = 50) below the requested to_block (100), simulating a node
+        // behind the load balancer that answered for a range it has not indexed.
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::json!([])); // clear getLogs
+        asserter.push_success(&serde_json::json!("0x32")); // clear tip = 50
+        asserter.push_success(&serde_json::json!([])); // take getLogs
+        asserter.push_success(&serde_json::json!("0x32")); // take tip = 50
+
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let result = enqueue_batch_events(
+            &provider,
+            &evm_ctx,
+            1,
+            100,
+            ExponentialBuilder::default().with_max_times(0),
+            job_queue,
+        )
+        .await;
+
+        let error = result.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                OnChainError::NodeLaggingBehindRequest {
+                    observed_tip: 50,
+                    required_tip: 100,
+                }
+            ),
+            "expected NodeLaggingBehindRequest {{ observed_tip: 50, required_tip: 100 }}, got {error:?}"
+        );
+        assert_eq!(job_count(&pool).await, 0);
+    }
+
+    #[tokio::test]
     async fn test_enqueue_batch_events_filter_creation() {
         let pool = setup_test_db().await;
         let job_queue = setup_job_queue(&pool).await;
@@ -1682,7 +1801,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([])); // clear events
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([])); // take events
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1738,7 +1859,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([])); // clear events
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([take_log1, take_log2])); // take events
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1785,11 +1908,13 @@ mod tests {
         // blocks 1-3000 (3 batches), second batch has take events
         for batch_idx in 0..3 {
             asserter.push_success(&serde_json::json!([])); // clear events
+            push_tip_response(&asserter);
             if batch_idx == 1 {
                 asserter.push_success(&serde_json::json!([take_log])); // take events
             } else {
                 asserter.push_success(&serde_json::json!([])); // take events
             }
+            push_tip_response(&asserter);
         }
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -1825,7 +1950,9 @@ mod tests {
         asserter.push_failure_msg("Rate limit exceeded");
         // Second attempt succeeds for both
         asserter.push_success(&serde_json::json!([])); // clear events (retry)
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([])); // take events (retry)
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1934,7 +2061,9 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([clear_log])); // clear events
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([take_log])); // take events
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
@@ -1967,7 +2096,9 @@ mod tests {
         // Should start from deployment_block (50) to end_block (100)
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([])); // clear events for 50-100
+        push_tip_response(&asserter);
         asserter.push_success(&serde_json::json!([])); // take events for 50-100
+        push_tip_response(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
