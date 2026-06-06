@@ -223,6 +223,9 @@ impl EventSourced for OffchainOrder {
                 executor,
                 placed_at,
                 is_extended_hours,
+                // Audit-only on the event; not carried in entity state.
+                limit_price: _,
+                client_order_id: _,
             } => Some(Self::Pending {
                 symbol: symbol.clone(),
                 shares: *shares,
@@ -363,6 +366,15 @@ impl EventSourced for OffchainOrder {
                 let is_extended_hours =
                     matches!(kind, CounterTradeOrderKind::ExtendedHoursLimit { .. });
 
+                // Captured before the order types consume them so the persisted
+                // Placed event records the exact terms submitted to the broker
+                // (limit price + idempotency key) for audit and reconciliation.
+                let placed_client_order_id = client_order_id.clone();
+                let placed_limit_price = match &kind {
+                    CounterTradeOrderKind::ExtendedHoursLimit { limit_price } => Some(*limit_price),
+                    CounterTradeOrderKind::Market => None,
+                };
+
                 let placement_result = match kind {
                     CounterTradeOrderKind::Market => {
                         let market_order = MarketOrder {
@@ -403,6 +415,8 @@ impl EventSourced for OffchainOrder {
                                 executor,
                                 placed_at: now,
                                 is_extended_hours,
+                                limit_price: placed_limit_price,
+                                client_order_id: Some(placed_client_order_id),
                             },
                             OffchainOrderEvent::Submitted {
                                 executor_order_id: result.executor_order_id,
@@ -418,6 +432,8 @@ impl EventSourced for OffchainOrder {
                             executor,
                             placed_at: now,
                             is_extended_hours,
+                            limit_price: placed_limit_price,
+                            client_order_id: Some(placed_client_order_id),
                         },
                         OffchainOrderEvent::Failed {
                             error: error.to_string(),
@@ -1513,6 +1529,16 @@ pub enum OffchainOrderEvent {
         /// persisted before this field existed.
         #[serde(default)]
         is_extended_hours: bool,
+        /// The limit price submitted to the broker for an extended-hours order
+        /// (`None` for market orders). Audit-only: not applied to entity state,
+        /// recorded so the actual submitted price is reconstructable from the
+        /// event stream. `#[serde(default)]` for events predating this field.
+        #[serde(default)]
+        limit_price: Option<Positive<Usd>>,
+        /// The broker idempotency key submitted with this placement. Audit-only.
+        /// `#[serde(default)]` (None) for events predating this field.
+        #[serde(default)]
+        client_order_id: Option<ClientOrderId>,
     },
     Submitted {
         executor_order_id: ExecutorOrderId,
@@ -1719,6 +1745,49 @@ mod tests {
             client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
             kind: CounterTradeOrderKind::Market,
         }
+    }
+
+    #[test]
+    fn placed_event_records_order_terms_and_defaults_for_legacy_events() {
+        let event = OffchainOrderEvent::Placed {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(100))).unwrap(),
+            direction: Direction::Buy,
+            executor: SupportedExecutor::DryRun,
+            placed_at: Utc::now(),
+            is_extended_hours: true,
+            limit_price: Some(Positive::new(Usd::new(float!(195.25))).unwrap()),
+            client_order_id: Some(ClientOrderId::from_uuid(uuid::Uuid::new_v4())),
+        };
+
+        // The submitted terms are recorded on the event for audit.
+        let mut value = serde_json::to_value(&event).unwrap();
+        assert!(
+            !value["Placed"]["limit_price"].is_null(),
+            "limit_price must be recorded on the Placed event"
+        );
+        assert!(
+            !value["Placed"]["client_order_id"].is_null(),
+            "client_order_id must be recorded on the Placed event"
+        );
+
+        // Events persisted before these fields existed (no keys) deserialize
+        // with the fields defaulted to None rather than failing.
+        let placed = value["Placed"].as_object_mut().unwrap();
+        placed.remove("limit_price");
+        placed.remove("client_order_id");
+        let legacy: OffchainOrderEvent = serde_json::from_value(value).unwrap();
+        assert!(
+            matches!(
+                legacy,
+                OffchainOrderEvent::Placed {
+                    limit_price: None,
+                    client_order_id: None,
+                    ..
+                }
+            ),
+            "legacy Placed event must default the audit terms to None, got: {legacy:?}"
+        );
     }
 
     #[tokio::test]
