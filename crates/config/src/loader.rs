@@ -36,7 +36,15 @@ static DRY_RUN_MIN_SHARES: LazyLock<Positive<FractionalShares>> = LazyLock::new(
     Positive::new(FractionalShares::new(float!(1))).unwrap_or_else(|_| unreachable!())
 });
 const MIN_COUNTER_TRADE_SLIPPAGE_BPS: u16 = 1;
-const MAX_COUNTER_TRADE_SLIPPAGE_BPS: u16 = 10_000;
+/// Slippage must be strictly less than 100%: 10_000 bps (exactly 100%) zeroes a
+/// sell-side limit price and fails `Positive::new` at runtime.
+///
+/// NOTE: this bound only rules out the exact-100% zero. It does NOT guarantee a
+/// positive sell price for every symbol: a near-100% slippage on a sub-dollar
+/// reference still floors to $0.0000 and fails `Positive::new` (fail-fast, not
+/// silent). Such a value is a gross misconfiguration; the bound exists to reject
+/// the degenerate exact-zero case, not to validate operationally sane slippage.
+const MAX_COUNTER_TRADE_SLIPPAGE_BPS: u16 = 9_999;
 
 #[derive(Parser, Debug)]
 pub struct Env {
@@ -218,6 +226,10 @@ struct Config {
     broker: Option<BrokerConfig>,
     assets: AssetsConfig,
     rest_api: Option<RestApiUrlConfig>,
+    /// When true, place limit orders during extended hours (pre-market /
+    /// after-hours) to hedge positions immediately instead of waiting for
+    /// regular market open. Must be explicitly configured.
+    extended_hours_counter_trading: bool,
 }
 
 /// Plaintext REST API settings (URL only). Credentials live in secrets.
@@ -444,6 +456,7 @@ pub struct Ctx {
     pub assets: AssetsConfig,
     pub travel_rule: Option<TravelRuleConfig>,
     pub rest_api: Option<RestApiCtx>,
+    pub extended_hours_counter_trading: bool,
     /// Alpaca redemption wallet from `[tokenization]`.
     /// `Some` when the config includes a `[tokenization]` section.
     pub redemption_wallet: Option<Address>,
@@ -539,7 +552,11 @@ impl std::fmt::Debug for Ctx {
             .field("assets", &self.assets)
             .field("travel_rule_configured", &self.travel_rule.is_some())
             .field("redemption_wallet", &self.redemption_wallet)
-            .field("rest_api", &self.rest_api);
+            .field("rest_api", &self.rest_api)
+            .field(
+                "extended_hours_counter_trading",
+                &self.extended_hours_counter_trading,
+            );
 
         debug_struct.finish()
     }
@@ -602,6 +619,7 @@ struct ValidatedParts {
     assets: AssetsConfig,
     travel_rule: Option<TravelRuleConfig>,
     rest_api: Option<RestApiCtx>,
+    extended_hours_counter_trading: bool,
     redemption_wallet: Option<Address>,
     /// Wallet construction inputs. Always present — `parse_and_validate`
     /// returns `WalletNotConfigured` when both config and secrets lack
@@ -844,6 +862,7 @@ fn parse_and_validate(
                 RestApiCtx::new(cfg.url, key_id, key_secret).map_err(CtxError::RestApiClient)
             })
             .transpose()?,
+        extended_hours_counter_trading: config.extended_hours_counter_trading,
         redemption_wallet,
         wallet_inputs,
         wallet_meta,
@@ -904,6 +923,7 @@ impl Ctx {
             assets: parts.assets,
             travel_rule: parts.travel_rule,
             rest_api: parts.rest_api,
+            extended_hours_counter_trading: parts.extended_hours_counter_trading,
             redemption_wallet: parts.redemption_wallet,
         })
     }
@@ -1071,6 +1091,7 @@ impl Ctx {
             assets,
             travel_rule,
             rest_api,
+            extended_hours_counter_trading: false,
             redemption_wallet,
         })
     }
@@ -1291,6 +1312,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         },
         travel_rule: None,
         rest_api: None,
+        extended_hours_counter_trading: false,
         redemption_wallet: None,
     }
 }
@@ -1321,6 +1343,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -1348,6 +1371,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -1377,6 +1401,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -1507,6 +1532,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -1547,6 +1573,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -1592,6 +1619,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -1634,6 +1662,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -1935,6 +1964,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn extended_hours_counter_trading_is_required() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+
+            deployment_block = 1
+            required_confirmations = 3
+        "#,
+        );
+        let secrets = dry_run_secrets_toml();
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CtxError::ConfigToml { .. }),
+            "expected config parse failure for missing extended-hours flag, got: {error:#}"
+        );
+
+        let source = std::error::Error::source(&error).unwrap();
+        let source_display = source.to_string();
+        assert!(
+            source_display.contains("extended_hours_counter_trading"),
+            "expected parse error to mention extended-hours flag, got: {source_display}"
+        );
+    }
+
+    #[tokio::test]
     async fn apalis_finished_job_cleanup_interval_must_be_non_zero() {
         let config = toml_file(
             r#"
@@ -1942,6 +2007,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 0
+            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -1980,6 +2046,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
             order_fill_poll_interval = 0
 
             [assets.equities]
@@ -2019,6 +2086,7 @@ mod tests {
             server_port = 8080
             board_port = 8080
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -2071,6 +2139,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -2129,6 +2198,7 @@ mod tests {
             database_url = ":memory:"
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
             log_level = "warn"
             server_port = 9090
             order_polling_interval = 30
@@ -2188,6 +2258,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -2278,6 +2349,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -2330,6 +2402,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -2393,6 +2466,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -2451,6 +2525,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -2513,6 +2588,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -2581,6 +2657,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -2631,6 +2708,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -2721,13 +2799,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn alpaca_broker_api_counter_trade_slippage_must_be_positive_and_at_most_10_000_bps() {
+    async fn alpaca_broker_api_counter_trade_slippage_must_be_positive_and_under_10_000_bps() {
         let config = toml_file(
             r#"
             database_url = ":memory:"
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -2764,10 +2843,64 @@ mod tests {
                 CtxError::CounterTradeSlippageBpsOutOfRange {
                     configured: 0,
                     min: 1,
-                    max: 10_000,
+                    max: 9_999,
                 }
             ),
             "Expected CounterTradeSlippageBpsOutOfRange, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn alpaca_broker_api_counter_trade_slippage_rejects_10_000_bps() {
+        // 10_000 bps (=100%) zeroes sell-side limit prices and fails
+        // Positive::new at runtime. Must be rejected at config load.
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+
+            deployment_block = 1
+            required_confirmations = 3
+
+            [broker]
+            counter_trade_slippage_bps = 10000
+        "#,
+        );
+        let secrets = toml_file(
+            r#"
+            [evm]
+            rpc_url = "http://localhost:8545"
+
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "dddddddd-eeee-aaaa-dddd-beeeeeeeeeef"
+        "#,
+        );
+
+        let err = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                CtxError::CounterTradeSlippageBpsOutOfRange {
+                    configured: 10_000,
+                    min: 1,
+                    max: 9_999,
+                }
+            ),
+            "Expected CounterTradeSlippageBpsOutOfRange{{configured: 10000}}, got: {err:?}"
         );
     }
     #[tokio::test]
@@ -2867,6 +3000,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -3195,6 +3329,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
             bogus_field = "should fail"
 
             [raindex]
@@ -3223,6 +3358,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
 
             [assets]
             bogus_field = "should fail"
@@ -3255,6 +3391,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
 
             [assets.equities.AAPL]
             tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -3290,6 +3427,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
 
             [assets.cash]
             rebalancing = "disabled"
@@ -3377,6 +3515,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
             bogus_field = "should fail"
 
             [raindex]
@@ -4175,6 +4314,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -4209,6 +4349,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -4258,6 +4399,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -4343,6 +4485,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -4383,6 +4526,7 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
+            extended_hours_counter_trading = false
             position_check_interval = 0
 
             [assets.equities]

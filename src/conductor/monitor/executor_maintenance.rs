@@ -60,8 +60,8 @@ mod tests {
     use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
     use st0x_execution::{
-        CounterTradePreflight, ExecutionError, InventoryResult, MarketOrder, OrderPlacement,
-        OrderState, SupportedExecutor, TryIntoExecutor,
+        CounterTradePreflight, ExecutionError, InventoryResult, LimitOrder, MarketOrder,
+        OrderPlacement, OrderState, SupportedExecutor, TryIntoExecutor,
     };
 
     use super::*;
@@ -106,6 +106,20 @@ mod tests {
             &self,
             _order: MarketOrder,
         ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
+            unreachable!("not used in maintenance tests")
+        }
+
+        async fn place_limit_order(
+            &self,
+            _order: LimitOrder,
+        ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
+            unreachable!("not used in maintenance tests")
+        }
+
+        async fn cancel_order(
+            &self,
+            _order_id: &Self::OrderId,
+        ) -> Result<st0x_execution::CancellationOutcome, Self::Error> {
             unreachable!("not used in maintenance tests")
         }
 

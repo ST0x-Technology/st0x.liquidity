@@ -231,6 +231,27 @@ pub(crate) enum TradeAccountingError {
     AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
     #[error("Failed to enqueue PollOrderStatus job: {0}")]
     EnqueuePollJob(#[from] crate::conductor::job::QueuePushError),
+    #[error("OrderPlacer not configured but market_session is Extended")]
+    OrderPlacerNotConfigured,
+    #[error("Failed to determine market session before placing hedge for {symbol}")]
+    MarketSessionCheck {
+        symbol: st0x_execution::Symbol,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    #[error("Failed to fetch latest trade price for {symbol}")]
+    LimitPriceFetch {
+        symbol: st0x_execution::Symbol,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    #[error(
+        "Executor does not support fetching trade prices for \
+         {symbol}"
+    )]
+    LimitPriceUnavailable { symbol: st0x_execution::Symbol },
+    #[error("Slippage calculation failed")]
+    SlippageCalculation(#[from] crate::trading::offchain::hedge::SlippageError),
 }
 
 #[cfg(test)]
@@ -329,6 +350,8 @@ mod tests {
             assets: ctx.assets.clone(),
             counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
             poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(&pool),
+            hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(&pool),
+            extended_hours_counter_trading: false,
         };
 
         let job_queue = DexTradeAccountingJobQueue::new(&pool);
@@ -456,6 +479,8 @@ mod tests {
             assets: ctx.assets.clone(),
             counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
             poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(&pool),
+            hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(&pool),
+            extended_hours_counter_trading: false,
         };
 
         let job_queue = DexTradeAccountingJobQueue::new(&pool);

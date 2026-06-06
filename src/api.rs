@@ -415,11 +415,11 @@ fn extract_log_file_date(entry: &std::fs::DirEntry) -> Option<chrono::NaiveDate>
     chrono::NaiveDate::parse_from_str(date_suffix, "%Y-%m-%d").ok()
 }
 
-/// Returns non-terminal offchain orders (Pending, Submitted, PartiallyFilled).
+/// Returns non-terminal offchain orders (Pending, Submitted, PartiallyFilled, Cancelling).
 async fn pending_orders(State(state): State<AppState>) -> Json<Vec<PendingOrderResponse>> {
     let rows: Vec<(String, String, String)> = match sqlx::query_as(
         "SELECT view_id, status, payload FROM offchain_order_view \
-         WHERE status IN ('Pending', 'Submitted', 'PartiallyFilled') \
+         WHERE status IN ('Pending', 'Submitted', 'PartiallyFilled', 'Cancelling') \
          ORDER BY rowid DESC LIMIT 100",
     )
     .fetch_all(&state.pool)
@@ -1543,6 +1543,77 @@ mod tests {
         assert_eq!(stuck.amount, "12.5");
         assert_eq!(stuck.location, StuckLocation::Issuer);
         assert_eq!(stuck.reason, StuckReason::MintAcceptanceFailed);
+    }
+
+    #[test]
+    fn parse_pending_order_handles_cancelling_status() {
+        // The cancel-and-replace flow introduced the non-terminal `Cancelling`
+        // state; the /orders/pending endpoint must surface it like any other
+        // live order rather than dropping it on the floor.
+        let payload = r#"{"Live":{"Cancelling":{"symbol":"AAPL","direction":"Sell","shares":"1.5","executor":"DryRun","placed_at":"2026-01-01T00:00:00Z","submitted_at":"2026-01-01T00:00:01Z","shares_filled":"0.5","avg_price":"195.25"}}}"#;
+
+        let parsed = parse_pending_order("order-1".to_string(), "Cancelling".to_string(), payload)
+            .expect("Cancelling order should parse");
+
+        assert_eq!(parsed.view_id, "order-1");
+        assert_eq!(parsed.status, "Cancelling");
+        assert_eq!(parsed.symbol, "AAPL");
+        assert_eq!(parsed.direction, "Sell");
+        assert_eq!(parsed.shares, "1.5");
+        assert_eq!(parsed.executor, "DryRun");
+        assert_eq!(parsed.placed_at, "2026-01-01T00:00:00Z");
+        assert_eq!(parsed.submitted_at.as_deref(), Some("2026-01-01T00:00:01Z"));
+        assert_eq!(parsed.shares_filled.as_deref(), Some("0.5"));
+        assert_eq!(parsed.avg_price.as_deref(), Some("195.25"));
+    }
+
+    #[tokio::test]
+    async fn offchain_order_view_status_column_maps_cancelling_and_cancelled() {
+        // The generated `status` column must map every lifecycle state; a
+        // missing CASE arm yields NULL and hides the order from the
+        // status-filtered pending-orders query.
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+
+        let cancelling_payload = r#"{"Live":{"Cancelling":{"symbol":"AAPL","direction":"Sell","shares":"1.5","executor":"DryRun","placed_at":"2026-01-01T00:00:00Z","submitted_at":"2026-01-01T00:00:01Z"}}}"#;
+        let cancelled_payload = r#"{"Live":{"Cancelled":{"symbol":"AAPL","direction":"Sell","shares":"1.5","executor":"DryRun","placed_at":"2026-01-01T00:00:00Z","cancelled_at":"2026-01-01T00:00:02Z"}}}"#;
+        for (view_id, payload) in [
+            ("order-cancelling", cancelling_payload),
+            ("order-cancelled", cancelled_payload),
+        ] {
+            sqlx::query(
+                "INSERT INTO offchain_order_view (view_id, version, payload) VALUES (?, 1, ?)",
+            )
+            .bind(view_id)
+            .bind(payload)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let statuses: Vec<(String, String)> =
+            sqlx::query_as("SELECT view_id, status FROM offchain_order_view ORDER BY view_id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            statuses,
+            vec![
+                ("order-cancelled".to_string(), "Cancelled".to_string()),
+                ("order-cancelling".to_string(), "Cancelling".to_string()),
+            ]
+        );
+
+        // The pending-orders filter must surface Cancelling (non-terminal)
+        // and exclude Cancelled (terminal).
+        let pending: Vec<(String,)> = sqlx::query_as(
+            "SELECT view_id FROM offchain_order_view \
+             WHERE status IN ('Pending', 'Submitted', 'PartiallyFilled', 'Cancelling')",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(pending, vec![("order-cancelling".to_string(),)]);
     }
 
     #[test]

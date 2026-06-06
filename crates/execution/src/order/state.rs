@@ -1,101 +1,53 @@
 use chrono::{DateTime, Utc};
 
-use rain_math_float::Float;
+use crate::{ExecutorOrderId, FractionalShares, Usd};
 
 use super::OrderStatus;
 
 /// Runtime representation of an offchain order's lifecycle state.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OrderState {
     Pending,
     Submitted {
-        order_id: String,
+        order_id: ExecutorOrderId,
+    },
+    /// Broker reports a partial fill. Carries the executed quantity so far
+    /// and the average fill price so the local aggregate can record the
+    /// fill via `UpdatePartialFill` before the order is either filled,
+    /// cancelled, or fails.
+    PartiallyFilled {
+        order_id: ExecutorOrderId,
+        shares_filled: FractionalShares,
+        avg_price: Option<Usd>,
+        partially_filled_at: DateTime<Utc>,
     },
     Filled {
         executed_at: DateTime<Utc>,
-        order_id: String,
-        price: Float,
+        order_id: ExecutorOrderId,
+        price: Usd,
+    },
+    Cancelled {
+        cancelled_at: DateTime<Utc>,
+        order_id: ExecutorOrderId,
+        shares_filled: Option<FractionalShares>,
+        avg_price: Option<Usd>,
     },
     Failed {
         failed_at: DateTime<Utc>,
         error_reason: Option<String>,
+        shares_filled: Option<FractionalShares>,
+        avg_price: Option<Usd>,
     },
 }
-
-impl std::fmt::Debug for OrderState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Pending => write!(f, "Pending"),
-            Self::Submitted { order_id } => f
-                .debug_struct("Submitted")
-                .field("order_id", order_id)
-                .finish(),
-            Self::Filled {
-                executed_at,
-                order_id,
-                price,
-            } => f
-                .debug_struct("Filled")
-                .field("executed_at", executed_at)
-                .field("order_id", order_id)
-                .field("price", &st0x_float_serde::DebugFloat(price))
-                .finish(),
-            Self::Failed {
-                failed_at,
-                error_reason,
-            } => f
-                .debug_struct("Failed")
-                .field("failed_at", failed_at)
-                .field("error_reason", error_reason)
-                .finish(),
-        }
-    }
-}
-
-impl PartialEq for OrderState {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Pending, Self::Pending) => true,
-            (Self::Submitted { order_id: lhs }, Self::Submitted { order_id: rhs }) => lhs == rhs,
-            (
-                Self::Filled {
-                    executed_at: lhs_executed_at,
-                    order_id: lhs_order_id,
-                    price: lhs_price,
-                },
-                Self::Filled {
-                    executed_at: rhs_executed_at,
-                    order_id: rhs_order_id,
-                    price: rhs_price,
-                },
-            ) => {
-                lhs_executed_at == rhs_executed_at
-                    && lhs_order_id == rhs_order_id
-                    && lhs_price.eq(*rhs_price).unwrap_or(false)
-            }
-            (
-                Self::Failed {
-                    failed_at: lhs_failed_at,
-                    error_reason: lhs_error_reason,
-                },
-                Self::Failed {
-                    failed_at: rhs_failed_at,
-                    error_reason: rhs_error_reason,
-                },
-            ) => lhs_failed_at == rhs_failed_at && lhs_error_reason == rhs_error_reason,
-            _ => false,
-        }
-    }
-}
-
-impl Eq for OrderState {}
 
 impl OrderState {
     pub const fn status(&self) -> OrderStatus {
         match self {
             Self::Pending => OrderStatus::Pending,
             Self::Submitted { .. } => OrderStatus::Submitted,
+            Self::PartiallyFilled { .. } => OrderStatus::PartiallyFilled,
             Self::Filled { .. } => OrderStatus::Filled,
+            Self::Cancelled { .. } => OrderStatus::Cancelled,
             Self::Failed { .. } => OrderStatus::Failed,
         }
     }
@@ -103,14 +55,16 @@ impl OrderState {
 
 #[cfg(test)]
 mod tests {
+    use rain_math_float::Float;
+
     use super::*;
 
     #[test]
     fn filled_debug_formats_price_as_decimal() {
         let state = OrderState::Filled {
             executed_at: Utc::now(),
-            order_id: "ORDER123".to_string(),
-            price: Float::parse("150.00".to_string()).unwrap(),
+            order_id: ExecutorOrderId::new("ORDER123"),
+            price: Usd::new(Float::parse("150.00".to_string()).unwrap()),
         };
 
         let debug_output = format!("{state:?}");
@@ -129,7 +83,7 @@ mod tests {
         assert_eq!(OrderState::Pending.status(), OrderStatus::Pending);
         assert_eq!(
             OrderState::Submitted {
-                order_id: "ORDER123".to_string()
+                order_id: ExecutorOrderId::new("ORDER123")
             }
             .status(),
             OrderStatus::Submitted
@@ -137,16 +91,28 @@ mod tests {
         assert_eq!(
             OrderState::Filled {
                 executed_at: Utc::now(),
-                order_id: "ORDER123".to_string(),
-                price: Float::parse("150.00".to_string()).unwrap(),
+                order_id: ExecutorOrderId::new("ORDER123"),
+                price: Usd::new(Float::parse("150.00".to_string()).unwrap()),
             }
             .status(),
             OrderStatus::Filled
         );
         assert_eq!(
+            OrderState::Cancelled {
+                cancelled_at: Utc::now(),
+                order_id: ExecutorOrderId::new("ORDER123"),
+                shares_filled: None,
+                avg_price: None,
+            }
+            .status(),
+            OrderStatus::Cancelled
+        );
+        assert_eq!(
             OrderState::Failed {
                 failed_at: Utc::now(),
-                error_reason: None
+                error_reason: None,
+                shares_filled: None,
+                avg_price: None,
             }
             .status(),
             OrderStatus::Failed

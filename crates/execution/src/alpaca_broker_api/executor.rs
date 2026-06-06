@@ -16,11 +16,12 @@ use super::journal::JournalResponse;
 use super::order::{
     AlpacaLimitOrder, ConversionDirection, CryptoOrderOutcome, CryptoOrderResponse,
 };
-use super::{AlpacaBrokerApiError, AssetStatus, TimeInForce};
+use super::{AlpacaBrokerApiError, AssetStatus, MissingOrderField, TimeInForce};
 use crate::{
-    ClientOrderId, CounterTradePreflight, Direction, Executor, FractionalShares, InventoryResult,
-    MarketOrder, OrderPlacement, OrderState, OrderStatus, Positive, SupportedExecutor, Symbol,
-    TryIntoExecutor, buying_power_counter_trade_preflight, estimate_buffered_cost_cents,
+    CancellationOutcome, ClientOrderId, CounterTradePreflight, Direction, Executor,
+    ExecutorOrderId, FractionalShares, InventoryResult, LimitOrder, MarketOrder, MarketSession,
+    OrderPlacement, OrderState, OrderStatus, Positive, SupportedExecutor, Symbol, TryIntoExecutor,
+    Usd, buying_power_counter_trade_preflight, estimate_buffered_cost_cents,
 };
 
 /// Response from the asset endpoint
@@ -140,25 +141,69 @@ impl Executor for AlpacaBrokerApi {
 
         match order_update.status {
             OrderStatus::Pending | OrderStatus::Submitted => Ok(OrderState::Submitted {
-                order_id: order_id.clone(),
+                order_id: ExecutorOrderId::new(order_id),
             }),
-            OrderStatus::Filled => {
-                let price = order_update.price.ok_or_else(|| {
-                    AlpacaBrokerApiError::IncompleteFilledOrder {
-                        order_id: order_id.clone(),
-                        field: "price".to_string(),
+            OrderStatus::PartiallyFilled => {
+                let shares_filled = order_update.shares_filled.ok_or_else(|| {
+                    AlpacaBrokerApiError::IncompleteOrder {
+                        order_id: ExecutorOrderId::new(order_id),
+                        field: MissingOrderField::FilledQty,
                     }
                 })?;
 
-                Ok(OrderState::Filled {
-                    executed_at: order_update.updated_at,
-                    order_id: order_id.clone(),
-                    price,
+                Ok(OrderState::PartiallyFilled {
+                    order_id: ExecutorOrderId::new(order_id),
+                    shares_filled,
+                    avg_price: order_update.price.map(Usd::new),
+                    partially_filled_at: order_update.updated_at,
                 })
             }
+            OrderStatus::Filled => {
+                let price =
+                    order_update
+                        .price
+                        .ok_or_else(|| AlpacaBrokerApiError::IncompleteOrder {
+                            order_id: ExecutorOrderId::new(order_id),
+                            field: MissingOrderField::Price,
+                        })?;
+
+                Ok(OrderState::Filled {
+                    executed_at: order_update.updated_at,
+                    order_id: ExecutorOrderId::new(order_id),
+                    price: Usd::new(price),
+                })
+            }
+            // Alpaca always reports filled_qty ("0" when unfilled), so a
+            // terminal response without it is malformed: passing None through
+            // would be indistinguishable from a no-fill terminal order
+            // downstream, silently dropping any partial fill (the
+            // double-hedge failure mode). Fail closed like PartiallyFilled.
+            OrderStatus::Cancelled => {
+                let shares_filled = order_update.shares_filled.ok_or_else(|| {
+                    AlpacaBrokerApiError::IncompleteOrder {
+                        order_id: ExecutorOrderId::new(order_id),
+                        field: MissingOrderField::FilledQty,
+                    }
+                })?;
+                Ok(OrderState::Cancelled {
+                    cancelled_at: order_update.updated_at,
+                    order_id: ExecutorOrderId::new(order_id),
+                    shares_filled: Some(shares_filled),
+                    avg_price: order_update.price.map(Usd::new),
+                })
+            }
+            // Unlike Cancelled, Failed does NOT fail closed on a missing
+            // filled_qty: rejected-order payloads have been observed without
+            // the field, and erroring here would wedge rejection handling
+            // (the poll retries the same read forever and the position never
+            // releases). A genuine partial fill on a failed order carries
+            // filled_qty, which the retained-fill path records; an absent
+            // field on a rejection means no fill.
             OrderStatus::Failed => Ok(OrderState::Failed {
                 failed_at: order_update.updated_at,
                 error_reason: None,
+                shares_filled: order_update.shares_filled,
+                avg_price: order_update.price.map(Usd::new),
             }),
         }
     }
@@ -202,7 +247,7 @@ impl Executor for AlpacaBrokerApi {
                 let account_funds = super::positions::get_account_funds(&self.client).await?;
                 let estimated_cost_cents = estimate_buffered_cost_cents(
                     order.shares,
-                    latest_trade_price.inner(),
+                    latest_trade_price.inner().inner(),
                     self.counter_trade_slippage_bps,
                 )?;
 
@@ -225,6 +270,52 @@ impl Executor for AlpacaBrokerApi {
                 Ok(preflight)
             }
         }
+    }
+
+    async fn fetch_latest_trade_price(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<Option<Positive<Usd>>, Self::Error> {
+        let price = crate::alpaca_market_data::fetch_latest_trade_price(
+            self.client.market_data_http_client(),
+            self.client.market_data_base_url(),
+            symbol,
+        )
+        .await?;
+        Ok(Some(price))
+    }
+
+    async fn market_session(&self) -> Result<MarketSession, Self::Error> {
+        super::market_hours::market_session(&self.client).await
+    }
+
+    async fn place_limit_order(
+        &self,
+        order: LimitOrder,
+    ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
+        let asset = self.get_asset_cached(&order.symbol).await?;
+        Self::validate_asset(&order.symbol, &asset)?;
+
+        let alpaca_limit_price = super::order::AlpacaLimitPrice::try_new(order.limit_price)?;
+
+        let alpaca_order = AlpacaLimitOrder {
+            symbol: order.symbol,
+            shares: order.shares,
+            direction: order.direction,
+            limit_price: alpaca_limit_price,
+            extended_hours: order.extended_hours,
+            client_order_id: order.client_order_id,
+        };
+
+        super::order::place_limit_order(&self.client, alpaca_order).await
+    }
+
+    async fn cancel_order(
+        &self,
+        order_id: &Self::OrderId,
+    ) -> Result<CancellationOutcome, Self::Error> {
+        let order_uuid = Uuid::parse_str(order_id)?;
+        self.client.cancel_order(order_uuid).await
     }
 }
 
@@ -316,12 +407,12 @@ impl AlpacaBrokerApi {
             .await
     }
 
-    /// Place a manual Alpaca Broker API limit order for operator intervention.
+    /// Place a manual Alpaca-specific limit order for operator intervention.
     ///
-    /// This stays outside the generic `Executor` trait because automated hedging
-    /// uses market orders only; manual CLI limit orders are an Alpaca-specific
-    /// workflow.
-    pub async fn place_limit_order(
+    /// Accepts `AlpacaLimitOrder` directly (pre-validated Alpaca price type).
+    /// For automated counter-trading, use the `Executor::place_limit_order`
+    /// trait method which accepts the broker-agnostic `LimitOrder` type.
+    pub async fn place_alpaca_limit_order(
         &self,
         order: AlpacaLimitOrder,
     ) -> Result<OrderPlacement<String>, AlpacaBrokerApiError> {
@@ -847,7 +938,8 @@ mod tests {
                     "type": "limit",
                     "limit_price": "195.25",
                     "time_in_force": "day",
-                    "extended_hours": true
+                    "extended_hours": true,
+                    "client_order_id": "88888888-8888-4888-8888-888888888888"
                 }));
             then.status(200)
                 .header("content-type", "application/json")
@@ -1135,9 +1227,12 @@ mod tests {
             )
             .unwrap(),
             extended_hours: true,
+            client_order_id: ClientOrderId::from_uuid(uuid!(
+                "88888888-8888-4888-8888-888888888888"
+            )),
         };
 
-        let result = executor.place_limit_order(order).await.unwrap();
+        let result = executor.place_alpaca_limit_order(order).await.unwrap();
 
         asset_mock.assert();
         order_mock.assert();
@@ -1169,9 +1264,10 @@ mod tests {
             )
             .unwrap(),
             extended_hours: true,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         };
 
-        let result = executor.place_limit_order(order).await;
+        let result = executor.place_alpaca_limit_order(order).await;
 
         asset_mock.assert();
         order_mock.assert_calls(0);
@@ -1210,9 +1306,10 @@ mod tests {
             )
             .unwrap(),
             extended_hours: true,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         };
 
-        let result = executor.place_limit_order(order).await;
+        let result = executor.place_alpaca_limit_order(order).await;
 
         asset_mock.assert();
         order_mock.assert_calls(0);
@@ -1223,6 +1320,191 @@ mod tests {
                 AlpacaBrokerApiError::AssetNotTradable { symbol } if *symbol == Symbol::new("AAPL").unwrap()
             ),
             "Expected AssetNotTradable error, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_order_surfaces_404_as_order_not_found() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = create_account_mock(&server);
+        let order_id = "904837e3-3b76-47ec-b432-046db621571b".to_string();
+
+        let cancel_mock = server.mock(|when, then| {
+            when.method(DELETE).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
+            ));
+            then.status(404)
+                .header("content-type", "application/json")
+                .json_body(json!({ "code": 40_410_000, "message": "order not found" }));
+        });
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let outcome = executor.cancel_order(&order_id).await.unwrap();
+
+        cancel_mock.assert();
+        assert_eq!(outcome, crate::CancellationOutcome::OrderNotFound);
+    }
+
+    #[tokio::test]
+    async fn cancel_order_surfaces_2xx_as_requested() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = create_account_mock(&server);
+        let order_id = "904837e3-3b76-47ec-b432-046db621571b".to_string();
+
+        let cancel_mock = server.mock(|when, then| {
+            when.method(DELETE).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
+            ));
+            then.status(204);
+        });
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let outcome = executor.cancel_order(&order_id).await.unwrap();
+
+        cancel_mock.assert();
+        assert_eq!(outcome, crate::CancellationOutcome::Requested);
+    }
+
+    #[tokio::test]
+    async fn get_order_status_maps_cancelled_broker_order_with_fill_to_order_state() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = create_account_mock(&server);
+        let order_id = "61e7b016-9c91-4a97-b912-615c9d365c9d".to_string();
+
+        let status_mock = server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
+            ));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": order_id,
+                    "symbol": "AAPL",
+                    "qty": "100",
+                    "filled_qty": "40.5",
+                    "side": "buy",
+                    "status": "canceled",
+                    "filled_avg_price": "199.50",
+                    "canceled_at": "2025-01-06T14:32:01.111111Z"
+                }));
+        });
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let state = executor.get_order_status(&order_id).await.unwrap();
+
+        status_mock.assert();
+        let OrderState::Cancelled {
+            shares_filled,
+            avg_price,
+            cancelled_at,
+            ..
+        } = state
+        else {
+            panic!("expected OrderState::Cancelled, got {state:?}");
+        };
+        assert_eq!(shares_filled, Some(FractionalShares::new(float!(40.5))));
+        assert_eq!(avg_price, Some(Usd::new(float!(199.50))));
+        // Broker cancellation time, not the local observation time.
+        assert_eq!(
+            cancelled_at,
+            "2025-01-06T14:32:01.111111Z"
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn get_order_status_rejected_without_filled_qty_maps_to_failed() {
+        // Rejected-order payloads have been observed without filled_qty.
+        // Failing closed here would wedge rejection handling: the poll
+        // would retry the same erroring status read forever and the
+        // position would never release its pending slot.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = create_account_mock(&server);
+        let order_id = "61e7b016-9c91-4a97-b912-615c9d365c9d".to_string();
+
+        let status_mock = server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
+            ));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": order_id,
+                    "symbol": "AAPL",
+                    "qty": "100",
+                    "side": "buy",
+                    "status": "rejected"
+                }));
+        });
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let state = executor.get_order_status(&order_id).await.unwrap();
+
+        status_mock.assert();
+        let OrderState::Failed {
+            shares_filled,
+            avg_price,
+            ..
+        } = state
+        else {
+            panic!("expected OrderState::Failed, got {state:?}");
+        };
+        assert_eq!(shares_filled, None);
+        assert_eq!(avg_price, None);
+    }
+
+    #[tokio::test]
+    async fn get_order_status_partially_filled_without_filled_qty_errors() {
+        // The PartiallyFilled arm requires filled_qty: a broker payload
+        // claiming a partial fill without the quantity must fail fast rather
+        // than fabricate a fill amount.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = create_account_mock(&server);
+        let order_id = "61e7b016-9c91-4a97-b912-615c9d365c9d".to_string();
+
+        let status_mock = server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
+            ));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": order_id,
+                    "symbol": "AAPL",
+                    "qty": "100",
+                    "side": "buy",
+                    "status": "partially_filled",
+                    "filled_avg_price": "199.50"
+                }));
+        });
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+
+        let error = executor.get_order_status(&order_id).await.unwrap_err();
+
+        status_mock.assert();
+        assert!(
+            matches!(
+                &error,
+                AlpacaBrokerApiError::IncompleteOrder { order_id: id, field: MissingOrderField::FilledQty }
+                    if *id == ExecutorOrderId::new(&order_id)
+            ),
+            "expected IncompleteOrder for FilledQty, got {error:?}"
         );
     }
 }
