@@ -702,6 +702,7 @@ async fn create_test_cqrs_with_assets(
         assets,
         counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
         poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(pool),
+        hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(pool),
         extended_hours_counter_trading: false,
     };
 

@@ -110,6 +110,10 @@ pub(crate) struct TradeProcessingCqrs {
     /// hook the order stays `Submitted` forever -- the system has no other
     /// trigger to ask the broker about an in-flight order.
     pub(crate) poll_status_queue: PollOrderStatusJobQueue,
+    /// Used to enqueue an immediate `PlaceHedge` for extended-hours fills, which
+    /// the inline path cannot place itself (it has no `OrderPlacer` for the
+    /// limit-order price lookup). `CheckPositions` is the backstop.
+    pub(crate) hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue,
     pub(crate) extended_hours_counter_trading: bool,
 }
 
@@ -1568,17 +1572,54 @@ where
         return Ok(None);
     };
 
-    // Extended-hours counter-trades are handled by the CheckPositions job
-    // which has access to the OrderPlacer for price lookups. The inline path
-    // can only place market orders.
+    // Extended-hours counter-trades cannot be placed inline (this path has no
+    // OrderPlacer for the limit-order price lookup). Instead of waiting for the
+    // next CheckPositions scan (~1 min), enqueue an immediate PlaceHedge job,
+    // which has the OrderPlacer and submits the limit order. CheckPositions
+    // remains the backstop. Preflight + clamp here, mirroring the scan path, so
+    // we never enqueue a hedge that would exceed buying power.
     if execution.market_session == MarketSession::Extended {
+        let _counter_trade_submission_guard = cqrs.counter_trade_submission_lock.lock().await;
+
+        match preflight_counter_trade_submission(executor, &execution, None).await? {
+            CounterTradeSubmissionCheck::Skipped => return Ok(None),
+            CounterTradeSubmissionCheck::Allowed { reservation } => {
+                clamp_shares_to_reservation(&mut execution, reservation.as_ref());
+            }
+        }
+
+        let offchain_order_id = OffchainOrderId::new();
         info!(
             target: "hedge",
             symbol = %execution.symbol,
             shares = %execution.shares,
             direction = ?execution.direction,
-            "Extended hours: deferring hedge to CheckPositions job (poll-driven, not event-driven)"
+            "Extended hours: enqueueing immediate PlaceHedge (limit order via the job's OrderPlacer)"
         );
+
+        let job = crate::trading::offchain::hedge::PlaceHedge {
+            symbol: execution.symbol.clone(),
+            direction: execution.direction,
+            shares: execution.shares,
+            executor: execution.executor,
+            threshold: cqrs.execution_threshold,
+            offchain_order_id,
+            market_session: execution.market_session,
+        };
+
+        if let Err(error) = cqrs.hedge_queue.clone().push(job).await {
+            error!(
+                target: "hedge",
+                symbol = %execution.symbol,
+                %error,
+                "Failed to enqueue extended-hours hedge; CheckPositions will retry"
+            );
+        }
+
+        // No inline offchain order was placed: the durable PlaceHedge job claims
+        // the position (via PlaceOffChainOrder) when it runs. Returning the job's
+        // not-yet-recorded id would be a synthetic handle the aggregates know
+        // nothing about, so signal "no inline placement" with None.
         return Ok(None);
     }
 
@@ -2898,6 +2939,7 @@ mod tests {
             },
             counter_trade_submission_lock: Arc::new(Mutex::new(())),
             poll_status_queue: PollOrderStatusJobQueue::new(pool),
+            hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(pool),
             extended_hours_counter_trading: false,
         }
     }
@@ -3064,6 +3106,81 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "Skipped counter trades must not create offchain orders"
+        );
+    }
+
+    #[tokio::test]
+    async fn extended_hours_trade_enqueues_immediate_hedge_job() {
+        // With extended-hours counter-trading enabled and the broker in an
+        // Extended session, an onchain fill must enqueue an immediate PlaceHedge
+        // job (which has the OrderPlacer for the limit order) rather than place
+        // inline or wait for the next CheckPositions scan.
+        let pool = setup_test_db().await;
+        setup_apalis_tables(&pool).await.unwrap();
+        let (frameworks, offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs = TradeProcessingCqrs {
+            onchain_trade: frameworks.onchain_trade.clone(),
+            position: frameworks.position.clone(),
+            position_projection: frameworks.position_projection.clone(),
+            offchain_order: frameworks.offchain_order.clone(),
+            execution_threshold: ExecutionThreshold::whole_share(),
+            assets: AssetsConfig {
+                equities: EquitiesConfig::default(),
+                cash: None,
+            },
+            counter_trade_submission_lock: Arc::new(Mutex::new(())),
+            poll_status_queue: PollOrderStatusJobQueue::new(&pool),
+            hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(&pool),
+            extended_hours_counter_trading: true,
+        };
+
+        let trade_event = make_trade_event(77);
+        let trade = test_trade_with_amount_and_direction(float!(5.0), 77, Direction::Buy);
+
+        let executor = MockExecutor::new()
+            .with_market_session(MarketSession::Extended)
+            .with_inventory(ExecutionInventory {
+                positions: vec![EquityPosition {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: FractionalShares::new(float!(10.0)),
+                    market_value: None,
+                }],
+                usd_balance_cents: 1_000_000,
+                cash_buying_power_cents: Some(1_000_000),
+                alpaca_usdc: None,
+                cash_withdrawable_cents: None,
+            });
+
+        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result, None,
+            "no inline offchain order is placed for extended hours; the PlaceHedge \
+             job claims the position when it runs"
+        );
+
+        assert!(
+            offchain_order_projection
+                .load_all()
+                .await
+                .unwrap()
+                .is_empty(),
+            "extended-hours hedge must be deferred to a PlaceHedge job, not placed inline"
+        );
+
+        let hedge_jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+            .bind(std::any::type_name::<
+                crate::trading::offchain::hedge::PlaceHedge,
+            >())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            hedge_jobs, 1,
+            "exactly one immediate PlaceHedge job should be enqueued for the extended-hours fill"
         );
     }
 

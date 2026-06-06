@@ -253,6 +253,7 @@ where
         assets: context.ctx.assets.clone(),
         counter_trade_submission_lock,
         poll_status_queue: poll_status_queue.clone(),
+        hedge_queue: hedge_queue.clone(),
         extended_hours_counter_trading: context.ctx.extended_hours_counter_trading,
     };
 
