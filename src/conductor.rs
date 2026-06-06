@@ -31,7 +31,7 @@ use st0x_event_sorcery::{
 use st0x_evm::Wallet;
 use st0x_execution::{
     ClientOrderId, CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason,
-    ExecutionError, Executor, FractionalShares, MarketOrder, MarketSession, Positive, Symbol,
+    ExecutionError, Executor, FractionalShares, MarketOrder, MarketSession, Symbol,
     TryIntoExecutor,
 };
 
@@ -47,7 +47,8 @@ use crate::inventory::{
 use crate::offchain::order::{
     ExecutorOrderPlacer, HandleOrderRejectionJobQueue, OffchainOrder, OffchainOrderCommand,
     OffchainOrderId, OrderPlacer, PollOrderStatus, PollOrderStatusJobQueue,
-    ReconcileOrderFillJobQueue, recover_submitted_offchain_orders,
+    ReconcileOrderFillJobQueue, TerminalPositionFinalization, recover_submitted_offchain_orders,
+    terminal_position_finalization,
 };
 use crate::onchain::OnchainTrade;
 use crate::onchain::USDC_BASE;
@@ -1190,92 +1191,43 @@ async fn recover_single_orphaned_order(
         return Ok(());
     };
 
-    let command = match order {
-        OffchainOrder::Filled {
-            ref executor_order_id,
-            price,
-            filled_at,
-            ..
-        } => {
-            info!(%symbol, %order_id, "Orphaned order already Filled -- recovering");
-            PositionCommand::CompleteOffChainOrder {
-                offchain_order_id: order_id,
-                shares_filled: order.shares(),
-                direction: order.direction(),
-                executor_order_id: executor_order_id.clone(),
-                price,
-                broker_timestamp: filled_at,
-            }
-        }
-
-        OffchainOrder::Failed {
-            shares_filled: Some(shares_filled),
-            avg_price: Some(price),
-            executor_order_id: Some(executor_order_id),
+    let command = match terminal_position_finalization(&order) {
+        Some(TerminalPositionFinalization::Complete {
+            shares_filled,
             direction,
-            ..
-        } if Positive::new(shares_filled).is_ok() => {
-            info!(%symbol, %order_id, "Orphaned order already Failed with partial fill -- recovering");
+            executor_order_id,
+            price,
+            broker_timestamp,
+        }) => {
+            info!(%symbol, %order_id, "Orphaned order terminal with fill -- recovering");
             PositionCommand::CompleteOffChainOrder {
                 offchain_order_id: order_id,
-                shares_filled: Positive::new(shares_filled)?,
+                shares_filled,
                 direction,
                 executor_order_id,
                 price,
-                broker_timestamp: Utc::now(),
+                broker_timestamp,
             }
         }
 
-        OffchainOrder::Failed { .. } => {
-            info!(%symbol, %order_id, "Orphaned order already Failed -- recovering");
+        Some(TerminalPositionFinalization::NoFill) => {
+            info!(%symbol, %order_id, "Orphaned terminal order with no fill -- clearing pending");
             PositionCommand::FailOffChainOrder {
                 offchain_order_id: order_id,
-                error: "recovered from orphaned state on startup".to_string(),
+                error: "recovered from orphaned terminal state on startup".to_string(),
             }
         }
 
-        OffchainOrder::Cancelled {
-            shares_filled,
-            avg_price,
-            direction,
-            executor_order_id,
-            reason,
-            ..
-        } => {
-            info!(%symbol, %order_id, ?reason, "Orphaned order already Cancelled -- recovering");
-
-            if let Ok(positive_filled) = Positive::new(shares_filled) {
-                let Some(price) = avg_price else {
-                    anyhow::bail!(
-                        "cancelled order {order_id} for {symbol} has {shares_filled} shares filled but no average price"
-                    );
-                };
-
-                PositionCommand::CompleteOffChainOrder {
-                    offchain_order_id: order_id,
-                    shares_filled: positive_filled,
-                    direction,
-                    executor_order_id,
-                    price,
-                    broker_timestamp: Utc::now(),
-                }
-            } else {
-                PositionCommand::FailOffChainOrder {
-                    offchain_order_id: order_id,
-                    error: format!("recovered cancelled order: {reason:?}"),
-                }
-            }
+        Some(TerminalPositionFinalization::UnpricedFill { shares_filled }) => {
+            anyhow::bail!(
+                "orphaned order {order_id} for {symbol} has {shares_filled} shares filled but no average price"
+            );
         }
 
-        OffchainOrder::Submitted { .. }
-        | OffchainOrder::PartiallyFilled { .. }
-        | OffchainOrder::Cancelling { .. } => {
+        // Non-terminal: the order is still in progress (Submitted /
+        // PartiallyFilled / Cancelling / Pending) -- nothing to finalize yet.
+        None => {
             debug!(%symbol, %order_id, "Pending offchain order still in progress");
-            return Ok(());
-        }
-
-        OffchainOrder::Pending { .. } => {
-            warn!(%symbol, %order_id, "Offchain order still Pending -- may not have been submitted");
             return Ok(());
         }
     };

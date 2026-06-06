@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use apalis::prelude::Status;
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tracing::{debug, error, info, warn};
@@ -17,7 +16,7 @@ use tracing::{debug, error, info, warn};
 use st0x_config::Ctx;
 use st0x_event_sorcery::{Projection, Store};
 use st0x_execution::{
-    ClientOrderId, CounterTradePreflight, Executor, MarketOrder, MarketSession, Positive, Symbol,
+    ClientOrderId, CounterTradePreflight, Executor, MarketOrder, MarketSession, Symbol,
 };
 
 use crate::conductor::clamp_shares_to_reservation;
@@ -25,6 +24,7 @@ use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::equity_redemption::symbols_with_active_transfers;
 use crate::offchain::order::{
     CancellationReason, OffchainOrder, OffchainOrderCommand, OffchainOrderId,
+    TerminalPositionFinalization, terminal_position_finalization,
 };
 use crate::onchain::accumulator::{ExecutionCtx, check_execution_readiness};
 use crate::position::{Position, PositionCommand};
@@ -406,156 +406,56 @@ where
         offchain_order_id: OffchainOrderId,
         order: &OffchainOrder,
     ) -> bool {
-        // Try to apply any partial fill first.
-        if let OffchainOrder::Cancelled {
-            shares_filled,
-            avg_price,
-            direction,
-            executor_order_id,
-            ..
-        } = order
-            && let Ok(positive_filled) = Positive::new(*shares_filled)
-        {
-            let Some(avg_price) = avg_price else {
-                warn!(
-                    %symbol, %offchain_order_id,
-                    "Cancelled order has partial fill without avg price; leaving position pending"
-                );
-                return false;
-            };
-
-            if let Err(error) = self
-                .position
-                .send(
-                    symbol,
-                    PositionCommand::CompleteOffChainOrder {
-                        offchain_order_id,
-                        shares_filled: positive_filled,
-                        direction: *direction,
-                        executor_order_id: executor_order_id.clone(),
-                        price: *avg_price,
-                        broker_timestamp: Utc::now(),
-                    },
-                )
-                .await
-            {
-                warn!(
-                    %symbol, %offchain_order_id, %error,
-                    "Failed to apply partial-fill CompleteOffChainOrder after cancel"
-                );
-                return false;
-            }
-            return true;
-        }
-
-        match order {
-            // Filled (short-circuit case): the broker fully filled the
-            // order between our last poll and the cancel. Apply the full
-            // fill to the position.
-            OffchainOrder::Filled {
-                shares,
+        let command = match terminal_position_finalization(order) {
+            Some(TerminalPositionFinalization::Complete {
+                shares_filled,
                 direction,
                 executor_order_id,
                 price,
-                ..
-            } => {
-                if let Err(error) = self
-                    .position
-                    .send(
-                        symbol,
-                        PositionCommand::CompleteOffChainOrder {
-                            offchain_order_id,
-                            shares_filled: *shares,
-                            direction: *direction,
-                            executor_order_id: executor_order_id.clone(),
-                            price: *price,
-                            broker_timestamp: Utc::now(),
-                        },
-                    )
-                    .await
-                {
-                    warn!(
-                        %symbol, %offchain_order_id, %error,
-                        "Failed to apply short-circuit fill after cancel"
-                    );
-                    return false;
-                }
-                true
-            }
-            OffchainOrder::Failed {
-                shares_filled: Some(shares_filled),
-                avg_price: Some(avg_price),
+                broker_timestamp,
+            }) => PositionCommand::CompleteOffChainOrder {
+                offchain_order_id,
+                shares_filled,
                 direction,
-                executor_order_id: Some(executor_order_id),
-                ..
-            } => {
-                let command = Positive::new(*shares_filled).map_or_else(
-                    |_| PositionCommand::FailOffChainOrder {
-                        offchain_order_id,
-                        error: "broker failed order before any fill".to_string(),
-                    },
-                    |positive_filled| PositionCommand::CompleteOffChainOrder {
-                        offchain_order_id,
-                        shares_filled: positive_filled,
-                        direction: *direction,
-                        executor_order_id: executor_order_id.clone(),
-                        price: *avg_price,
-                        broker_timestamp: Utc::now(),
-                    },
-                );
-
-                if let Err(error) = self.position.send(symbol, command).await {
-                    warn!(
-                        %symbol, %offchain_order_id, %error,
-                        "Failed to apply partial-fill CompleteOffChainOrder after broker failure"
-                    );
-                    return false;
-                }
-                true
-            }
-            // Cancelled with no partial fill, or Failed at the broker with
-            // no recorded fill -- nothing to apply to net, just clear pending.
-            OffchainOrder::Cancelled { .. } | OffchainOrder::Failed { .. } => {
-                let error_message = match order {
-                    OffchainOrder::Cancelled { reason, .. } => {
-                        format!("Cancelled: {reason:?}")
-                    }
+                executor_order_id,
+                price,
+                broker_timestamp,
+            },
+            Some(TerminalPositionFinalization::NoFill) => {
+                let error = match order {
+                    OffchainOrder::Cancelled { reason, .. } => format!("Cancelled: {reason:?}"),
                     OffchainOrder::Failed { error, .. } => error.clone(),
-                    _ => unreachable!(),
+                    _ => "terminal order finalized with no fill".to_string(),
                 };
-                if let Err(error) = self
-                    .position
-                    .send(
-                        symbol,
-                        PositionCommand::FailOffChainOrder {
-                            offchain_order_id,
-                            error: error_message,
-                        },
-                    )
-                    .await
-                {
-                    warn!(
-                        %symbol, %offchain_order_id, %error,
-                        "Failed to clear position pending state after cancel"
-                    );
-                    return false;
+                PositionCommand::FailOffChainOrder {
+                    offchain_order_id,
+                    error,
                 }
-                true
             }
-            // Live or pre-terminal states should not appear here -- we
-            // just successfully cancelled or the scan retry was triggered.
-            // Log and skip.
-            OffchainOrder::Pending { .. }
-            | OffchainOrder::Submitted { .. }
-            | OffchainOrder::PartiallyFilled { .. }
-            | OffchainOrder::Cancelling { .. } => {
+            Some(TerminalPositionFinalization::UnpricedFill { shares_filled }) => {
+                warn!(
+                    %symbol, %offchain_order_id, ?shares_filled,
+                    "Terminal order has a partial fill without avg price; leaving position pending"
+                );
+                return false;
+            }
+            None => {
                 warn!(
                     %symbol, %offchain_order_id, state = ?order,
-                    "Order in non-terminal state after cancel attempt; skipping position finalize"
+                    "Order in non-terminal state during finalization; skipping"
                 );
-                false
+                return false;
             }
+        };
+
+        if let Err(error) = self.position.send(symbol, command).await {
+            warn!(
+                %symbol, %offchain_order_id, %error,
+                "Failed to finalize position for terminal order"
+            );
+            return false;
         }
+        true
     }
 }
 

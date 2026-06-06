@@ -1052,6 +1052,119 @@ impl OffchainOrder {
     }
 }
 
+/// How a *terminal* [`OffchainOrder`] should finalize its owning `Position`.
+///
+/// Shared by the two finalization sites -- the startup orphan-recovery sweep in
+/// `conductor` and the cancel-and-replace pass in `position_check` -- so the
+/// terminal-state -> position-command mapping lives in one place and cannot
+/// drift between them. `broker_timestamp` is the order's own broker event time
+/// (`filled_at`/`cancelled_at`/`failed_at`), the moment the broker recorded the
+/// outcome -- not the wall-clock time finalization happens to run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TerminalPositionFinalization {
+    /// Apply the recorded (priced) fill to the position.
+    Complete {
+        shares_filled: Positive<FractionalShares>,
+        direction: Direction,
+        executor_order_id: ExecutorOrderId,
+        price: Usd,
+        broker_timestamp: DateTime<Utc>,
+    },
+    /// No fill to record -- clear the position's pending reference. The caller
+    /// supplies the reason string it records.
+    NoFill,
+    /// A positive fill quantity with no average price: the fill cannot be
+    /// recorded correctly, so the position must NOT be finalized (the caller
+    /// retries) rather than silently dropping the filled shares.
+    UnpricedFill { shares_filled: FractionalShares },
+}
+
+/// Classifies a terminal [`OffchainOrder`] (`Filled`/`Cancelled`/`Failed`) into
+/// the [`TerminalPositionFinalization`] it implies. Returns `None` for
+/// non-terminal states (the caller leaves the position pending and retries).
+pub(crate) fn terminal_position_finalization(
+    order: &OffchainOrder,
+) -> Option<TerminalPositionFinalization> {
+    match order {
+        OffchainOrder::Filled {
+            shares,
+            direction,
+            executor_order_id,
+            price,
+            filled_at,
+            ..
+        } => Some(TerminalPositionFinalization::Complete {
+            shares_filled: *shares,
+            direction: *direction,
+            executor_order_id: executor_order_id.clone(),
+            price: *price,
+            broker_timestamp: *filled_at,
+        }),
+
+        OffchainOrder::Cancelled {
+            shares_filled,
+            avg_price,
+            direction,
+            executor_order_id,
+            cancelled_at,
+            ..
+        } => Some(classify_terminal_fill(
+            *shares_filled,
+            *avg_price,
+            *direction,
+            executor_order_id.clone(),
+            *cancelled_at,
+        )),
+
+        OffchainOrder::Failed {
+            shares_filled: Some(shares_filled),
+            avg_price,
+            direction,
+            executor_order_id: Some(executor_order_id),
+            failed_at,
+            ..
+        } => Some(classify_terminal_fill(
+            *shares_filled,
+            *avg_price,
+            *direction,
+            executor_order_id.clone(),
+            *failed_at,
+        )),
+
+        // Failed with no recorded fill (or no executor id) -- nothing to apply.
+        OffchainOrder::Failed { .. } => Some(TerminalPositionFinalization::NoFill),
+
+        OffchainOrder::Pending { .. }
+        | OffchainOrder::Submitted { .. }
+        | OffchainOrder::PartiallyFilled { .. }
+        | OffchainOrder::Cancelling { .. } => None,
+    }
+}
+
+/// A priced positive fill -> `Complete`; a positive fill without a price ->
+/// `UnpricedFill` (must not be dropped); zero -> `NoFill`.
+fn classify_terminal_fill(
+    shares_filled: FractionalShares,
+    avg_price: Option<Usd>,
+    direction: Direction,
+    executor_order_id: ExecutorOrderId,
+    broker_timestamp: DateTime<Utc>,
+) -> TerminalPositionFinalization {
+    let Ok(positive) = Positive::new(shares_filled) else {
+        return TerminalPositionFinalization::NoFill;
+    };
+    avg_price.map_or(
+        TerminalPositionFinalization::UnpricedFill { shares_filled },
+        |price| TerminalPositionFinalization::Complete {
+            shares_filled: positive,
+            direction,
+            executor_order_id,
+            price,
+            broker_timestamp,
+        },
+    )
+}
+
 /// Queries the broker for the current state of an order before cancellation
 /// and emits the appropriate partial-fill / fill events so the local
 /// aggregate is reconciled with the broker before the terminal Cancelled
