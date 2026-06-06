@@ -154,6 +154,7 @@ mod tests {
                     direction: Direction::Sell,
                     executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
                     client_order_id: ClientOrderId::from_uuid(id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
                 },
             )
             .await
@@ -164,6 +165,7 @@ mod tests {
                 &id,
                 OffchainOrderCommand::CompleteFill {
                     price: st0x_finance::Usd::new(float!(200)),
+                    filled_at: Utc::now(),
                 },
             )
             .await
@@ -294,6 +296,7 @@ mod tests {
                     direction: Direction::Buy,
                     executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
                     client_order_id: ClientOrderId::from_uuid(id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
                 },
             )
             .await

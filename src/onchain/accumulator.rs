@@ -4,7 +4,9 @@ use tracing::info;
 
 use st0x_config::AssetsConfig;
 use st0x_event_sorcery::Projection;
-use st0x_execution::{Direction, Executor, FractionalShares, Positive, SupportedExecutor, Symbol};
+use st0x_execution::{
+    Direction, Executor, FractionalShares, MarketSession, Positive, SupportedExecutor, Symbol,
+};
 
 use crate::onchain::OnChainError;
 use crate::position::Position;
@@ -15,6 +17,7 @@ pub(crate) struct ExecutionCtx {
     pub(crate) direction: Direction,
     pub(crate) shares: Positive<FractionalShares>,
     pub(crate) executor: SupportedExecutor,
+    pub(crate) market_session: MarketSession,
 }
 
 /// Checks whether a position is ready for offchain execution.
@@ -31,6 +34,7 @@ pub(crate) async fn check_execution_readiness<E: Executor>(
     executor_type: SupportedExecutor,
     assets: &AssetsConfig,
     asset_enabled: bool,
+    extended_hours_enabled: bool,
 ) -> Result<Option<ExecutionCtx>, OnChainError> {
     if !check_asset_enabled(asset_enabled, symbol) {
         return Ok(None);
@@ -53,18 +57,21 @@ pub(crate) async fn check_execution_readiness<E: Executor>(
         return Ok(None);
     };
 
-    if !check_market_open(executor, symbol).await? {
+    let Some(market_session) =
+        check_market_session(executor, symbol, extended_hours_enabled).await?
+    else {
         return Ok(None);
-    }
+    };
 
     let shares = Positive::new(shares)?;
-    debug!(target: "hedge", %symbol, %shares, ?direction, "Position ready for execution");
+    debug!(target: "hedge", %symbol, %shares, ?direction, ?market_session, "Position ready for execution");
 
     Ok(Some(ExecutionCtx {
         symbol: symbol.clone(),
         direction,
         shares,
         executor: executor_type,
+        market_session,
     }))
 }
 
@@ -76,20 +83,37 @@ fn check_asset_enabled(asset_enabled: bool, symbol: &Symbol) -> bool {
     asset_enabled
 }
 
-async fn check_market_open<E: Executor>(
+/// Returns `Some(session)` when execution is allowed (regular hours, or
+/// extended hours when enabled), or `None` when the position should wait.
+async fn check_market_session<E: Executor>(
     executor: &E,
     symbol: &Symbol,
-) -> Result<bool, OnChainError> {
-    let is_open = executor
-        .is_market_open()
+    extended_hours_enabled: bool,
+) -> Result<Option<MarketSession>, OnChainError> {
+    let session = executor
+        .market_session()
         .await
-        .map_err(|e| OnChainError::MarketHoursCheck(Box::new(e)))?;
+        .map_err(|error| OnChainError::MarketHoursCheck(Box::new(error)))?;
 
-    if !is_open {
-        debug!(target: "hedge", symbol = %symbol, "Market closed, deferring execution");
+    match session {
+        MarketSession::Regular => Ok(Some(session)),
+
+        MarketSession::Extended if extended_hours_enabled => {
+            debug!(target: "hedge", %symbol, "Extended hours session, will use limit order");
+            Ok(Some(session))
+        }
+
+        MarketSession::Extended | MarketSession::Closed => {
+            debug!(
+                target: "hedge",
+                %symbol,
+                ?session,
+                extended_hours_enabled,
+                "Market not available for trading, deferring execution"
+            );
+            Ok(None)
+        }
     }
-
-    Ok(is_open)
 }
 
 /// Checks all positions for execution readiness.
@@ -124,9 +148,14 @@ pub(crate) async fn check_all_positions<E: Executor>(
             .or(assets.equities.operational_limit);
 
         if let Some((direction, shares)) = position.is_ready_for_execution(shares_limit)? {
-            if !check_market_open(executor, symbol).await? {
+            // Extended-hours is hardcoded false here: this helper only backs
+            // the test-only check_and_execute_accumulated_positions path in
+            // conductor.rs. The production CheckPositions sweep goes through
+            // check_execution_readiness (src/position_check.rs) with the
+            // configured extended_hours_counter_trading flag.
+            let Some(market_session) = check_market_session(executor, symbol, false).await? else {
                 continue;
-            }
+            };
 
             let shares = Positive::new(shares)?;
 
@@ -143,6 +172,7 @@ pub(crate) async fn check_all_positions<E: Executor>(
                 direction,
                 shares,
                 executor: executor_type,
+                market_session,
             });
         }
     }
@@ -226,6 +256,7 @@ mod tests {
                 cash: None,
             },
             true,
+            false,
         )
         .await
         .unwrap();
@@ -258,6 +289,7 @@ mod tests {
                 cash: None,
             },
             true,
+            false,
         )
         .await
         .unwrap();
@@ -290,6 +322,7 @@ mod tests {
                 cash: None,
             },
             true,
+            false,
         )
         .await
         .unwrap()
@@ -388,6 +421,7 @@ mod tests {
                 cash: None,
             },
             true,
+            false,
         )
         .await
         .unwrap();
@@ -425,6 +459,7 @@ mod tests {
                 cash: None,
             },
             true,
+            false,
         )
         .await
         .unwrap()
@@ -465,6 +500,7 @@ mod tests {
                 cash: None,
             },
             true,
+            false,
         )
         .await
         .unwrap();
@@ -500,6 +536,7 @@ mod tests {
                 cash: None,
             },
             true,
+            false,
         )
         .await
         .unwrap();
@@ -521,6 +558,7 @@ mod tests {
                 cash: None,
             },
             true,
+            false,
         )
         .await
         .unwrap()
@@ -578,6 +616,7 @@ mod tests {
             SupportedExecutor::DryRun,
             &assets,
             true,
+            false,
         )
         .await
         .unwrap()
@@ -615,6 +654,7 @@ mod tests {
                 equities: EquitiesConfig::default(),
                 cash: None,
             },
+            false,
             false,
         )
         .await

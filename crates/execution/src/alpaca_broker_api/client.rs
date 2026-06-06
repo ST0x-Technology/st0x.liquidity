@@ -15,7 +15,7 @@ use super::journal::{JournalRequest, JournalResponse};
 use super::order::{
     CryptoOrderRequest, CryptoOrderResponse, LimitOrderRequest, OrderRequest, OrderResponse,
 };
-use crate::{ClientOrderId, FractionalShares, Positive, Symbol};
+use crate::{CancellationOutcome, ClientOrderId, FractionalShares, Positive, Symbol};
 
 /// Alpaca Broker API HTTP client with Basic authentication
 pub(crate) struct AlpacaBrokerApiClient {
@@ -196,6 +196,47 @@ impl AlpacaBrokerApiClient {
         }
     }
 
+    /// Cancel an order by ID.
+    ///
+    /// A 404 (the broker does not recognise the order id) is surfaced as
+    /// [`CancellationOutcome::OrderNotFound`] rather than collapsed into
+    /// success: the caller must resolve the order as terminal instead of
+    /// waiting for a cancellation confirmation that `get_order_status` (which
+    /// would also 404) can never deliver.
+    ///
+    /// NOTE: 404 means "order id not found" ONLY. An order that exists but is in
+    /// a non-cancelable terminal state (filled / expired / already canceled)
+    /// returns 422, which is propagated as an error here. Per the endpoint
+    /// reference (https://docs.alpaca.markets/reference/deleteorderforaccount):
+    /// 204 No Content on success, 404 "Resource does not exist", 422 when the
+    /// order is no longer cancelable. Cancel-and-replace
+    /// still converges in that case because the caller runs
+    /// `reconcile_pre_cancel` (a broker status read) before every DELETE: a
+    /// just-filled order is observed terminal on the retry and short-circuits
+    /// before the DELETE is reattempted.
+    pub(super) async fn cancel_order(
+        &self,
+        order_id: Uuid,
+    ) -> Result<CancellationOutcome, AlpacaBrokerApiError> {
+        let url = format!(
+            "{}/v1/trading/accounts/{}/orders/{}",
+            self.base_url, self.account_id, order_id
+        );
+
+        debug!("Cancelling order {} at {}", order_id, url);
+
+        match self.delete(&url).await {
+            Ok(()) => Ok(CancellationOutcome::Requested),
+            Err(AlpacaBrokerApiError::ApiError { status, .. })
+                if status == reqwest::StatusCode::NOT_FOUND =>
+            {
+                debug!(%order_id, "Cancel returned 404; broker does not recognise the order");
+                Ok(CancellationOutcome::OrderNotFound)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Get asset information by symbol
     pub(super) async fn get_asset(
         &self,
@@ -298,6 +339,29 @@ impl AlpacaBrokerApiClient {
         let response = self.http_client.get(url).send().await?;
 
         self.handle_response(Method::GET, response).await
+    }
+
+    /// Perform a DELETE request, expecting no response body.
+    pub(super) async fn delete(&self, url: &str) -> Result<(), AlpacaBrokerApiError> {
+        let response = self.http_client.delete(url).send().await?;
+        let status = response.status();
+
+        if status.is_success() {
+            return Ok(());
+        }
+
+        let error_body = response.text().await?;
+
+        let (alpaca_code, message) = match serde_json::from_str::<AlpacaApiErrorBody>(&error_body) {
+            Ok(parsed) => (parsed.code, parsed.message),
+            Err(_) => (None, error_body),
+        };
+
+        Err(AlpacaBrokerApiError::ApiError {
+            status,
+            alpaca_code,
+            message,
+        })
     }
 
     /// Perform a POST request with JSON body
@@ -424,6 +488,79 @@ mod tests {
         assert!(!debug_output.contains("test_secret_key"));
         assert!(debug_output.contains("904837e3-3b76-47ec-b432-046db621571b"));
         assert!(debug_output.contains("Sandbox"));
+    }
+
+    #[tokio::test]
+    async fn cancel_order_succeeds_on_2xx() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let order_id = uuid!("11111111-1111-1111-1111-111111111111");
+
+        let mock = server.mock(|when, then| {
+            when.method(DELETE).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
+            ));
+            then.status(204);
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let outcome = client.cancel_order(order_id).await.unwrap();
+
+        mock.assert();
+        assert_eq!(outcome, CancellationOutcome::Requested);
+    }
+
+    #[tokio::test]
+    async fn cancel_order_maps_404_to_order_not_found() {
+        // A 404 means the broker no longer recognises the id. It must surface
+        // as a distinct outcome -- not success (the order would wait forever
+        // for a cancellation confirmation) and not a retryable error (the
+        // DELETE can never succeed).
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let order_id = uuid!("22222222-2222-2222-2222-222222222222");
+
+        let mock = server.mock(|when, then| {
+            when.method(DELETE).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
+            ));
+            then.status(404)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "code": 40_410_000, "message": "order not found" }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let outcome = client.cancel_order(order_id).await.unwrap();
+
+        mock.assert();
+        assert_eq!(outcome, CancellationOutcome::OrderNotFound);
+    }
+
+    #[tokio::test]
+    async fn cancel_order_propagates_non_404_error() {
+        // A 5xx (or 422 non-cancelable) must NOT be swallowed -- only 404 is
+        // idempotent. The caller's pre-cancel reconcile handles terminal states.
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let order_id = uuid!("33333333-3333-3333-3333-333333333333");
+
+        let mock = server.mock(|when, then| {
+            when.method(DELETE).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
+            ));
+            then.status(500)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({ "message": "internal error" }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let error = client.cancel_order(order_id).await.unwrap_err();
+
+        mock.assert();
+        let AlpacaBrokerApiError::ApiError { status, .. } = error else {
+            panic!("expected ApiError, got {error:?}");
+        };
+        assert_eq!(status, reqwest::StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]

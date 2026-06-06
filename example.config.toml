@@ -7,6 +7,12 @@ apalis_finished_job_cleanup_interval_secs = 3600
 # Each tick enqueues a backfill range over the unprocessed blocks, capped at
 # `tip - required_confirmations`. Defaults to 5 when omitted.
 order_fill_poll_interval = 5
+# When true, counter-trades may be placed during extended (pre-/after-market)
+# sessions as limit orders, instead of waiting for the regular open. Extended
+# sessions have thinner liquidity and wider spreads, so the limit price is
+# derived from the latest trade plus `[broker].counter_trade_slippage_bps`.
+# Leave false to restrict hedging to regular-hours market orders.
+extended_hours_counter_trading = false
 hyperdx.service_name = "st0x-hedge"
 
 # Travel Rule info for Alpaca whitelist creation (required since 2026-03-27).

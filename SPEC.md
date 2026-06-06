@@ -247,6 +247,69 @@ The bot supports multiple brokers through a unified trait interface:
 - Position querying for inventory management
 - Account balance monitoring for available capital
 
+#### Extended-Hours Counter-Trading
+
+By default, automated counter-trades execute as market orders during regular
+market hours (9:30–16:00 ET). Onchain fills that arrive in pre-market (4:00–9:30
+ET) or after-hours (16:00–20:00 ET) would otherwise leave directional exposure
+unhedged until the next regular open — potentially hours of unmanaged delta.
+When enabled, the bot hedges immediately during extended sessions using limit
+orders, and converges any unfilled extended-hours orders back to market orders
+at the regular open.
+
+This behavior is **opt-in** via the required `extended_hours_counter_trading`
+config flag (committed as `false`). With it disabled, behavior is unchanged:
+market orders during regular hours only.
+
+##### Market session model
+
+Execution decisions are driven by a `MarketSession` classification derived from
+the broker calendar:
+
+- **Regular** — standard hours; counter-trades place market orders.
+- **Extended** — pre-market or after-hours; the broker accepts only limit orders
+  flagged `extended_hours = true`. Counter-trades place a limit order priced
+  from the latest trade price plus a configured slippage buffer
+  (`counter_trade_slippage_bps`). Rounding favors fill probability (buys round
+  up, sells round down) and honors the broker's minimum price variance (penny
+  increments at or above $1.00, sub-penny below).
+- **Closed** — outside all sessions (overnight, weekends, holidays); no order is
+  placed. The exposure is left for the next scan to hedge once the venue
+  reopens, rather than failing a durable job against a multi-hour closure.
+
+The session is re-checked at execution time, immediately before placement, so a
+hedge job that was enqueued in one session but runs after a 9:30/16:00 boundary
+places the order type appropriate to the _current_ session, not the stale
+enqueue-time one.
+
+##### Cancel-and-replace at the regular open
+
+Extended-hours limit orders may not fill before regular hours begin. Every
+position scan during Regular hours requests cancellation of any still-live
+extended-hours limit order so it is replaced with a market order on a subsequent
+scan. The pass is level-triggered rather than keyed to the observed session
+transition -- orders already cancelling or terminal are skipped, making the
+sweep idempotent -- so an order that straddles the 9:30 boundary, survives a
+restart, or whose cancellation request transiently failed is still converged.
+Cancellation is two-phase: the order is reconciled against broker state _before_
+the cancel is issued (so a fill that landed between the last poll and the cancel
+is recorded, never dropped), then moves to a `Cancelling` state and becomes
+terminal only once the broker confirms. The owning position is finalized —
+applying any partial fill and releasing the pending reference so the symbol can
+resume hedging — once the cancellation confirms.
+
+##### Order lifecycle and integrity guarantees
+
+- Orders carry a broker-side `client_order_id` idempotency key so a retry after
+  a lost placement response is deduped by the broker rather than
+  double-submitted.
+- Broker `PartiallyFilled` status is preserved through the executor boundary
+  (cumulative fills are not collapsed into `Submitted`), and broker-confirmed
+  `Cancelled` is represented distinctly from `Failed`.
+- Partial fills are reconciled both by the status-poll loop and immediately
+  before any cancellation, so a fill is never lost when an order transitions to
+  a terminal state.
+
 #### Idempotency Controls
 
 - Event queue table to track all events with unique (transaction_hash,
