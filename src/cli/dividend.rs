@@ -104,6 +104,7 @@ mod tests {
             rest_api: None,
             issuance: create_test_issuance_ctx(),
             redemption_wallet: None,
+            extended_hours_counter_trading: false,
         }
     }
 

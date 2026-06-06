@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use st0x_config::{Ctx, ExecutionThreshold};
+use st0x_config::{BrokerCtx, Ctx, ExecutionThreshold};
 use st0x_event_sorcery::{Projection, Store};
 use st0x_evm::ReadOnlyEvm;
 use st0x_execution::Executor;
@@ -103,6 +103,9 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
 }
 
 /// Wires all runtime components and returns a running [`Conductor`].
+// Straight-line builder that wires every runtime context; splitting it would
+// scatter the wiring across helpers without reducing complexity.
+#[allow(clippy::too_many_lines)]
 #[bon::builder]
 pub(crate) fn spawn<Prov, Exec>(
     context: ConductorCtx<Prov, Exec>,
@@ -230,6 +233,7 @@ where
     let poll_status_ctx = Arc::new(PollOrderStatusCtx {
         executor: context.executor.clone(),
         offchain_order_projection: context.frameworks.offchain_order_projection.clone(),
+        offchain_order_store: context.frameworks.offchain_order.clone(),
         poll_status_queue: poll_status_queue.clone(),
         reconcile_queue: reconcile_queue.clone(),
         rejection_queue: rejection_queue.clone(),
@@ -248,15 +252,32 @@ where
 
     let counter_trade_submission_lock = Arc::new(tokio::sync::Mutex::new(()));
 
+    let hedge_order_placer: Option<Arc<dyn crate::offchain::order::OrderPlacer>> =
+        if context.ctx.extended_hours_counter_trading {
+            Some(Arc::new(crate::offchain::order::ExecutorOrderPlacer(
+                context.executor.clone(),
+            )))
+        } else {
+            None
+        };
+
     let hedge_ctx = Arc::new(HedgeCtx {
         position: context.frameworks.position.clone(),
         offchain_order: context.frameworks.offchain_order.clone(),
         poll_status_queue: poll_status_queue.clone(),
+        order_placer: hedge_order_placer,
+        counter_trade_submission_lock: counter_trade_submission_lock.clone(),
+        counter_trade_slippage_bps: match &context.ctx.broker {
+            BrokerCtx::AlpacaBrokerApi(alpaca_ctx) => alpaca_ctx.counter_trade_slippage_bps,
+            BrokerCtx::DryRun => st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
+        },
     });
 
     let check_positions_ctx = Arc::new(CheckPositionsCtx {
         executor: context.executor.clone(),
         position_projection: context.frameworks.position_projection.clone(),
+        offchain_order: context.frameworks.offchain_order.clone(),
+        position: context.frameworks.position.clone(),
         hedge_queue: hedge_queue.clone(),
         check_positions_queue: check_positions_queue.clone(),
         ctx: context.ctx.clone(),
@@ -273,6 +294,8 @@ where
         assets: context.ctx.assets.clone(),
         counter_trade_submission_lock,
         poll_status_queue: poll_status_queue.clone(),
+        hedge_queue: hedge_queue.clone(),
+        extended_hours_counter_trading: context.ctx.extended_hours_counter_trading,
     };
 
     let maintenance_interval = context.executor.maintenance_interval();
