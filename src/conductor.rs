@@ -1210,11 +1210,21 @@ async fn recover_single_orphaned_order(
             }
         }
 
+        // An intentional cancellation clears pending without failure semantics;
+        // a real failure keeps the failure event.
         Some(TerminalPositionFinalization::NoFill) => {
-            info!(%symbol, %order_id, "Orphaned terminal order with no fill -- clearing pending");
-            PositionCommand::FailOffChainOrder {
-                offchain_order_id: order_id,
-                error: "recovered from orphaned terminal state on startup".to_string(),
+            if let OffchainOrder::Cancelled { reason, .. } = &order {
+                info!(%symbol, %order_id, ?reason, "Orphaned cancelled order -- clearing pending");
+                PositionCommand::CancelOffChainOrder {
+                    offchain_order_id: order_id,
+                    reason: *reason,
+                }
+            } else {
+                info!(%symbol, %order_id, "Orphaned terminal order with no fill -- clearing pending");
+                PositionCommand::FailOffChainOrder {
+                    offchain_order_id: order_id,
+                    error: "recovered from orphaned terminal state on startup".to_string(),
+                }
             }
         }
 

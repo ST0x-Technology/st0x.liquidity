@@ -421,17 +421,22 @@ where
                 price,
                 broker_timestamp,
             },
-            Some(TerminalPositionFinalization::NoFill) => {
-                let error = match order {
-                    OffchainOrder::Cancelled { reason, .. } => format!("Cancelled: {reason:?}"),
-                    OffchainOrder::Failed { error, .. } => error.clone(),
-                    _ => "terminal order finalized with no fill".to_string(),
-                };
-                PositionCommand::FailOffChainOrder {
+            Some(TerminalPositionFinalization::NoFill) => match order {
+                // An intentional cancellation clears the pending slot without
+                // the failure semantics (keeps failure-rate analytics clean).
+                OffchainOrder::Cancelled { reason, .. } => PositionCommand::CancelOffChainOrder {
                     offchain_order_id,
-                    error,
-                }
-            }
+                    reason: *reason,
+                },
+                OffchainOrder::Failed { error, .. } => PositionCommand::FailOffChainOrder {
+                    offchain_order_id,
+                    error: error.clone(),
+                },
+                _ => PositionCommand::FailOffChainOrder {
+                    offchain_order_id,
+                    error: "terminal order finalized with no fill".to_string(),
+                },
+            },
             Some(TerminalPositionFinalization::UnpricedFill { shares_filled }) => {
                 warn!(
                     %symbol, %offchain_order_id, ?shares_filled,

@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use st0x_config::ExecutionThreshold;
 use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
@@ -21,7 +21,7 @@ use st0x_finance::{Usd, Usdc};
 use st0x_float_macro::float;
 use st0x_float_serde::{DebugFloat, DebugOptionFloat};
 
-use crate::offchain::order::OffchainOrderId;
+use crate::offchain::order::{CancellationReason, OffchainOrderId};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Position {
@@ -206,6 +206,20 @@ impl EventSourced for Position {
                     .last_failed_offchain_order_id
                     .or(Some(*offchain_order_id)),
                 last_updated: Some(*failed_at),
+                ..entity.clone()
+            })),
+
+            OffChainOrderCancelled {
+                offchain_order_id, ..
+            } if entity.pending_offchain_order_id != Some(*offchain_order_id) => Ok(None),
+
+            OffChainOrderCancelled { cancelled_at, .. } => Ok(Some(Self {
+                // Intentional cancellation: release the pending slot so the
+                // symbol can re-hedge. Deliberately does NOT set the
+                // failure/idempotency anchor -- the replacement is a fresh
+                // order, not a retry of the cancelled one.
+                pending_offchain_order_id: None,
+                last_updated: Some(*cancelled_at),
                 ..entity.clone()
             })),
 
@@ -414,6 +428,25 @@ impl EventSourced for Position {
                     offchain_order_id,
                     error,
                     failed_at: Utc::now(),
+                }])
+            }
+
+            CancelOffChainOrder {
+                offchain_order_id,
+                reason,
+            } => {
+                self.validate_pending_execution(offchain_order_id)?;
+
+                info!(
+                    target: "hedge",
+                    %offchain_order_id, symbol = %self.symbol, ?reason,
+                    "Offchain order cancelled; clearing pending"
+                );
+
+                Ok(vec![PositionEvent::OffChainOrderCancelled {
+                    offchain_order_id,
+                    reason,
+                    cancelled_at: Utc::now(),
                 }])
             }
 
@@ -736,6 +769,14 @@ pub enum PositionCommand {
         offchain_order_id: OffchainOrderId,
         error: String,
     },
+    /// Clear a pending offchain order that was intentionally cancelled (e.g.
+    /// the extended-hours -> regular cancel-and-replace), distinct from a broker
+    /// failure. Does not set the failure/idempotency anchor: the replacement is
+    /// a fresh order, not a retry under the cancelled key.
+    CancelOffChainOrder {
+        offchain_order_id: OffchainOrderId,
+        reason: CancellationReason,
+    },
     UpdateThreshold {
         threshold: ExecutionThreshold,
     },
@@ -793,6 +834,14 @@ pub enum PositionEvent {
         error: String,
         failed_at: DateTime<Utc>,
     },
+    /// A pending offchain order was intentionally cancelled (not a failure), so
+    /// failure-rate analytics can tell the two apart. Clears the pending
+    /// reference without setting the failure/idempotency anchor.
+    OffChainOrderCancelled {
+        offchain_order_id: OffchainOrderId,
+        reason: CancellationReason,
+        cancelled_at: DateTime<Utc>,
+    },
     ThresholdUpdated {
         old_threshold: ExecutionThreshold,
         new_threshold: ExecutionThreshold,
@@ -823,6 +872,7 @@ impl PositionEvent {
                 broker_timestamp, ..
             } => *broker_timestamp,
             OffChainOrderFailed { failed_at, .. } => *failed_at,
+            OffChainOrderCancelled { cancelled_at, .. } => *cancelled_at,
             ThresholdUpdated { updated_at, .. } => *updated_at,
             ManualPositionAdjusted { adjusted_at, .. } => *adjusted_at,
         }
@@ -838,6 +888,7 @@ impl DomainEvent for PositionEvent {
             OffChainOrderPlaced { .. } => "PositionEvent::OffChainOrderPlaced".to_string(),
             OffChainOrderFilled { .. } => "PositionEvent::OffChainOrderFilled".to_string(),
             OffChainOrderFailed { .. } => "PositionEvent::OffChainOrderFailed".to_string(),
+            OffChainOrderCancelled { .. } => "PositionEvent::OffChainOrderCancelled".to_string(),
             ThresholdUpdated { .. } => "PositionEvent::ThresholdUpdated".to_string(),
             ManualPositionAdjusted { .. } => "PositionEvent::ManualPositionAdjusted".to_string(),
         }
@@ -1131,6 +1182,14 @@ impl std::fmt::Debug for PositionCommand {
                 .field("offchain_order_id", offchain_order_id)
                 .field("error", error)
                 .finish(),
+            Self::CancelOffChainOrder {
+                offchain_order_id,
+                reason,
+            } => f
+                .debug_struct("CancelOffChainOrder")
+                .field("offchain_order_id", offchain_order_id)
+                .field("reason", reason)
+                .finish(),
             Self::UpdateThreshold { threshold } => f
                 .debug_struct("UpdateThreshold")
                 .field("threshold", threshold)
@@ -1227,6 +1286,16 @@ impl std::fmt::Debug for PositionEvent {
                 .field("offchain_order_id", offchain_order_id)
                 .field("error", error)
                 .field("failed_at", failed_at)
+                .finish(),
+            Self::OffChainOrderCancelled {
+                offchain_order_id,
+                reason,
+                cancelled_at,
+            } => f
+                .debug_struct("OffChainOrderCancelled")
+                .field("offchain_order_id", offchain_order_id)
+                .field("reason", reason)
+                .field("cancelled_at", cancelled_at)
                 .finish(),
             Self::ThresholdUpdated {
                 old_threshold,
@@ -1579,6 +1648,64 @@ mod tests {
             .events();
 
         assert_eq!(events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_offchain_order_emits_cancelled_not_failed() {
+        let threshold = one_share_threshold();
+        let offchain_order_id = OffchainOrderId::new();
+
+        let events = TestHarness::<Position>::with(())
+            .given(vec![
+                PositionEvent::Initialized {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    threshold,
+                    initialized_at: Utc::now(),
+                },
+                PositionEvent::OnChainOrderFilled {
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(float!(1.5)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                    seen_at: Utc::now(),
+                },
+                PositionEvent::OffChainOrderPlaced {
+                    offchain_order_id,
+                    shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    trigger_reason: TriggerReason::SharesThreshold {
+                        net_position_shares: float!(1.5),
+                        threshold_shares: float!(1),
+                    },
+                    placed_at: Utc::now(),
+                },
+            ])
+            .when(PositionCommand::CancelOffChainOrder {
+                offchain_order_id,
+                reason: CancellationReason::MarketOpenReplacement,
+            })
+            .await
+            .events();
+
+        // An intentional cancellation must emit OffChainOrderCancelled, NOT
+        // OffChainOrderFailed -- otherwise it pollutes failure-rate analytics.
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(
+                events.first(),
+                Some(PositionEvent::OffChainOrderCancelled {
+                    reason: CancellationReason::MarketOpenReplacement,
+                    ..
+                })
+            ),
+            "expected OffChainOrderCancelled, got: {:?}",
+            events.first()
+        );
     }
 
     #[tokio::test]
