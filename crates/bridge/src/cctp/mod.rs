@@ -71,7 +71,7 @@ pub use test_contracts::{
 use std::mem::size_of;
 use std::time::Duration;
 
-use alloy::primitives::{Address, Bytes, FixedBytes, TxHash, U256, address};
+use alloy::primitives::{Address, B256, Bytes, FixedBytes, TxHash, U256, address};
 use alloy::sol;
 use alloy::transports::{RpcError, TransportErrorKind};
 use async_trait::async_trait;
@@ -179,35 +179,13 @@ pub struct AttestationResponse {
     /// Circle's attestation signature for the message.
     /// Required to prove the burn happened and authorize minting.
     attestation: Bytes,
-    /// The real CCTP nonce pre-validated as u64 at construction time.
-    validated_nonce: u64,
-}
-
-impl AttestationResponse {
-    /// Constructs an `AttestationResponse`, validating that the 32-byte
-    /// nonce fits in a u64 at construction time rather than deferring to
-    /// runtime.
-    fn new(message: Bytes, attestation: Bytes, nonce: FixedBytes<32>) -> Result<Self, CctpError> {
-        let bytes: &[u8; 32] = nonce.as_ref();
-        let (padding, value) = bytes.split_at(bytes.len() - size_of::<u64>());
-
-        if padding.iter().any(|&b| b != 0) {
-            return Err(CctpError::NonceOverflow { nonce });
-        }
-
-        let validated_nonce = u64::from_be_bytes(value.try_into()?);
-
-        Ok(Self {
-            message,
-            attestation,
-            validated_nonce,
-        })
-    }
+    /// The real 32-byte CCTP V2 nonce extracted from the attested message.
+    nonce: B256,
 }
 
 impl crate::Attestation for AttestationResponse {
-    fn nonce(&self) -> u64 {
-        self.validated_nonce
+    fn nonce(&self) -> B256 {
+        self.nonce
     }
 
     fn as_bytes(&self) -> &[u8] {
@@ -319,6 +297,8 @@ pub enum CctpError {
     MintAndWithdrawEventNotFound,
     #[error("Message too short for nonce extraction: got {length} bytes, need at least 44")]
     MessageTooShort { length: usize },
+    #[error("Attested message carried an all-zero nonce: Circle returned a placeholder bytes32(0)")]
+    ZeroNonce,
     #[error("Fee calculation overflow")]
     FeeCalculationOverflow,
     #[error("Float operation error: {0}")]
@@ -331,10 +311,6 @@ pub enum CctpError {
     HexDecode(#[from] alloy::hex::FromHexError),
     #[error("Fee value parse error: {0}")]
     FeeValueParse(#[from] std::num::ParseIntError),
-    #[error("Nonce exceeds u64: upper 24 bytes are non-zero")]
-    NonceOverflow { nonce: FixedBytes<32> },
-    #[error("Slice conversion error: {0}")]
-    SliceConversion(#[from] std::array::TryFromSliceError),
 }
 
 /// Errors specific to attestation polling from Circle's API.
@@ -571,7 +547,18 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
 
         let nonce = extract_nonce_from_message(&message)?;
 
-        AttestationResponse::new(message, attestation, nonce)
+        // A "complete" attestation must carry the real nonce Circle filled in. An all-zero
+        // value means the placeholder bytes32(0) from the MessageSent event leaked through, so
+        // fail fast rather than threading an invalid nonce through the bridge as if it were real.
+        if nonce.is_zero() {
+            return Err(CctpError::ZeroNonce);
+        }
+
+        Ok(AttestationResponse {
+            message,
+            attestation,
+            nonce,
+        })
     }
 
     /// Burns USDC on the source chain for the given bridge direction.
@@ -916,6 +903,97 @@ mod tests {
             mock.calls() == 4,
             "Expected exactly 4 attempts (1 initial + 3 retries)"
         );
+    }
+
+    #[tokio::test]
+    async fn poll_attestation_rejects_all_zero_nonce() {
+        let server = MockServer::start();
+
+        // Complete attestation whose message carries the placeholder bytes32(0) nonce that
+        // CCTP V2 emits in the MessageSent event. Circle should never return this on a complete
+        // attestation; the bridge must fail fast rather than thread it through as a real nonce.
+        let zero_nonce_message = build_nonce_message(&[0u8; NONCE_INDEX], [0u8; 32], &[0u8; 56]);
+
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v2/messages/{ETHEREUM_DOMAIN}"));
+            then.status(200).json_body(serde_json::json!({
+                "messages": [{
+                    "attestation": "0x1234567890abcdef",
+                    "message": alloy::hex::encode_prefixed(&zero_nonce_message),
+                    "status": "complete"
+                }]
+            }));
+        });
+
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _base_key) = setup_anvil();
+
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            USDC_ETHEREUM,
+        )
+        .await
+        .unwrap()
+        .with_circle_api_base(server.base_url());
+
+        let burn_tx = b256!("1234567890123456789012345678901234567890123456789012345678901234");
+
+        let error = bridge
+            .poll_attestation_internal(BridgeDirection::EthereumToBase, burn_tx)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CctpError::ZeroNonce),
+            "Expected CctpError::ZeroNonce, got: {error:?}"
+        );
+        assert_eq!(mock.calls(), 1, "Expected exactly 1 API call");
+    }
+
+    #[tokio::test]
+    async fn poll_attestation_returns_real_nonce_from_attested_message() {
+        let server = MockServer::start();
+
+        let expected_nonce = [0xABu8; 32];
+        let message = build_nonce_message(&[0u8; NONCE_INDEX], expected_nonce, &[0u8; 56]);
+
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v2/messages/{ETHEREUM_DOMAIN}"));
+            then.status(200).json_body(serde_json::json!({
+                "messages": [{
+                    "attestation": "0x1234567890abcdef",
+                    "message": alloy::hex::encode_prefixed(&message),
+                    "status": "complete"
+                }]
+            }));
+        });
+
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _base_key) = setup_anvil();
+
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            USDC_ETHEREUM,
+        )
+        .await
+        .unwrap()
+        .with_circle_api_base(server.base_url());
+
+        let burn_tx = b256!("1234567890123456789012345678901234567890123456789012345678901234");
+
+        let response = bridge
+            .poll_attestation_internal(BridgeDirection::EthereumToBase, burn_tx)
+            .await
+            .unwrap();
+
+        assert_eq!(response.nonce, FixedBytes::from(expected_nonce));
+        assert_eq!(mock.calls(), 1, "Expected exactly 1 API call");
     }
 
     // Committed ABI: CCTP contracts use solc 0.7.6 which solc.nix doesn't have for aarch64-darwin

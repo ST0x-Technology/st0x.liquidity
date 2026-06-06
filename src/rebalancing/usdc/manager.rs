@@ -1955,7 +1955,7 @@ mod tests {
             id,
             UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01],
-                cctp_nonce: 99999,
+                cctp_nonce: B256::left_padding_from(&99999u64.to_be_bytes()),
                 mint_scan_from_block: 100,
             },
         )
@@ -2044,7 +2044,7 @@ mod tests {
             id,
             ReceiveAttestation {
                 attestation: vec![0x01],
-                cctp_nonce: 12345,
+                cctp_nonce: B256::left_padding_from(&12345u64.to_be_bytes()),
                 mint_scan_from_block: 100,
             },
         )
@@ -2132,7 +2132,7 @@ mod tests {
             id,
             ReceiveAttestation {
                 attestation: vec![0x01],
-                cctp_nonce: 12345,
+                cctp_nonce: B256::left_padding_from(&12345u64.to_be_bytes()),
                 // Scan from genesis: the fresh test chain sits below 100, so a 0
                 // bound makes the find_recent_mint scan a valid range that
                 // genuinely finds no mint, letting resume proceed to the mint.
@@ -2959,7 +2959,7 @@ mod tests {
             &id,
             UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01],
-                cctp_nonce: 12345,
+                cctp_nonce: B256::left_padding_from(&12345u64.to_be_bytes()),
                 mint_scan_from_block: 100,
             },
         )
@@ -3634,7 +3634,7 @@ mod tests {
             id,
             UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01],
-                cctp_nonce: 99_999,
+                cctp_nonce: B256::left_padding_from(&99_999u64.to_be_bytes()),
                 // Scan from genesis, not the sibling helpers' `100`: the resume test
                 // built on this helper actually scans from this block for an
                 // already-submitted mint, and the fresh test chain (advanced only via
@@ -3682,7 +3682,7 @@ mod tests {
             id,
             UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01],
-                cctp_nonce: 99_999,
+                cctp_nonce: B256::left_padding_from(&99_999u64.to_be_bytes()),
                 mint_scan_from_block: 100,
             },
         )
@@ -3797,9 +3797,8 @@ mod tests {
 
         // Return a `complete` attestation for any /v2/messages request so
         // poll_circle_attestation resolves immediately (no 5-minute real-API
-        // retry). The message must be >= 44 bytes with the upper 24 bytes of the
-        // 32-byte nonce (offset 12..36) zero so AttestationResponse::new's u64
-        // nonce check passes -- a mostly-zero 100-byte message with one low byte.
+        // retry). The message just needs to be >= MIN_MESSAGE_LENGTH (44 bytes)
+        // for nonce extraction to succeed -- a mostly-zero 100-byte message.
         let mut message = vec![0u8; 100];
         message[43] = 1;
         let message_hex = format!("0x{}", alloy::hex::encode(&message));
