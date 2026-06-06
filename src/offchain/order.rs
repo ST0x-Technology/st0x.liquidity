@@ -1313,17 +1313,22 @@ pub trait OrderPlacer: Send + Sync {
     }
 
     /// Queries the broker for the current state of an order. Used by the
-    /// `CancelOrder` handler to reconcile any fills that landed between
-    /// the last poll and the cancel. The default returns `Submitted` so
-    /// implementations without status-query support don't break the
-    /// reconciliation flow -- they just skip it.
+    /// `CancelOrder` handler's `reconcile_pre_cancel` to apply any fill that
+    /// landed between the last poll and the cancel.
+    ///
+    /// The default deliberately FAILS rather than fabricating a `Submitted`
+    /// state: a fabricated-`Submitted` default would make an implementer that
+    /// forgot to query the broker silently skip reconciliation and drop a fill
+    /// -- the exact partial-fill loss `reconcile_pre_cancel` exists to prevent.
+    /// `reconcile_pre_cancel` maps this error to `PreCancelStatusFetchFailed`,
+    /// which keeps the order in its prior state and retries instead of
+    /// cancelling blind. Real implementations (`ExecutorOrderPlacer`) override
+    /// this to delegate to the executor.
     async fn get_order_status(
         &self,
-        executor_order_id: &ExecutorOrderId,
+        _executor_order_id: &ExecutorOrderId,
     ) -> Result<st0x_execution::OrderState, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(st0x_execution::OrderState::Submitted {
-            order_id: executor_order_id.as_ref().to_string(),
-        })
+        Err("get_order_status not implemented for this OrderPlacer".into())
     }
 }
 
@@ -1420,6 +1425,17 @@ pub(crate) fn noop_order_placer() -> Arc<dyn OrderPlacer> {
             _executor_order_id: &ExecutorOrderId,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
+        }
+
+        async fn get_order_status(
+            &self,
+            executor_order_id: &ExecutorOrderId,
+        ) -> Result<st0x_execution::OrderState, Box<dyn std::error::Error + Send + Sync>> {
+            // No-op placer reports the order still live, so pre-cancel
+            // reconciliation finds nothing to apply (matches the prior default).
+            Ok(st0x_execution::OrderState::Submitted {
+                order_id: executor_order_id.as_ref().to_string(),
+            })
         }
     }
 
@@ -2317,6 +2333,18 @@ mod tests {
                     _executor_order_id: &ExecutorOrderId,
                 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     Err("simulated broker DELETE failure".into())
+                }
+
+                async fn get_order_status(
+                    &self,
+                    executor_order_id: &ExecutorOrderId,
+                ) -> Result<st0x_execution::OrderState, Box<dyn std::error::Error + Send + Sync>>
+                {
+                    // Order still live -> pre-cancel reconciliation is a no-op,
+                    // so the flow reaches the failing DELETE under test.
+                    Ok(st0x_execution::OrderState::Submitted {
+                        order_id: executor_order_id.as_ref().to_string(),
+                    })
                 }
             }
 
