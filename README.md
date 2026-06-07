@@ -89,7 +89,6 @@ Current broker support is limited to `alpaca-broker-api` and `dry-run`.
 
 ```bash
 cargo run --bin server -- --config path/to/config.toml --secrets path/to/secrets.toml
-cargo run --bin reporter -- --config path/to/config.toml
 ```
 
 Manual wrap of tokenized equity into wrapped vault shares (requires rebalancing
@@ -282,12 +281,6 @@ the bot cycles liquidity back through hedging and rebalancing.
 
 Open `http://localhost:5173` to watch the dashboard. Press `Ctrl-C` to stop.
 
-## P&L Tracking
-
-The P&L reporter (`cargo run --bin reporter`) calculates realized profit/loss
-using FIFO accounting and writes metrics to the `metrics_pnl` table for Grafana
-visualization. This subsystem is currently being reworked.
-
 ## Project Structure
 
 ### Cargo Workspace
@@ -295,19 +288,29 @@ visualization. This subsystem is currently being reworked.
 Workspace crates:
 
 - **`st0x-hedge`** (root) - Main arbitrage bot: event loop, CQRS/ES aggregates,
-  conductor, reporter, dashboard backend, and CLI
+  conductor, dashboard backend, and CLI
+- **`st0x-config`** (`crates/config/`) - TOML/secrets loading, `Ctx`/`BrokerCtx`/`Env`
+  assembly, and tracing setup. Only `st0x-hedge` binaries may depend on this.
 - **`st0x-dto`** (`crates/dto/`) - Dashboard DTOs and TypeScript binding
   generation
-- **`st0x-event-sorcery`** (`crates/event-sorcery/`) - CQRS/event-sourcing
-  helpers, snapshot-backed loading, compactable observational event streams, and
-  testing utilities
 - **`st0x-execution`** (`crates/execution/`) - Standalone `Executor` trait
   abstraction with Alpaca Broker API and mock implementations
+- **`st0x-finance`** (`crates/finance/`) - Leaf crate with zero workspace
+  dependencies providing shared financial primitives: `Symbol`, `FractionalShares`,
+  `Usdc`, `Usd`, `Positive`, `NonNegative`, `HasZero`, and `Id<Tag>`
 - **`st0x-bridge`** (`crates/bridge/`) - Cross-chain bridge abstractions and
   CCTP implementation
 - **`st0x-evm`** (`crates/evm/`) - EVM wallet, provider, and test-chain support
+- **`st0x-float-macro`** (`crates/float-macro/`) - Procedural macro crate
+  providing the `float!` literal macro
 - **`st0x-float-serde`** (`crates/float-serde/`) - Shared Rain Float formatting
   and serde helpers for workspace wire formats
+
+External dependency (not a local workspace member):
+
+- **`st0x-event-sorcery`** (git: `ST0x-Technology/event-sorcery`) - CQRS/event-sourcing
+  helpers, snapshot-backed loading, compactable observational event streams, and
+  testing utilities
 
 ### Infrastructure
 

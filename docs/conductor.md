@@ -47,15 +47,19 @@ SupervisorBuilder::default()
 
 ### OrderFillMonitor
 
-Defined in `src/conductor/order_fill_monitor.rs`. Subscribes to
+Defined in `src/conductor/monitor/order_fills.rs`. Subscribes to
 ClearV3/TakeOrderV3 WebSocket streams and pushes each event into the
-`DexTradeAccountingJobQueue` as an `AccountForDexTrade` job.
+`DexTradeAccountingJobQueue` as an `AccountForDexTrade` job. On every
+(re)connect it also enqueues a `BackfillRange` job covering the gap between
+the last persisted checkpoint and the current confirmation boundary, so events
+missed during a disconnect are recovered without relying on the live stream.
 
 ```rust
 struct OrderFillMonitor {
-    ws_url: Url,
-    orderbook: Address,
+    evm_ctx: EvmCtx,
     job_queue: DexTradeAccountingJobQueue,
+    backfill_queue: BackfillJobQueue,
+    pool: SqlitePool,
 }
 ```
 
