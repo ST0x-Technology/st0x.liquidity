@@ -211,7 +211,11 @@ const MESSAGE_BODY_INDEX: usize = 148;
 /// Extracts the 32-byte nonce from a CCTP V2 message.
 ///
 /// Used to extract the real nonce from the attested message returned by Circle's API.
-/// The nonce in the original MessageSent event is always bytes32(0) in CCTP V2.
+/// The nonce in the original MessageSent event is always bytes32(0) in CCTP V2;
+/// Circle's attestation service fills in the real nonce. An all-zero nonce in an
+/// attested message therefore means Circle has not filled it in (or the response
+/// is malformed), so we reject it rather than advancing the bridge with a bogus
+/// placeholder nonce.
 fn extract_nonce_from_message(message: &[u8]) -> Result<FixedBytes<32>, CctpError> {
     if message.len() < MIN_MESSAGE_LENGTH {
         return Err(CctpError::MessageTooShort {
@@ -219,9 +223,13 @@ fn extract_nonce_from_message(message: &[u8]) -> Result<FixedBytes<32>, CctpErro
         });
     }
 
-    Ok(FixedBytes::<32>::from_slice(
-        &message[NONCE_INDEX..NONCE_INDEX + 32],
-    ))
+    let nonce = FixedBytes::<32>::from_slice(&message[NONCE_INDEX..NONCE_INDEX + 32]);
+
+    if nonce.is_zero() {
+        return Err(CctpError::PlaceholderNonce);
+    }
+
+    Ok(nonce)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,8 +344,6 @@ pub enum CctpError {
     MintAndWithdrawEventNotFound,
     #[error("Message too short for nonce extraction: got {length} bytes, need at least 44")]
     MessageTooShort { length: usize },
-    #[error("Attested message carried an all-zero nonce: Circle returned a placeholder bytes32(0)")]
-    ZeroNonce,
     #[error("Message too short for receiveMessage recovery: got {length} bytes, need at least 148")]
     MessageTooShortForRecovery { length: usize },
     #[error("CCTP message destination domain mismatch: expected {expected}, got {actual}")]
@@ -354,6 +360,11 @@ pub enum CctpError {
     RecoveredMintReceiptReverted { tx_hash: TxHash },
     #[error("MintAndWithdraw event not found in recovered CCTP mint transaction: {tx_hash}")]
     RecoveredMintAndWithdrawEventNotFound { tx_hash: TxHash },
+    #[error(
+        "Attested message carries the all-zero placeholder nonce; Circle has not \
+         filled in the real nonce yet or the response is malformed"
+    )]
+    PlaceholderNonce,
     #[error("Fee calculation overflow")]
     FeeCalculationOverflow,
     #[error("Float operation error: {0}")]
@@ -600,14 +611,11 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
                 source: err,
             })?;
 
+        // `extract_nonce_from_message` rejects the all-zero placeholder nonce
+        // (`PlaceholderNonce`), so a "complete" attestation that leaked the
+        // bytes32(0) from the MessageSent event fails fast here rather than
+        // threading an invalid nonce through the bridge as if it were real.
         let nonce = extract_nonce_from_message(&message)?;
-
-        // A "complete" attestation must carry the real nonce Circle filled in. An all-zero
-        // value means the placeholder bytes32(0) from the MessageSent event leaked through, so
-        // fail fast rather than threading an invalid nonce through the bridge as if it were real.
-        if nonce.is_zero() {
-            return Err(CctpError::ZeroNonce);
-        }
 
         Ok(AttestationResponse {
             message,
@@ -1052,8 +1060,8 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(error, CctpError::ZeroNonce),
-            "Expected CctpError::ZeroNonce, got: {error:?}"
+            matches!(error, CctpError::PlaceholderNonce),
+            "Expected CctpError::PlaceholderNonce, got: {error:?}"
         );
         assert_eq!(mock.calls(), 1, "Expected exactly 1 API call");
     }
@@ -2490,12 +2498,29 @@ mod tests {
 
     #[test]
     fn extract_nonce_ignores_bytes_before_nonce_index() {
-        let expected_nonce = [0x00; 32];
-        let message = build_nonce_message(&[0xAB; NONCE_INDEX], expected_nonce, &[]);
+        let expected_nonce = [0xAB; 32];
+        let message = build_nonce_message(&[0xCD; NONCE_INDEX], expected_nonce, &[]);
 
         let nonce = extract_nonce_from_message(&message).unwrap();
 
         assert_eq!(nonce, FixedBytes::from(expected_nonce));
+    }
+
+    #[test]
+    fn extract_nonce_rejects_all_zero_placeholder() {
+        // The CCTP V2 MessageSent event carries an all-zero placeholder nonce.
+        // Circle's attestation service fills in the real nonce; an all-zero nonce
+        // in an attested message means it was never filled (or the response is
+        // malformed), so extraction must reject it rather than advance the bridge
+        // with a bogus nonce.
+        let message = build_nonce_message(&[0xCD; NONCE_INDEX], [0u8; 32], &[0xEF; 56]);
+
+        let err = extract_nonce_from_message(&message).unwrap_err();
+
+        assert!(
+            matches!(err, CctpError::PlaceholderNonce),
+            "Expected PlaceholderNonce, got: {err:?}"
+        );
     }
 
     #[test]
@@ -2532,6 +2557,8 @@ mod tests {
             nonce in any::<[u8; 32]>(),
             trailer_len in 0usize..100,
         ) {
+            // The all-zero nonce is the CCTP placeholder and is rejected, not extracted.
+            prop_assume!(nonce != [0u8; 32]);
             let trailer = vec![0u8; trailer_len];
             let message = build_nonce_message(&header, nonce, &trailer);
 
@@ -2546,6 +2573,8 @@ mod tests {
             nonce in any::<[u8; 32]>(),
             trailer in prop::collection::vec(any::<u8>(), 0..100),
         ) {
+            // The all-zero nonce is the CCTP placeholder and is rejected, not extracted.
+            prop_assume!(nonce != [0u8; 32]);
             let message = build_nonce_message(&header, nonce, &trailer);
 
             let extracted = extract_nonce_from_message(&message).unwrap();
