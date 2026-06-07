@@ -31,7 +31,9 @@ agent) would benefit from knowing.
   others; `docs/` entries are mutable references describing _what_ the system
   currently does and _how_ to work with it.
 - **The product specification.** That lives in [SPEC.md](../SPEC.md).
-- **The roadmap.** That lives in [ROADMAP.md](../ROADMAP.md).
+- **The roadmap.** Work is planned and tracked in Linear; see
+  [linear-workflow.md](linear-workflow.md) for how we organize issues and
+  projects.
 
 ## Lifecycle
 

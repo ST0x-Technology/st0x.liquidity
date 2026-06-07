@@ -119,4 +119,4 @@ _before_ implementation begins — not after. The sequence is:
    behavior, then run the **full test suite** to ensure nothing else broke
 4. **Refine and clean up**: refactor, fix clippy warnings, improve code quality.
    Re-validate SPEC.md — refine any details that became clearer during
-   implementation. Update ROADMAP.md and AGENTS.md to reflect what changed
+   implementation. Update Linear and AGENTS.md to reflect what changed

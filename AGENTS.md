@@ -42,9 +42,9 @@ the limit:
 
 - **README.md** — if project structure, features, commands, or architecture
   changed
-- **ROADMAP.md** — mark completed issues, link PRs. When a PR is chained
-  (depends on a parent PR), mark both as done in the roadmap so it's up to date
-  by the time they merge.
+- **Linear** — move completed issues to Done and link the PR. When a PR is
+  chained (depends on a parent PR), close both so status is current by the time
+  they merge.
 - **`docs/`** — when research or trial-and-error reveals non-obvious patterns,
   pitfalls, or framework behavior, document it in the relevant `docs/` file (or
   create a new one) to prevent rediscovery. Prioritize documenting:
@@ -84,14 +84,13 @@ The project uses a strict document hierarchy:
 
 1. **SPEC.md** - Source of truth for system behavior. Features documented here
    before implementation.
-2. **ROADMAP.md / GitHub Issues** - Downstream from spec. Describe problems, not
-   solutions.
+2. **Linear issues/projects** - Downstream from spec. Describe problems, not
+   solutions. See [docs/linear-workflow.md](docs/linear-workflow.md).
 3. **Planning** - Downstream from issues. Implementation plans before coding.
 4. **Tests** - Downstream from plan. Written before implementation (TDD).
 5. **Implementation** - Makes the tests pass.
 
-**Before implementing:** Ensure feature is in SPEC.md -> has GitHub issue ->
-plan the implementation.
+**Before implementing:** SPEC.md -> Linear issue -> plan.
 
 ### Goal-Oriented Planning
 
@@ -117,19 +116,19 @@ Decompose epics to maximize independent parallel execution:
 7. **Converge to a single terminal node.** One final PR depends on all parallel
    streams for integration.
 
-### Managing Epics in the Roadmap
+### Managing Epics in Linear
 
-An epic is a roadmap subsection grouping related issues toward a single goal.
+An epic is a Linear project grouping related issues toward a single goal. See
+[docs/linear-workflow.md](docs/linear-workflow.md) for issue-vs-project rules.
 
-- **Lead with motivation**: One or two sentences explaining why this work
-  matters and what the end state looks like.
-- **Show the dependency structure**: Use a Mermaid diagram (GitHub renders them
-  natively) to make the execution order and parallelism obvious at a glance.
-- **Reference issues, not solutions**: Each item links to a GitHub issue. The
-  issue describes the desired outcome; the PR (added later) describes the
-  solution.
-- **Mark progress inline**: `[x]` with PR link as branches merge. When all items
-  complete, move the section to "Completed."
+- **Lead with motivation**: the project description states why this work matters
+  and what the end state looks like.
+- **Show the dependency structure**: use issue relations (blocks/blocked-by) and
+  sub-issues so execution order and parallelism are explicit.
+- **Reference issues, not solutions**: each issue describes the desired outcome;
+  the PR (linked later) describes the solution.
+- **Mark progress via status**: advance issues through workflow states and link
+  the PR as branches merge; the project completes when its issues do.
 
 ## Plan & Review
 
@@ -169,7 +168,7 @@ immediately. Do not paraphrase the request back as a confirmation step.
 When the user points out an issue, bug, or problem - fix it immediately. Do not
 ask "Want me to fix this?" or "Should I address this?". The user never sends
 messages just for the sake of it; when they point out issues, they expect action
-(usually a fix, sometimes reproducing, opening a GitHub issue, etc. based on
+(usually a fix, sometimes reproducing, opening a Linear issue, etc. based on
 context).
 
 **CRITICAL: Re-evaluate all work when a pattern is identified.** When the user
@@ -370,49 +369,18 @@ the existing message stays. If amended work has different scope than the
 branch's message, it belongs on a different branch -- don't rewrite the message
 to absorb it.
 
-### Updating ROADMAP.md
+### Updating Linear
 
-After completing work or creating new issues, update ROADMAP.md:
+After completing work or creating issues, keep Linear current:
 
-**Section ordering (newest first):**
-
-The roadmap is ordered with highest priority / most recent work at the top:
-
-1. **Current Development Focus** - Active work and immediate priorities
-2. **Backlog sections** - Planned future work by category
-3. **Completed sections** - Finished work, ordered newest to oldest
-
-This ordering ensures readers see current priorities immediately without
-scrolling past historical work. When adding new "Completed" sections, add them
-above older completed sections.
-
-**After completing a plan:**
-
-1. Mark completed issues as `[x]` with PR link
-2. Use this format:
-   ```markdown
-   - [x] [#N Issue title](https://github.com/ST0x-Technology/st0x.liquidity/issues/N)
-     - PR: [#M PR title](https://github.com/ST0x-Technology/st0x.liquidity/pull/M)
-   ```
-3. Move completed items from "Current Development Focus" to the appropriate
-   "Completed" section (or create a new one if it represents a milestone)
-
-**When creating new issues:**
-
-1. Add the issue to the appropriate **existing** roadmap section. Do not create
-   a new section for a single issue — only create subsections when grouping
-   multiple related items. If no existing section fits, add to the closest
-   match.
-2. Use this format:
-   ```markdown
-   - [ ] [#N Issue title](https://github.com/ST0x-Technology/st0x.liquidity/issues/N)
-   ```
-
-**Verification:**
-
-- Use `gh issue list --state all` and `gh pr list --state all` to cross-check
-- Ensure no issues are marked `[x]` in ROADMAP.md but still open on GitHub
-- Ensure all recent closed issues/PRs are reflected in the roadmap
+- **Completed work**: move the issue to Done and link the merged PR. If a PR is
+  chained on a parent, close both so status reflects reality at merge time.
+- **New issues**: file under the right project/milestone per
+  [docs/linear-workflow.md](docs/linear-workflow.md). Bundle a tight cluster of
+  related issues under one parent issue.
+- **Verification**: cross-check with `linear issue list` (issues) and
+  `gh pr list --state all` (PRs). No issue should sit Done with its PR unmerged,
+  and no merged PR should leave its issue open.
 
 ## Architecture Overview
 
