@@ -322,6 +322,16 @@ let
           echo "Deleting live database..."
           ssh_remote "rm -f $db_path $db_path-wal $db_path-shm $db_path-journal"
 
+          # Recreate the DB as an empty st0x-owned file immediately. Leaving the
+          # path empty opens a window where any root process that touches it
+          # (a manual sqlite3 inspection, a status query, monitoring) creates a
+          # root:root database the st0x service can never write to, sending the
+          # unit into a SQLITE_READONLY crash loop. SQLite treats a zero-length
+          # file as a valid empty database, so the bot still runs migrations on
+          # next start -- it just inherits an already-correctly-owned file.
+          echo "Recreating empty database owned by st0x:st0x..."
+          ssh_remote "install -o st0x -g st0x -m 644 /dev/null $db_path"
+
           echo "Updating deployment_block to $target_block..."
           ssh_remote "sed -i 's/^deployment_block = .*/deployment_block = $target_block/' $config"
           ssh_remote "grep -q '^deployment_block = $target_block$' $config"
