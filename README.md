@@ -106,6 +106,21 @@ configured Base liquidity wallet):
 cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml unwrap-equity --symbol AAPL --quantity 10.5
 ```
 
+Manual repair of local position tracking after an operator trade or rebalance:
+
+```bash
+cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml repair set-position --symbol SPYM --zero --reason "manual rebalance completed"
+cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml repair set-position --symbol SPYM --long 100 --price 200 --reason "manual buy not observed by bot"
+cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml repair set-position --symbol SPYM --short 12.5 --price 200 --reason "manual sell not observed by bot"
+```
+
+`--price` (USDC per share) is required for a nonzero target when the symbol uses
+a dollar-value execution threshold and no price is already known; without it the
+repaired exposure could never be valued and would never hedge.
+
+`set-position` is rejected while the symbol still has a pending offchain hedge
+order; resolve it first with `repair fail-pending-offchain-order`, then retry.
+
 ### Brokerage Setup
 
 **Alpaca Broker API** (managed accounts, supports auto-rebalancing):

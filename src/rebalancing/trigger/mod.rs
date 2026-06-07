@@ -1548,7 +1548,17 @@ impl Reactor for RebalancingService {
                         self.equity_scheduler.enqueue_check(symbol).await;
                         return Ok(());
                     }
-                    Initialized { .. } | ThresholdUpdated { .. } => return Ok(()),
+                    Initialized { .. } | ThresholdUpdated { .. } => {
+                        return Ok(());
+                    }
+                    ManualPositionAdjusted { .. } => {
+                        // A manual adjustment can create a hedgeable imbalance.
+                        // Nudge an immediate equity check (mirroring the
+                        // OffChainOrderFailed arm) rather than waiting up to a
+                        // full poll cycle for the periodic scan to notice.
+                        self.equity_scheduler.enqueue_check(symbol).await;
+                        return Ok(());
+                    }
                 };
 
                 let inventory_result = {
@@ -6416,36 +6426,92 @@ mod tests {
     #[tokio::test]
     async fn position_noop_events_via_reactor_do_not_error() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::default().with_equity(symbol.clone(), shares(0), shares(0));
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(5), shares(5))
+            .with_usdc(usdc(10000), usdc(10000));
 
         let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
-        // Initialized, OffChainOrderPlaced, OffChainOrderFailed, ThresholdUpdated
-        // all return Ok(()) without modifying inventory
-        harness
-            .receive::<Position>(
-                symbol.clone(),
-                PositionEvent::Initialized {
-                    symbol: symbol.clone(),
-                    threshold: ExecutionThreshold::whole_share(),
-                    initialized_at: Utc::now(),
-                },
-            )
+        // Seed the pending-hedge gate so we can prove no-op events leave it intact
+        // (OffChainOrderFailed clears it; manual adjustments must not).
+        trigger
+            .pending_offchain_order_symbols
+            .write()
             .await
-            .unwrap();
+            .insert(symbol.clone());
 
-        harness
-            .receive::<Position>(
-                symbol.clone(),
-                PositionEvent::ThresholdUpdated {
-                    old_threshold: ExecutionThreshold::whole_share(),
-                    new_threshold: ExecutionThreshold::whole_share(),
-                    updated_at: Utc::now(),
-                },
-            )
-            .await
-            .unwrap();
+        // Initialized, ThresholdUpdated, and ManualPositionAdjusted all return
+        // Ok(()) without touching inventory or the pending-hedge gate.
+        for event in [
+            PositionEvent::Initialized {
+                symbol: symbol.clone(),
+                threshold: ExecutionThreshold::whole_share(),
+                initialized_at: Utc::now(),
+            },
+            PositionEvent::ThresholdUpdated {
+                old_threshold: ExecutionThreshold::whole_share(),
+                new_threshold: ExecutionThreshold::whole_share(),
+                updated_at: Utc::now(),
+            },
+            PositionEvent::ManualPositionAdjusted {
+                previous_net: shares(5),
+                target_net: shares(0),
+                reason: "operator repair".to_string(),
+                price_usdc: Some(float!(150)),
+                adjusted_at: Utc::now(),
+            },
+        ] {
+            harness
+                .receive::<Position>(symbol.clone(), event)
+                .await
+                .unwrap();
+        }
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::Hedging),
+            Some(shares(5)),
+            "manual adjustment must not change hedging equity"
+        );
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(5)),
+            "manual adjustment must not change market-making equity"
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::Hedging),
+            Some(usdc(10000)),
+            "manual adjustment must not change hedging USDC"
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::MarketMaking),
+            Some(usdc(10000)),
+            "manual adjustment must not change market-making USDC"
+        );
+        drop(inventory);
+
+        assert!(
+            trigger
+                .pending_offchain_order_symbols
+                .read()
+                .await
+                .contains(&symbol),
+            "manual adjustment must not clear the pending-hedge gate"
+        );
+
+        let pending_equity_checks = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<EquityRebalancingCheck>())
+        .fetch_one(trigger.equity_scheduler.queue().pool())
+        .await
+        .expect("count pending equity-check jobs after ManualPositionAdjusted");
+
+        assert_eq!(
+            pending_equity_checks, 1,
+            "ManualPositionAdjusted must enqueue exactly one immediate equity recheck"
+        );
     }
 
     #[tokio::test]

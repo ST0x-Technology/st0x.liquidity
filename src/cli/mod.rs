@@ -11,7 +11,7 @@ mod wrapper;
 
 use alloy::primitives::{Address, B256, TxHash};
 use alloy::providers::{ProviderBuilder, WsConnect};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use rain_math_float::Float;
 use sqlx::SqlitePool;
 use std::io::Write;
@@ -96,10 +96,49 @@ pub enum RepairCommand {
         )]
         reason: String,
     },
+    /// Set a position's net exposure after an operator manual correction.
+    #[command(group(
+        ArgGroup::new("target")
+            .required(true)
+            .multiple(false)
+            .args(["zero", "long", "short"])
+    ))]
+    SetPosition {
+        /// Position symbol (e.g., SPYM)
+        #[arg(short = 's', long = "symbol")]
+        symbol: Symbol,
+        /// Set the position to exactly zero shares
+        #[arg(long = "zero")]
+        zero: bool,
+        /// Set the position to a positive long net exposure
+        #[arg(long = "long", value_parser = parse_positive_shares)]
+        long: Option<Positive<FractionalShares>>,
+        /// Set the position to a negative short net exposure
+        #[arg(long = "short", value_parser = parse_positive_shares)]
+        short: Option<Positive<FractionalShares>>,
+        /// USDC price per share, required for nonzero targets under a dollar-value threshold
+        #[arg(long = "price", value_parser = parse_positive_price)]
+        price: Option<Float>,
+        /// Operator reason to persist on the Position::ManualPositionAdjusted event
+        #[arg(short = 'r', long = "reason")]
+        reason: String,
+    },
 }
 
 fn parse_float(input: &str) -> Result<Float, String> {
     Float::parse(input.to_string()).map_err(|err| format!("{err}"))
+}
+
+/// Parses a strictly-positive price. A zero or negative `--price` would poison
+/// `last_price_usdc` and make a dollar-value threshold never trigger a hedge --
+/// the exact never-hedges state the price requirement exists to prevent.
+fn parse_positive_price(input: &str) -> Result<Float, String> {
+    let value = Float::parse(input.to_string()).map_err(|err| format!("{err}"))?;
+    let zero = Float::parse("0".to_string()).map_err(|err| format!("{err}"))?;
+    if !value.gt(zero).map_err(|err| format!("{err}"))? {
+        return Err(format!("--price must be strictly positive, got {value:?}"));
+    }
+    Ok(value)
 }
 
 fn parse_positive_shares(input: &str) -> Result<Positive<FractionalShares>, String> {
@@ -1129,7 +1168,9 @@ async fn run_simple_command<W: Write>(
         SimpleCommand::RebuildView { aggregate, id, all } => {
             rebuild_view(stdout, pool, aggregate, id, all).await
         }
-        SimpleCommand::Repair { command } => run_repair_command(stdout, pool, command).await,
+        SimpleCommand::Repair { command } => {
+            run_repair_command(stdout, pool, command, ctx.execution_threshold).await
+        }
         SimpleCommand::FailTransfer {
             transfer_type,
             id,
@@ -1194,6 +1235,7 @@ async fn run_repair_command<W: Write>(
     stdout: &mut W,
     pool: &SqlitePool,
     command: RepairCommand,
+    execution_threshold: st0x_config::ExecutionThreshold,
 ) -> anyhow::Result<()> {
     match command {
         RepairCommand::FailPendingOffchainOrder {
@@ -1203,6 +1245,58 @@ async fn run_repair_command<W: Write>(
         } => {
             repair::fail_pending_offchain_order_command(stdout, pool, &symbol, order_id, reason)
                 .await
+        }
+        RepairCommand::SetPosition {
+            symbol,
+            zero,
+            long,
+            short,
+            price,
+            reason,
+        } => {
+            let target_net = ManualPositionTarget::from_flags(zero, long, short)?.net()?;
+            repair::set_position_command(
+                stdout,
+                pool,
+                &symbol,
+                target_net,
+                reason,
+                execution_threshold,
+                price,
+            )
+            .await
+        }
+    }
+}
+
+/// Operator-chosen target for `repair set-position`, converted from the mutually
+/// exclusive `--zero`/`--long`/`--short` clap flags at the parser boundary so
+/// internal code carries one valid state instead of three flags.
+enum ManualPositionTarget {
+    Zero,
+    Long(Positive<FractionalShares>),
+    Short(Positive<FractionalShares>),
+}
+
+impl ManualPositionTarget {
+    fn from_flags(
+        zero: bool,
+        long: Option<Positive<FractionalShares>>,
+        short: Option<Positive<FractionalShares>>,
+    ) -> anyhow::Result<Self> {
+        match (zero, long, short) {
+            (true, None, None) => Ok(Self::Zero),
+            (false, Some(shares), None) => Ok(Self::Long(shares)),
+            (false, None, Some(shares)) => Ok(Self::Short(shares)),
+            _ => anyhow::bail!("exactly one of --zero, --long, or --short is required"),
+        }
+    }
+
+    fn net(self) -> anyhow::Result<FractionalShares> {
+        match self {
+            Self::Zero => Ok(FractionalShares::ZERO),
+            Self::Long(shares) => Ok(shares.inner()),
+            Self::Short(shares) => Ok((FractionalShares::ZERO - shares.inner())?),
         }
     }
 }
@@ -1543,6 +1637,159 @@ mod tests {
     }
 
     #[test]
+    fn repair_set_position_zero_parses() {
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "repair",
+            "set-position",
+            "--symbol",
+            "SPYM",
+            "--zero",
+            "--reason",
+            "manual rebalance completed",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Repair {
+                command:
+                    RepairCommand::SetPosition {
+                        symbol,
+                        zero,
+                        long,
+                        short,
+                        price,
+                        reason,
+                    },
+            } => {
+                assert_eq!(symbol, Symbol::new("SPYM").unwrap());
+                assert!(zero);
+                assert_eq!(long, None);
+                assert_eq!(short, None);
+                assert!(price.is_none());
+                assert_eq!(reason, "manual rebalance completed");
+            }
+            other => panic!("expected repair set-position command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repair_set_position_long_and_short_parse_positive_amounts() {
+        let long = Cli::try_parse_from([
+            "st0x-cli",
+            "repair",
+            "set-position",
+            "--symbol",
+            "SPYM",
+            "--long",
+            "100",
+            "--reason",
+            "manual buy",
+        ])
+        .unwrap();
+
+        match long.command {
+            Commands::Repair {
+                command:
+                    RepairCommand::SetPosition {
+                        long: Some(quantity),
+                        ..
+                    },
+            } => assert_eq!(quantity, positive_shares("100")),
+            other => panic!("expected repair set-position --long, got: {other:?}"),
+        }
+
+        let short = Cli::try_parse_from([
+            "st0x-cli",
+            "repair",
+            "set-position",
+            "--symbol",
+            "SPYM",
+            "--short",
+            "12.5",
+            "--reason",
+            "manual sell",
+        ])
+        .unwrap();
+
+        match short.command {
+            Commands::Repair {
+                command:
+                    RepairCommand::SetPosition {
+                        short: Some(quantity),
+                        ..
+                    },
+            } => assert_eq!(quantity, positive_shares("12.5")),
+            other => panic!("expected repair set-position --short, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repair_set_position_rejects_missing_reason() {
+        let error = Cli::try_parse_from([
+            "st0x-cli",
+            "repair",
+            "set-position",
+            "--symbol",
+            "SPYM",
+            "--zero",
+        ])
+        .unwrap_err();
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("reason"),
+            "unexpected clap error: {rendered}"
+        );
+    }
+
+    #[test]
+    fn repair_set_position_rejects_multiple_targets() {
+        let error = Cli::try_parse_from([
+            "st0x-cli",
+            "repair",
+            "set-position",
+            "--symbol",
+            "SPYM",
+            "--zero",
+            "--long",
+            "1",
+            "--reason",
+            "operator repair",
+        ])
+        .unwrap_err();
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("cannot be used with")
+                && rendered.contains("--zero")
+                && rendered.contains("--long"),
+            "unexpected clap error: {rendered}"
+        );
+    }
+
+    #[test]
+    fn repair_set_position_rejects_zero_long_amount() {
+        let error = Cli::try_parse_from([
+            "st0x-cli",
+            "repair",
+            "set-position",
+            "--symbol",
+            "SPYM",
+            "--long",
+            "0",
+            "--reason",
+            "operator repair",
+        ])
+        .unwrap_err();
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("invalid value '0'")
+                && rendered.contains("--long")
+                && rendered.contains("value must be positive"),
+            "unexpected clap error: {rendered}"
+        );
+    }
+
+    #[test]
     fn classify_repair_command_as_simple() {
         let order_id = OffchainOrderId::new();
         let command = Commands::Repair {
@@ -1578,6 +1825,49 @@ mod tests {
                 | ProviderCommand::AlpacaTokenizationRequests,
             ) => panic!("expected simple command classification"),
         }
+    }
+
+    #[tokio::test]
+    async fn run_command_with_writers_executes_repair_set_position() {
+        let ctx = create_test_ctx();
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("SPYM").unwrap();
+        let command = Commands::Repair {
+            command: RepairCommand::SetPosition {
+                symbol: symbol.clone(),
+                zero: false,
+                long: Some(positive_shares("100")),
+                short: None,
+                price: None,
+                reason: "manual buy not observed by bot".to_string(),
+            },
+        };
+
+        let mut stdout_buffer = Vec::new();
+        run_command_with_writers(ctx, command, &pool, &mut stdout_buffer)
+            .await
+            .unwrap();
+
+        let projection = Projection::<Position>::sqlite(pool.clone());
+        let view = projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(view.net, positive_shares("100").inner());
+
+        let output = String::from_utf8(stdout_buffer).unwrap();
+        assert!(
+            output.contains("Set SPYM position from 0 to 100"),
+            "unexpected output: {output}"
+        );
+    }
+
+    #[test]
+    fn manual_position_target_converts_short_to_negative_net() {
+        let target = ManualPositionTarget::from_flags(false, None, Some(positive_shares("12.5")))
+            .unwrap()
+            .net()
+            .unwrap();
+        let expected = (FractionalShares::ZERO - positive_shares("12.5").inner()).unwrap();
+
+        assert_eq!(target, expected);
     }
 
     #[tokio::test]

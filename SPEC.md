@@ -941,6 +941,9 @@ struct Position {
     accumulated_short: FractionalShares,
     pending_execution_id: Option<ExecutionId>,
     threshold: ExecutionThreshold,
+    last_price_usdc: Option<Float>,  // Last known USDC price per share; drives
+                                     // dollar-threshold hedging. None until a
+                                     // priced fill or manual adjustment sets it.
     last_updated: Option<DateTime<Utc>>,
 }
 
@@ -986,6 +989,14 @@ enum PositionCommand {
         execution_id: ExecutionId,
         error: String,
     },
+    ManuallyAdjustPosition {
+        symbol: Symbol,
+        target_net: FractionalShares,
+        reason: String,
+        threshold: ExecutionThreshold,
+        expected_net: Option<FractionalShares>,
+        price_usdc: Option<Decimal>,
+    },
 }
 ```
 
@@ -1022,6 +1033,13 @@ enum PositionEvent {
         broker_code: Option<BrokerErrorCode>,
         failed_at: DateTime<Utc>,
     },
+    ManualPositionAdjusted {
+        previous_net: FractionalShares,
+        target_net: FractionalShares,
+        reason: String,
+        price_usdc: Option<Decimal>,
+        adjusted_at: DateTime<Utc>,
+    },
 }
 
 enum TriggerReason {
@@ -1042,6 +1060,25 @@ enum TriggerReason {
 
 - `AcknowledgeOnChainFill` serves as the genesis event (initializes the
   aggregate on first fill)
+- `ManuallyAdjustPosition` is an audited operator repair command that sets the
+  absolute net exposure after manual trading or rebalancing outside the bot. It
+  may initialize a missing position, including a zero target, using the
+  configured execution threshold.
+- Manual position adjustment is rejected while an offchain hedge order is
+  pending; operators must fail or resolve the pending order first.
+- Manual position adjustment changes only `net`, not accumulated long/short
+  trading volume, because it corrects exposure rather than rewriting fill
+  history.
+- Manual position adjustment is optimistically concurrency-checked: when
+  `expected_net` is supplied (the CLI always supplies the net it read), the
+  command is rejected with `ManualAdjustmentStateChanged` if the live aggregate
+  net no longer matches, so a concurrent onchain fill cannot be silently erased.
+- A nonzero target under a dollar-value threshold requires a price: the operator
+  must supply `price_usdc` (CLI `--price`) unless the position already has a
+  known `last_price_usdc`. Otherwise the command is rejected with
+  `ManualAdjustmentRequiresPrice`, preventing a repaired exposure that can never
+  be valued and would therefore never hedge. The supplied price is persisted as
+  `last_price_usdc`. A zero target needs no price.
 - Can only place offchain order when threshold is met:
   - **Shares threshold**: `|net_position| >= threshold` (e.g., whole-share
     threshold)
