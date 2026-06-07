@@ -164,8 +164,7 @@ Both operations are tracked as CQRS event-sourced aggregates
 
 ### Reporter
 
-A standalone service (separate binary) that computes P&L metrics from trade
-history. It uses FIFO inventory accounting to calculate realized P&L, cumulative
-P&L, and net position for each symbol. Runs on a polling interval against the
-same SQLite database as the server, but requires no secrets (only a plaintext
-config with the database path).
+P&L reporting has been removed. Historical realized P&L, cumulative P&L, and
+per-symbol net position were previously provided by a separate `reporter` binary
+that read from the shared SQLite database; that subsystem no longer exists in the
+codebase.
