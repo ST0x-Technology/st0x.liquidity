@@ -28,6 +28,8 @@ pub enum RebalancingCtxError {
     ZeroTransferTimeout,
     #[error("rebalancing transfer_attempt_timeout_secs must be non-zero")]
     ZeroTransferAttemptTimeout,
+    #[error("rebalancing attestation_retry_deadline_secs must be non-zero")]
+    ZeroAttestationRetryDeadline,
     #[error("invalid wallet config: {0}")]
     WalletConfig(#[from] toml::de::Error),
     #[error(transparent)]
@@ -58,6 +60,16 @@ pub struct RebalancingConfig {
     /// retries rather than wedging forever. Distinct from
     /// `transfer_timeout_secs`, which is the whole-transfer stall reaper.
     pub transfer_attempt_timeout_secs: u64,
+    /// How long to keep retrying Circle attestation polling after the first
+    /// poll times out before giving up and marking the bridge failed.
+    ///
+    /// This is a soft bound: the deadline is checked between redrive attempts,
+    /// not mid-poll. An in-flight poll that started before the deadline runs to
+    /// completion, so the effective cutoff is the first redrive at or after the
+    /// deadline -- up to one poll window plus the redrive delay past this value.
+    /// At the production default (24h) the overshoot is negligible; set with
+    /// that granularity in mind, not as a hard millisecond cutoff.
+    pub attestation_retry_deadline_secs: u64,
 }
 
 /// Runtime configuration for rebalancing operations.
@@ -74,6 +86,7 @@ pub struct RebalancingCtx {
     /// attempt (hung-RPC backstop). See
     /// [`RebalancingConfig::transfer_attempt_timeout_secs`].
     pub transfer_attempt_timeout: Duration,
+    pub attestation_retry_deadline: Duration,
     /// Circle attestation/fee API base URL (test-only override).
     #[cfg(feature = "test-support")]
     pub circle_api_base: String,
@@ -92,6 +105,9 @@ impl RebalancingCtx {
         if config.transfer_timeout_secs == 0 {
             return Err(RebalancingCtxError::ZeroTransferTimeout);
         }
+        if config.attestation_retry_deadline_secs == 0 {
+            return Err(RebalancingCtxError::ZeroAttestationRetryDeadline);
+        }
 
         if config.transfer_attempt_timeout_secs == 0 {
             return Err(RebalancingCtxError::ZeroTransferAttemptTimeout);
@@ -109,6 +125,7 @@ impl RebalancingCtx {
             usdc,
             transfer_timeout: Duration::from_secs(config.transfer_timeout_secs),
             transfer_attempt_timeout: Duration::from_secs(config.transfer_attempt_timeout_secs),
+            attestation_retry_deadline: Duration::from_secs(config.attestation_retry_deadline_secs),
             #[cfg(feature = "test-support")]
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
             #[cfg(feature = "test-support")]
@@ -132,12 +149,15 @@ impl RebalancingCtx {
         usdc: Option<ImbalanceThreshold>,
         #[builder(default = Duration::from_secs(30 * 60))] transfer_timeout: Duration,
         #[builder(default = Duration::from_secs(60 * 60))] transfer_attempt_timeout: Duration,
+        #[builder(default = Duration::from_secs(24 * 60 * 60))]
+        attestation_retry_deadline: Duration,
     ) -> Self {
         Self {
             equity,
             usdc,
             transfer_timeout,
             transfer_attempt_timeout,
+            attestation_retry_deadline,
             #[cfg(feature = "test-support")]
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
             #[cfg(feature = "test-support")]
@@ -159,6 +179,8 @@ impl RebalancingCtx {
         usdc: UsdcRebalancing,
         #[builder(default = Duration::from_secs(30 * 60))] transfer_timeout: Duration,
         #[builder(default = Duration::from_secs(60 * 60))] transfer_attempt_timeout: Duration,
+        #[builder(default = Duration::from_secs(24 * 60 * 60))]
+        attestation_retry_deadline: Duration,
     ) -> Self {
         let usdc = match usdc {
             UsdcRebalancing::Enabled { target, deviation } => {
@@ -172,6 +194,7 @@ impl RebalancingCtx {
             usdc,
             transfer_timeout,
             transfer_attempt_timeout,
+            attestation_retry_deadline,
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
             token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
             message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
@@ -218,6 +241,7 @@ mod tests {
         r#"
             transfer_timeout_secs = 1800
             transfer_attempt_timeout_secs = 3600
+            attestation_retry_deadline_secs = 86400
 
             [equity]
             target = "0.5"
@@ -244,6 +268,7 @@ mod tests {
         assert!(deviation.eq(float!(0.3)).unwrap());
         assert_eq!(config.transfer_timeout_secs, 1800);
         assert_eq!(config.transfer_attempt_timeout_secs, 3600);
+        assert_eq!(config.attestation_retry_deadline_secs, 86400);
     }
 
     #[test]
@@ -252,6 +277,7 @@ mod tests {
             r#"
             transfer_timeout_secs = 1800
             transfer_attempt_timeout_secs = 3600
+            attestation_retry_deadline_secs = 7200
 
             [equity]
             target = "0.6"
@@ -273,6 +299,7 @@ mod tests {
         };
         assert!(target.eq(float!(0.4)).unwrap());
         assert!(deviation.eq(float!(0.15)).unwrap());
+        assert_eq!(config.attestation_retry_deadline_secs, 7200);
     }
 
     #[test]
@@ -296,9 +323,60 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_missing_attestation_retry_deadline_secs_fails() {
+        let toml_str = r#"
+            transfer_timeout_secs = 1800
+            transfer_attempt_timeout_secs = 3600
+
+            [equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [usdc]
+            mode = "enabled"
+            target = "0.5"
+            deviation = "0.3"
+        "#;
+
+        let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
+        assert!(
+            error.message().contains("attestation_retry_deadline_secs"),
+            "Expected missing attestation_retry_deadline_secs error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn zero_attestation_retry_deadline_secs_fails_validation() {
+        let config: RebalancingConfig = toml::from_str(
+            r#"
+            transfer_timeout_secs = 1800
+            transfer_attempt_timeout_secs = 3600
+            attestation_retry_deadline_secs = 0
+
+            [equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [usdc]
+            mode = "enabled"
+            target = "0.5"
+            deviation = "0.3"
+        "#,
+        )
+        .unwrap();
+
+        let error = RebalancingCtx::new(&config).unwrap_err();
+        assert!(matches!(
+            error,
+            RebalancingCtxError::ZeroAttestationRetryDeadline
+        ));
+    }
+
+    #[test]
     fn deserialize_missing_equity_fails() {
         let toml_str = r#"
             transfer_timeout_secs = 1800
+            attestation_retry_deadline_secs = 86400
 
             [usdc]
             mode = "enabled"
@@ -317,6 +395,7 @@ mod tests {
     fn deserialize_missing_usdc_fails() {
         let toml_str = r#"
             transfer_timeout_secs = 1800
+            attestation_retry_deadline_secs = 86400
 
             [equity]
             target = "0.5"
@@ -358,6 +437,7 @@ mod tests {
             r#"
             transfer_timeout_secs = 1800
             transfer_attempt_timeout_secs = 0
+            attestation_retry_deadline_secs = 86400
 
             [equity]
             target = "0.5"

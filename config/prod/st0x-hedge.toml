@@ -50,6 +50,7 @@ redemption_wallet = "0x1c66D6708914C40239D54919320b4C48cAE3D1A9"
 [rebalancing]
 transfer_timeout_secs = 1800
 transfer_attempt_timeout_secs = 3600
+attestation_retry_deadline_secs = 86400
 
 [rebalancing.usdc]
 mode = "enabled"

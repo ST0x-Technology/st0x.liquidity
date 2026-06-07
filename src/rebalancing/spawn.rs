@@ -3,6 +3,7 @@
 use alloy::primitives::Address;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -67,6 +68,7 @@ pub(crate) struct RebalancerServices<Chain: Wallet> {
     raindex: Arc<RaindexService<Chain>>,
     tokenizer: Arc<dyn Tokenizer>,
     wrapper: Arc<WrapperService<Chain>>,
+    attestation_retry_deadline: Duration,
 }
 
 impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
@@ -85,11 +87,8 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
         raindex: Arc<RaindexService<Chain>>,
         tokenizer: Arc<dyn Tokenizer>,
     ) -> Result<Self, SpawnRebalancerError> {
-        // ctx is only consumed behind #[cfg(feature = "test-support")]
-        #[cfg(not(feature = "test-support"))]
-        let _ = ctx;
-
         let broker = Arc::new(AlpacaBrokerApi::try_from_ctx(broker_auth).await?);
+        let attestation_retry_deadline = ctx.attestation_retry_deadline;
 
         let cctp = Arc::new(
             CctpBridge::try_from_ctx(CctpCtx {
@@ -116,6 +115,7 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
             raindex,
             tokenizer,
             wrapper,
+            attestation_retry_deadline,
         })
     }
 
@@ -149,6 +149,7 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
             frameworks.usdc,
             market_maker_wallet,
             usdc_vault_id,
+            self.attestation_retry_deadline,
         ));
 
         let resume_base_to_alpaca: Arc<dyn ResumeBaseToAlpaca> = usdc.clone();
@@ -377,6 +378,7 @@ mod tests {
             raindex,
             tokenizer: tokenization,
             wrapper,
+            attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
         };
 
         (services, rebalancing_ctx)

@@ -830,6 +830,10 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             .cloned()
             .collect();
 
+        let transfer_usdc_to_hedging_queue = deps.schedulers.transfer_usdc_to_hedging.clone();
+        let transfer_usdc_to_market_making_queue =
+            deps.schedulers.transfer_usdc_to_market_making.clone();
+
         let rebalancing_service = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
                 equity: rebalancing_ctx.equity,
@@ -946,10 +950,12 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         let transfer_usdc_to_hedging_ctx = Arc::new(TransferUsdcToHedgingCtx {
             transfer: spawned.resume_base_to_alpaca,
             timeout: rebalancing_ctx.transfer_attempt_timeout,
+            job_queue: transfer_usdc_to_hedging_queue,
         });
 
         let transfer_usdc_to_market_making_ctx = Arc::new(TransferUsdcToMarketMakingCtx {
             transfer: spawned.resume_alpaca_to_base,
+            job_queue: transfer_usdc_to_market_making_queue,
         });
 
         Ok(RebalancingInfrastructure {

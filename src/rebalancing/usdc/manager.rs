@@ -5,12 +5,14 @@
 //! execute USDC transfers between Alpaca and Base.
 
 use alloy::primitives::{Address, TxHash, U256};
+use chrono::{DateTime, Utc};
+use rain_math_float::Float;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
-use rain_math_float::Float;
-use st0x_bridge::cctp::{AttestationResponse, CctpBridge};
+use st0x_bridge::cctp::{AttestationResponse, CctpBridge, CctpError};
 use st0x_bridge::{Attestation, Bridge, BridgeDirection, BurnReceipt, MintReceipt};
 use st0x_event_sorcery::Store;
 use st0x_evm::Wallet;
@@ -41,6 +43,12 @@ pub(crate) struct CrossVenueCashTransfer<Chain: Wallet> {
     cqrs: Arc<Store<UsdcRebalance>>,
     market_maker_wallet: Address,
     vault_id: RaindexVaultId,
+    attestation_retry_deadline: Duration,
+}
+
+enum AttestationPollOutcome {
+    Received(AttestationResponse),
+    TimedOut,
 }
 
 impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
@@ -52,6 +60,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
         cqrs: Arc<Store<UsdcRebalance>>,
         market_maker_wallet: Address,
         vault_id: RaindexVaultId,
+        attestation_retry_deadline: Duration,
     ) -> Self {
         Self {
             alpaca_broker,
@@ -61,7 +70,175 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
             cqrs,
             market_maker_wallet,
             vault_id,
+            attestation_retry_deadline,
         }
+    }
+
+    fn attestation_retry_deadline_at(
+        &self,
+        id: &UsdcRebalanceId,
+    ) -> Result<DateTime<Utc>, UsdcTransferError> {
+        let duration =
+            chrono::Duration::from_std(self.attestation_retry_deadline).map_err(|_| {
+                UsdcTransferError::AttestationRetryDeadlineOverflow {
+                    id: id.clone(),
+                    retry_deadline: self.attestation_retry_deadline,
+                }
+            })?;
+
+        Utc::now().checked_add_signed(duration).ok_or_else(|| {
+            UsdcTransferError::AttestationRetryDeadlineOverflow {
+                id: id.clone(),
+                retry_deadline: self.attestation_retry_deadline,
+            }
+        })
+    }
+
+    async fn record_attestation_timeout(
+        &self,
+        id: &UsdcRebalanceId,
+    ) -> Result<(), UsdcTransferError> {
+        let retry_deadline_at = self.attestation_retry_deadline_at(id)?;
+
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::TimeoutAttestation { retry_deadline_at },
+            )
+            .await?;
+
+        warn!(
+            target: "rebalance",
+            %id,
+            %retry_deadline_at,
+            "Circle attestation poll timed out; leaving USDC rebalance retryable until the deadline"
+        );
+
+        Ok(())
+    }
+
+    /// Polls Circle for the attestation, classifying the result.
+    ///
+    /// A `CctpError::AttestationTimeout` is a recoverable, retryable condition
+    /// (the attestation simply has not arrived yet) and maps to
+    /// [`AttestationPollOutcome::TimedOut`]. Any other `CctpError` is a hard
+    /// failure (malformed response, placeholder nonce, transport error): the
+    /// USDC is already burned, so the aggregate is moved to `BridgingFailed`
+    /// via `FailBridging` -- surfacing a durable terminal state for operator
+    /// reconciliation rather than wedging the rebalance in a non-terminal state
+    /// while the worker exhausts retries and fail-stops.
+    async fn poll_cctp_attestation(
+        &self,
+        id: &UsdcRebalanceId,
+        direction: BridgeDirection,
+        burn_tx: TxHash,
+    ) -> Result<AttestationPollOutcome, UsdcTransferError> {
+        match self.cctp_bridge.poll_attestation(direction, burn_tx).await {
+            Ok(response) => Ok(AttestationPollOutcome::Received(response)),
+            Err(CctpError::AttestationTimeout { attempts, source }) => {
+                warn!(
+                    target: "rebalance",
+                    attempts,
+                    ?source,
+                    "Circle attestation poll timed out"
+                );
+                Ok(AttestationPollOutcome::TimedOut)
+            }
+            Err(error) => {
+                warn!(target: "rebalance", %id, ?error, "Attestation polling failed");
+                self.cqrs
+                    .send(
+                        id,
+                        UsdcRebalanceCommand::FailBridging {
+                            reason: format!("attestation polling failed: {error}"),
+                        },
+                    )
+                    .await?;
+                Err(UsdcTransferError::Cctp(Box::new(error)))
+            }
+        }
+    }
+
+    /// Polls Circle once, failing the bridge if the retry deadline has already
+    /// elapsed.
+    ///
+    /// The deadline is a soft bound: it is checked here, between redrive
+    /// attempts, not inside the poll. A poll that begins before the deadline
+    /// runs to completion (up to its own internal timeout), so the effective
+    /// cutoff is the first redrive at or after `retry_deadline_at`, which can
+    /// overshoot by one poll window plus the redrive delay. Negligible at the
+    /// production 24h default.
+    async fn poll_cctp_attestation_until_deadline(
+        &self,
+        id: &UsdcRebalanceId,
+        direction: BridgeDirection,
+        burn_tx: TxHash,
+        retry_deadline_at: DateTime<Utc>,
+    ) -> Result<AttestationPollOutcome, UsdcTransferError> {
+        if Utc::now() >= retry_deadline_at {
+            warn!(
+                target: "rebalance",
+                %id,
+                %retry_deadline_at,
+                "Circle attestation retry deadline elapsed"
+            );
+            self.cqrs
+                .send(
+                    id,
+                    UsdcRebalanceCommand::FailBridging {
+                        reason: "attestation retry deadline elapsed".to_string(),
+                    },
+                )
+                .await?;
+            return Err(UsdcTransferError::AttestationRetryDeadlineElapsed { id: id.clone() });
+        }
+
+        self.poll_cctp_attestation(id, direction, burn_tx).await
+    }
+
+    async fn record_attestation(
+        &self,
+        id: &UsdcRebalanceId,
+        direction: BridgeDirection,
+        response: &AttestationResponse,
+    ) -> Result<(), UsdcTransferError> {
+        // Capture the destination head before minting so a crash before
+        // `ConfirmBridging` resumes by scanning for the already-submitted mint
+        // instead of re-minting, which reverts on the already-used CCTP nonce.
+        // A lookup failure here is transient (a destination RPC/read hiccup):
+        // the aggregate is still in `Bridging`/`AwaitingAttestation` with no
+        // attestation recorded yet, and both directions have resume entry points
+        // for those states that re-poll the attestation idempotently. So
+        // propagate the error and let the job retry rather than latching a
+        // terminal `FailBridging` and stranding already-burned USDC behind manual
+        // reconciliation.
+        let mint_scan_from_block = match self.cctp_bridge.destination_block(direction).await {
+            Ok(block) => block,
+            Err(error) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    ?error,
+                    "Destination head lookup failed; leaving aggregate in \
+                     Bridging/AwaitingAttestation for retry"
+                );
+                return Err(UsdcTransferError::Cctp(Box::new(error)));
+            }
+        };
+
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::ReceiveAttestation {
+                    attestation: response.as_bytes().to_vec(),
+                    cctp_nonce: response.nonce(),
+                    mint_scan_from_block,
+                },
+            )
+            .await?;
+
+        info!(target: "rebalance", "Circle attestation received");
+        Ok(())
     }
 
     /// Converts USD buying power to USDC in the crypto wallet.
@@ -344,6 +521,22 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                     .await
             }
 
+            Some(UsdcRebalance::AwaitingAttestation {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                burn_tx_hash,
+                retry_deadline_at,
+                ..
+            }) => {
+                self.continue_alpaca_to_base_from_awaiting_attestation(
+                    id,
+                    amount,
+                    burn_tx_hash,
+                    retry_deadline_at,
+                )
+                .await
+            }
+
             // `Attested` must NOT route through the `Bridging` path: that re-emits
             // `ReceiveAttestation`, which the aggregate rejects from `Attested`,
             // stranding the already-burned USDC. Reconstruct the mint instead --
@@ -448,6 +641,10 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                     direction: BaseToAlpaca,
                     ..
                 }
+                | AwaitingAttestation {
+                    direction: BaseToAlpaca,
+                    ..
+                }
                 | Attested {
                     direction: BaseToAlpaca,
                     ..
@@ -549,7 +746,61 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
             amount: usdc_to_u256(amount)?,
         };
 
-        let attestation_response = self.poll_attestation(id, &burn_receipt).await?;
+        let attestation_response = match self
+            .poll_cctp_attestation(id, BridgeDirection::EthereumToBase, burn_receipt.tx)
+            .await?
+        {
+            AttestationPollOutcome::Received(response) => {
+                self.record_attestation(id, BridgeDirection::EthereumToBase, &response)
+                    .await?;
+                response
+            }
+            AttestationPollOutcome::TimedOut => {
+                self.record_attestation_timeout(id).await?;
+                return Err(UsdcTransferError::AttestationTimedOut { id: id.clone() });
+            }
+        };
+
+        let mint_receipt = self.execute_cctp_mint(id, attestation_response).await?;
+
+        self.continue_alpaca_to_base_from_bridged(id, u256_to_usdc(mint_receipt.amount)?)
+            .await
+    }
+
+    /// Drives an Alpaca->Base transfer after a previous attestation timeout.
+    /// Success records the delayed attestation and continues; another timeout
+    /// stays retryable without appending another timeout event.
+    async fn continue_alpaca_to_base_from_awaiting_attestation(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        burn_tx_hash: TxHash,
+        retry_deadline_at: DateTime<Utc>,
+    ) -> Result<(), UsdcTransferError> {
+        let burn_receipt = BurnReceipt {
+            tx: burn_tx_hash,
+            amount: usdc_to_u256(amount)?,
+        };
+
+        let attestation_response = match self
+            .poll_cctp_attestation_until_deadline(
+                id,
+                BridgeDirection::EthereumToBase,
+                burn_receipt.tx,
+                retry_deadline_at,
+            )
+            .await?
+        {
+            AttestationPollOutcome::Received(response) => {
+                self.record_attestation(id, BridgeDirection::EthereumToBase, &response)
+                    .await?;
+                response
+            }
+            AttestationPollOutcome::TimedOut => {
+                return Err(UsdcTransferError::AttestationTimedOut { id: id.clone() });
+            }
+        };
+
         let mint_receipt = self.execute_cctp_mint(id, attestation_response).await?;
 
         self.continue_alpaca_to_base_from_bridged(id, u256_to_usdc(mint_receipt.amount)?)
@@ -620,9 +871,15 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
             tx: burn_tx_hash,
             amount: usdc_to_u256(amount)?,
         };
-        let attestation_response = self
-            .poll_circle_attestation(id, BridgeDirection::EthereumToBase, &burn_receipt)
-            .await?;
+        let attestation_response = match self
+            .poll_cctp_attestation(id, BridgeDirection::EthereumToBase, burn_receipt.tx)
+            .await?
+        {
+            AttestationPollOutcome::Received(response) => response,
+            AttestationPollOutcome::TimedOut => {
+                return Err(UsdcTransferError::AttestationTimedOut { id: id.clone() });
+            }
+        };
         let mint_receipt = self.execute_cctp_mint(id, attestation_response).await?;
 
         self.continue_alpaca_to_base_from_bridged(id, u256_to_usdc(mint_receipt.amount)?)
@@ -675,14 +932,8 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
         };
         let burn_receipt = self.execute_cctp_burn(id, burn_amount).await?;
 
-        let attestation_response = self.poll_attestation(id, &burn_receipt).await?;
-
-        // Use the actual minted amount (net of CCTP fee) for vault deposit
-        let mint_receipt = self.execute_cctp_mint(id, attestation_response).await?;
-
-        self.deposit_to_vault(id, mint_receipt.amount).await?;
-
-        self.confirm_deposit(id).await?;
+        self.continue_alpaca_to_base_from_bridging(id, usdc_amount, burn_receipt.tx)
+            .await?;
 
         info!(target: "rebalance", "Alpaca to Base rebalance completed successfully");
         Ok(())
@@ -812,62 +1063,6 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
 
         info!(target: "rebalance", burn_tx = %burn_receipt.tx, "CCTP burn executed");
         Ok(burn_receipt)
-    }
-
-    #[instrument(target = "rebalance", skip(self, burn_receipt), fields(%id, burn_tx = %burn_receipt.tx), level = tracing::Level::DEBUG)]
-    async fn poll_attestation(
-        &self,
-        id: &UsdcRebalanceId,
-        burn_receipt: &BurnReceipt,
-    ) -> Result<AttestationResponse, UsdcTransferError> {
-        let response = match self
-            .cctp_bridge
-            .poll_attestation(BridgeDirection::EthereumToBase, burn_receipt.tx)
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                warn!(target: "rebalance", "Attestation polling failed: {error}");
-                self.cqrs
-                    .send(
-                        id,
-                        UsdcRebalanceCommand::FailBridging {
-                            reason: format!("Attestation polling failed: {error}"),
-                        },
-                    )
-                    .await?;
-                return Err(UsdcTransferError::Cctp(Box::new(error)));
-            }
-        };
-
-        // Capture the destination (Base) head before minting so a crash before
-        // `ConfirmBridging` resumes by scanning for the already-submitted mint
-        // (`continue_alpaca_to_base_from_attested`) instead of re-minting, which
-        // reverts on the already-used CCTP nonce. Fail on a head-lookup error
-        // rather than recording a sentinel: now that AlpacaToBase has a resume
-        // entry point that reads this bound, a sentinel of 0 would scan from
-        // genesis on resume and risk adopting an unrelated mint. A transient
-        // failure here leaves the aggregate in `Bridging`, which resumes safely
-        // by re-polling.
-        let mint_scan_from_block = self
-            .cctp_bridge
-            .destination_block(BridgeDirection::EthereumToBase)
-            .await
-            .map_err(|error| UsdcTransferError::Cctp(Box::new(error)))?;
-
-        self.cqrs
-            .send(
-                id,
-                UsdcRebalanceCommand::ReceiveAttestation {
-                    attestation: response.as_bytes().to_vec(),
-                    cctp_nonce: response.nonce(),
-                    mint_scan_from_block,
-                },
-            )
-            .await?;
-
-        info!(target: "rebalance", "Circle attestation received");
-        Ok(response)
     }
 
     #[instrument(target = "rebalance", skip(self, attestation_response), fields(%id), level = tracing::Level::DEBUG)]
@@ -1100,6 +1295,18 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                 self.continue_from_bridging(id, amount, burn_tx_hash).await
             }
 
+            Some(UsdcRebalance::AwaitingAttestation {
+                direction,
+                amount,
+                burn_tx_hash,
+                retry_deadline_at,
+                ..
+            }) => {
+                Self::require_base_to_alpaca(id, &direction)?;
+                self.continue_from_awaiting_attestation(id, amount, burn_tx_hash, retry_deadline_at)
+                    .await
+            }
+
             Some(UsdcRebalance::Attested {
                 direction,
                 amount,
@@ -1329,32 +1536,59 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
             tx: burn_tx_hash,
             amount: usdc_to_u256(amount)?,
         };
-        let attestation_response = self
-            .poll_circle_attestation(id, BridgeDirection::BaseToEthereum, &burn_receipt)
-            .await?;
-
-        // Capture the destination (Ethereum) head before minting so a crash
-        // before `ConfirmBridging` resumes by scanning for the already-submitted
-        // mint (`continue_from_attested`) instead of re-minting, which reverts on
-        // the already-used CCTP nonce.
-        let mint_scan_from_block = self
-            .cctp_bridge
-            .destination_block(BridgeDirection::BaseToEthereum)
-            .await
-            .map_err(|error| UsdcTransferError::Cctp(Box::new(error)))?;
-
-        self.cqrs
-            .send(
-                id,
-                UsdcRebalanceCommand::ReceiveAttestation {
-                    attestation: attestation_response.as_bytes().to_vec(),
-                    cctp_nonce: attestation_response.nonce(),
-                    mint_scan_from_block,
-                },
-            )
-            .await?;
+        let attestation_response = match self
+            .poll_cctp_attestation(id, BridgeDirection::BaseToEthereum, burn_receipt.tx)
+            .await?
+        {
+            AttestationPollOutcome::Received(response) => {
+                self.record_attestation(id, BridgeDirection::BaseToEthereum, &response)
+                    .await?;
+                response
+            }
+            AttestationPollOutcome::TimedOut => {
+                self.record_attestation_timeout(id).await?;
+                return Err(UsdcTransferError::AttestationTimedOut { id: id.clone() });
+            }
+        };
 
         info!(target: "rebalance", "Circle attestation received for Base burn");
+        self.mint_and_continue(id, attestation_response).await
+    }
+
+    /// Drives the transfer from `AwaitingAttestation`: re-poll Circle until the
+    /// retry deadline, recording `ReceiveAttestation` only when the attestation
+    /// actually arrives.
+    async fn continue_from_awaiting_attestation(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        burn_tx_hash: TxHash,
+        retry_deadline_at: DateTime<Utc>,
+    ) -> Result<(), UsdcTransferError> {
+        let burn_receipt = BurnReceipt {
+            tx: burn_tx_hash,
+            amount: usdc_to_u256(amount)?,
+        };
+
+        let attestation_response = match self
+            .poll_cctp_attestation_until_deadline(
+                id,
+                BridgeDirection::BaseToEthereum,
+                burn_receipt.tx,
+                retry_deadline_at,
+            )
+            .await?
+        {
+            AttestationPollOutcome::Received(response) => {
+                self.record_attestation(id, BridgeDirection::BaseToEthereum, &response)
+                    .await?;
+                response
+            }
+            AttestationPollOutcome::TimedOut => {
+                return Err(UsdcTransferError::AttestationTimedOut { id: id.clone() });
+            }
+        };
+
         self.mint_and_continue(id, attestation_response).await
     }
 
@@ -1369,6 +1603,13 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
     /// aggregate stores the attestation bytes and nonce but not the full message
     /// envelope [`Bridge::mint`] needs) and mints, WITHOUT re-emitting
     /// `ReceiveAttestation` -- which the aggregate rejects from `Attested`.
+    ///
+    /// A re-poll timeout here retries until success (no deadline) by design:
+    /// reaching `Attested` means Circle already issued an attestation once, so a
+    /// re-poll timeout is transient and bounding it would strand already-burned
+    /// USDC. The `attestation_retry_deadline` bounds only the
+    /// `AwaitingAttestation` wait. A hard (non-timeout) poll error still fails
+    /// the bridge -- see [`Self::poll_cctp_attestation`].
     async fn continue_from_attested(
         &self,
         id: &UsdcRebalanceId,
@@ -1427,9 +1668,15 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
             tx: burn_tx_hash,
             amount: usdc_to_u256(amount)?,
         };
-        let attestation_response = self
-            .poll_circle_attestation(id, BridgeDirection::BaseToEthereum, &burn_receipt)
-            .await?;
+        let attestation_response = match self
+            .poll_cctp_attestation(id, BridgeDirection::BaseToEthereum, burn_receipt.tx)
+            .await?
+        {
+            AttestationPollOutcome::Received(response) => response,
+            AttestationPollOutcome::TimedOut => {
+                return Err(UsdcTransferError::AttestationTimedOut { id: id.clone() });
+            }
+        };
         self.mint_and_continue(id, attestation_response).await
     }
 
@@ -1699,39 +1946,6 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
         Ok(burn_receipt)
     }
 
-    /// Polls Circle for the attestation of a Base burn. On failure records
-    /// `FailBridging` (valid from both `Bridging` and `Attested`) and returns the
-    /// error. Does NOT emit `ReceiveAttestation` -- the caller records it only on
-    /// the `Bridging` path, where it is valid; the `Attested` resume path must
-    /// not re-emit it.
-    #[instrument(target = "rebalance", skip(self, burn_receipt), fields(%id, burn_tx = %burn_receipt.tx), level = tracing::Level::DEBUG)]
-    async fn poll_circle_attestation(
-        &self,
-        id: &UsdcRebalanceId,
-        direction: BridgeDirection,
-        burn_receipt: &BurnReceipt,
-    ) -> Result<AttestationResponse, UsdcTransferError> {
-        match self
-            .cctp_bridge
-            .poll_attestation(direction, burn_receipt.tx)
-            .await
-        {
-            Ok(response) => Ok(response),
-            Err(error) => {
-                warn!(target: "rebalance", "Attestation polling failed: {error}");
-                self.cqrs
-                    .send(
-                        id,
-                        UsdcRebalanceCommand::FailBridging {
-                            reason: format!("Attestation polling failed: {error}"),
-                        },
-                    )
-                    .await?;
-                Err(UsdcTransferError::Cctp(Box::new(error)))
-            }
-        }
-    }
-
     #[instrument(target = "rebalance", skip(self, attestation_response), fields(%id), level = tracing::Level::DEBUG)]
     async fn execute_cctp_mint_on_ethereum(
         &self,
@@ -1911,6 +2125,7 @@ mod tests {
     const TEST_VAULT_ID: RaindexVaultId = RaindexVaultId(b256!(
         "0x0000000000000000000000000000000000000000000000000000000000000001"
     ));
+    const TEST_ATTESTATION_RETRY_DEADLINE: Duration = Duration::from_secs(24 * 60 * 60);
 
     async fn create_test_store_instance() -> Arc<Store<UsdcRebalance>> {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
@@ -2491,6 +2706,7 @@ mod tests {
             cqrs,
             market_maker_wallet,
             TEST_VAULT_ID,
+            TEST_ATTESTATION_RETRY_DEADLINE,
         );
 
         // Mock conversion order (conversion happens before withdrawal)
@@ -2546,6 +2762,7 @@ mod tests {
             cqrs,
             market_maker_wallet,
             TEST_VAULT_ID,
+            TEST_ATTESTATION_RETRY_DEADLINE,
         );
 
         // Mock conversion order (conversion happens before withdrawal)
@@ -2608,6 +2825,7 @@ mod tests {
             cqrs,
             market_maker_wallet,
             TEST_VAULT_ID,
+            TEST_ATTESTATION_RETRY_DEADLINE,
         );
 
         // Mock conversion order (conversion happens before withdrawal)
@@ -2664,6 +2882,7 @@ mod tests {
             cqrs,
             market_maker_wallet,
             TEST_VAULT_ID,
+            TEST_ATTESTATION_RETRY_DEADLINE,
         );
 
         let id = UsdcRebalanceId(Uuid::new_v4());
@@ -2703,6 +2922,7 @@ mod tests {
             cqrs,
             market_maker_wallet,
             TEST_VAULT_ID,
+            TEST_ATTESTATION_RETRY_DEADLINE,
         );
 
         let id = UsdcRebalanceId(Uuid::new_v4());
@@ -2741,6 +2961,7 @@ mod tests {
             cqrs,
             market_maker_wallet,
             TEST_VAULT_ID,
+            TEST_ATTESTATION_RETRY_DEADLINE,
         );
 
         // Mock the conversion order placement (POST)
@@ -2786,6 +3007,7 @@ mod tests {
             cqrs,
             market_maker_wallet,
             TEST_VAULT_ID,
+            TEST_ATTESTATION_RETRY_DEADLINE,
         );
 
         // Mock the conversion order - will be called but CQRS command will fail
@@ -2839,6 +3061,7 @@ mod tests {
             cqrs,
             market_maker_wallet,
             TEST_VAULT_ID,
+            TEST_ATTESTATION_RETRY_DEADLINE,
         );
 
         // Order starts as pending
@@ -2883,6 +3106,7 @@ mod tests {
             cqrs,
             market_maker_wallet,
             TEST_VAULT_ID,
+            TEST_ATTESTATION_RETRY_DEADLINE,
         );
 
         // Order starts as pending
@@ -2998,6 +3222,7 @@ mod tests {
             cqrs,
             market_maker_wallet,
             TEST_VAULT_ID,
+            TEST_ATTESTATION_RETRY_DEADLINE,
         );
 
         // Order starts as pending then gets rejected
@@ -3049,6 +3274,7 @@ mod tests {
             Arc::clone(&cqrs),
             market_maker_wallet,
             TEST_VAULT_ID,
+            TEST_ATTESTATION_RETRY_DEADLINE,
         );
 
         // Mock order placement to fail with 500 error
@@ -3116,6 +3342,7 @@ mod tests {
             cqrs,
             market_maker_wallet,
             TEST_VAULT_ID,
+            TEST_ATTESTATION_RETRY_DEADLINE,
         );
 
         // Mock conversion order - MUST be called before withdrawal
@@ -3187,6 +3414,7 @@ mod tests {
             Arc::clone(&cqrs),
             market_maker_wallet,
             TEST_VAULT_ID,
+            TEST_ATTESTATION_RETRY_DEADLINE,
         );
 
         let conversion_mock = server.mock(|when, then| {
@@ -3254,6 +3482,7 @@ mod tests {
             cqrs,
             market_maker_wallet,
             TEST_VAULT_ID,
+            TEST_ATTESTATION_RETRY_DEADLINE,
         );
 
         // Order starts as pending
@@ -3328,6 +3557,7 @@ mod tests {
             cqrs,
             market_maker_wallet,
             TEST_VAULT_ID,
+            TEST_ATTESTATION_RETRY_DEADLINE,
         );
 
         // Mock that should NOT be called - if InitiateConversion fails, no order should be placed
@@ -3392,6 +3622,7 @@ mod tests {
             Arc::clone(&cqrs),
             market_maker_wallet,
             TEST_VAULT_ID,
+            TEST_ATTESTATION_RETRY_DEADLINE,
         );
 
         // Mock order placement to fail with API error
@@ -3455,6 +3686,7 @@ mod tests {
             Arc::clone(&cqrs),
             market_maker_wallet,
             TEST_VAULT_ID,
+            TEST_ATTESTATION_RETRY_DEADLINE,
         );
 
         let _order_mock = create_conversion_order_mock(&server, "1000");
@@ -3508,6 +3740,7 @@ mod tests {
             cqrs,
             market_maker_wallet,
             TEST_VAULT_ID,
+            TEST_ATTESTATION_RETRY_DEADLINE,
         );
 
         // Request 1000, but only 999.5 fills due to slippage
@@ -3563,6 +3796,7 @@ mod tests {
             cqrs.clone(),
             market_maker_wallet,
             TEST_VAULT_ID,
+            TEST_ATTESTATION_RETRY_DEADLINE,
         );
 
         (manager, cqrs, anvil)
@@ -3598,6 +3832,7 @@ mod tests {
             cqrs.clone(),
             market_maker_wallet,
             TEST_VAULT_ID,
+            TEST_ATTESTATION_RETRY_DEADLINE,
         );
 
         (manager, cqrs, anvil)
@@ -3646,6 +3881,271 @@ mod tests {
         .await
         .unwrap();
         burn_tx
+    }
+
+    async fn advance_to_awaiting_attestation_base_to_alpaca(
+        cqrs: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        retry_deadline_at: DateTime<Utc>,
+    ) -> TxHash {
+        let burn_tx =
+            fixed_bytes!("0xaaaa000000000000000000000000000000000000000000000000000000000002");
+
+        cqrs.send(
+            id,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount,
+                withdrawal: TransferRef::OnchainTx(burn_tx),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .await
+            .unwrap();
+        cqrs.send(id, UsdcRebalanceCommand::InitiateBridging { burn_tx })
+            .await
+            .unwrap();
+        cqrs.send(
+            id,
+            UsdcRebalanceCommand::TimeoutAttestation { retry_deadline_at },
+        )
+        .await
+        .unwrap();
+
+        burn_tx
+    }
+
+    async fn advance_to_awaiting_attestation_alpaca_to_base(
+        cqrs: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        retry_deadline_at: DateTime<Utc>,
+    ) -> TxHash {
+        let burn_tx =
+            fixed_bytes!("0xbbbb000000000000000000000000000000000000000000000000000000000002");
+
+        cqrs.send(
+            id,
+            UsdcRebalanceCommand::InitiateConversion {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            id,
+            UsdcRebalanceCommand::ConfirmConversion {
+                filled_amount: amount,
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            id,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .await
+            .unwrap();
+        cqrs.send(id, UsdcRebalanceCommand::InitiateBridging { burn_tx })
+            .await
+            .unwrap();
+        cqrs.send(
+            id,
+            UsdcRebalanceCommand::TimeoutAttestation { retry_deadline_at },
+        )
+        .await
+        .unwrap();
+
+        burn_tx
+    }
+
+    #[tokio::test]
+    async fn resume_base_to_alpaca_from_awaiting_attestation_after_deadline_fails_bridging() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        let retry_deadline_at = Utc::now() - chrono::Duration::seconds(1);
+        let burn_tx =
+            advance_to_awaiting_attestation_base_to_alpaca(&cqrs, &id, amount, retry_deadline_at)
+                .await;
+
+        let error = manager
+            .resume_base_to_alpaca(&id, amount)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            UsdcTransferError::AttestationRetryDeadlineElapsed { .. }
+        ));
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::BridgingFailed {
+                    burn_tx_hash: Some(state_burn_tx),
+                    ..
+                } if state_burn_tx == burn_tx
+            ),
+            "Expected BridgingFailed with burn tx after deadline, got {state:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_alpaca_to_base_from_awaiting_attestation_after_deadline_fails_bridging() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        let retry_deadline_at = Utc::now() - chrono::Duration::seconds(1);
+        let burn_tx =
+            advance_to_awaiting_attestation_alpaca_to_base(&cqrs, &id, amount, retry_deadline_at)
+                .await;
+
+        let error = manager
+            .resume_alpaca_to_base(&id, amount)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            UsdcTransferError::AttestationRetryDeadlineElapsed { .. }
+        ));
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::BridgingFailed {
+                    burn_tx_hash: Some(state_burn_tx),
+                    ..
+                } if state_burn_tx == burn_tx
+            ),
+            "Expected BridgingFailed with burn tx after deadline, got {state:?}"
+        );
+    }
+
+    /// Mocks Circle's `/v2/messages/` lookup to return a `complete` attestation
+    /// immediately, so a re-poll from `AwaitingAttestation` resolves without the
+    /// 5-minute real-API retry. The message just needs to be >=
+    /// MIN_MESSAGE_LENGTH (44 bytes) for nonce extraction.
+    fn mock_complete_attestation(server: &MockServer) -> httpmock::Mock<'_> {
+        let mut message = vec![0u8; 100];
+        message[43] = 1;
+        let message_hex = format!("0x{}", alloy::hex::encode(&message));
+        let attestation_hex = format!("0x{}", "ab".repeat(65));
+        server.mock(|when, then| {
+            when.method(GET).path_includes("/v2/messages/");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "messages": [{
+                        "status": "complete",
+                        "message": message_hex,
+                        "attestation": attestation_hex,
+                    }]
+                }));
+        })
+    }
+
+    /// Happy path of the feature: resuming from `AwaitingAttestation` while the
+    /// retry deadline is still in the future and the attestation has now
+    /// arrived must record `ReceiveAttestation` (advancing past
+    /// `AwaitingAttestation`) and proceed to mint -- NOT time out again and NOT
+    /// fail on the deadline. The mint then fails in the local test harness, but
+    /// the recorded `cctp_nonce` surviving into the failed state is the proof
+    /// the attestation was received first: a timeout would leave the nonce
+    /// `None` (and the aggregate still in `AwaitingAttestation`).
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn resume_base_to_alpaca_from_awaiting_attestation_before_deadline_records_attestation() {
+        let server = MockServer::start();
+        let _attestation_mock = mock_complete_attestation(&server);
+        let (manager, cqrs, _anvil) =
+            make_resume_test_manager_with_circle_api(&server, server.base_url()).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        let retry_deadline_at = Utc::now() + chrono::Duration::hours(1);
+        let burn_tx =
+            advance_to_awaiting_attestation_base_to_alpaca(&cqrs, &id, amount, retry_deadline_at)
+                .await;
+
+        let error = manager
+            .resume_base_to_alpaca(&id, amount)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::Cctp(_)),
+            "attestation arriving before the deadline must record it and proceed to \
+             mint, not time out or fail on the deadline, got: {error:?}"
+        );
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                &state,
+                UsdcRebalance::BridgingFailed {
+                    burn_tx_hash: Some(state_burn_tx),
+                    cctp_nonce: Some(_),
+                    ..
+                } if *state_burn_tx == burn_tx
+            ),
+            "the recorded cctp_nonce must survive into the failed state, proving the \
+             attestation was received (a timeout would leave it None), got {state:?}"
+        );
+    }
+
+    /// Symmetric to the Base->Alpaca happy-path resume above, for the
+    /// Alpaca->Base direction.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn resume_alpaca_to_base_from_awaiting_attestation_before_deadline_records_attestation() {
+        let server = MockServer::start();
+        let _attestation_mock = mock_complete_attestation(&server);
+        let (manager, cqrs, _anvil) =
+            make_resume_test_manager_with_circle_api(&server, server.base_url()).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        let retry_deadline_at = Utc::now() + chrono::Duration::hours(1);
+        let burn_tx =
+            advance_to_awaiting_attestation_alpaca_to_base(&cqrs, &id, amount, retry_deadline_at)
+                .await;
+
+        let error = manager
+            .resume_alpaca_to_base(&id, amount)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::Cctp(_)),
+            "attestation arriving before the deadline must record it and proceed to \
+             mint, not time out or fail on the deadline, got: {error:?}"
+        );
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                &state,
+                UsdcRebalance::BridgingFailed {
+                    burn_tx_hash: Some(state_burn_tx),
+                    cctp_nonce: Some(_),
+                    ..
+                } if *state_burn_tx == burn_tx
+            ),
+            "the recorded cctp_nonce must survive into the failed state, proving the \
+             attestation was received (a timeout would leave it None), got {state:?}"
+        );
     }
 
     /// Drives the aggregate through `Initiate` -> `ConfirmWithdrawal` ->
@@ -3795,26 +4295,9 @@ mod tests {
     async fn resume_base_to_alpaca_from_attested_does_not_re_emit_receive_attestation() {
         let server = MockServer::start();
 
-        // Return a `complete` attestation for any /v2/messages request so
-        // poll_circle_attestation resolves immediately (no 5-minute real-API
-        // retry). The message just needs to be >= MIN_MESSAGE_LENGTH (44 bytes)
-        // for nonce extraction to succeed -- a mostly-zero 100-byte message.
-        let mut message = vec![0u8; 100];
-        message[43] = 1;
-        let message_hex = format!("0x{}", alloy::hex::encode(&message));
-        let attestation_hex = format!("0x{}", "ab".repeat(65));
-        let _attestation_mock = server.mock(|when, then| {
-            when.method(GET).path_includes("/v2/messages/");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "messages": [{
-                        "status": "complete",
-                        "message": message_hex,
-                        "attestation": attestation_hex,
-                    }]
-                }));
-        });
+        // Return a `complete` attestation immediately so poll_cctp_attestation
+        // resolves without the 5-minute real-API retry.
+        let _attestation_mock = mock_complete_attestation(&server);
 
         let (manager, cqrs, _anvil) =
             make_resume_test_manager_with_circle_api(&server, server.base_url()).await;
@@ -4608,6 +5091,7 @@ mod tests {
             cqrs.clone(),
             market_maker_wallet,
             TEST_VAULT_ID,
+            TEST_ATTESTATION_RETRY_DEADLINE,
         );
 
         // Drive the aggregate to `Attested`, recording the real burn tx and the
@@ -4800,6 +5284,7 @@ mod tests {
             cqrs.clone(),
             market_maker_wallet,
             TEST_VAULT_ID,
+            TEST_ATTESTATION_RETRY_DEADLINE,
         );
 
         let id = UsdcRebalanceId(Uuid::new_v4());
@@ -4854,6 +5339,7 @@ mod tests {
             cqrs.clone(),
             market_maker_wallet,
             TEST_VAULT_ID,
+            TEST_ATTESTATION_RETRY_DEADLINE,
         );
 
         let id = UsdcRebalanceId(Uuid::new_v4());
@@ -4975,6 +5461,85 @@ mod tests {
             matches!(final_state, UsdcRebalance::Bridged { .. }),
             "a failed deposit submission must leave the aggregate in `Bridged` for safe \
              retry (no half-recorded deposit), got: {final_state:?}",
+        );
+    }
+
+    /// A destination-head lookup failure inside `record_attestation` is a
+    /// transient RPC error: the attestation has not been recorded yet, so the
+    /// aggregate is still in `Bridging` and resumable. It must NOT latch a
+    /// terminal `BridgingFailed` -- doing so would strand already-burned USDC
+    /// behind manual reconciliation for a momentary destination RPC hiccup.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn resume_alpaca_to_base_destination_block_failure_stays_bridging() {
+        let server = MockServer::start();
+        let _attestation_mock = mock_complete_attestation(&server);
+        let (manager, cqrs, anvil) =
+            make_resume_test_manager_with_circle_api(&server, server.base_url()).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+
+        // Drive to `Bridging` (burn recorded, attestation not yet received) so
+        // the resume re-polls the attestation and then performs the destination
+        // head lookup.
+        let burn_tx =
+            fixed_bytes!("0xaaaa000000000000000000000000000000000000000000000000000000000001");
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::InitiateConversion {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmConversion {
+                filled_amount: amount,
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .await
+            .unwrap();
+        cqrs.send(&id, UsdcRebalanceCommand::InitiateBridging { burn_tx })
+            .await
+            .unwrap();
+
+        // Kill the chain so the post-attestation `destination_block` lookup
+        // fails with a transient RPC error. Attestation polling hits the Circle
+        // HTTP mock, not the chain, so it still resolves.
+        drop(anvil);
+
+        let error = manager
+            .resume_alpaca_to_base(&id, amount)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::Cctp(_)),
+            "a destination head lookup failure must surface as a transient Cctp error, \
+             got: {error:?}",
+        );
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::Bridging { .. }),
+            "a transient destination head lookup failure must leave the aggregate in \
+             `Bridging` for retry, not latch a terminal `BridgingFailed`, got: {state:?}",
         );
     }
 }

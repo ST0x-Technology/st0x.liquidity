@@ -15,18 +15,19 @@ pub(crate) use job::{
 };
 pub(crate) use manager::{CrossVenueCashTransfer, u256_to_usdc};
 
+use std::time::Duration;
+
 use rain_math_float::FloatError;
 use thiserror::Error;
 
 use st0x_bridge::cctp::CctpError;
 use st0x_event_sorcery::SendError;
 use st0x_execution::{AlpacaBrokerApiError, ClientOrderId, InvalidSharesError, NotPositive};
-use st0x_finance::Usdc;
+use st0x_finance::{Usdc, UsdcConversionError};
 
 use crate::alpaca_wallet::AlpacaWalletError;
 use crate::onchain::raindex::RaindexError;
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceId};
-use st0x_finance::UsdcConversionError;
 
 #[derive(Debug, Error)]
 pub(crate) enum UsdcTransferError {
@@ -69,6 +70,24 @@ pub(crate) enum UsdcTransferError {
          required"
     )]
     ResumeWithoutMintScanBound { id: UsdcRebalanceId },
+    #[error(
+        "USDC rebalance {id} attestation polling timed out; retrying until \
+         attestation retry deadline"
+    )]
+    AttestationTimedOut { id: UsdcRebalanceId },
+    #[error(
+        "USDC rebalance {id} attestation retry deadline elapsed; failed for \
+         operator reconciliation"
+    )]
+    AttestationRetryDeadlineElapsed { id: UsdcRebalanceId },
+    #[error(
+        "USDC rebalance {id} attestation retry deadline duration {retry_deadline:?} \
+         cannot be represented as an absolute timestamp"
+    )]
+    AttestationRetryDeadlineOverflow {
+        id: UsdcRebalanceId,
+        retry_deadline: Duration,
+    },
     #[error("USDC rebalance {id} cannot resume: aggregate is in terminal failure state")]
     PreviouslyFailedAggregate { id: UsdcRebalanceId },
     #[error(

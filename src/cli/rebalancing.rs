@@ -265,6 +265,8 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
         .build(())
         .await?;
 
+    let attestation_retry_deadline = ctx.rebalancing_ctx()?.attestation_retry_deadline;
+
     let rebalance_manager = CrossVenueCashTransfer::new(
         alpaca_broker,
         alpaca_wallet,
@@ -273,6 +275,7 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
         usdc_store,
         owner,
         RaindexVaultId(usdc_vault_id),
+        attestation_retry_deadline,
     );
 
     writeln!(stdout, "   Transfer may take several minutes...")?;

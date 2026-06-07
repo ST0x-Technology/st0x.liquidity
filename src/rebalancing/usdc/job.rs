@@ -22,14 +22,17 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::warn;
 
 use st0x_evm::Wallet;
 use st0x_finance::Usdc;
 
 use super::UsdcTransferError;
 use super::manager::CrossVenueCashTransfer;
-use crate::conductor::job::{Job, JobQueue, Label};
+use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::usdc_rebalance::UsdcRebalanceId;
+
+const ATTESTATION_REDRIVE_DELAY: Duration = Duration::from_secs(60);
 
 /// Apalis queue type for [`TransferUsdcToHedging`].
 pub(crate) type TransferUsdcToHedgingJobQueue = JobQueue<TransferUsdcToHedging>;
@@ -95,6 +98,7 @@ pub(crate) struct TransferUsdcToHedgingCtx {
     /// a hung RPC fails the attempt (and retries) instead of wedging the
     /// single-concurrency worker forever.
     pub(crate) timeout: Duration,
+    pub(crate) job_queue: TransferUsdcToHedgingJobQueue,
 }
 
 /// Errors emitted by [`TransferUsdcToHedging::perform`].
@@ -107,6 +111,8 @@ pub(crate) enum TransferUsdcToHedgingJobError {
         id: UsdcRebalanceId,
         timeout: Duration,
     },
+    #[error(transparent)]
+    Enqueue(#[from] QueuePushError),
 }
 
 /// Apalis job payload. The `id` is generated at enqueue time so retries
@@ -132,28 +138,180 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
     }
 
     async fn perform(&self, ctx: &TransferUsdcToHedgingCtx) -> Result<Self::Output, Self::Error> {
+        // Per-attempt timeout wrapper (hedging only): abort a hung resume so the
+        // attempt fails and retries instead of wedging the single-concurrency
+        // worker. The inner result is then classified for redrive/terminal
+        // handling.
         let resume = ctx.transfer.resume_base_to_alpaca(&self.id, self.amount);
+        let result = match tokio::time::timeout(ctx.timeout, resume).await {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                return Err(TransferUsdcToHedgingJobError::Timeout {
+                    id: self.id.clone(),
+                    timeout: ctx.timeout,
+                });
+            }
+        };
 
-        match tokio::time::timeout(ctx.timeout, resume).await {
-            Ok(result) => Ok(result?),
-            Err(_elapsed) => Err(TransferUsdcToHedgingJobError::Timeout {
-                id: self.id.clone(),
-                timeout: ctx.timeout,
-            }),
+        match result {
+            Ok(()) => {}
+            Err(UsdcTransferError::AttestationTimedOut { id }) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    delay = ?ATTESTATION_REDRIVE_DELAY,
+                    "Rescheduling Base->Alpaca USDC transfer after attestation timeout"
+                );
+                let mut job_queue = ctx.job_queue.clone();
+                job_queue
+                    .push_with_delay(self.clone(), ATTESTATION_REDRIVE_DELAY)
+                    .await?;
+            }
+            Err(UsdcTransferError::AttestationRetryDeadlineElapsed { id }) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    "Base->Alpaca USDC transfer attestation retry deadline elapsed; \
+                     bridge marked failed for operator reconciliation"
+                );
+            }
+            Err(UsdcTransferError::PreviouslyFailedAggregate { id }) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    "Base->Alpaca USDC transfer already in a terminal failed state; \
+                     nothing to redrive, leaving for operator reconciliation"
+                );
+            }
+            Err(error) => return Err(error.into()),
         }
+
+        Ok(())
+    }
+}
+
+/// Dependencies the Alpaca->Base job needs. Symmetric to
+/// [`TransferUsdcToHedgingCtx`].
+pub(crate) struct TransferUsdcToMarketMakingCtx {
+    pub(crate) transfer: Arc<dyn ResumeAlpacaToBase>,
+    pub(crate) job_queue: TransferUsdcToMarketMakingJobQueue,
+}
+
+/// Errors emitted by [`TransferUsdcToMarketMaking::perform`].
+#[derive(Debug, Error)]
+pub(crate) enum TransferUsdcToMarketMakingJobError {
+    #[error(transparent)]
+    Transfer(#[from] UsdcTransferError),
+    #[error(transparent)]
+    Enqueue(#[from] QueuePushError),
+}
+
+/// Apalis job payload for the Alpaca->Base direction. The `id` is generated
+/// at enqueue time so retries resume the same aggregate.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct TransferUsdcToMarketMaking {
+    pub(crate) id: UsdcRebalanceId,
+    pub(crate) amount: Usdc,
+}
+
+impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
+    type Output = ();
+    type Error = TransferUsdcToMarketMakingJobError;
+
+    const WORKER_NAME: &'static str = "transfer-usdc-to-market-making-worker";
+
+    #[cfg(any(test, feature = "test-support"))]
+    const JOB_KIND: crate::conductor::job::JobKind =
+        crate::conductor::job::JobKind::TransferUsdcToMarketMaking;
+
+    fn label(&self) -> Label {
+        Label::new(format!("TransferUsdcToMarketMaking:{}", self.id))
+    }
+
+    async fn perform(
+        &self,
+        ctx: &TransferUsdcToMarketMakingCtx,
+    ) -> Result<Self::Output, Self::Error> {
+        match ctx
+            .transfer
+            .resume_alpaca_to_base(&self.id, self.amount)
+            .await
+        {
+            Ok(()) => {}
+            Err(UsdcTransferError::AttestationTimedOut { id }) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    delay = ?ATTESTATION_REDRIVE_DELAY,
+                    "Rescheduling Alpaca->Base USDC transfer after attestation timeout"
+                );
+                let mut job_queue = ctx.job_queue.clone();
+                job_queue
+                    .push_with_delay(self.clone(), ATTESTATION_REDRIVE_DELAY)
+                    .await?;
+            }
+            Err(UsdcTransferError::AttestationRetryDeadlineElapsed { id }) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    "Alpaca->Base USDC transfer attestation retry deadline elapsed; \
+                     bridge marked failed for operator reconciliation"
+                );
+            }
+            Err(UsdcTransferError::PreviouslyFailedAggregate { id }) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    "Alpaca->Base USDC transfer already in a terminal failed state; \
+                     nothing to redrive, leaving for operator reconciliation"
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
+
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
+    use sqlx::SqlitePool;
     use uuid::Uuid;
 
     use st0x_float_macro::float;
 
     use super::*;
+    use crate::conductor::setup_apalis_tables;
 
-    /// Models a hung RPC inside the transfer: the resume future never
-    /// completes within the configured per-attempt timeout.
+    struct TimeoutBaseToAlpaca;
+
+    #[async_trait]
+    impl ResumeBaseToAlpaca for TimeoutBaseToAlpaca {
+        async fn resume_base_to_alpaca(
+            &self,
+            id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Err(UsdcTransferError::AttestationTimedOut { id: id.clone() })
+        }
+    }
+
+    struct TimeoutAlpacaToBase;
+
+    #[async_trait]
+    impl ResumeAlpacaToBase for TimeoutAlpacaToBase {
+        async fn resume_alpaca_to_base(
+            &self,
+            id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Err(UsdcTransferError::AttestationTimedOut { id: id.clone() })
+        }
+    }
+
+    /// Models a hung RPC inside the transfer: the resume future never completes
+    /// within the configured per-attempt timeout.
     struct HangingResume;
 
     #[async_trait]
@@ -168,11 +326,135 @@ mod tests {
         }
     }
 
+    /// Terminal outcomes a resume can report that the job must treat as a clean
+    /// `Ok(())` (no redrive, no error) because the aggregate is already in a
+    /// durable terminal state needing only operator reconciliation.
+    #[derive(Clone, Copy)]
+    enum TerminalOutcome {
+        DeadlineElapsed,
+        PreviouslyFailed,
+    }
+
+    impl TerminalOutcome {
+        fn into_error(self, id: &UsdcRebalanceId) -> UsdcTransferError {
+            match self {
+                Self::DeadlineElapsed => {
+                    UsdcTransferError::AttestationRetryDeadlineElapsed { id: id.clone() }
+                }
+                Self::PreviouslyFailed => {
+                    UsdcTransferError::PreviouslyFailedAggregate { id: id.clone() }
+                }
+            }
+        }
+    }
+
+    struct TerminalBaseToAlpaca(TerminalOutcome);
+
+    #[async_trait]
+    impl ResumeBaseToAlpaca for TerminalBaseToAlpaca {
+        async fn resume_base_to_alpaca(
+            &self,
+            id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Err(self.0.into_error(id))
+        }
+    }
+
+    struct TerminalAlpacaToBase(TerminalOutcome);
+
+    #[async_trait]
+    impl ResumeAlpacaToBase for TerminalAlpacaToBase {
+        async fn resume_alpaca_to_base(
+            &self,
+            id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Err(self.0.into_error(id))
+        }
+    }
+
+    async fn setup_queue_pool() -> SqlitePool {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        setup_apalis_tables(&pool).await.unwrap();
+        pool
+    }
+
+    async fn pending_job_count<Task>(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM Jobs \
+             WHERE job_type = ? AND status = 'Pending'",
+        )
+        .bind(std::any::type_name::<Task>())
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Returns the serialized payload (apalis stores it as a `serde_json` BLOB
+    /// via `JsonCodec`) and the `run_at` unix-second timestamp of the single
+    /// pending row of the given task type.
+    async fn pending_job_row<Task>(pool: &SqlitePool) -> (Vec<u8>, i64) {
+        sqlx::query_as(
+            "SELECT job, run_at FROM Jobs \
+             WHERE job_type = ? AND status = 'Pending'",
+        )
+        .bind(std::any::type_name::<Task>())
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn hedging_job_reschedules_attestation_timeout() {
+        let pool = setup_queue_pool().await;
+        let job_queue = TransferUsdcToHedgingJobQueue::new(&pool);
+        let ctx = TransferUsdcToHedgingCtx {
+            transfer: Arc::new(TimeoutBaseToAlpaca),
+            timeout: Duration::from_secs(3600),
+            job_queue,
+        };
+        let job = TransferUsdcToHedging {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+        };
+
+        let before = Utc::now().timestamp();
+        job.perform(&ctx).await.unwrap();
+        let after = Utc::now().timestamp();
+
+        assert_eq!(
+            pending_job_count::<TransferUsdcToHedging>(&pool).await,
+            1,
+            "attestation timeout should enqueue a delayed replacement job"
+        );
+
+        let (payload, run_at) = pending_job_row::<TransferUsdcToHedging>(&pool).await;
+        let rescheduled: TransferUsdcToHedging = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            rescheduled.id, job.id,
+            "the rescheduled job must resume the same aggregate id"
+        );
+        assert!(
+            rescheduled.amount.eq(&job.amount).unwrap(),
+            "the rescheduled job must carry the same amount, got {} vs {}",
+            rescheduled.amount,
+            job.amount
+        );
+        assert!(
+            run_at >= before + 55 && run_at <= after + 65,
+            "redrive must be delayed by ~{ATTESTATION_REDRIVE_DELAY:?} -- neither immediate nor \
+             excessive: run_at={run_at} before={before} after={after}"
+        );
+    }
+
     #[tokio::test]
     async fn perform_times_out_when_resume_hangs() {
+        let pool = setup_queue_pool().await;
         let ctx = TransferUsdcToHedgingCtx {
             transfer: Arc::new(HangingResume),
             timeout: Duration::from_millis(50),
+            job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
         };
         let job = TransferUsdcToHedging {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -185,6 +467,146 @@ mod tests {
             error,
             TransferUsdcToHedgingJobError::Timeout { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn market_making_job_reschedules_attestation_timeout() {
+        let pool = setup_queue_pool().await;
+        let job_queue = TransferUsdcToMarketMakingJobQueue::new(&pool);
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(TimeoutAlpacaToBase),
+            job_queue,
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+        };
+
+        let before = Utc::now().timestamp();
+        job.perform(&ctx).await.unwrap();
+        let after = Utc::now().timestamp();
+
+        assert_eq!(
+            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
+            1,
+            "attestation timeout should enqueue a delayed replacement job"
+        );
+
+        let (payload, run_at) = pending_job_row::<TransferUsdcToMarketMaking>(&pool).await;
+        let rescheduled: TransferUsdcToMarketMaking = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            rescheduled.id, job.id,
+            "the rescheduled job must resume the same aggregate id"
+        );
+        assert!(
+            rescheduled.amount.eq(&job.amount).unwrap(),
+            "the rescheduled job must carry the same amount, got {} vs {}",
+            rescheduled.amount,
+            job.amount
+        );
+        assert!(
+            run_at >= before + 55 && run_at <= after + 65,
+            "redrive must be delayed by ~{ATTESTATION_REDRIVE_DELAY:?} -- neither immediate nor \
+             excessive: run_at={run_at} before={before} after={after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hedging_job_treats_deadline_elapsed_as_clean_terminal() {
+        let pool = setup_queue_pool().await;
+        let job_queue = TransferUsdcToHedgingJobQueue::new(&pool);
+        let ctx = TransferUsdcToHedgingCtx {
+            transfer: Arc::new(TerminalBaseToAlpaca(TerminalOutcome::DeadlineElapsed)),
+            timeout: Duration::from_secs(3600),
+            job_queue,
+        };
+        let job = TransferUsdcToHedging {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+        };
+
+        job.perform(&ctx)
+            .await
+            .expect("deadline-elapsed must be a clean terminal outcome, not a job error");
+
+        assert_eq!(
+            pending_job_count::<TransferUsdcToHedging>(&pool).await,
+            0,
+            "a deadline-elapsed transfer is terminally failed; the job must not redrive it"
+        );
+    }
+
+    #[tokio::test]
+    async fn hedging_job_treats_previously_failed_as_clean_terminal() {
+        let pool = setup_queue_pool().await;
+        let job_queue = TransferUsdcToHedgingJobQueue::new(&pool);
+        let ctx = TransferUsdcToHedgingCtx {
+            transfer: Arc::new(TerminalBaseToAlpaca(TerminalOutcome::PreviouslyFailed)),
+            timeout: Duration::from_secs(3600),
+            job_queue,
+        };
+        let job = TransferUsdcToHedging {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+        };
+
+        job.perform(&ctx).await.expect(
+            "a previously-failed aggregate must be a clean terminal outcome, not a job error",
+        );
+
+        assert_eq!(
+            pending_job_count::<TransferUsdcToHedging>(&pool).await,
+            0,
+            "a previously-failed transfer must not be redriven and must not trip the breaker"
+        );
+    }
+
+    #[tokio::test]
+    async fn market_making_job_treats_deadline_elapsed_as_clean_terminal() {
+        let pool = setup_queue_pool().await;
+        let job_queue = TransferUsdcToMarketMakingJobQueue::new(&pool);
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(TerminalAlpacaToBase(TerminalOutcome::DeadlineElapsed)),
+            job_queue,
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+        };
+
+        job.perform(&ctx)
+            .await
+            .expect("deadline-elapsed must be a clean terminal outcome, not a job error");
+
+        assert_eq!(
+            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
+            0,
+            "a deadline-elapsed transfer is terminally failed; the job must not redrive it"
+        );
+    }
+
+    #[tokio::test]
+    async fn market_making_job_treats_previously_failed_as_clean_terminal() {
+        let pool = setup_queue_pool().await;
+        let job_queue = TransferUsdcToMarketMakingJobQueue::new(&pool);
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(TerminalAlpacaToBase(TerminalOutcome::PreviouslyFailed)),
+            job_queue,
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+        };
+
+        job.perform(&ctx).await.expect(
+            "a previously-failed aggregate must be a clean terminal outcome, not a job error",
+        );
+
+        assert_eq!(
+            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
+            0,
+            "a previously-failed transfer must not be redriven and must not trip the breaker"
+        );
     }
 
     /// Records the resume call and returns a configurable outcome, so the
@@ -214,12 +636,14 @@ mod tests {
 
     #[tokio::test]
     async fn market_making_perform_forwards_id_and_amount_to_resume() {
+        let pool = setup_queue_pool().await;
         let stub = Arc::new(RecordingResume {
             fail: false,
             captured: std::sync::Mutex::new(None),
         });
         let ctx = TransferUsdcToMarketMakingCtx {
             transfer: stub.clone(),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
         };
         let id = UsdcRebalanceId(Uuid::new_v4());
         let amount = Usdc::new(float!(250));
@@ -240,11 +664,13 @@ mod tests {
 
     #[tokio::test]
     async fn market_making_perform_returns_ok_on_successful_resume() {
+        let pool = setup_queue_pool().await;
         let ctx = TransferUsdcToMarketMakingCtx {
             transfer: Arc::new(RecordingResume {
                 fail: false,
                 captured: std::sync::Mutex::new(None),
             }),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -256,11 +682,13 @@ mod tests {
 
     #[tokio::test]
     async fn market_making_perform_propagates_resume_failure() {
+        let pool = setup_queue_pool().await;
         let ctx = TransferUsdcToMarketMakingCtx {
             transfer: Arc::new(RecordingResume {
                 fail: true,
                 captured: std::sync::Mutex::new(None),
             }),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
         };
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
@@ -277,51 +705,5 @@ mod tests {
             matches!(error, TransferUsdcToMarketMakingJobError::Transfer(_)),
             "perform must propagate the resume failure as a Transfer error, got {error:?}",
         );
-    }
-}
-
-/// Dependencies the Alpaca->Base job needs. Symmetric to
-/// [`TransferUsdcToHedgingCtx`].
-pub(crate) struct TransferUsdcToMarketMakingCtx {
-    pub(crate) transfer: Arc<dyn ResumeAlpacaToBase>,
-}
-
-/// Errors emitted by [`TransferUsdcToMarketMaking::perform`].
-#[derive(Debug, Error)]
-pub(crate) enum TransferUsdcToMarketMakingJobError {
-    #[error(transparent)]
-    Transfer(#[from] UsdcTransferError),
-}
-
-/// Apalis job payload for the Alpaca->Base direction. The `id` is generated
-/// at enqueue time so retries resume the same aggregate.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct TransferUsdcToMarketMaking {
-    pub(crate) id: UsdcRebalanceId,
-    pub(crate) amount: Usdc,
-}
-
-impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
-    type Output = ();
-    type Error = TransferUsdcToMarketMakingJobError;
-
-    const WORKER_NAME: &'static str = "transfer-usdc-to-market-making-worker";
-
-    #[cfg(any(test, feature = "test-support"))]
-    const JOB_KIND: crate::conductor::job::JobKind =
-        crate::conductor::job::JobKind::TransferUsdcToMarketMaking;
-
-    fn label(&self) -> Label {
-        Label::new(format!("TransferUsdcToMarketMaking:{}", self.id))
-    }
-
-    async fn perform(
-        &self,
-        ctx: &TransferUsdcToMarketMakingCtx,
-    ) -> Result<Self::Output, Self::Error> {
-        ctx.transfer
-            .resume_alpaca_to_base(&self.id, self.amount)
-            .await?;
-        Ok(())
     }
 }

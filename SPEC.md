@@ -1693,6 +1693,17 @@ enum UsdcRebalance {
         initiated_at: DateTime<Utc>,
         burned_at: DateTime<Utc>,
     },
+    // Non-terminal: a Circle attestation poll timed out. The transfer stays
+    // retryable (re-polled by a delayed job) until `retry_deadline_at`, after
+    // which it is marked BridgingFailed for operator reconciliation.
+    AwaitingAttestation {
+        direction: RebalanceDirection,
+        amount: Usdc,
+        burn_tx_hash: TxHash,
+        initiated_at: DateTime<Utc>,
+        timed_out_at: DateTime<Utc>,
+        retry_deadline_at: DateTime<Utc>,
+    },
     Attested {
         direction: RebalanceDirection,
         amount: Usdc,
@@ -1800,6 +1811,9 @@ enum UsdcRebalanceCommand {
 
     // Bridging commands
     InitiateBridging { burn_tx: TxHash },
+    // Records that attestation polling timed out, moving Bridging ->
+    // AwaitingAttestation with the deadline beyond which retries stop.
+    TimeoutAttestation { retry_deadline_at: DateTime<Utc> },
     ReceiveAttestation { attestation: Vec<u8>, cctp_nonce: u64, mint_scan_from_block: u64 },
     ConfirmBridging { mint_tx: TxHash, amount_received: Usdc, fee_collected: Usdc },
     FailBridging { reason: String },
@@ -1839,6 +1853,11 @@ enum UsdcRebalanceEvent {
 
     // Bridging events (cctp_nonce comes from attestation, not burn tx)
     BridgingInitiated { burn_tx_hash: TxHash, burned_at: DateTime<Utc> },
+    AttestationTimedOut {
+        burn_tx_hash: TxHash,
+        retry_deadline_at: DateTime<Utc>,
+        timed_out_at: DateTime<Utc>,
+    },
     BridgeAttestationReceived {
         attestation: Vec<u8>,
         cctp_nonce: u64,
@@ -1907,6 +1926,28 @@ enum BridgeStage { Burn, Attestation, Mint }
   logs
 - Attestation must be retrieved by polling Circle's REST API (~13 sec finality,
   no websocket option available)
+- **Retryable attestation timeout**: an attestation poll timeout is recoverable,
+  not a hard failure. `Bridging` moves to `AwaitingAttestation` (via
+  `TimeoutAttestation`) and a delayed job re-polls until the attestation arrives
+  or `retry_deadline_at` passes (`attestation_retry_deadline_secs`, a required
+  config field, default 24h). On deadline elapse the transfer is marked
+  `BridgingFailed` for operator reconciliation. The deadline is a soft bound:
+  checked between polls, so it can overshoot by up to one poll window plus the
+  redrive delay. Structural failures detected _after_ a `complete` attestation
+  is fetched (e.g. an all-zero placeholder nonce) fail the bridge immediately.
+  Failures _within_ the poll loop (HTTP errors, a still-`pending` or malformed
+  `complete` response) are retried and, once the per-poll attempts exhaust,
+  surface as the same retryable timeout -- so a malformed response is bounded by
+  the deadline rather than failing fast. (Failing fast on a definitively
+  malformed `complete` response is a tracked follow-up.)
+- **Post-attestation re-poll retries until success (no deadline)**: once
+  `BridgeAttestationReceived` is recorded (`Attested`), the attestation is
+  permanently retrievable from Circle. The mint needs the full message envelope,
+  which the aggregate does not persist, so resuming from `Attested` re-polls
+  Circle; a timeout there retries until success rather than failing, because the
+  USDC is already burned and bounding it would strand recoverable funds. The
+  `attestation_retry_deadline` bounds only the `AwaitingAttestation` wait (where
+  the attestation may never arrive).
 - Bridge mint transaction requires valid attestation
 - Bridge mint transaction must be confirmed before destination deposit
 - A `receiveMessage()` revert because the CCTP nonce was already used is
@@ -2469,6 +2510,9 @@ Some failure scenarios may leave assets in states requiring manual intervention:
    - USDC burned on source chain (BridgingInitiated)
    - Attestation retrieval fails or mint transaction repeatedly fails
    - USDC is neither on source nor destination chain
+   - Attestation poll _timeouts_ are retried automatically until
+     `attestation_retry_deadline_secs`; manual reconciliation is only needed
+     after the deadline elapses (BridgingFailed) or on a hard mint failure
    - **Resolution**: Retry attestation fetching or mint transaction with
      extended timeout
 

@@ -3,7 +3,7 @@
 //!
 //! # State Flow
 //!
-//! The aggregate progresses through 10 states grouped into three phases:
+//! The aggregate progresses through states grouped into three phases:
 //!
 //! ```text
 //! WITHDRAWAL PHASE:
@@ -15,8 +15,11 @@
 //!                                                                          |
 //!                                                          FailBridging    v
 //!   Bridging --ReceiveAttestation--> Attested --ConfirmBridging--> Bridged
-//!       |                                |                             |
-//!       +----------FailBridging----------+--> BridgingFailed           |
+//!       |              |                 |                             |
+//!       |              +--FailBridging---+--> BridgingFailed           |
+//!       +--TimeoutAttestation--> AwaitingAttestation                   |
+//!                                      |                               |
+//!                                      +--ReceiveAttestation--> Attested
 //!                                                                      |
 //! DEPOSIT PHASE:                                             InitiateDeposit
 //!                                                                      |
@@ -230,7 +233,8 @@ pub(crate) enum UsdcRebalanceCommand {
     BeginBridging { from_block: u64 },
     /// Record the CCTP burn transaction. Valid only from `BridgingSubmitting` state.
     InitiateBridging { burn_tx: TxHash },
-    /// Record the Circle attestation. Valid only from `Bridging` state.
+    /// Record the Circle attestation. Valid from `Bridging` or
+    /// `AwaitingAttestation` state.
     /// The cctp_nonce is extracted from the attested message (not the burn tx, which has placeholder).
     /// `mint_scan_from_block` is the destination chain head captured before the mint,
     /// bounding the crash-safe resume scan that adopts an already-submitted mint.
@@ -239,6 +243,9 @@ pub(crate) enum UsdcRebalanceCommand {
         cctp_nonce: B256,
         mint_scan_from_block: u64,
     },
+    /// Record that Circle attestation polling timed out while the burn remains
+    /// recoverable. Valid only from `Bridging` state.
+    TimeoutAttestation { retry_deadline_at: DateTime<Utc> },
     /// Confirm the CCTP mint transaction. Valid only from `Attested` state.
     /// Includes actual amounts from the MintAndWithdraw event for accurate inventory tracking.
     ConfirmBridging {
@@ -337,6 +344,13 @@ pub(crate) enum UsdcRebalanceEvent {
         mint_scan_from_block: Option<u64>,
         attested_at: DateTime<Utc>,
     },
+    /// Circle attestation polling timed out, but the burn remains recoverable
+    /// until the retry deadline.
+    AttestationTimedOut {
+        burn_tx_hash: TxHash,
+        retry_deadline_at: DateTime<Utc>,
+        timed_out_at: DateTime<Utc>,
+    },
     /// CCTP mint transaction confirmed on destination chain.
     /// Contains actual amount received (after CCTP fees) for accurate inventory tracking.
     Bridged {
@@ -388,6 +402,7 @@ impl DomainEvent for UsdcRebalanceEvent {
             Self::BridgeAttestationReceived { .. } => {
                 "UsdcRebalanceEvent::BridgeAttestationReceived"
             }
+            Self::AttestationTimedOut { .. } => "UsdcRebalanceEvent::AttestationTimedOut",
             Self::Bridged { .. } => "UsdcRebalanceEvent::Bridged",
             Self::BridgingFailed { .. } => "UsdcRebalanceEvent::BridgingFailed",
             Self::DepositInitiated { .. } => "UsdcRebalanceEvent::DepositInitiated",
@@ -483,6 +498,17 @@ pub(crate) enum UsdcRebalance {
         burn_tx_hash: TxHash,
         initiated_at: DateTime<Utc>,
         burned_at: DateTime<Utc>,
+    },
+    /// CCTP burn has succeeded and Circle attestation has not arrived within
+    /// the per-poll timeout. The burn remains recoverable, so the aggregate is
+    /// non-terminal and the apalis transfer job can retry until the deadline.
+    AwaitingAttestation {
+        direction: RebalanceDirection,
+        amount: Usdc,
+        burn_tx_hash: TxHash,
+        initiated_at: DateTime<Utc>,
+        timed_out_at: DateTime<Utc>,
+        retry_deadline_at: DateTime<Utc>,
     },
     /// Circle attestation has been received, ready for minting on destination chain
     Attested {
@@ -682,42 +708,35 @@ impl UsdcRebalance {
                 direction,
                 amount,
                 initiated_at,
-                burned_at,
+                burned_at: updated_at,
                 ..
-            } => (
-                direction,
-                *amount,
-                UsdcBridgeStatus::Bridging,
-                *initiated_at,
-                *burned_at,
-            ),
-
-            Self::Attested {
+            }
+            | Self::AwaitingAttestation {
                 direction,
                 amount,
                 initiated_at,
-                attested_at,
+                timed_out_at: updated_at,
+                ..
+            }
+            | Self::Attested {
+                direction,
+                amount,
+                initiated_at,
+                attested_at: updated_at,
+                ..
+            }
+            | Self::Bridged {
+                direction,
+                amount_received: amount,
+                initiated_at,
+                minted_at: updated_at,
                 ..
             } => (
                 direction,
                 *amount,
                 UsdcBridgeStatus::Bridging,
                 *initiated_at,
-                *attested_at,
-            ),
-
-            Self::Bridged {
-                direction,
-                amount_received,
-                initiated_at,
-                minted_at,
-                ..
-            } => (
-                direction,
-                *amount_received,
-                UsdcBridgeStatus::Bridging,
-                *initiated_at,
-                *minted_at,
+                *updated_at,
             ),
 
             Self::DepositInitiated {
@@ -795,6 +814,7 @@ impl UsdcRebalance {
             | Self::WithdrawalSubmitting { .. }
             | Self::BridgingSubmitting { .. }
             | Self::Bridging { .. }
+            | Self::AwaitingAttestation { .. }
             | Self::Attested { .. }
             | Self::Bridged { .. }
             | Self::DepositInitiated { .. }
@@ -882,6 +902,7 @@ pub(crate) async fn interrupted_usdc_rebalance_ids(
                'UsdcRebalanceEvent::BridgingSubmitting', \
                'UsdcRebalanceEvent::BridgingInitiated', \
                'UsdcRebalanceEvent::BridgeAttestationReceived', \
+               'UsdcRebalanceEvent::AttestationTimedOut', \
                'UsdcRebalanceEvent::Bridged', \
                'UsdcRebalanceEvent::BridgingFailed', \
                'UsdcRebalanceEvent::DepositInitiated', \
@@ -929,7 +950,9 @@ impl EventSourced for UsdcRebalance {
     // so they rebuild from events. No event upcaster needed: persisted events
     // only ever stored cctp_nonce=null (the nonce bug prevented any successful
     // attestation), which deserializes unchanged into Option<B256>.
-    const SCHEMA_VERSION: u64 = 2;
+    // v3: added the non-terminal AwaitingAttestation state so attestation
+    // timeouts replay as retryable instead of terminal bridge failures.
+    const SCHEMA_VERSION: u64 = 3;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use UsdcRebalanceEvent::*;
@@ -1164,6 +1187,13 @@ impl EventSourced for UsdcRebalance {
                     burn_tx_hash,
                     initiated_at,
                     ..
+                }
+                | Self::AwaitingAttestation {
+                    direction,
+                    amount,
+                    burn_tx_hash,
+                    initiated_at,
+                    ..
                 },
             ) => Self::Attested {
                 direction: direction.clone(),
@@ -1174,6 +1204,28 @@ impl EventSourced for UsdcRebalance {
                 mint_scan_from_block: *mint_scan_from_block,
                 initiated_at: *initiated_at,
                 attested_at: *attested_at,
+            },
+
+            (
+                AttestationTimedOut {
+                    burn_tx_hash,
+                    retry_deadline_at,
+                    timed_out_at,
+                },
+                Self::Bridging {
+                    direction,
+                    amount,
+                    burn_tx_hash: state_burn_tx_hash,
+                    initiated_at,
+                    ..
+                },
+            ) if burn_tx_hash == state_burn_tx_hash => Self::AwaitingAttestation {
+                direction: direction.clone(),
+                amount: *amount,
+                burn_tx_hash: *burn_tx_hash,
+                initiated_at: *initiated_at,
+                timed_out_at: *timed_out_at,
+                retry_deadline_at: *retry_deadline_at,
             },
 
             (
@@ -1221,6 +1273,12 @@ impl EventSourced for UsdcRebalance {
                     ..
                 }
                 | Self::Bridging {
+                    direction,
+                    amount,
+                    initiated_at,
+                    ..
+                }
+                | Self::AwaitingAttestation {
                     direction,
                     amount,
                     initiated_at,
@@ -1389,7 +1447,7 @@ impl EventSourced for UsdcRebalance {
                 Err(UsdcRebalanceError::WithdrawalNotConfirmed)
             }
 
-            ReceiveAttestation { .. } | FailBridging { .. } => {
+            ReceiveAttestation { .. } | TimeoutAttestation { .. } | FailBridging { .. } => {
                 Err(UsdcRebalanceError::BridgingNotInitiated)
             }
 
@@ -1435,6 +1493,9 @@ impl EventSourced for UsdcRebalance {
                 cctp_nonce,
                 mint_scan_from_block,
             } => self.transition_receive_attestation(attestation, cctp_nonce, mint_scan_from_block),
+            TimeoutAttestation { retry_deadline_at } => {
+                self.transition_timeout_attestation(retry_deadline_at)
+            }
             ConfirmBridging {
                 mint_tx,
                 amount_received,
@@ -1620,6 +1681,7 @@ impl UsdcRebalance {
             | Self::BridgingSubmitting { .. }
             | Self::WithdrawalFailed { .. }
             | Self::Bridging { .. }
+            | Self::AwaitingAttestation { .. }
             | Self::Attested { .. }
             | Self::Bridged { .. }
             | Self::BridgingFailed { .. }
@@ -1644,6 +1706,7 @@ impl UsdcRebalance {
             | Self::BridgingSubmitting { .. }
             | Self::WithdrawalFailed { .. }
             | Self::Bridging { .. }
+            | Self::AwaitingAttestation { .. }
             | Self::Attested { .. }
             | Self::Bridged { .. }
             | Self::BridgingFailed { .. }
@@ -1674,6 +1737,7 @@ impl UsdcRebalance {
             }]),
             Self::BridgingSubmitting { .. }
             | Self::Bridging { .. }
+            | Self::AwaitingAttestation { .. }
             | Self::Attested { .. }
             | Self::Bridged { .. }
             | Self::BridgingFailed { .. }
@@ -1709,6 +1773,7 @@ impl UsdcRebalance {
                 }])
             }
             Self::Bridging { .. }
+            | Self::AwaitingAttestation { .. }
             | Self::Attested { .. }
             | Self::Bridged { .. }
             | Self::BridgingFailed { .. }
@@ -1737,14 +1802,51 @@ impl UsdcRebalance {
             | Self::WithdrawalComplete { .. }
             | Self::BridgingSubmitting { .. }
             | Self::WithdrawalFailed { .. } => Err(UsdcRebalanceError::BridgingNotInitiated),
-            Self::Bridging { .. } => Ok(vec![BridgeAttestationReceived {
-                attestation,
-                cctp_nonce,
-                mint_scan_from_block: Some(mint_scan_from_block),
-                attested_at: Utc::now(),
-            }]),
+            Self::Bridging { .. } | Self::AwaitingAttestation { .. } => {
+                Ok(vec![BridgeAttestationReceived {
+                    attestation,
+                    cctp_nonce,
+                    mint_scan_from_block: Some(mint_scan_from_block),
+                    attested_at: Utc::now(),
+                }])
+            }
             Self::Attested { .. } => Err(UsdcRebalanceError::InvalidCommand {
                 command: "ReceiveAttestation".to_string(),
+                state: "Attested".to_string(),
+            }),
+            Self::Bridged { .. }
+            | Self::BridgingFailed { .. }
+            | Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. } => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
+        }
+    }
+
+    fn transition_timeout_attestation(
+        &self,
+        retry_deadline_at: DateTime<Utc>,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed { .. }
+            | Self::WithdrawalSubmitting { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalComplete { .. }
+            | Self::BridgingSubmitting { .. }
+            | Self::WithdrawalFailed { .. } => Err(UsdcRebalanceError::BridgingNotInitiated),
+            Self::Bridging { burn_tx_hash, .. } => Ok(vec![AttestationTimedOut {
+                burn_tx_hash: *burn_tx_hash,
+                retry_deadline_at,
+                timed_out_at: Utc::now(),
+            }]),
+            Self::AwaitingAttestation { .. } => Err(UsdcRebalanceError::InvalidCommand {
+                command: "TimeoutAttestation".to_string(),
+                state: "AwaitingAttestation".to_string(),
+            }),
+            Self::Attested { .. } => Err(UsdcRebalanceError::InvalidCommand {
+                command: "TimeoutAttestation".to_string(),
                 state: "Attested".to_string(),
             }),
             Self::Bridged { .. }
@@ -1771,7 +1873,8 @@ impl UsdcRebalance {
             | Self::WithdrawalComplete { .. }
             | Self::BridgingSubmitting { .. }
             | Self::WithdrawalFailed { .. }
-            | Self::Bridging { .. } => Err(UsdcRebalanceError::AttestationNotReceived),
+            | Self::Bridging { .. }
+            | Self::AwaitingAttestation { .. } => Err(UsdcRebalanceError::AttestationNotReceived),
             Self::Attested { .. } => Ok(vec![Bridged {
                 mint_tx_hash: mint_tx,
                 amount_received,
@@ -1810,7 +1913,8 @@ impl UsdcRebalance {
                     failed_at: Utc::now(),
                 }])
             }
-            Self::Bridging { burn_tx_hash, .. } => Ok(vec![BridgingFailed {
+            Self::Bridging { burn_tx_hash, .. }
+            | Self::AwaitingAttestation { burn_tx_hash, .. } => Ok(vec![BridgingFailed {
                 burn_tx_hash: Some(*burn_tx_hash),
                 cctp_nonce: None,
                 reason,
@@ -1849,6 +1953,7 @@ impl UsdcRebalance {
             | Self::BridgingSubmitting { .. }
             | Self::WithdrawalFailed { .. }
             | Self::Bridging { .. }
+            | Self::AwaitingAttestation { .. }
             | Self::Attested { .. }
             | Self::BridgingFailed { .. } => Err(UsdcRebalanceError::BridgingNotCompleted),
             Self::Bridged { .. } => Ok(vec![DepositInitiated {
@@ -1876,6 +1981,7 @@ impl UsdcRebalance {
             | Self::BridgingSubmitting { .. }
             | Self::WithdrawalFailed { .. }
             | Self::Bridging { .. }
+            | Self::AwaitingAttestation { .. }
             | Self::Attested { .. }
             | Self::BridgingFailed { .. }
             | Self::Bridged { .. } => Err(UsdcRebalanceError::DepositNotInitiated),
@@ -1907,6 +2013,7 @@ impl UsdcRebalance {
             | Self::BridgingSubmitting { .. }
             | Self::WithdrawalFailed { .. }
             | Self::Bridging { .. }
+            | Self::AwaitingAttestation { .. }
             | Self::Attested { .. }
             | Self::BridgingFailed { .. }
             | Self::Bridged { .. } => Err(UsdcRebalanceError::DepositNotInitiated),
@@ -2481,6 +2588,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_timeout_attestation_after_bridging_initiated() {
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let burn_tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let retry_deadline_at = Utc::now() + chrono::Duration::hours(24);
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc::new(float!(1000.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash,
+                    burned_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::TimeoutAttestation { retry_deadline_at })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::AttestationTimedOut {
+            burn_tx_hash: event_burn_tx_hash,
+            retry_deadline_at: event_retry_deadline_at,
+            ..
+        } = events[0]
+        else {
+            panic!("Expected AttestationTimedOut event");
+        };
+        assert_eq!(event_burn_tx_hash, burn_tx_hash);
+        assert_eq!(event_retry_deadline_at, retry_deadline_at);
+    }
+
+    #[test]
+    fn replay_timeout_attestation_enters_awaiting_attestation() {
+        let initiated_at = Utc::now();
+        let timed_out_at = initiated_at + chrono::Duration::minutes(5);
+        let retry_deadline_at = initiated_at + chrono::Duration::hours(24);
+
+        let state = replay::<UsdcRebalance>(vec![
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(1000.00)),
+                withdrawal_ref: TransferRef::OnchainTx(BURN_TX),
+                initiated_at,
+            },
+            UsdcRebalanceEvent::WithdrawalConfirmed {
+                confirmed_at: initiated_at,
+            },
+            UsdcRebalanceEvent::BridgingInitiated {
+                burn_tx_hash: BURN_TX,
+                burned_at: initiated_at,
+            },
+            UsdcRebalanceEvent::AttestationTimedOut {
+                burn_tx_hash: BURN_TX,
+                retry_deadline_at,
+                timed_out_at,
+            },
+        ])
+        .expect("event stream should replay")
+        .expect("event stream should materialize aggregate state");
+
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::AwaitingAttestation {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    burn_tx_hash: BURN_TX,
+                    retry_deadline_at: deadline,
+                    timed_out_at: timeout,
+                    ..
+                } if deadline == retry_deadline_at && timeout == timed_out_at
+            ),
+            "Expected AwaitingAttestation state, got {state:?}"
+        );
+    }
+
+    #[test]
+    fn receive_attestation_after_timeout_advances_to_attested() {
+        let initiated_at = Utc::now();
+        let attested_at = initiated_at + chrono::Duration::minutes(6);
+
+        let state = replay::<UsdcRebalance>(vec![
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(1000.00)),
+                withdrawal_ref: TransferRef::OnchainTx(BURN_TX),
+                initiated_at,
+            },
+            UsdcRebalanceEvent::WithdrawalConfirmed {
+                confirmed_at: initiated_at,
+            },
+            UsdcRebalanceEvent::BridgingInitiated {
+                burn_tx_hash: BURN_TX,
+                burned_at: initiated_at,
+            },
+            UsdcRebalanceEvent::AttestationTimedOut {
+                burn_tx_hash: BURN_TX,
+                retry_deadline_at: initiated_at + chrono::Duration::hours(24),
+                timed_out_at: initiated_at + chrono::Duration::minutes(5),
+            },
+            UsdcRebalanceEvent::BridgeAttestationReceived {
+                attestation: vec![0x01, 0x02],
+                cctp_nonce: TEST_CCTP_NONCE,
+                mint_scan_from_block: Some(100),
+                attested_at,
+            },
+        ])
+        .expect("event stream should replay")
+        .expect("event stream should materialize aggregate state");
+
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::Attested {
+                    burn_tx_hash: BURN_TX,
+                    cctp_nonce: TEST_CCTP_NONCE,
+                    attested_at: state_attested_at,
+                    ..
+                } if state_attested_at == attested_at
+            ),
+            "Expected Attested state, got {state:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_cannot_initiate_bridging_before_withdrawal() {
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
@@ -2996,6 +3235,60 @@ mod tests {
         assert_eq!(*event_burn_tx, Some(burn_tx_hash));
         assert_eq!(*event_nonce, None);
         assert_eq!(reason, "CCTP timeout");
+    }
+
+    /// Failing from `AwaitingAttestation` (reached after an attestation timeout,
+    /// e.g. when the retry deadline elapses) must retain `burn_tx_hash` with a
+    /// `None` nonce. That populated burn tx is what keeps `holds_rebalance_guard`
+    /// latched on restart -- a regression to the pre-burn shape would clear the
+    /// guard and reopen the re-burn window on already-burned USDC.
+    #[tokio::test]
+    async fn test_fail_bridging_from_awaiting_attestation() {
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let burn_tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc::new(float!(1000.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::AttestationTimedOut {
+                    burn_tx_hash,
+                    retry_deadline_at: Utc::now() + chrono::Duration::hours(1),
+                    timed_out_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::FailBridging {
+                reason: "attestation retry deadline elapsed".to_string(),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::BridgingFailed {
+            burn_tx_hash: event_burn_tx,
+            cctp_nonce: event_nonce,
+            reason,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected BridgingFailed event");
+        };
+
+        assert_eq!(*event_burn_tx, Some(burn_tx_hash));
+        assert_eq!(*event_nonce, None);
+        assert_eq!(reason, "attestation retry deadline elapsed");
     }
 
     #[tokio::test]
@@ -4762,6 +5055,30 @@ mod tests {
     }
 
     #[test]
+    fn to_dto_awaiting_attestation_maps_to_bridging_status() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let initiated_at = Utc::now();
+        let timed_out_at = initiated_at + chrono::Duration::minutes(5);
+        let state = UsdcRebalance::AwaitingAttestation {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: Usdc::new(float!(2000)),
+            burn_tx_hash: BURN_TX,
+            initiated_at,
+            timed_out_at,
+            retry_deadline_at: initiated_at + chrono::Duration::hours(24),
+        };
+
+        let dto = state.to_dto(&id);
+        let TransferOperation::UsdcBridge(bridge) = dto else {
+            panic!("expected UsdcBridge variant");
+        };
+
+        assert!(matches!(bridge.status, UsdcBridgeStatus::Bridging));
+        assert_eq!(bridge.started_at, initiated_at);
+        assert_eq!(bridge.updated_at, timed_out_at);
+    }
+
+    #[test]
     fn to_dto_deposit_confirmed_maps_to_completed_status() {
         let id = UsdcRebalanceId(Uuid::new_v4());
         let initiated_at = Utc::now();
@@ -5109,13 +5426,24 @@ mod tests {
             .holds_rebalance_guard()
         );
         assert!(
+            AwaitingAttestation {
+                direction: BaseToAlpaca,
+                amount,
+                burn_tx_hash: BURN_TX,
+                initiated_at: now,
+                timed_out_at: now,
+                retry_deadline_at: now + chrono::Duration::hours(24),
+            }
+            .holds_rebalance_guard()
+        );
+        assert!(
             Attested {
                 direction: AlpacaToBase,
                 amount,
                 burn_tx_hash: BURN_TX,
                 cctp_nonce: TEST_CCTP_NONCE,
                 attestation: vec![],
-                mint_scan_from_block: Some(0),
+                mint_scan_from_block: Some(100),
                 initiated_at: now,
                 attested_at: now,
             }
@@ -5346,6 +5674,43 @@ mod tests {
             .await
             .unwrap();
 
+        // Awaiting attestation after a post-burn timeout -- must be included.
+        let awaiting_attestation = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &awaiting_attestation,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(BURN_TX),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &awaiting_attestation,
+                UsdcRebalanceCommand::ConfirmWithdrawal,
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &awaiting_attestation,
+                UsdcRebalanceCommand::InitiateBridging { burn_tx: BURN_TX },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &awaiting_attestation,
+                UsdcRebalanceCommand::TimeoutAttestation {
+                    retry_deadline_at: Utc::now() + chrono::Duration::hours(24),
+                },
+            )
+            .await
+            .unwrap();
+
         // In-progress (mid-withdrawal) -- must be included.
         let withdrawing = UsdcRebalanceId(Uuid::new_v4());
         store
@@ -5363,7 +5728,10 @@ mod tests {
         let interrupted = interrupted_usdc_rebalance_ids(&pool).await.unwrap();
         let got: HashSet<UsdcRebalanceId> = interrupted.ids.into_iter().collect();
 
-        assert_eq!(got, HashSet::from([bridge_failed, withdrawing]));
+        assert_eq!(
+            got,
+            HashSet::from([bridge_failed, awaiting_attestation, withdrawing])
+        );
         assert!(
             interrupted.unparseable.is_empty(),
             "well-formed UUID aggregate_ids must not be reported as unparseable"

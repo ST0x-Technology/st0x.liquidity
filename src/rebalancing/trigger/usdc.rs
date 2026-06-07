@@ -167,6 +167,7 @@ impl UsdcRebalanceStage {
             // BridgingInitiated, so they emit no distinct progress stage.
             WithdrawalSubmitting { .. }
             | BridgingSubmitting { .. }
+            | AttestationTimedOut { .. }
             | ConversionConfirmed { .. }
             | ConversionFailed { .. }
             | WithdrawalFailed { .. }
@@ -695,7 +696,9 @@ impl RebalancingService {
             // burn. Detailed stage tracking starts at the subsequent Initiated /
             // BridgingInitiated; the inventory's active-rebalance claim is set by
             // the caller on this (first non-terminal) event, so nothing to do here.
-            WithdrawalSubmitting { .. } | BridgingSubmitting { .. } => {}
+            WithdrawalSubmitting { .. }
+            | BridgingSubmitting { .. }
+            | AttestationTimedOut { .. } => {}
             // Withdrawal failure is always pre-burn -> reconcile to source.
             WithdrawalFailed { .. } => {
                 self.cancel_tracked_usdc_rebalance(id).await?;
