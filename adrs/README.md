@@ -118,7 +118,8 @@ decision.
 
 ## Index
 
-| #                                   | Title                                                                            | Status   |
-| ----------------------------------- | -------------------------------------------------------------------------------- | -------- |
-| [1](1-cash-bp-for-equity-hedges.md) | Use Alpaca `cash` (not `non_marginable_buying_power`) for equity hedge preflight | Accepted |
-| [0002](0002-axum-and-tower.md)      | Adopt Axum and lean on Tower for both transport and business logic               | Accepted |
+| #                                                       | Title                                                                            | Status   |
+| ------------------------------------------------------- | -------------------------------------------------------------------------------- | -------- |
+| [1](1-cash-bp-for-equity-hedges.md)                     | Use Alpaca `cash` (not `non_marginable_buying_power`) for equity hedge preflight | Accepted |
+| [0002](0002-axum-and-tower.md)                          | Adopt Axum and lean on Tower for both transport and business logic               | Accepted |
+| [0003](0003-durable-usdc-rebalance-guard-on-restart.md) | Reconstruct the USDC rebalancing guard from persisted state on startup           | Accepted |

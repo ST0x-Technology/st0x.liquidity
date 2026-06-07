@@ -2290,8 +2290,16 @@ know about cross-venue inventory.
   moves from inflight to destination available
 - `UsdcRebalanceEvent::ConversionConfirmed` - Terminal success for BaseToAlpaca;
   moves from inflight to destination available
-- `UsdcRebalanceEvent::WithdrawalFailed`, `BridgingFailed`, `DepositFailed`,
-  `ConversionFailed` - Reconciles inflight back to source available
+- `UsdcRebalanceEvent::WithdrawalFailed`, pre-burn `BridgingFailed`, and
+  AlpacaToBase `ConversionFailed` (the pre-withdrawal USD->USDC leg) -
+  Reconciles inflight back to source available, because the failure happened
+  before the CCTP burn so the funds are still on the source venue
+- Post-burn `UsdcRebalanceEvent::BridgingFailed`, `DepositFailed`, and
+  BaseToAlpaca `ConversionFailed` (the post-deposit USDC->USD leg) - Keeps
+  source inflight and the USDC rebalancing guard active because the funds were
+  burned (and, for the deposit/conversion failures, already minted) by CCTP and
+  are not available on the source venue. The same applies to any transfer that
+  times out at or after the burn
 - `InventorySnapshotEvent::OnchainEquity` - Onchain equity balances fetched from
   vaults
 - `InventorySnapshotEvent::OnchainCash` - Onchain USDC balance fetched from
@@ -2386,10 +2394,20 @@ when no inflight operations exist for the asset. Trigger events are emitted to
 
 #### Failure Handling and Reconciliation
 
-**Automatic Reconciliation**: When rebalancing operations fail, the projection
-logic automatically reconciles inflight balances back to source venue's
-available balance. This ensures InventoryView remains accurate even when
-operations fail.
+**Automatic Reconciliation**: When rebalancing operations fail before assets
+leave the recoverable source side, the projection logic reconciles inflight
+balances back to the source venue's available balance. Failures after an
+irreversible handoff (for example, a CCTP burn) stay inflight until settlement
+or manual operator recovery.
+
+**Durable rebalancing guard**: The single-rebalance guard that blocks a new USDC
+rebalance while one is unsettled is reconstructed from persisted `UsdcRebalance`
+event state on startup, so a restart between a post-burn failure and settlement
+cannot re-open the re-burn window. Any aggregate not in a clearable-terminal
+state (success, or a pre-burn failure that reconciles to source) re-asserts the
+guard at boot and blocks new USDC rebalancing until it settles or an operator
+recovers it. USDC bridges are not auto-resumed on restart, so the guard is held
+until manual recovery.
 
 ##### Manual Reconciliation Required
 

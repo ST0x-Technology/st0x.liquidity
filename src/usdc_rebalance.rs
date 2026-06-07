@@ -69,8 +69,10 @@ use alloy::primitives::{B256, TxHash};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
+use tracing::warn;
 use uuid::Uuid;
 
 use st0x_dto::{TransferOperation, UsdcBridgeOperation, UsdcBridgeStatus};
@@ -770,6 +772,145 @@ impl UsdcRebalance {
             updated_at,
         })
     }
+
+    /// Whether an aggregate in this state should hold the single-rebalance
+    /// guard (`usdc_in_progress`) when the guard is reconstructed on startup.
+    ///
+    /// True for any state where a rebalance is still in progress or stranded
+    /// after a CCTP burn; false only for clearable-terminal states -- success,
+    /// or a failure that reconciles inflight back to the source venue. The live
+    /// reactor holds the guard from dispatch until a clearable-terminal event;
+    /// re-deriving that boolean from durable event state keeps a restart from
+    /// re-opening the re-burn window. See ADR 2.
+    pub(crate) fn holds_rebalance_guard(&self) -> bool {
+        match self {
+            // `WithdrawalSubmitting`/`BridgingSubmitting` are transient intent
+            // markers persisted immediately before an irreversible on-chain
+            // withdraw/burn. A crash here may have already broadcast that effect,
+            // so they hold the guard defensively to keep a restart from opening a
+            // re-burn window while apalis resumes the job.
+            Self::Converting { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalComplete { .. }
+            | Self::WithdrawalSubmitting { .. }
+            | Self::BridgingSubmitting { .. }
+            | Self::Bridging { .. }
+            | Self::Attested { .. }
+            | Self::Bridged { .. }
+            | Self::DepositInitiated { .. }
+            // DepositFailed is post-burn/post-mint (the CCTP mint already
+            // happened), so the funds cannot be reconciled to source; the live
+            // reactor preserves it (PreservePostBurn), so recovery holds too.
+            | Self::DepositFailed { .. } => true,
+            // AlpacaToBase: pre-withdrawal conversion, still has withdraw/bridge/
+            // deposit ahead. BaseToAlpaca: post-deposit conversion -> terminal.
+            Self::ConversionComplete { direction, .. } => match direction {
+                RebalanceDirection::AlpacaToBase => true,
+                RebalanceDirection::BaseToAlpaca => false,
+            },
+            // Post-burn failure (burn already broadcast) keeps the guard so a
+            // re-burn cannot fire against funds CCTP already burned. The
+            // `FailBridging` command only emits `burn_tx_hash: Some` from the
+            // post-burn `Bridging`/`Attested` states; a pre-burn failure (from
+            // `WithdrawalComplete`) carries `None` and reconciles to source.
+            Self::BridgingFailed { burn_tx_hash, .. } => burn_tx_hash.is_some(),
+            // BaseToAlpaca-only post-burn legs: after DepositConfirmed the
+            // post-deposit USDC->USD conversion is still pending, and a
+            // post-deposit ConversionFailed is post-mint -- both hold. For
+            // AlpacaToBase both clear: DepositConfirmed is terminal success and
+            // ConversionFailed is the pre-withdrawal (pre-burn) leg.
+            Self::DepositConfirmed { direction, .. } | Self::ConversionFailed { direction, .. } => {
+                match direction {
+                    RebalanceDirection::BaseToAlpaca => true,
+                    RebalanceDirection::AlpacaToBase => false,
+                }
+            }
+            // Withdrawal failure is always pre-burn: reconcile to source and clear.
+            Self::WithdrawalFailed { .. } => false,
+        }
+    }
+}
+
+/// Candidate `UsdcRebalance` aggregates whose latest event leaves them
+/// potentially holding the single-rebalance guard, for startup recovery, split
+/// by whether their persisted `aggregate_id` parsed.
+///
+/// `unparseable` rows cannot be loaded or classified, so the recovery path must
+/// fail closed and hold the guard for them rather than silently dropping them --
+/// dropping would leave the guard clear for a possibly-post-burn rebalance and
+/// re-open the re-burn window. The raw ids are retained for diagnostics.
+pub(crate) struct InterruptedUsdcRebalances {
+    pub(crate) ids: Vec<UsdcRebalanceId>,
+    pub(crate) unparseable: Vec<String>,
+}
+
+/// Returns the candidate `UsdcRebalance` aggregates whose latest event leaves
+/// them potentially holding the single-rebalance guard, for startup recovery.
+///
+/// The `event_type` filter is a coarse pre-filter: it excludes only
+/// `WithdrawalFailed` (always pre-burn, reconciles to source) and keeps every
+/// other latest event -- including `ConversionFailed` (post-burn for
+/// BaseToAlpaca's post-deposit leg, pre-burn for AlpacaToBase) and the events
+/// that are terminal in one direction but intermediate in the other
+/// (`ConversionConfirmed`, `DepositConfirmed`). The caller loads each aggregate
+/// and applies [`UsdcRebalance::holds_rebalance_guard`] for the precise,
+/// direction-aware decision. USDC rebalances are infrequent, large operations,
+/// so loading the recently-terminal ones to filter them out is cheap.
+pub(crate) async fn interrupted_usdc_rebalance_ids(
+    pool: &SqlitePool,
+) -> Result<InterruptedUsdcRebalances, sqlx::Error> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "WITH latest AS ( \
+             SELECT aggregate_id, MAX(sequence) AS max_seq \
+             FROM events \
+             WHERE aggregate_type = 'UsdcRebalance' \
+             GROUP BY aggregate_id \
+         ) \
+         SELECT latest.aggregate_id \
+         FROM events last_ev \
+         INNER JOIN latest \
+             ON last_ev.aggregate_id = latest.aggregate_id \
+            AND last_ev.sequence = latest.max_seq \
+         WHERE last_ev.aggregate_type = 'UsdcRebalance' \
+           AND last_ev.event_type IN ( \
+               'UsdcRebalanceEvent::ConversionInitiated', \
+               'UsdcRebalanceEvent::ConversionConfirmed', \
+               'UsdcRebalanceEvent::ConversionFailed', \
+               'UsdcRebalanceEvent::Initiated', \
+               'UsdcRebalanceEvent::WithdrawalSubmitting', \
+               'UsdcRebalanceEvent::WithdrawalConfirmed', \
+               'UsdcRebalanceEvent::BridgingSubmitting', \
+               'UsdcRebalanceEvent::BridgingInitiated', \
+               'UsdcRebalanceEvent::BridgeAttestationReceived', \
+               'UsdcRebalanceEvent::Bridged', \
+               'UsdcRebalanceEvent::BridgingFailed', \
+               'UsdcRebalanceEvent::DepositInitiated', \
+               'UsdcRebalanceEvent::DepositConfirmed', \
+               'UsdcRebalanceEvent::DepositFailed' \
+           ) \
+         ORDER BY latest.aggregate_id",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut ids = Vec::new();
+    let mut unparseable = Vec::new();
+    for raw in rows {
+        match raw.parse::<UsdcRebalanceId>() {
+            Ok(id) => ids.push(id),
+            Err(error) => {
+                warn!(
+                    target: "rebalance",
+                    %raw, ?error,
+                    "Unparseable UsdcRebalance aggregate_id during guard recovery; \
+                     holding guard defensively"
+                );
+                unparseable.push(raw);
+            }
+        }
+    }
+
+    Ok(InterruptedUsdcRebalances { ids, unparseable })
 }
 
 #[async_trait]
@@ -1788,12 +1929,13 @@ impl UsdcRebalance {
 mod tests {
     use alloy::primitives::fixed_bytes;
     use serde_json::{from_value, json};
+    use std::collections::HashSet;
     use uuid::Uuid;
 
-    use st0x_event_sorcery::{LifecycleError, TestHarness, replay};
+    use st0x_event_sorcery::{LifecycleError, TestHarness, replay, test_store};
+    use st0x_float_macro::float;
 
     use super::*;
-    use st0x_float_macro::float;
 
     /// Realistic CCTP V2 nonce with non-zero upper bytes -- the actual nonce
     /// from a prod burn that the old u64 validation rejected. Regression guard
@@ -4911,5 +5053,320 @@ mod tests {
         assert_eq!(bridge.amount, Usdc::new(float!(3000)));
         assert_eq!(bridge.started_at, initiated_at);
         assert_eq!(bridge.updated_at, deposit_initiated_at);
+    }
+
+    const BURN_TX: TxHash =
+        fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000aa");
+    const MINT_TX: TxHash =
+        fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000bb");
+
+    #[test]
+    fn holds_rebalance_guard_holds_for_in_progress_and_post_burn_failure() {
+        use RebalanceDirection::{AlpacaToBase, BaseToAlpaca};
+        use UsdcRebalance::*;
+
+        let now = Utc::now();
+        let amount = Usdc::new(float!(400.0));
+        let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
+        let withdrawal_ref = TransferRef::OnchainTx(BURN_TX);
+
+        // In-progress states hold the guard, pre- and post-burn, both directions.
+        assert!(
+            Converting {
+                direction: AlpacaToBase,
+                amount,
+                order_id,
+                initiated_at: now,
+            }
+            .holds_rebalance_guard()
+        );
+        assert!(
+            Withdrawing {
+                direction: BaseToAlpaca,
+                amount,
+                withdrawal_ref: withdrawal_ref.clone(),
+                initiated_at: now,
+            }
+            .holds_rebalance_guard()
+        );
+        assert!(
+            WithdrawalComplete {
+                direction: AlpacaToBase,
+                amount,
+                initiated_at: now,
+                confirmed_at: now,
+            }
+            .holds_rebalance_guard()
+        );
+        assert!(
+            Bridging {
+                direction: BaseToAlpaca,
+                amount,
+                burn_tx_hash: BURN_TX,
+                initiated_at: now,
+                burned_at: now,
+            }
+            .holds_rebalance_guard()
+        );
+        assert!(
+            Attested {
+                direction: AlpacaToBase,
+                amount,
+                burn_tx_hash: BURN_TX,
+                cctp_nonce: TEST_CCTP_NONCE,
+                attestation: vec![],
+                mint_scan_from_block: Some(0),
+                initiated_at: now,
+                attested_at: now,
+            }
+            .holds_rebalance_guard()
+        );
+        assert!(
+            Bridged {
+                direction: BaseToAlpaca,
+                amount,
+                amount_received: amount,
+                fee_collected: Usdc::new(float!(0.0)),
+                burn_tx_hash: BURN_TX,
+                mint_tx_hash: MINT_TX,
+                initiated_at: now,
+                minted_at: now,
+            }
+            .holds_rebalance_guard()
+        );
+        assert!(
+            DepositInitiated {
+                direction: AlpacaToBase,
+                amount,
+                burn_tx_hash: BURN_TX,
+                mint_tx_hash: MINT_TX,
+                deposit_ref: withdrawal_ref.clone(),
+                initiated_at: now,
+                deposit_initiated_at: now,
+            }
+            .holds_rebalance_guard()
+        );
+        // Deposit failure is post-burn/post-mint -> holds the guard.
+        assert!(
+            DepositFailed {
+                direction: BaseToAlpaca,
+                amount,
+                burn_tx_hash: BURN_TX,
+                mint_tx_hash: MINT_TX,
+                deposit_ref: Some(withdrawal_ref),
+                reason: "deposit failed".to_string(),
+                initiated_at: now,
+                failed_at: now,
+            }
+            .holds_rebalance_guard()
+        );
+        // Post-burn bridge failure keeps the guard; pre-burn failure clears it.
+        assert!(
+            BridgingFailed {
+                direction: AlpacaToBase,
+                amount,
+                burn_tx_hash: Some(BURN_TX),
+                cctp_nonce: None,
+                reason: "post-burn".to_string(),
+                initiated_at: now,
+                failed_at: now,
+            }
+            .holds_rebalance_guard()
+        );
+        assert!(
+            !BridgingFailed {
+                direction: AlpacaToBase,
+                amount,
+                burn_tx_hash: None,
+                cctp_nonce: None,
+                reason: "pre-burn".to_string(),
+                initiated_at: now,
+                failed_at: now,
+            }
+            .holds_rebalance_guard()
+        );
+    }
+
+    #[test]
+    fn holds_rebalance_guard_is_direction_aware_for_conversion_and_deposit_terminals() {
+        use RebalanceDirection::{AlpacaToBase, BaseToAlpaca};
+        use UsdcRebalance::*;
+
+        let now = Utc::now();
+        let amount = Usdc::new(float!(400.0));
+        let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
+
+        // ConversionComplete: AlpacaToBase is the pre-withdrawal conversion (still
+        // in progress); BaseToAlpaca is the post-deposit terminal success.
+        assert!(
+            ConversionComplete {
+                direction: AlpacaToBase,
+                amount,
+                filled_amount: amount,
+                initiated_at: now,
+                converted_at: now,
+            }
+            .holds_rebalance_guard()
+        );
+        assert!(
+            !ConversionComplete {
+                direction: BaseToAlpaca,
+                amount,
+                filled_amount: amount,
+                initiated_at: now,
+                converted_at: now,
+            }
+            .holds_rebalance_guard()
+        );
+
+        // DepositConfirmed: AlpacaToBase is terminal; BaseToAlpaca still has the
+        // post-deposit USDC->USD conversion ahead.
+        assert!(
+            !DepositConfirmed {
+                direction: AlpacaToBase,
+                amount,
+                burn_tx_hash: BURN_TX,
+                mint_tx_hash: MINT_TX,
+                initiated_at: now,
+                deposit_confirmed_at: now,
+            }
+            .holds_rebalance_guard()
+        );
+        assert!(
+            DepositConfirmed {
+                direction: BaseToAlpaca,
+                amount,
+                burn_tx_hash: BURN_TX,
+                mint_tx_hash: MINT_TX,
+                initiated_at: now,
+                deposit_confirmed_at: now,
+            }
+            .holds_rebalance_guard()
+        );
+
+        // ConversionFailed is direction-aware: AlpacaToBase's pre-withdrawal
+        // conversion reconciles to source (clear); BaseToAlpaca's post-deposit
+        // conversion is post-mint (hold).
+        assert!(
+            !ConversionFailed {
+                direction: AlpacaToBase,
+                amount,
+                order_id: order_id.clone(),
+                reason: "x".to_string(),
+                initiated_at: now,
+                failed_at: now,
+            }
+            .holds_rebalance_guard()
+        );
+        assert!(
+            ConversionFailed {
+                direction: BaseToAlpaca,
+                amount,
+                order_id,
+                reason: "x".to_string(),
+                initiated_at: now,
+                failed_at: now,
+            }
+            .holds_rebalance_guard()
+        );
+        // Withdrawal failure is always pre-burn -> clears.
+        assert!(
+            !WithdrawalFailed {
+                direction: BaseToAlpaca,
+                amount,
+                withdrawal_ref: TransferRef::OnchainTx(BURN_TX),
+                reason: "x".to_string(),
+                initiated_at: now,
+                failed_at: now,
+            }
+            .holds_rebalance_guard()
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_usdc_rebalance_ids_excludes_clearable_terminals() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let amount = Usdc::new(float!(400.0));
+
+        // Clearable terminal (withdrawal failed, pre-burn) -- must be excluded.
+        let withdrawal_failed = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &withdrawal_failed,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(BURN_TX),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &withdrawal_failed,
+                UsdcRebalanceCommand::FailWithdrawal {
+                    reason: "x".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Post-burn bridge failure -- must be included.
+        let bridge_failed = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &bridge_failed,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(BURN_TX),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(&bridge_failed, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .await
+            .unwrap();
+        store
+            .send(
+                &bridge_failed,
+                UsdcRebalanceCommand::InitiateBridging { burn_tx: BURN_TX },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &bridge_failed,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "x".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // In-progress (mid-withdrawal) -- must be included.
+        let withdrawing = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &withdrawing,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(BURN_TX),
+                },
+            )
+            .await
+            .unwrap();
+
+        let interrupted = interrupted_usdc_rebalance_ids(&pool).await.unwrap();
+        let got: HashSet<UsdcRebalanceId> = interrupted.ids.into_iter().collect();
+
+        assert_eq!(got, HashSet::from([bridge_failed, withdrawing]));
+        assert!(
+            interrupted.unparseable.is_empty(),
+            "well-formed UUID aggregate_ids must not be reported as unparseable"
+        );
     }
 }
