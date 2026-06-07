@@ -1872,6 +1872,14 @@ enum BridgeStage { Burn, Attestation, Mint }
   no websocket option available)
 - Bridge mint transaction requires valid attestation
 - Bridge mint transaction must be confirmed before destination deposit
+- A `receiveMessage()` revert because the CCTP nonce was already used is
+  idempotent success only when destination-chain logs confirm all of the
+  following: (1) a `MessageReceived` event for that nonce exists whose source
+  domain and message body match the attested message; (2) the transaction that
+  emitted that `MessageReceived` also emitted `MintAndWithdraw`. Transaction
+  success is implicit since reverted transactions emit no logs. Any source
+  domain or message body mismatch, or absence of the expected `MintAndWithdraw`,
+  means the revert remains a bridge mint failure
 - Destination deposit must be confirmed to complete rebalancing (for
   AlpacaToBase) or before post-deposit conversion (for BaseToAlpaca)
 - Can mark failed from any non-terminal state

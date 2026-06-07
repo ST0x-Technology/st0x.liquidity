@@ -203,6 +203,10 @@ impl crate::Attestation for AttestationResponse {
 const NONCE_INDEX: usize = 12;
 const NONCE_SIZE: usize = size_of::<FixedBytes<32>>();
 const MIN_MESSAGE_LENGTH: usize = NONCE_INDEX + NONCE_SIZE;
+const SOURCE_DOMAIN_INDEX: usize = 4;
+const DESTINATION_DOMAIN_INDEX: usize = 8;
+const DOMAIN_SIZE: usize = size_of::<u32>();
+const MESSAGE_BODY_INDEX: usize = 148;
 
 /// Extracts the 32-byte nonce from a CCTP V2 message.
 ///
@@ -218,6 +222,41 @@ fn extract_nonce_from_message(message: &[u8]) -> Result<FixedBytes<32>, CctpErro
     Ok(FixedBytes::<32>::from_slice(
         &message[NONCE_INDEX..NONCE_INDEX + 32],
     ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CctpReceivedMessage<'a> {
+    source_domain: u32,
+    destination_domain: u32,
+    nonce: B256,
+    message_body: &'a [u8],
+}
+
+fn extract_domain(message: &[u8], index: usize) -> Result<u32, CctpError> {
+    let Some(domain) = message.get(index..index + DOMAIN_SIZE) else {
+        return Err(CctpError::MessageTooShortForRecovery {
+            length: message.len(),
+        });
+    };
+
+    Ok(u32::from_be_bytes([
+        domain[0], domain[1], domain[2], domain[3],
+    ]))
+}
+
+fn parse_received_message(message: &[u8]) -> Result<CctpReceivedMessage<'_>, CctpError> {
+    if message.len() < MESSAGE_BODY_INDEX {
+        return Err(CctpError::MessageTooShortForRecovery {
+            length: message.len(),
+        });
+    }
+
+    Ok(CctpReceivedMessage {
+        source_domain: extract_domain(message, SOURCE_DOMAIN_INDEX)?,
+        destination_domain: extract_domain(message, DESTINATION_DOMAIN_INDEX)?,
+        nonce: FixedBytes::<32>::from_slice(&message[NONCE_INDEX..NONCE_INDEX + NONCE_SIZE]),
+        message_body: &message[MESSAGE_BODY_INDEX..],
+    })
 }
 
 /// Runtime context for constructing a [`CctpBridge`].
@@ -299,6 +338,22 @@ pub enum CctpError {
     MessageTooShort { length: usize },
     #[error("Attested message carried an all-zero nonce: Circle returned a placeholder bytes32(0)")]
     ZeroNonce,
+    #[error("Message too short for receiveMessage recovery: got {length} bytes, need at least 148")]
+    MessageTooShortForRecovery { length: usize },
+    #[error("CCTP message destination domain mismatch: expected {expected}, got {actual}")]
+    MessageDestinationDomainMismatch { expected: u32, actual: u32 },
+    #[error("already-minted CCTP nonce {nonce} had no matching MessageReceived log")]
+    AlreadyMintedMessageNotFound { nonce: B256 },
+    #[error(
+        "recovered CCTP MessageReceived log for nonce {nonce} did not match the attested message"
+    )]
+    RecoveredMintMessageMismatch { nonce: B256 },
+    #[error("recovered CCTP mint log for nonce {nonce} is missing transaction hash or log index")]
+    RecoveredMintLogMissingTxHash { nonce: B256 },
+    #[error("recovered CCTP mint transaction reverted: {tx_hash}")]
+    RecoveredMintReceiptReverted { tx_hash: TxHash },
+    #[error("MintAndWithdraw event not found in recovered CCTP mint transaction: {tx_hash}")]
+    RecoveredMintAndWithdrawEventNotFound { tx_hash: TxHash },
     #[error("Fee calculation overflow")]
     FeeCalculationOverflow,
     #[error("Float operation error: {0}")]
@@ -600,10 +655,14 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     ) -> Result<MintReceipt, CctpError> {
         match direction {
             BridgeDirection::EthereumToBase => {
-                self.base.claim::<Registry>(message, attestation).await
+                self.base
+                    .claim::<Registry>(direction, message, attestation)
+                    .await
             }
             BridgeDirection::BaseToEthereum => {
-                self.ethereum.claim::<Registry>(message, attestation).await
+                self.ethereum
+                    .claim::<Registry>(direction, message, attestation)
+                    .await
             }
         }
     }
@@ -612,6 +671,52 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     fn with_circle_api_base(mut self, base_url: String) -> Self {
         self.circle_api_base = base_url;
         self
+    }
+
+    /// Returns the receipt of an already-executed mint for the attested
+    /// `message` on the destination chain of `direction`, or `None` if its nonce
+    /// is unused.
+    ///
+    /// Used by crash-recovery resume to avoid re-submitting `receiveMessage`
+    /// (which reverts on a consumed nonce) when a mint already landed but its
+    /// confirming event was not yet persisted. Passing the full message (not
+    /// just the nonce) lets the reconstruction match the on-chain log against
+    /// the attested source domain and body.
+    pub async fn find_existing_mint(
+        &self,
+        direction: BridgeDirection,
+        message: &[u8],
+    ) -> Result<Option<crate::MintReceipt>, CctpError> {
+        let receipt = match direction {
+            BridgeDirection::EthereumToBase => {
+                self.base
+                    .find_existing_mint::<OpenChainErrorRegistry>(direction, message)
+                    .await?
+            }
+            BridgeDirection::BaseToEthereum => {
+                self.ethereum
+                    .find_existing_mint::<OpenChainErrorRegistry>(direction, message)
+                    .await?
+            }
+        };
+
+        Ok(receipt.map(|receipt| crate::MintReceipt {
+            tx: receipt.tx,
+            amount: receipt.amount,
+            fee: receipt.fee_collected,
+        }))
+    }
+
+    /// Returns `holder`'s USDC balance on Base, the destination chain for
+    /// AlpacaToBase mints.
+    ///
+    /// Used as an idempotency guard before re-depositing on resume from `Bridged`:
+    /// if the freshly minted USDC is no longer in the wallet, the vault deposit
+    /// already landed, so re-submitting it would double-deposit (or revert).
+    pub async fn base_usdc_balance(&self, holder: Address) -> Result<U256, CctpError> {
+        self.base
+            .usdc_balance::<OpenChainErrorRegistry>(holder)
+            .await
     }
 }
 
@@ -1967,7 +2072,11 @@ mod tests {
         // Call claim() directly on the Evm instance
         let mint_receipt = bridge
             .base
-            .claim::<NoOpErrorRegistry>(message_with_nonce, attestation)
+            .claim::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce,
+                attestation,
+            )
             .await
             .unwrap();
 
@@ -2006,7 +2115,11 @@ mod tests {
         // Call claim() directly on the Evm instance
         let mint_receipt = bridge
             .ethereum
-            .claim::<NoOpErrorRegistry>(message_with_nonce, attestation)
+            .claim::<NoOpErrorRegistry>(
+                BridgeDirection::BaseToEthereum,
+                message_with_nonce,
+                attestation,
+            )
             .await
             .unwrap();
 
@@ -2019,6 +2132,189 @@ mod tests {
             mint_receipt.fee_collected,
             U256::ZERO,
             "fee should be 0 in mock"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_existing_mint_returns_none_before_mint_and_recovers_receipt_after() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(2_500_000u64); // 2.5 USDC
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        // Before the mint the nonce is unconsumed, so there is nothing to recover.
+        let before = bridge
+            .find_existing_mint(BridgeDirection::EthereumToBase, &message_with_nonce)
+            .await
+            .unwrap();
+        assert_eq!(
+            before, None,
+            "unused nonce must report no existing mint, got: {before:?}"
+        );
+
+        let mint_receipt = bridge
+            .mint_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce.clone(),
+                attestation,
+            )
+            .await
+            .unwrap();
+
+        // After the mint the nonce is consumed; recovery reconstructs the exact
+        // receipt (tx + net amount + fee) from the on-chain events without re-minting.
+        let recovered = bridge
+            .find_existing_mint(BridgeDirection::EthereumToBase, &message_with_nonce)
+            .await
+            .unwrap()
+            .expect("consumed nonce must report the existing mint");
+
+        assert_eq!(
+            recovered.tx, mint_receipt.tx,
+            "recovered mint tx must match"
+        );
+        assert_eq!(
+            recovered.amount, mint_receipt.amount,
+            "recovered net amount must match the MintAndWithdraw event"
+        );
+        assert_eq!(
+            recovered.fee, mint_receipt.fee_collected,
+            "recovered fee must match the MintAndWithdraw event"
+        );
+
+        // Wrong destination domain: this message was minted to Base, so trying to
+        // reconstruct it as a Base->Ethereum transfer must reject, not recover.
+        let wrong_direction_error = bridge
+            .base
+            .find_existing_mint::<NoOpErrorRegistry>(
+                BridgeDirection::BaseToEthereum,
+                &message_with_nonce,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                wrong_direction_error,
+                CctpError::MessageDestinationDomainMismatch {
+                    expected: TEST_ETHEREUM_DOMAIN,
+                    actual: TEST_BASE_DOMAIN,
+                }
+            ),
+            "wrong destination domain must not recover: {wrong_direction_error:?}"
+        );
+
+        // A message whose body no longer matches the on-chain MessageReceived log
+        // for its (consumed) nonce must not be recovered.
+        let nonce = extract_nonce_from_message(&message_with_nonce).unwrap();
+        let mut mismatched_message = message_with_nonce.to_vec();
+        assert!(
+            mismatched_message.len() > MESSAGE_BODY_INDEX,
+            "test CCTP message must include a body byte to mutate"
+        );
+        mismatched_message[MESSAGE_BODY_INDEX] ^= 0xFF;
+
+        let mismatched_message_error = bridge
+            .base
+            .find_existing_mint::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &mismatched_message,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                mismatched_message_error,
+                CctpError::RecoveredMintMessageMismatch { nonce: event_nonce }
+                    if event_nonce == nonce
+            ),
+            "message-body mismatch must not recover: {mismatched_message_error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_recovers_when_receive_message_nonce_already_used() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(3_000_000u64);
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        let first_mint = bridge
+            .mint_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce.clone(),
+                attestation.clone(),
+            )
+            .await
+            .unwrap();
+
+        // A second mint of the same attested message hits the already-used-nonce
+        // revert; claim() recovers the original mint instead of failing.
+        let recovered_mint = bridge
+            .mint_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce.clone(),
+                attestation,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            recovered_mint.tx, first_mint.tx,
+            "recovery must return the original mint transaction"
+        );
+        assert_eq!(recovered_mint.amount, first_mint.amount);
+        assert_eq!(recovered_mint.fee_collected, first_mint.fee_collected);
+
+        // A revert whose nonce is NOT marked used on-chain is not an already-minted
+        // case: the reactive path must re-surface the original submit error rather
+        // than fabricate a recovery outcome. Mutating the nonce yields a
+        // never-minted nonce on a structurally valid message (usedNonces == 0).
+        let sentinel_error = || EvmError::Reverted {
+            tx_hash: TxHash::repeat_byte(0xEE),
+        };
+        let mut unused_nonce_message = message_with_nonce.to_vec();
+        unused_nonce_message[NONCE_INDEX..NONCE_INDEX + NONCE_SIZE].fill(0xAB);
+
+        let unused_nonce_error = bridge
+            .base
+            .recover_already_minted::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &unused_nonce_message,
+                sentinel_error(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                unused_nonce_error,
+                CctpError::Evm(EvmError::Reverted { tx_hash })
+                    if tx_hash == TxHash::repeat_byte(0xEE)
+            ),
+            "unused nonce must propagate the original submit error: {unused_nonce_error:?}"
         );
     }
 
@@ -2109,6 +2405,43 @@ mod tests {
             .chain(nonce)
             .chain(trailer.iter().copied())
             .collect_vec()
+    }
+
+    #[test]
+    fn parse_received_message_extracts_recovery_fields() {
+        let nonce = [0xAB; 32];
+        let body = [0x01, 0x02, 0x03];
+        let mut message = vec![0u8; MESSAGE_BODY_INDEX + body.len()];
+        message[SOURCE_DOMAIN_INDEX..SOURCE_DOMAIN_INDEX + DOMAIN_SIZE]
+            .copy_from_slice(&TEST_ETHEREUM_DOMAIN.to_be_bytes());
+        message[DESTINATION_DOMAIN_INDEX..DESTINATION_DOMAIN_INDEX + DOMAIN_SIZE]
+            .copy_from_slice(&TEST_BASE_DOMAIN.to_be_bytes());
+        message[NONCE_INDEX..NONCE_INDEX + NONCE_SIZE].copy_from_slice(&nonce);
+        message[MESSAGE_BODY_INDEX..].copy_from_slice(&body);
+
+        let parsed = parse_received_message(&message).unwrap();
+
+        assert_eq!(parsed.source_domain, TEST_ETHEREUM_DOMAIN);
+        assert_eq!(parsed.destination_domain, TEST_BASE_DOMAIN);
+        assert_eq!(parsed.nonce, FixedBytes::from(nonce));
+        assert_eq!(parsed.message_body, body);
+    }
+
+    #[test]
+    fn parse_received_message_rejects_messages_without_body_offset() {
+        let message = [0u8; MESSAGE_BODY_INDEX - 1];
+
+        let err = parse_received_message(&message).unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                CctpError::MessageTooShortForRecovery {
+                    length
+                } if length == MESSAGE_BODY_INDEX - 1
+            ),
+            "expected MessageTooShortForRecovery, got: {err:?}"
+        );
     }
 
     #[test]
