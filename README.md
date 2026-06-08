@@ -318,8 +318,6 @@ Workspace crates:
   `Symbol`, `FractionalShares`, `Usdc`, `Usd`, and related domain types
 - **`st0x-float-serde`** (`crates/float-serde/`) - Shared Rain Float formatting
   and serde helpers for workspace wire formats
-- **`st0x-finance`** (`crates/finance/`) - Core financial domain types
-  (`Symbol`, `FractionalShares`, `Usdc`, etc.) shared across crates
 - **`st0x-float-macro`** (`crates/float-macro/`) - Proc-macro for compile-time
   `Float` literals (`float!(1.5)`)
 
