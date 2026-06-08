@@ -40,7 +40,7 @@ in
   };
 
   age.secrets."tailscale-authkey-${environment}" = {
-    file = ./secret/tailscale-authkey-${environment}.age;
+    file = ../secret/tailscale-authkey-${environment}.age;
     mode = "0400";
   };
 
