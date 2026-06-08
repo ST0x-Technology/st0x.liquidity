@@ -89,7 +89,6 @@ Current broker support is limited to `alpaca-broker-api` and `dry-run`.
 
 ```bash
 cargo run --bin server -- --config path/to/config.toml --secrets path/to/secrets.toml
-cargo run --bin reporter -- --config path/to/config.toml
 ```
 
 Manual wrap of tokenized equity into wrapped vault shares (requires rebalancing
@@ -158,16 +157,16 @@ and rollbacks without affecting other services.
 
 ### Key Files
 
-| File                 | Purpose                                                |
-| -------------------- | ------------------------------------------------------ |
-| `os.nix`             | NixOS system configuration (services, firewall, users) |
-| `deploy.nix`         | deploy-rs profiles and deployment wrappers             |
-| `rust.nix`           | Nix derivation for Rust binaries                       |
-| `keys.nix`           | SSH public keys and role-based access                  |
-| `config/secrets.nix` | ragenix secret declarations                            |
-| `config/*.toml.age`  | Encrypted service configs (decrypted at deploy)        |
-| `infra/`             | Terraform for DigitalOcean infrastructure              |
-| `disko.nix`          | Disk partitioning for nixos-anywhere bootstrap         |
+| File                | Purpose                                                |
+| ------------------- | ------------------------------------------------------ |
+| `os.nix`            | NixOS system configuration (services, firewall, users) |
+| `deploy.nix`        | deploy-rs profiles and deployment wrappers             |
+| `rust.nix`          | Nix derivation for Rust binaries                       |
+| `keys.nix`          | SSH public keys and role-based access                  |
+| `infra/secrets.nix` | ragenix secret declarations                            |
+| `secret/*.toml.age` | Encrypted service configs (decrypted at deploy)        |
+| `infra/`            | Terraform for DigitalOcean infrastructure              |
+| `disko.nix`         | Disk partitioning for nixos-anywhere bootstrap         |
 
 ### Deploy Commands
 
@@ -220,10 +219,10 @@ using its SSH key, mounting cleartext to `/run/agenix/` (tmpfs).
 
 ```bash
 # Edit an encrypted config
-nix run .#secret config/st0x-hedge.toml.age
+nix run .#secret secret/st0x-hedge.toml.age
 
 # Re-encrypt all secrets after key changes
-ragenix --rules ./config/secrets.nix -r
+ragenix --rules ./infra/secrets.nix -r
 ```
 
 Key access is managed via roles in `keys.nix`:
@@ -297,12 +296,6 @@ the bot cycles liquidity back through hedging and rebalancing.
 
 Open `http://localhost:5173` to watch the dashboard. Press `Ctrl-C` to stop.
 
-## P&L Tracking
-
-The P&L reporter (`cargo run --bin reporter`) calculates realized profit/loss
-using FIFO accounting and writes metrics to the `metrics_pnl` table for Grafana
-visualization. This subsystem is currently being reworked.
-
 ## Project Structure
 
 ### Cargo Workspace
@@ -310,7 +303,7 @@ visualization. This subsystem is currently being reworked.
 Workspace crates:
 
 - **`st0x-hedge`** (root) - Main arbitrage bot: event loop, CQRS/ES aggregates,
-  conductor, reporter, dashboard backend, and CLI
+  conductor, dashboard backend, and CLI
 - **`st0x-dto`** (`crates/dto/`) - Dashboard DTOs and TypeScript binding
   generation
 - **`st0x-event-sorcery`** (`crates/event-sorcery/`) - CQRS/event-sourcing
@@ -323,6 +316,10 @@ Workspace crates:
 - **`st0x-evm`** (`crates/evm/`) - EVM wallet, provider, and test-chain support
 - **`st0x-float-serde`** (`crates/float-serde/`) - Shared Rain Float formatting
   and serde helpers for workspace wire formats
+- **`st0x-finance`** (`crates/finance/`) - Core financial domain types
+  (`Symbol`, `FractionalShares`, `Usdc`, etc.) shared across crates
+- **`st0x-float-macro`** (`crates/float-macro/`) - Proc-macro for compile-time
+  `Float` literals (`float!(1.5)`)
 
 ### Infrastructure
 
@@ -334,10 +331,15 @@ rust.nix                   # Rust package derivation
 disko.nix                  # Disk partitioning for bootstrap
 keys.nix                   # SSH keys and role-based access
 config/
+├── prod/
+│   └── st0x-hedge.toml   # plaintext prod service config
+└── staging/
+    └── st0x-hedge.toml   # plaintext staging service config
+infra/
 ├── secrets.nix            # ragenix secret declarations
-├── st0x-hedge.toml        # plaintext service config
-└── st0x-hedge.toml.age    # encrypted service secrets
-infra/                     # Terraform (DigitalOcean)
+└── ...                    # Terraform (DigitalOcean)
+secret/
+└── st0x-hedge.toml.age   # encrypted service secrets
 dashboard/                 # SvelteKit operations dashboard
 .github/workflows/
 ├── ci.yaml                # Build, test, clippy, dashboard

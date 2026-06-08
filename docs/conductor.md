@@ -221,24 +221,26 @@ hedging pipeline:
 ### AccountantCtx
 
 Defined in `src/trading/onchain/trade_accountant.rs`. Bundles all dependencies
-the job needs: config, symbol cache, EVM provider, CQRS frameworks, vault
-registry, executor. Wrapped in `Arc` and injected via apalis `Data`.
+the job needs: config, symbol cache, Pyth feed ID cache, EVM provider, orderbook
+address, CQRS frameworks, vault registry, executor, database pool, and job
+queue. Wrapped in `Arc` and injected via apalis `Data`.
 
 ## Conductor assembly
 
 `builder::spawn()` (`src/conductor/builder.rs`) uses `#[bon::builder]` to
-construct a running `Conductor`. Required parameters: `ConductorCtx` (shared
-dependencies), `DexTradeAccountingJobQueue`, `DexEventStreams`. Optional:
-`executor_maintenance`, `rebalancer`.
+construct a running `Conductor`. Takes a `ConductorCtx` (shared dependencies)
+plus per-subsystem job queues, schedulers, and optional handles for rebalancing
+and executor maintenance.
 
 `ConductorCtx` bundles the shared dependencies (config, symbol cache, provider,
-executor, CQRS frameworks, execution threshold, wallet polling config).
+executor, CQRS frameworks, pool, execution threshold, wallet polling config,
+optional `tokenizer: Option<Arc<dyn Tokenizer>>`, shutdown token).
 
 `Conductor` lifecycle:
 
-- `run()` -- the single entry point. Sets up apalis tables, CQRS frameworks,
-  determines cutoff block, backfills historical events, then calls
-  `builder::spawn()` to start the runtime
+- `run()` -- the single entry point. Connects the HTTP provider, sets up apalis
+  tables and CQRS frameworks, seeds the vault registry, requeues orphaned jobs,
+  then calls `builder::spawn()` to start the runtime
 - `wait_for_completion()` -- `tokio::select!` across supervisor, apalis monitor,
   and periodic job cleanup (see periodic cleanup below); returns when any exits
 - `abort_all()` -- shuts down supervisor, aborts all task handles
@@ -246,16 +248,19 @@ executor, CQRS frameworks, execution threshold, wallet polling config).
 ## Startup sequencing
 
 ```
-Phase 1 (parallel):  connect_http | setup_cqrs | setup_apalis_tables
-Phase 2 (parallel):  get_cutoff_block | seed_vaults | setup_rebalancing
-Phase 3 (sequential): backfill checkpoint gap to job queue
-Phase 4:              builder::spawn() starts the runtime
+Phase 1: connect_http (with RPC probe) | setup_apalis_tables | build CQRS stores
+Phase 2: seed_vault_registry (inline) | setup_rebalancing (optional)
+Phase 3: requeue_orphaned jobs | hydrate inventory | recover pending orders
+Phase 4: builder::spawn() starts supervisor + apalis workers
 ```
 
-The trade accounting worker starts only after the initial backfill completes.
-Ingestion is a checkpoint-driven `eth_getLogs` poll, not a live subscription, so
-no events are missed across downtime: the monitor always resumes from the
-persisted checkpoint and re-scans any gap.
+There is no WebSocket and no pre-runtime backfill pass. `Conductor::run()`
+creates a single HTTP provider before spawn; `OrderFillMonitor` clones it and,
+on each tick, derives the confirmation cutoff and enqueues a `BackfillRange` for
+any gap since the persisted checkpoint. The backfill and trade-accounting
+workers start together in Phase 4. Ingestion is checkpoint-driven `eth_getLogs`
+polling, not a live subscription, so no events are missed across downtime: the
+monitor always resumes from the persisted checkpoint and re-scans any gap.
 
 Backfill reads the last successful checkpoint from SQLite. The configured
 `deployment_block` seeds only the first run; subsequent runs start at

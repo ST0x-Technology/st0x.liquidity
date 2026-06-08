@@ -11,7 +11,7 @@ Types follow a strict naming convention based on their role:
 
 | Suffix     | Meaning                  | Source                               | Example                       |
 | ---------- | ------------------------ | ------------------------------------ | ----------------------------- |
-| `*Env`     | CLI args / env vars      | clap-powered struct                  | `ServerEnv`, `ReporterEnv`    |
+| `*Env`     | CLI args / env vars      | clap-powered struct                  | `Env`, `CliEnv`               |
 | `*Config`  | Non-secret settings      | Plaintext TOML (`config/*.toml`)     | `BrokerConfig`, `EvmConfig`   |
 | `*Secrets` | Secret credentials       | Encrypted TOML (`secret/*.toml.age`) | `BrokerSecrets`, `EvmSecrets` |
 | `*Ctx`     | Combined runtime context | Assembled from runtime state         | `BrokerCtx`, `EvmCtx`         |
@@ -159,13 +159,5 @@ equities:
 - **Redemption**: The reverse - burn onchain tokens to recover broker-held
   shares (e.g., 100 tAAPL tokens -> 100 AAPL shares at Alpaca).
 
-Both operations are tracked as CQRS event-sourced aggregates
-(`TokenizedEquityMint`, `EquityRedemption`) providing an immutable audit trail.
-
-### Reporter
-
-A standalone service (separate binary) that computes P&L metrics from trade
-history. It uses FIFO inventory accounting to calculate realized P&L, cumulative
-P&L, and net position for each symbol. Runs on a polling interval against the
-same SQLite database as the server, but requires no secrets (only a plaintext
-config with the database path).
+Both operations provide an immutable audit trail, tracked as CQRS event-sourced
+aggregates (`TokenizedEquityMint`, `EquityRedemption`).
