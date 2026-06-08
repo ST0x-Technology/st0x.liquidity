@@ -5,6 +5,15 @@ on:
   push:
     branches-ignore:
       - 'graphite-base/**'
+    # Docs/markdown-only changes skip the real CI. The companion ci-docs.yaml
+    # workflow reports the required backend/dashboard/hooks checks green for
+    # those pushes so docs-only PRs stay mergeable. Keep this list in sync with
+    # the `paths:` filter in ci-docs.yaml.
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'AGENTS.md'
+      - 'README*'
 
 concurrency:
   group: ${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}-${{ github.ref == 'refs/heads/master' && github.sha || ''}}

@@ -1,0 +1,45 @@
+name: CI
+
+# Companion to ci.yaml. Docs/markdown-only pushes are skipped by ci.yaml's
+# `paths-ignore`, but `backend`, `dashboard`, and `hooks` are required status
+# checks on master -- without a reporting workflow those checks stay pending
+# forever and block docs-only PRs from merging. This workflow runs ONLY on
+# docs-only pushes (the inverse `paths:` filter) and reports those three check
+# contexts green. Job names here MUST match the required-check contexts in
+# ci.yaml (`backend`, `dashboard`, `hooks`), and the `paths:` list MUST stay in
+# sync with ci.yaml's `paths-ignore:`.
+#
+# NOTE: a push that touches BOTH docs and code matches both this filter and
+# ci.yaml's, so both workflows run and each emits a `backend`/`dashboard`/`hooks`
+# check. Verify the branch-protection behavior for that mixed case before relying
+# on it (see RAI-895).
+
+on:
+  push:
+    branches-ignore:
+      - 'graphite-base/**'
+    paths:
+      - '**/*.md'
+      - 'docs/**'
+      - 'AGENTS.md'
+      - 'README*'
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: backend
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - run: echo "Docs-only change - backend validation not required."
+
+  dashboard:
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - run: echo "Docs-only change - dashboard build not required."
+
+  hooks:
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - run: echo "Docs-only change - hooks not required."
