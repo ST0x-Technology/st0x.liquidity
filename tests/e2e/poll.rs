@@ -371,7 +371,7 @@ pub async fn poll_for_hedge_completion(
 ///
 /// Jobs that retry with exponential backoff (e.g., due to CQRS aggregate
 /// conflicts) may still be in-flight after higher-level conditions are met.
-/// Use this instead of an immediate `count_done_jobs` assertion.
+/// Use this instead of an immediate done-count assertion.
 ///
 /// The self-rescheduling `CheckPositions` job is excluded from both totals,
 /// since it always leaves exactly one `Pending` row in the queue waiting for
@@ -441,32 +441,6 @@ pub async fn count_events(pool: &SqlitePool, aggregate_type: &str) -> anyhow::Re
         .bind(aggregate_type)
         .fetch_one(pool)
         .await?;
-
-    Ok(row.0)
-}
-
-/// Counts total apalis jobs enqueued, excluding the periodic
-/// `CheckPositions` job. CheckPositions reschedules itself on a
-/// wall-clock interval, so its count is a function of test duration
-/// rather than pipeline work and would dwarf the signal in
-/// crash-recovery comparisons.
-pub async fn count_jobs(pool: &SqlitePool) -> anyhow::Result<i64> {
-    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type != ?")
-        .bind(st0x_hedge::check_positions_job_type())
-        .fetch_one(pool)
-        .await?;
-
-    Ok(row.0)
-}
-
-/// Counts apalis jobs that have been processed (status = 'Done'),
-/// excluding the periodic `CheckPositions` job (see `count_jobs`).
-pub async fn count_done_jobs(pool: &SqlitePool) -> anyhow::Result<i64> {
-    let row: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM Jobs WHERE status = 'Done' AND job_type != ?")
-            .bind(st0x_hedge::check_positions_job_type())
-            .fetch_one(pool)
-            .await?;
 
     Ok(row.0)
 }

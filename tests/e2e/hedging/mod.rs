@@ -551,8 +551,6 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
     .await?;
 
     let ref_pool = connect_db(&ref_infra.db_path).await?;
-    let ref_jobs = count_jobs(&ref_pool).await?;
-    let ref_done_jobs = count_done_jobs(&ref_pool).await?;
     let ref_onchain_events = count_events(&ref_pool, "OnChainTrade").await?;
     let ref_offchain_events = count_events(&ref_pool, "OffchainOrder").await?;
     ref_pool.close().await;
@@ -650,44 +648,10 @@ async fn crash_recovery_eventual_consistency() -> anyhow::Result<()> {
     .await?;
 
     let crash_pool = connect_db(&crash_infra.db_path).await?;
-    let crash_jobs = count_jobs(&crash_pool).await?;
-    let crash_done_jobs = count_done_jobs(&crash_pool).await?;
     let crash_onchain_events = count_events(&crash_pool, "OnChainTrade").await?;
     let crash_offchain_events = count_events(&crash_pool, "OffchainOrder").await?;
     crash_pool.close().await;
 
-    // Crash recovery may produce slightly more or fewer jobs than the
-    // reference run. More jobs come from re-running backfill on restart
-    // and the CheckPositions scan enqueueing extra PlaceHedge jobs
-    // during recovery (idempotent -- the aggregate rejects duplicates
-    // via PendingExecution). Fewer jobs come from the duplicate-trade
-    // shortcut in `process_queued_trade`: a trade already processed
-    // before the crash skips PollOrderStatus / ReconcileOrderFill
-    // enqueuing on the second pass. Bound the delta in both directions
-    // to catch runaway re-enqueueing while tolerating these legitimate
-    // differences.
-    //
-    // `MAX_JOB_DELTA` is a safety margin, not an empirically measured
-    // bound. Bidirectional +/-4 catches gross re-enqueue regressions while
-    // tolerating the legitimate +/-1-3 spread observed during development.
-    // Revisit if recovery timing or backfill/monitor cadence changes -- a
-    // sudden spike past 4 indicates duplicate enqueueing, a drop below
-    // -4 indicates skipped recovery work.
-    //
-    // The bidirectional bound is intentionally loose: it cannot catch a
-    // recovery bug that silently skips a *required* poll re-enqueue. The
-    // direct invariant check below ("no pollable orders remain after
-    // recovery completes") covers that case.
-    const MAX_JOB_DELTA: i64 = 4;
-
-    assert!(
-        (crash_jobs - ref_jobs).abs() <= MAX_JOB_DELTA,
-        "expected {ref_jobs}±{MAX_JOB_DELTA} jobs but got {crash_jobs}",
-    );
-    assert!(
-        (crash_done_jobs - ref_done_jobs).abs() <= MAX_JOB_DELTA,
-        "expected {ref_done_jobs}±{MAX_JOB_DELTA} done jobs but got {crash_done_jobs}",
-    );
     assert_eq!(
         crash_onchain_events, ref_onchain_events,
         "Crash recovery should persist the exact same OnChainTrade event count as reference",

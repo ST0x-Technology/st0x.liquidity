@@ -1,6 +1,15 @@
 let
   inherit (import ../keys.nix) roles;
-  services = import ../services.nix;
+  # services.nix is `{ lib }: { byName, enabled }`. These rules only read each
+  # service's `kind`/`encryptedSecret` from the `byName` map; `enabled` (the
+  # sole consumer of `lib`) is never forced here, so a stub `lib` keeps this
+  # rules file evaluable under ragenix's pure, NIX_PATH-free eval.
+  services =
+    (import ../services.nix {
+      lib = {
+        filterAttrs = _: attrs: attrs;
+      };
+    }).byName;
   # Deduplicate keys across environments (st0x-op appears in both roles).
   # Uses builtins only so this rules file stays pure — ragenix evaluates it
   # without NIX_PATH, so `import <nixpkgs/lib>` would be fragile.

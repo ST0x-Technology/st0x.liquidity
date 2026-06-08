@@ -110,12 +110,22 @@ excellent async ecosystem for handling concurrent trading flows.
 
 #### Raindex Event Monitor
 
-- WebSocket or polling connection to Ethereum node
-- Filter for events involving any orders from the arbitrageur's owner address
-  (Clear and TakeOrder events)
+- Continuous HTTP `eth_getLogs` polling over a single transport -- no WebSocket.
+  Every `order_fill_poll_interval` seconds the monitor enqueues a backfill range
+  covering the blocks since the persisted checkpoint, capped at
+  `tip - required_confirmations`; the backfill worker fetches the `Clear` and
+  `TakeOrder` logs for the arbitrageur's owner address and advances the
+  checkpoint only on success.
+- WebSocket `.watch()` filter polling and `eth_subscribe`/`subscribe_logs` are
+  deliberately rejected: on a load-balanced RPC, filters live on a single
+  backend node so most polls are round-robined to nodes returning `-32601`, and
+  push subscriptions are sticky to one node and silently stall. HTTP polling
+  with a persisted checkpoint and explicit, durable retries is the chosen
+  ingestion path (aligned with the issuance bot).
 - Parse events to extract: symbol, quantity, price, direction
 - Generate unique identifiers using transaction hash and log index for trade
-  tracking
+  tracking (idempotent ingestion -- overlapping ranges dedupe by
+  `(tx_hash, log_index)`)
 
 #### Orchestration
 
@@ -137,9 +147,10 @@ All work flows through one of these patterns:
   order. Durable across process restarts. Examples: trade accounting, vault
   discovery, rebalancing operations.
 - **Long-running streaming services** (task-supervisor): Continuous async tasks
-  that maintain connections and restart with exponential backoff on failure.
-  Ephemeral resources (WebSocket connections) are created inside `run()` so each
-  restart establishes a fresh connection. Examples: DEX event monitoring.
+  that tick on a fixed interval (or maintain a connection) and restart with
+  exponential backoff on failure. Transient per-tick errors are logged and
+  swallowed; the supervisor restarts only on a panic. Example: the DEX order
+  fill monitor, which polls `eth_getLogs` and enqueues backfill ranges.
 - **Scheduled jobs** (apalis, future): Cron/interval-triggered work replacing
   manual polling loops. Examples: inventory polling, executor maintenance.
 - **Lifecycle workflows** (apalis-workflow, future): Durable multi-step
@@ -154,7 +165,7 @@ Startup has explicit dependency phases with parallelism where possible:
 
 ```mermaid
 graph LR
-    connect_ws --> get_cutoff_block
+    connect_http --> get_cutoff_block
     setup_cqrs --> get_cutoff_block
     setup_cqrs --> seed_vaults
     setup_cqrs --> setup_rebalancing
@@ -165,10 +176,11 @@ graph LR
     backfill --> start_runtime
 ```
 
-The trade accounting worker starts only after backfill completes, guaranteeing
-historical events are processed before live events. The WebSocket subscription
-is established early, so no events are missed -- they buffer until the runtime
-starts.
+The trade accounting worker starts only after the initial backfill completes,
+guaranteeing historical events are processed in order. Because ingestion is a
+checkpoint-driven `eth_getLogs` poll rather than a live subscription, no events
+can be missed across downtime: the order fill monitor always resumes from the
+persisted checkpoint and re-scans any gap.
 
 Historical backfill resumes from a persisted database checkpoint. The configured
 `deployment_block` is only the initial seed for the first startup or for an

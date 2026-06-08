@@ -675,12 +675,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_run_function_websocket_connection_error() {
+    async fn test_run_function_unreachable_rpc_fails_startup() {
         let mut ctx = create_test_ctx_with_order_owner(address!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
         let pool = create_test_pool().await;
-        ctx.evm.ws_rpc_url = "ws://invalid.nonexistent.url:8545".parse().unwrap();
+        // Port 1 refuses connections immediately, so the startup RPC probe
+        // fails fast rather than hanging on a retry loop.
+        ctx.evm.rpc_url = "http://127.0.0.1:1".parse().unwrap();
         let error = Box::pin(run_conductor_session(
             ctx,
             pool,
@@ -696,8 +698,8 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("failed to connect websocket provider"),
-            "expected websocket provider connection failure, got: {error:#}"
+                .contains("failed to reach RPC endpoint at startup"),
+            "expected startup RPC probe failure, got: {error:#}"
         );
     }
 
@@ -706,7 +708,7 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(address!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
-        ctx.evm.ws_rpc_url = "ws://invalid.nonexistent.localhost:9999".parse().unwrap();
+        ctx.evm.rpc_url = "http://127.0.0.1:1".parse().unwrap();
         let pool = create_test_pool().await;
         let error = Box::pin(run_conductor_session(
             ctx,
@@ -723,8 +725,8 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("failed to connect websocket provider"),
-            "expected websocket provider connection failure, got: {error:#}"
+                .contains("failed to reach RPC endpoint at startup"),
+            "expected startup RPC probe failure, got: {error:#}"
         );
     }
 

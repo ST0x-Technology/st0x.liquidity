@@ -15,8 +15,11 @@ pub struct EvmConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvmSecrets {
-    #[serde(rename = "ws_rpc_url")]
-    pub ws: Url,
+    /// HTTP RPC URL for the orderbook chain. Drives continuous `eth_getLogs`
+    /// fill polling and all read-only contract calls (single transport, no
+    /// WebSocket).
+    #[serde(rename = "rpc_url")]
+    pub rpc: Url,
     /// Base chain RPC URL for wallet operations. Required when `[wallet]`
     /// is configured.
     #[serde(rename = "base_rpc_url")]
@@ -29,7 +32,7 @@ pub struct EvmSecrets {
 
 #[derive(Clone)]
 pub struct EvmCtx {
-    pub ws_rpc_url: Url,
+    pub rpc_url: Url,
     pub orderbook: Address,
     pub deployment_block: u64,
     pub required_confirmations: u64,
@@ -38,7 +41,7 @@ pub struct EvmCtx {
 impl std::fmt::Debug for EvmCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EvmCtx")
-            .field("ws_rpc_url", &"[REDACTED]")
+            .field("rpc_url", &"[REDACTED]")
             .field("orderbook", &self.orderbook)
             .field("deployment_block", &self.deployment_block)
             .field("required_confirmations", &self.required_confirmations)
@@ -49,7 +52,7 @@ impl std::fmt::Debug for EvmCtx {
 impl EvmCtx {
     pub fn new(config: &EvmConfig, secrets: EvmSecrets) -> Self {
         Self {
-            ws_rpc_url: secrets.ws,
+            rpc_url: secrets.rpc,
             orderbook: config.orderbook,
             deployment_block: config.deployment_block,
             required_confirmations: config.required_confirmations,

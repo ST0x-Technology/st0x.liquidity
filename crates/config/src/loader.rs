@@ -174,6 +174,7 @@ struct Config {
     order_polling_max_jitter: Option<u64>,
     position_check_interval: Option<u64>,
     inventory_poll_interval: Option<u64>,
+    order_fill_poll_interval: Option<u64>,
     apalis_finished_job_cleanup_interval_secs: u64,
     #[serde(rename = "hyperdx")]
     telemetry: Option<TelemetryConfig>,
@@ -387,6 +388,10 @@ pub struct Ctx {
     pub order_polling_max_jitter: u64,
     pub position_check_interval: u64,
     pub inventory_poll_interval: u64,
+    /// Interval (seconds) between continuous `eth_getLogs` polls for orderbook
+    /// fills. Each tick enqueues a backfill range over the unprocessed blocks
+    /// (capped at `tip - required_confirmations`).
+    pub order_fill_poll_interval: u64,
     pub apalis_finished_job_cleanup_interval_secs: u64,
     pub broker: BrokerCtx,
     pub telemetry: Option<TelemetryCtx>,
@@ -480,6 +485,7 @@ impl std::fmt::Debug for Ctx {
             .field("order_polling_max_jitter", &self.order_polling_max_jitter)
             .field("position_check_interval", &self.position_check_interval)
             .field("inventory_poll_interval", &self.inventory_poll_interval)
+            .field("order_fill_poll_interval", &self.order_fill_poll_interval)
             .field(
                 "apalis_finished_job_cleanup_interval_secs",
                 &self.apalis_finished_job_cleanup_interval_secs,
@@ -547,6 +553,7 @@ struct ValidatedParts {
     order_polling_max_jitter: u64,
     position_check_interval: u64,
     inventory_poll_interval: u64,
+    order_fill_poll_interval: u64,
     apalis_finished_job_cleanup_interval_secs: u64,
     broker: BrokerCtx,
     telemetry: Option<TelemetryCtx>,
@@ -725,6 +732,13 @@ fn parse_and_validate(
         });
     }
 
+    let order_fill_poll_interval = config.order_fill_poll_interval.unwrap_or(5);
+    if order_fill_poll_interval == 0 {
+        return Err(CtxError::ZeroPollingInterval {
+            field: "order_fill_poll_interval",
+        });
+    }
+
     let apalis_finished_job_cleanup_interval_secs =
         config.apalis_finished_job_cleanup_interval_secs;
     if apalis_finished_job_cleanup_interval_secs == 0 {
@@ -764,6 +778,7 @@ fn parse_and_validate(
         order_polling_max_jitter: config.order_polling_max_jitter.unwrap_or(5),
         position_check_interval,
         inventory_poll_interval,
+        order_fill_poll_interval,
         apalis_finished_job_cleanup_interval_secs,
         broker,
         telemetry,
@@ -833,6 +848,7 @@ impl Ctx {
             order_polling_max_jitter: parts.order_polling_max_jitter,
             position_check_interval: parts.position_check_interval,
             inventory_poll_interval: parts.inventory_poll_interval,
+            order_fill_poll_interval: parts.order_fill_poll_interval,
             apalis_finished_job_cleanup_interval_secs: parts
                 .apalis_finished_job_cleanup_interval_secs,
             broker: parts.broker,
@@ -937,7 +953,7 @@ impl Ctx {
     #[builder]
     pub fn for_test(
         database_url: String,
-        ws_rpc_url: Url,
+        rpc_url: Url,
         orderbook: Address,
         deployment_block: u64,
         #[builder(default = 0)] required_confirmations: u64,
@@ -975,7 +991,7 @@ impl Ctx {
             server_port,
             board_port,
             evm: EvmCtx {
-                ws_rpc_url,
+                rpc_url,
                 orderbook,
                 deployment_block,
                 required_confirmations,
@@ -984,6 +1000,7 @@ impl Ctx {
             order_polling_max_jitter: 0,
             position_check_interval: 2,
             inventory_poll_interval,
+            order_fill_poll_interval: 1,
             apalis_finished_job_cleanup_interval_secs,
             broker,
             telemetry: None,
@@ -1187,7 +1204,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         evm: EvmCtx {
             // Hard-coded literal URL — parse cannot fail in a test helper.
             #[allow(clippy::unwrap_used)]
-            ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+            rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
             orderbook: alloy::primitives::address!("0x1111111111111111111111111111111111111111"),
             deployment_block: 1,
             required_confirmations: 1,
@@ -1196,6 +1213,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         order_polling_max_jitter: 5,
         position_check_interval: 60,
         inventory_poll_interval: 60,
+        order_fill_poll_interval: 5,
         apalis_finished_job_cleanup_interval_secs: 3600,
         broker: BrokerCtx::DryRun,
         telemetry: None,
@@ -1320,7 +1338,7 @@ mod tests {
         file.write_all(
             br#"
             [evm]
-            ws_rpc_url = "ws://localhost:8545"
+            rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
 
@@ -1339,7 +1357,7 @@ mod tests {
         toml_file(
             r#"
             [evm]
-            ws_rpc_url = "ws://localhost:8545"
+            rpc_url = "http://localhost:8545"
 
             [broker]
             type = "schwab"
@@ -1613,6 +1631,7 @@ mod tests {
         assert_eq!(ctx.order_polling_max_jitter, 5);
         assert_eq!(ctx.position_check_interval, 60);
         assert_eq!(ctx.inventory_poll_interval, 60);
+        assert_eq!(ctx.order_fill_poll_interval, 5);
     }
 
     #[tokio::test]
@@ -1759,6 +1778,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn order_fill_poll_interval_must_be_non_zero() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            order_fill_poll_interval = 0
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+
+            deployment_block = 1
+            required_confirmations = 3
+
+            [wallet]
+            kind = "private-key"
+            address = "0x0000000000000000000000000000000000000001"
+        "#,
+        );
+        let secrets = dry_run_secrets_toml();
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::ZeroPollingInterval {
+                    field: "order_fill_poll_interval"
+                }
+            ),
+            "expected ZeroPollingInterval for order fill poll interval, got: {error:#}"
+        );
+    }
+
+    #[tokio::test]
     async fn server_port_and_board_port_must_differ() {
         let config = toml_file(
             r#"
@@ -1796,7 +1854,7 @@ mod tests {
         let secrets = toml_file(
             r#"
             [evm]
-            ws_rpc_url = "ws://localhost:8545"
+            rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
 
@@ -1914,7 +1972,7 @@ mod tests {
         let secrets = toml_file(
             r#"
             [evm]
-            ws_rpc_url = "ws://localhost:8545"
+            rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
 
@@ -2046,7 +2104,7 @@ mod tests {
         let secrets = toml_file(
             r#"
             [evm]
-            ws_rpc_url = "ws://localhost:8545"
+            rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
 
@@ -2110,7 +2168,7 @@ mod tests {
         let secrets = toml_file(
             r#"
             [evm]
-            ws_rpc_url = "ws://localhost:8545"
+            rpc_url = "http://localhost:8545"
 
             [broker]
             type = "dry-run"
@@ -2173,7 +2231,7 @@ mod tests {
         let secrets = toml_file(
             r#"
             [evm]
-            ws_rpc_url = "ws://localhost:8545"
+            rpc_url = "http://localhost:8545"
 
             [broker]
             type = "alpaca-broker-api"
@@ -2234,7 +2292,7 @@ mod tests {
         let secrets = toml_file(
             r#"
             [evm]
-            ws_rpc_url = "ws://localhost:8545"
+            rpc_url = "http://localhost:8545"
 
             [broker]
             type = "alpaca-broker-api"
@@ -2297,7 +2355,7 @@ mod tests {
         let secrets = toml_file(
             r#"
             [evm]
-            ws_rpc_url = "ws://localhost:8545"
+            rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.example.com"
 
@@ -2352,7 +2410,7 @@ mod tests {
         let secrets = toml_file(
             r#"
             [evm]
-            ws_rpc_url = "ws://localhost:8545"
+            rpc_url = "http://localhost:8545"
 
             [broker]
             type = "alpaca-broker-api"
@@ -2402,7 +2460,7 @@ mod tests {
         let secrets = toml_file(
             r#"
             [evm]
-            ws_rpc_url = "ws://localhost:8545"
+            rpc_url = "http://localhost:8545"
 
             [broker]
             type = "alpaca-broker-api"
@@ -2447,7 +2505,7 @@ mod tests {
         let secrets = toml_file(
             r#"
             [evm]
-            ws_rpc_url = "ws://localhost:8545"
+            rpc_url = "http://localhost:8545"
 
             [broker]
             type = "alpaca-broker-api"
@@ -2491,7 +2549,7 @@ mod tests {
         let secrets = toml_file(
             r#"
             [evm]
-            ws_rpc_url = "ws://localhost:8545"
+            rpc_url = "http://localhost:8545"
 
             [broker]
             type = "alpaca-broker-api"
@@ -2523,7 +2581,7 @@ mod tests {
         let secrets = toml_file(
             r#"
             [evm]
-            ws_rpc_url = "ws://localhost:8545"
+            rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
 
@@ -2551,7 +2609,7 @@ mod tests {
         let secrets = toml_file(
             r#"
             [evm]
-            ws_rpc_url = "ws://localhost:8545"
+            rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
 
@@ -2593,7 +2651,7 @@ mod tests {
         let secrets = toml_file(
             r#"
             [evm]
-            ws_rpc_url = "ws://localhost:8545"
+            rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
 
@@ -2935,7 +2993,7 @@ mod tests {
         let secrets = toml_file(
             r#"
             [evm]
-            ws_rpc_url = "ws://localhost:8545"
+            rpc_url = "http://localhost:8545"
             extra_secret = "should fail"
 
             [broker]
@@ -2958,7 +3016,7 @@ mod tests {
         let secrets = toml_file(
             r#"
             [evm]
-            ws_rpc_url = "ws://localhost:8545"
+            rpc_url = "http://localhost:8545"
             extra_secret = "should fail"
 
             [broker]
@@ -3022,7 +3080,7 @@ mod tests {
         let secrets = toml_file(
             r#"
             [evm]
-            ws_rpc_url = "ws://localhost:8545"
+            rpc_url = "http://localhost:8545"
 
             [broker]
             type = "alpaca-broker-api"
@@ -3629,7 +3687,7 @@ mod tests {
             let toml_str = format!(
                 r#"
                 [evm]
-                ws_rpc_url = "ws://localhost:8545"
+                rpc_url = "http://localhost:8545"
 
                 [broker]
                 type = "{kebab_value}"
@@ -3663,7 +3721,7 @@ mod tests {
         // those fields (orderbook, deployment_block) are Raindex-specific.
         let with_evm = r#"
             [evm]
-            ws_rpc_url = "ws://localhost:8545"
+            rpc_url = "http://localhost:8545"
 
             [broker]
             type = "dry-run"
@@ -3679,7 +3737,7 @@ mod tests {
 
         let with_raindex = r#"
             [raindex]
-            ws_rpc_url = "ws://localhost:8545"
+            rpc_url = "http://localhost:8545"
 
             [broker]
             type = "dry-run"
@@ -3701,7 +3759,7 @@ mod tests {
             let toml_str = format!(
                 r#"
                 [evm]
-                ws_rpc_url = "ws://localhost:8545"
+                rpc_url = "http://localhost:8545"
 
                 [broker]
                 type = "{snake_value}"
@@ -3765,7 +3823,7 @@ mod tests {
         let secrets = toml_file(
             r#"
             [evm]
-            ws_rpc_url = "ws://localhost:8545"
+            rpc_url = "http://localhost:8545"
             extra_secret = "should fail"
 
             [broker]
@@ -3800,7 +3858,7 @@ mod tests {
         let secrets = toml_file(
             r#"
             [evm]
-            ws_rpc_url = "ws://localhost:8545"
+            rpc_url = "http://localhost:8545"
 
             [broker]
             type = "dry-run"
@@ -3845,7 +3903,7 @@ mod tests {
         let secrets = toml_file(
             r#"
             [evm]
-            ws_rpc_url = "ws://localhost:8545"
+            rpc_url = "http://localhost:8545"
 
             [broker]
             type = "alpaca-broker-api"
@@ -3894,7 +3952,7 @@ mod tests {
         let secrets = toml_file(
             r#"
             [evm]
-            ws_rpc_url = "ws://localhost:8545"
+            rpc_url = "http://localhost:8545"
 
             [broker]
             type = "alpaca-broker-api"
@@ -3926,7 +3984,7 @@ mod tests {
         let secrets = toml_file(
             r#"
             [evm]
-            ws_rpc_url = "ws://localhost:8545"
+            rpc_url = "http://localhost:8545"
             base_rpc_url = "https://base.example.com"
             ethereum_rpc_url = "https://mainnet.infura.io"
 
