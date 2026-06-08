@@ -1,4 +1,4 @@
-import { browser } from '$app/environment'
+import { browser, dev } from '$app/environment'
 import { env } from '$env/dynamic/public'
 
 const DEFAULT_LOCAL_DEV_PORT = '8001'
@@ -67,9 +67,10 @@ export const getSimulateSourceId = (): string | null => {
 
 export const getPnlSqlApiUrl = (): string | null => {
   const envKey = 'PUBLIC_PNL_SQL_API_URL'
-  const val = env[envKey]?.trim()
+  const rawEnv = env as Record<string, string | undefined>
+  const val = rawEnv[envKey]?.trim()
   if (val === undefined || val === '') return null
-  if (isLocalDev() && isAbsoluteHttpUrl(val)) return PNL_SQL_DEV_PROXY_PATH
+  if (dev && isAbsoluteHttpUrl(val)) return PNL_SQL_DEV_PROXY_PATH
   return val
 }
 

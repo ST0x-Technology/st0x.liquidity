@@ -27,11 +27,15 @@ bun run dev
 bun run dev --open
 ```
 
-Run the dashboard with mock API responses and synthetic PnL data:
+Run the dashboard with mock API responses for non-PnL panels:
 
 ```sh
 PUBLIC_DASHBOARD_MOCK_MODE=1 bun run dev
 ```
+
+The PnL panel does not provide generated fallback data. Configure
+`PUBLIC_PNL_SQL_API_URL` or the backend PnL endpoint must respond; otherwise the
+panel shows the live load/configuration failure.
 
 Run the PnL tab against a Datasette-style SQL JSON endpoint:
 

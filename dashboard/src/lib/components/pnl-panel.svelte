@@ -4,20 +4,15 @@
   import * as Table from '$lib/components/ui/table'
   import MultiSelect from '$lib/components/multi-select.svelte'
   import { decimalCompare, formatDecimal } from '$lib/decimal'
-  import { getPnlSqlApiUrl, isDashboardMockMode } from '$lib/env'
   import { reactive } from '$lib/frp.svelte'
   import { formatUtc } from '$lib/time'
   import { fetchPnlReport } from '$lib/pnl/api'
   import { STREAM_KEYS } from '$lib/pnl/report'
-  import { syntheticPnlDashboard } from '$lib/pnl/synthetic'
   import type {
     PnlEntry,
     PnlResponse,
     PnlStreamKey,
-    PnlSummary,
-    PnlSymbolSummary,
-    PnlWindow,
-    PnlWindowSymbol
+    PnlWindow
   } from '$lib/pnl/report'
 
   type RangePreset = '1w' | '1m' | 'ytd' | '1y' | 'all' | 'custom'
@@ -25,8 +20,6 @@
   const PNL_ENTRY_LIMIT = Number.MAX_SAFE_INTEGER
   const POLL_INTERVAL_MS = 10_000
   const MS_PER_DAY = 24 * 60 * 60 * 1_000
-  const mockMode = isDashboardMockMode()
-  const hasSqlPnlSource = getPnlSqlApiUrl() !== null
 
   const dateFromIso = (value: string): Date => new Date(`${value}T00:00:00.000Z`)
 
@@ -38,15 +31,8 @@
     return isoDate(date)
   }
 
-  const syntheticAvailableStartDate = syntheticPnlDashboard.windows[0]?.startAt.slice(0, 10) ?? ''
-  const syntheticAvailableEndDate = syntheticPnlDashboard.windows.at(-1)?.startAt.slice(0, 10) ?? ''
-  const initialAvailableEndDate =
-    !mockMode && hasSqlPnlSource ? new Date().toISOString().slice(0, 10) : syntheticAvailableEndDate
-  const initialAvailableStartDate =
-    !mockMode && hasSqlPnlSource
-      ? shiftDate(initialAvailableEndDate, -6)
-      : syntheticAvailableStartDate
-  const defaultChartSymbols = syntheticPnlDashboard.report.symbols.map((row) => row.symbol).sort()
+  const initialAvailableEndDate = new Date().toISOString().slice(0, 10)
+  const initialAvailableStartDate = shiftDate(initialAvailableEndDate, -6)
 
   const clampDateForRange = (value: string, start: string, end: string): string => {
     if (!start || !end) return value
@@ -79,30 +65,23 @@
   const error = reactive<string | null>(null)
   const total = reactive(0)
   const selectedSymbols = reactive<Set<string>>(new Set())
-  const selectedAssetChartSymbols = reactive<Set<string>>(new Set(defaultChartSymbols))
+  const selectedAssetChartSymbols = reactive<Set<string>>(new Set())
   const selectedAssetChartStreams = reactive<Set<PnlStreamKey>>(new Set(STREAM_KEYS))
-  const selectedMethodChartSymbols = reactive<Set<string>>(new Set(defaultChartSymbols))
+  const selectedMethodChartSymbols = reactive<Set<string>>(new Set())
   const selectedMethodChartStreams = reactive<Set<PnlStreamKey>>(new Set(STREAM_KEYS))
   const dayFilter = reactive<'all' | 'weekday' | 'weekend'>('all')
-  const dataMode = reactive<'synthetic' | 'backend'>(
-    !mockMode && hasSqlPnlSource ? 'backend' : 'synthetic'
-  )
-  const availableStartDate = $derived.by(() => {
-    if (dataMode.current === 'synthetic') return syntheticAvailableStartDate
-    return (
+  const availableStartDate = $derived.by(
+    () =>
       report.current?.sampleStats?.firstAt?.slice(0, 10) ??
       report.current?.windows?.[0]?.startAt.slice(0, 10) ??
       initialAvailableStartDate
-    )
-  })
-  const availableEndDate = $derived.by(() => {
-    if (dataMode.current === 'synthetic') return syntheticAvailableEndDate
-    return (
+  )
+  const availableEndDate = $derived.by(
+    () =>
       report.current?.sampleStats?.lastAt?.slice(0, 10) ??
       report.current?.windows?.at(-1)?.startAt.slice(0, 10) ??
       initialAvailableEndDate
-    )
-  })
+  )
   const clampDate = (value: string): string =>
     clampDateForRange(value, availableStartDate, availableEndDate)
   const presetStart = (preset: RangePreset): string =>
@@ -179,9 +158,6 @@
   const isPnlStreamKey = (value: string): value is PnlStreamKey =>
     (STREAM_KEYS as readonly string[]).includes(value)
 
-  const isWeekendTimestamp = (timestamp: string): boolean =>
-    [0, 6].includes(new Date(timestamp).getUTCDay())
-
   const matchesDayFilter = (isWeekend: boolean): boolean => {
     if (dayFilter.current === 'weekday') return !isWeekend
     if (dayFilter.current === 'weekend') return isWeekend
@@ -195,104 +171,6 @@
     const end = fromDate.current <= toDate.current ? toDate.current : fromDate.current
 
     return (!start || date >= start) && (!end || date <= end)
-  }
-
-  const emptySymbolSummary = (symbol: string): PnlSymbolSummary => ({
-    symbol,
-    counterTradePnlUsd: '0',
-    onchainNettingPnlUsd: '0',
-    directionalInventoryBaselinePnlUsd: '0',
-    directionalImbalanceExcessPnlUsd: '0',
-    directionalExposurePnlUsd: '0',
-    totalPnlUsd: '0',
-    realizedPnlUsd: '0',
-    matchedShares: '0',
-    inventoryDriftShares: '0',
-    inventoryDriftUsd: '0',
-    openLongShares: '0',
-    openShortShares: '0',
-    unmatchedOffchainShares: '0',
-    matchedLotCount: 0,
-    onchainFillCount: 0,
-    offchainFillCount: 0,
-    unmatchedOffchainFillCount: 0
-  })
-
-  const addWindowSymbol = (target: PnlSymbolSummary, row: PnlWindowSymbol): void => {
-    const counter = Number(target.counterTradePnlUsd) + Number(row.counterTradePnlUsd)
-    const onchain = Number(target.onchainNettingPnlUsd) + Number(row.onchainNettingPnlUsd)
-    const baseline =
-      Number(target.directionalInventoryBaselinePnlUsd) +
-      Number(row.directionalInventoryBaselinePnlUsd)
-    const excess =
-      Number(target.directionalImbalanceExcessPnlUsd) + Number(row.directionalImbalanceExcessPnlUsd)
-    const directional = baseline + excess
-    const realized = counter + onchain
-
-    target.counterTradePnlUsd = moneyText(counter)
-    target.onchainNettingPnlUsd = moneyText(onchain)
-    target.directionalInventoryBaselinePnlUsd = moneyText(baseline)
-    target.directionalImbalanceExcessPnlUsd = moneyText(excess)
-    target.directionalExposurePnlUsd = moneyText(directional)
-    target.realizedPnlUsd = moneyText(realized + excess)
-    target.totalPnlUsd = moneyText(realized + directional)
-    target.inventoryDriftUsd = target.directionalInventoryBaselinePnlUsd
-  }
-
-  const syntheticWindowsForCurrentFilter = (): PnlWindow[] =>
-    syntheticPnlDashboard.windows.filter(
-      (window) => matchesDayFilter(window.isWeekend) && matchesDateRange(dateKey(window.startAt))
-    )
-
-  const syntheticEntriesForCurrentFilter = (): PnlEntry[] => {
-    const selected = selectedSymbols.current
-
-    return syntheticPnlDashboard.report.entries.filter((entry) => {
-      if (selected.size > 0 && !selected.has(entry.symbol)) return false
-      if (!matchesDateRange(dateKey(entry.closedAt))) return false
-      return matchesDayFilter(isWeekendTimestamp(entry.closedAt))
-    })
-  }
-
-  const syntheticSymbolRowsForCurrentFilter = (
-    syntheticEntries: PnlEntry[]
-  ): PnlSymbolSummary[] => {
-    const selected = selectedSymbols.current
-    const windows = syntheticWindowsForCurrentFilter()
-    const symbols = new Map<string, PnlSymbolSummary>()
-
-    for (const row of syntheticPnlDashboard.report.symbols) {
-      if (selected.size > 0 && !selected.has(row.symbol)) continue
-      symbols.set(row.symbol, emptySymbolSummary(row.symbol))
-    }
-
-    for (const window of windows) {
-      for (const row of window.symbols) {
-        if (selected.size > 0 && !selected.has(row.symbol)) continue
-        const target = symbols.get(row.symbol)
-        if (target) addWindowSymbol(target, row)
-      }
-    }
-
-    for (const row of symbols.values()) {
-      const symbolEntries = syntheticEntries.filter((entry) => entry.symbol === row.symbol)
-      row.matchedLotCount = symbolEntries.length
-      row.onchainFillCount = windows.length * 28
-      row.offchainFillCount = windows.length * 20
-      row.unmatchedOffchainFillCount = symbolEntries.filter(
-        (entry) => entry.delayedCounterTrade
-      ).length
-      row.matchedShares = moneyText(
-        symbolEntries.reduce((totalValue, entry) => totalValue + Number(entry.shares), 0)
-      )
-      row.unmatchedOffchainShares = moneyText(
-        symbolEntries
-          .filter((entry) => entry.delayedCounterTrade)
-          .reduce((totalValue, entry) => totalValue + Number(entry.shares) * 0.08, 0)
-      )
-    }
-
-    return [...symbols.values()].sort((left, right) => left.symbol.localeCompare(right.symbol))
   }
 
   const isCompleteSelection = (selected: Set<string>, symbols: string[]): boolean =>
@@ -336,93 +214,8 @@
     )
   }
 
-  const aggregateSummary = (symbols: PnlSymbolSummary[]): PnlSummary => {
-    const sums = symbols.reduce(
-      (acc, row) => ({
-        counterTradePnlUsd: acc.counterTradePnlUsd + Number(row.counterTradePnlUsd),
-        onchainNettingPnlUsd: acc.onchainNettingPnlUsd + Number(row.onchainNettingPnlUsd),
-        directionalInventoryBaselinePnlUsd:
-          acc.directionalInventoryBaselinePnlUsd + Number(row.directionalInventoryBaselinePnlUsd),
-        directionalImbalanceExcessPnlUsd:
-          acc.directionalImbalanceExcessPnlUsd + Number(row.directionalImbalanceExcessPnlUsd),
-        matchedLotCount: acc.matchedLotCount + row.matchedLotCount,
-        onchainFillCount: acc.onchainFillCount + row.onchainFillCount,
-        offchainFillCount: acc.offchainFillCount + row.offchainFillCount,
-        unmatchedOffchainFillCount: acc.unmatchedOffchainFillCount + row.unmatchedOffchainFillCount,
-        matchedShares: acc.matchedShares + Number(row.matchedShares),
-        unmatchedOffchainShares: acc.unmatchedOffchainShares + Number(row.unmatchedOffchainShares)
-      }),
-      {
-        counterTradePnlUsd: 0,
-        onchainNettingPnlUsd: 0,
-        directionalInventoryBaselinePnlUsd: 0,
-        directionalImbalanceExcessPnlUsd: 0,
-        matchedLotCount: 0,
-        onchainFillCount: 0,
-        offchainFillCount: 0,
-        unmatchedOffchainFillCount: 0,
-        matchedShares: 0,
-        unmatchedOffchainShares: 0
-      }
-    )
-    const directional =
-      sums.directionalInventoryBaselinePnlUsd + sums.directionalImbalanceExcessPnlUsd
-    const realized =
-      sums.counterTradePnlUsd + sums.onchainNettingPnlUsd + sums.directionalImbalanceExcessPnlUsd
-
-    return {
-      counterTradePnlUsd: moneyText(sums.counterTradePnlUsd),
-      onchainNettingPnlUsd: moneyText(sums.onchainNettingPnlUsd),
-      directionalInventoryBaselinePnlUsd: moneyText(sums.directionalInventoryBaselinePnlUsd),
-      directionalImbalanceExcessPnlUsd: moneyText(sums.directionalImbalanceExcessPnlUsd),
-      directionalExposurePnlUsd: moneyText(directional),
-      realizedPnlUsd: moneyText(realized),
-      totalPnlUsd: moneyText(realized + sums.directionalInventoryBaselinePnlUsd),
-      inventoryDriftShares: '0',
-      inventoryDriftUsd: moneyText(sums.directionalInventoryBaselinePnlUsd),
-      openLongShares: '0',
-      openShortShares: '0',
-      matchedLotCount: sums.matchedLotCount,
-      onchainFillCount: sums.onchainFillCount,
-      offchainFillCount: sums.offchainFillCount,
-      openLotCount: 0,
-      unmatchedOffchainFillCount: sums.unmatchedOffchainFillCount,
-      matchedShares: moneyText(sums.matchedShares),
-      onchainNotionalUsd: moneyText(sums.matchedShares * 42),
-      offchainNotionalUsd: moneyText(sums.matchedShares * 41.9),
-      unmatchedOffchainShares: moneyText(sums.unmatchedOffchainShares),
-      unmatchedOffchainNotionalUsd: moneyText(sums.unmatchedOffchainShares * 55)
-    }
-  }
-
-  const loadSyntheticPnl = () => {
-    const selectedEntries = syntheticEntriesForCurrentFilter()
-    const selectedSymbolRows = syntheticSymbolRowsForCurrentFilter(selectedEntries)
-
-    report.update(() => ({
-      ...syntheticPnlDashboard.report,
-      summary: aggregateSummary(selectedSymbolRows),
-      symbols: selectedSymbolRows,
-      entries: selectedEntries,
-      total: selectedEntries.length,
-      hasMore: false
-    }))
-    total.update(() => selectedEntries.length)
-    entries.update(() => selectedEntries)
-    syncAvailableSymbols(
-      syntheticPnlDashboard.report.symbols.map((row) => row.symbol),
-      true
-    )
-    error.update(() => null)
-  }
-
   const fetchPnl = async () => {
     const seq = ++fetchSeq
-
-    if (dataMode.current === 'synthetic') {
-      loadSyntheticPnl()
-      return
-    }
 
     loading.update(() => true)
     error.update(() => null)
@@ -589,7 +382,6 @@
     return `${prefix}${fmtUsd(value)}`
   }
   const fmtShares = (value: string): string => formatDecimal(value, 4)
-  const moneyText = (value: number): string => value.toFixed(2).replace(/\.?0+$/u, '')
   const fmtDuration = (seconds: number): string => {
     if (seconds < 60) return `${String(seconds)}s`
     const minutes = Math.floor(seconds / 60)
@@ -606,9 +398,7 @@
     return `${id.slice(0, 8)}...${id.slice(-6)}`
   }
 
-  const chartSymbolUniverse = $derived(
-    allSymbols.current.length > 0 ? allSymbols.current : defaultChartSymbols
-  )
+  const chartSymbolUniverse = $derived(allSymbols.current)
   const chartSymbolOptions = $derived(
     chartSymbolUniverse.map((symbol) => ({
       value: symbol,
@@ -640,7 +430,7 @@
     STREAM_KEYS.filter((stream) => selectedMethodChartStreams.current.has(stream))
   )
 
-  const chartWindowSource = $derived(report.current?.windows ?? syntheticPnlDashboard.windows)
+  const chartWindowSource = $derived(report.current?.windows ?? [])
   const chartWindows = $derived(
     chartWindowSource.filter(
       (window) => matchesDayFilter(window.isWeekend) && matchesDateRange(dateKey(window.startAt))
@@ -1039,7 +829,7 @@
       <span>PnL</span>
 
       <div class="flex items-center gap-2">
-        {#if !mockMode && hasFilters}
+        {#if hasFilters}
           <button
             class="rounded border bg-background px-2 py-1 text-xs hover:bg-accent"
             onclick={clearFilters}>All assets</button
@@ -1056,7 +846,7 @@
     </Card.Title>
 
     <div class="flex flex-wrap items-center gap-2 rounded-md bg-muted/30 px-2 py-1.5 text-xs">
-      {#if !mockMode && symbolOptions.length > 0}
+      {#if symbolOptions.length > 0}
         <MultiSelect
           label="Assets"
           options={symbolOptions}

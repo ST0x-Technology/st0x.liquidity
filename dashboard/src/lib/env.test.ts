@@ -3,7 +3,7 @@ import { getWebSocketUrl, getExplorerTxUrl, getPnlSqlApiUrl } from './env'
 
 const mockEnv = { current: {} as Record<string, string | undefined> }
 
-vi.mock('$app/environment', () => ({ browser: true }))
+vi.mock('$app/environment', () => ({ browser: true, dev: true }))
 vi.mock('$env/dynamic/public', () => ({
   get env() {
     return mockEnv.current
@@ -152,12 +152,32 @@ describe('getPnlSqlApiUrl', () => {
     expect(getPnlSqlApiUrl()).toBeNull()
   })
 
-  it('returns trimmed SQL source URL when configured', () => {
+  it('uses the dev proxy for absolute SQL URLs when configured', () => {
     mockEnv.current = {
       PUBLIC_PNL_SQL_API_URL: '  http://example.com:8081/st0x-hedge.json  '
     }
 
-    expect(getPnlSqlApiUrl()).toBe('http://example.com:8081/st0x-hedge.json')
+    expect(getPnlSqlApiUrl()).toBe('/__pnl_sql')
+  })
+
+  it('uses the dev proxy for absolute SQL URLs on a Tailscale dev hostname', () => {
+    Object.defineProperty(globalThis, 'window', {
+      value: {
+        location: {
+          hostname: 'dashboard.tailnet.ts.net',
+          port: '5173',
+          host: 'dashboard.tailnet.ts.net:5173',
+          protocol: 'http:'
+        }
+      },
+      writable: true,
+      configurable: true
+    })
+    mockEnv.current = {
+      PUBLIC_PNL_SQL_API_URL: 'http://example.com:8081/st0x-hedge.json'
+    }
+
+    expect(getPnlSqlApiUrl()).toBe('/__pnl_sql')
   })
 
   it('uses the dev proxy for absolute SQL URLs during local development', () => {
