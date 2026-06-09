@@ -17,8 +17,8 @@ permissions:
 jobs:
   nix-source-cache:
     name: nix source cache
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -85,52 +85,19 @@ jobs:
           sort -u "$paths_file" -o "$paths_file"
 
   backend-validation:
-    name: backend ${{ matrix.name }}
+    name: backend test ${{ matrix.partition }} of 4
     needs: nix-source-cache
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 30
     strategy:
       fail-fast: false
 
       matrix:
-        include:
-          - name: check
-            cache_target: check
-            command: nix develop .#ci-backend -c cargo check --workspace
-
-          - name: test 1 of 4
-            cache_target: test
-            command: >
-              nix develop .#ci-backend -c cargo nextest run --workspace
-              --all-features --profile ci --partition hash:1/4
-
-          - name: test 2 of 4
-            cache_target: test
-            command: >
-              nix develop .#ci-backend -c cargo nextest run --workspace
-              --all-features --profile ci --partition hash:2/4
-
-          - name: test 3 of 4
-            cache_target: test
-            command: >
-              nix develop .#ci-backend -c cargo nextest run --workspace
-              --all-features --profile ci --partition hash:3/4
-
-          - name: test 4 of 4
-            cache_target: test
-            command: >
-              nix develop .#ci-backend -c cargo nextest run --workspace
-              --all-features --profile ci --partition hash:4/4
-
-          - name: clippy
-            cache_target: clippy
-            command: >
-              nix develop .#ci-backend -c cargo clippy --workspace
-              --all-targets --all-features
+        partition: [1, 2, 3, 4]
 
     env:
       CARGO_INCREMENTAL: "0"
-      CARGO_TARGET_DIR: target/${{ matrix.cache_target }}
+      CARGO_TARGET_DIR: target/test
     steps:
       - uses: actions/checkout@v4
 
@@ -179,19 +146,31 @@ jobs:
             ~/.cargo/git/db/
             ~/.cargo/registry/cache/
             ~/.cargo/registry/index/
-            target/${{ matrix.cache_target }}/
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ matrix.cache_target }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'flake.lock', 'flake.nix', 'rust.nix') }}
+            target/test/
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-test-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'flake.lock', 'flake.nix', 'rust.nix') }}
           restore-keys: |
-            cargo-${{ runner.os }}-${{ runner.arch }}-${{ matrix.cache_target }}-
+            cargo-${{ runner.os }}-${{ runner.arch }}-test-
 
-      - name: ${{ matrix.name }}
-        run: ${{ matrix.command }}
+      # Each partition builds the full test binaries, so clippy reuses the warm
+      # target/test cache instead of compiling the workspace into a separate
+      # dir. It only needs to run once, so it rides on partition 1.
+      - name: test ${{ matrix.partition }} of 4
+        run: |
+          nix develop .#ci-backend -c bash -c '
+            set -euxo pipefail
+            cargo nextest run --workspace --all-features --profile ci \
+              --partition hash:${{ matrix.partition }}/4
+            if [ "${{ matrix.partition }}" = "1" ]; then
+              cargo clippy --workspace --all-targets --all-features
+            fi
+          '
 
   backend:
     name: backend
     needs: backend-validation
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 25
     steps:
       - name: Check backend validation
         run: |
@@ -201,7 +180,8 @@ jobs:
           fi
 
   dashboard:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -236,7 +216,8 @@ jobs:
         run: nix build .#st0x-dashboard
 
   hooks:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
