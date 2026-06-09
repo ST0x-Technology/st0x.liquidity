@@ -580,6 +580,58 @@ const RECEIPT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 #[cfg(any(feature = "turnkey", feature = "local-signer"))]
 const RECEIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Maximum time to wait for confirmation depth after a receipt is found.
+/// Generous (30 min) because the tx is already mined — we just need blocks.
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+const CONFIRMATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Grace period before the dropped-from-mempool check may fire. A
+/// freshly-submitted tx is not visible on every node of a load-balanced RPC
+/// for several seconds, and on Ethereum mainnet it is not mined for ~1 block
+/// (~12s); concluding "dropped" earlier yields false positives that fail a tx
+/// which actually lands. Set above one mainnet block time.
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+const DROPPED_TX_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Consecutive `get_transaction_by_hash == None` observations (after the grace
+/// period) required before concluding the tx was dropped. Any sighting —
+/// pending or mined — resets the count. Debounces the load-balanced-RPC race
+/// where a single lagging node transiently reports a live tx as absent.
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+const DROPPED_TX_CONSECUTIVE_MISSES: u32 = 3;
+
+/// Tuning parameters for [`wait_for_receipt_with_config`]. Bundled into a struct
+/// so the wait function keeps a small argument list as knobs are added.
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReceiptWaitConfig {
+    /// Interval between receipt polls.
+    pub(crate) poll_interval: std::time::Duration,
+    /// Max time to wait for the tx to be included in a block.
+    pub(crate) inclusion_timeout: std::time::Duration,
+    /// Max time to wait for confirmation depth once a receipt is found.
+    pub(crate) confirmation_timeout: std::time::Duration,
+    /// Grace period before the dropped-from-mempool check may fire.
+    pub(crate) dropped_grace: std::time::Duration,
+    /// Consecutive mempool-absence observations required to conclude a drop.
+    pub(crate) dropped_consecutive_misses: u32,
+}
+
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+impl ReceiptWaitConfig {
+    /// Defaults tuned for Ethereum mainnet (~12s blocks) behind a
+    /// load-balanced RPC.
+    const fn mainnet_defaults() -> Self {
+        Self {
+            poll_interval: RECEIPT_POLL_INTERVAL,
+            inclusion_timeout: RECEIPT_TIMEOUT,
+            confirmation_timeout: CONFIRMATION_TIMEOUT,
+            dropped_grace: DROPPED_TX_GRACE,
+            dropped_consecutive_misses: DROPPED_TX_CONSECUTIVE_MISSES,
+        }
+    }
+}
+
 /// Polls for a transaction receipt with confirmation depth, bypassing alloy's
 /// heartbeat-based `get_receipt()` which can hang when the WebSocket
 /// subscription misses a block.
@@ -598,23 +650,10 @@ pub(crate) async fn wait_for_receipt(
         provider,
         tx_hash,
         required_confirmations,
-        RECEIPT_POLL_INTERVAL,
-        RECEIPT_TIMEOUT,
-        CONFIRMATION_TIMEOUT,
+        ReceiptWaitConfig::mainnet_defaults(),
     )
     .await
 }
-
-/// Maximum time to wait for confirmation depth after a receipt is found.
-/// Generous (30 min) because the tx is already mined — we just need blocks.
-#[cfg(any(feature = "turnkey", feature = "local-signer"))]
-const CONFIRMATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-
-/// Number of receipt polls before checking whether the transaction was
-/// dropped from the mempool. Gives the tx time to propagate before
-/// concluding it was never broadcast.
-#[cfg(any(feature = "turnkey", feature = "local-signer"))]
-const DROPPED_TX_CHECK_AFTER_POLLS: u32 = 3;
 
 /// Parameterized version of [`wait_for_receipt`] for testability.
 #[cfg(any(feature = "turnkey", feature = "local-signer"))]
@@ -622,34 +661,43 @@ pub(crate) async fn wait_for_receipt_with_config(
     provider: &impl Provider,
     tx_hash: alloy::primitives::TxHash,
     required_confirmations: u64,
-    poll_interval: std::time::Duration,
-    inclusion_timeout: std::time::Duration,
-    confirmation_timeout: std::time::Duration,
+    config: ReceiptWaitConfig,
 ) -> Result<TransactionReceipt, EvmError> {
-    let mut poll = interval(poll_interval);
+    let mut poll = interval(config.poll_interval);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let start = std::time::Instant::now();
 
     // Phase 1: wait for inclusion (with timeout).
-    let (receipt, receipt_block) = timeout(inclusion_timeout, async {
-        let mut poll_count = 0u32;
+    let (receipt, receipt_block) = timeout(config.inclusion_timeout, async {
+        // Consecutive polls where the tx is absent from BOTH the receipt lookup
+        // and the mempool. A single absence is unreliable on a load-balanced
+        // RPC (the lookup may hit a lagging node that has not seen a recent tx),
+        // so we require several in a row — and only after a grace period —
+        // before concluding the tx was dropped.
+        let mut consecutive_misses = 0u32;
 
         loop {
             poll.tick().await;
-            poll_count += 1;
 
             let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? else {
-                // After initial propagation window, check if the tx
-                // still exists in the mempool. If not, it was dropped
-                // and will never mine.
-                if poll_count >= DROPPED_TX_CHECK_AFTER_POLLS
-                    && provider.get_transaction_by_hash(tx_hash).await?.is_none()
-                {
-                    return Err(EvmError::TransactionDropped {
-                        tx_hash,
-                        elapsed_secs: start.elapsed().as_secs(),
-                    });
+                // Not yet mined. Only suspect a drop once the grace period has
+                // elapsed; before that a missing tx is almost certainly still
+                // propagating or awaiting its first block.
+                if start.elapsed() >= config.dropped_grace {
+                    if provider.get_transaction_by_hash(tx_hash).await?.is_none() {
+                        consecutive_misses += 1;
+
+                        if consecutive_misses >= config.dropped_consecutive_misses {
+                            return Err(EvmError::TransactionDropped {
+                                tx_hash,
+                                elapsed_secs: start.elapsed().as_secs(),
+                            });
+                        }
+                    } else {
+                        // Tx is still in the mempool; it was not dropped.
+                        consecutive_misses = 0;
+                    }
                 }
 
                 continue;
@@ -665,11 +713,11 @@ pub(crate) async fn wait_for_receipt_with_config(
     .await
     .map_err(|_| EvmError::ReceiptTimeout {
         tx_hash,
-        timeout_secs: inclusion_timeout.as_secs(),
+        timeout_secs: config.inclusion_timeout.as_secs(),
     })??;
 
     // Phase 2: wait for confirmation depth (generous timeout).
-    timeout(confirmation_timeout, async {
+    timeout(config.confirmation_timeout, async {
         loop {
             let current_block = provider.get_block_number().await?;
             let confirmations = current_block.saturating_sub(receipt_block) + 1;
@@ -684,7 +732,7 @@ pub(crate) async fn wait_for_receipt_with_config(
     .await
     .map_err(|_| EvmError::ReceiptTimeout {
         tx_hash,
-        timeout_secs: confirmation_timeout.as_secs(),
+        timeout_secs: config.confirmation_timeout.as_secs(),
     })?
 }
 
@@ -1008,15 +1056,108 @@ mod tests {
             &provider,
             fake_hash,
             1,
-            std::time::Duration::from_millis(50),
-            std::time::Duration::from_secs(30),
-            std::time::Duration::from_secs(60),
+            ReceiptWaitConfig {
+                poll_interval: std::time::Duration::from_millis(50),
+                inclusion_timeout: std::time::Duration::from_secs(30),
+                confirmation_timeout: std::time::Duration::from_secs(60),
+                dropped_grace: std::time::Duration::ZERO,
+                dropped_consecutive_misses: 1,
+            },
         )
         .await;
 
         assert!(
             matches!(result, Err(EvmError::TransactionDropped { tx_hash, .. }) if tx_hash == fake_hash),
             "expected TransactionDropped for nonexistent tx, got: {result:?}"
+        );
+    }
+
+    /// Regression for RAI-904: a tx that is still visible in the mempool (not
+    /// yet mined) must NEVER be reported as dropped — even on a slow chain.
+    /// Before the fix, a single `get_transaction_by_hash == None` after a few
+    /// polls falsely failed a live tx; now a mempool sighting keeps it alive
+    /// until the inclusion timeout, surfacing `ReceiptTimeout`, not
+    /// `TransactionDropped`.
+    #[cfg(feature = "local-signer")]
+    #[tokio::test]
+    async fn wait_for_receipt_does_not_drop_tx_visible_in_mempool() {
+        // `--no-mining`: the tx is accepted into the mempool but never mined,
+        // so `get_transaction_receipt` stays None while `get_transaction_by_hash`
+        // returns the pending tx.
+        let anvil = Anvil::new().arg("--no-mining").spawn();
+        let signer = anvil_signer(&anvil);
+        let provider = ProviderBuilder::new()
+            .wallet(signer)
+            .connect_http(anvil.endpoint_url());
+
+        let tx = TransactionRequest::default()
+            .to(Address::ZERO)
+            .value(U256::ZERO);
+        let pending = provider.send_transaction(tx).await.unwrap();
+        let tx_hash = *pending.tx_hash();
+
+        let read_provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
+
+        let result = wait_for_receipt_with_config(
+            &read_provider,
+            tx_hash,
+            1,
+            ReceiptWaitConfig {
+                poll_interval: std::time::Duration::from_millis(50),
+                inclusion_timeout: std::time::Duration::from_millis(600),
+                confirmation_timeout: std::time::Duration::from_secs(60),
+                // Grace already elapsed and a single miss would trip the old
+                // logic — the tx is in the mempool, so it must not be dropped.
+                dropped_grace: std::time::Duration::ZERO,
+                dropped_consecutive_misses: 1,
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(EvmError::ReceiptTimeout { tx_hash: ht, .. }) if ht == tx_hash),
+            "a live (pending) tx must time out, not be reported dropped, got: {result:?}"
+        );
+    }
+
+    /// The dropped-from-mempool check must not fire before the grace period,
+    /// even for a genuinely absent tx (RAI-904).
+    #[cfg(feature = "local-signer")]
+    #[tokio::test]
+    async fn wait_for_receipt_respects_dropped_grace() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
+
+        let fake_hash = alloy::primitives::B256::random();
+        let grace = std::time::Duration::from_millis(400);
+        let start = std::time::Instant::now();
+
+        let result = wait_for_receipt_with_config(
+            &provider,
+            fake_hash,
+            1,
+            ReceiptWaitConfig {
+                poll_interval: std::time::Duration::from_millis(50),
+                inclusion_timeout: std::time::Duration::from_secs(30),
+                confirmation_timeout: std::time::Duration::from_secs(60),
+                dropped_grace: grace,
+                dropped_consecutive_misses: 1,
+            },
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(EvmError::TransactionDropped { .. })),
+            "expected TransactionDropped once grace elapsed, got: {result:?}"
+        );
+        assert!(
+            elapsed >= grace,
+            "drop must not be declared before the grace period: elapsed {elapsed:?} < {grace:?}"
         );
     }
 
