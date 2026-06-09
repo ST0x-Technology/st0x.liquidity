@@ -172,8 +172,17 @@ Not covered by `recheck-transfer` yet:
   request id to look up, so this needs a retry/resume-send style CLI.
 - Provider rejections. These remain failed unless an operator performs a
   separate manual reconciliation.
-- USDC rebalancing failures. Those use the USDC/CCTP state machine and need
-  separate recovery commands.
+- USDC rebalancing failures. Those use the USDC/CCTP state machine and have
+  their own recovery command. A manual `transfer-usdc` prints its transfer id
+  and, if interrupted after the burn, is resumed with
+  `stox resume-usdc-transfer --id <id> --direction <to-raindex|to-alpaca>
+  --amount <amount>`.
+  The `--direction` must match the original (a mismatch is rejected to avoid
+  mis-driving) and an unknown id is rejected rather than starting a fresh burn;
+  the `--amount` is required for symmetry with `transfer-usdc` but a resume uses
+  the aggregate's persisted amount. Run it only when the bot is not concurrently
+  driving that same id, since it drives the aggregate directly rather than
+  through the bot's resume lock.
 
 For local dashboard testing, run:
 

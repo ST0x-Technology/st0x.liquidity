@@ -17,6 +17,7 @@ use sqlx::SqlitePool;
 use std::io::Write;
 use std::sync::Arc;
 use tracing::info;
+use uuid::Uuid;
 
 use st0x_config::{Ctx, Env};
 use st0x_event_sorcery::Projection;
@@ -247,6 +248,26 @@ pub enum Commands {
         #[arg(short = 'd', long = "direction")]
         direction: TransferDirection,
         /// Amount of USDC to transfer
+        #[arg(short = 'a', long = "amount")]
+        amount: Usdc,
+    },
+
+    /// Resume an interrupted USDC transfer by its id (Raindex <-> Alpaca)
+    ///
+    /// Re-drives a transfer whose CLI invocation was interrupted after the burn.
+    /// The id is printed by `transfer-usdc` at start. An unknown id is rejected
+    /// (never starts a fresh burn) and `--direction` must match the original;
+    /// `--amount` is required for symmetry with the printed recovery command but
+    /// is not validated -- the resume uses the aggregate's persisted amount.
+    ResumeUsdcTransfer {
+        /// Id of the transfer to resume (printed by `transfer-usdc`)
+        #[arg(long = "id")]
+        id: Uuid,
+        /// Direction of the original transfer (must match the persisted transfer)
+        #[arg(short = 'd', long = "direction")]
+        direction: TransferDirection,
+        /// Amount printed by `transfer-usdc`; required for symmetry but not
+        /// validated -- the resume uses the persisted amount
         #[arg(short = 'a', long = "amount")]
         amount: Usdc,
     },
@@ -828,6 +849,11 @@ enum ProviderCommand {
         direction: TransferDirection,
         amount: Usdc,
     },
+    ResumeUsdcTransfer {
+        id: Uuid,
+        direction: TransferDirection,
+        amount: Usdc,
+    },
     CctpBridge {
         amount: Option<Usdc>,
         all: bool,
@@ -946,6 +972,15 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
         Commands::TransferUsdc { direction, amount } => {
             Err(ProviderCommand::TransferUsdc { direction, amount })
         }
+        Commands::ResumeUsdcTransfer {
+            id,
+            direction,
+            amount,
+        } => Err(ProviderCommand::ResumeUsdcTransfer {
+            id,
+            direction,
+            amount,
+        }),
         Commands::VaultDeposit {
             amount,
             token,
@@ -1328,6 +1363,14 @@ async fn run_provider_command<W: Write>(
         ProviderCommand::TransferUsdc { direction, amount } => {
             rebalancing::transfer_usdc_command(stdout, direction, amount, ctx, pool).await
         }
+        ProviderCommand::ResumeUsdcTransfer {
+            id,
+            direction,
+            amount,
+        } => {
+            rebalancing::resume_usdc_transfer_command(stdout, id, direction, amount, ctx, pool)
+                .await
+        }
         ProviderCommand::CctpBridge { amount, all, from } => {
             cctp::cctp_bridge_command::<OpenChainErrorRegistry, _>(stdout, amount, all, from, ctx)
                 .await
@@ -1522,6 +1565,7 @@ mod tests {
             Err(
                 ProviderCommand::ProcessTx { .. }
                 | ProviderCommand::TransferUsdc { .. }
+                | ProviderCommand::ResumeUsdcTransfer { .. }
                 | ProviderCommand::CctpBridge { .. }
                 | ProviderCommand::CctpRecover { .. }
                 | ProviderCommand::ResetAllowance { .. }
@@ -1542,6 +1586,7 @@ mod tests {
             Err(ProviderCommand::ProcessTx { .. }) => {}
             Err(
                 ProviderCommand::TransferUsdc { .. }
+                | ProviderCommand::ResumeUsdcTransfer { .. }
                 | ProviderCommand::CctpBridge { .. }
                 | ProviderCommand::CctpRecover { .. }
                 | ProviderCommand::ResetAllowance { .. }
@@ -1575,6 +1620,38 @@ mod tests {
     }
 
     #[test]
+    fn resume_usdc_transfer_command_parses_id_direction_and_amount() {
+        let id = Uuid::from_u128(42);
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "resume-usdc-transfer",
+            "--id",
+            &id.to_string(),
+            "--direction",
+            "to-raindex",
+            "--amount",
+            "100",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::ResumeUsdcTransfer {
+                id: parsed_id,
+                direction,
+                amount,
+            } => {
+                assert_eq!(parsed_id, id);
+                assert!(matches!(direction, TransferDirection::ToRaindex));
+                assert_eq!(
+                    amount,
+                    Usdc::new(rain_math_float::Float::parse("100".to_string()).unwrap())
+                );
+            }
+            other => panic!("expected resume-usdc-transfer command, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn classify_recheck_transfer_command_as_simple() {
         // The recheck-transfer command must route without an RPC provider:
         // it delegates to the running bot's REST API rather than touching chain.
@@ -1592,6 +1669,7 @@ mod tests {
             Err(
                 ProviderCommand::ProcessTx { .. }
                 | ProviderCommand::TransferUsdc { .. }
+                | ProviderCommand::ResumeUsdcTransfer { .. }
                 | ProviderCommand::CctpBridge { .. }
                 | ProviderCommand::CctpRecover { .. }
                 | ProviderCommand::ResetAllowance { .. }
@@ -1816,6 +1894,7 @@ mod tests {
             Err(
                 ProviderCommand::ProcessTx { .. }
                 | ProviderCommand::TransferUsdc { .. }
+                | ProviderCommand::ResumeUsdcTransfer { .. }
                 | ProviderCommand::CctpBridge { .. }
                 | ProviderCommand::CctpRecover { .. }
                 | ProviderCommand::ResetAllowance { .. }

@@ -889,6 +889,38 @@ impl UsdcRebalance {
             _ => None,
         }
     }
+
+    /// The rebalance direction, present in every non-initial state and invariant
+    /// across the whole lifecycle. Used by the CLI `resume-usdc-transfer` command
+    /// to validate the operator-supplied `--direction` against the persisted
+    /// transfer, so a wrong flag is rejected rather than mis-driving the aggregate
+    /// through the opposite-direction resume path.
+    ///
+    /// Deliberately does NOT expose the amount: a state's `amount` field is
+    /// reassigned to the conversion `filled_amount` (and later the post-fee
+    /// `amount_received`), so it is not the original requested amount the CLI
+    /// prints -- validating `--amount` against it would reject legitimate resumes
+    /// whenever slippage or CCTP fees move the effective amount.
+    pub(crate) fn direction(&self) -> RebalanceDirection {
+        match self {
+            Self::Converting { direction, .. }
+            | Self::ConversionComplete { direction, .. }
+            | Self::ConversionFailed { direction, .. }
+            | Self::WithdrawalSubmitting { direction, .. }
+            | Self::Withdrawing { direction, .. }
+            | Self::WithdrawalComplete { direction, .. }
+            | Self::WithdrawalFailed { direction, .. }
+            | Self::BridgingSubmitting { direction, .. }
+            | Self::Bridging { direction, .. }
+            | Self::AwaitingAttestation { direction, .. }
+            | Self::Attested { direction, .. }
+            | Self::Bridged { direction, .. }
+            | Self::BridgingFailed { direction, .. }
+            | Self::DepositInitiated { direction, .. }
+            | Self::DepositConfirmed { direction, .. }
+            | Self::DepositFailed { direction, .. } => direction.clone(),
+        }
+    }
 }
 
 /// Candidate `UsdcRebalance` aggregates whose latest event leaves them
@@ -3185,6 +3217,54 @@ mod tests {
             None,
             "BridgingSubmitting is pre-burn and must NOT be re-armed (double-burn risk)",
         );
+    }
+
+    // `direction` backs the CLI resume guard's `--direction` validation, so a
+    // wrong destructure in its 16-arm match would mis-classify a transfer's
+    // direction and either reject a valid resume or mis-drive the aggregate.
+    // Spot-check states spread across the or-pattern in both directions.
+    #[test]
+    fn direction_reads_persisted_direction() {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000002");
+        let now = Utc::now();
+        let amount = Usdc::new(float!(321));
+
+        let bridged = UsdcRebalance::Bridged {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount,
+            amount_received: Usdc::new(float!(320)),
+            fee_collected: Usdc::new(float!(1)),
+            burn_tx_hash: burn_tx,
+            mint_tx_hash: burn_tx,
+            initiated_at: now,
+            minted_at: now,
+        };
+        assert_eq!(bridged.direction(), RebalanceDirection::AlpacaToBase);
+
+        let conversion_complete = UsdcRebalance::ConversionComplete {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount,
+            filled_amount: Usdc::new(float!(999)),
+            initiated_at: now,
+            converted_at: now,
+        };
+        assert_eq!(
+            conversion_complete.direction(),
+            RebalanceDirection::BaseToAlpaca,
+        );
+
+        let deposit_failed = UsdcRebalance::DepositFailed {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount,
+            burn_tx_hash: burn_tx,
+            mint_tx_hash: burn_tx,
+            deposit_ref: None,
+            reason: "boom".to_string(),
+            initiated_at: now,
+            failed_at: now,
+        };
+        assert_eq!(deposit_failed.direction(), RebalanceDirection::AlpacaToBase);
     }
 
     #[tokio::test]

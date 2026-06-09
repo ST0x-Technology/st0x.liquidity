@@ -3,8 +3,11 @@
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use sqlx::SqlitePool;
+use std::future::Future;
 use std::io::{self, Write};
 use std::sync::Arc;
+use std::time::Duration;
+use tracing::warn;
 use uuid::Uuid;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
@@ -25,13 +28,14 @@ use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, Equity, EquityTransferServices};
 use crate::rebalancing::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
 use crate::rebalancing::usdc::CrossVenueCashTransfer;
+use crate::rebalancing::usdc::UsdcTransferError;
 use crate::tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus, Tokenizer,
 };
 use crate::tokenized_equity_mint::{
     IssuerRequestId, TokenizedEquityMint, TokenizedEquityMintCommand,
 };
-use crate::usdc_rebalance::{UsdcRebalance, UsdcRebalanceId};
+use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceId};
 use crate::vault_registry::VaultRegistry;
 use crate::wrapper::{Wrapper, WrapperService};
 use st0x_config::{BrokerCtx, Ctx};
@@ -171,10 +175,124 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
     Ok(())
 }
 
+/// Per-retry delay for the manual CLI redrive loop when Circle's attestation is
+/// not yet ready. Mirrors the apalis job's redrive cadence.
+const CLI_ATTESTATION_REDRIVE_DELAY: Duration = Duration::from_secs(60);
+
+/// Drives a manual USDC transfer to a terminal outcome, redriving on attestation
+/// timeouts so a single CLI invocation cannot strand after the burn.
+///
+/// `resume` is re-invoked with the same `UsdcRebalanceId` on every attempt, so a
+/// timeout resumes the already-burned transfer instead of starting a second
+/// fund-moving one. Any non-timeout error -- including
+/// `AttestationRetryDeadlineElapsed` and a previously-failed aggregate -- is
+/// terminal and returned to the caller.
+async fn redrive_transfer_until_settled<Resume, Fut>(
+    redrive_delay: Duration,
+    mut resume: Resume,
+) -> Result<(), UsdcTransferError>
+where
+    Resume: FnMut() -> Fut,
+    Fut: Future<Output = Result<(), UsdcTransferError>>,
+{
+    loop {
+        match resume().await {
+            Ok(()) => return Ok(()),
+            Err(UsdcTransferError::AttestationTimedOut { id }) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    ?redrive_delay,
+                    "Circle attestation not ready for manual USDC transfer; retrying after delay"
+                );
+                tokio::time::sleep(redrive_delay).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Starts a fresh manual USDC transfer. Surfaces the generated id up front so an
+/// operator can resume it (via `resume-usdc-transfer`) if the process is
+/// interrupted, then drives it to terminal with attestation-timeout redrive.
+/// Whether a USDC transfer command may start a fresh transfer or must resume an
+/// existing one. Drives the `None`-state policy in [`run_usdc_transfer`]: a
+/// freshly generated id is expected to have no state (first run), but an
+/// operator-supplied resume id that loads to `None` is a wrong/typoed id and
+/// must be rejected -- never burned into a brand-new transfer.
+#[derive(Clone, Copy)]
+enum UsdcTransferStartMode {
+    Fresh,
+    Resume,
+}
+
 pub(super) async fn transfer_usdc_command<Writer: Write>(
     stdout: &mut Writer,
     direction: TransferDirection,
     amount: Usdc,
+    ctx: &Ctx,
+    pool: &SqlitePool,
+) -> anyhow::Result<()> {
+    let id = UsdcRebalanceId(Uuid::new_v4());
+    let dir_flag = match direction {
+        TransferDirection::ToRaindex => "to-raindex",
+        TransferDirection::ToAlpaca => "to-alpaca",
+    };
+    writeln!(
+        stdout,
+        "USDC transfer id: {id}\n   If this is interrupted after the burn, resume with:\n   \
+         resume-usdc-transfer --id {id} --direction {dir_flag} --amount {amount}"
+    )?;
+    // Flush the recovery id to durable output BEFORE the burn: the resume safety
+    // story depends on the operator still having this id if the process is killed
+    // after burning, and buffered/redirected stdout could otherwise lose it.
+    stdout.flush()?;
+    run_usdc_transfer(
+        stdout,
+        direction,
+        amount,
+        id,
+        UsdcTransferStartMode::Fresh,
+        ctx,
+        pool,
+    )
+    .await
+}
+
+/// Resumes an interrupted manual USDC transfer by its id, driving it to terminal
+/// with the same attestation-timeout redrive as a fresh transfer. Refuses to run
+/// if the id has no persisted transfer (a wrong/typoed id would otherwise start a
+/// brand-new burn) or if `--direction` disagrees with the persisted transfer. The
+/// `--amount` is required for symmetry with the `transfer-usdc` recovery hint but
+/// is not validated -- a resume uses the aggregate's persisted amount.
+pub(super) async fn resume_usdc_transfer_command<Writer: Write>(
+    stdout: &mut Writer,
+    id: Uuid,
+    direction: TransferDirection,
+    amount: Usdc,
+    ctx: &Ctx,
+    pool: &SqlitePool,
+) -> anyhow::Result<()> {
+    let id = UsdcRebalanceId(id);
+    writeln!(stdout, "Resuming USDC transfer id: {id}")?;
+    run_usdc_transfer(
+        stdout,
+        direction,
+        amount,
+        id,
+        UsdcTransferStartMode::Resume,
+        ctx,
+        pool,
+    )
+    .await
+}
+
+async fn run_usdc_transfer<Writer: Write>(
+    stdout: &mut Writer,
+    direction: TransferDirection,
+    amount: Usdc,
+    id: UsdcRebalanceId,
+    mode: UsdcTransferStartMode,
     ctx: &Ctx,
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
@@ -183,6 +301,43 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
         TransferDirection::ToAlpaca => "Raindex -> Alpaca",
     };
     writeln!(stdout, "Transferring USDC: {dir}, Amount: {amount} USDC")?;
+
+    let usdc_store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        .build(())
+        .await?;
+
+    // A resume must target an existing transfer, checked up front before any
+    // broker/bridge setup. The manager's `resume_*` path treats a `None`-state id
+    // as a first run and burns a brand-new transfer -- correct for a freshly
+    // generated `transfer-usdc` id, but a fund-moving foot-gun for an
+    // operator-supplied resume id that is mistyped or points at the wrong
+    // database. Reject `None`, and reject a `--direction` that disagrees with the
+    // persisted transfer (driving the opposite-direction resume path would
+    // mis-drive the aggregate). The `--amount` is NOT validated: it stays in the
+    // recovery command for symmetry with `transfer-usdc`, but a resume uses the
+    // aggregate's persisted amount, and the persisted state amount is the
+    // post-conversion/post-fee effective amount, not the original requested one.
+    if matches!(mode, UsdcTransferStartMode::Resume) {
+        let Some(state) = usdc_store.load(&id).await? else {
+            anyhow::bail!(
+                "resume-usdc-transfer: no transfer found for id {id}. Refusing to start a new \
+                 burn -- check the id and that you are pointed at the right database."
+            );
+        };
+
+        let expected_direction = match direction {
+            TransferDirection::ToRaindex => RebalanceDirection::AlpacaToBase,
+            TransferDirection::ToAlpaca => RebalanceDirection::BaseToAlpaca,
+        };
+
+        if state.direction() != expected_direction {
+            anyhow::bail!(
+                "resume-usdc-transfer: --direction does not match the persisted transfer for id \
+                 {id} (persisted {:?}). Refusing to mis-drive the transfer.",
+                state.direction()
+            );
+        }
+    }
 
     let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
         anyhow::bail!("transfer-usdc requires Alpaca Broker API configuration");
@@ -261,10 +416,6 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
         owner,
     ));
 
-    let usdc_store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
-        .build(())
-        .await?;
-
     let attestation_retry_deadline = ctx.rebalancing_ctx()?.attestation_retry_deadline;
 
     let rebalance_manager = CrossVenueCashTransfer::new(
@@ -280,22 +431,28 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
 
     writeln!(stdout, "   Transfer may take several minutes...")?;
 
-    let id = UsdcRebalanceId(Uuid::new_v4());
+    // Drive through `resume_*` (not `execute_*`): a fresh id with no prior state
+    // takes the execute path inside `resume_*`, and an attestation timeout
+    // re-enters from the persisted state on the same id -- so this single
+    // invocation covers both the first run and every redrive without ever
+    // minting a second `UsdcRebalanceId` against the already-burned funds.
+    redrive_transfer_until_settled(CLI_ATTESTATION_REDRIVE_DELAY, || async {
+        match direction {
+            TransferDirection::ToRaindex => {
+                rebalance_manager.resume_alpaca_to_base(&id, amount).await
+            }
+            TransferDirection::ToAlpaca => {
+                rebalance_manager.resume_base_to_alpaca(&id, amount).await
+            }
+        }
+    })
+    .await?;
 
-    match direction {
-        TransferDirection::ToRaindex => {
-            rebalance_manager
-                .execute_alpaca_to_base(&id, amount)
-                .await?;
-            writeln!(stdout, "USDC transfer to Raindex completed successfully")?;
-        }
-        TransferDirection::ToAlpaca => {
-            rebalance_manager
-                .execute_base_to_alpaca(&id, amount)
-                .await?;
-            writeln!(stdout, "USDC transfer to Alpaca completed successfully")?;
-        }
-    }
+    let completion = match direction {
+        TransferDirection::ToRaindex => "USDC transfer to Raindex completed successfully",
+        TransferDirection::ToAlpaca => "USDC transfer to Alpaca completed successfully",
+    };
+    writeln!(stdout, "{completion}")?;
 
     Ok(())
 }
@@ -747,12 +904,70 @@ mod tests {
     use super::*;
     use crate::inventory::ImbalanceThreshold;
     use crate::test_utils::setup_test_db;
+    use crate::usdc_rebalance::{TransferRef, UsdcRebalanceCommand};
     use st0x_config::EvmCtx;
     use st0x_config::ExecutionThreshold;
     use st0x_config::RebalancingCtx;
     use st0x_config::{
         AssetsConfig, CashAssetConfig, EquitiesConfig, LogLevel, OperationMode, TradingMode,
     };
+
+    /// RAI-835: the manual redrive loop must re-invoke `resume` on the same id
+    /// after an attestation timeout and drive through to success -- so a single
+    /// CLI invocation cannot strand a burned transfer.
+    #[tokio::test]
+    async fn redrive_loop_retries_attestation_timeout_then_succeeds() {
+        let calls = std::cell::Cell::new(0u32);
+
+        let result = redrive_transfer_until_settled(Duration::from_millis(0), || {
+            let attempt = calls.get() + 1;
+            calls.set(attempt);
+            async move {
+                if attempt == 1 {
+                    Err(UsdcTransferError::AttestationTimedOut {
+                        id: UsdcRebalanceId(Uuid::from_u128(7)),
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+
+        result.expect("redrive must succeed once the attestation arrives");
+        assert_eq!(
+            calls.get(),
+            2,
+            "the loop must retry exactly once after the timeout, then succeed",
+        );
+    }
+
+    /// RAI-835: a non-timeout terminal outcome (deadline elapsed) must end the
+    /// loop immediately, not spin forever.
+    #[tokio::test]
+    async fn redrive_loop_returns_terminal_error_without_looping() {
+        let calls = std::cell::Cell::new(0u32);
+
+        let result = redrive_transfer_until_settled(Duration::from_millis(0), || {
+            calls.set(calls.get() + 1);
+            async move {
+                Err(UsdcTransferError::AttestationRetryDeadlineElapsed {
+                    id: UsdcRebalanceId(Uuid::from_u128(7)),
+                })
+            }
+        })
+        .await;
+
+        let error = result.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                UsdcTransferError::AttestationRetryDeadlineElapsed { .. }
+            ),
+            "a deadline-elapsed outcome must surface, not be retried; got {error:?}",
+        );
+        assert_eq!(calls.get(), 1, "a terminal error must not be retried");
+    }
 
     fn create_ctx_without_rebalancing() -> Ctx {
         Ctx {
@@ -933,6 +1148,139 @@ mod tests {
         assert!(
             err_msg.contains("requires Alpaca Broker API configuration"),
             "Expected Alpaca Broker API error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_usdc_transfer_rejects_unknown_id_without_burning() {
+        // The core safety contract of `resume-usdc-transfer`: an id that has no
+        // persisted transfer (a typo, or the wrong database) MUST be rejected up
+        // front rather than falling through to the manager's `None` -> fresh-burn
+        // path. The existence check runs before any broker/bridge setup, so a bare
+        // ctx and an empty pool reach it directly.
+        let ctx = create_ctx_without_rebalancing();
+        let pool = setup_test_db().await;
+        let amount = Usdc::new(Float::parse("100".to_string()).unwrap());
+        let unknown_id = Uuid::from_u128(0xDEAD_BEEF);
+
+        let mut stdout = Vec::new();
+        let result = resume_usdc_transfer_command(
+            &mut stdout,
+            unknown_id,
+            TransferDirection::ToRaindex,
+            amount,
+            &ctx,
+            &pool,
+        )
+        .await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("no transfer found for id"),
+            "resume of an unknown id must refuse, not start a new burn; got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_usdc_transfer_rejects_direction_mismatch() {
+        // Seed an AlpacaToBase transfer, then resume with the opposite direction
+        // (`--direction to-alpaca` => BaseToAlpaca). The guard must reject it
+        // rather than driving the aggregate through the wrong-direction resume
+        // path. The check runs before broker setup, so a bare ctx reaches it.
+        let ctx = create_ctx_without_rebalancing();
+        let pool = setup_test_db().await;
+        let amount = Usdc::new(Float::parse("100".to_string()).unwrap());
+        let id = Uuid::from_u128(99);
+
+        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        store
+            .send(
+                &UsdcRebalanceId(id),
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(b256!(
+                        "0x00000000000000000000000000000000000000000000000000000000000000a1"
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut stdout = Vec::new();
+        let result = resume_usdc_transfer_command(
+            &mut stdout,
+            id,
+            TransferDirection::ToAlpaca,
+            amount,
+            &ctx,
+            &pool,
+        )
+        .await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("does not match the persisted transfer"),
+            "resume with the wrong direction must be rejected, not mis-drive; got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_usdc_transfer_accepts_amount_differing_from_persisted() {
+        // Regression guard: a resume with the CORRECT direction but a `--amount`
+        // different from the persisted state amount must NOT be rejected. The
+        // persisted amount is the post-slippage/post-fee effective amount, not the
+        // original requested one the operator types, so validating against it
+        // would wrongly reject legitimate resumes (the iter2 bug). The preflight
+        // guard must let it through -- here it then fails at broker setup, proving
+        // the guard accepted it.
+        let ctx = create_ctx_without_rebalancing();
+        let pool = setup_test_db().await;
+        let seeded_amount = Usdc::new(Float::parse("100".to_string()).unwrap());
+        let different_amount = Usdc::new(Float::parse("250".to_string()).unwrap());
+        let id = Uuid::from_u128(123);
+
+        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        store
+            .send(
+                &UsdcRebalanceId(id),
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: seeded_amount,
+                    withdrawal: TransferRef::OnchainTx(b256!(
+                        "0x00000000000000000000000000000000000000000000000000000000000000a2"
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+
+        // ToRaindex maps to AlpacaToBase -- the correct direction for the seed.
+        let mut stdout = Vec::new();
+        let result = resume_usdc_transfer_command(
+            &mut stdout,
+            id,
+            TransferDirection::ToRaindex,
+            different_amount,
+            &ctx,
+            &pool,
+        )
+        .await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            !err_msg.contains("does not match"),
+            "a differing --amount must pass the guard (resume uses persisted amount); got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("requires Alpaca Broker API configuration"),
+            "past the guard, the bare ctx must fail at broker setup; got: {err_msg}"
         );
     }
 
