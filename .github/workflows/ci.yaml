@@ -27,7 +27,7 @@ jobs:
           git config --global http.lowSpeedLimit 524288
           git config --global http.lowSpeedTime 60
 
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/nix-installer-action@v22
         with:
           extra-conf: |
             accept-flake-config = true
@@ -106,14 +106,14 @@ jobs:
           git config --global http.lowSpeedLimit 524288
           git config --global http.lowSpeedTime 60
 
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/nix-installer-action@v22
         with:
           extra-conf: |
             accept-flake-config = true
             fallback = true
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
 
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@v14
         continue-on-error: true
 
       - name: Restore Nix source cache
@@ -190,7 +190,7 @@ jobs:
           git config --global http.lowSpeedLimit 524288
           git config --global http.lowSpeedTime 60
 
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/nix-installer-action@v22
         with:
           extra-conf: |
             accept-flake-config = true
@@ -226,7 +226,7 @@ jobs:
           git config --global http.lowSpeedLimit 524288
           git config --global http.lowSpeedTime 60
 
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/nix-installer-action@v22
         with:
           extra-conf: |
             accept-flake-config = true
