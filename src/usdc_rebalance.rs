@@ -863,6 +863,32 @@ impl UsdcRebalance {
             Self::WithdrawalFailed { .. } => false,
         }
     }
+
+    /// The `(direction, amount)` of a post-burn transfer that an apalis job must
+    /// drive forward, or `None` if the state needs no job (terminal, or a
+    /// pre-burn leg the live reactor re-arms on its own).
+    ///
+    /// Used by startup recovery to re-enqueue a transfer job for an aggregate
+    /// stranded post-burn with no pending job -- e.g. a redrive enqueue that
+    /// failed after `TimeoutAttestation` committed, leaving the aggregate durably
+    /// `AwaitingAttestation` with nothing to retry it. Scoped to the post-burn,
+    /// pre-mint-confirmation states (`Bridging`, `AwaitingAttestation`,
+    /// `Attested`) where polling/minting is the only thing advancing the transfer
+    /// and a lost job latches the guard indefinitely.
+    pub(crate) fn resumable_post_burn_transfer(&self) -> Option<(RebalanceDirection, Usdc)> {
+        match self {
+            Self::Bridging {
+                direction, amount, ..
+            }
+            | Self::AwaitingAttestation {
+                direction, amount, ..
+            }
+            | Self::Attested {
+                direction, amount, ..
+            } => Some((direction.clone(), *amount)),
+            _ => None,
+        }
+    }
 }
 
 /// Candidate `UsdcRebalance` aggregates whose latest event leaves them
@@ -3067,6 +3093,97 @@ mod tests {
             mint_scan_from_block,
             Some(8_675_309),
             "evolve must carry the scan bound into the Attested state",
+        );
+    }
+
+    // `resumable_post_burn_transfer` is the classifier startup recovery uses to
+    // decide which stranded aggregates get a re-armed transfer job. Pin all three
+    // post-burn resumable arms (carrying the right direction so the re-arm routes
+    // to the correct queue) and a terminal arm that must NOT be re-armed -- a
+    // narrowed match would silently strand or double-drive burned-USDC transfers.
+    #[test]
+    fn resumable_post_burn_transfer_classifies_post_burn_states() {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let now = Utc::now();
+        let amount = Usdc::new(float!(750));
+
+        let bridging = UsdcRebalance::Bridging {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount,
+            burn_tx_hash: burn_tx,
+            initiated_at: now,
+            burned_at: now,
+        };
+        assert_eq!(
+            bridging.resumable_post_burn_transfer(),
+            Some((RebalanceDirection::BaseToAlpaca, amount)),
+            "Bridging is post-burn and must be resumable",
+        );
+
+        let awaiting = UsdcRebalance::AwaitingAttestation {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount,
+            burn_tx_hash: burn_tx,
+            initiated_at: now,
+            timed_out_at: now,
+            retry_deadline_at: now,
+        };
+        assert_eq!(
+            awaiting.resumable_post_burn_transfer(),
+            Some((RebalanceDirection::AlpacaToBase, amount)),
+            "AwaitingAttestation is post-burn and must be resumable in its own direction",
+        );
+
+        let attested = UsdcRebalance::Attested {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount,
+            burn_tx_hash: burn_tx,
+            cctp_nonce: TEST_CCTP_NONCE,
+            attestation: vec![0x01],
+            message: Some(vec![0xDE, 0xAD]),
+            mint_scan_from_block: Some(100),
+            initiated_at: now,
+            attested_at: now,
+        };
+        assert_eq!(
+            attested.resumable_post_burn_transfer(),
+            Some((RebalanceDirection::AlpacaToBase, amount)),
+            "Attested is post-burn, pre-mint and must be resumable",
+        );
+
+        // A confirmed mint is terminal for the transfer leg: re-arming it would
+        // double-drive an already-bridged transfer, so it must classify as None.
+        let bridged = UsdcRebalance::Bridged {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount,
+            amount_received: amount,
+            fee_collected: Usdc::new(float!(0.01)),
+            burn_tx_hash: burn_tx,
+            mint_tx_hash: burn_tx,
+            initiated_at: now,
+            minted_at: now,
+        };
+        assert_eq!(
+            bridged.resumable_post_burn_transfer(),
+            None,
+            "Bridged (mint confirmed) must not be re-armed",
+        );
+
+        // BridgingSubmitting is the pre-burn intent marker: the on-chain burn may
+        // or may not have landed. Re-arming it could drive a second CCTP burn, so
+        // it must classify as None and be left to crash-safe scan/operator
+        // recovery -- never auto-re-armed.
+        let submitting = UsdcRebalance::BridgingSubmitting {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount,
+            from_block: 100,
+            initiated_at: now,
+        };
+        assert_eq!(
+            submitting.resumable_post_burn_transfer(),
+            None,
+            "BridgingSubmitting is pre-burn and must NOT be re-armed (double-burn risk)",
         );
     }
 

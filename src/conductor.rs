@@ -136,6 +136,37 @@ pub(crate) struct Conductor {
     apalis_shutdown_token: CancellationToken,
 }
 
+/// Resets a transfer queue's orphaned `Running`/`Queued` rows back to `Pending`
+/// at startup -- run before workers spawn, so any such row is orphaned by a dead
+/// process by definition. apalis cannot rescue these on its own (the
+/// deterministic worker name keeps the heartbeat fresh, so the row never ages
+/// out), and the re-arm / enqueue-dedup paths treat a non-terminal row as
+/// in-flight, so a wedged row would silently suppress every future transfer in
+/// that direction. Fails fast on a reset error -- the bot must not come up
+/// looking healthy with crash-safe recovery disabled.
+async fn requeue_transfer_orphans<Task>(
+    queue: &job::JobQueue<Task>,
+    direction_label: &str,
+) -> anyhow::Result<()>
+where
+    Task: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + Unpin + 'static,
+{
+    let count = queue.requeue_orphaned().await.with_context(|| {
+        format!("failed to re-queue orphaned {direction_label} transfer jobs at startup")
+    })?;
+
+    if count > 0 {
+        info!(
+            target: "rebalance",
+            count,
+            direction = direction_label,
+            "Re-queued orphaned transfer job(s) for crash-safe resume",
+        );
+    }
+
+    Ok(())
+}
+
 impl Conductor {
     pub(crate) async fn run<E>(
         executor_ctx: impl TryIntoExecutor<Executor = E>,
@@ -231,31 +262,19 @@ impl Conductor {
         .await?;
 
         // A previous process may have died mid-transfer, leaving an apalis
-        // `Running` row that no live worker owns. apalis cannot rescue such an
-        // orphan on a quick restart -- the deterministic worker name keeps its
-        // heartbeat fresh, so the row never ages out -- and the enqueue dedup
-        // keys off that row, wedging every future Base->Alpaca transfer. Reset
-        // orphans here, before the monitor spawns (so any `Running` row is by
-        // definition orphaned), letting the worker re-drive them through the
-        // crash-safe resume path. Only meaningful when the transfer worker is
-        // wired, i.e. rebalancing is enabled.
+        // `Running` row that no live worker owns. Reset orphaned rows for both
+        // transfer directions before the monitor spawns (so any `Running` row is
+        // orphaned by definition). The two queues are wedge-prone symmetrically:
+        // Base->Alpaca via the enqueue dedup, Alpaca->Base because
+        // `rearm_stranded_transfers` treats a `Running` row as in-flight and
+        // skips it. Only meaningful when the transfer worker is wired, i.e.
+        // rebalancing is enabled (both ctxs are set together).
         if transfer_usdc_to_hedging_ctx.is_some() {
-            // Fail startup fast if the reset fails: a stale `Running` row left
-            // wedged silently suppresses every future Base->Alpaca transfer, so
-            // the bot must not come up looking healthy with recovery disabled.
-            let count = schedulers
-                .transfer_usdc_to_hedging
-                .requeue_orphaned()
-                .await
-                .context("failed to re-queue orphaned Base->Alpaca transfer jobs at startup")?;
-
-            if count > 0 {
-                info!(
-                    target: "rebalance",
-                    count,
-                    "Re-queued orphaned Base->Alpaca transfer job(s) for crash-safe resume",
-                );
-            }
+            requeue_transfer_orphans(&schedulers.transfer_usdc_to_hedging, "Base->Alpaca").await?;
+        }
+        if transfer_usdc_to_market_making_ctx.is_some() {
+            requeue_transfer_orphans(&schedulers.transfer_usdc_to_market_making, "Alpaca->Base")
+                .await?;
         }
 
         // The backfill queue has the same orphan hazard. `OrderFillMonitor`

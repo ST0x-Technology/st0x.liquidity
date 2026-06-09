@@ -117,6 +117,8 @@ pub(crate) enum RebalancingServiceError {
     },
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
+    #[error("failed to re-arm a stranded USDC transfer job at startup: {0}")]
+    RearmEnqueue(#[from] QueuePushError),
 }
 
 /// Why loading a token address from the vault registry failed.
@@ -923,6 +925,45 @@ impl RebalancingService {
         }
     }
 
+    /// Whether a USDC transfer apalis row for `id` exists in *either* direction in
+    /// ANY status -- including terminal `Failed`/`Done`, unlike
+    /// [`Self::transfer_in_flight_for_id`].
+    ///
+    /// Used by startup re-arm to fire only for the true "no job row at all"
+    /// strand (a failed redrive enqueue, or a crash before the enqueue
+    /// committed). A `Failed` row is a job that exhausted its retry budget and is
+    /// awaiting operator reconciliation -- re-arming it would re-drive a
+    /// known-failing transfer on every restart and bypass the retry budget,
+    /// contradicting [`JobQueue::requeue_orphaned`]'s policy of leaving `Failed`
+    /// rows latched. The operator path for such a transfer is the manual
+    /// `resume-usdc-transfer` CLI, not an automatic re-arm.
+    ///
+    /// Unlike the timeout-sweep probe, this PROPAGATES query/decode failures so
+    /// startup recovery fails fast rather than silently skipping (or spuriously
+    /// firing) a re-arm it could not verify.
+    async fn transfer_has_job_row_for_id(&self, id: &UsdcRebalanceId) -> Result<bool, sqlx::Error> {
+        #[derive(serde::Deserialize)]
+        struct TransferJobId {
+            id: UsdcRebalanceId,
+        }
+
+        let rows: Vec<(Vec<u8>,)> = sqlx::query_as("SELECT job FROM Jobs WHERE job_type IN (?, ?)")
+            .bind(std::any::type_name::<TransferUsdcToHedging>())
+            .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+            .fetch_all(self.transfer_usdc_to_hedging_queue.pool())
+            .await?;
+
+        for (payload,) in rows {
+            let job: TransferJobId = serde_json::from_slice(&payload)
+                .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
+            if job.id == *id {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
     async fn retire_stale_suppression_and_collect_active_symbols(
         &self,
         fetched_at: DateTime<Utc>,
@@ -1238,8 +1279,8 @@ impl RebalancingService {
         use InventorySnapshotEvent::*;
         use RebalancingServiceError::{
             EquityTrigger, Float, MissingUsdcBridgedAmount, MissingUsdcTrackingContext, Projection,
-            RedemptionUnwrappedExceedsTracked, SettledUsdcExceedsInitiatedAmount, SharesConversion,
-            Sqlx,
+            RearmEnqueue, RedemptionUnwrappedExceedsTracked, SettledUsdcExceedsInitiatedAmount,
+            SharesConversion, Sqlx,
         };
 
         self.expire_stuck_operations_with_logging().await;
@@ -1254,7 +1295,8 @@ impl RebalancingService {
             | MissingUsdcBridgedAmount { .. }
             | SettledUsdcExceedsInitiatedAmount { .. }
             | RedemptionUnwrappedExceedsTracked { .. }
-            | Sqlx(_)) => {
+            | Sqlx(_)
+            | RearmEnqueue(_)) => {
                 return Err(other);
             }
         };
@@ -2356,7 +2398,8 @@ impl RebalancingService {
     }
 
     /// Reconstructs the single-rebalance guard (`usdc_in_progress`) from durable
-    /// `UsdcRebalance` event state on startup.
+    /// `UsdcRebalance` event state on startup, and re-arms transfer jobs for
+    /// post-burn rebalances stranded with no pending job.
     ///
     /// The guard is in-memory and resets to `false` on restart. Without this, a
     /// restart between a post-burn `BridgingFailed` (or any unsettled in-flight
@@ -2365,10 +2408,15 @@ impl RebalancingService {
     /// guard when any aggregate is in a guard-holding state blocks new USDC
     /// rebalancing until the stuck transfer settles or an operator recovers it.
     ///
-    /// Guard-only by design: USDC bridges have no resume/recheck path, so no
-    /// settlement events arrive post-restart, and reconstructing inventory
-    /// inflight (which risks double-counting against re-hydrated available
-    /// balances) would be dead state. See ADR 2.
+    /// USDC bridges DO resume post-restart: apalis re-picks any pending transfer
+    /// job row and drives it via `resume_*`. But a redrive enqueue that fails
+    /// after its `TimeoutAttestation` already committed (or a crash in that
+    /// window) leaves the aggregate durably `AwaitingAttestation`/`Attested` with
+    /// no job to retry it -- the guard would then stay latched forever. So for
+    /// each post-burn resumable aggregate with no in-flight job row, this
+    /// re-enqueues a transfer job keyed by the existing id. The
+    /// `transfer_in_flight_for_id` check makes this idempotent with apalis's own
+    /// re-pick of still-pending rows. See ADR 2.
     pub(crate) async fn recover_usdc_guard(
         &self,
         pool: &SqlitePool,
@@ -2381,11 +2429,16 @@ impl RebalancingService {
 
         let mut held_ids = Vec::new();
         let mut unresolved_ids = Vec::new();
+        let mut rearm_candidates = Vec::new();
         for id in candidate_ids {
             match usdc_store.load(&id).await {
                 Ok(Some(entity)) => {
                     if entity.holds_rebalance_guard() {
-                        held_ids.push(id);
+                        held_ids.push(id.clone());
+                    }
+
+                    if let Some((direction, amount)) = entity.resumable_post_burn_transfer() {
+                        rearm_candidates.push((id, direction, amount));
                     }
                 }
                 // The id came from the event log, so a missing or unreplayable
@@ -2414,6 +2467,14 @@ impl RebalancingService {
             }
         }
 
+        // Re-arm a transfer job for each post-burn resumable aggregate that has
+        // no job row at all -- the strand that a failed redrive enqueue (or a
+        // crash in that window) leaves behind. Done before the early return because a
+        // resumable aggregate always holds the guard, so this set is non-empty
+        // only when `held_ids` is too. Propagates on failure so startup recovery
+        // fails fast rather than coming up with a latched guard and no driving job.
+        self.rearm_stranded_transfers(rearm_candidates).await?;
+
         // An unparseable candidate aggregate_id cannot be loaded or classified,
         // so it joins the unresolved set: hold the guard rather than risk leaving
         // a possibly-post-burn rebalance unguarded. Same fail-closed direction as
@@ -2431,6 +2492,66 @@ impl RebalancingService {
             "Reconstructed USDC in-progress guard for unsettled rebalances on startup; \
              new USDC rebalancing is blocked until they settle or are recovered"
         );
+
+        Ok(())
+    }
+
+    /// Re-enqueues a transfer job for each stranded post-burn rebalance that has
+    /// no in-flight job row, keyed by the existing aggregate id so the resumed
+    /// job hits the same aggregate.
+    ///
+    /// Fires only for the true "no job row at all" strand: a candidate that has
+    /// any job row (in-flight OR a terminal `Failed` row awaiting operator
+    /// reconciliation) is skipped via [`Self::transfer_has_job_row_for_id`], so
+    /// re-arm never bypasses the retry budget of a job that already ran and gave
+    /// up. An enqueue failure (or a probe failure) is propagated so startup
+    /// recovery fails fast and the supervisor retries -- consistent with the
+    /// `requeue_orphaned` startup path -- rather than coming up "healthy" with the
+    /// guard latched and no job driving a post-burn transfer.
+    async fn rearm_stranded_transfers(
+        &self,
+        candidates: Vec<(UsdcRebalanceId, RebalanceDirection, Usdc)>,
+    ) -> Result<(), RebalancingServiceError> {
+        for (id, direction, amount) in candidates {
+            if self.transfer_has_job_row_for_id(&id).await? {
+                debug!(
+                    target: "rebalance",
+                    %id,
+                    "Post-burn transfer already has a job row on startup (in-flight or a latched \
+                     Failed row); not re-arming",
+                );
+                continue;
+            }
+
+            match direction {
+                RebalanceDirection::BaseToAlpaca => {
+                    self.transfer_usdc_to_hedging_queue
+                        .clone()
+                        .push(TransferUsdcToHedging {
+                            id: id.clone(),
+                            amount,
+                        })
+                        .await?;
+                }
+                RebalanceDirection::AlpacaToBase => {
+                    self.transfer_usdc_to_market_making_queue
+                        .clone()
+                        .push(TransferUsdcToMarketMaking {
+                            id: id.clone(),
+                            amount,
+                        })
+                        .await?;
+                }
+            }
+
+            warn!(
+                target: "rebalance",
+                %id,
+                ?direction,
+                %amount,
+                "Re-armed a stranded post-burn USDC transfer with no job row on startup",
+            );
+        }
 
         Ok(())
     }
@@ -5041,6 +5162,19 @@ mod tests {
         .fetch_one(service.transfer_usdc_to_hedging_queue.pool())
         .await
         .expect("count pending TransferUsdcToHedging jobs")
+    }
+
+    async fn count_pending_transfer_usdc_to_market_making_jobs(
+        service: &RebalancingService,
+    ) -> i64 {
+        let job_type = std::any::type_name::<TransferUsdcToMarketMaking>();
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(job_type)
+        .fetch_one(service.transfer_usdc_to_market_making_queue.pool())
+        .await
+        .expect("count pending TransferUsdcToMarketMaking jobs")
     }
 
     /// Drains every pending USDC transfer row (both directions) from the
@@ -9182,6 +9316,230 @@ mod tests {
             service.usdc_in_progress.load(Ordering::SeqCst),
             "a crash at BridgingSubmitting (burn possibly already broadcast) must \
              re-assert the USDC guard on startup"
+        );
+    }
+
+    /// Drives an aggregate to `AwaitingAttestation` -- the state a redrive
+    /// enqueue that failed after `TimeoutAttestation` committed leaves behind.
+    async fn seed_awaiting_attestation(
+        store: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        direction: RebalanceDirection,
+        amount: Usdc,
+        burn_tx: TxHash,
+    ) {
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::Initiate {
+                    direction,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(burn_tx),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .await
+            .unwrap();
+        store
+            .send(id, UsdcRebalanceCommand::InitiateBridging { burn_tx })
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::TimeoutAttestation {
+                    retry_deadline_at: Utc::now() + chrono::Duration::hours(1),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// RAI-836: a post-burn aggregate stranded in `AwaitingAttestation` with no
+    /// pending job (e.g. a redrive enqueue that failed after `TimeoutAttestation`
+    /// committed) must get a transfer job re-armed on startup, keyed by the same
+    /// id and routed to the direction's queue -- otherwise the guard latches
+    /// forever with nothing driving the transfer.
+    #[tokio::test]
+    async fn recover_usdc_guard_rearms_stranded_awaiting_attestation() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let burn_tx =
+            fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000dd");
+
+        seed_awaiting_attestation(
+            &store,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            burn_tx,
+        )
+        .await;
+
+        let (service, _receiver) = make_trigger_with_inventory(InventoryView::default()).await;
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&service).await,
+            1,
+            "a stranded Base->Alpaca AwaitingAttestation must be re-armed as a hedging job",
+        );
+
+        let payload: Vec<u8> =
+            sqlx::query_scalar("SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?")
+                .bind(std::any::type_name::<TransferUsdcToHedging>())
+                .fetch_one(service.transfer_usdc_to_hedging_queue.pool())
+                .await
+                .unwrap();
+        let job: TransferUsdcToHedging = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            job.id, id,
+            "the re-armed job must resume the same aggregate id, not a fresh one",
+        );
+    }
+
+    /// RAI-836: re-arming is idempotent with apalis's own re-pick of pending
+    /// rows. An aggregate that still has a non-terminal job row on startup must
+    /// NOT get a second job -- a duplicate would drive two concurrent resumes of
+    /// the same id.
+    #[tokio::test]
+    async fn recover_usdc_guard_skips_rearm_when_job_already_in_flight() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let burn_tx =
+            fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000ee");
+
+        seed_awaiting_attestation(
+            &store,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            burn_tx,
+        )
+        .await;
+
+        let (service, _receiver) = make_trigger_with_inventory(InventoryView::default()).await;
+
+        // A still-pending job row for this id, as apalis would re-pick on restart.
+        let mut queue = service.transfer_usdc_to_hedging_queue.clone();
+        queue
+            .push(TransferUsdcToHedging {
+                id: id.clone(),
+                amount: usdc(400),
+            })
+            .await
+            .unwrap();
+
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&service).await,
+            1,
+            "an aggregate with a job already in flight must not be re-armed a second time",
+        );
+    }
+
+    /// RAI-836: a post-burn aggregate whose transfer job already exhausted its
+    /// retry budget (a terminal `Failed` row) must NOT be re-armed -- re-driving
+    /// it every restart would bypass the retry budget and silently retry a
+    /// known-failing transfer. It latches for operator reconciliation (recoverable
+    /// via the `resume-usdc-transfer` CLI), matching `requeue_orphaned`'s policy of
+    /// leaving `Failed` rows alone.
+    #[tokio::test]
+    async fn recover_usdc_guard_does_not_rearm_when_job_already_failed() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let burn_tx =
+            fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000bb");
+
+        seed_awaiting_attestation(
+            &store,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            burn_tx,
+        )
+        .await;
+
+        let (service, _receiver) = make_trigger_with_inventory(InventoryView::default()).await;
+
+        // A job that ran and exhausted its retries, as apalis leaves it: push a
+        // row, then mark it terminal `Failed`.
+        service
+            .transfer_usdc_to_hedging_queue
+            .clone()
+            .push(TransferUsdcToHedging {
+                id: id.clone(),
+                amount: usdc(400),
+            })
+            .await
+            .unwrap();
+        sqlx::query("UPDATE Jobs SET status = 'Failed' WHERE job_type = ?")
+            .bind(std::any::type_name::<TransferUsdcToHedging>())
+            .execute(service.transfer_usdc_to_hedging_queue.pool())
+            .await
+            .unwrap();
+
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&service).await,
+            0,
+            "a Failed (retries-exhausted) job must NOT be re-armed; it latches for operator recovery",
+        );
+    }
+
+    /// RAI-836: the re-arm must cover the Alpaca->Base direction too -- it routes
+    /// to the market-making queue with a `TransferUsdcToMarketMaking` payload. A
+    /// direction-routing bug would strand every Alpaca->Base rebalance while the
+    /// Base->Alpaca test stays green, so assert the market-making job explicitly.
+    #[tokio::test]
+    async fn recover_usdc_guard_rearms_stranded_awaiting_attestation_alpaca_to_base() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let burn_tx =
+            fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000cc");
+
+        seed_awaiting_attestation(
+            &store,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            usdc(400),
+            burn_tx,
+        )
+        .await;
+
+        let (service, _receiver) = make_trigger_with_inventory(InventoryView::default()).await;
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&service).await,
+            1,
+            "a stranded Alpaca->Base AwaitingAttestation must be re-armed as a market-making job",
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&service).await,
+            0,
+            "an Alpaca->Base strand must not be routed to the hedging queue",
+        );
+
+        let payload: Vec<u8> =
+            sqlx::query_scalar("SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?")
+                .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+                .fetch_one(service.transfer_usdc_to_market_making_queue.pool())
+                .await
+                .unwrap();
+        let job: TransferUsdcToMarketMaking = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            job.id, id,
+            "the re-armed market-making job must resume the same aggregate id, not a fresh one",
         );
     }
 
