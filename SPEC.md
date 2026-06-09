@@ -1720,8 +1720,12 @@ enum UsdcRebalance {
         direction: RebalanceDirection,
         amount: Usdc,
         burn_tx_hash: TxHash,
-        cctp_nonce: u64,
+        cctp_nonce: B256,
         attestation: Vec<u8>,
+        // Full CCTP message envelope, persisted so a resume reconstructs the
+        // AttestationResponse and mints without re-polling Circle. None for
+        // transfers whose BridgeAttestationReceived predates this field.
+        message: Option<Vec<u8>>,
         mint_scan_from_block: u64,
         initiated_at: DateTime<Utc>,
         attested_at: DateTime<Utc>,
@@ -1740,7 +1744,7 @@ enum UsdcRebalance {
         direction: RebalanceDirection,
         amount: Usdc,
         burn_tx_hash: Option<TxHash>,
-        cctp_nonce: Option<u64>,
+        cctp_nonce: Option<B256>,
         reason: String,
         initiated_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
@@ -1826,7 +1830,7 @@ enum UsdcRebalanceCommand {
     // Records that attestation polling timed out, moving Bridging ->
     // AwaitingAttestation with the deadline beyond which retries stop.
     TimeoutAttestation { retry_deadline_at: DateTime<Utc> },
-    ReceiveAttestation { attestation: Vec<u8>, cctp_nonce: u64, mint_scan_from_block: u64 },
+    ReceiveAttestation { attestation: Vec<u8>, cctp_nonce: B256, message: Vec<u8>, mint_scan_from_block: u64 },
     ConfirmBridging { mint_tx: TxHash, amount_received: Usdc, fee_collected: Usdc },
     FailBridging { reason: String },
 
@@ -1872,7 +1876,12 @@ enum UsdcRebalanceEvent {
     },
     BridgeAttestationReceived {
         attestation: Vec<u8>,
-        cctp_nonce: u64,
+        cctp_nonce: B256,
+        // Full CCTP message envelope, persisted so an Attested resume
+        // reconstructs the AttestationResponse and mints without re-polling
+        // Circle. Option: None for events serialized before this field existed
+        // (those resume via the legacy re-poll fallback).
+        message: Option<Vec<u8>>,
         mint_scan_from_block: u64,
         attested_at: DateTime<Utc>,
     },
@@ -1884,7 +1893,7 @@ enum UsdcRebalanceEvent {
     },
     BridgingFailed {
         burn_tx_hash: Option<TxHash>,
-        cctp_nonce: Option<u64>,
+        cctp_nonce: Option<B256>,
         stage: BridgeStage,
         failed_tx_hash: Option<TxHash>,
         failed_at: DateTime<Utc>,
@@ -1952,12 +1961,18 @@ enum BridgeStage { Burn, Attestation, Mint }
   surface as the same retryable timeout -- so a malformed response is bounded by
   the deadline rather than failing fast. (Failing fast on a definitively
   malformed `complete` response is a tracked follow-up.)
-- **Post-attestation re-poll retries until success (no deadline)**: once
-  `BridgeAttestationReceived` is recorded (`Attested`), the attestation is
-  permanently retrievable from Circle. The mint needs the full message envelope,
-  which the aggregate does not persist, so resuming from `Attested` re-polls
-  Circle; a timeout there retries until success rather than failing, because the
-  USDC is already burned and bounding it would strand recoverable funds. The
+- **Attested resume reconstructs the mint offline (no Circle re-poll)**: the
+  mint needs the full CCTP message envelope, which `BridgeAttestationReceived`
+  persists (the `message` field) alongside the attestation. Resuming from
+  `Attested` reconstructs the `AttestationResponse` from the stored envelope and
+  attestation -- re-deriving and cross-checking the nonce against the recorded
+  `cctp_nonce` -- and mints with no Circle call. A reconstruction failure
+  (corrupt envelope, placeholder nonce, or nonce mismatch) marks
+  `BridgingFailed` for operator reconciliation, since the USDC is already
+  burned. Transfers whose `BridgeAttestationReceived` predates the `message`
+  field carry `None` and fall back to re-polling Circle: the attestation is
+  permanently retrievable, so a timeout there retries until success rather than
+  failing (bounding it would strand recoverable funds). The
   `attestation_retry_deadline` bounds only the `AwaitingAttestation` wait (where
   the attestation may never arrive).
 - Bridge mint transaction requires valid attestation

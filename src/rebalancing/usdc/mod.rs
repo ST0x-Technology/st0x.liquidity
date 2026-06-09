@@ -88,6 +88,16 @@ pub(crate) enum UsdcTransferError {
         id: UsdcRebalanceId,
         retry_deadline: Duration,
     },
+    #[error(
+        "USDC rebalance {id} recorded cctp_nonce {recorded} does not match nonce \
+         {reconstructed} re-derived from the persisted message envelope; failed for \
+         operator reconciliation rather than minting against an unverifiable nonce"
+    )]
+    AttestationNonceMismatch {
+        id: UsdcRebalanceId,
+        recorded: alloy::primitives::B256,
+        reconstructed: alloy::primitives::B256,
+    },
     #[error("USDC rebalance {id} cannot resume: aggregate is in terminal failure state")]
     PreviouslyFailedAggregate { id: UsdcRebalanceId },
     #[error(

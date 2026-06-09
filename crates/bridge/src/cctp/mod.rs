@@ -191,6 +191,45 @@ impl crate::Attestation for AttestationResponse {
     fn as_bytes(&self) -> &[u8] {
         &self.attestation
     }
+
+    fn message_bytes(&self) -> &[u8] {
+        &self.message
+    }
+}
+
+impl AttestationResponse {
+    /// Reconstructs a response from a persisted message envelope and signature,
+    /// re-deriving the nonce from the message so a stored attestation is
+    /// self-validating (an all-zero placeholder nonce is rejected, mirroring a
+    /// fresh poll).
+    ///
+    /// Validates that the message reaches the CCTP body offset
+    /// (`MESSAGE_BODY_INDEX`) -- the same bound [`parse_received_message`] uses --
+    /// not merely enough to extract a nonce. A truncated envelope that still
+    /// carried a non-zero nonce would otherwise construct and then revert in
+    /// `receiveMessage` on-chain instead of failing here, where the caller routes
+    /// it to operator reconciliation. This is the shared constructor for both a
+    /// fresh poll and a persisted-envelope resume, so both enforce identical
+    /// rules. (It does not guarantee a mintable body, only a complete header.)
+    ///
+    /// Module-private: external callers reconstruct via
+    /// [`crate::Bridge::reconstruct_attestation`] so they never depend on this
+    /// concrete representation.
+    fn from_parts(message: Bytes, attestation: Bytes) -> Result<Self, CctpError> {
+        if message.len() < MESSAGE_BODY_INDEX {
+            return Err(CctpError::MessageTooShortForRecovery {
+                length: message.len(),
+            });
+        }
+
+        let nonce = extract_nonce_from_message(&message)?;
+
+        Ok(Self {
+            message,
+            attestation,
+            nonce,
+        })
+    }
 }
 
 // CCTP V2 message layout (see Circle's evm-cctp-contracts: src/messages/v2/MessageV2.sol):
@@ -611,17 +650,12 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
                 source: err,
             })?;
 
-        // `extract_nonce_from_message` rejects the all-zero placeholder nonce
-        // (`PlaceholderNonce`), so a "complete" attestation that leaked the
-        // bytes32(0) from the MessageSent event fails fast here rather than
-        // threading an invalid nonce through the bridge as if it were real.
-        let nonce = extract_nonce_from_message(&message)?;
-
-        Ok(AttestationResponse {
-            message,
-            attestation,
-            nonce,
-        })
+        // Validate through the same constructor a persisted-envelope resume uses,
+        // so a fresh poll and a reconstruction enforce identical rules: a
+        // truncated envelope or an all-zero placeholder nonce (the bytes32(0) the
+        // MessageSent event leaks) fails fast here rather than being recorded and
+        // then rejected on a later resume.
+        AttestationResponse::from_parts(message, attestation)
     }
 
     /// Burns USDC on the source chain for the given bridge direction.
@@ -775,6 +809,14 @@ where
         })
     }
 
+    fn reconstruct_attestation(
+        &self,
+        message: Vec<u8>,
+        attestation: Vec<u8>,
+    ) -> Result<Self::Attestation, Self::Error> {
+        AttestationResponse::from_parts(Bytes::from(message), Bytes::from(attestation))
+    }
+
     /// Scans the burn source chain for an already-submitted burn matching
     /// `(amount, destinationDomain, recipient)` at or after `from_block`, for
     /// crash-safe resume. Delegates to the source endpoint for the given
@@ -854,7 +896,7 @@ mod tests {
     use st0x_evm::local::RawPrivateKeyWallet;
 
     use super::*;
-    use crate::Bridge;
+    use crate::{Attestation, Bridge};
 
     const USDC_ETHEREUM: Address = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
     const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
@@ -1025,7 +1067,9 @@ mod tests {
         // Complete attestation whose message carries the placeholder bytes32(0) nonce that
         // CCTP V2 emits in the MessageSent event. Circle should never return this on a complete
         // attestation; the bridge must fail fast rather than thread it through as a real nonce.
-        let zero_nonce_message = build_nonce_message(&[0u8; NONCE_INDEX], [0u8; 32], &[0u8; 56]);
+        // Full-length so it reaches the nonce check rather than the envelope-length guard.
+        let zero_nonce_message =
+            build_nonce_message(&[0u8; NONCE_INDEX], [0u8; 32], &[0u8; MESSAGE_BODY_INDEX]);
 
         let mock = server.mock(|when, then| {
             when.method(GET)
@@ -1071,7 +1115,11 @@ mod tests {
         let server = MockServer::start();
 
         let expected_nonce = [0xABu8; 32];
-        let message = build_nonce_message(&[0u8; NONCE_INDEX], expected_nonce, &[0u8; 56]);
+        let message = build_nonce_message(
+            &[0u8; NONCE_INDEX],
+            expected_nonce,
+            &[0u8; MESSAGE_BODY_INDEX],
+        );
 
         let mock = server.mock(|when, then| {
             when.method(GET)
@@ -2516,6 +2564,98 @@ mod tests {
         let message = build_nonce_message(&[0xCD; NONCE_INDEX], [0u8; 32], &[0xEF; 56]);
 
         let err = extract_nonce_from_message(&message).unwrap_err();
+
+        assert!(
+            matches!(err, CctpError::PlaceholderNonce),
+            "Expected PlaceholderNonce, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_parts_reconstructs_response_with_message_derived_nonce() {
+        // A persisted envelope resumes a mint offline: `from_parts` must rebuild
+        // the response with the nonce re-derived from the message (not trusting a
+        // separately-stored copy) and preserve the attestation signature verbatim.
+        let expected_nonce: [u8; 32] = core::array::from_fn(|index| {
+            u8::try_from(index + 1).expect("index 0..31 + 1 always fits in u8")
+        });
+        // A full CCTP envelope: header + nonce + body, length >= MESSAGE_BODY_INDEX.
+        let body = vec![0xCD; MESSAGE_BODY_INDEX];
+        let message = build_nonce_message(&[0u8; NONCE_INDEX], expected_nonce, &body);
+        let attestation = vec![0xAB; 65];
+
+        let response = AttestationResponse::from_parts(
+            Bytes::from(message.clone()),
+            Bytes::from(attestation.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(response.nonce(), B256::from(expected_nonce));
+        assert_eq!(response.as_bytes(), attestation.as_slice());
+        assert_eq!(response.message_bytes(), message.as_slice());
+    }
+
+    #[test]
+    fn from_parts_accepts_message_at_body_index_boundary() {
+        // A message of exactly MESSAGE_BODY_INDEX bytes is the shortest envelope
+        // `from_parts` accepts: one byte shorter is rejected (see
+        // from_parts_rejects_truncated_envelope_with_valid_nonce). This pins the
+        // boundary to MESSAGE_BODY_INDEX, not MIN_MESSAGE_LENGTH.
+        let expected_nonce: [u8; 32] = core::array::from_fn(|index| {
+            u8::try_from(index + 1).expect("index 0..31 + 1 always fits in u8")
+        });
+        let trailer_len = MESSAGE_BODY_INDEX - MIN_MESSAGE_LENGTH;
+        let message =
+            build_nonce_message(&[0u8; NONCE_INDEX], expected_nonce, &vec![0u8; trailer_len]);
+        assert_eq!(message.len(), MESSAGE_BODY_INDEX);
+
+        let response = AttestationResponse::from_parts(
+            Bytes::from(message.clone()),
+            Bytes::from(vec![0xAB; 65]),
+        )
+        .unwrap();
+
+        assert_eq!(response.nonce(), B256::from(expected_nonce));
+        assert_eq!(response.message_bytes(), message.as_slice());
+    }
+
+    #[test]
+    fn from_parts_rejects_truncated_envelope_with_valid_nonce() {
+        // A nonce-bearing but truncated envelope (long enough to extract a nonce,
+        // too short to be a full CCTP message) is corrupt persisted data. It must
+        // be rejected at reconstruction rather than reconstructing and reverting
+        // in `receiveMessage` on-chain.
+        let expected_nonce: [u8; 32] = core::array::from_fn(|index| {
+            u8::try_from(index + 1).expect("index 0..31 + 1 always fits in u8")
+        });
+        let truncated_len = MESSAGE_BODY_INDEX - 1;
+        let body_len = truncated_len - MIN_MESSAGE_LENGTH;
+        let message =
+            build_nonce_message(&[0u8; NONCE_INDEX], expected_nonce, &vec![0u8; body_len]);
+        assert_eq!(message.len(), truncated_len);
+
+        let err =
+            AttestationResponse::from_parts(Bytes::from(message), Bytes::from(vec![0xAB; 65]))
+                .unwrap_err();
+
+        assert!(
+            matches!(err, CctpError::MessageTooShortForRecovery { length } if length == truncated_len),
+            "Expected MessageTooShortForRecovery, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_parts_rejects_placeholder_nonce() {
+        // An all-zero nonce means the attested message was never filled in by
+        // Circle; reconstructing from it must fail rather than mint with a bogus
+        // nonce, mirroring a fresh poll. The envelope is full-length so it reaches
+        // the nonce check rather than the length check.
+        let message =
+            build_nonce_message(&[0xCD; NONCE_INDEX], [0u8; 32], &[0xEF; MESSAGE_BODY_INDEX]);
+
+        let err =
+            AttestationResponse::from_parts(Bytes::from(message), Bytes::from(vec![0xAB; 65]))
+                .unwrap_err();
 
         assert!(
             matches!(err, CctpError::PlaceholderNonce),

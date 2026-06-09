@@ -241,6 +241,10 @@ pub(crate) enum UsdcRebalanceCommand {
     ReceiveAttestation {
         attestation: Vec<u8>,
         cctp_nonce: B256,
+        /// Full CCTP message envelope from the attestation, persisted on the
+        /// `BridgeAttestationReceived` event so an `Attested` resume mints
+        /// without re-polling Circle.
+        message: Vec<u8>,
         mint_scan_from_block: u64,
     },
     /// Record that Circle attestation polling timed out while the burn remains
@@ -340,6 +344,11 @@ pub(crate) enum UsdcRebalanceEvent {
     BridgeAttestationReceived {
         attestation: Vec<u8>,
         cctp_nonce: B256,
+        /// Full CCTP message envelope, persisted so an `Attested` resume mints
+        /// without re-polling Circle. `None` for events serialized before this
+        /// field existed: such a resume re-polls Circle as a fallback.
+        #[serde(default)]
+        message: Option<Vec<u8>>,
         #[serde(default)]
         mint_scan_from_block: Option<u64>,
         attested_at: DateTime<Utc>,
@@ -517,6 +526,11 @@ pub(crate) enum UsdcRebalance {
         burn_tx_hash: TxHash,
         cctp_nonce: B256,
         attestation: Vec<u8>,
+        /// Full CCTP message envelope from the attestation, persisted so a resume
+        /// can reconstruct the `AttestationResponse` and mint without re-polling
+        /// Circle. `None` for transfers whose `BridgeAttestationReceived` predates
+        /// this field: such a resume falls back to re-polling Circle.
+        message: Option<Vec<u8>>,
         /// Destination chain head captured before the mint, bounding the
         /// crash-safe resume scan that adopts an already-submitted mint. `None`
         /// for transfers whose `BridgeAttestationReceived` predates this field.
@@ -952,7 +966,15 @@ impl EventSourced for UsdcRebalance {
     // attestation), which deserializes unchanged into Option<B256>.
     // v3: added the non-terminal AwaitingAttestation state so attestation
     // timeouts replay as retryable instead of terminal bridge failures.
-    const SCHEMA_VERSION: u64 = 3;
+    // v4: added the `message` envelope field to the Attested state and the
+    // BridgeAttestationReceived event. The field is `Option<Vec<u8>>`, so serde
+    // deserializes both a stale snapshot and a pre-field event with a missing
+    // `message` as `None` -- legacy `Attested` transfers stay loadable and
+    // resume via the re-poll fallback either way. Bumped (defensively, matching
+    // v2/v3) to clear stale snapshots and rebuild from events, so any persisted
+    // `Attested` snapshot is regenerated under the current schema rather than
+    // relying on serde's missing-Option-as-None leniency.
+    const SCHEMA_VERSION: u64 = 4;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use UsdcRebalanceEvent::*;
@@ -1178,6 +1200,7 @@ impl EventSourced for UsdcRebalance {
                 BridgeAttestationReceived {
                     attestation,
                     cctp_nonce,
+                    message,
                     mint_scan_from_block,
                     attested_at,
                 },
@@ -1201,6 +1224,7 @@ impl EventSourced for UsdcRebalance {
                 burn_tx_hash: *burn_tx_hash,
                 cctp_nonce: *cctp_nonce,
                 attestation: attestation.clone(),
+                message: message.clone(),
                 mint_scan_from_block: *mint_scan_from_block,
                 initiated_at: *initiated_at,
                 attested_at: *attested_at,
@@ -1491,8 +1515,14 @@ impl EventSourced for UsdcRebalance {
             ReceiveAttestation {
                 attestation,
                 cctp_nonce,
+                message,
                 mint_scan_from_block,
-            } => self.transition_receive_attestation(attestation, cctp_nonce, mint_scan_from_block),
+            } => self.transition_receive_attestation(
+                attestation,
+                cctp_nonce,
+                message,
+                mint_scan_from_block,
+            ),
             TimeoutAttestation { retry_deadline_at } => {
                 self.transition_timeout_attestation(retry_deadline_at)
             }
@@ -1790,6 +1820,7 @@ impl UsdcRebalance {
         &self,
         attestation: Vec<u8>,
         cctp_nonce: B256,
+        message: Vec<u8>,
         mint_scan_from_block: u64,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
@@ -1806,6 +1837,7 @@ impl UsdcRebalance {
                 Ok(vec![BridgeAttestationReceived {
                     attestation,
                     cctp_nonce,
+                    message: Some(message),
                     mint_scan_from_block: Some(mint_scan_from_block),
                     attested_at: Utc::now(),
                 }])
@@ -2035,7 +2067,7 @@ impl UsdcRebalance {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::fixed_bytes;
-    use serde_json::{from_value, json};
+    use serde_json::{from_value, json, to_value};
     use std::collections::HashSet;
     use uuid::Uuid;
 
@@ -2077,6 +2109,113 @@ mod tests {
         };
 
         assert_eq!(mint_scan_from_block, None);
+    }
+
+    // An event persisted before the `message` envelope field existed must still
+    // deserialize on replay -- to `None`, not a hard error -- so an `Attested`
+    // resume of an older aggregate falls back to re-polling Circle rather than
+    // failing to rebuild (the `#[serde(default)]`).
+    #[test]
+    fn bridge_attestation_received_without_message_deserializes_to_none() {
+        let old_event = json!({
+            "BridgeAttestationReceived": {
+                "attestation": [1, 2, 3],
+                "cctp_nonce": "0xa01ca42d9082e926a81dc287d973a8f072dfa1b20a4fbf7b20f3abda1b376278",
+                "mint_scan_from_block": 100,
+                "attested_at": "2026-01-01T00:00:00Z"
+            }
+        });
+
+        let event: UsdcRebalanceEvent =
+            from_value(old_event).expect("pre-field event must still deserialize");
+
+        let UsdcRebalanceEvent::BridgeAttestationReceived { message, .. } = event else {
+            panic!("expected BridgeAttestationReceived");
+        };
+
+        assert_eq!(message, None);
+    }
+
+    // The `message` envelope must survive replay into the `Attested` state so an
+    // `Attested` resume can reconstruct the attestation without re-polling Circle.
+    #[test]
+    fn bridge_attestation_received_carries_message_into_attested() {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let envelope = vec![0xDE, 0xAD, 0xBE, 0xEF];
+
+        let state = replay::<UsdcRebalance>(vec![
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(100)),
+                withdrawal_ref: TransferRef::OnchainTx(burn_tx),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::WithdrawalConfirmed {
+                confirmed_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::BridgingInitiated {
+                burn_tx_hash: burn_tx,
+                burned_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::BridgeAttestationReceived {
+                attestation: vec![0x01],
+                cctp_nonce: TEST_CCTP_NONCE,
+                message: Some(envelope.clone()),
+                mint_scan_from_block: Some(100),
+                attested_at: Utc::now(),
+            },
+        ])
+        .expect("event stream should replay into Attested");
+
+        let Some(UsdcRebalance::Attested { message, .. }) = state else {
+            panic!("expected Attested, got {state:?}");
+        };
+
+        assert_eq!(message, Some(envelope));
+    }
+
+    // A snapshot persisted before the `message` field existed must still load
+    // under the current schema: `message` is `Option<Vec<u8>>`, and serde
+    // deserializes a missing key for an `Option` field as `None` (no
+    // `#[serde(default)]` required). So a stale `Attested` snapshot remains
+    // loadable and resumes via the legacy re-poll fallback -- the state-level
+    // mirror of `bridge_attestation_received_without_message_deserializes_to_none`.
+    // This guards the backward-compat boundary: switching `message` to a
+    // non-optional type, or adding `deny_unknown_fields`, would strand in-flight
+    // pre-`message` transfers held in an `Attested` snapshot.
+    #[test]
+    fn attested_snapshot_without_message_deserializes_to_none() {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mut snapshot = to_value(UsdcRebalance::Attested {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: Usdc::new(float!(100)),
+            burn_tx_hash: burn_tx,
+            cctp_nonce: TEST_CCTP_NONCE,
+            attestation: vec![0x01, 0x02, 0x03],
+            message: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            mint_scan_from_block: Some(100),
+            initiated_at: Utc::now(),
+            attested_at: Utc::now(),
+        })
+        .expect("Attested state serializes");
+
+        // Simulate a snapshot persisted before the `message` field existed.
+        snapshot
+            .get_mut("Attested")
+            .and_then(|attested| attested.as_object_mut())
+            .expect("externally-tagged Attested object")
+            .remove("message");
+
+        let state =
+            from_value::<UsdcRebalance>(snapshot).expect("pre-message snapshot must still load");
+
+        let UsdcRebalance::Attested { message, .. } = state else {
+            panic!("expected Attested, got {state:?}");
+        };
+
+        assert_eq!(message, None);
     }
 
     #[tokio::test]
@@ -2698,6 +2837,7 @@ mod tests {
             UsdcRebalanceEvent::BridgeAttestationReceived {
                 attestation: vec![0x01, 0x02],
                 cctp_nonce: TEST_CCTP_NONCE,
+                message: None,
                 mint_scan_from_block: Some(100),
                 attested_at,
             },
@@ -2834,6 +2974,7 @@ mod tests {
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         let attestation = vec![0x01, 0x02, 0x03, 0x04];
+        let message = vec![0x05, 0x06, 0x07, 0x08];
 
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
@@ -2854,6 +2995,7 @@ mod tests {
             .when(UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: attestation.clone(),
                 cctp_nonce: TEST_CCTP_NONCE,
+                message: message.clone(),
                 mint_scan_from_block: 8_675_309,
             })
             .await
@@ -2863,6 +3005,7 @@ mod tests {
         let UsdcRebalanceEvent::BridgeAttestationReceived {
             attestation: event_attestation,
             cctp_nonce: event_nonce,
+            message: event_message,
             mint_scan_from_block,
             ..
         } = &events[0]
@@ -2871,6 +3014,11 @@ mod tests {
         };
 
         assert_eq!(*event_attestation, attestation);
+        assert_eq!(
+            *event_message,
+            Some(message),
+            "ReceiveAttestation must persist the full CCTP message envelope into the event",
+        );
         assert_eq!(
             *mint_scan_from_block,
             Some(8_675_309),
@@ -2899,6 +3047,7 @@ mod tests {
             &UsdcRebalanceEvent::BridgeAttestationReceived {
                 attestation: vec![0x01],
                 cctp_nonce: TEST_CCTP_NONCE,
+                message: None,
                 mint_scan_from_block: Some(8_675_309),
                 attested_at: Utc::now(),
             },
@@ -2928,6 +3077,7 @@ mod tests {
             .when(UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01, 0x02],
                 cctp_nonce: TEST_CCTP_NONCE,
+                message: vec![],
                 mint_scan_from_block: 100,
             })
             .await
@@ -2953,6 +3103,7 @@ mod tests {
             .when(UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01, 0x02],
                 cctp_nonce: TEST_CCTP_NONCE,
+                message: vec![],
                 mint_scan_from_block: 100,
             })
             .await
@@ -2983,6 +3134,7 @@ mod tests {
             .when(UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01, 0x02],
                 cctp_nonce: TEST_CCTP_NONCE,
+                message: vec![],
                 mint_scan_from_block: 100,
             })
             .await
@@ -3014,6 +3166,7 @@ mod tests {
             .when(UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01, 0x02],
                 cctp_nonce: TEST_CCTP_NONCE,
+                message: vec![],
                 mint_scan_from_block: 100,
             })
             .await
@@ -3049,6 +3202,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: TEST_CCTP_NONCE,
+                    message: None,
                     mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
@@ -3056,6 +3210,7 @@ mod tests {
             .when(UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x03, 0x04],
                 cctp_nonce: OTHER_CCTP_NONCE,
+                message: vec![],
                 mint_scan_from_block: 100,
             })
             .await
@@ -3093,6 +3248,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02, 0x03, 0x04],
                     cctp_nonce: TEST_CCTP_NONCE,
+                    message: None,
                     mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
@@ -3316,6 +3472,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce,
+                    message: None,
                     mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
@@ -3416,6 +3573,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: TEST_CCTP_NONCE,
+                    message: None,
                     mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
@@ -3468,6 +3626,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: TEST_CCTP_NONCE,
+                    message: None,
                     mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
@@ -3559,6 +3718,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: TEST_CCTP_NONCE,
+                    message: None,
                     mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
@@ -3617,6 +3777,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: TEST_CCTP_NONCE,
+                    message: None,
                     mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
@@ -3670,6 +3831,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: TEST_CCTP_NONCE,
+                    message: None,
                     mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
@@ -3715,6 +3877,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: TEST_CCTP_NONCE,
+                    message: None,
                     mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
@@ -3767,6 +3930,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: TEST_CCTP_NONCE,
+                    message: None,
                     mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
@@ -3816,6 +3980,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: TEST_CCTP_NONCE,
+                    message: None,
                     mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
@@ -3880,6 +4045,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01, 0x02],
                     cctp_nonce: TEST_CCTP_NONCE,
+                    message: None,
                     mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
@@ -3940,6 +4106,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0xAB, 0xCD, 0xEF],
                     cctp_nonce: TEST_CCTP_NONCE,
+                    message: None,
                     mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
@@ -3993,6 +4160,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x11, 0x22, 0x33, 0x44],
                     cctp_nonce: OTHER_CCTP_NONCE,
+                    message: None,
                     mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
@@ -4101,6 +4269,7 @@ mod tests {
             .when(UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01],
                 cctp_nonce: TEST_CCTP_NONCE,
+                message: vec![],
                 mint_scan_from_block: 100,
             })
             .await
@@ -4180,6 +4349,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01],
                     cctp_nonce: TEST_CCTP_NONCE,
+                    message: None,
                     mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
@@ -4234,6 +4404,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01],
                     cctp_nonce: TEST_CCTP_NONCE,
+                    message: None,
                     mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
@@ -4291,6 +4462,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01],
                     cctp_nonce: TEST_CCTP_NONCE,
+                    message: None,
                     mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
@@ -4609,6 +4781,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01],
                     cctp_nonce: TEST_CCTP_NONCE,
+                    message: None,
                     mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
@@ -4676,6 +4849,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01],
                     cctp_nonce: TEST_CCTP_NONCE,
+                    message: None,
                     mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
@@ -4749,6 +4923,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01],
                     cctp_nonce: TEST_CCTP_NONCE,
+                    message: None,
                     mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
@@ -4811,6 +4986,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: vec![0x01],
                     cctp_nonce: TEST_CCTP_NONCE,
+                    message: None,
                     mint_scan_from_block: Some(100),
                     attested_at: Utc::now(),
                 },
@@ -4879,6 +5055,7 @@ mod tests {
             UsdcRebalanceEvent::BridgeAttestationReceived {
                 attestation: vec![0x01],
                 cctp_nonce: TEST_CCTP_NONCE,
+                message: None,
                 mint_scan_from_block: Some(100),
                 attested_at: withdrawal_confirmed_at + chrono::Duration::seconds(15),
             },
@@ -5283,6 +5460,7 @@ mod tests {
             burn_tx_hash: burn_tx,
             cctp_nonce: TEST_CCTP_NONCE,
             attestation: vec![0xAA, 0xBB],
+            message: None,
             mint_scan_from_block: Some(100),
             initiated_at,
             attested_at,
@@ -5443,6 +5621,7 @@ mod tests {
                 burn_tx_hash: BURN_TX,
                 cctp_nonce: TEST_CCTP_NONCE,
                 attestation: vec![],
+                message: None,
                 mint_scan_from_block: Some(100),
                 initiated_at: now,
                 attested_at: now,

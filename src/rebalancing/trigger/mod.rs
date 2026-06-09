@@ -8261,9 +8261,20 @@ mod tests {
         UsdcRebalanceEvent::BridgeAttestationReceived {
             attestation: vec![1, 2, 3, 4],
             cctp_nonce: B256::left_padding_from(&42u64.to_be_bytes()),
+            message: None,
             mint_scan_from_block: Some(100),
             attested_at: Utc::now(),
         }
+    }
+
+    /// A full-length CCTP message envelope (>= MESSAGE_BODY_INDEX = 148 bytes,
+    /// non-zero nonce in bytes 12..44), matching the manager-test helper so a
+    /// `ReceiveAttestation` fixture lands a stored envelope that
+    /// `AttestationResponse::from_parts` would accept.
+    fn valid_cctp_message() -> Vec<u8> {
+        let mut message = vec![0u8; 200];
+        message[43] = 1;
+        message
     }
 
     fn make_usdc_bridged() -> UsdcRebalanceEvent {
@@ -9769,6 +9780,7 @@ mod tests {
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: vec![1, 2, 3],
                     cctp_nonce: B256::left_padding_from(&12345u64.to_be_bytes()),
+                    message: valid_cctp_message(),
                     mint_scan_from_block: 100,
                 },
             )
@@ -9856,6 +9868,7 @@ mod tests {
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: vec![1, 2, 3],
                     cctp_nonce: B256::left_padding_from(&67890u64.to_be_bytes()),
+                    message: valid_cctp_message(),
                     mint_scan_from_block: 100,
                 },
             )
@@ -10154,6 +10167,7 @@ mod tests {
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: vec![1, 2, 3],
                     cctp_nonce: B256::left_padding_from(&99999u64.to_be_bytes()),
+                    message: valid_cctp_message(),
                     mint_scan_from_block: 100,
                 },
             )

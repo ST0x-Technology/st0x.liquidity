@@ -4,7 +4,7 @@
 //! `CctpBridge`, `RaindexService`, and the `UsdcRebalance` aggregate to
 //! execute USDC transfers between Alpaca and Base.
 
-use alloy::primitives::{Address, TxHash, U256};
+use alloy::primitives::{Address, B256, TxHash, U256};
 use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use std::sync::Arc;
@@ -232,6 +232,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: response.as_bytes().to_vec(),
                     cctp_nonce: response.nonce(),
+                    message: response.message_bytes().to_vec(),
                     mint_scan_from_block,
                 },
             )
@@ -239,6 +240,100 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
 
         info!(target: "rebalance", "Circle attestation received");
         Ok(())
+    }
+
+    /// Obtains the [`AttestationResponse`] for an `Attested` resume.
+    ///
+    /// When the full CCTP message envelope was persisted with the attestation
+    /// (the common case since envelope persistence landed), the response is
+    /// reconstructed from stored data and no Circle call is made -- making the
+    /// `Attested` resume deterministic and offline-capable. Transfers whose
+    /// `BridgeAttestationReceived` predates the envelope field carry no message,
+    /// so they fall back to re-polling Circle (idempotent for a completed
+    /// attestation).
+    async fn attested_attestation_response(
+        &self,
+        id: &UsdcRebalanceId,
+        mint_direction: BridgeDirection,
+        burn_tx: TxHash,
+        attestation: Vec<u8>,
+        cctp_nonce: B256,
+        message: Option<Vec<u8>>,
+    ) -> Result<AttestationResponse, UsdcTransferError> {
+        let Some(message) = message else {
+            warn!(
+                target: "rebalance",
+                %id,
+                "Attested transfer predates envelope persistence; re-polling Circle for the attestation"
+            );
+            return match self
+                .poll_cctp_attestation(id, mint_direction, burn_tx)
+                .await?
+            {
+                AttestationPollOutcome::Received(response) => Ok(response),
+                AttestationPollOutcome::TimedOut => {
+                    Err(UsdcTransferError::AttestationTimedOut { id: id.clone() })
+                }
+            };
+        };
+
+        info!(
+            target: "rebalance",
+            %id,
+            "Reconstructing attestation from the persisted message envelope; no Circle re-poll needed"
+        );
+
+        // A reconstruction failure means the persisted envelope is unusable
+        // (corrupt bytes, placeholder nonce). The USDC is already burned, so move
+        // the aggregate to `BridgingFailed` for operator reconciliation rather
+        // than wedging it in `Attested` while the worker exhausts retries --
+        // mirroring the hard-error arm of `poll_cctp_attestation`.
+        let response = match self
+            .cctp_bridge
+            .reconstruct_attestation(message, attestation)
+        {
+            Ok(response) => response,
+            Err(error) => {
+                warn!(target: "rebalance", %id, ?error, "Reconstructing attestation from the persisted envelope failed");
+                self.cqrs
+                    .send(
+                        id,
+                        UsdcRebalanceCommand::FailBridging {
+                            reason: format!("attestation reconstruction failed: {error}"),
+                        },
+                    )
+                    .await?;
+                return Err(UsdcTransferError::Cctp(Box::new(error)));
+            }
+        };
+
+        // The nonce is persisted twice: standalone (`cctp_nonce`) and embedded in
+        // the envelope. Both originate from the same attestation, so a mismatch
+        // means the persisted record is internally inconsistent (storage
+        // corruption or manual repair). Refuse to mint against an unverifiable
+        // nonce; the burn is durable, so surface a terminal failure for operator
+        // reconciliation.
+        let reconstructed = response.nonce();
+        if reconstructed != cctp_nonce {
+            warn!(target: "rebalance", %id, %reconstructed, recorded = %cctp_nonce, "Reconstructed attestation nonce does not match the recorded cctp_nonce");
+            self.cqrs
+                .send(
+                    id,
+                    UsdcRebalanceCommand::FailBridging {
+                        reason: format!(
+                            "attestation nonce mismatch: reconstructed {reconstructed}, recorded {cctp_nonce}"
+                        ),
+                    },
+                )
+                .await?;
+            return Err(UsdcTransferError::AttestationNonceMismatch {
+                id: id.clone(),
+                recorded: cctp_nonce,
+                reconstructed,
+            });
+        }
+
+        Ok(response)
     }
 
     /// Converts USD buying power to USDC in the crypto wallet.
@@ -441,6 +536,10 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
     ///
     /// On errors, sends appropriate `Fail*` command to transition
     /// aggregate to failed state.
+    // A single state-dispatch match with one trivial arm per aggregate state.
+    // Splitting it would scatter the resume routing across pointless helpers; per
+    // the project guidance, suppress the length lint instead.
+    #[allow(clippy::too_many_lines)]
     #[instrument(target = "rebalance", skip(self), fields(%id, %amount), level = tracing::Level::DEBUG)]
     pub(crate) async fn resume_alpaca_to_base(
         &self,
@@ -544,15 +643,19 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
             // re-recording it -- then go straight to mint + vault deposit.
             Some(Attested {
                 direction: AlpacaToBase,
-                amount,
                 burn_tx_hash,
+                cctp_nonce,
+                attestation,
+                message,
                 mint_scan_from_block,
                 ..
             }) => {
                 self.continue_alpaca_to_base_from_attested(
                     id,
-                    amount,
                     burn_tx_hash,
+                    attestation,
+                    cctp_nonce,
+                    message,
                     mint_scan_from_block,
                 )
                 .await
@@ -816,13 +919,16 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
     /// scans the Base chain (bounded by `mint_scan_from_block`) for an
     /// already-submitted mint to the market-maker wallet and adopts it via
     /// `ConfirmBridging` -- re-minting would revert on the already-used CCTP
-    /// nonce. Only if no mint is found does it re-poll Circle (idempotent) and
-    /// mint afresh.
+    /// nonce. Only if no mint is found does it reconstruct the attestation from
+    /// the persisted message envelope (or re-poll Circle for transfers predating
+    /// envelope persistence) and mint afresh.
     async fn continue_alpaca_to_base_from_attested(
         &self,
         id: &UsdcRebalanceId,
-        amount: Usdc,
         burn_tx_hash: TxHash,
+        attestation: Vec<u8>,
+        cctp_nonce: B256,
+        message: Option<Vec<u8>>,
         mint_scan_from_block: Option<u64>,
     ) -> Result<(), UsdcTransferError> {
         // Events persisted before crash-safe resume carry no scan bound. Scanning
@@ -863,23 +969,21 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                 .await;
         }
 
-        // No mint landed yet: re-poll Circle for the attestation (idempotent for a
-        // completed attestation) WITHOUT re-emitting `ReceiveAttestation`, then
-        // mint on Base. `execute_cctp_mint` emits `ConfirmBridging`, advancing the
-        // aggregate to `Bridged`.
-        let burn_receipt = BurnReceipt {
-            tx: burn_tx_hash,
-            amount: usdc_to_u256(amount)?,
-        };
-        let attestation_response = match self
-            .poll_cctp_attestation(id, BridgeDirection::EthereumToBase, burn_receipt.tx)
-            .await?
-        {
-            AttestationPollOutcome::Received(response) => response,
-            AttestationPollOutcome::TimedOut => {
-                return Err(UsdcTransferError::AttestationTimedOut { id: id.clone() });
-            }
-        };
+        // No mint landed yet: reconstruct the attestation from persisted data
+        // (or re-poll Circle for transfers predating envelope persistence)
+        // WITHOUT re-emitting `ReceiveAttestation`, then mint on Base.
+        // `execute_cctp_mint` emits `ConfirmBridging`, advancing the aggregate to
+        // `Bridged`.
+        let attestation_response = self
+            .attested_attestation_response(
+                id,
+                BridgeDirection::EthereumToBase,
+                burn_tx_hash,
+                attestation,
+                cctp_nonce,
+                message,
+            )
+            .await?;
         let mint_receipt = self.execute_cctp_mint(id, attestation_response).await?;
 
         self.continue_alpaca_to_base_from_bridged(id, u256_to_usdc(mint_receipt.amount)?)
@@ -1212,10 +1316,10 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
     }
 
     /// Non-obvious points the match body below cannot express on its own:
-    /// - `Attested` re-polls rather than reconstructing an `AttestationResponse`
-    ///   because the aggregate stores attestation bytes + nonce but not the
-    ///   full message envelope [`Bridge::mint`] needs; Circle's API is
-    ///   idempotent for completed attestations so the cost is negligible.
+    /// - `Attested` reconstructs the `AttestationResponse` from the persisted
+    ///   message envelope and mints with no Circle call. Transfers whose
+    ///   attestation predates envelope persistence carry no message and fall
+    ///   back to re-polling Circle (idempotent for a completed attestation).
     /// - `Converting` is unrecoverable: the aggregate persists the correlation
     ///   UUID but not the broker order ID, so a polling-based resume cannot
     ///   identify the order. Operator reconciles manually.
@@ -1309,8 +1413,10 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
 
             Some(UsdcRebalance::Attested {
                 direction,
-                amount,
                 burn_tx_hash,
+                cctp_nonce,
+                attestation,
+                message,
                 mint_scan_from_block,
                 ..
             }) => {
@@ -1318,8 +1424,10 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                 self.continue_from_attested(
                     id,
                     direction,
-                    amount,
                     burn_tx_hash,
+                    attestation,
+                    cctp_nonce,
+                    message,
                     mint_scan_from_block,
                 )
                 .await
@@ -1599,23 +1707,26 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
     /// already-submitted mint to the market maker wallet and adopts it via
     /// `ConfirmBridging` -- re-minting would revert on the already-used CCTP
     /// nonce and fail a transfer whose USDC was in fact minted. When no mint is
-    /// found, it re-polls Circle for a fresh [`AttestationResponse`] (the
-    /// aggregate stores the attestation bytes and nonce but not the full message
-    /// envelope [`Bridge::mint`] needs) and mints, WITHOUT re-emitting
+    /// found, it reconstructs the [`AttestationResponse`] from the persisted
+    /// message envelope and mints with no Circle call, WITHOUT re-emitting
     /// `ReceiveAttestation` -- which the aggregate rejects from `Attested`.
+    /// Transfers whose attestation predates envelope persistence carry no
+    /// message and fall back to re-polling Circle.
     ///
-    /// A re-poll timeout here retries until success (no deadline) by design:
-    /// reaching `Attested` means Circle already issued an attestation once, so a
-    /// re-poll timeout is transient and bounding it would strand already-burned
-    /// USDC. The `attestation_retry_deadline` bounds only the
+    /// A re-poll timeout in the fallback path retries until success (no deadline)
+    /// by design: reaching `Attested` means Circle already issued an attestation
+    /// once, so a re-poll timeout is transient and bounding it would strand
+    /// already-burned USDC. The `attestation_retry_deadline` bounds only the
     /// `AwaitingAttestation` wait. A hard (non-timeout) poll error still fails
     /// the bridge -- see [`Self::poll_cctp_attestation`].
     async fn continue_from_attested(
         &self,
         id: &UsdcRebalanceId,
         direction: RebalanceDirection,
-        amount: Usdc,
         burn_tx_hash: TxHash,
+        attestation: Vec<u8>,
+        cctp_nonce: B256,
+        message: Option<Vec<u8>>,
         mint_scan_from_block: Option<u64>,
     ) -> Result<(), UsdcTransferError> {
         // Events persisted before crash-safe resume carry no scan bound. Scanning
@@ -1664,19 +1775,16 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                 .await;
         }
 
-        let burn_receipt = BurnReceipt {
-            tx: burn_tx_hash,
-            amount: usdc_to_u256(amount)?,
-        };
-        let attestation_response = match self
-            .poll_cctp_attestation(id, BridgeDirection::BaseToEthereum, burn_receipt.tx)
-            .await?
-        {
-            AttestationPollOutcome::Received(response) => response,
-            AttestationPollOutcome::TimedOut => {
-                return Err(UsdcTransferError::AttestationTimedOut { id: id.clone() });
-            }
-        };
+        let attestation_response = self
+            .attested_attestation_response(
+                id,
+                mint_direction,
+                burn_tx_hash,
+                attestation,
+                cctp_nonce,
+                message,
+            )
+            .await?;
         self.mint_and_continue(id, attestation_response).await
     }
 
@@ -2171,6 +2279,7 @@ mod tests {
             UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01],
                 cctp_nonce: B256::left_padding_from(&99999u64.to_be_bytes()),
+                message: valid_cctp_message(),
                 mint_scan_from_block: 100,
             },
         )
@@ -2260,6 +2369,7 @@ mod tests {
             ReceiveAttestation {
                 attestation: vec![0x01],
                 cctp_nonce: B256::left_padding_from(&12345u64.to_be_bytes()),
+                message: valid_cctp_message(),
                 mint_scan_from_block: 100,
             },
         )
@@ -2347,7 +2457,11 @@ mod tests {
             id,
             ReceiveAttestation {
                 attestation: vec![0x01],
-                cctp_nonce: B256::left_padding_from(&12345u64.to_be_bytes()),
+                // Must equal the nonce embedded in `valid_cctp_message()` (byte 43 = 1):
+                // an `Attested` resume cross-checks the re-derived envelope nonce against
+                // this recorded value and fails on a mismatch.
+                cctp_nonce: B256::left_padding_from(&1u64.to_be_bytes()),
+                message: valid_cctp_message(),
                 // Scan from genesis: the fresh test chain sits below 100, so a 0
                 // bound makes the find_recent_mint scan a valid range that
                 // genuinely finds no mint, letting resume proceed to the mint.
@@ -3184,6 +3298,7 @@ mod tests {
             UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01],
                 cctp_nonce: B256::left_padding_from(&12345u64.to_be_bytes()),
+                message: valid_cctp_message(),
                 mint_scan_from_block: 100,
             },
         )
@@ -3869,7 +3984,11 @@ mod tests {
             id,
             UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01],
-                cctp_nonce: B256::left_padding_from(&99_999u64.to_be_bytes()),
+                // Must equal the nonce embedded in `valid_cctp_message()` (byte 43 = 1):
+                // an `Attested` resume cross-checks the re-derived envelope nonce against
+                // this recorded value and fails on a mismatch.
+                cctp_nonce: B256::left_padding_from(&1u64.to_be_bytes()),
+                message: valid_cctp_message(),
                 // Scan from genesis, not the sibling helpers' `100`: the resume test
                 // built on this helper actually scans from this block for an
                 // already-submitted mint, and the fresh test chain (advanced only via
@@ -4037,12 +4156,27 @@ mod tests {
         );
     }
 
+    /// A CCTP message envelope valid for nonce extraction: >= MIN_MESSAGE_LENGTH
+    /// (44 bytes) with a non-zero nonce in bytes 12..44 (byte 43 set), so
+    /// `AttestationResponse::from_parts` reconstructs it without rejecting a
+    /// placeholder nonce. Used as the persisted `message` in `ReceiveAttestation`
+    /// fixtures so an `Attested` resume reconstructs rather than re-polling.
+    fn valid_cctp_message() -> Vec<u8> {
+        // A full CCTP envelope (>= MESSAGE_BODY_INDEX bytes): `from_parts` rejects
+        // anything shorter as a truncated/corrupt envelope. Byte 43 (last byte of
+        // the nonce at bytes 12..44) is set to 1 so the extracted nonce is 1.
+        let mut message = vec![0u8; 200];
+        message[43] = 1;
+        message
+    }
+
     /// Mocks Circle's `/v2/messages/` lookup to return a `complete` attestation
     /// immediately, so a re-poll from `AwaitingAttestation` resolves without the
-    /// 5-minute real-API retry. The message just needs to be >=
-    /// MIN_MESSAGE_LENGTH (44 bytes) for nonce extraction.
+    /// 5-minute real-API retry. The message is a full-length CCTP envelope (>=
+    /// MESSAGE_BODY_INDEX) so it passes the shared `from_parts` validation the
+    /// poll path now enforces, with byte 43 = 1 giving an extracted nonce of 1.
     fn mock_complete_attestation(server: &MockServer) -> httpmock::Mock<'_> {
-        let mut message = vec![0u8; 100];
+        let mut message = vec![0u8; 200];
         message[43] = 1;
         let message_hex = format!("0x{}", alloy::hex::encode(&message));
         let attestation_hex = format!("0x{}", "ab".repeat(65));
@@ -4183,6 +4317,7 @@ mod tests {
             UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: vec![0x01],
                 cctp_nonce: B256::left_padding_from(&99_999u64.to_be_bytes()),
+                message: valid_cctp_message(),
                 mint_scan_from_block: 100,
             },
         )
@@ -4292,12 +4427,14 @@ mod tests {
 
     #[cfg(feature = "test-support")]
     #[tokio::test]
-    async fn resume_base_to_alpaca_from_attested_does_not_re_emit_receive_attestation() {
+    async fn resume_base_to_alpaca_from_attested_reconstructs_without_repolling_circle() {
         let server = MockServer::start();
 
-        // Return a `complete` attestation immediately so poll_cctp_attestation
-        // resolves without the 5-minute real-API retry.
-        let _attestation_mock = mock_complete_attestation(&server);
+        // A `complete` attestation is mocked, but the resume must NOT call it:
+        // the persisted message envelope lets it reconstruct the attestation
+        // offline. The mock exists only to prove (via 0 hits) that no re-poll
+        // happens.
+        let attestation_mock = mock_complete_attestation(&server);
 
         let (manager, cqrs, _anvil) =
             make_resume_test_manager_with_circle_api(&server, server.base_url()).await;
@@ -4318,9 +4455,9 @@ mod tests {
 
         // The OLD (buggy) behavior re-sent ReceiveAttestation from Attested, which
         // the aggregate rejects -> UsdcTransferError::Aggregate(InvalidCommand).
-        // The fix routes Attested through continue_from_attested (poll -> mint, no
-        // ReceiveAttestation), so resume gets PAST the Attested gate and instead
-        // fails at the mint on the undeployed contract -> Cctp.
+        // The fix routes Attested through continue_from_attested (reconstruct ->
+        // mint, no ReceiveAttestation), so resume gets PAST the Attested gate and
+        // instead fails at the mint on the undeployed contract -> Cctp.
         assert!(
             !matches!(&error, UsdcTransferError::Aggregate(_)),
             "resume from Attested must NOT re-emit ReceiveAttestation (the aggregate \
@@ -4330,6 +4467,146 @@ mod tests {
             matches!(error, UsdcTransferError::Cctp(_)),
             "resume from Attested should proceed to mint and fail with a Cctp contract \
              error; got: {error:?}",
+        );
+        assert_eq!(
+            attestation_mock.calls(),
+            0,
+            "resume from Attested must reconstruct the attestation from the persisted \
+             message envelope, not re-poll Circle",
+        );
+    }
+
+    fn valid_message_nonce() -> B256 {
+        // `valid_cctp_message()` sets byte 43 = 1, so the nonce extracted from it
+        // is 1. The staging helpers record this as `cctp_nonce`.
+        B256::left_padding_from(&1u64.to_be_bytes())
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn attested_attestation_response_without_message_repolls_circle() {
+        let server = MockServer::start();
+        let attestation_mock = mock_complete_attestation(&server);
+
+        let (manager, cqrs, _anvil) =
+            make_resume_test_manager_with_circle_api(&server, server.base_url()).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        let burn_tx = advance_to_attested_base_to_alpaca(&cqrs, &id, amount).await;
+
+        // A transfer whose `BridgeAttestationReceived` predates envelope
+        // persistence carries `message: None`, so the response must be re-fetched
+        // from Circle (the backward-compatible fallback).
+        let response = manager
+            .attested_attestation_response(
+                &id,
+                BridgeDirection::BaseToEthereum,
+                burn_tx,
+                vec![0x01],
+                valid_message_nonce(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.nonce(), valid_message_nonce());
+        assert_eq!(
+            attestation_mock.calls(),
+            1,
+            "a legacy None-envelope resume must re-poll Circle exactly once",
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn attested_attestation_response_with_corrupt_envelope_fails_bridging() {
+        let server = MockServer::start();
+        let attestation_mock = mock_complete_attestation(&server);
+
+        let (manager, cqrs, _anvil) =
+            make_resume_test_manager_with_circle_api(&server, server.base_url()).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        let burn_tx = advance_to_attested_base_to_alpaca(&cqrs, &id, amount).await;
+
+        // A persisted envelope too short to extract a nonce is unusable. The USDC
+        // is already burned, so the aggregate must move to `BridgingFailed` for
+        // operator reconciliation rather than wedge in `Attested`.
+        let error = manager
+            .attested_attestation_response(
+                &id,
+                BridgeDirection::BaseToEthereum,
+                burn_tx,
+                vec![0x01],
+                valid_message_nonce(),
+                Some(vec![0u8; 10]),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::Cctp(_)),
+            "a corrupt envelope must surface a Cctp error, got: {error:?}",
+        );
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::BridgingFailed { .. }),
+            "a reconstruction failure must fail the bridge, got: {state:?}",
+        );
+        assert_eq!(
+            attestation_mock.calls(),
+            0,
+            "a reconstruction failure must not re-poll Circle",
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn attested_attestation_response_with_mismatched_nonce_fails_bridging() {
+        let server = MockServer::start();
+        let attestation_mock = mock_complete_attestation(&server);
+
+        let (manager, cqrs, _anvil) =
+            make_resume_test_manager_with_circle_api(&server, server.base_url()).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        let burn_tx = advance_to_attested_base_to_alpaca(&cqrs, &id, amount).await;
+
+        // `valid_cctp_message()` embeds nonce 1; recording a different cctp_nonce
+        // makes the persisted record internally inconsistent. Minting against an
+        // unverifiable nonce is refused -> `BridgingFailed`.
+        let recorded = B256::left_padding_from(&999u64.to_be_bytes());
+        let error = manager
+            .attested_attestation_response(
+                &id,
+                BridgeDirection::BaseToEthereum,
+                burn_tx,
+                vec![0x01],
+                recorded,
+                Some(valid_cctp_message()),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                UsdcTransferError::AttestationNonceMismatch { recorded: error_recorded, reconstructed, .. }
+                    if error_recorded == recorded && reconstructed == valid_message_nonce()
+            ),
+            "a nonce mismatch must surface AttestationNonceMismatch, got: {error:?}",
+        );
+
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(state, UsdcRebalance::BridgingFailed { .. }),
+            "a nonce mismatch must fail the bridge, got: {state:?}",
+        );
+        assert_eq!(
+            attestation_mock.calls(),
+            0,
+            "a nonce mismatch must not re-poll Circle",
         );
     }
 
@@ -5123,6 +5400,7 @@ mod tests {
             UsdcRebalanceCommand::ReceiveAttestation {
                 attestation: attestation_response.as_bytes().to_vec(),
                 cctp_nonce: attestation_response.nonce(),
+                message: attestation_response.message_bytes().to_vec(),
                 mint_scan_from_block,
             },
         )
@@ -5170,6 +5448,80 @@ mod tests {
             matches!(final_state, UsdcRebalance::ConversionComplete { .. }),
             "Expected ConversionComplete after adopting the existing mint on resume, \
              got: {final_state:?}"
+        );
+    }
+
+    /// A persisted envelope must actually mint, not merely reconstruct. Rebuild
+    /// the `AttestationResponse` from the stored message + attestation bytes
+    /// (exactly as an `Attested` resume does via `from_parts`) and mint it
+    /// on-chain over dual-chain CCTP with no Circle re-poll. A successful mint
+    /// receipt for the burned amount proves the stored envelope alone is
+    /// sufficient to call `receiveMessage` -- guarding against persisting an
+    /// envelope shape that round-trips but cannot mint.
+    #[tokio::test]
+    async fn persisted_envelope_reconstructs_into_a_mintable_response() {
+        let chains = deploy_dual_chain_cctp().await;
+
+        let attestation = CctpAttestationMock::start().await;
+        let _watcher = attestation
+            .start_watcher(
+                ProviderBuilder::new()
+                    .connect(&chains.ethereum_endpoint)
+                    .await
+                    .unwrap(),
+                ProviderBuilder::new()
+                    .connect(&chains.base_endpoint)
+                    .await
+                    .unwrap(),
+                chains.attester_key,
+            )
+            .await
+            .unwrap();
+
+        let cctp_bridge = CctpBridge::try_from_ctx(CctpCtx {
+            usdc_ethereum: USDC_ADDRESS,
+            usdc_base: USDC_ADDRESS,
+            ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
+            base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+            circle_api_base: attestation.base_url(),
+            token_messenger: chains.token_messenger,
+            message_transmitter: chains.message_transmitter,
+        })
+        .unwrap();
+
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
+        let amount_u256 = usdc_to_u256(usdc("100")).unwrap();
+        let burn_receipt = cctp_bridge
+            .burn(
+                BridgeDirection::BaseToEthereum,
+                amount_u256,
+                market_maker_wallet,
+            )
+            .await
+            .unwrap();
+        let response = cctp_bridge
+            .poll_attestation(BridgeDirection::BaseToEthereum, burn_receipt.tx)
+            .await
+            .unwrap();
+
+        // Persist then reconstruct exactly as the `Attested` resume path does:
+        // store only the envelope + attestation bytes, then rebuild with no
+        // Circle call.
+        let reconstructed = cctp_bridge
+            .reconstruct_attestation(
+                response.message_bytes().to_vec(),
+                response.as_bytes().to_vec(),
+            )
+            .unwrap();
+
+        let mint_receipt = cctp_bridge
+            .mint(BridgeDirection::BaseToEthereum, &reconstructed)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mint_receipt.amount, amount_u256,
+            "the reconstructed envelope must mint the full burned amount",
         );
     }
 
@@ -5364,28 +5716,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_alpaca_to_base_from_attested_does_not_re_emit_receive_attestation() {
+    async fn resume_alpaca_to_base_from_attested_reconstructs_without_repolling_circle() {
         let server = MockServer::start();
 
-        // Return a `complete` attestation for any /v2/messages request so the
-        // attestation re-poll resolves immediately (same shape as the
-        // Base->Alpaca sibling test).
-        let mut message = vec![0u8; 100];
-        message[43] = 1;
-        let message_hex = format!("0x{}", alloy::hex::encode(&message));
-        let attestation_hex = format!("0x{}", "ab".repeat(65));
-        let _attestation_mock = server.mock(|when, then| {
-            when.method(GET).path_includes("/v2/messages/");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "messages": [{
-                        "status": "complete",
-                        "message": message_hex,
-                        "attestation": attestation_hex,
-                    }]
-                }));
-        });
+        // A `complete` attestation is mocked, but the resume must NOT call it:
+        // the persisted message envelope lets it reconstruct the attestation
+        // offline. The mock exists only to prove (via 0 hits) that no re-poll
+        // happens. (Same shape as the Base->Alpaca sibling test.)
+        let attestation_mock = mock_complete_attestation(&server);
 
         let (manager, cqrs, _anvil) =
             make_resume_test_manager_with_circle_api(&server, server.base_url()).await;
@@ -5420,6 +5758,12 @@ mod tests {
             matches!(error, UsdcTransferError::Cctp(_)),
             "resume from Attested should proceed past the gate to the CCTP mint and \
              fail with a Cctp error; got: {error:?}",
+        );
+        assert_eq!(
+            attestation_mock.calls(),
+            0,
+            "resume from Attested must reconstruct the attestation from the persisted \
+             message envelope, not re-poll Circle",
         );
     }
 

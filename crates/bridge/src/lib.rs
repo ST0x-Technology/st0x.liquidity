@@ -46,8 +46,14 @@ pub trait Attestation: Send + Sync {
     /// Returns the 32-byte CCTP V2 nonce for this attestation.
     fn nonce(&self) -> B256;
 
-    /// Returns the raw attestation bytes.
+    /// Returns the raw attestation signature bytes.
     fn as_bytes(&self) -> &[u8];
+
+    /// Returns the full message envelope bytes. Minting needs the whole
+    /// envelope (not just the signature), so a caller persisting an attestation
+    /// for an offline resume stores these alongside [`Attestation::as_bytes`]
+    /// and later rebuilds via [`Bridge::reconstruct_attestation`].
+    fn message_bytes(&self) -> &[u8];
 }
 
 /// Generic bridge trait for cross-chain USDC transfers.
@@ -82,6 +88,18 @@ pub trait Bridge: Send + Sync + 'static {
         direction: BridgeDirection,
         attestation: &Self::Attestation,
     ) -> Result<MintReceipt, Self::Error>;
+
+    /// Rebuilds an attestation from a persisted message envelope and signature,
+    /// so an `Attested` resume mints offline without re-polling the attestation
+    /// service. The implementation re-derives and validates any embedded nonce,
+    /// so a corrupt or truncated envelope fails here rather than on-chain. This
+    /// keeps reconstruction behind the trait, so callers never depend on a
+    /// concrete attestation representation.
+    fn reconstruct_attestation(
+        &self,
+        message: Vec<u8>,
+        attestation: Vec<u8>,
+    ) -> Result<Self::Attestation, Self::Error>;
 
     /// Scans the burn source chain for an already-submitted burn matching
     /// `(amount, destinationDomain, recipient)` at or after `from_block`, for
