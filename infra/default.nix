@@ -297,6 +297,14 @@ let
               echo "Ensuring st0x-hedge is restarted on ${env}..." >&2
               ssh_remote "mkdir -p /run/st0x && touch /run/st0x/st0x-hedge.ready && systemctl start st0x-hedge" || true
             fi
+            # datasette holds the pre-reset DB inode open; recreating the DB
+            # leaves it serving the deleted file forever. Reopen the live inode
+            # on every exit path, even under --stopped. The marker must be
+            # touched first: datasette's ConditionPathExists gates the start, so
+            # a bare restart with an absent marker silently stops it (exit 0).
+            echo "Restarting datasette on ${env}..." >&2
+            ssh_remote "mkdir -p /run/st0x && touch /run/st0x/datasette.ready && systemctl restart datasette" \
+              || echo "WARNING: datasette restart failed on ${env}; it may still serve the deleted inode" >&2
             _cleanup_identity
           }
           trap _restart_service EXIT
