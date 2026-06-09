@@ -84,17 +84,11 @@ jobs:
           xargs nix path-info -r < "$abi_outputs" >> "$paths_file"
           sort -u "$paths_file" -o "$paths_file"
 
-  backend-validation:
-    name: backend test ${{ matrix.partition }} of 4
+  backend-build:
+    name: backend build
     needs: nix-source-cache
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-
-      matrix:
-        partition: [1, 2, 3, 4]
-
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_TARGET_DIR: target/test
@@ -151,30 +145,103 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-${{ runner.arch }}-test-
 
-      # Each partition builds the full test binaries, so clippy reuses the warm
-      # target/test cache instead of compiling the workspace into a separate
-      # dir. It only needs to run once, so it rides on partition 1.
+      # Build the test binaries once into a nextest archive shared by all four
+      # partitions, and run clippy here since this is the single full compile.
+      - name: Build nextest archive and run clippy
+        run: |
+          nix develop .#ci-backend -c bash -c '
+            set -euxo pipefail
+            cargo nextest archive --workspace --all-features --profile ci \
+              --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst"
+            cargo clippy --workspace --all-targets --all-features
+            # compile_fail_tests (trybuild) shells out to cargo at run time, so
+            # run it here where the workspace build cache is warm. The archive
+            # partitions only carry prebuilt binaries and would compile it cold.
+            cargo nextest run --workspace --all-features --profile ci \
+              -E "test(compile_fail_tests)"
+          '
+
+      - name: Upload nextest archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-archive
+          path: ${{ runner.temp }}/nextest-archive.tar.zst
+          retention-days: 1
+          if-no-files-found: error
+
+  backend-test:
+    name: backend test ${{ matrix.partition }} of 4
+    needs: backend-build
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+
+      matrix:
+        partition: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure Git fetch fail-fast
+        run: |
+          git config --global http.lowSpeedLimit 524288
+          git config --global http.lowSpeedTime 60
+
+      - uses: DeterminateSystems/nix-installer-action@v22
+        with:
+          extra-conf: |
+            accept-flake-config = true
+            fallback = true
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
+      - uses: DeterminateSystems/magic-nix-cache-action@v14
+        continue-on-error: true
+
+      - name: Restore Nix source cache
+        id: nix-source-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .tmp/nix-ci-cache
+            .tmp/nix-ci-cache-paths.txt
+          key: nix-source-abi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/*.nix') }}
+          fail-on-cache-miss: false
+
+      - name: Import Nix source cache
+        if: steps.nix-source-cache.outputs.cache-hit == 'true'
+        run: |
+          nix copy \
+            --from "file://$GITHUB_WORKSPACE/.tmp/nix-ci-cache" \
+            --no-check-sigs \
+            --stdin < "$GITHUB_WORKSPACE/.tmp/nix-ci-cache-paths.txt"
+
+      - name: Download nextest archive
+        uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive
+          path: ${{ runner.temp }}
+
+      # Test binaries come from the archive built in backend-build; no recompile.
       - name: test ${{ matrix.partition }} of 4
         run: |
           nix develop .#ci-backend -c bash -c '
             set -euxo pipefail
-            cargo nextest run --workspace --all-features --profile ci \
+            cargo nextest run --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst" \
+              --workspace-remap . --profile ci \
+              -E "not test(compile_fail_tests)" \
               --partition hash:${{ matrix.partition }}/4
-            if [ "${{ matrix.partition }}" = "1" ]; then
-              cargo clippy --workspace --all-targets --all-features
-            fi
           '
 
   backend:
     name: backend
-    needs: backend-validation
+    needs: [backend-build, backend-test]
     if: always()
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 25
     steps:
       - name: Check backend validation
         run: |
-          if [ "${{ needs.backend-validation.result }}" != "success" ]; then
+          if [ "${{ needs.backend-build.result }}" != "success" ] || [ "${{ needs.backend-test.result }}" != "success" ]; then
             echo "backend validation failed"
             exit 1
           fi
