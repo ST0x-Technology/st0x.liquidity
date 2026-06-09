@@ -377,6 +377,13 @@ pub enum CctpError {
         attempts: usize,
         source: AttestationError,
     },
+    /// A `status == "complete"` attestation came back malformed (a required
+    /// field absent, or hex that does not decode). Unlike `AttestationTimeout`
+    /// this is a definitively-hard error: retrying cannot fix a complete-but-bad
+    /// response, so it short-circuits the retry loop and is routed to immediate
+    /// bridge failure rather than retried to the deadline.
+    #[error("malformed complete attestation: {source}")]
+    MalformedAttestation { source: AttestationError },
     #[error("MessageSent event not found in transaction receipt")]
     MessageSentEventNotFound,
     #[error("MintAndWithdraw event not found in transaction receipt")]
@@ -431,10 +438,52 @@ pub enum AttestationError {
     Pending { status: String },
     #[error("No messages in attestation response")]
     NoMessages,
-    #[error("Attestation response missing required field: {field}")]
+    #[error("Attestation response missing or non-string required field: {field}")]
     MissingField { field: &'static str },
     #[error("Attestation not yet available (HTTP {status})")]
     NotYetAvailable { status: u16 },
+}
+
+impl AttestationError {
+    /// Whether polling should keep retrying on this error.
+    ///
+    /// Transient sources -- the attestation simply has not landed yet (`Pending`,
+    /// `NotYetAvailable`, `NoMessages`) or a transport hiccup (`Http`, which also
+    /// wraps any `reqwest` JSON-decode failure) -- are retryable. `MissingField`
+    /// and `HexDecode` are not: they only arise *after* the `status == "complete"`
+    /// check, so they mean Circle returned a complete-but-malformed response that
+    /// retrying cannot fix. Failing fast on those surfaces a terminal bridge
+    /// failure for operator reconciliation instead of retrying to the 24h deadline.
+    /// (`JsonParse` is classified retryable too, for completeness -- it is not
+    /// produced on the current poll path, where `reqwest`'s `.json()` surfaces
+    /// decode errors as `Http`.)
+    fn is_retryable(&self) -> bool {
+        match self {
+            Self::Http(_)
+            | Self::JsonParse(_)
+            | Self::Pending { .. }
+            | Self::NoMessages
+            | Self::NotYetAvailable { .. } => true,
+            Self::HexDecode(_) | Self::MissingField { .. } => false,
+        }
+    }
+
+    /// Maps the error that ended the poll loop to its terminal [`CctpError`],
+    /// single-sourcing the retry-vs-malformed decision the `.when` gate uses: a
+    /// retryable error here means the loop exhausted `attempts` (a timeout), while
+    /// a non-retryable one short-circuited the loop (a definitively-malformed
+    /// complete response). They route differently downstream -- a timeout is
+    /// retried to the deadline, a malformed attestation fails the bridge fast.
+    fn into_terminal(self, attempts: usize) -> CctpError {
+        if self.is_retryable() {
+            CctpError::AttestationTimeout {
+                attempts,
+                source: self,
+            }
+        } else {
+            CctpError::MalformedAttestation { source: self }
+        }
+    }
 }
 
 /// Fee entry from Circle's `/v2/burn/USDC/fees/{source}/{dest}` API.
@@ -583,8 +632,16 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         #[derive(Deserialize, Debug)]
         #[serde(rename_all = "camelCase")]
         struct MessageEntry {
-            attestation: Option<String>,
-            message: Option<String>,
+            // Parsed leniently as raw `Value`, not `Option<String>`: a complete
+            // response carrying a non-string `message`/`attestation` (e.g. a JSON
+            // number) is a definitively-malformed complete attestation. Strong
+            // `Option<String>` deserialization would instead fail the whole
+            // `response.json()` as a retryable transport/JSON error, letting that
+            // bad complete response retry to the deadline. Keeping the fields raw
+            // defers the string check to *after* the `status == "complete"` gate,
+            // where a missing-or-non-string field becomes a terminal failure.
+            attestation: Option<serde_json::Value>,
+            message: Option<serde_json::Value>,
             status: String,
         }
 
@@ -615,16 +672,17 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
                 });
             }
 
-            let attestation_hex =
-                entry
-                    .attestation
-                    .as_ref()
-                    .ok_or(AttestationError::MissingField {
-                        field: "attestation",
-                    })?;
+            let attestation_hex = entry
+                .attestation
+                .as_ref()
+                .and_then(|value| value.as_str())
+                .ok_or(AttestationError::MissingField {
+                    field: "attestation",
+                })?;
             let message_hex = entry
                 .message
                 .as_ref()
+                .and_then(|value| value.as_str())
                 .ok_or(AttestationError::MissingField { field: "message" })?;
 
             let message = Bytes::from(alloy::hex::decode(message_hex)?);
@@ -635,6 +693,10 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
 
         let (message, attestation) = fetch_attestation
             .retry(backoff)
+            // A complete-but-malformed response cannot be fixed by retrying, so
+            // stop the loop immediately on a non-retryable error; transient
+            // sources keep retrying until `MAX_ATTEMPTS`.
+            .when(AttestationError::is_retryable)
             .notify(|err, dur| match err {
                 AttestationError::Pending { status } => {
                     debug!(target: "bridge", %status, ?dur, "Attestation pending, retrying");
@@ -645,9 +707,15 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
                 err => warn!(target: "bridge", ?err, ?dur, "Attestation error, retrying"),
             })
             .await
-            .map_err(|err| CctpError::AttestationTimeout {
-                attempts: MAX_ATTEMPTS,
-                source: err,
+            .map_err(|err| err.into_terminal(MAX_ATTEMPTS))
+            // The `.when` short-circuit returns without invoking `.notify`, so the
+            // bridge layer is otherwise silent on a fast-fail. Log it here so a
+            // terminal malformed-attestation failure is traceable at the bridge
+            // target, distinct from an exhausted-retry timeout.
+            .inspect_err(|error| {
+                if let CctpError::MalformedAttestation { .. } = error {
+                    warn!(target: "bridge", ?error, "Malformed complete attestation; failing bridge fast");
+                }
             })?;
 
         // Validate through the same constructor a persisted-envelope resume uses,
@@ -1108,6 +1176,236 @@ mod tests {
             "Expected CctpError::PlaceholderNonce, got: {error:?}"
         );
         assert_eq!(mock.calls(), 1, "Expected exactly 1 API call");
+    }
+
+    #[tokio::test]
+    async fn poll_attestation_fails_fast_on_malformed_complete_response() {
+        let server = MockServer::start();
+
+        // A `complete` attestation that is missing the required `message` field.
+        // This is a definitively-hard error (a complete response cannot become
+        // well-formed by retrying), so the poll must fail fast with
+        // `MalformedAttestation` after a single call -- NOT retry to the 60-attempt
+        // timeout (which at the real 5s interval would take 5 minutes).
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v2/messages/{ETHEREUM_DOMAIN}"));
+            then.status(200).json_body(serde_json::json!({
+                "messages": [{
+                    "attestation": "0x1234567890abcdef",
+                    "status": "complete"
+                }]
+            }));
+        });
+
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _base_key) = setup_anvil();
+
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            USDC_ETHEREUM,
+        )
+        .await
+        .unwrap()
+        .with_circle_api_base(server.base_url());
+
+        let burn_tx = b256!("1234567890123456789012345678901234567890123456789012345678901234");
+
+        let error = bridge
+            .poll_attestation_internal(BridgeDirection::EthereumToBase, burn_tx)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CctpError::MalformedAttestation {
+                    source: AttestationError::MissingField { field: "message" }
+                }
+            ),
+            "Expected CctpError::MalformedAttestation for a complete-but-missing-field \
+             response, got: {error:?}"
+        );
+        assert_eq!(
+            mock.calls(),
+            1,
+            "a malformed complete response must fail fast, not retry to the timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_attestation_fails_fast_on_non_string_complete_field() {
+        let server = MockServer::start();
+
+        // A `complete` response whose `message` is a JSON number, not a hex
+        // string. Strong `Option<String>` deserialization would fail the whole
+        // `response.json()` as a retryable transport error, letting this
+        // definitively-malformed complete response retry to the 60-attempt
+        // timeout. The lenient `Value` parse instead classifies it as a terminal
+        // `MalformedAttestation` after a single call.
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v2/messages/{ETHEREUM_DOMAIN}"));
+            then.status(200).json_body(serde_json::json!({
+                "messages": [{
+                    "attestation": "0x1234567890abcdef",
+                    "message": 123,
+                    "status": "complete"
+                }]
+            }));
+        });
+
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _base_key) = setup_anvil();
+
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            USDC_ETHEREUM,
+        )
+        .await
+        .unwrap()
+        .with_circle_api_base(server.base_url());
+
+        let burn_tx = b256!("1234567890123456789012345678901234567890123456789012345678901234");
+
+        let error = bridge
+            .poll_attestation_internal(BridgeDirection::EthereumToBase, burn_tx)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CctpError::MalformedAttestation {
+                    source: AttestationError::MissingField { field: "message" }
+                }
+            ),
+            "Expected CctpError::MalformedAttestation for a complete-but-non-string \
+             field, got: {error:?}"
+        );
+        assert_eq!(
+            mock.calls(),
+            1,
+            "a non-string complete field must fail fast, not retry to the timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_attestation_fails_fast_on_non_string_attestation_field() {
+        let server = MockServer::start();
+
+        // The `attestation` field is extracted before `message`, so a non-string
+        // `attestation` on a complete response must fail fast and report the
+        // `attestation` field label (not `message`). Guards the symmetric arm of
+        // the lenient-parse validation.
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v2/messages/{ETHEREUM_DOMAIN}"));
+            then.status(200).json_body(serde_json::json!({
+                "messages": [{
+                    "attestation": 123,
+                    "message": "0x1234567890abcdef",
+                    "status": "complete"
+                }]
+            }));
+        });
+
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _base_key) = setup_anvil();
+
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            USDC_ETHEREUM,
+        )
+        .await
+        .unwrap()
+        .with_circle_api_base(server.base_url());
+
+        let burn_tx = b256!("1234567890123456789012345678901234567890123456789012345678901234");
+
+        let error = bridge
+            .poll_attestation_internal(BridgeDirection::EthereumToBase, burn_tx)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CctpError::MalformedAttestation {
+                    source: AttestationError::MissingField {
+                        field: "attestation"
+                    }
+                }
+            ),
+            "Expected MalformedAttestation reporting the `attestation` field, got: {error:?}"
+        );
+        assert_eq!(
+            mock.calls(),
+            1,
+            "a non-string attestation field must fail fast, not retry to the timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_attestation_fails_fast_on_invalid_hex_complete_field() {
+        let server = MockServer::start();
+
+        // A `complete` response whose `message` is a string but not valid hex.
+        // Hex decoding only happens after the `status == "complete"` gate, so this
+        // is a terminal `MalformedAttestation` (HexDecode), not a retryable error.
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v2/messages/{ETHEREUM_DOMAIN}"));
+            then.status(200).json_body(serde_json::json!({
+                "messages": [{
+                    "attestation": "0x1234567890abcdef",
+                    "message": "not-hex-at-all",
+                    "status": "complete"
+                }]
+            }));
+        });
+
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _base_key) = setup_anvil();
+
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            USDC_ETHEREUM,
+        )
+        .await
+        .unwrap()
+        .with_circle_api_base(server.base_url());
+
+        let burn_tx = b256!("1234567890123456789012345678901234567890123456789012345678901234");
+
+        let error = bridge
+            .poll_attestation_internal(BridgeDirection::EthereumToBase, burn_tx)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CctpError::MalformedAttestation {
+                    source: AttestationError::HexDecode(_)
+                }
+            ),
+            "Expected CctpError::MalformedAttestation with a HexDecode source for an \
+             invalid-hex complete field, got: {error:?}"
+        );
+        assert_eq!(
+            mock.calls(),
+            1,
+            "an invalid-hex complete field must fail fast, not retry to the timeout"
+        );
     }
 
     #[tokio::test]

@@ -4282,6 +4282,71 @@ mod tests {
         );
     }
 
+    /// Mocks Circle's lookup to return a `status == "complete"` response that is
+    /// missing the required `message` field -- a definitively-malformed response
+    /// the bridge surfaces as `CctpError::MalformedAttestation` (RAI-837), not a
+    /// retryable timeout.
+    fn mock_malformed_complete_attestation(server: &MockServer) -> httpmock::Mock<'_> {
+        let attestation_hex = format!("0x{}", "ab".repeat(65));
+        server.mock(|when, then| {
+            when.method(GET).path_includes("/v2/messages/");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "messages": [{
+                        "status": "complete",
+                        "attestation": attestation_hex,
+                    }]
+                }));
+        })
+    }
+
+    /// RAI-837: a malformed `complete` attestation is a hard error, not a
+    /// retryable timeout. Resuming from `AwaitingAttestation` against such a
+    /// response must move the aggregate straight to `BridgingFailed` (immediate
+    /// operator reconciliation) rather than leave it retryable in
+    /// `AwaitingAttestation` until the 24h deadline.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn resume_from_awaiting_attestation_with_malformed_complete_fails_bridging() {
+        let server = MockServer::start();
+        let _attestation_mock = mock_malformed_complete_attestation(&server);
+        let (manager, cqrs, _anvil) =
+            make_resume_test_manager_with_circle_api(&server, server.base_url()).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        let retry_deadline_at = Utc::now() + chrono::Duration::hours(1);
+        let burn_tx =
+            advance_to_awaiting_attestation_base_to_alpaca(&cqrs, &id, amount, retry_deadline_at)
+                .await;
+
+        let error = manager
+            .resume_base_to_alpaca(&id, amount)
+            .await
+            .unwrap_err();
+
+        let UsdcTransferError::Cctp(inner) = &error else {
+            panic!("expected UsdcTransferError::Cctp, got: {error:?}");
+        };
+        assert!(
+            matches!(**inner, CctpError::MalformedAttestation { .. }),
+            "a malformed complete attestation must surface as a terminal \
+             MalformedAttestation, not a retryable AttestationTimeout, got: {error:?}"
+        );
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                &state,
+                UsdcRebalance::BridgingFailed {
+                    burn_tx_hash: Some(state_burn_tx),
+                    ..
+                } if *state_burn_tx == burn_tx
+            ),
+            "a malformed complete attestation must fail the bridge immediately, not leave it \
+             retryable in AwaitingAttestation, got {state:?}"
+        );
+    }
+
     /// Drives the aggregate through `Initiate` -> `ConfirmWithdrawal` ->
     /// `InitiateBridging` -> `ReceiveAttestation` -> `ConfirmBridging` so
     /// the next callable step is the Alpaca deposit initiation.
