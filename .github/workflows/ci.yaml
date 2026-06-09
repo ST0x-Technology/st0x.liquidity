@@ -14,79 +14,15 @@ permissions:
   id-token: write
   contents: read
 
+# Nix is installed via nix-quick-install-action and both the shared
+# `rainlanguage` Cachix (cachix-action) and the per-runner nix store
+# (cache-nix-action) are warmed before any `nix` invocation. This replaces the
+# old DeterminateSystems installer + magic-nix-cache + custom ABI-prefetch job,
+# which did not share the `rainlanguage` cache that raindex CI populates.
+
 jobs:
-  nix-source-cache:
-    name: nix source cache
-    runs-on: blacksmith-2vcpu-ubuntu-2404
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Configure Git fetch fail-fast
-        run: |
-          git config --global http.lowSpeedLimit 524288
-          git config --global http.lowSpeedTime 60
-
-      - uses: DeterminateSystems/nix-installer-action@v22
-        with:
-          extra-conf: |
-            accept-flake-config = true
-            fallback = true
-            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
-
-      - name: Restore Nix source cache
-        id: nix-source-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            .tmp/nix-ci-cache
-            .tmp/nix-ci-cache-paths.txt
-          key: nix-source-abi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/*.nix') }}
-
-      - name: Populate Nix source cache
-        if: steps.nix-source-cache.outputs.cache-hit != 'true'
-        run: |
-          set -euxo pipefail
-
-          cache_dir="$GITHUB_WORKSPACE/.tmp/nix-ci-cache"
-          archive_json="$GITHUB_WORKSPACE/.tmp/nix-ci-cache-flake-archive.json"
-          abi_outputs="$GITHUB_WORKSPACE/.tmp/nix-ci-cache-abi-outputs.txt"
-          paths_file="$GITHUB_WORKSPACE/.tmp/nix-ci-cache-paths.txt"
-
-          mkdir -p "$cache_dir"
-
-          retry() {
-            for attempt in 1 2 3; do
-              if "$@"; then
-                return 0
-              fi
-
-              if [ "$attempt" = 3 ]; then
-                return 1
-              fi
-
-              sleep "$((attempt * 15))"
-            done
-          }
-
-          retry bash -c 'nix flake archive --json --to "$1" . > "$2"' \
-            _ "file://$cache_dir" "$archive_json"
-
-          jq -r '[.. | objects | select(has("path")) | .path] | unique | .[]' \
-            "$archive_json" > "$paths_file"
-
-          retry bash -c 'nix build --no-link --print-out-paths .#forgeStd .#rainOrderbook .#pyth > "$1"' \
-            _ "$abi_outputs"
-
-          retry bash -c 'xargs nix copy --to "$1" < "$2"' \
-            _ "file://$cache_dir" "$abi_outputs"
-
-          xargs nix path-info -r < "$abi_outputs" >> "$paths_file"
-          sort -u "$paths_file" -o "$paths_file"
-
   backend-build:
     name: backend build
-    needs: nix-source-cache
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 30
     env:
@@ -100,50 +36,37 @@ jobs:
           git config --global http.lowSpeedLimit 524288
           git config --global http.lowSpeedTime 60
 
-      - uses: DeterminateSystems/nix-installer-action@v22
+      - uses: nixbuild/nix-quick-install-action@v34
         with:
-          extra-conf: |
+          # Nix 2.24-2.28 fail to resolve rainix's overridden `foundry` input
+          # (`cannot find flake 'flake:foundry'`); the fix landed in 2.30. v30
+          # of this action only shipped up to 2.26, so use v34 and pin a
+          # working release.
+          nix_version: "2.31.2"
+          nix_conf: |
             accept-flake-config = true
             fallback = true
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            keep-env-derivations = true
+            keep-outputs = true
 
-      - uses: DeterminateSystems/magic-nix-cache-action@v14
+      - uses: cachix/cachix-action@v15
         continue-on-error: true
-
-      - name: Restore Nix source cache
-        id: nix-source-cache
-        uses: actions/cache/restore@v4
         with:
-          path: |
-            .tmp/nix-ci-cache
-            .tmp/nix-ci-cache-paths.txt
-          key: nix-source-abi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/*.nix') }}
-          # A miss must not fail the job. GitHub's 10GB cache can evict the
-          # nix-source-abi entry between the populate job saving it and this
-          # restore (especially under concurrent load), so on a miss we skip the
-          # import below and let `nix develop .#ci-backend` build the ABIs from
-          # source. Slower, but the build stays green instead of hard-failing.
-          fail-on-cache-miss: false
+          name: rainlanguage
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          useDaemon: false
 
-      - name: Import Nix source cache
-        if: steps.nix-source-cache.outputs.cache-hit == 'true'
-        run: |
-          nix copy \
-            --from "file://$GITHUB_WORKSPACE/.tmp/nix-ci-cache" \
-            --no-check-sigs \
-            --stdin < "$GITHUB_WORKSPACE/.tmp/nix-ci-cache-paths.txt"
-
-      - name: Cache cargo artifacts
-        uses: actions/cache@v4
+      - uses: nix-community/cache-nix-action@v7
         with:
-          path: |
-            ~/.cargo/git/db/
-            ~/.cargo/registry/cache/
-            ~/.cargo/registry/index/
-            target/test/
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-test-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'flake.lock', 'flake.nix', 'rust.nix') }}
-          restore-keys: |
-            cargo-${{ runner.os }}-${{ runner.arch }}-test-
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 8G
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: rust-${{ github.workflow }}
+          workspaces: ". -> target/test"
 
       # Build the test binaries once into a nextest archive shared by all four
       # partitions, and run clippy here since this is the single full compile.
@@ -187,33 +110,32 @@ jobs:
           git config --global http.lowSpeedLimit 524288
           git config --global http.lowSpeedTime 60
 
-      - uses: DeterminateSystems/nix-installer-action@v22
+      - uses: nixbuild/nix-quick-install-action@v34
         with:
-          extra-conf: |
+          # Nix 2.24-2.28 fail to resolve rainix's overridden `foundry` input
+          # (`cannot find flake 'flake:foundry'`); the fix landed in 2.30. v30
+          # of this action only shipped up to 2.26, so use v34 and pin a
+          # working release.
+          nix_version: "2.31.2"
+          nix_conf: |
             accept-flake-config = true
             fallback = true
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            keep-env-derivations = true
+            keep-outputs = true
 
-      - uses: DeterminateSystems/magic-nix-cache-action@v14
+      - uses: cachix/cachix-action@v15
         continue-on-error: true
-
-      - name: Restore Nix source cache
-        id: nix-source-cache
-        uses: actions/cache/restore@v4
         with:
-          path: |
-            .tmp/nix-ci-cache
-            .tmp/nix-ci-cache-paths.txt
-          key: nix-source-abi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/*.nix') }}
-          fail-on-cache-miss: false
+          name: rainlanguage
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          useDaemon: false
 
-      - name: Import Nix source cache
-        if: steps.nix-source-cache.outputs.cache-hit == 'true'
-        run: |
-          nix copy \
-            --from "file://$GITHUB_WORKSPACE/.tmp/nix-ci-cache" \
-            --no-check-sigs \
-            --stdin < "$GITHUB_WORKSPACE/.tmp/nix-ci-cache-paths.txt"
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 8G
 
       - name: Download nextest archive
         uses: actions/download-artifact@v4
@@ -257,12 +179,32 @@ jobs:
           git config --global http.lowSpeedLimit 524288
           git config --global http.lowSpeedTime 60
 
-      - uses: DeterminateSystems/nix-installer-action@v22
+      - uses: nixbuild/nix-quick-install-action@v34
         with:
-          extra-conf: |
+          # Nix 2.24-2.28 fail to resolve rainix's overridden `foundry` input
+          # (`cannot find flake 'flake:foundry'`); the fix landed in 2.30. v30
+          # of this action only shipped up to 2.26, so use v34 and pin a
+          # working release.
+          nix_version: "2.31.2"
+          nix_conf: |
             accept-flake-config = true
             fallback = true
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            keep-env-derivations = true
+            keep-outputs = true
+
+      - uses: cachix/cachix-action@v15
+        continue-on-error: true
+        with:
+          name: rainlanguage
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          useDaemon: false
+
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 8G
 
       - name: Check bun.nix is up to date
         run: |
@@ -293,12 +235,32 @@ jobs:
           git config --global http.lowSpeedLimit 524288
           git config --global http.lowSpeedTime 60
 
-      - uses: DeterminateSystems/nix-installer-action@v22
+      - uses: nixbuild/nix-quick-install-action@v34
         with:
-          extra-conf: |
+          # Nix 2.24-2.28 fail to resolve rainix's overridden `foundry` input
+          # (`cannot find flake 'flake:foundry'`); the fix landed in 2.30. v30
+          # of this action only shipped up to 2.26, so use v34 and pin a
+          # working release.
+          nix_version: "2.31.2"
+          nix_conf: |
             accept-flake-config = true
             fallback = true
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+            keep-env-derivations = true
+            keep-outputs = true
+
+      - uses: cachix/cachix-action@v15
+        continue-on-error: true
+        with:
+          name: rainlanguage
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          useDaemon: false
+
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 8G
 
       - name: deploy migration invariants
         run: ./scripts/validate-deploy-migration.sh
