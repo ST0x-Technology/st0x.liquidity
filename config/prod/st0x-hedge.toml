@@ -72,8 +72,8 @@ vault_id = "0xfab4"
 rebalancing = "enabled"
 # Maximum USDC moved per rebalance operation.
 operational_limit = 1000
-# USD cash kept offchain and unavailable for rebalancing.
-reserved = 25000
+# No cash reserve: all offchain USDC is available for rebalancing.
+# (Omitted because `reserved` is typed Positive<Usd> and rejects 0.)
 
 # Per-equity asset configuration.
 # - trading: whether the bot hedges fills for this asset.
