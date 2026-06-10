@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use std::sync::Mutex;
 
 use st0x_evm::EvmError;
+use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
 
-use super::raindex::{Raindex, RaindexError, RaindexVaultId};
 use crate::bindings::IERC20;
 
 /// Whether `submit_deposit` should succeed, fail generically, or fail

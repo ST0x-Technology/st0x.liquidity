@@ -33,6 +33,7 @@ use st0x_execution::{
     ClientOrderId, CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason,
     ExecutionError, Executor, FractionalShares, MarketOrder, Symbol, TryIntoExecutor,
 };
+use st0x_raindex::{RaindexService, RaindexVaultId};
 
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::conductor::exit::{ConductorExit, MonitorTaskError};
@@ -54,7 +55,6 @@ use crate::onchain::USDC_BASE;
 use crate::onchain::accumulator::check_all_positions;
 use crate::onchain::accumulator::{ExecutionCtx, check_execution_readiness};
 use crate::onchain::backfill::BackfillJobQueue;
-use crate::onchain::raindex::{RaindexService, RaindexVaultId};
 use crate::onchain::trade::{RaindexTradeEvent, extract_owned_vaults, extract_vaults_from_clear};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
 use crate::position::{Position, PositionCommand, TradeId};

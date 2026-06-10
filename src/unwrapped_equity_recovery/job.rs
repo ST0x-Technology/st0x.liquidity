@@ -674,11 +674,11 @@ mod tests {
     use uuid::Uuid;
 
     use st0x_event_sorcery::test_store;
+    use st0x_raindex::{Raindex, RaindexVaultId};
 
     use crate::conductor::setup_apalis_tables;
     use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand};
     use crate::onchain::mock::MockRaindex;
-    use crate::onchain::raindex::{Raindex, RaindexVaultId};
     use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
     use crate::tokenization::Tokenizer;
     use crate::tokenization::mock::{MockCompletionOutcome, MockDetectionOutcome, MockTokenizer};

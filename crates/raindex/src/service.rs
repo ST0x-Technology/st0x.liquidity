@@ -1,10 +1,13 @@
 //! Rain OrderBook V6 (Raindex) vault operations on Base.
 //!
-//! This module provides a service layer for depositing and withdrawing tokens to/from
-//! Raindex vaults using the `deposit4` and `withdraw4` contract functions.
+//! [`RaindexService`] implements the [`Raindex`](crate::Raindex) trait for depositing and
+//! withdrawing tokens to/from Raindex vaults using the `deposit4` and `withdraw4`
+//! contract functions. The primary use case is USDC vault management for inventory
+//! rebalancing in the market making system.
 //!
-//! The primary use case is USDC vault management for inventory rebalancing in the
-//! market making system.
+//! This module and its private `IRaindexV6`/`IERC20` bindings are gated behind the
+//! `rain` feature; the [`Raindex`](crate::Raindex) trait and its domain types ship in the
+//! default build.
 //!
 //! ## V6 Float Format
 //!
@@ -14,6 +17,7 @@
 use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, TransactionReceipt};
+use alloy::sol;
 use alloy::sol_types::SolEvent;
 use async_trait::async_trait;
 use rain_math_float::Float;
@@ -22,9 +26,18 @@ use tracing::{debug, info};
 use st0x_evm::{Evm, IntoErrorRegistry, OpenChainErrorRegistry, Wallet};
 use st0x_execution::FractionalShares;
 use st0x_finance::Usdc;
-pub(crate) use st0x_raindex::{Raindex, RaindexError, RaindexVaultId, USDC_BASE};
 
-use crate::bindings::{IERC20, IRaindexV6};
+use crate::{Raindex, RaindexError, RaindexVaultId, USDC_BASE};
+
+sol!(
+    #![sol(all_derives = true, rpc)]
+    IRaindexV6, env!("ST0X_IORDERBOOK_V6_ABI")
+);
+
+sol!(
+    #![sol(all_derives = true, rpc)]
+    IERC20, env!("ST0X_IERC20_ABI")
+);
 
 const USDC_DECIMALS: u8 = 6;
 
@@ -56,14 +69,14 @@ const SCAN_FINALITY_MARGIN: u64 = 2;
 /// let deposit_tx = service.submit_deposit_usdc(vault_id, amount).await?;
 /// service.confirm_tx(deposit_tx).await?;
 /// ```
-pub(crate) struct RaindexService<E: Evm> {
+pub struct RaindexService<E: Evm> {
     orderbook_address: Address,
     evm: E,
     owner: Address,
 }
 
 impl<E: Evm> RaindexService<E> {
-    pub(crate) fn new(evm: E, orderbook: Address, owner: Address) -> Self {
+    pub fn new(evm: E, orderbook: Address, owner: Address) -> Self {
         Self {
             orderbook_address: orderbook,
             evm,
@@ -88,7 +101,7 @@ impl<W: Wallet> RaindexService<W> {
     /// Returns `RaindexError::ZeroAmount` if amount is zero.
     /// Returns `RaindexError::Float` if amount cannot be converted to float format.
     /// Returns `RaindexError::Evm` for transaction errors.
-    pub(crate) async fn deposit<Registry: IntoErrorRegistry>(
+    pub async fn deposit<Registry: IntoErrorRegistry>(
         &self,
         token: Address,
         vault_id: RaindexVaultId,
@@ -207,7 +220,7 @@ impl<W: Wallet> RaindexService<W> {
     /// `InitiateDeposit` before confirmation, so a crash during the confirmation
     /// wait resumes from `DepositInitiated` (re-verifying the recorded tx via
     /// `confirm_tx`) instead of re-submitting a second deposit.
-    pub(crate) async fn submit_deposit_usdc(
+    pub async fn submit_deposit_usdc(
         &self,
         vault_id: RaindexVaultId,
         amount: U256,
@@ -227,7 +240,7 @@ impl<W: Wallet> RaindexService<W> {
     ///
     /// * `vault_id` - Source vault identifier
     /// * `target_amount` - Target amount of USDC to withdraw (in USDC's base units, 6 decimals)
-    pub(crate) async fn withdraw_usdc(
+    pub async fn withdraw_usdc(
         &self,
         vault_id: RaindexVaultId,
         target_amount: U256,
@@ -239,7 +252,7 @@ impl<W: Wallet> RaindexService<W> {
 
 /// Read operations that only need chain access (no signing).
 impl<E: Evm> RaindexService<E> {
-    pub(crate) async fn get_equity_balance<Registry: IntoErrorRegistry>(
+    pub async fn get_equity_balance<Registry: IntoErrorRegistry>(
         &self,
         owner: Address,
         token: Address,
@@ -252,7 +265,7 @@ impl<E: Evm> RaindexService<E> {
     }
 
     /// Gets the USDC balance of a vault on Base.
-    pub(crate) async fn get_usdc_balance<Registry: IntoErrorRegistry>(
+    pub async fn get_usdc_balance<Registry: IntoErrorRegistry>(
         &self,
         owner: Address,
         vault_id: RaindexVaultId,
@@ -283,7 +296,7 @@ impl<E: Evm> RaindexService<E> {
     /// be lagging (the dRPC load-balancing hazard AGENTS.md warns about) yields a
     /// retryable [`RaindexError::ScanInconclusive`] instead, so the caller never
     /// re-executes the irreversible withdraw off a single stale empty `eth_getLogs`.
-    pub(crate) async fn find_recent_withdrawal(
+    pub async fn find_recent_withdrawal(
         &self,
         token: Address,
         vault_id: RaindexVaultId,
@@ -340,7 +353,7 @@ impl<E: Evm> RaindexService<E> {
     /// Returns the current chain head. Captured before submitting an on-chain
     /// action so a later [`find_recent_withdrawal`](Self::find_recent_withdrawal)
     /// scan can bound its search to blocks at or after the action.
-    pub(crate) async fn current_block(&self) -> Result<u64, RaindexError> {
+    pub async fn current_block(&self) -> Result<u64, RaindexError> {
         Ok(self.evm.provider().get_block_number().await?)
     }
 
@@ -461,32 +474,72 @@ impl<W: Wallet> Raindex for RaindexService<W> {
 
 #[cfg(test)]
 mod tests {
-    use alloy::network::Ethereum;
+    use alloy::network::{Ethereum, TransactionBuilder};
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::Log as PrimitiveLog;
     use alloy::primitives::{B256, address, b256};
-    use alloy::providers::Provider;
+    use alloy::providers::ext::AnvilApi as _;
     use alloy::providers::fillers::{
         BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
     };
-    use alloy::providers::{Identity, ProviderBuilder, RootProvider};
-    use alloy::rpc::types::Log;
+    use alloy::providers::mock::Asserter;
+    use alloy::providers::{Identity, Provider, ProviderBuilder, RootProvider};
+    use alloy::rpc::types::{Log, TransactionRequest};
+    use alloy::sol;
     use alloy::transports::{RpcError, TransportErrorKind};
     use proptest::prelude::*;
+    use serde_json::json;
     use tracing_test::traced_test;
 
-    use alloy::providers::mock::Asserter;
-    use serde_json::json;
-
-    use st0x_evm::EvmError;
-    use st0x_evm::NoOpErrorRegistry;
-    use st0x_evm::ReadOnlyEvm;
-    use st0x_evm::Wallet;
     use st0x_evm::local::RawPrivateKeyWallet;
+    use st0x_evm::{EvmError, NoOpErrorRegistry, ReadOnlyEvm, Wallet};
 
     use super::*;
-    use crate::bindings::{IRaindexV6, RaindexV6, TestERC20};
-    use crate::test_utils::deploy_tofu_singleton;
+
+    sol!(
+        #![sol(all_derives = true, rpc)]
+        RaindexV6, env!("ST0X_ORDERBOOK_ABI")
+    );
+
+    sol!(
+        #![sol(all_derives = true, rpc)]
+        TestERC20, env!("ST0X_TEST_ERC20_ABI")
+    );
+
+    /// Deterministic singleton address of the TOFUTokenDecimals contract. The
+    /// orderbook's `LibTOFUTokenDecimals.ensureDeployed` hardcodes this address and
+    /// checks the codehash, so any test exercising deposits, withdrawals, or order
+    /// takes must place the canonical runtime here.
+    const TOFU_TOKEN_DECIMALS: Address = address!("0x200e12D10bb0c5E4a17e7018f0F1161919bb9389");
+
+    /// Canonical TOFUTokenDecimals init bytecode, copied from
+    /// rain-tofu-erc20-decimals' `LibTOFUTokenDecimals.TOFU_DECIMALS_EXPECTED_CREATION_CODE`.
+    /// Deploying this and etching the resulting runtime at `TOFU_TOKEN_DECIMALS` yields the
+    /// codehash `ensureDeployed` requires; rain.orderbook's own recompile of TOFUTokenDecimals.sol
+    /// does not match that hash, so its artifact bytecode cannot be used directly.
+    const TOFU_DECIMALS_CREATION_CODE: &str = "0x6080604052348015600e575f80fd5b5061044b8061001c5f395ff3fe608060405234801561000f575f80fd5b506004361061004a575f3560e01c80630782d7e11461004e57806354636d2b14610078578063b7bad1b11461009d578063f5c36eaf146100b0575b5f80fd5b61006161005c366004610363565b6100c3565b60405161006f929190610403565b60405180910390f35b61008b610086366004610363565b6100d8565b60405160ff909116815260200161006f565b6100616100ab366004610363565b6100e9565b61008b6100be366004610363565b6100f5565b5f806100cf5f84610100565b91509150915091565b5f6100e35f836101f0565b92915050565b5f806100cf5f84610281565b5f6100e35f83610356565b73ffffffffffffffffffffffffffffffffffffffff81165f9081526020838152604080832081518083019092525460ff8082161515835261010090910416818301527f313ce56700000000000000000000000000000000000000000000000000000000808452839283908190816004818a5afa915060203d1015610182575f91505b811561019857505f5160ff811115610198575f91505b816101af57505050602001516003925090506101e9565b83516101c3575f955093506101e992505050565b836020015160ff1681146101d85760026101db565b60015b846020015195509550505050505b9250929050565b5f805f6101fd8585610281565b909250905060018260038111156102165761021661039d565b1415801561023557505f8260038111156102325761023261039d565b14155b156102795783826040517fee07877f000000000000000000000000000000000000000000000000000000008152600401610270929190610421565b60405180910390fd5b949350505050565b5f805f8061028f8686610100565b90925090505f8260038111156102a7576102a761039d565b0361034b576040805180820182526001815260ff838116602080840191825273ffffffffffffffffffffffffffffffffffffffff8a165f908152908b9052939093209151825493517fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff00009094169015157fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff00ff161761010093909116929092029190911790555b909590945092505050565b5f805f6101fd8585610100565b5f60208284031215610373575f80fd5b813573ffffffffffffffffffffffffffffffffffffffff81168114610396575f80fd5b9392505050565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52602160045260245ffd5b600481106103ff577f4e487b71000000000000000000000000000000000000000000000000000000005f52602160045260245ffd5b9052565b6040810161041182856103ca565b60ff831660208301529392505050565b73ffffffffffffffffffffffffffffffffffffffff831681526040810161039660208301846103ca56";
+
+    /// Deploys the canonical TOFUTokenDecimals init bytecode and etches the resulting
+    /// runtime at [`TOFU_TOKEN_DECIMALS`]. The orderbook checks both the address and
+    /// the codehash, so the runtime must come from executing the canonical creation
+    /// code rather than from a recompiled artifact.
+    async fn deploy_tofu_singleton<P: Provider>(provider: &P) {
+        let creation_code = alloy::hex::decode(TOFU_DECIMALS_CREATION_CODE).unwrap();
+        let deployed = provider
+            .send_transaction(TransactionRequest::default().with_deploy_code(creation_code))
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap()
+            .contract_address
+            .unwrap();
+        let runtime = provider.get_code_at(deployed).await.unwrap();
+        provider
+            .anvil_set_code(TOFU_TOKEN_DECIMALS, runtime)
+            .await
+            .unwrap();
+    }
 
     type BaseProvider = FillProvider<
         JoinFill<

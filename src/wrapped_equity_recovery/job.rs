@@ -452,6 +452,7 @@ mod tests {
     use uuid::Uuid;
 
     use st0x_event_sorcery::test_store;
+    use st0x_raindex::Raindex;
 
     use super::super::aggregate::WrappedEquityRecoveryServices;
     use super::*;
@@ -459,7 +460,6 @@ mod tests {
     use crate::inventory::BroadcastingInventory;
     use crate::inventory::view::InventoryView;
     use crate::onchain::mock::MockRaindex;
-    use crate::onchain::raindex::Raindex;
     use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
     use crate::tokenization::mock::MockTokenizer;
     use crate::vault_lookup::{MockVaultLookup, VaultLookup};

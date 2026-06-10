@@ -212,7 +212,7 @@ st0x-execution.workspace = true
 st0x-finance.workspace = true
 st0x-float-macro.workspace = true
 st0x-float-serde.workspace = true
-st0x-raindex.workspace = true
+st0x-raindex = { workspace = true, features = ["rain"] }
 thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true

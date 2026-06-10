@@ -25,6 +25,7 @@ use uuid::Uuid;
 use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::EvmError;
 use st0x_execution::{FractionalShares, SharesConversionError, Symbol};
+use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
 
 use super::RebalancingService;
 use super::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
@@ -32,7 +33,6 @@ use super::trigger::RecoveryClaim;
 use crate::equity_redemption::{
     DetectionFailure, EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId,
 };
-use crate::onchain::raindex::{Raindex, RaindexError, RaindexVaultId};
 use crate::tokenization::{
     AlpacaTokenizationError, MintVerificationError, TokenizationRequest, TokenizationRequestStatus,
     Tokenizer, TokenizerError,

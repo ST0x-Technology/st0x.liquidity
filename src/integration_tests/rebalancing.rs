@@ -32,6 +32,7 @@ use st0x_execution::{
 };
 use st0x_finance::{Usd, Usdc};
 use st0x_float_macro::float;
+use st0x_raindex::{Raindex, RaindexVaultId};
 
 use super::{ExpectedEvent, assert_events, fetch_events};
 use crate::bindings::{IERC20, TestERC20};
@@ -39,7 +40,6 @@ use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, Redemp
 use crate::inventory::{BroadcastingInventory, ImbalanceThreshold, InventoryView, Venue};
 use crate::offchain::order::OffchainOrderId;
 use crate::onchain::mock::MockRaindex;
-use crate::onchain::raindex::{Raindex, RaindexVaultId};
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::rebalancing::equity::mock::MockCrossVenueEquityTransfer;
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, Equity, EquityTransferServices};
@@ -456,7 +456,7 @@ async fn build_imbalanced_inventory(imbalance: Imbalance<'_>) {
 
 fn build_equity_transfer_with_wrapper(
     pool: &SqlitePool,
-    raindex: Arc<dyn crate::onchain::raindex::Raindex>,
+    raindex: Arc<dyn Raindex>,
     vault_lookup: Arc<dyn VaultLookup>,
     tokenizer: Arc<dyn Tokenizer>,
     mock_wrapper: MockWrapper,
@@ -495,7 +495,7 @@ fn build_equity_transfer_with_wrapper(
 /// lifecycle events flow through the trigger and update inflight state.
 async fn build_equity_transfer_with_service(
     pool: &SqlitePool,
-    raindex: Arc<dyn crate::onchain::raindex::Raindex>,
+    raindex: Arc<dyn Raindex>,
     vault_lookup: Arc<dyn VaultLookup>,
     tokenizer: Arc<dyn Tokenizer>,
     mock_wrapper: MockWrapper,
@@ -1234,10 +1234,10 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
     use st0x_evm::ReadOnlyEvm;
     use st0x_execution::{Inventory as ExecutorInventory, MockExecutor};
     use st0x_finance::Usd;
+    use st0x_raindex::RaindexService;
 
     use crate::inventory::InventoryPollingService;
     use crate::inventory::snapshot::{InventorySnapshotCommand, InventorySnapshotId};
-    use crate::onchain::raindex::RaindexService;
 
     let pool = setup_test_db().await;
 
