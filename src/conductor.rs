@@ -75,6 +75,7 @@ use crate::unwrapped_equity_recovery::{
     UnwrappedEquityRecovery, UnwrappedEquityRecoveryCtx, UnwrappedEquityRecoveryJobQueue,
     UnwrappedEquityRecoveryServices,
 };
+use crate::vault_lookup::{VaultLookup, VaultRegistryLookup};
 use crate::vault_registry::{
     SeedVaultRegistry, SeedVaultRegistryCtx, SeedVaultRegistryJobQueue, VaultRegistry,
     VaultRegistryCommand, VaultRegistryId,
@@ -304,7 +305,7 @@ impl Conductor {
             inventory.clone(),
             event_sender,
             vault_registry.clone(),
-            vault_registry_projection.clone(),
+            vault_registry_projection,
             schedulers.clone(),
         )
         .await?;
@@ -354,7 +355,6 @@ impl Conductor {
             offchain_order,
             offchain_order_projection,
             vault_registry,
-            vault_registry_projection,
             snapshot,
         };
 
@@ -925,10 +925,15 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         const OPERATION_CHANNEL_CAPACITY: usize = 100;
         let (operation_sender, operation_receiver) = mpsc::channel(OPERATION_CHANNEL_CAPACITY);
 
+        let vault_lookup: Arc<dyn VaultLookup> = Arc::new(VaultRegistryLookup::new(
+            deps.vault_registry_projection,
+            deps.ctx.evm.orderbook,
+            market_maker_wallet,
+        ));
+
         let raindex_service = Arc::new(RaindexService::new(
             base_wallet.clone(),
             deps.ctx.evm.orderbook,
-            deps.vault_registry_projection,
             market_maker_wallet,
         ));
 
@@ -950,6 +955,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
 
         let equity_transfer_services = EquityTransferServices {
             raindex: raindex_service.clone(),
+            vault_lookup: vault_lookup.clone(),
             tokenizer: tokenizer.clone(),
             wrapper: wrapper.clone(),
         };
@@ -1004,6 +1010,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
 
         let recovery_transfer = Arc::new(CrossVenueEquityTransfer::new(
             raindex_service.clone(),
+            vault_lookup.clone(),
             tokenizer.clone(),
             wrapper.clone(),
             market_maker_wallet,
@@ -1018,6 +1025,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             StoreBuilder::<WrappedEquityRecovery>::new(deps.pool.clone())
                 .build(WrappedEquityRecoveryServices {
                     raindex: raindex_service.clone(),
+                    vault_lookup: vault_lookup.clone(),
                     wrapper: wrapper.clone(),
                     transfer: recovery_transfer.clone(),
                 })
@@ -1027,6 +1035,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             StoreBuilder::<UnwrappedEquityRecovery>::new(deps.pool.clone())
                 .build(UnwrappedEquityRecoveryServices {
                     raindex: raindex_service.clone(),
+                    vault_lookup: vault_lookup.clone(),
                     wrapper: wrapper.clone(),
                     transfer: recovery_transfer.clone(),
                     wallet: base_wallet.address(),
@@ -1086,6 +1095,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         let spawned = services.spawn(
             market_maker_wallet,
             RaindexVaultId(usdc_vault_id),
+            vault_lookup,
             operation_receiver,
             frameworks,
             equity_in_progress,
@@ -2914,11 +2924,10 @@ mod tests {
                 .await
                 .unwrap();
 
-        let (vault_registry, vault_registry_projection) =
-            StoreBuilder::<VaultRegistry>::new(pool.clone())
-                .build(())
-                .await
-                .unwrap();
+        let (vault_registry, _) = StoreBuilder::<VaultRegistry>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
 
         let snapshot = StoreBuilder::<InventorySnapshot>::new(pool.clone())
             .build(())
@@ -2933,7 +2942,6 @@ mod tests {
                 offchain_order,
                 offchain_order_projection: offchain_order_projection.clone(),
                 vault_registry,
-                vault_registry_projection,
                 snapshot,
             },
             offchain_order_projection,

@@ -1559,10 +1559,10 @@ impl EventSourced for EquityRedemption {
                     wrapped_amount,
                     ..
                 } => {
-                    let vault_id = match services.raindex.lookup_vault_id(*token).await {
+                    let vault_id = match services.vault_lookup.vault_id_for_token(*token).await {
                         Ok(id) => id,
                         Err(error) => {
-                            warn!(target: "rebalance", %error, %token, "Raindex vault lookup failed");
+                            warn!(target: "rebalance", %error, %token, "Vault lookup failed");
                             return Err(EquityRedemptionError::RaindexVaultNotFound(*token));
                         }
                     };
@@ -2207,20 +2207,27 @@ mod tests {
     use std::sync::Arc;
 
     use alloy::consensus::{Receipt, ReceiptEnvelope, ReceiptWithBloom};
-    use alloy::primitives::{Bloom, Bytes, Log as PrimitiveLog, LogData};
+    use alloy::primitives::{B256, Bloom, Bytes, Log as PrimitiveLog, LogData};
     use alloy::rpc::types::Log;
     use st0x_dto::EquityRedemptionStatus;
     use st0x_event_sorcery::{AggregateError, LifecycleError, TestHarness, TestStore, replay};
 
     use super::*;
     use crate::onchain::mock::MockRaindex;
+    use crate::onchain::raindex::RaindexVaultId;
     use crate::tokenization::mock::MockTokenizer;
+    use crate::vault_lookup::MockVaultLookup;
     use crate::wrapper::mock::MockWrapper;
     use st0x_float_macro::float;
+
+    fn mock_vault_lookup() -> MockVaultLookup {
+        MockVaultLookup::new().with_default_vault(RaindexVaultId(B256::ZERO))
+    }
 
     fn mock_services() -> EquityTransferServices {
         EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
         }
@@ -2469,6 +2476,7 @@ mod tests {
 
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new().with_tokenized_shares(underlying_token)),
         };
@@ -2542,6 +2550,7 @@ mod tests {
 
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new().with_withdraw_actual_amount(actual_amount)),
+            vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
         };
@@ -2589,6 +2598,7 @@ mod tests {
 
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new().with_withdraw_actual_amount(actual_amount)),
+            vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
         };
@@ -2647,6 +2657,7 @@ mod tests {
     async fn confirm_withdraw_fails_without_matching_receipt_transfer() {
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new().with_withdraw_actual_amount(U256::ZERO)),
+            vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
         };
@@ -3019,6 +3030,7 @@ mod tests {
     async fn send_tokens_with_failure_emits_transfer_failed() {
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new().with_send_failure()),
             wrapper: Arc::new(MockWrapper::new()),
         };
@@ -3085,6 +3097,7 @@ mod tests {
     async fn send_tokens_without_redemption_wallet_emits_transfer_failed() {
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new().with_no_redemption_wallet()),
             wrapper: Arc::new(MockWrapper::new()),
         };
@@ -3151,6 +3164,7 @@ mod tests {
     async fn unwrap_failure_returns_unwrap_failed_error() {
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::failing_unwrap()),
         };
@@ -3176,6 +3190,7 @@ mod tests {
     async fn underlying_lookup_failure_returns_underlying_lookup_failed_error() {
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::failing_lookup()),
         };

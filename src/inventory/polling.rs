@@ -854,7 +854,7 @@ mod tests {
     use chrono::Utc;
     use httpmock::prelude::*;
     use sqlx::{Row, SqlitePool};
-    use st0x_event_sorcery::{StoreBuilder, test_store};
+    use st0x_event_sorcery::test_store;
     use st0x_evm::ReadOnlyEvm;
     use st0x_execution::{EquityPosition, FractionalShares, Inventory, MockExecutor, Symbol};
     use st0x_finance::Usdc;
@@ -1058,20 +1058,12 @@ mod tests {
         symbols.iter().map(|symbol| test_symbol(symbol)).collect()
     }
 
-    async fn create_test_raindex_service(
-        pool: &SqlitePool,
+    fn create_test_raindex_service(
         provider: impl Provider + Clone + 'static,
     ) -> Arc<RaindexService<ReadOnlyEvm<impl Provider + Clone + 'static>>> {
-        let (_vault_store, vault_registry_projection) =
-            StoreBuilder::<VaultRegistry>::new(pool.clone())
-                .build(())
-                .await
-                .unwrap();
-
         Arc::new(RaindexService::new(
             ReadOnlyEvm::new(provider),
             Address::ZERO,
-            vault_registry_projection,
             Address::ZERO,
         ))
     }
@@ -1080,7 +1072,7 @@ mod tests {
     async fn poll_and_record_emits_offchain_equity_command_with_executor_positions() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let inventory = Inventory {
@@ -1145,7 +1137,7 @@ mod tests {
     async fn poll_and_record_emits_zero_for_configured_position_absent_from_executor() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let inventory = Inventory {
@@ -1203,7 +1195,7 @@ mod tests {
     async fn poll_and_record_ignores_executor_positions_not_in_configured_symbols() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let inventory = Inventory {
@@ -1272,7 +1264,7 @@ mod tests {
     async fn poll_and_record_emits_offchain_usd_command_with_executor_usd_balance() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let inventory = Inventory {
@@ -1322,7 +1314,7 @@ mod tests {
     async fn reserved_cash_subtracted_from_offchain_usd() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let inventory = Inventory {
@@ -1382,7 +1374,7 @@ mod tests {
     async fn reserved_cash_larger_than_balance_sets_available_to_zero() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let inventory = Inventory {
@@ -1442,7 +1434,7 @@ mod tests {
     async fn zero_reserved_cash_passes_through_full_balance() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let inventory = Inventory {
@@ -1499,7 +1491,7 @@ mod tests {
     async fn poll_and_record_emits_empty_positions_when_executor_has_no_positions() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let inventory = Inventory {
@@ -1544,7 +1536,7 @@ mod tests {
     async fn poll_and_record_skips_offchain_commands_when_executor_returns_unimplemented() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let executor = MockExecutor::new();
@@ -1595,7 +1587,7 @@ mod tests {
     async fn negative_usd_balance_errors() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         // Margin account with negative cash (borrowed funds) — even with
@@ -1643,7 +1635,7 @@ mod tests {
     async fn poll_and_record_handles_fractional_share_positions() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let fractional_qty = FractionalShares::new(float!(12.345)); // 12.345 shares
@@ -1696,7 +1688,7 @@ mod tests {
     async fn poll_and_record_uses_correct_aggregate_id() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let orderbook = address!("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
         let order_owner = address!("0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
 
@@ -1801,7 +1793,7 @@ mod tests {
     async fn poll_and_record_skips_onchain_when_vault_registry_not_initialized() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let executor = MockExecutor::new();
@@ -1855,7 +1847,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&ZERO_FLOAT_HEX); // vaultBalance2 for USDC vault
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let raindex_service = create_test_raindex_service(&pool, provider).await;
+        let raindex_service = create_test_raindex_service(provider);
 
         let executor = MockExecutor::new();
 
@@ -1909,7 +1901,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&ZERO_FLOAT_HEX); // vaultBalance2 for equity vault
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let raindex_service = create_test_raindex_service(&pool, provider).await;
+        let raindex_service = create_test_raindex_service(provider);
 
         let executor = MockExecutor::new();
 
@@ -1962,7 +1954,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_failure_msg("RPC failure"); // vaultBalance2 for equity vault
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let raindex_service = create_test_raindex_service(&pool, provider).await;
+        let raindex_service = create_test_raindex_service(provider);
 
         let executor = MockExecutor::new();
 
@@ -2002,7 +1994,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_failure_msg("RPC failure"); // vaultBalance2 for USDC vault
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let raindex_service = create_test_raindex_service(&pool, provider).await;
+        let raindex_service = create_test_raindex_service(provider);
 
         let executor = MockExecutor::new();
 
@@ -2042,7 +2034,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_failure_msg("RPC failure");
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let raindex_service = create_test_raindex_service(&pool, provider).await;
+        let raindex_service = create_test_raindex_service(provider);
         let inventory = Inventory {
             positions: vec![],
             usd_balance_cents: 10_000_000,
@@ -2086,7 +2078,7 @@ mod tests {
     async fn poll_offchain_emits_alpaca_usdc_from_executor_inventory() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
         let snapshot_id = InventorySnapshotId {
             orderbook,
@@ -2130,7 +2122,7 @@ mod tests {
     async fn poll_offchain_skips_alpaca_usdc_when_executor_omits_it() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
         let snapshot_id = InventorySnapshotId {
             orderbook,
@@ -2170,7 +2162,7 @@ mod tests {
     async fn poll_and_record_aborts_tick_when_inflight_poll_fails() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         // Inventory is present, so the offchain group would emit balance
@@ -2254,7 +2246,7 @@ mod tests {
     async fn poll_and_record_emits_ethereum_usdc_when_wallet_provided() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let raw_usdc = U256::from(5_000_000_000u64); // 5000 USDC (6 decimals)
@@ -2302,7 +2294,7 @@ mod tests {
     async fn poll_and_record_emits_base_wallet_usdc_when_wallet_provided() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let raw_usdc = U256::from(5_000_000_000u64); // 5000 USDC (6 decimals)
@@ -2352,7 +2344,7 @@ mod tests {
     async fn poll_and_record_skips_ethereum_usdc_when_no_wallet() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let executor = MockExecutor::new();
@@ -2393,7 +2385,7 @@ mod tests {
     async fn poll_and_record_skips_base_wallet_usdc_when_no_wallet() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let executor = MockExecutor::new();
@@ -2433,7 +2425,7 @@ mod tests {
     async fn poll_wallets_propagates_ethereum_rpc_failure() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let asserter = Asserter::new();
@@ -2472,7 +2464,7 @@ mod tests {
     async fn poll_wallets_propagates_base_wallet_rpc_failure() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let asserter = Asserter::new();
@@ -2511,7 +2503,7 @@ mod tests {
     async fn poll_and_record_continues_to_offchain_after_wallet_failure() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let asserter = Asserter::new();
@@ -2565,7 +2557,7 @@ mod tests {
     async fn poll_and_record_emits_base_wallet_unwrapped_equity_when_wallet_and_tokens_provided() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let token_addr = address!("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
@@ -2631,7 +2623,7 @@ mod tests {
     async fn poll_and_record_skips_base_wallet_unwrapped_equity_when_no_wallet() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let executor = MockExecutor::new();
@@ -2673,7 +2665,7 @@ mod tests {
     async fn poll_wallets_propagates_base_wallet_unwrapped_equity_rpc_failure() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let asserter = Asserter::new();
@@ -2724,7 +2716,7 @@ mod tests {
     async fn poll_wallets_propagates_base_wallet_unwrapped_equity_shares_conversion_failure() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let asserter = Asserter::new();
@@ -2779,7 +2771,7 @@ mod tests {
     async fn poll_and_record_emits_base_wallet_wrapped_equity_when_wallet_and_tokens_provided() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let token_addr = address!("0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
@@ -2844,7 +2836,7 @@ mod tests {
     async fn poll_and_record_emits_base_wallet_wrapped_equity_for_multiple_assets() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let raw_balance = U256::from(42u64) * U256::from(10u64).pow(U256::from(18u64));
@@ -2914,7 +2906,7 @@ mod tests {
     async fn poll_and_record_skips_base_wallet_wrapped_equity_when_no_wallet() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let executor = MockExecutor::new();
@@ -2956,7 +2948,7 @@ mod tests {
     async fn poll_wallets_propagates_base_wallet_wrapped_equity_rpc_failure() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let asserter = Asserter::new();
@@ -3007,7 +2999,7 @@ mod tests {
     async fn poll_and_record_skips_unchanged_base_wallet_wrapped_equity_snapshot() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let raw_balance = U256::from(3u64) * U256::from(10u64).pow(U256::from(18u64));
@@ -3071,7 +3063,7 @@ mod tests {
     async fn poll_and_record_skips_token_snapshots_when_token_addresses_empty() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let executor = MockExecutor::new();
@@ -3196,7 +3188,7 @@ mod tests {
     async fn poll_inflight_equity_emits_mints_and_redemptions() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let tokenizer = Arc::new(
@@ -3256,7 +3248,7 @@ mod tests {
     async fn poll_inflight_equity_aggregates_same_symbol() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let tokenizer = Arc::new(
@@ -3316,7 +3308,7 @@ mod tests {
     async fn poll_inflight_equity_skipped_without_tokenizer() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let executor = MockExecutor::new();
@@ -3352,7 +3344,7 @@ mod tests {
     async fn poll_inflight_equity_emits_empty_snapshot_when_no_requests_pending() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let executor = MockExecutor::new();
@@ -3397,7 +3389,7 @@ mod tests {
     async fn poll_inflight_equity_treats_requests_as_external_without_ownership_source() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let tokenizer = Arc::new(
@@ -3456,7 +3448,7 @@ mod tests {
     async fn poll_inflight_equity_ignores_external_requests_even_for_matching_wallet() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
         let other_wallet = address!("0x9999999999999999999999999999999999999999");
 
@@ -3529,7 +3521,7 @@ mod tests {
     async fn poll_inflight_equity_includes_owned_mint_by_issuer_request_id() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let tokenizer = Arc::new(
@@ -3587,7 +3579,7 @@ mod tests {
     async fn poll_inflight_equity_includes_pending_redemption_intent_before_detection() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let raindex_service = create_test_raindex_service(&pool, provider.clone()).await;
+        let raindex_service = create_test_raindex_service(provider.clone());
         let (orderbook, order_owner) = test_addresses();
         let redemption_tx = TxHash::random();
         let external_tx = TxHash::random();

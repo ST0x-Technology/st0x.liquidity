@@ -471,6 +471,7 @@ mod tests {
     use crate::onchain::raindex::Raindex;
     use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
     use crate::tokenization::mock::MockTokenizer;
+    use crate::vault_lookup::{MockVaultLookup, VaultLookup};
     use crate::wrapper::Wrapper;
     use crate::wrapper::mock::MockWrapper;
 
@@ -484,9 +485,11 @@ mod tests {
         setup_apalis_tables(&pool).await.unwrap();
 
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
+        let vault_lookup: Arc<dyn VaultLookup> = Arc::new(MockVaultLookup::new());
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
         let transfer_services = EquityTransferServices {
             raindex: raindex.clone(),
+            vault_lookup: vault_lookup.clone(),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: wrapper.clone(),
         };
@@ -494,6 +497,7 @@ mod tests {
         let redemption_store = Arc::new(test_store(pool.clone(), transfer_services));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             raindex.clone(),
+            vault_lookup.clone(),
             Arc::new(MockTokenizer::new()),
             wrapper.clone(),
             Address::random(),
@@ -504,6 +508,7 @@ mod tests {
             pool.clone(),
             WrappedEquityRecoveryServices {
                 raindex,
+                vault_lookup,
                 wrapper,
                 transfer,
             },

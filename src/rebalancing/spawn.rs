@@ -27,6 +27,7 @@ use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::tokenization::Tokenizer;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
+use crate::vault_lookup::VaultLookup;
 use crate::wrapper::WrapperService;
 
 /// Errors that can occur when spawning the rebalancer.
@@ -128,12 +129,14 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
         self,
         market_maker_wallet: Address,
         usdc_vault_id: RaindexVaultId,
+        vault_lookup: Arc<dyn VaultLookup>,
         operation_receiver: mpsc::Receiver<TriggeredOperation>,
         frameworks: RebalancingCqrsFrameworks,
         equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
     ) -> SpawnedRebalancer {
         let equity = Arc::new(CrossVenueEquityTransfer::new(
             self.raindex.clone(),
+            vault_lookup,
             self.tokenizer,
             self.wrapper,
             market_maker_wallet,
@@ -195,7 +198,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use uuid::Uuid;
 
-    use st0x_event_sorcery::{StoreBuilder, test_store};
+    use st0x_event_sorcery::test_store;
     use st0x_evm::local::RawPrivateKeyWallet;
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Symbol,
@@ -210,7 +213,7 @@ mod tests {
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::tokenization::alpaca::AlpacaTokenizationService;
     use crate::tokenization::mock::MockTokenizer;
-    use crate::vault_registry::VaultRegistry;
+    use crate::vault_lookup::MockVaultLookup;
     use crate::wrapper::mock::MockWrapper;
     use st0x_config::{AssetsConfig, EquitiesConfig};
     use st0x_float_macro::float;
@@ -358,18 +361,8 @@ mod tests {
 
         let wrapper = Arc::new(WrapperService::new(base_wallet.clone(), HashMap::new()));
 
-        let (_vault_registry_store, vault_registry_projection) =
-            StoreBuilder::<VaultRegistry>::new(crate::test_utils::setup_test_db().await)
-                .build(())
-                .await
-                .unwrap();
         let owner = base_wallet.address();
-        let raindex = Arc::new(RaindexService::new(
-            base_wallet,
-            TEST_ORDERBOOK,
-            vault_registry_projection,
-            owner,
-        ));
+        let raindex = Arc::new(RaindexService::new(base_wallet, TEST_ORDERBOOK, owner));
 
         let services = RebalancerServices {
             broker,
@@ -424,6 +417,7 @@ mod tests {
         let mock_services = EquityTransferServices {
             tokenizer: Arc::new(MockTokenizer::new()),
             raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(MockVaultLookup::new()),
             wrapper: Arc::new(MockWrapper::new()),
         };
         let mint_cqrs = Arc::new(test_store(pool.clone(), mock_services.clone()));
@@ -442,6 +436,7 @@ mod tests {
         let spawned = services.spawn(
             Address::random(),
             RaindexVaultId(B256::ZERO),
+            Arc::new(MockVaultLookup::new()),
             rx,
             frameworks,
             Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),

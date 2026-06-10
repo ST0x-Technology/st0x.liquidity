@@ -41,6 +41,7 @@ use crate::tokenized_equity_mint::{
     IssuerRequestId, TOKENIZED_EQUITY_DECIMALS, TokenizationRequestId, TokenizedEquityMint,
     TokenizedEquityMintCommand,
 };
+use crate::vault_lookup::{VaultLookup, VaultLookupError};
 use crate::wrapper::{UnderlyingPerWrapped, Wrapper, WrapperError};
 
 /// A quantity of equity in a specific symbol.
@@ -181,6 +182,7 @@ async fn load_mint_recheck_context(
 #[derive(Clone)]
 pub(crate) struct EquityTransferServices {
     pub(crate) raindex: Arc<dyn Raindex>,
+    pub(crate) vault_lookup: Arc<dyn VaultLookup>,
     pub(crate) tokenizer: Arc<dyn Tokenizer>,
     pub(crate) wrapper: Arc<dyn Wrapper>,
 }
@@ -195,6 +197,7 @@ impl EquityTransferServices {
     pub(crate) fn panicking() -> Self {
         Self {
             raindex: Arc::new(PanickingRaindex),
+            vault_lookup: Arc::new(PanickingVaultLookup),
             tokenizer: Arc::new(PanickingTokenizer),
             wrapper: Arc::new(PanickingWrapper),
         }
@@ -206,17 +209,6 @@ struct PanickingRaindex;
 
 #[async_trait]
 impl Raindex for PanickingRaindex {
-    async fn lookup_vault_id(&self, _: Address) -> Result<RaindexVaultId, RaindexError> {
-        unimplemented!("PanickingRaindex: not available in CLI context")
-    }
-
-    async fn lookup_vault_info(
-        &self,
-        _: &Symbol,
-    ) -> Result<(Address, RaindexVaultId), RaindexError> {
-        unimplemented!("PanickingRaindex: not available in CLI context")
-    }
-
     async fn withdraw(
         &self,
         _: Address,
@@ -249,6 +241,20 @@ impl Raindex for PanickingRaindex {
 
     async fn confirm_tx_receipt(&self, _: TxHash) -> Result<TransactionReceipt, RaindexError> {
         unimplemented!("PanickingRaindex: not available in CLI context")
+    }
+}
+
+/// Panicking VaultLookup stub for CLI-only use. All methods panic.
+struct PanickingVaultLookup;
+
+#[async_trait]
+impl VaultLookup for PanickingVaultLookup {
+    async fn vault_id_for_token(&self, _: Address) -> Result<RaindexVaultId, VaultLookupError> {
+        unimplemented!("PanickingVaultLookup: not available in CLI context")
+    }
+
+    async fn vault_token_for_symbol(&self, _: &Symbol) -> Result<Address, VaultLookupError> {
+        unimplemented!("PanickingVaultLookup: not available in CLI context")
     }
 }
 
@@ -393,6 +399,8 @@ pub(crate) enum MintError {
     Wrapper(#[from] WrapperError),
     #[error("Raindex error: {0}")]
     Raindex(#[from] RaindexError),
+    #[error("Vault lookup error: {0}")]
+    VaultLookup(#[from] VaultLookupError),
     #[error("Onchain mint verification failed: {0}")]
     Verification(#[from] MintVerificationError),
     #[error(
@@ -474,6 +482,8 @@ pub(crate) enum RedemptionError {
     #[error(transparent)]
     Raindex(#[from] RaindexError),
     #[error(transparent)]
+    VaultLookup(#[from] VaultLookupError),
+    #[error(transparent)]
     Alpaca(#[from] AlpacaTokenizationError),
     #[error(transparent)]
     Tokenizer(#[from] TokenizerError),
@@ -498,6 +508,7 @@ pub(crate) enum RedemptionError {
 /// transfers only through [`CrossVenueTransfer::transfer()`].
 pub(crate) struct CrossVenueEquityTransfer {
     raindex: Arc<dyn Raindex>,
+    vault_lookup: Arc<dyn VaultLookup>,
     tokenizer: Arc<dyn Tokenizer>,
     wrapper: Arc<dyn Wrapper>,
     wallet: Address,
@@ -508,6 +519,7 @@ pub(crate) struct CrossVenueEquityTransfer {
 impl CrossVenueEquityTransfer {
     pub(crate) fn new(
         raindex: Arc<dyn Raindex>,
+        vault_lookup: Arc<dyn VaultLookup>,
         tokenizer: Arc<dyn Tokenizer>,
         wrapper: Arc<dyn Wrapper>,
         wallet: Address,
@@ -516,6 +528,7 @@ impl CrossVenueEquityTransfer {
     ) -> Self {
         Self {
             raindex,
+            vault_lookup,
             tokenizer,
             wrapper,
             wallet,
@@ -600,7 +613,7 @@ impl CrossVenueEquityTransfer {
         wrapped_token: Address,
         wrapped_shares: U256,
     ) -> Result<(), MintError> {
-        let vault_id = self.raindex.lookup_vault_id(wrapped_token).await?;
+        let vault_id = self.vault_lookup.vault_id_for_token(wrapped_token).await?;
 
         let vault_deposit_tx_hash = self
             .raindex
@@ -1503,7 +1516,7 @@ impl CrossVenueTransfer<MarketMakingVenue, HedgingVenue> for CrossVenueEquityTra
     async fn transfer(&self, asset: Self::Asset) -> Result<(), Self::Error> {
         let Equity { symbol, quantity } = asset;
 
-        let (token, _vault_id) = self.raindex.lookup_vault_info(&symbol).await?;
+        let token = self.vault_lookup.vault_token_for_symbol(&symbol).await?;
         let amount = quantity.to_u256_18_decimals()?;
         let aggregate_id = RedemptionAggregateId::new(Uuid::new_v4().to_string());
 
@@ -1529,7 +1542,7 @@ impl CrossVenueTransfer<MarketMakingVenue, HedgingVenue> for CrossVenueEquityTra
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, address};
+    use alloy::primitives::{Address, B256, address};
     use chrono::Utc;
     use sqlx::SqlitePool;
     use std::collections::HashSet;
@@ -1553,12 +1566,21 @@ mod tests {
     use crate::tokenization::mock::{
         MockCompletionOutcome, MockDetectionOutcome, MockTokenizer, MockVerificationOutcome,
     };
+    use crate::vault_lookup::MockVaultLookup;
     use crate::vault_registry::VaultRegistry;
     use crate::wrapper::mock::MockWrapper;
+
+    fn mock_vault_lookup() -> MockVaultLookup {
+        MockVaultLookup::new()
+            .with_symbol_token(Symbol::new("TEST").unwrap(), Address::ZERO)
+            .with_vault(Address::ZERO, RaindexVaultId(B256::ZERO))
+            .with_default_vault(RaindexVaultId(B256::ZERO))
+    }
 
     fn mock_services() -> EquityTransferServices {
         EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
         }
@@ -1729,6 +1751,7 @@ mod tests {
 
         let transfer = CrossVenueEquityTransfer::new(
             Arc::new(MockRaindex::new()),
+            Arc::new(MockVaultLookup::new()),
             tokenizer,
             Arc::new(MockWrapper::new()),
             address!("0x0000000000000000000000000000000000000001"),
@@ -1867,6 +1890,7 @@ mod tests {
 
         let transfer = CrossVenueEquityTransfer::new(
             Arc::new(MockRaindex::new()),
+            Arc::new(MockVaultLookup::new()),
             tokenizer,
             Arc::new(MockWrapper::new()),
             address!("0x0000000000000000000000000000000000000001"),
@@ -1911,9 +1935,11 @@ mod tests {
 
         let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
         let redemption_store = Arc::new(test_store(pool, services));
+        let vault_lookup = mock_vault_lookup();
 
         CrossVenueEquityTransfer::new(
             raindex,
+            Arc::new(vault_lookup),
             tokenizer,
             wrapper,
             Address::random(),
@@ -1991,7 +2017,11 @@ mod tests {
 
         let id = RedemptionAggregateId::new("redemption-resume");
         let symbol = Symbol::new("TEST").unwrap();
-        let (token, _vault_id) = transfer.raindex.lookup_vault_info(&symbol).await.unwrap();
+        let token = transfer
+            .vault_lookup
+            .vault_token_for_symbol(&symbol)
+            .await
+            .unwrap();
         let amount = FractionalShares::new(float!(50))
             .to_u256_18_decimals()
             .unwrap();

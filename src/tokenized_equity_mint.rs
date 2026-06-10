@@ -1963,6 +1963,7 @@ impl EventSourced for TokenizedEquityMint {
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::B256;
     use sqlx::SqlitePool;
     use std::sync::Arc;
 
@@ -1970,15 +1971,22 @@ mod tests {
 
     use super::*;
     use crate::onchain::mock::MockRaindex;
+    use crate::onchain::raindex::RaindexVaultId;
     use crate::tokenization::Tokenizer;
     use crate::tokenization::mock::{MockMintPollOutcome, MockMintRequestOutcome, MockTokenizer};
+    use crate::vault_lookup::MockVaultLookup;
     use crate::wrapper::mock::MockWrapper;
     use st0x_float_macro::float;
+
+    fn mock_vault_lookup() -> MockVaultLookup {
+        MockVaultLookup::new().with_default_vault(RaindexVaultId(B256::ZERO))
+    }
 
     fn mint_services(tokenizer: MockTokenizer) -> EquityTransferServices {
         EquityTransferServices {
             tokenizer: Arc::new(tokenizer),
             raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
             wrapper: Arc::new(MockWrapper::new()),
         }
     }
@@ -2467,6 +2475,7 @@ mod tests {
         let store = TestStore::<TokenizedEquityMint>::new(EquityTransferServices {
             tokenizer: Arc::clone(&tokenizer) as Arc<dyn Tokenizer>,
             raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(mock_vault_lookup()),
             wrapper: Arc::new(MockWrapper::new()),
         });
         let id = IssuerRequestId::new("ISS001");

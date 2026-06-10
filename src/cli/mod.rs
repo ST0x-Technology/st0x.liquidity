@@ -1171,7 +1171,7 @@ async fn run_simple_command<W: Write>(
                 token,
                 vault_id,
             };
-            vault::vault_deposit_command(stdout, deposit, ctx, pool).await
+            vault::vault_deposit_command(stdout, deposit, ctx).await
         }
         SimpleCommand::VaultWithdraw {
             amount,
@@ -1183,10 +1183,10 @@ async fn run_simple_command<W: Write>(
                 token,
                 vault_id,
             };
-            vault::vault_withdraw_command(stdout, withdraw, ctx, pool).await
+            vault::vault_withdraw_command(stdout, withdraw, ctx).await
         }
         SimpleCommand::VaultWithdrawUsdc { amount } => {
-            vault::vault_withdraw_usdc_command(stdout, amount, ctx, pool).await
+            vault::vault_withdraw_usdc_command(stdout, amount, ctx).await
         }
         SimpleCommand::OrderStatus { order_id } => {
             trading::order_status_command(stdout, &order_id, ctx, pool).await

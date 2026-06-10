@@ -1,7 +1,7 @@
 //! Mock implementations for onchain services.
 
 use alloy::consensus::{Receipt, ReceiptEnvelope, ReceiptWithBloom};
-use alloy::primitives::{Address, B256, Bloom, Log as PrimitiveLog, TxHash, U256};
+use alloy::primitives::{Address, Bloom, Log as PrimitiveLog, TxHash, U256};
 use alloy::rpc::types::{Log, TransactionReceipt};
 use alloy::sol_types::SolEvent;
 use alloy::transports::RpcError;
@@ -9,7 +9,6 @@ use async_trait::async_trait;
 use std::sync::Mutex;
 
 use st0x_evm::EvmError;
-use st0x_execution::Symbol;
 
 use super::raindex::{Raindex, RaindexError, RaindexVaultId};
 use crate::bindings::IERC20;
@@ -36,11 +35,8 @@ enum ConfirmTxBehavior {
 }
 
 pub(crate) struct MockRaindex {
-    vault_id: RaindexVaultId,
-    token: Address,
     withdraw_tx: TxHash,
     deposit_tx: TxHash,
-    fail_vault_lookup: bool,
     deposit_behavior: DepositBehavior,
     confirm_behavior: ConfirmTxBehavior,
     deposited_token: Mutex<Option<Address>>,
@@ -100,11 +96,8 @@ fn transfer_log(token: Address, to: Address, amount: U256) -> Log {
 impl MockRaindex {
     pub(crate) fn new() -> Self {
         Self {
-            vault_id: RaindexVaultId(B256::ZERO),
-            token: Address::ZERO,
             withdraw_tx: TxHash::random(),
             deposit_tx: TxHash::random(),
-            fail_vault_lookup: false,
             deposit_behavior: DepositBehavior::Succeed,
             confirm_behavior: ConfirmTxBehavior::Succeed,
             deposited_token: Mutex::new(None),
@@ -151,13 +144,6 @@ impl MockRaindex {
         }
     }
 
-    pub(crate) fn failing_vault_lookup() -> Self {
-        Self {
-            fail_vault_lookup: true,
-            ..Self::new()
-        }
-    }
-
     /// Returns the token address that was passed to the last `deposit()` call.
     pub(crate) fn last_deposited_token(&self) -> Option<Address> {
         *self.deposited_token.lock().unwrap()
@@ -171,11 +157,6 @@ impl MockRaindex {
         *self.confirmed_tx.lock().unwrap()
     }
 
-    pub(crate) fn with_token(mut self, token: Address) -> Self {
-        self.token = token;
-        self
-    }
-
     pub(crate) fn with_withdraw_actual_amount(mut self, amount: U256) -> Self {
         self.withdraw_actual_amount = Some(amount);
         self
@@ -184,21 +165,6 @@ impl MockRaindex {
 
 #[async_trait]
 impl Raindex for MockRaindex {
-    async fn lookup_vault_id(&self, _token: Address) -> Result<RaindexVaultId, RaindexError> {
-        if self.fail_vault_lookup {
-            return Err(RaindexError::VaultNotFound(self.token));
-        }
-
-        Ok(self.vault_id)
-    }
-
-    async fn lookup_vault_info(
-        &self,
-        _symbol: &Symbol,
-    ) -> Result<(Address, RaindexVaultId), RaindexError> {
-        Ok((self.token, self.vault_id))
-    }
-
     async fn withdraw(
         &self,
         _token: Address,
