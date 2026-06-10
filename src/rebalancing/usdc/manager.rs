@@ -1495,13 +1495,108 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                 Ok(())
             }
 
+            // A post-burn BridgingFailed is recoverable: the CCTP burn consumed
+            // the source USDC and the mint may have landed (e.g. a transient
+            // receipt error failed the bridge while receiveMessage succeeded).
+            // Re-check on-chain, un-fail to Bridged, and finish the deposit.
+            Some(UsdcRebalance::BridgingFailed {
+                direction,
+                burn_tx_hash,
+                ..
+            }) => {
+                Self::require_base_to_alpaca(id, &direction)?;
+                self.recover_from_bridging_failed(id, burn_tx_hash).await
+            }
+
             Some(
                 UsdcRebalance::WithdrawalFailed { .. }
-                | UsdcRebalance::BridgingFailed { .. }
                 | UsdcRebalance::DepositFailed { .. }
                 | UsdcRebalance::ConversionFailed { .. },
             ) => Err(UsdcTransferError::PreviouslyFailedAggregate { id: id.clone() }),
         }
+    }
+
+    /// Recover a post-burn `BridgingFailed` whose CCTP mint may have landed:
+    /// re-poll the attestation, idempotently mint (a consumed nonce returns the
+    /// existing receipt rather than re-minting), un-fail to `Bridged` via
+    /// `RecoverBridging`, then drive the deposit leg to terminal so the
+    /// in-progress guard clears through the normal path. A pre-burn failure (no
+    /// burn tx) has no mint to adopt and is left for manual reconciliation.
+    ///
+    /// BaseToAlpaca only (mint lands on Ethereum); an `AlpacaToBase`
+    /// `BridgingFailed` is still surfaced for manual reconciliation.
+    async fn recover_from_bridging_failed(
+        &self,
+        id: &UsdcRebalanceId,
+        burn_tx_hash: Option<TxHash>,
+    ) -> Result<(), UsdcTransferError> {
+        let Some(burn_tx_hash) = burn_tx_hash else {
+            warn!(
+                target: "rebalance",
+                %id,
+                "Pre-burn BridgingFailed has no mint to recover; leaving for \
+                 manual reconciliation"
+            );
+            return Err(UsdcTransferError::PreviouslyFailedAggregate { id: id.clone() });
+        };
+
+        info!(
+            target: "rebalance",
+            %id,
+            %burn_tx_hash,
+            "Recovering post-burn BridgingFailed: re-checking the CCTP mint on-chain"
+        );
+
+        // Poll the bridge directly (not `poll_cctp_attestation`, which fails the
+        // bridge on error) because the aggregate is already terminally failed --
+        // a transient poll/mint error must leave it recoverable for the next
+        // redrive, not re-fail it.
+        let attestation = match self
+            .cctp_bridge
+            .poll_attestation(BridgeDirection::BaseToEthereum, burn_tx_hash)
+            .await
+        {
+            Ok(attestation) => attestation,
+            // Circle has not signed yet. Surface the dedicated timeout error so
+            // the job reschedules on the attestation redrive cadence rather than
+            // the generic backoff, mirroring `poll_cctp_attestation` -- without
+            // failing the (already-terminal) aggregate.
+            Err(CctpError::AttestationTimeout { attempts, source }) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    attempts,
+                    ?source,
+                    "Attestation not yet available during bridge recovery; rescheduling redrive"
+                );
+                return Err(UsdcTransferError::AttestationTimedOut { id: id.clone() });
+            }
+            Err(error) => return Err(UsdcTransferError::Cctp(Box::new(error))),
+        };
+
+        // Idempotent: if the nonce was already consumed, `mint` returns the
+        // existing receipt via `recover_already_minted` instead of re-minting.
+        let mint_receipt = self
+            .cctp_bridge
+            .mint(BridgeDirection::BaseToEthereum, &attestation)
+            .await
+            .map_err(|error| UsdcTransferError::Cctp(Box::new(error)))?;
+
+        let amount_received = u256_to_usdc(mint_receipt.amount)?;
+
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::RecoverBridging {
+                    mint_tx: mint_receipt.tx,
+                    amount_received,
+                    fee_collected: u256_to_usdc(mint_receipt.fee)?,
+                },
+            )
+            .await?;
+
+        self.continue_from_bridged(id, amount_received, mint_receipt.tx)
+            .await
     }
 
     fn require_base_to_alpaca(
@@ -2076,10 +2171,13 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
         //   returns `MintAndWithdrawEventNotFound` with no `usedNonces()` probe,
         //   and there the nonce may already be consumed.
         //
-        // No path is auto-recovered today: a mint that lands (or already landed)
-        // but is unconfirmed here stays a terminal `BridgingFailed` for manual
-        // operator reconciliation. Do not re-probe -- a synchronous re-check
-        // cannot observe a mint that confirms after this decision.
+        // Do not re-probe synchronously here -- a re-check cannot observe a mint
+        // that confirms after this decision, and recovery is deferred, not lost:
+        // a post-burn `BridgingFailed` (carries `burn_tx_hash`) is later un-failed
+        // by `recover_from_bridging_failed` on a resume/redrive, which re-polls the
+        // attestation, idempotently adopts the landed mint, and drives the deposit
+        // leg to terminal. That resume is operator-triggered today (CLI/apalis
+        // redrive); a pre-burn failure has no mint to adopt and stays terminal.
         let mint_receipt = match self
             .cctp_bridge
             .mint(BridgeDirection::BaseToEthereum, &attestation_response)
@@ -4696,21 +4794,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_base_to_alpaca_from_terminal_failure_returns_previously_failed_error() {
+    async fn resume_base_to_alpaca_from_pre_burn_failure_returns_previously_failed_error() {
         let server = MockServer::start();
         let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
 
         let id = UsdcRebalanceId(Uuid::new_v4());
         let amount = usdc("100");
 
-        let burn_tx =
+        let withdraw_tx =
             fixed_bytes!("0xcccc000000000000000000000000000000000000000000000000000000000002");
         cqrs.send(
             &id,
             UsdcRebalanceCommand::Initiate {
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount,
-                withdrawal: TransferRef::OnchainTx(burn_tx),
+                withdrawal: TransferRef::OnchainTx(withdraw_tx),
             },
         )
         .await
@@ -4718,9 +4816,11 @@ mod tests {
         cqrs.send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
             .await
             .unwrap();
-        cqrs.send(&id, UsdcRebalanceCommand::InitiateBridging { burn_tx })
-            .await
-            .unwrap();
+        // Fail BEFORE the burn (no `InitiateBridging`), so the resulting
+        // `BridgingFailed` carries `burn_tx_hash: None`. A pre-burn failure has
+        // no mint to adopt, so resume must still reject it as terminal -- it is
+        // NOT recoverable. (A post-burn `BridgingFailed` IS now recovered, see
+        // `resume_base_to_alpaca_from_bridging_failed_recovers_to_terminal`.)
         cqrs.send(
             &id,
             UsdcRebalanceCommand::FailBridging {
@@ -5532,6 +5632,172 @@ mod tests {
         assert!(
             matches!(final_state, UsdcRebalance::ConversionComplete { .. }),
             "Expected ConversionComplete after adopting the existing mint on resume, \
+             got: {final_state:?}"
+        );
+    }
+
+    /// The un-fail core: a post-burn `BridgingFailed` whose mint actually landed
+    /// is un-failed and driven to terminal on resume. We mint for real, then fail
+    /// the aggregate post-burn, then resume. `recover_from_bridging_failed`
+    /// re-polls, mints idempotently (the consumed nonce returns the existing
+    /// receipt rather than reverting), emits `RecoverBridging`, and finishes the
+    /// deposit leg. Reaching `ConversionComplete` proves the un-fail + adoption +
+    /// terminal drive all happened -- a re-mint would revert on the used nonce and
+    /// re-latch `BridgingFailed`.
+    #[tokio::test]
+    async fn resume_base_to_alpaca_from_bridging_failed_recovers_to_terminal() {
+        let chains = deploy_dual_chain_cctp().await;
+
+        let attestation = CctpAttestationMock::start().await;
+        let _watcher = attestation
+            .start_watcher(
+                ProviderBuilder::new()
+                    .connect(&chains.ethereum_endpoint)
+                    .await
+                    .unwrap(),
+                ProviderBuilder::new()
+                    .connect(&chains.base_endpoint)
+                    .await
+                    .unwrap(),
+                chains.attester_key,
+            )
+            .await
+            .unwrap();
+
+        let cctp_bridge = Arc::new(
+            CctpBridge::try_from_ctx(CctpCtx {
+                usdc_ethereum: USDC_ADDRESS,
+                usdc_base: USDC_ADDRESS,
+                ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
+                base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+                circle_api_base: attestation.base_url(),
+                token_messenger: chains.token_messenger,
+                message_transmitter: chains.message_transmitter,
+            })
+            .unwrap(),
+        );
+
+        // Produce a real on-chain mint so the nonce is already consumed before
+        // recovery runs -- recovery must adopt it, not re-mint.
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
+        let amount = usdc("100");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+        let burn_receipt = cctp_bridge
+            .burn(
+                BridgeDirection::BaseToEthereum,
+                amount_u256,
+                market_maker_wallet,
+            )
+            .await
+            .unwrap();
+        let attestation_response = cctp_bridge
+            .poll_attestation(BridgeDirection::BaseToEthereum, burn_receipt.tx)
+            .await
+            .unwrap();
+        let mint_receipt = cctp_bridge
+            .mint(BridgeDirection::BaseToEthereum, &attestation_response)
+            .await
+            .unwrap();
+
+        let server = MockServer::start();
+        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let pool = crate::test_utils::setup_test_db().await;
+        let (_vault_registry_store, vault_registry_projection) =
+            StoreBuilder::<VaultRegistry>::new(pool)
+                .build(())
+                .await
+                .unwrap();
+        let vault_service = RaindexService::new(
+            create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+            ORDERBOOK_ADDRESS,
+            vault_registry_projection,
+            chains.bot_address,
+        );
+        let cqrs = create_test_store_instance().await;
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::clone(&cctp_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            market_maker_wallet,
+            TEST_VAULT_ID,
+            TEST_ATTESTATION_RETRY_DEADLINE,
+        );
+
+        // Drive to a POST-burn BridgingFailed: InitiateBridging records the burn
+        // tx, then FailBridging preserves it (a transient receipt error failing
+        // the bridge while the mint had in fact landed -- the incident this
+        // recovery path exists to repair).
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount,
+                withdrawal: TransferRef::OnchainTx(burn_receipt.tx),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .await
+            .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::InitiateBridging {
+                burn_tx: burn_receipt.tx,
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::FailBridging {
+                reason: "transient receipt error while the mint actually landed".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Downstream Alpaca legs after the un-fail: deposit detection (by the
+        // adopted mint tx) then the USDC->USD conversion.
+        let _transfers_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([{
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "direction": "INCOMING",
+                    "amount": "100",
+                    "usd_value": "100",
+                    "chain": "ethereum",
+                    "asset": "USDC",
+                    "from_address": "0x0000000000000000000000000000000000000001",
+                    "to_address": "0x1111111111111111111111111111111111111111",
+                    "status": "COMPLETE",
+                    "tx_hash": format!("{:#x}", mint_receipt.tx),
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "network_fee": "0",
+                    "fees": "0"
+                }]));
+        });
+        let _conversion_mock = create_conversion_order_mock(&server, "100");
+        let _get_order_mock = create_get_order_mock(
+            &server,
+            "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "filled",
+            "100",
+        );
+
+        manager.resume_base_to_alpaca(&id, amount).await.unwrap();
+
+        let final_state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(final_state, UsdcRebalance::ConversionComplete { .. }),
+            "Expected ConversionComplete after recovering a post-burn BridgingFailed, \
              got: {final_state:?}"
         );
     }

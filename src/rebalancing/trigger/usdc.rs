@@ -28,7 +28,6 @@ pub(super) enum UsdcRebalanceOperation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UsdcTrackingEvent {
     Initiated,
-    Bridged,
     DepositConfirmed,
     ConversionConfirmed,
 }
@@ -37,7 +36,6 @@ impl std::fmt::Display for UsdcTrackingEvent {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Initiated => write!(formatter, "Initiated"),
-            Self::Bridged => write!(formatter, "Bridged"),
             Self::DepositConfirmed => write!(formatter, "DepositConfirmed"),
             Self::ConversionConfirmed => write!(formatter, "ConversionConfirmed"),
         }
@@ -160,7 +158,7 @@ impl UsdcRebalanceStage {
             WithdrawalConfirmed { .. } => Some(Self::WithdrawalConfirmed),
             BridgingInitiated { .. } => Some(Self::BridgingInitiated),
             BridgeAttestationReceived { .. } => Some(Self::BridgeAttestationReceived),
-            Bridged { .. } => Some(Self::Bridged),
+            Bridged { .. } | BridgingCompletionRecovered { .. } => Some(Self::Bridged),
             DepositInitiated { .. } => Some(Self::DepositInitiated),
             DepositConfirmed { .. } => Some(Self::DepositConfirmed),
             // Transient intent markers: immediately superseded by Initiated /
@@ -195,6 +193,9 @@ impl UsdcRebalanceStage {
                 Some(*attested_at)
             }
             (Self::Bridged, Bridged { minted_at, .. }) => Some(*minted_at),
+            (Self::Bridged, BridgingCompletionRecovered { recovered_at, .. }) => {
+                Some(*recovered_at)
+            }
             (
                 Self::DepositInitiated,
                 DepositInitiated {
@@ -670,7 +671,16 @@ impl RebalancingService {
             }
             Bridged {
                 amount_received, ..
+            }
+            | BridgingCompletionRecovered {
+                amount_received, ..
             } => {
+                // `BridgingCompletionRecovered` un-fails a post-burn
+                // `BridgingFailed` back to `Bridged`: the mint is now confirmed,
+                // so record the bridged amount and advance stage progress just
+                // as a first-time `Bridged` would. The in-progress guard stays
+                // held (recovery is mid-flight) and clears on the terminal
+                // deposit, exactly like the normal bridge path.
                 self.track_bridged_amount(id, *amount_received).await?;
                 self.track_usdc_stage_progress(id, event).await;
             }
@@ -865,11 +875,14 @@ impl RebalancingService {
     ) -> Result<(), RebalancingServiceError> {
         let mut tracking = self.usdc_tracking.write().await;
         let Some(existing) = tracking.get_mut(id) else {
-            warn!(target: "rebalance", id = %id, "Bridged event missing USDC tracking context");
-            return Err(RebalancingServiceError::MissingUsdcTrackingContext {
-                id: id.clone(),
-                event: UsdcTrackingEvent::Bridged,
-            });
+            // Resumed after a restart with no rebuilt tracking (e.g. a post-burn
+            // BridgingFailed recovered via RecoverBridging): there is no in-memory
+            // bridged amount to record, and the terminal success event clears the
+            // guard without reconciliation. Warn and return Ok -- consistent with
+            // complete_usdc_rebalance / complete_alpaca_to_base_deposit -- rather
+            // than wedging the reactor on a MissingUsdcTrackingContext error.
+            warn!(target: "rebalance", id = %id, "Bridged event missing USDC tracking context; skipping bridged-amount tracking (resumed after restart)");
+            return Ok(());
         };
 
         existing.bridged_amount_received = Some(amount_received);

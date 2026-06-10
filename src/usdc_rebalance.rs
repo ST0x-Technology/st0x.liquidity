@@ -33,7 +33,8 @@
 //!
 //! Terminal states:
 //! - WithdrawalFailed
-//! - BridgingFailed
+//! - BridgingFailed (terminal EXCEPT a post-burn failure carrying a burn tx,
+//!   which RecoverBridging un-fails back to Bridged once the mint is confirmed)
 //! - DepositFailed
 //! - DepositConfirmed for AlpacaToBase
 //! - ConversionConfirmed for BaseToAlpaca
@@ -64,7 +65,10 @@
 //! - `BridgingFailed`: Preserves `burn_tx_hash` and `cctp_nonce` when available
 //! - `DepositFailed`: Preserves `deposit_ref` for tracking the failed deposit
 //!
-//! Terminal states reject all commands to prevent invalid state transitions.
+//! Terminal states reject all commands to prevent invalid state transitions,
+//! with one exception: a post-burn `BridgingFailed` (carrying a burn tx) accepts
+//! `RecoverBridging`, which un-fails it back to `Bridged` once the mint that
+//! actually landed is confirmed on-chain.
 //!
 //! [`AlpacaWalletService`]: crate::alpaca_wallet::AlpacaWalletService
 
@@ -267,6 +271,17 @@ pub(crate) enum UsdcRebalanceCommand {
     FailWithdrawal { reason: String },
     /// Record bridging failure. Valid from `Bridging` or `Attested` states.
     FailBridging { reason: String },
+    /// Recover a post-burn `BridgingFailed` whose CCTP mint actually landed
+    /// on-chain (a transient receipt error failed the bridge while the
+    /// `receiveMessage` in fact succeeded). Transitions back to `Bridged` so the
+    /// deposit leg completes and the in-progress guard clears via the normal
+    /// terminal path. Valid ONLY from a `BridgingFailed` carrying a burn tx
+    /// (post-burn). Driven by a resume/recheck of the failed transfer.
+    RecoverBridging {
+        mint_tx: TxHash,
+        amount_received: Usdc,
+        fee_collected: Usdc,
+    },
     /// Record deposit failure. Valid only from `DepositInitiated` state.
     FailDeposit { reason: String },
 }
@@ -377,6 +392,15 @@ pub(crate) enum UsdcRebalanceEvent {
         reason: String,
         failed_at: DateTime<Utc>,
     },
+    /// A post-burn `BridgingFailed` whose CCTP mint was confirmed on-chain after
+    /// the fact. Un-fails the aggregate back to `Bridged` so the deposit leg can
+    /// finish. Mirrors equities' `ProviderCompletionRecovered`.
+    BridgingCompletionRecovered {
+        mint_tx_hash: TxHash,
+        amount_received: Usdc,
+        fee_collected: Usdc,
+        recovered_at: DateTime<Utc>,
+    },
     /// Deposit to destination initiated.
     DepositInitiated {
         deposit_ref: TransferRef,
@@ -414,6 +438,9 @@ impl DomainEvent for UsdcRebalanceEvent {
             Self::AttestationTimedOut { .. } => "UsdcRebalanceEvent::AttestationTimedOut",
             Self::Bridged { .. } => "UsdcRebalanceEvent::Bridged",
             Self::BridgingFailed { .. } => "UsdcRebalanceEvent::BridgingFailed",
+            Self::BridgingCompletionRecovered { .. } => {
+                "UsdcRebalanceEvent::BridgingCompletionRecovered"
+            }
             Self::DepositInitiated { .. } => "UsdcRebalanceEvent::DepositInitiated",
             Self::DepositConfirmed { .. } => "UsdcRebalanceEvent::DepositConfirmed",
             Self::DepositFailed { .. } => "UsdcRebalanceEvent::DepositFailed",
@@ -977,6 +1004,7 @@ pub(crate) async fn interrupted_usdc_rebalance_ids(
                'UsdcRebalanceEvent::AttestationTimedOut', \
                'UsdcRebalanceEvent::Bridged', \
                'UsdcRebalanceEvent::BridgingFailed', \
+               'UsdcRebalanceEvent::BridgingCompletionRecovered', \
                'UsdcRebalanceEvent::DepositInitiated', \
                'UsdcRebalanceEvent::DepositConfirmed', \
                'UsdcRebalanceEvent::DepositFailed' \
@@ -1335,6 +1363,35 @@ impl EventSourced for UsdcRebalance {
                 minted_at: *minted_at,
             },
 
+            // Un-fail a post-burn `BridgingFailed` whose mint landed on-chain.
+            // Only matches when the failed state carries a burn tx (post-burn);
+            // a pre-burn `BridgingFailed` (burn_tx_hash None) has no mint to
+            // adopt and falls through to an invalid transition.
+            (
+                BridgingCompletionRecovered {
+                    mint_tx_hash,
+                    amount_received,
+                    fee_collected,
+                    recovered_at,
+                },
+                Self::BridgingFailed {
+                    direction,
+                    amount,
+                    burn_tx_hash: Some(burn_tx_hash),
+                    initiated_at,
+                    ..
+                },
+            ) => Self::Bridged {
+                direction: direction.clone(),
+                amount: *amount,
+                amount_received: *amount_received,
+                fee_collected: *fee_collected,
+                burn_tx_hash: *burn_tx_hash,
+                mint_tx_hash: *mint_tx_hash,
+                initiated_at: *initiated_at,
+                minted_at: *recovered_at,
+            },
+
             (
                 BridgingFailed {
                     burn_tx_hash,
@@ -1535,6 +1592,8 @@ impl EventSourced for UsdcRebalance {
 
             ConfirmBridging { .. } => Err(UsdcRebalanceError::AttestationNotReceived),
 
+            RecoverBridging { .. } => Err(UsdcRebalanceError::BridgingNotInitiated),
+
             InitiateDeposit { .. } => Err(UsdcRebalanceError::BridgingNotCompleted),
 
             ConfirmDeposit | FailDeposit { .. } => Err(UsdcRebalanceError::DepositNotInitiated),
@@ -1590,6 +1649,11 @@ impl EventSourced for UsdcRebalance {
                 fee_collected,
             } => self.transition_confirm_bridging(mint_tx, amount_received, fee_collected),
             FailBridging { reason } => self.transition_fail_bridging(reason),
+            RecoverBridging {
+                mint_tx,
+                amount_received,
+                fee_collected,
+            } => self.transition_recover_bridging(mint_tx, amount_received, fee_collected),
             InitiateDeposit { deposit } => self.transition_initiate_deposit(deposit),
             ConfirmDeposit => self.transition_confirm_deposit(),
             FailDeposit { reason } => self.transition_fail_deposit(reason),
@@ -2025,6 +2089,44 @@ impl UsdcRebalance {
             | Self::DepositInitiated { .. }
             | Self::DepositConfirmed { .. }
             | Self::DepositFailed { .. } => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
+        }
+    }
+
+    /// Un-fail a post-burn `BridgingFailed` whose CCTP mint is confirmed
+    /// on-chain, transitioning back to `Bridged` so the deposit leg completes.
+    /// Valid only from a `BridgingFailed` carrying a burn tx: a pre-burn failure
+    /// has no mint to adopt and must be re-initiated rather than recovered.
+    fn transition_recover_bridging(
+        &self,
+        mint_tx: TxHash,
+        amount_received: Usdc,
+        fee_collected: Usdc,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::BridgingFailed {
+                burn_tx_hash: Some(_),
+                ..
+            } => Ok(vec![BridgingCompletionRecovered {
+                mint_tx_hash: mint_tx,
+                amount_received,
+                fee_collected,
+                recovered_at: Utc::now(),
+            }]),
+            Self::BridgingFailed {
+                burn_tx_hash: None, ..
+            } => Err(UsdcRebalanceError::InvalidCommand {
+                command: "RecoverBridging".to_string(),
+                state: "BridgingFailed (pre-burn: no mint to recover)".to_string(),
+            }),
+            // Recovery only makes sense for a terminally-failed post-burn
+            // bridge; from any other state there is nothing to un-fail.
+            _ => Err(UsdcRebalanceError::InvalidCommand {
+                command: "RecoverBridging".to_string(),
+                state: "non-failed (RecoverBridging is only valid from a \
+                        post-burn BridgingFailed)"
+                    .to_string(),
+            }),
         }
     }
 
@@ -4522,6 +4624,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recover_bridging_unfails_post_burn_failed_to_bridged() {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let nonce =
+            fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000aa");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        // A post-burn BridgingFailed (carries a burn tx) whose mint in fact
+        // landed: RecoverBridging un-fails it back to Bridged.
+        let history = vec![
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(100.00)),
+                withdrawal_ref: TransferRef::OnchainTx(burn_tx),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::WithdrawalConfirmed {
+                confirmed_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::BridgingInitiated {
+                burn_tx_hash: burn_tx,
+                burned_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::BridgingFailed {
+                burn_tx_hash: Some(burn_tx),
+                cctp_nonce: Some(nonce),
+                reason: "dropped from mempool".to_string(),
+                failed_at: Utc::now(),
+            },
+        ];
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(history.clone())
+            .when(UsdcRebalanceCommand::RecoverBridging {
+                mint_tx,
+                amount_received: Usdc::new(float!(99.99)),
+                fee_collected: Usdc::new(float!(0.01)),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::BridgingCompletionRecovered {
+            mint_tx_hash,
+            amount_received,
+            fee_collected,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected BridgingCompletionRecovered, got {:?}", events[0]);
+        };
+        assert_eq!(*mint_tx_hash, mint_tx);
+        assert_eq!(*amount_received, Usdc::new(float!(99.99)));
+        assert_eq!(*fee_collected, Usdc::new(float!(0.01)));
+
+        // Applying the event must un-fail the aggregate back to Bridged with the
+        // recovered mint adopted -- the apply arm, not just the command handler.
+        let state = replay::<UsdcRebalance>([history, events].concat())
+            .expect("event stream should replay")
+            .expect("event stream should materialize aggregate state");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::Bridged {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    burn_tx_hash: state_burn_tx,
+                    mint_tx_hash: state_mint_tx,
+                    amount_received: state_received,
+                    fee_collected: state_fee,
+                    ..
+                } if state_burn_tx == burn_tx
+                    && state_mint_tx == mint_tx
+                    && state_received == Usdc::new(float!(99.99))
+                    && state_fee == Usdc::new(float!(0.01))
+            ),
+            "recovered aggregate should be Bridged with the adopted mint, got {state:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_bridging_rejects_pre_burn_failed() {
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        // A pre-burn BridgingFailed (no burn tx) has no mint to adopt; recovery
+        // must be rejected -- the transfer should be re-initiated, not un-failed.
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc::new(float!(100.00)),
+                    withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
+                        "0x0000000000000000000000000000000000000000000000000000000000000001"
+                    )),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingFailed {
+                    burn_tx_hash: None,
+                    cctp_nonce: None,
+                    reason: "pre-burn failure".to_string(),
+                    failed_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::RecoverBridging {
+                mint_tx,
+                amount_received: Usdc::new(float!(99.99)),
+                fee_collected: Usdc::new(float!(0.01)),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn recover_bridging_rejects_non_failed_state() {
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        // RecoverBridging is only valid from a post-burn BridgingFailed. From a
+        // non-failed state (here mid-bridge, after the burn) it must be rejected
+        // as an invalid command, never silently adopting a second mint.
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc::new(float!(100.00)),
+                    withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
+                        "0x0000000000000000000000000000000000000000000000000000000000000001"
+                    )),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash: fixed_bytes!(
+                        "0x0000000000000000000000000000000000000000000000000000000000000001"
+                    ),
+                    burned_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::RecoverBridging {
+                mint_tx,
+                amount_received: Usdc::new(float!(99.99)),
+                fee_collected: Usdc::new(float!(0.01)),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn test_deposit_failed_rejects_confirm_deposit() {
         let burn_tx =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
@@ -6087,6 +6353,55 @@ mod tests {
             .await
             .unwrap();
 
+        // Recovered post-burn bridge (latest event BridgingCompletionRecovered,
+        // state Bridged) -- mid-flight after un-fail, holds the guard, must be
+        // included so a crash before the deposit leg reasserts usdc_in_progress.
+        let recovered = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &recovered,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(BURN_TX),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(&recovered, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .await
+            .unwrap();
+        store
+            .send(
+                &recovered,
+                UsdcRebalanceCommand::InitiateBridging { burn_tx: BURN_TX },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &recovered,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "transient receipt error".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &recovered,
+                UsdcRebalanceCommand::RecoverBridging {
+                    mint_tx: fixed_bytes!(
+                        "0x2222222222222222222222222222222222222222222222222222222222222222"
+                    ),
+                    amount_received: Usdc::new(float!(399.99)),
+                    fee_collected: Usdc::new(float!(0.01)),
+                },
+            )
+            .await
+            .unwrap();
+
         // In-progress (mid-withdrawal) -- must be included.
         let withdrawing = UsdcRebalanceId(Uuid::new_v4());
         store
@@ -6106,7 +6421,7 @@ mod tests {
 
         assert_eq!(
             got,
-            HashSet::from([bridge_failed, awaiting_attestation, withdrawing])
+            HashSet::from([bridge_failed, awaiting_attestation, recovered, withdrawing])
         );
         assert!(
             interrupted.unparseable.is_empty(),

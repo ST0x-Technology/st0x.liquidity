@@ -8436,6 +8436,15 @@ mod tests {
         }
     }
 
+    fn make_usdc_bridging_completion_recovered() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::BridgingCompletionRecovered {
+            mint_tx_hash: TxHash::random(),
+            amount_received: Usdc::new(float!(99.99)),
+            fee_collected: Usdc::new(float!(0.01)),
+            recovered_at: Utc::now(),
+        }
+    }
+
     fn make_usdc_pre_burn_bridging_failed() -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::BridgingFailed {
             burn_tx_hash: None,
@@ -8575,23 +8584,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bridged_without_initiated_returns_tracking_error() {
+    async fn recovered_post_burn_bridge_holds_guard_then_clears_on_terminal() {
+        // Recovery lifecycle through the reactor: a post-burn
+        // BridgingFailed is un-failed by BridgingCompletionRecovered (non-terminal
+        // -> guard stays held mid-recovery) and the guard clears only on the
+        // terminal BaseToAlpaca ConversionConfirmed, exactly like the normal
+        // bridge path.
+        let inventory = InventoryView::default().with_usdc(usdc(5000), usdc(5000));
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        // The guard is armed when the rebalance is initiated.
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        // Initiated sets up tracking so the recovery event has bridged-amount
+        // context; the guard stays held (non-terminal).
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(1000)),
+            )
+            .await
+            .unwrap();
+
+        // The recovery event records the bridged amount and must keep the guard
+        // held (it is not a terminal state).
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_bridging_completion_recovered())
+            .await
+            .unwrap();
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "BridgingCompletionRecovered is non-terminal and must hold the guard mid-recovery"
+        );
+
+        // The terminal conversion clears the guard through the normal path.
+        harness
+            .receive::<UsdcRebalance>(
+                id,
+                make_usdc_conversion_confirmed(RebalanceDirection::BaseToAlpaca, usdc(999)),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "terminal ConversionConfirmed must clear the guard after recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn bridged_without_initiated_is_tolerated_and_holds_guard() {
+        // A Bridged event with no in-memory tracking is the post-restart-recovery
+        // shape: the guard was reasserted on startup but `usdc_tracking` was not
+        // rebuilt. `track_bridged_amount` warns and returns Ok (consistent with
+        // the other completion helpers) instead of wedging the reactor, and the
+        // non-terminal event leaves the (pre-armed) in-progress guard held.
         let (trigger, _receiver) = make_trigger_with_inventory(InventoryView::default()).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = UsdcRebalanceId(Uuid::new_v4());
 
-        let error = harness
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        harness
             .receive::<UsdcRebalance>(id.clone(), make_usdc_bridged())
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert!(matches!(
-            error,
-            RebalancingServiceError::MissingUsdcTrackingContext {
-                id: error_id,
-                event: usdc::UsdcTrackingEvent::Bridged,
-            } if error_id == id
-        ));
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "a tolerated non-terminal Bridged event must not clear the guard"
+        );
     }
 
     #[tokio::test]
@@ -9978,6 +10041,11 @@ mod tests {
         ));
         assert!(!RebalancingService::is_terminal_usdc_rebalance_event(
             &make_usdc_bridged()
+        ));
+        // A recovered post-burn bridge re-enters the Bridged stage and must stay
+        // non-terminal so the guard holds until the terminal deposit leg.
+        assert!(!RebalancingService::is_terminal_usdc_rebalance_event(
+            &make_usdc_bridging_completion_recovered()
         ));
     }
 
