@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::EvmError;
-use st0x_execution::{FractionalShares, SharesBlockchain, SharesConversionError, Symbol};
+use st0x_execution::{FractionalShares, SharesConversionError, Symbol};
 
 use super::RebalancingService;
 use super::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};

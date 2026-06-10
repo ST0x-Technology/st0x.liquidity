@@ -31,9 +31,9 @@ use rain_math_float::Float;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::collections::HashMap;
 
-use st0x_execution::SharesBlockchain;
 use st0x_finance::{FractionalShares, Positive, Usd};
 use st0x_float_macro::float;
+use st0x_hedge::ImbalanceThreshold;
 use st0x_hedge::OperationMode;
 use st0x_hedge::bindings::IOrderBookV6;
 use st0x_hedge::cli::seed_mint_at_tokens_wrapped_for_test;
@@ -2339,6 +2339,230 @@ async fn wrapped_equity_in_bot_wallet_recovers_into_raindex() -> anyhow::Result<
     );
     assert_single_clean_aggregate(
         &recovery_events,
+        &["WrappedEquityRecoveryEvent::RecoveryFailed"],
+    );
+
+    bot.abort();
+    Ok(())
+}
+
+/// Orphan recovery for unwrapped equity (tSTOCK) found on the bot wallet.
+///
+/// Mirrors `wrapped_equity_in_bot_wallet_recovers_into_raindex` but for the
+/// unwrapped path: the wallet starts with leftover tSTOCK (unwrapped) from
+/// vault deployment, no in-flight mint or redemption owns it, so the
+/// UnwrappedEquityRecoveryJob takes the orphan path and runs the full
+/// four-step sequence (wrap submit + confirm, then deposit submit + confirm).
+///
+/// Asserts: the bot wallet ends up with zero tSTOCK and zero wtSTOCK (both
+/// drained), the configured Raindex vault is topped up by at least the
+/// originally-unwrapped balance, and the recovery aggregate's event stream
+/// records the full orphan sequence `Detected -> OrphanWrapSubmitted ->
+/// OrphanWrapped -> OrphanDepositSubmitted -> OrphanDeposited`.
+#[test_log::test(tokio::test)]
+#[ignore = "TTDD red state: nothing enqueues UnwrappedEquityRecoveryJob until the rebalancing \
+            reactor trigger lands upstack; feat/unwrapped-equity-recovery-trigger removes this \
+            ignore"]
+async fn unwrapped_equity_in_bot_wallet_recovers_into_raindex() -> anyhow::Result<()> {
+    let onchain_price = float!("150.00");
+    let broker_fill_price = float!("150.00");
+
+    let infra = TestInfra::start(
+        vec![("AAPL", broker_fill_price)],
+        vec![("AAPL", float!("1"))],
+    )
+    .await?;
+
+    let wrapped_token = infra.equity_addresses[0].1;
+    let unwrapped_token = infra.equity_addresses[0].2;
+
+    // Register a Raindex vault for AAPL via setup_order so the bot knows
+    // where to deposit recovered shares. The order is never taken; we only
+    // need the vault ID and the side-effect of leaving tSTOCK in the owner
+    // wallet from deploy_equity_vault.
+    let prepared = infra
+        .base_chain
+        .setup_order()
+        .symbol("AAPL")
+        .amount(float!("1"))
+        .price(onchain_price)
+        .direction(TakeDirection::SellEquity)
+        .call()
+        .await?;
+
+    let owner_unwrapped_balance_before =
+        crate::base_chain::IERC20::new(unwrapped_token, &infra.base_chain.provider)
+            .balanceOf(infra.base_chain.owner)
+            .call()
+            .await?;
+    let owner_wrapped_balance_before =
+        crate::base_chain::IERC20::new(wrapped_token, &infra.base_chain.provider)
+            .balanceOf(infra.base_chain.owner)
+            .call()
+            .await?;
+
+    assert!(
+        owner_unwrapped_balance_before > U256::ZERO,
+        "Test precondition violated: owner wallet should hold tSTOCK after vault deployment",
+    );
+    assert!(
+        owner_wrapped_balance_before > U256::ZERO,
+        "Test precondition violated: owner wallet should hold wtSTOCK after vault deployment",
+    );
+
+    let current_block = infra.base_chain.provider.get_block_number().await?;
+    let cash_vault_id = prepared.input_vault_id;
+    let equity_vault_id = prepared.output_vault_id;
+    let equity_vault_ids = HashMap::from([("AAPL".to_owned(), equity_vault_id)]);
+
+    let orderbook = IOrderBookV6::IOrderBookV6Instance::new(
+        infra.base_chain.orderbook,
+        &infra.base_chain.provider,
+    );
+
+    let vault_balance_before_raw = orderbook
+        .vaultBalance2(infra.base_chain.owner, wrapped_token, equity_vault_id)
+        .call()
+        .await?;
+
+    let ctx = build_rebalancing_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .equity_tokens(&infra.equity_addresses)
+        .equity_vault_ids(&equity_vault_ids)
+        .cash_vault_id(cash_vault_id)
+        .usdc_rebalancing(UsdcRebalancing::Disabled)
+        .cash_rebalancing(OperationMode::Disabled)
+        // Suppress equity rebalancing with an unreachable imbalance deviation so
+        // this test isolates recovery. Equity rebalancing must stay `Enabled`
+        // (the wallet poller only emits the events that dispatch recovery jobs
+        // for rebalancing-enabled symbols), but with it actively transferring,
+        // the wtSTOCK the recovery deposits into the vault creates an imbalance
+        // that fires a Raindex->Alpaca transfer. That transfer holds the per-symbol
+        // `equity_in_progress` guard and starves the wrapped recovery (and
+        // drains the vault the assertions check). A huge deviation keeps the
+        // imbalance check from ever triggering a transfer. The recovery<->
+        // rebalancing interaction itself is a separate integration concern.
+        .equity_imbalance(ImbalanceThreshold::new(float!(0.5), float!(100))?)
+        .wrapped_equity_recovery(OperationMode::Enabled)
+        .redemption_wallet(REDEMPTION_WALLET)
+        .call()?;
+
+    let mut bot = spawn_bot(ctx);
+
+    // The bot wallet holds BOTH unwrapped tSTOCK and pre-existing wtSTOCK for
+    // AAPL, so two recovery jobs are enqueued: the unwrapped recovery (wraps the
+    // tSTOCK and deposits exactly that wrapped amount) and the wrapped recovery
+    // (deposits the pre-existing wtSTOCK). Both claim the same per-symbol
+    // `equity_in_progress` guard, so they run serially -- whichever wins the
+    // guard first runs to completion while the other silently skips, and the
+    // skipped one is only re-dispatched on the next inventory poll once the
+    // guard is free. We must therefore wait for BOTH terminal events before
+    // asserting the wallet is fully drained; waiting only for the unwrapped
+    // terminal races the wrapped recovery, which has not run yet.
+    poll_for_events_with_timeout(
+        &mut bot,
+        &infra.db_path,
+        "UnwrappedEquityRecoveryEvent::OrphanDeposited",
+        1,
+        Duration::from_secs(60),
+    )
+    .await;
+    poll_for_events_with_timeout(
+        &mut bot,
+        &infra.db_path,
+        "WrappedEquityRecoveryEvent::OrphanDeposited",
+        1,
+        Duration::from_secs(60),
+    )
+    .await;
+
+    let owner_unwrapped_balance_after =
+        crate::base_chain::IERC20::new(unwrapped_token, &infra.base_chain.provider)
+            .balanceOf(infra.base_chain.owner)
+            .call()
+            .await?;
+    let owner_wrapped_balance_after =
+        crate::base_chain::IERC20::new(wrapped_token, &infra.base_chain.provider)
+            .balanceOf(infra.base_chain.owner)
+            .call()
+            .await?;
+
+    assert_eq!(
+        owner_unwrapped_balance_after,
+        U256::ZERO,
+        "Recovery should have wrapped every tSTOCK out of the owner wallet \
+         (started with {owner_unwrapped_balance_before}, still holding \
+         {owner_unwrapped_balance_after})",
+    );
+
+    assert_eq!(
+        owner_wrapped_balance_after,
+        U256::ZERO,
+        "Recovery should have deposited every wtSTOCK into the vault, leaving \
+         the owner wallet empty (still holding {owner_wrapped_balance_after})",
+    );
+
+    let vault_balance_after_raw = orderbook
+        .vaultBalance2(infra.base_chain.owner, wrapped_token, equity_vault_id)
+        .call()
+        .await?;
+
+    let (vault_balance_before, _lossless_before) =
+        Float::from_raw(vault_balance_before_raw).to_fixed_decimal_lossy(18)?;
+    let (vault_balance_after, _lossless_after) =
+        Float::from_raw(vault_balance_after_raw).to_fixed_decimal_lossy(18)?;
+    let vault_delta = vault_balance_after.saturating_sub(vault_balance_before);
+
+    // Vault delta must cover BOTH the pre-existing wtSTOCK (which the wrapped
+    // recovery deposits) AND the wtSTOCK produced by wrapping the tSTOCK (which
+    // the unwrapped recovery is responsible for). Asserting the lower bound at
+    // `owner_unwrapped_balance_before` alone would pass even if the unwrapped
+    // path did nothing, because the wrapped path would still deposit the
+    // pre-existing balance.
+    let expected_min_delta = owner_unwrapped_balance_before
+        .checked_add(owner_wrapped_balance_before)
+        .expect("snapshot sum fits in U256");
+    assert!(
+        vault_delta >= expected_min_delta,
+        "Recovery should have deposited at least {expected_min_delta} into the configured \
+         Raindex vault (pre-existing wtSTOCK={owner_wrapped_balance_before} plus the \
+         wrapped equivalent of {owner_unwrapped_balance_before} recovered tSTOCK) \
+         (before={vault_balance_before}, after={vault_balance_after}, delta={vault_delta})",
+    );
+
+    let pool = connect_db(&infra.db_path).await?;
+    let unwrapped_recovery_events = fetch_events_by_type(&pool, "UnwrappedEquityRecovery").await?;
+    let wrapped_recovery_events = fetch_events_by_type(&pool, "WrappedEquityRecovery").await?;
+    pool.close().await;
+
+    assert_event_subsequence(
+        &unwrapped_recovery_events,
+        &[
+            "UnwrappedEquityRecoveryEvent::Detected",
+            "UnwrappedEquityRecoveryEvent::OrphanWrapSubmitted",
+            "UnwrappedEquityRecoveryEvent::OrphanWrapped",
+            "UnwrappedEquityRecoveryEvent::OrphanDepositSubmitted",
+            "UnwrappedEquityRecoveryEvent::OrphanDeposited",
+        ],
+    );
+    assert_single_clean_aggregate(
+        &unwrapped_recovery_events,
+        &["UnwrappedEquityRecoveryEvent::RecoveryFailed"],
+    );
+
+    assert_event_subsequence(
+        &wrapped_recovery_events,
+        &[
+            "WrappedEquityRecoveryEvent::Detected",
+            "WrappedEquityRecoveryEvent::OrphanDepositSubmitted",
+            "WrappedEquityRecoveryEvent::OrphanDeposited",
+        ],
+    );
+    assert_single_clean_aggregate(
+        &wrapped_recovery_events,
         &["WrappedEquityRecoveryEvent::RecoveryFailed"],
     );
 

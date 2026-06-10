@@ -208,6 +208,12 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
     usdc_rebalancing: UsdcRebalancing,
     cash_rebalancing: OperationMode,
     wrapped_equity_recovery: OperationMode,
+    // Equity imbalance threshold. Defaults to the standard (0.5 target, 0.1
+    // deviation). Recovery tests pass a huge deviation to suppress equity
+    // rebalancing transfers (which would churn the wallet/vault and starve a
+    // second recovery) while keeping `rebalancing: Enabled` so the wallet
+    // poller still emits the events that dispatch recovery jobs.
+    equity_imbalance: Option<ImbalanceThreshold>,
     redemption_wallet: Address,
 ) -> anyhow::Result<Ctx> {
     let alpaca_auth = AlpacaBrokerApiCtx {
@@ -243,8 +249,13 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
         TestWallet::new(&chain.owner_key, chain.endpoint().parse()?, 1)?,
     );
 
+    let equity_threshold = match equity_imbalance {
+        Some(threshold) => threshold,
+        None => ImbalanceThreshold::new(float!(0.5), float!(0.1))?,
+    };
+
     let rebalancing_ctx = st0x_hedge::RebalancingCtx::with_wallets()
-        .equity(ImbalanceThreshold::new(float!(0.5), float!(0.1))?)
+        .equity(equity_threshold)
         .usdc(usdc_rebalancing)
         .call();
 

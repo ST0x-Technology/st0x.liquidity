@@ -1,5 +1,6 @@
 //! Fractional share quantity newtype with checked arithmetic.
 
+use alloy_primitives::U256;
 use rain_math_float::{Float, FloatError};
 use serde::Serialize;
 use st0x_float_macro::float;
@@ -68,6 +69,50 @@ impl FractionalShares {
         let frac = self.0.frac()?;
         frac.is_zero()
     }
+
+    /// Converts to U256 with 18 decimal places (standard ERC20 decimals).
+    ///
+    /// Uses lossy conversion because Float's 224-bit coefficient may carry
+    /// more than 18 decimal places of precision, but ERC-20 tokens are 18
+    /// decimals so the extra precision is representational noise.
+    pub fn to_u256_18_decimals(self) -> Result<U256, SharesConversionError> {
+        if self.is_negative()? {
+            return Err(SharesConversionError::NegativeValue(self.0));
+        }
+
+        if self.is_zero()? {
+            return Ok(U256::ZERO);
+        }
+
+        self.0
+            .to_fixed_decimal_lossy(18)
+            .map(|(fixed, _lossless)| fixed)
+            .map_err(SharesConversionError::FloatConversion)
+    }
+
+    /// Creates `FractionalShares` from a U256 value with 18 decimal places.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SharesConversionError`] if the Float conversion fails.
+    pub fn from_u256_18_decimals(value: U256) -> Result<Self, SharesConversionError> {
+        if value.is_zero() {
+            return Ok(Self::ZERO);
+        }
+
+        Float::from_fixed_decimal(value, 18)
+            .map(Self)
+            .map_err(SharesConversionError::FloatConversion)
+    }
+}
+
+/// Errors converting between `FractionalShares` and 18-decimal U256 amounts.
+#[derive(Debug, thiserror::Error)]
+pub enum SharesConversionError {
+    #[error("shares value cannot be negative: {0:?}")]
+    NegativeValue(Float),
+    #[error("Float conversion failed: {0}")]
+    FloatConversion(#[from] FloatError),
 }
 
 impl PartialEq for FractionalShares {
@@ -198,6 +243,59 @@ mod tests {
     #[test]
     fn zero_constant_is_zero() {
         assert!(FractionalShares::ZERO.is_zero().unwrap());
+    }
+
+    #[test]
+    fn to_u256_18_decimals_zero_returns_zero() {
+        let result = FractionalShares::ZERO.to_u256_18_decimals().unwrap();
+        assert_eq!(result, U256::ZERO);
+    }
+
+    #[test]
+    fn to_u256_18_decimals_one_returns_10_pow_18() {
+        let result = FractionalShares::new(float!(1))
+            .to_u256_18_decimals()
+            .unwrap();
+        assert_eq!(result, U256::from_str("1000000000000000000").unwrap());
+    }
+
+    #[test]
+    fn to_u256_18_decimals_fractional_value() {
+        let result = FractionalShares::new(float!(1.5))
+            .to_u256_18_decimals()
+            .unwrap();
+        assert_eq!(result, U256::from_str("1500000000000000000").unwrap());
+    }
+
+    #[test]
+    fn to_u256_18_decimals_negative_returns_error() {
+        let err = FractionalShares::new(float!(-1))
+            .to_u256_18_decimals()
+            .unwrap_err();
+        assert!(
+            matches!(err, SharesConversionError::NegativeValue(_)),
+            "Expected NegativeValue error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_u256_18_decimals_zero_returns_zero() {
+        let result = FractionalShares::from_u256_18_decimals(U256::ZERO).unwrap();
+        assert_eq!(result, FractionalShares::ZERO);
+    }
+
+    #[test]
+    fn from_u256_18_decimals_one_whole_share() {
+        let one_share = U256::from_str("1000000000000000000").unwrap();
+        let result = FractionalShares::from_u256_18_decimals(one_share).unwrap();
+        assert!(result.inner().eq(float!(1)).unwrap());
+    }
+
+    #[test]
+    fn from_u256_18_decimals_fractional_amount() {
+        let one_and_a_half = U256::from_str("1500000000000000000").unwrap();
+        let result = FractionalShares::from_u256_18_decimals(one_and_a_half).unwrap();
+        assert!(result.inner().eq(float!(1.5)).unwrap());
     }
 
     #[test]

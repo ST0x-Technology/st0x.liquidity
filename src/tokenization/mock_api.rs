@@ -26,7 +26,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use st0x_execution::alpaca_broker_api::{AlpacaBrokerMock, TEST_ACCOUNT_ID};
-use st0x_execution::{FractionalShares, SharesBlockchain, Symbol};
+use st0x_execution::{FractionalShares, Symbol};
 use st0x_float_serde::format_float_with_fallback;
 
 use crate::bindings::DeployableERC20;

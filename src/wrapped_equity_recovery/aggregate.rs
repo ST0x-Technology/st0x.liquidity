@@ -40,7 +40,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
-use st0x_execution::{FractionalShares, SharesBlockchain, Symbol};
+use st0x_execution::{FractionalShares, Symbol};
 
 use crate::equity_redemption::RedemptionAggregateId;
 use crate::onchain::raindex::Raindex;

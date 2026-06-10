@@ -35,68 +35,9 @@ pub use order::{
 };
 
 pub use st0x_finance::{
-    EmptySymbolError, FractionalShares, HasZero, NotPositive, Positive, Symbol, ToWholeSharesError,
-    Usd, Usdc,
+    EmptySymbolError, FractionalShares, HasZero, NotPositive, Positive, SharesConversionError,
+    Symbol, ToWholeSharesError, Usd, Usdc,
 };
-
-/// Extension trait for U256 conversions on `FractionalShares`.
-///
-/// These depend on alloy types and therefore live in st0x-execution
-/// rather than the leaf st0x-finance crate.
-pub trait SharesBlockchain {
-    /// Converts to U256 with 18 decimal places (standard ERC20 decimals).
-    ///
-    /// Uses lossy conversion because Float's 224-bit coefficient may carry
-    /// more than 18 decimal places of precision, but ERC-20 tokens are 18
-    /// decimals so the extra precision is representational noise.
-    fn to_u256_18_decimals(self) -> Result<alloy::primitives::U256, SharesConversionError>;
-
-    /// Creates `FractionalShares` from a U256 value with 18 decimal places.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SharesConversionError`] if the Float conversion fails.
-    fn from_u256_18_decimals(
-        value: alloy::primitives::U256,
-    ) -> Result<FractionalShares, SharesConversionError>;
-}
-
-impl SharesBlockchain for FractionalShares {
-    fn to_u256_18_decimals(self) -> Result<alloy::primitives::U256, SharesConversionError> {
-        if self.is_negative()? {
-            return Err(SharesConversionError::NegativeValue(self.inner()));
-        }
-
-        if self.is_zero()? {
-            return Ok(alloy::primitives::U256::ZERO);
-        }
-
-        self.inner()
-            .to_fixed_decimal_lossy(18)
-            .map(|(fixed, _lossless)| fixed)
-            .map_err(SharesConversionError::FloatConversion)
-    }
-
-    fn from_u256_18_decimals(
-        value: alloy::primitives::U256,
-    ) -> Result<FractionalShares, SharesConversionError> {
-        if value.is_zero() {
-            return Ok(Self::ZERO);
-        }
-
-        Float::from_fixed_decimal(value, 18)
-            .map(Self::new)
-            .map_err(SharesConversionError::FloatConversion)
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum SharesConversionError {
-    #[error("shares value cannot be negative: {0:?}")]
-    NegativeValue(Float),
-    #[error("Float conversion failed: {0}")]
-    FloatConversion(#[from] FloatError),
-}
 
 /// Alpaca supports a maximum of 9 decimal places for order quantities.
 pub(crate) const ALPACA_MAX_DECIMAL_PLACES: u8 = 9;
@@ -580,8 +521,6 @@ impl Display for ExecutorOrderId {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::U256;
-    use std::str::FromStr;
     use uuid::Uuid;
 
     use super::*;
@@ -666,39 +605,6 @@ mod tests {
     }
 
     #[test]
-    fn to_u256_18_decimals_zero_returns_zero() {
-        let result = FractionalShares::ZERO.to_u256_18_decimals().unwrap();
-        assert_eq!(result, U256::ZERO);
-    }
-
-    #[test]
-    fn to_u256_18_decimals_one_returns_10_pow_18() {
-        let result = FractionalShares::new(float!(1))
-            .to_u256_18_decimals()
-            .unwrap();
-        assert_eq!(result, U256::from_str("1000000000000000000").unwrap());
-    }
-
-    #[test]
-    fn to_u256_18_decimals_fractional_value() {
-        let result = FractionalShares::new(float!(1.5))
-            .to_u256_18_decimals()
-            .unwrap();
-        assert_eq!(result, U256::from_str("1500000000000000000").unwrap());
-    }
-
-    #[test]
-    fn to_u256_18_decimals_negative_returns_error() {
-        let err = FractionalShares::new(float!(-1))
-            .to_u256_18_decimals()
-            .unwrap_err();
-        assert!(
-            matches!(err, SharesConversionError::NegativeValue(_)),
-            "Expected NegativeValue error, got: {err:?}"
-        );
-    }
-
-    #[test]
     fn test_symbol_new_valid() {
         let symbol = Symbol::new("AAPL").unwrap();
         assert_eq!(symbol.to_string(), "AAPL");
@@ -747,26 +653,6 @@ mod tests {
     fn test_shares_new_one() {
         let shares = Shares::new(1).unwrap();
         assert_eq!(shares.to_string(), "1");
-    }
-
-    #[test]
-    fn from_u256_18_decimals_zero_returns_zero() {
-        let result = FractionalShares::from_u256_18_decimals(U256::ZERO).unwrap();
-        assert_eq!(result, FractionalShares::ZERO);
-    }
-
-    #[test]
-    fn from_u256_18_decimals_one_whole_share() {
-        let one_share = U256::from_str("1000000000000000000").unwrap();
-        let result = FractionalShares::from_u256_18_decimals(one_share).unwrap();
-        assert!(result.inner().eq(float!(1)).unwrap());
-    }
-
-    #[test]
-    fn from_u256_18_decimals_fractional_amount() {
-        let one_and_a_half = U256::from_str("1500000000000000000").unwrap();
-        let result = FractionalShares::from_u256_18_decimals(one_and_a_half).unwrap();
-        assert!(result.inner().eq(float!(1.5)).unwrap());
     }
 
     #[test]

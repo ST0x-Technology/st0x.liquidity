@@ -4,7 +4,7 @@ use alloy::primitives::Address;
 use std::io::Write;
 
 use st0x_config::Ctx;
-use st0x_execution::{FractionalShares, Positive, SharesBlockchain, Symbol};
+use st0x_execution::{FractionalShares, Positive, Symbol};
 
 use crate::wrapper::{Wrapper, WrapperService};
 

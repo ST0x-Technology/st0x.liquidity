@@ -18,9 +18,7 @@ use tracing::{debug, warn};
 
 use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::{Evm, EvmError, OpenChainErrorRegistry, Wallet};
-use st0x_execution::{
-    Executor, FractionalShares, InventoryResult, SharesBlockchain, SharesConversionError, Symbol,
-};
+use st0x_execution::{Executor, FractionalShares, InventoryResult, SharesConversionError, Symbol};
 use st0x_finance::{HasZero, Usd, UsdToCentsError};
 
 use crate::bindings::IERC20;

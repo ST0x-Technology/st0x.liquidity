@@ -17,7 +17,7 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use st0x_dto::TradingVenue;
-use st0x_execution::{FractionalShares, SharesBlockchain};
+use st0x_execution::FractionalShares;
 
 use crate::AppState;
 use crate::dashboard::transfer_loader::{InvalidTransferKind, TransferKind};

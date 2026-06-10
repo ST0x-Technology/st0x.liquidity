@@ -20,7 +20,7 @@ use st0x_config::{AssetsConfig, OperationMode};
 use st0x_event_sorcery::{
     AggregateError, EntityList, LifecycleError, Projection, ProjectionError, Reactor, Store, deps,
 };
-use st0x_execution::{FractionalShares, Positive, SharesBlockchain, SharesConversionError, Symbol};
+use st0x_execution::{FractionalShares, Positive, SharesConversionError, Symbol};
 use st0x_finance::{HasZero, Usd, Usdc};
 
 use self::usdc::UsdcRebalanceOperation;

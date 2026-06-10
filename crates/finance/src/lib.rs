@@ -17,7 +17,7 @@ mod usd;
 mod usdc;
 
 pub use id::{BlankIdError, Id};
-pub use shares::FractionalShares;
+pub use shares::{FractionalShares, SharesConversionError};
 pub use symbol::{EmptySymbolError, Symbol};
 pub use usd::{Usd, UsdToCentsError};
 pub use usdc::{Usdc, UsdcConversionError};

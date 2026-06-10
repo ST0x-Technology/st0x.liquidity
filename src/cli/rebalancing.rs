@@ -14,8 +14,8 @@ use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 use st0x_event_sorcery::StoreBuilder;
 use st0x_evm::{Evm, OpenChainErrorRegistry, ReadOnlyEvm};
 use st0x_execution::{
-    AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Executor, FractionalShares,
-    SharesBlockchain, Symbol, TimeInForce,
+    AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Executor, FractionalShares, Symbol,
+    TimeInForce,
 };
 use st0x_finance::Usdc;
 
