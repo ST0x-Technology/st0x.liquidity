@@ -904,6 +904,16 @@ impl UsdcRebalance {
     /// and a lost job latches the guard indefinitely.
     pub(crate) fn resumable_post_burn_transfer(&self) -> Option<(RebalanceDirection, Usdc)> {
         match self {
+            // The post-burn, pre-mint-confirmation states a job must keep
+            // driving, PLUS a post-burn `BridgingFailed`, which is recoverable
+            // (RAI-909): the BaseToAlpaca resume path re-checks the mint
+            // on-chain, un-fails the aggregate, and finishes the deposit. Re-arm
+            // it on startup so a transfer stranded by a transient mint-receipt
+            // error (the RAI-903 incident) self-heals without operator action
+            // (RAI-906). The `BridgingFailed` arm is scoped to BaseToAlpaca with
+            // a burn tx: a pre-burn failure (`burn_tx_hash` `None`) has no mint
+            // to adopt, and the AlpacaToBase recovery path is not yet
+            // implemented -- both are left for manual reconciliation.
             Self::Bridging {
                 direction, amount, ..
             }
@@ -912,6 +922,12 @@ impl UsdcRebalance {
             }
             | Self::Attested {
                 direction, amount, ..
+            }
+            | Self::BridgingFailed {
+                direction: direction @ RebalanceDirection::BaseToAlpaca,
+                amount,
+                burn_tx_hash: Some(_),
+                ..
             } => Some((direction.clone(), *amount)),
             _ => None,
         }
@@ -3318,6 +3334,56 @@ mod tests {
             submitting.resumable_post_burn_transfer(),
             None,
             "BridgingSubmitting is pre-burn and must NOT be re-armed (double-burn risk)",
+        );
+
+        // A post-burn BaseToAlpaca BridgingFailed is recoverable (RAI-906): the
+        // resume path re-checks the mint and un-fails it, so it must be re-armed.
+        let post_burn_failed = UsdcRebalance::BridgingFailed {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount,
+            burn_tx_hash: Some(burn_tx),
+            cctp_nonce: Some(TEST_CCTP_NONCE),
+            reason: "dropped from mempool".to_string(),
+            initiated_at: now,
+            failed_at: now,
+        };
+        assert_eq!(
+            post_burn_failed.resumable_post_burn_transfer(),
+            Some((RebalanceDirection::BaseToAlpaca, amount)),
+            "post-burn BaseToAlpaca BridgingFailed is recoverable and must be re-armed",
+        );
+
+        // A pre-burn failure has no mint to adopt -- not re-armable.
+        let pre_burn_failed = UsdcRebalance::BridgingFailed {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount,
+            burn_tx_hash: None,
+            cctp_nonce: None,
+            reason: "pre-burn failure".to_string(),
+            initiated_at: now,
+            failed_at: now,
+        };
+        assert_eq!(
+            pre_burn_failed.resumable_post_burn_transfer(),
+            None,
+            "pre-burn BridgingFailed has no mint to recover and must NOT be re-armed",
+        );
+
+        // AlpacaToBase recovery is not yet implemented -- left for manual
+        // reconciliation rather than auto-re-armed into an unsupported path.
+        let alpaca_to_base_failed = UsdcRebalance::BridgingFailed {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount,
+            burn_tx_hash: Some(burn_tx),
+            cctp_nonce: Some(TEST_CCTP_NONCE),
+            reason: "dropped from mempool".to_string(),
+            initiated_at: now,
+            failed_at: now,
+        };
+        assert_eq!(
+            alpaca_to_base_failed.resumable_post_burn_transfer(),
+            None,
+            "AlpacaToBase BridgingFailed recovery is unimplemented and must NOT be re-armed",
         );
     }
 
