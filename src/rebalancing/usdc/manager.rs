@@ -5761,6 +5761,13 @@ mod tests {
         .await
         .unwrap();
 
+        // Sanity: the aggregate is terminally failed before recovery.
+        let failed_state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(failed_state, UsdcRebalance::BridgingFailed { .. }),
+            "expected BridgingFailed before recovery, got: {failed_state:?}"
+        );
+
         // Downstream Alpaca legs after the un-fail: deposit detection (by the
         // adopted mint tx) then the USDC->USD conversion.
         let _transfers_mock = server.mock(|when, then| {
@@ -5792,6 +5799,7 @@ mod tests {
             "100",
         );
 
+        // Resume the terminally-failed transfer: it must recover, not stay failed.
         manager.resume_base_to_alpaca(&id, amount).await.unwrap();
 
         let final_state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
