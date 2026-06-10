@@ -2060,6 +2060,26 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
         id: &UsdcRebalanceId,
         attestation_response: AttestationResponse,
     ) -> Result<MintReceipt, UsdcTransferError> {
+        // This `Err` arm records a durable, terminal `FailBridging`. What it
+        // implies about the CCTP nonce depends on which `mint()` error landed:
+        //
+        // - A `receiveMessage` SUBMISSION error (e.g. a dropped/timed-out
+        //   receipt on a load-balanced RPC) is routed through
+        //   `recover_already_minted`, which probes `usedNonces()` and returns
+        //   the real receipt if the mint landed. Reaching this arm that way
+        //   means recovery found no receipt: the nonce read UNUSED, or the probe
+        //   was inconclusive (the `usedNonces()` read or log scan failed, or the
+        //   receipt could not be reconstructed). Both re-surface the submit
+        //   error, so "definitely unused" and "unknown" are indistinguishable.
+        // - Other `mint()` errors skip recovery entirely: notably a SUCCESSFUL
+        //   `receiveMessage` whose receipt lacks the `MintAndWithdraw` event
+        //   returns `MintAndWithdrawEventNotFound` with no `usedNonces()` probe,
+        //   and there the nonce may already be consumed.
+        //
+        // No path is auto-recovered today: a mint that lands (or already landed)
+        // but is unconfirmed here stays a terminal `BridgingFailed` for manual
+        // operator reconciliation. Do not re-probe -- a synchronous re-check
+        // cannot observe a mint that confirms after this decision.
         let mint_receipt = match self
             .cctp_bridge
             .mint(BridgeDirection::BaseToEthereum, &attestation_response)
