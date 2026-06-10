@@ -362,6 +362,17 @@
                 '';
               };
 
+              "pr-template" = pkgs.writeShellApplication {
+                name = "pr-template";
+                runtimeInputs = [
+                  pkgs.gh
+                  pkgs.nushell
+                ];
+                text = ''
+                  exec nu ${./scripts/pr-template.nu} "$@"
+                '';
+              };
+
               bootstrap = pkgs.writeShellApplication {
                 name = "bootstrap-nixos";
                 runtimeInputs = infraPkgs.buildInputs ++ [
