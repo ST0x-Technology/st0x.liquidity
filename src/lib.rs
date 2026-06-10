@@ -61,6 +61,7 @@ pub use tokenization::mock_api;
 mod tokenized_equity_mint;
 mod unwrapped_equity_recovery;
 mod usdc_rebalance;
+mod vault_lookup;
 mod vault_registry;
 mod wrapped_equity_recovery;
 mod wrapper;
