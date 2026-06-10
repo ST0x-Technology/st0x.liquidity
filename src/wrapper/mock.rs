@@ -1,10 +1,12 @@
 //! Mock implementation of the Wrapper trait for testing.
 
 use alloy::primitives::{Address, TxHash, U256};
+use alloy::transports::RpcError;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use st0x_evm::EvmError;
 use st0x_execution::Symbol;
 
 use super::{RATIO_ONE, UnderlyingPerWrapped, Wrapper, WrapperError};
@@ -15,6 +17,8 @@ enum MockFailure {
     #[default]
     None,
     Wrap,
+    ConfirmWrap,
+    RetryableConfirmWrap,
     Unwrap,
     Lookup,
     DerivativeLookup,
@@ -89,6 +93,23 @@ impl MockWrapper {
     pub(crate) fn failing_lookup() -> Self {
         let mut mock = Self::new();
         mock.failure = MockFailure::Lookup;
+        mock
+    }
+
+    /// Creates a mock wrapper that submits wraps successfully but fails on
+    /// `confirm_wrap`, simulating a receipt that never surfaces the deposit
+    /// event.
+    pub(crate) fn failing_confirm_wrap() -> Self {
+        let mut mock = Self::new();
+        mock.failure = MockFailure::ConfirmWrap;
+        mock
+    }
+
+    /// Creates a mock wrapper that fails `confirm_wrap` with a retryable RPC
+    /// error rather than a confirmed missing-event receipt.
+    pub(crate) fn retryable_confirm_wrap() -> Self {
+        let mut mock = Self::new();
+        mock.failure = MockFailure::RetryableConfirmWrap;
         mock
     }
 
@@ -183,6 +204,19 @@ impl Wrapper for MockWrapper {
         _wrapped_token: Address,
         tx_hash: TxHash,
     ) -> Result<U256, WrapperError> {
+        if self.failure == MockFailure::ConfirmWrap {
+            return Err(WrapperError::MissingDepositEvent);
+        }
+        if self.failure == MockFailure::RetryableConfirmWrap {
+            return Err(WrapperError::Evm(EvmError::Transport(RpcError::ErrorResp(
+                alloy::rpc::json_rpc::ErrorPayload {
+                    code: -32000,
+                    message: "temporary RPC failure".into(),
+                    data: None,
+                },
+            ))));
+        }
+
         // 1:1 ratio — return the amount that was submitted for this tx
         let amount = self
             .submitted_amounts
