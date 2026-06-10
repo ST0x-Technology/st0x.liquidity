@@ -6883,6 +6883,7 @@ dependencies = [
  "st0x-float-macro",
  "st0x-float-serde",
  "st0x-hedge",
+ "st0x-raindex",
  "task-supervisor",
  "temp-env",
  "tempfile",
@@ -6903,6 +6904,17 @@ dependencies = [
  "urlencoding",
  "uuid",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "st0x-raindex"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "async-trait",
+ "rain-math-float",
+ "st0x-evm",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

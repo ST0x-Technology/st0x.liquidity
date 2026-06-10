@@ -185,6 +185,32 @@ pub enum EvmError {
 }
 
 impl EvmError {
+    /// `true` if this reports a transaction dropped from the mempool (it will
+    /// never mine) -- a terminal failure, distinct from a still-pending tx that
+    /// merely has not confirmed yet. Only the wallet builds (`turnkey` /
+    /// `local-signer`), which run the confirm loop, can produce it.
+    pub fn is_transaction_dropped(&self) -> bool {
+        match self {
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::TransactionDropped { .. } => true,
+            Self::Transaction(_)
+            | Self::Transport(_)
+            | Self::Contract(_)
+            | Self::AbiDecode(_)
+            | Self::DecodedRevert(_)
+            | Self::Reverted { .. }
+            | Self::WalletConfigParse(_) => false,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::ReceiptTimeout { .. } => false,
+            #[cfg(feature = "local-signer")]
+            Self::InvalidPrivateKey(_) => false,
+            #[cfg(feature = "turnkey")]
+            Self::Turnkey(_) => false,
+        }
+    }
+}
+
+impl EvmError {
     /// Returns `true` if this is a "nonce too low" RPC error, which
     /// occurs when an external process (e.g. CLI) submitted
     /// transactions from the same wallet, advancing the chain nonce
