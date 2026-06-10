@@ -1,7 +1,8 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   buildPnlResponseFromSqlRows,
   buildSqlApiUrl,
+  fetchPnlReportFromSql,
   type SqlPositionEventRow,
   type SqlPositionViewRow,
   type SqlSampleStatsRow
@@ -90,6 +91,22 @@ const offchainBuy = (
   }
 })
 
+const response = (body: unknown): Response =>
+  ({
+    ok: true,
+    json: () => Promise.resolve(body)
+  }) as Response
+
+const fetchInputUrl = (input: RequestInfo | URL): URL => {
+  if (input instanceof URL) return input
+  if (typeof input === 'string') return new URL(input)
+  return new URL(input.url)
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
+
 describe('buildSqlApiUrl', () => {
   it('uses the Datasette SQL JSON shape expected by the prod read endpoint', () => {
     const url = buildSqlApiUrl(
@@ -98,7 +115,7 @@ describe('buildSqlApiUrl', () => {
     )
 
     expect(url).toBe(
-      'http://host:8081/st0x-hedge.json?sql=SELECT+symbol%2C+net_position+FROM+position_view&_shape=objects&_size=max'
+      'http://host:8081/st0x-hedge.json?sql=SELECT+*+FROM+%28SELECT+symbol%2C+net_position+FROM+position_view%29+LIMIT+900+OFFSET+0&_shape=objects&_size=max'
     )
   })
 
@@ -112,7 +129,7 @@ describe('buildSqlApiUrl', () => {
       })
 
       expect(buildSqlApiUrl('/__pnl_sql', 'SELECT 1')).toBe(
-        'http://localhost:5174/__pnl_sql?sql=SELECT+1&_shape=objects&_size=max'
+        'http://localhost:5174/__pnl_sql?sql=SELECT+*+FROM+%28SELECT+1%29+LIMIT+900+OFFSET+0&_shape=objects&_size=max'
       )
     } finally {
       Object.defineProperty(globalThis, 'location', {
@@ -121,6 +138,58 @@ describe('buildSqlApiUrl', () => {
         configurable: true
       })
     }
+  })
+})
+
+describe('fetchPnlReportFromSql', () => {
+  it('paginates Datasette SQL reads instead of rendering a capped prefix', async () => {
+    const firstEventPage = Array.from({ length: 900 }, (_, index) => onchainSell(index + 1))
+    const secondEventPage = [
+      onchainSell(901),
+      offchainBuy(902, '2026-05-15T10:01:00Z', '8')
+    ]
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = fetchInputUrl(input)
+      const sql = url.searchParams.get('sql') ?? ''
+
+      if (sql.includes('FROM position_view')) {
+        return Promise.resolve(response({ rows: positionRows, truncated: false }))
+      }
+
+      if (sql.includes('GROUP BY aggregate_id')) {
+        return Promise.resolve(response({ rows: sampleRows, truncated: false }))
+      }
+
+      if (sql.includes('OFFSET 900')) {
+        return Promise.resolve(response({ rows: secondEventPage, truncated: false }))
+      }
+
+      if (sql.includes('OFFSET 0')) {
+        return Promise.resolve(response({ rows: firstEventPage, truncated: false }))
+      }
+
+      return Promise.resolve(response({ rows: [], truncated: false }))
+    })
+
+    vi.stubGlobal('fetch', fetchMock)
+
+    const report = await fetchPnlReportFromSql('http://host:8081/st0x-hedge.json', baseQuery)
+    const requestedSql = fetchMock.mock.calls.map(([input]) =>
+      fetchInputUrl(input).searchParams.get('sql')
+    )
+
+    expect(requestedSql.some((sql) => (sql ?? '').includes('OFFSET 900'))).toBe(true)
+    expect(report.summary.counterTradePnlUsd).toBe('2')
+    expect(report.summary.openShortShares).toBe('900')
+    expect(report.entries).toHaveLength(1)
+    expect(report.entries[0]).toEqual(
+      expect.objectContaining({
+        openingRowid: 1,
+        closingRowid: 902,
+        pnlBucket: 'counter_trade',
+        realizedPnlUsd: '2'
+      })
+    )
   })
 })
 
