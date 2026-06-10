@@ -71,6 +71,10 @@ use crate::tokenization::alpaca::AlpacaTokenizationService;
 use crate::tokenized_equity_mint::{TokenizedEquityMint, interrupted_mint_ids};
 use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::trade_accountant::{DexTradeAccountingJobQueue, TradeAccountingError};
+use crate::unwrapped_equity_recovery::{
+    UnwrappedEquityRecovery, UnwrappedEquityRecoveryCtx, UnwrappedEquityRecoveryJobQueue,
+    UnwrappedEquityRecoveryServices,
+};
 use crate::vault_registry::{
     SeedVaultRegistry, SeedVaultRegistryCtx, SeedVaultRegistryJobQueue, VaultRegistry,
     VaultRegistryCommand, VaultRegistryId,
@@ -167,6 +171,32 @@ where
     Ok(())
 }
 
+/// Resets recovery queue rows that were left in-flight by a previous process.
+/// Recovery jobs are durable and crash-resumable, but only if the apalis row is
+/// made runnable again before the deterministic worker id starts heartbeating.
+async fn requeue_recovery_orphans<Task>(
+    queue: &job::JobQueue<Task>,
+    recovery_label: &str,
+) -> anyhow::Result<()>
+where
+    Task: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + Unpin + 'static,
+{
+    let count = queue.requeue_orphaned().await.with_context(|| {
+        format!("failed to re-queue orphaned {recovery_label} recovery jobs at startup")
+    })?;
+
+    if count > 0 {
+        info!(
+            target: "rebalance",
+            count,
+            recovery = recovery_label,
+            "Re-queued orphaned recovery job(s) for crash-safe resume",
+        );
+    }
+
+    Ok(())
+}
+
 impl Conductor {
     pub(crate) async fn run<E>(
         executor_ctx: impl TryIntoExecutor<Executor = E>,
@@ -245,6 +275,7 @@ impl Conductor {
             service: rebalancing_service,
             recovery_transfer,
             wrapped_equity_recovery_store,
+            unwrapped_equity_recovery_store,
             mint_store,
             redemption_store,
             transfer_usdc_to_hedging_ctx,
@@ -332,12 +363,13 @@ impl Conductor {
         let rejection_queue = HandleOrderRejectionJobQueue::new(&pool);
 
         let wrapped_equity_recovery_queue = WrappedEquityRecoveryJobQueue::new(&pool);
+        let unwrapped_equity_recovery_queue = UnwrappedEquityRecoveryJobQueue::new(&pool);
 
         let wrapped_equity_recovery_ctx = match (
             wrapped_equity_recovery_store,
             rebalancing_service.clone(),
-            mint_store,
-            redemption_store,
+            mint_store.clone(),
+            redemption_store.clone(),
         ) {
             (Some(store), Some(service), Some(mint_store), Some(redemption_store)) => {
                 Some(Arc::new(WrappedEquityRecoveryCtx {
@@ -350,6 +382,23 @@ impl Conductor {
             }
             _ => None,
         };
+
+        let unwrapped_equity_recovery_ctx = build_unwrapped_equity_recovery_ctx(
+            unwrapped_equity_recovery_store,
+            rebalancing_service.clone(),
+            mint_store,
+            redemption_store,
+            inventory.clone(),
+            unwrapped_equity_recovery_queue.clone(),
+            Duration::from_secs(ctx.inventory_poll_interval),
+        );
+
+        if wrapped_equity_recovery_ctx.is_some() {
+            requeue_recovery_orphans(&wrapped_equity_recovery_queue, "wrapped equity").await?;
+        }
+        if unwrapped_equity_recovery_ctx.is_some() {
+            requeue_recovery_orphans(&unwrapped_equity_recovery_queue, "unwrapped equity").await?;
+        }
 
         let check_positions_queue = CheckPositionsJobQueue::new(&pool);
 
@@ -397,6 +446,8 @@ impl Conductor {
             .check_positions_queue(check_positions_queue)
             .wrapped_equity_recovery_queue(wrapped_equity_recovery_queue)
             .maybe_wrapped_equity_recovery_ctx(wrapped_equity_recovery_ctx)
+            .unwrapped_equity_recovery_queue(unwrapped_equity_recovery_queue)
+            .maybe_unwrapped_equity_recovery_ctx(unwrapped_equity_recovery_ctx)
             .equity_check_scheduler(schedulers.equity)
             .usdc_check_scheduler(schedulers.usdc)
             .transfer_usdc_to_hedging_queue(schedulers.transfer_usdc_to_hedging)
@@ -516,6 +567,34 @@ impl Conductor {
         }
         self.job_cleanup.abort();
     }
+}
+
+/// Builds the [`UnwrappedEquityRecoveryCtx`] when every dependency the recovery
+/// job needs is present; returns `None` (recovery wiring absent) if any is not.
+fn build_unwrapped_equity_recovery_ctx(
+    store: Option<Arc<Store<UnwrappedEquityRecovery>>>,
+    service: Option<Arc<RebalancingService>>,
+    mint_store: Option<Arc<Store<TokenizedEquityMint>>>,
+    redemption_store: Option<Arc<Store<EquityRedemption>>>,
+    inventory: Arc<BroadcastingInventory>,
+    queue: UnwrappedEquityRecoveryJobQueue,
+    reschedule_interval: Duration,
+) -> Option<Arc<UnwrappedEquityRecoveryCtx>> {
+    let (Some(store), Some(service), Some(mint_store), Some(redemption_store)) =
+        (store, service, mint_store, redemption_store)
+    else {
+        return None;
+    };
+
+    Some(Arc::new(UnwrappedEquityRecoveryCtx {
+        inventory,
+        store,
+        mint_store,
+        redemption_store,
+        equity_in_progress: service.equity_in_progress.clone(),
+        queue,
+        reschedule_interval,
+    }))
 }
 
 fn base_wallet_unwrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Address> {
@@ -691,6 +770,7 @@ struct RebalancingInfrastructure {
     service: Arc<RebalancingService>,
     recovery_transfer: Arc<CrossVenueEquityTransfer>,
     wrapped_equity_recovery_store: Arc<Store<WrappedEquityRecovery>>,
+    unwrapped_equity_recovery_store: Arc<Store<UnwrappedEquityRecovery>>,
     mint_store: Arc<Store<TokenizedEquityMint>>,
     redemption_store: Arc<Store<EquityRedemption>>,
     transfer_usdc_to_hedging_ctx: Arc<TransferUsdcToHedgingCtx>,
@@ -724,6 +804,7 @@ struct PositionAndRebalancing {
     service: Option<Arc<RebalancingService>>,
     recovery_transfer: Option<Arc<CrossVenueEquityTransfer>>,
     wrapped_equity_recovery_store: Option<Arc<Store<WrappedEquityRecovery>>>,
+    unwrapped_equity_recovery_store: Option<Arc<Store<UnwrappedEquityRecovery>>>,
     mint_store: Option<Arc<Store<TokenizedEquityMint>>>,
     redemption_store: Option<Arc<Store<EquityRedemption>>>,
     transfer_usdc_to_hedging_ctx: Option<Arc<TransferUsdcToHedgingCtx>>,
@@ -781,6 +862,7 @@ impl PositionAndRebalancing {
                 service: Some(infra.service),
                 recovery_transfer: Some(infra.recovery_transfer),
                 wrapped_equity_recovery_store: Some(infra.wrapped_equity_recovery_store),
+                unwrapped_equity_recovery_store: Some(infra.unwrapped_equity_recovery_store),
                 mint_store: Some(infra.mint_store),
                 redemption_store: Some(infra.redemption_store),
                 transfer_usdc_to_hedging_ctx: Some(infra.transfer_usdc_to_hedging_ctx),
@@ -809,6 +891,7 @@ impl PositionAndRebalancing {
                 service: None,
                 recovery_transfer: None,
                 wrapped_equity_recovery_store: None,
+                unwrapped_equity_recovery_store: None,
                 mint_store: None,
                 redemption_store: None,
                 transfer_usdc_to_hedging_ctx: None,
@@ -937,6 +1020,16 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
                 })
                 .await?;
 
+        let unwrapped_equity_recovery_store =
+            StoreBuilder::<UnwrappedEquityRecovery>::new(deps.pool.clone())
+                .build(UnwrappedEquityRecoveryServices {
+                    raindex: raindex_service.clone(),
+                    wrapper: wrapper.clone(),
+                    transfer: recovery_transfer.clone(),
+                    wallet: base_wallet.address(),
+                })
+                .await?;
+
         recover_interrupted_tokenization_aggregates(
             &deps.pool,
             &rebalancing_service,
@@ -1016,6 +1109,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             service: rebalancing_service,
             recovery_transfer,
             wrapped_equity_recovery_store,
+            unwrapped_equity_recovery_store,
             mint_store,
             redemption_store,
             transfer_usdc_to_hedging_ctx,
@@ -2149,6 +2243,8 @@ mod tests {
     use crate::rebalancing::{RebalancingSchedulers, RebalancingService, TriggeredOperation};
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
     use crate::trading::onchain::inclusion::EmittedOnChain;
+    use crate::unwrapped_equity_recovery::UnwrappedEquityRecoveryJob;
+    use crate::unwrapped_equity_recovery::aggregate::UnwrappedEquityRecoveryId;
     use crate::wrapper::mock::MockWrapper;
     use crate::wrapper::{RATIO_ONE, UnderlyingPerWrapped};
 
@@ -2188,6 +2284,42 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn requeue_recovery_orphans_resets_unwrapped_recovery_rows() {
+        let pool = setup_test_db().await;
+        setup_apalis_tables(&pool).await.unwrap();
+        let mut queue = UnwrappedEquityRecoveryJobQueue::new(&pool);
+        let job_type = std::any::type_name::<UnwrappedEquityRecoveryJob>();
+
+        queue
+            .push(UnwrappedEquityRecoveryJob {
+                symbol: Symbol::new("AAPL").unwrap(),
+                recovery_id: UnwrappedEquityRecoveryId(uuid::Uuid::new_v4()),
+            })
+            .await
+            .unwrap();
+
+        sqlx::query("UPDATE Jobs SET status = ?, lock_at = 1 WHERE job_type = ?")
+            .bind(Status::Running.to_string())
+            .bind(job_type)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        requeue_recovery_orphans(&queue, "unwrapped equity")
+            .await
+            .unwrap();
+
+        let (status, lock_by): (String, Option<String>) =
+            sqlx::query_as("SELECT status, lock_by FROM Jobs WHERE job_type = ?")
+                .bind(job_type)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, Status::Pending.to_string());
+        assert_eq!(lock_by, None);
     }
 
     async fn job_count(pool: &SqlitePool) -> i64 {
