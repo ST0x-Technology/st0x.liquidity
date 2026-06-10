@@ -12,7 +12,7 @@ use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, T
 pub(crate) use st0x_execution::{FractionalShares, Positive, Symbol};
 pub(crate) use st0x_hedge::ExecutionThreshold;
 use st0x_hedge::TradingMode;
-use st0x_hedge::bindings::IOrderBookV6;
+use st0x_hedge::bindings::IRaindexV6;
 pub(crate) use st0x_hedge::{OffchainOrder, Position};
 
 pub(crate) use crate::assert::ExpectedPosition;
@@ -160,7 +160,7 @@ async fn assert_onchain_vaults<P: Provider>(
             .unwrap_or_else(|_| format!("{raw}"))
     };
 
-    let orderbook = IOrderBookV6::IOrderBookV6Instance::new(orderbook, provider);
+    let orderbook = IRaindexV6::IRaindexV6Instance::new(orderbook, provider);
 
     let output_balance_now = orderbook
         .vaultBalance2(owner, take_result.output_token, take_result.output_vault_id)

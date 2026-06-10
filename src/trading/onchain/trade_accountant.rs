@@ -246,8 +246,8 @@ mod tests {
 
     use super::*;
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
-    use crate::bindings::IOrderBookV6;
-    use crate::bindings::IOrderBookV6::{
+    use crate::bindings::IRaindexV6;
+    use crate::bindings::IRaindexV6::{
         ClearConfigV2, SignedContextV1, TakeOrderConfigV4, TakeOrderV3 as TakeOrderV3Event,
     };
     use crate::offchain::order::OffchainOrder;
@@ -259,7 +259,7 @@ mod tests {
 
     fn test_job() -> AccountForDexTrade {
         let log = get_test_log();
-        let event = RaindexTradeEvent::ClearV3(Box::new(IOrderBookV6::ClearV3 {
+        let event = RaindexTradeEvent::ClearV3(Box::new(IRaindexV6::ClearV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
             alice: get_test_order(),
             bob: get_test_order(),

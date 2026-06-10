@@ -34,10 +34,9 @@ use st0x_float_macro::float;
 use st0x_float_serde::format_float_with_fallback;
 
 use super::{ExpectedEvent, assert_events, fetch_events};
-use crate::bindings::IOrderBookV6::{self, TakeOrderV3};
+use crate::bindings::IRaindexV6::{self, TakeOrderV3};
 use crate::bindings::{
-    DeployableERC20, Deployer, Interpreter, OrderBook, Parser, Store as RainStore,
-    TOFUTokenDecimals,
+    DeployableERC20, Deployer, Interpreter, Parser, RaindexV6, Store as RainStore,
 };
 use crate::conductor::{
     AccumulatedPositionExecutionCtx, TradeProcessingCqrs, VaultDiscoveryCtx,
@@ -52,7 +51,7 @@ use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::RaindexTradeEvent;
 use crate::position::{Position, PositionCommand};
 use crate::symbol::cache::SymbolCache;
-use crate::test_utils::setup_test_db;
+use crate::test_utils::{deploy_tofu_singleton, setup_test_db};
 use crate::tokenization::alpaca::tests::setup_anvil;
 use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::trade_accountant::TradeAccountingError;
@@ -61,8 +60,17 @@ use crate::vault_registry::VaultRegistryId;
 const TEST_AAPL: &str = "AAPL";
 const TEST_MSFT: &str = "MSFT";
 const AAPL_PRICE: u32 = 100;
-const TOFU_TOKEN_DECIMALS: Address = address!("0xF66761F6b5F58202998D6Cd944C81b22Dc6d4f1E");
 const MSFT_PRICE: u32 = 200;
+
+// Rainlang interpreter components deploy to deterministic "zoltu" addresses; the
+// expression deployer references the parser/store/interpreter by these hardcoded
+// constants (see LibInterpreterDeploy in rainlang). Tests therefore etch each
+// runtime at its canonical address rather than deploying to sequential ones.
+const RAINLANG_INTERPRETER: Address = address!("0xb3A710b89A5569893dA4Ca0dB7D178593b5BE8a0");
+const RAINLANG_STORE: Address = address!("0x1Aa775533E28B1D843e1A589034984E3a62005DC");
+const RAINLANG_PARSER: Address = address!("0x9179445a637E6Ae72Bb38273944FAB96834488dd");
+const RAINLANG_EXPRESSION_DEPLOYER: Address =
+    address!("0xC9e1D673eD122193b28376016AC506De2fA20beE");
 
 /// Loads a position and asserts it matches the expected field values.
 ///
@@ -293,6 +301,33 @@ async fn deploy_usdc_at_base<P: Provider>(provider: &P, owner: Address) {
         .unwrap();
 }
 
+/// Etches the Rainlang interpreter, store, parser, and expression deployer
+/// runtimes at their deterministic deployment addresses. The expression deployer
+/// hardcodes these addresses, so order evaluation only works when each runtime
+/// lives at its canonical address -- the alloy/anvil equivalent of upstream's
+/// `LibInterpreterDeploy.etchRainlang`.
+async fn etch_rainlang<P: Provider>(provider: &P) {
+    provider
+        .anvil_set_code(RAINLANG_INTERPRETER, Interpreter::DEPLOYED_BYTECODE.clone())
+        .await
+        .unwrap();
+    provider
+        .anvil_set_code(RAINLANG_STORE, RainStore::DEPLOYED_BYTECODE.clone())
+        .await
+        .unwrap();
+    provider
+        .anvil_set_code(RAINLANG_PARSER, Parser::DEPLOYED_BYTECODE.clone())
+        .await
+        .unwrap();
+    provider
+        .anvil_set_code(
+            RAINLANG_EXPRESSION_DEPLOYER,
+            Deployer::DEPLOYED_BYTECODE.clone(),
+        )
+        .await
+        .unwrap();
+}
+
 async fn setup_anvil_orderbook() -> AnvilOrderBook<impl alloy::providers::Provider + Clone> {
     let (anvil, endpoint, key) = setup_anvil();
     let signer = PrivateKeySigner::from_bytes(&key).unwrap();
@@ -304,38 +339,20 @@ async fn setup_anvil_orderbook() -> AnvilOrderBook<impl alloy::providers::Provid
         .unwrap();
     let owner = signer.address();
 
-    provider
-        .anvil_set_code(
-            TOFU_TOKEN_DECIMALS,
-            TOFUTokenDecimals::DEPLOYED_BYTECODE.clone(),
-        )
-        .await
-        .unwrap();
+    deploy_tofu_singleton(&provider).await;
 
-    let interpreter = Interpreter::deploy(&provider).await.unwrap();
-    let store = RainStore::deploy(&provider).await.unwrap();
-    let parser = Parser::deploy(&provider).await.unwrap();
-    let deployer = Deployer::deploy(
-        &provider,
-        Deployer::RainterpreterExpressionDeployerConstructionConfigV2 {
-            interpreter: *interpreter.address(),
-            store: *store.address(),
-            parser: *parser.address(),
-        },
-    )
-    .await
-    .unwrap();
+    etch_rainlang(&provider).await;
 
-    let orderbook = OrderBook::deploy(&provider).await.unwrap();
+    let orderbook = RaindexV6::deploy(&provider).await.unwrap();
 
     // Place USDC contract directly at USDC_BASE so vault discovery recognizes it.
     deploy_usdc_at_base(&provider, owner).await;
 
     // Extract addresses before moving provider into the struct
     let orderbook_addr = *orderbook.address();
-    let deployer_addr = *deployer.address();
-    let interpreter_addr = *interpreter.address();
-    let store_addr = *store.address();
+    let deployer_addr = RAINLANG_EXPRESSION_DEPLOYER;
+    let interpreter_addr = RAINLANG_INTERPRETER;
+    let store_addr = RAINLANG_STORE;
 
     AnvilOrderBook {
         _anvil: anvil,
@@ -450,8 +467,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
         // which hold immutable references to self.provider.
         let equity_addr = self.ensure_equity_token(symbol).await;
 
-        let orderbook =
-            IOrderBookV6::IOrderBookV6Instance::new(self.orderbook_addr, &self.provider);
+        let orderbook = IRaindexV6::IRaindexV6Instance::new(self.orderbook_addr, &self.provider);
         let deployer_instance = Deployer::DeployerInstance::new(self.deployer_addr, &self.provider);
 
         let is_sell = direction == Direction::Sell;
@@ -496,17 +512,17 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
         let input_vault_id = B256::random();
         let output_vault_id = B256::random();
 
-        let order_config = IOrderBookV6::OrderConfigV4 {
-            evaluable: IOrderBookV6::EvaluableV4 {
+        let order_config = IRaindexV6::OrderConfigV4 {
+            evaluable: IRaindexV6::EvaluableV4 {
                 interpreter: self.interpreter_addr,
                 store: self.store_addr,
                 bytecode: Bytes::from(parsed_bytecode),
             },
-            validInputs: vec![IOrderBookV6::IOV2 {
+            validInputs: vec![IRaindexV6::IOV2 {
                 token: input_token,
                 vaultId: input_vault_id,
             }],
-            validOutputs: vec![IOrderBookV6::IOV2 {
+            validOutputs: vec![IRaindexV6::IOV2 {
                 token: output_token,
                 vaultId: output_vault_id,
             }],
@@ -528,7 +544,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
             .inner
             .logs()
             .iter()
-            .find_map(|log| log.log_decode::<IOrderBookV6::AddOrderV3>().ok())
+            .find_map(|log| log.log_decode::<IRaindexV6::AddOrderV3>().ok())
             .expect("AddOrderV3 event not found");
         let order = add_order_event.data().order.clone();
 
@@ -585,7 +601,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
             .unwrap();
 
         // Take the order with permissive bounds (large maximumIO/maximumIORatio)
-        let take_config = IOrderBookV6::TakeOrdersConfigV5 {
+        let take_config = IRaindexV6::TakeOrdersConfigV5 {
             minimumIO: B256::ZERO,
             maximumIO: Float::from_fixed_decimal_lossy(U256::from(1_000_000), 0)
                 .unwrap()
@@ -596,7 +612,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
                 .0
                 .get_inner(),
             IOIsInput: true,
-            orders: vec![IOrderBookV6::TakeOrderConfigV4 {
+            orders: vec![IRaindexV6::TakeOrderConfigV4 {
                 order: order.clone(),
                 inputIOIndex: U256::from(0),
                 outputIOIndex: U256::from(0),

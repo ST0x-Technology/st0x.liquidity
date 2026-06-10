@@ -24,7 +24,7 @@ use st0x_execution::FractionalShares;
 use st0x_finance::Usdc;
 pub(crate) use st0x_raindex::{Raindex, RaindexError, RaindexVaultId, USDC_BASE};
 
-use crate::bindings::{IERC20, IOrderBookV6};
+use crate::bindings::{IERC20, IRaindexV6};
 
 const USDC_DECIMALS: u8 = 6;
 
@@ -156,7 +156,7 @@ impl<W: Wallet> RaindexService<W> {
 
         debug!(target: "orderbook", %token, ?vault_id, %amount, "Sending deposit4");
 
-        let calldata = IOrderBookV6::deposit4Call {
+        let calldata = IRaindexV6::deposit4Call {
             token,
             vaultId: vault_id.0,
             depositAmount: amount_float.get_inner(),
@@ -184,7 +184,7 @@ impl<W: Wallet> RaindexService<W> {
 
         debug!(target: "orderbook", %token, ?vault_id, %amount, "Sending deposit4");
 
-        let calldata = IOrderBookV6::deposit4Call {
+        let calldata = IRaindexV6::deposit4Call {
             token,
             vaultId: vault_id.0,
             depositAmount: amount_float.get_inner(),
@@ -293,7 +293,7 @@ impl<E: Evm> RaindexService<E> {
         let filter = Filter::new()
             .from_block(from_block)
             .address(self.orderbook_address)
-            .event_signature(IOrderBookV6::WithdrawV2::SIGNATURE_HASH);
+            .event_signature(IRaindexV6::WithdrawV2::SIGNATURE_HASH);
 
         for attempt in 1..=SCAN_ATTEMPTS {
             let logs = self.evm.provider().get_logs(&filter).await?;
@@ -302,7 +302,7 @@ impl<E: Evm> RaindexService<E> {
             // most recent matching withdrawal wins -- under single-in-flight that
             // is this transfer's withdrawal.
             for log in logs.iter().rev() {
-                let decoded = log.log_decode::<IOrderBookV6::WithdrawV2>()?;
+                let decoded = log.log_decode::<IRaindexV6::WithdrawV2>()?;
                 let event = decoded.data();
 
                 if event.sender == self.owner
@@ -354,7 +354,7 @@ impl<E: Evm> RaindexService<E> {
             .evm
             .call::<Registry, _>(
                 self.orderbook_address,
-                IOrderBookV6::vaultBalance2Call {
+                IRaindexV6::vaultBalance2Call {
                     owner,
                     token,
                     vaultId: vault_id.0,
@@ -385,7 +385,7 @@ impl<W: Wallet> Raindex for RaindexService<W> {
             .evm
             .submit::<OpenChainErrorRegistry, _>(
                 self.orderbook_address,
-                IOrderBookV6::withdraw4Call {
+                IRaindexV6::withdraw4Call {
                     token,
                     vaultId: vault_id.0,
                     targetAmount: amount_float.get_inner(),
@@ -434,7 +434,7 @@ impl<W: Wallet> Raindex for RaindexService<W> {
             .evm
             .submit_pending(
                 self.orderbook_address,
-                IOrderBookV6::withdraw4Call {
+                IRaindexV6::withdraw4Call {
                     token,
                     vaultId: vault_id.0,
                     targetAmount: amount_float.get_inner(),
@@ -485,9 +485,8 @@ mod tests {
     use st0x_evm::local::RawPrivateKeyWallet;
 
     use super::*;
-    use crate::bindings::{IOrderBookV6, OrderBook, TOFUTokenDecimals, TestERC20};
-    /// Address where LibTOFUTokenDecimals expects the singleton contract to be deployed.
-    const TOFU_DECIMALS_ADDRESS: Address = address!("0xF66761F6b5F58202998D6Cd944C81b22Dc6d4f1E");
+    use crate::bindings::{IRaindexV6, RaindexV6, TestERC20};
+    use crate::test_utils::deploy_tofu_singleton;
 
     type BaseProvider = FillProvider<
         JoinFill<
@@ -516,7 +515,7 @@ mod tests {
             let base_provider = ProviderBuilder::new().connect_http(endpoint.parse()?);
             let wallet = RawPrivateKeyWallet::new(&private_key, base_provider, 1)?;
 
-            Self::deploy_tofu_decimals(wallet.signing_provider()).await?;
+            deploy_tofu_singleton(wallet.signing_provider()).await;
 
             let orderbook_address = Self::deploy_orderbook(wallet.signing_provider()).await?;
 
@@ -532,22 +531,8 @@ mod tests {
             })
         }
 
-        async fn deploy_tofu_decimals(provider: &impl Provider) -> Result<(), LocalEvmError> {
-            let tofu = TOFUTokenDecimals::deploy(provider).await?;
-            let deployed_code = provider.get_code_at(*tofu.address()).await?;
-
-            provider
-                .raw_request::<_, ()>(
-                    "anvil_setCode".into(),
-                    (TOFU_DECIMALS_ADDRESS, deployed_code),
-                )
-                .await?;
-
-            Ok(())
-        }
-
         async fn deploy_orderbook(provider: &impl Provider) -> Result<Address, LocalEvmError> {
-            let orderbook = OrderBook::deploy(provider).await?;
+            let orderbook = RaindexV6::deploy(provider).await?;
 
             Ok(*orderbook.address())
         }
@@ -597,7 +582,7 @@ mod tests {
                 .wallet
                 .call::<NoOpErrorRegistry, _>(
                     self.orderbook_address,
-                    IOrderBookV6::vaultBalance2Call {
+                    IRaindexV6::vaultBalance2Call {
                         owner: self.wallet.address(),
                         token,
                         vaultId: vault_id,
@@ -693,7 +678,7 @@ mod tests {
     /// A `WithdrawV2` from this owner's vault, mined at `block_number`, that
     /// `find_recent_withdrawal` will see for `(USDC_BASE, TEST_VAULT_ID)`.
     fn withdraw_log(block_number: u64, withdraw_amount: U256) -> Log {
-        let event = IOrderBookV6::WithdrawV2 {
+        let event = IRaindexV6::WithdrawV2 {
             sender: Address::ZERO,
             token: USDC_BASE,
             vaultId: TEST_VAULT_ID.0,

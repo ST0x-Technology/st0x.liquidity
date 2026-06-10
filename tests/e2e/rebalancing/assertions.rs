@@ -36,7 +36,7 @@ use st0x_execution::{
 };
 use st0x_finance::{Positive, Usd};
 pub(crate) use st0x_hedge::UsdcRebalancing;
-use st0x_hedge::bindings::IOrderBookV6;
+use st0x_hedge::bindings::IRaindexV6;
 pub(crate) use st0x_hedge::mock_api::REDEMPTION_WALLET;
 use st0x_hedge::mock_api::{AlpacaTokenizationMock, TokenizationStatus};
 pub(crate) use st0x_hedge::mock_api::{RedemptionOutcome, TokenizationRequestType};
@@ -572,7 +572,7 @@ async fn assert_equity_mint_rebalancing<P: Provider>(
         })
         .collect::<anyhow::Result<_>>()?;
 
-    let orderbook = IOrderBookV6::IOrderBookV6Instance::new(orderbook, provider);
+    let orderbook = IRaindexV6::IRaindexV6Instance::new(orderbook, provider);
     let mut total_refilled_wrapped_shares_delta = U256::ZERO;
     for ((token, vault_id), pre_rebalance_balance) in consumed_output_vaults {
         let post_rebalance_balance = orderbook
@@ -767,7 +767,7 @@ async fn assert_equity_redeem_rebalancing<P: Provider>(
             Ok(((result.input_token, result.input_vault_id), after_take))
         })
         .collect::<anyhow::Result<_>>()?;
-    let orderbook = IOrderBookV6::IOrderBookV6Instance::new(orderbook, provider);
+    let orderbook = IRaindexV6::IRaindexV6Instance::new(orderbook, provider);
     let mut total_withdrawn_wrapped_shares = U256::ZERO;
     for ((token, vault_id), pre_rebalance_balance) in &redeemed_input_vaults {
         let post_rebalance_balance = orderbook
@@ -1219,7 +1219,7 @@ async fn assert_usdc_rebalancing_onchain_state<P: Provider>(
     event_amounts: &UsdcRebalanceEventAmounts,
     take_results: &[TakeOrderResult],
 ) -> anyhow::Result<()> {
-    let orderbook = IOrderBookV6::IOrderBookV6Instance::new(orderbook, provider);
+    let orderbook = IRaindexV6::IRaindexV6Instance::new(orderbook, provider);
     let vault_balance = orderbook
         .vaultBalance2(owner, base_chain::USDC_BASE, usdc_vault_id)
         .call()

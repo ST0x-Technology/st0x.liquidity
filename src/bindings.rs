@@ -6,7 +6,7 @@ use alloy::sol;
 sol!(
     #![sol(all_derives = true, rpc)]
     #[derive(serde::Serialize, serde::Deserialize)]
-    IOrderBookV6, env!("ST0X_IORDERBOOK_V6_ABI")
+    IRaindexV6, env!("ST0X_IORDERBOOK_V6_ABI")
 );
 
 sol!(
@@ -32,7 +32,7 @@ sol!(
 sol!(
     #![sol(all_derives = true, rpc)]
     #[derive(serde::Serialize, serde::Deserialize)]
-    OrderBook, env!("ST0X_ORDERBOOK_ABI")
+    RaindexV6, env!("ST0X_ORDERBOOK_ABI")
 );
 
 #[cfg(any(test, feature = "test-support"))]

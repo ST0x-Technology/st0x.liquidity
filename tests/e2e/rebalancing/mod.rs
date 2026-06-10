@@ -35,7 +35,7 @@ use st0x_finance::{FractionalShares, Positive, Usd};
 use st0x_float_macro::float;
 use st0x_hedge::ImbalanceThreshold;
 use st0x_hedge::OperationMode;
-use st0x_hedge::bindings::IOrderBookV6;
+use st0x_hedge::bindings::IRaindexV6;
 use st0x_hedge::cli::seed_mint_at_tokens_wrapped_for_test;
 
 use self::assertions::*;
@@ -946,7 +946,7 @@ async fn usdc_imbalance_triggers_alpaca_to_base() -> anyhow::Result<()> {
     // flow is long enough (CCTP bridge + attestation) that the vault
     // balance won't change before we snapshot.
     let usdc_vault_balance_before_rebalance =
-        st0x_hedge::bindings::IOrderBookV6::IOrderBookV6Instance::new(
+        st0x_hedge::bindings::IRaindexV6::IRaindexV6Instance::new(
             infra.base_chain.orderbook,
             &infra.base_chain.provider,
         )
@@ -2254,10 +2254,8 @@ async fn wrapped_equity_in_bot_wallet_recovers_into_raindex() -> anyhow::Result<
     let equity_vault_id = prepared.output_vault_id;
     let equity_vault_ids = HashMap::from([("AAPL".to_owned(), equity_vault_id)]);
 
-    let orderbook = IOrderBookV6::IOrderBookV6Instance::new(
-        infra.base_chain.orderbook,
-        &infra.base_chain.provider,
-    );
+    let orderbook =
+        IRaindexV6::IRaindexV6Instance::new(infra.base_chain.orderbook, &infra.base_chain.provider);
 
     let vault_balance_before_raw = orderbook
         .vaultBalance2(infra.base_chain.owner, wrapped_token, equity_vault_id)
@@ -2412,10 +2410,8 @@ async fn unwrapped_equity_in_bot_wallet_recovers_into_raindex() -> anyhow::Resul
     let equity_vault_id = prepared.output_vault_id;
     let equity_vault_ids = HashMap::from([("AAPL".to_owned(), equity_vault_id)]);
 
-    let orderbook = IOrderBookV6::IOrderBookV6Instance::new(
-        infra.base_chain.orderbook,
-        &infra.base_chain.provider,
-    );
+    let orderbook =
+        IRaindexV6::IRaindexV6Instance::new(infra.base_chain.orderbook, &infra.base_chain.provider);
 
     let vault_balance_before_raw = orderbook
         .vaultBalance2(infra.base_chain.owner, wrapped_token, equity_vault_id)
@@ -2649,10 +2645,8 @@ async fn active_mint_in_tokens_wrapped_recovers_into_raindex_vault() -> anyhow::
     let equity_vault_id = prepared.output_vault_id;
     let equity_vault_ids = HashMap::from([("AAPL".to_owned(), equity_vault_id)]);
 
-    let orderbook = IOrderBookV6::IOrderBookV6Instance::new(
-        infra.base_chain.orderbook,
-        &infra.base_chain.provider,
-    );
+    let orderbook =
+        IRaindexV6::IRaindexV6Instance::new(infra.base_chain.orderbook, &infra.base_chain.provider);
 
     let vault_balance_before = orderbook
         .vaultBalance2(infra.base_chain.owner, wrapped_token, equity_vault_id)
