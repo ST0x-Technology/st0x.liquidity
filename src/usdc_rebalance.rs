@@ -841,7 +841,7 @@ impl UsdcRebalance {
     /// or a failure that reconciles inflight back to the source venue. The live
     /// reactor holds the guard from dispatch until a clearable-terminal event;
     /// re-deriving that boolean from durable event state keeps a restart from
-    /// re-opening the re-burn window. See ADR 2.
+    /// re-opening the re-burn window. See ADR 0003.
     pub(crate) fn holds_rebalance_guard(&self) -> bool {
         match self {
             // `WithdrawalSubmitting`/`BridgingSubmitting` are transient intent
@@ -874,6 +874,15 @@ impl UsdcRebalance {
             // `FailBridging` command only emits `burn_tx_hash: Some` from the
             // post-burn `Bridging`/`Attested` states; a pre-burn failure (from
             // `WithdrawalComplete`) carries `None` and reconciles to source.
+            //
+            // For a BaseToAlpaca post-burn failure this is not a permanent latch:
+            // it is now recoverable and auto-re-armed on startup, and recovery
+            // drives `BridgingFailed -> Bridged -> deposit -> terminal`, at which
+            // point this returns `false` and the guard clears via the normal
+            // terminal path with no operator action. An AlpacaToBase post-burn
+            // failure also holds the guard here, but has no recovery path yet
+            // (neither startup re-arm nor the resume CLI drive it), so it stays
+            // held until manual reconciliation.
             Self::BridgingFailed { burn_tx_hash, .. } => burn_tx_hash.is_some(),
             // BaseToAlpaca-only post-burn legs: after DepositConfirmed the
             // post-deposit USDC->USD conversion is still pending, and a

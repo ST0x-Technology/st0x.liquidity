@@ -61,10 +61,14 @@ Mechanically, mirroring mint/redemption recovery:
 
 - **The guard is the primary dispatch gate.** `check_and_trigger_usdc` claims it
   before anything else; re-asserting it durably is sufficient to block re-burns.
-- **No settlement events arrive post-restart.** With no USDC bridge
-  resume/poller and a `Nil` reactor, an interrupted aggregate emits no further
-  events, so the inventory-inflight bookkeeping the live terminal paths would
-  consume is never needed. Reconstructing it would be dead state.
+- **Restart drives no inventory-inflight reconstruction.** An interrupted
+  aggregate with no recovery path (an AlpacaToBase post-burn failure, or an
+  in-flight bridge with a `Nil` reactor) emits no further events post-restart. A
+  BaseToAlpaca post-burn `BridgingFailed` does flow to terminal via re-armed
+  recovery (RAI-906), but that path tolerates absent in-memory tracking rather
+  than rebuilding it. Either way the inventory-inflight bookkeeping the live
+  terminal paths consume is never reconstructed on restart, so rebuilding it
+  would be dead state.
 - **Avoids financial-misaccounting risk.** Re-deriving inventory inflight on
   restart (when available balances are independently re-hydrated from polled
   on-chain/broker readings) risks double-counting -- the exact class of bug the
@@ -76,26 +80,47 @@ Mechanically, mirroring mint/redemption recovery:
 
 ## Consequences
 
-- A stuck or in-flight USDC aggregate at boot holds the guard until manual
-  operator recovery, consistent with the PR's stated "minimum safe behavior"
-  (stuck post-burn funds already require manual recovery) and with the fact that
-  USDC bridges are not auto-resumed.
+- A stuck or in-flight USDC aggregate at boot holds the guard until it is driven
+  terminal -- automatically for a BaseToAlpaca post-burn `BridgingFailed` (see
+  Operator recovery path), or by manual operator recovery otherwise. This is
+  consistent with the PR's stated "minimum safe behavior" (stuck post-burn funds
+  must never silently unguard).
 - All new USDC rebalancing is blocked while one aggregate is unsettled. This is
   correct: the system only runs one USDC rebalance at a time, and blocking is
   the safe failure mode (the incident was double-burning, not under-burning).
-- Terminally-failed post-burn aggregates have no automatic guard clear -- the
-  same as the live in-memory behavior today; an operator clears it as part of
-  recovery. The boot-time error log surfaces it on every restart until resolved.
+- A post-burn `BridgingFailed` clears the guard automatically for the
+  BaseToAlpaca direction (RAI-909 un-fail + RAI-906 startup re-arm; see Operator
+  recovery path below). The one case that holds the guard with no automatic
+  clear is an `AlpacaToBase` post-burn failure; it still requires an operator to
+  drive the aggregate terminal, and the boot-time error log surfaces it on every
+  restart until resolved. (A pre-burn `BridgingFailed` carries no burn tx, so
+  `holds_rebalance_guard` returns `false` for it -- it does not latch the guard
+  and reconciles to source like any other pre-burn failure.)
 
 **Operator recovery path.** There is no dedicated "clear the USDC guard" CLI
-command. The guard is derived state (see below), so the only way to clear it is
-to drive the stuck aggregate to a terminal state for which
-`UsdcRebalance::holds_rebalance_guard` returns `false` (i.e. confirm the
-post-burn funds settled, or otherwise reconcile them), then restart -- recovery
-re-derives the guard from the event log and leaves it clear. A purpose-built
-"CCTP stuck" aggregate state with an explicit operator recovery/resume command
-is the tracked follow-up (RAI-715, see Out of scope). Until it exists, recovery
-is the manual reconcile-then-restart procedure above.
+command, and there does not need to be: the guard is derived state (see below),
+so it clears only by driving the stuck aggregate to a terminal state for which
+`UsdcRebalance::holds_rebalance_guard` returns `false`.
+
+The RAI-903 epic made that automatic for the common case. A post-burn
+`BridgingFailed` is now recoverable (RAI-909: `RecoverBridging` un-fails it to
+`Bridged` after re-checking the mint on-chain) and, for the BaseToAlpaca
+direction, is auto-re-armed on startup (RAI-906 added a BaseToAlpaca-scoped
+`BridgingFailed` arm to `resumable_post_burn_transfer`). Startup recovery
+re-enqueues a transfer job that drives
+`BridgingFailed -> Bridged -> deposit -> terminal`, at which point the guard
+clears with no operator action. The key invariant for that common case: **a
+BaseToAlpaca post-burn `BridgingFailed` is not a permanent latch -- the guard is
+held only while funds are genuinely in-flight and clears via recovery
+completion.**
+
+The one case that genuinely latches the guard with no recovery path is an
+`AlpacaToBase` post-burn failure (neither auto-re-armed nor accepted by the
+resume CLI, which rejects it via `require_base_to_alpaca` -- recovery not yet
+implemented); it requires manual reconcile-then-restart. (A pre-burn
+`BridgingFailed` does not hold the guard at all -- no burn tx -- so it needs no
+guard-clearing action.) An explicit operator recheck command (RAI-715 / RAI-909
+follow-up) remains optional polish on top of the automatic path.
 
 ## Alternatives considered
 
