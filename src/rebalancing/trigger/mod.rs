@@ -7,7 +7,7 @@ use alloy::primitives::{Address, TxHash};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -30,6 +30,7 @@ use crate::equity_redemption::{
 };
 use crate::inventory::projection::InventoryProjectionError;
 use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
+use crate::inventory::view::InFlightEquityLocation;
 use crate::inventory::{
     BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, InventoryViewError,
     Operator, PendingRequestOwnership, PendingRequestOwnershipSnapshot, TransferOp, Venue,
@@ -41,6 +42,10 @@ use crate::rebalancing::usdc::{
 };
 use crate::tokenized_equity_mint::{
     IssuerRequestId, TokenizedEquityMint, TokenizedEquityMintCommand, TokenizedEquityMintEvent,
+};
+use crate::unwrapped_equity_recovery::aggregate::UnwrappedEquityRecoveryId;
+use crate::unwrapped_equity_recovery::{
+    UnwrappedEquityRecoveryJob, UnwrappedEquityRecoveryJobQueue,
 };
 use crate::usdc_rebalance::{
     InterruptedUsdcRebalances, RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent,
@@ -61,6 +66,7 @@ pub(crate) struct RebalancingSchedulers {
     pub(crate) equity: EquityRebalancingCheckScheduler,
     pub(crate) usdc: UsdcRebalancingCheckScheduler,
     pub(crate) wrapped_equity_recovery: WrappedEquityRecoveryJobQueue,
+    pub(crate) unwrapped_equity_recovery: UnwrappedEquityRecoveryJobQueue,
     pub(crate) transfer_usdc_to_hedging: TransferUsdcToHedgingJobQueue,
     pub(crate) transfer_usdc_to_market_making: TransferUsdcToMarketMakingJobQueue,
 }
@@ -71,6 +77,7 @@ impl RebalancingSchedulers {
             equity: EquityRebalancingCheckScheduler::new(pool),
             usdc: UsdcRebalancingCheckScheduler::new(pool),
             wrapped_equity_recovery: WrappedEquityRecoveryJobQueue::new(pool),
+            unwrapped_equity_recovery: UnwrappedEquityRecoveryJobQueue::new(pool),
             transfer_usdc_to_hedging: TransferUsdcToHedgingJobQueue::new(pool),
             transfer_usdc_to_market_making: TransferUsdcToMarketMakingJobQueue::new(pool),
         }
@@ -448,6 +455,7 @@ pub(crate) struct RebalancingService {
     pub(super) equity_scheduler: EquityRebalancingCheckScheduler,
     pub(super) usdc_scheduler: UsdcRebalancingCheckScheduler,
     pub(super) wrapped_equity_recovery_queue: WrappedEquityRecoveryJobQueue,
+    pub(super) unwrapped_equity_recovery_queue: UnwrappedEquityRecoveryJobQueue,
     /// Queues for the USDC transfer apalis jobs that drive each rebalancing
     /// direction. `check_and_trigger_usdc` enqueues into one of these
     /// directly rather than dispatching through the `Rebalancer` mpsc channel.
@@ -532,6 +540,7 @@ impl RebalancingService {
             equity: equity_scheduler,
             usdc: usdc_scheduler,
             wrapped_equity_recovery: wrapped_equity_recovery_queue,
+            unwrapped_equity_recovery: unwrapped_equity_recovery_queue,
             transfer_usdc_to_hedging: transfer_usdc_to_hedging_queue,
             transfer_usdc_to_market_making: transfer_usdc_to_market_making_queue,
         } = schedulers;
@@ -549,6 +558,7 @@ impl RebalancingService {
             equity_scheduler,
             usdc_scheduler,
             wrapped_equity_recovery_queue,
+            unwrapped_equity_recovery_queue,
             transfer_usdc_to_hedging_queue,
             transfer_usdc_to_market_making_queue,
             mint_tracking: Arc::new(RwLock::new(HashMap::new())),
@@ -1487,17 +1497,22 @@ impl RebalancingService {
                     if !self.is_wrapped_equity_recovery_enabled(symbol) {
                         continue;
                     }
+
                     let mut queue = self.wrapped_equity_recovery_queue.clone();
                     let job_type = std::any::type_name::<WrappedEquityRecoveryJob>();
-                    let symbol_pattern = format!("%{symbol}%");
+
+                    // Match the serialized `symbol` field exactly (json_extract, not
+                    // a LIKE substring) so a queued job for a ticker that contains
+                    // this symbol as a substring (e.g. GOOGL vs GOOG) can't suppress
+                    // a distinct recovery.
                     let existing: Result<(i64,), _> = sqlx::query_as(
                         "SELECT COUNT(*) FROM Jobs \
                          WHERE job_type = ? \
                          AND status IN ('Pending', 'Queued', 'Running') \
-                         AND job LIKE ?",
+                         AND json_extract(job, '$.symbol') = ?",
                     )
                     .bind(job_type)
-                    .bind(&symbol_pattern)
+                    .bind(symbol.to_string())
                     .fetch_one(queue.pool())
                     .await;
 
@@ -1539,6 +1554,83 @@ impl RebalancingService {
                     }
                 }
             }
+            // Unwrapped equity (tSTOCK) in the bot wallet triggers a
+            // recovery dispatch per symbol with a positive balance.
+            // Gated per-symbol on `wrapped_equity_recovery` -- the same
+            // config flag covers both detection paths since they share
+            // the same "auto-recover misplaced equity" intent.
+            BaseWalletUnwrappedEquity { balances, .. } => {
+                for (symbol, amount) in balances {
+                    if *amount == FractionalShares::ZERO {
+                        continue;
+                    }
+                    if !self.is_wrapped_equity_recovery_enabled(symbol) {
+                        continue;
+                    }
+
+                    let mut queue = self.unwrapped_equity_recovery_queue.clone();
+                    let job_type = std::any::type_name::<UnwrappedEquityRecoveryJob>();
+
+                    // Status-scoped dedup, mirroring the wrapped path: only a
+                    // non-terminal row blocks a re-enqueue. apalis's
+                    // `ON CONFLICT(job_type, idempotency_key) DO NOTHING` never
+                    // surfaces a unique-violation, and its index spans all
+                    // statuses, so an idempotency key would silently wedge a
+                    // symbol behind its own `Done` row until the hourly cleanup
+                    // -- starving the next-poll re-dispatch the guard-contention
+                    // skip relies on. Match the serialized `symbol` field
+                    // exactly (json_extract, not a LIKE substring) so a queued
+                    // job for a ticker that contains this symbol as a substring
+                    // (e.g. GOOGL vs GOOG) can't suppress a distinct recovery.
+                    let existing: Result<(i64,), _> = sqlx::query_as(
+                        "SELECT COUNT(*) FROM Jobs \
+                         WHERE job_type = ? \
+                         AND status IN ('Pending', 'Queued', 'Running') \
+                         AND json_extract(job, '$.symbol') = ?",
+                    )
+                    .bind(job_type)
+                    .bind(symbol.to_string())
+                    .fetch_one(queue.pool())
+                    .await;
+
+                    match existing {
+                        Ok((count,)) if count > 0 => {
+                            debug!(
+                                target: "rebalance",
+                                %symbol, %count,
+                                "Skipped UnwrappedEquityRecoveryJob enqueue: a non-terminal \
+                                 row for this symbol already exists",
+                            );
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            warn!(
+                                target: "rebalance",
+                                %symbol, %error,
+                                "Failed to query existing UnwrappedEquityRecoveryJob rows; \
+                                 skipping enqueue to avoid duplicates",
+                            );
+                            continue;
+                        }
+                    }
+
+                    let recovery_id = UnwrappedEquityRecoveryId(Uuid::new_v4());
+                    if let Err(error) = queue
+                        .push(UnwrappedEquityRecoveryJob {
+                            symbol: symbol.clone(),
+                            recovery_id: recovery_id.clone(),
+                        })
+                        .await
+                    {
+                        warn!(
+                            target: "rebalance",
+                            %symbol, %recovery_id, ?error,
+                            "Failed to enqueue UnwrappedEquityRecoveryJob",
+                        );
+                    }
+                }
+            }
             // Wallet-read USDC events update `inflight_cash` for
             // visibility but don't drive triggers here.
             // Suppression-aware re-triggering will be added once
@@ -1546,7 +1638,6 @@ impl RebalancingService {
             EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
             | AlpacaUsdc { .. }
-            | BaseWalletUnwrappedEquity { .. }
             // Buying power is display-only and doesn't feed any rebalance
             // decision.
             | OffchainCashBuyingPower { .. }
@@ -1554,6 +1645,53 @@ impl RebalancingService {
             // indicate transfers already in progress, not new balances
             // to rebalance.
             | InflightEquity { .. } => {}
+        }
+    }
+
+    /// Re-drives recovery producers from the already-hydrated inventory view.
+    ///
+    /// Startup hydration updates the in-memory view directly instead of
+    /// dispatching snapshot reactor events. Wallet polls also suppress unchanged
+    /// balances, so a positive tSTOCK/wtSTOCK balance that was persisted before
+    /// restart would otherwise wait forever for a new event.
+    pub(crate) async fn enqueue_recovery_for_current_wallet_balances(&self) {
+        let (wrapped, unwrapped) = {
+            let view = self.inventory.read().await;
+            let mut wrapped = BTreeMap::new();
+            let mut unwrapped = BTreeMap::new();
+
+            for symbol in self.config.assets.equities.symbols.keys() {
+                if let Some(amount) =
+                    view.inflight_equity_at(symbol, InFlightEquityLocation::BaseWalletWrapped)
+                {
+                    wrapped.insert(symbol.clone(), amount);
+                }
+                if let Some(amount) =
+                    view.inflight_equity_at(symbol, InFlightEquityLocation::BaseWalletUnwrapped)
+                {
+                    unwrapped.insert(symbol.clone(), amount);
+                }
+            }
+
+            (wrapped, unwrapped)
+        };
+
+        let fetched_at = Utc::now();
+
+        if !wrapped.is_empty() {
+            self.enqueue_checks_for_snapshot(&InventorySnapshotEvent::BaseWalletWrappedEquity {
+                balances: wrapped,
+                fetched_at,
+            })
+            .await;
+        }
+
+        if !unwrapped.is_empty() {
+            self.enqueue_checks_for_snapshot(&InventorySnapshotEvent::BaseWalletUnwrappedEquity {
+                balances: unwrapped,
+                fetched_at,
+            })
+            .await;
         }
     }
 }
@@ -3498,7 +3636,9 @@ mod tests {
     use tokio::sync::mpsc::error::TryRecvError;
     use uuid::Uuid;
 
-    use st0x_config::{CashAssetConfig, EquitiesConfig, ExecutionThreshold, OperationMode};
+    use st0x_config::{
+        CashAssetConfig, EquitiesConfig, EquityAssetConfig, ExecutionThreshold, OperationMode,
+    };
     use st0x_dto::Statement;
     use st0x_event_sorcery::{
         EntityList, Never, Reactor, ReactorHarness, TestStore, deps, test_store,
@@ -3516,7 +3656,7 @@ mod tests {
     use crate::inventory::snapshot::{
         InventorySnapshot, InventorySnapshotEvent, InventorySnapshotId,
     };
-    use crate::inventory::view::Operator;
+    use crate::inventory::view::{InFlightEquityLocation, Operator};
     use crate::inventory::{InventoryError, InventoryView, TransferOp, Venue};
     use crate::offchain::order::OffchainOrderId;
     use crate::position::{Position, PositionCommand, PositionEvent, TradeId, TriggerReason};
@@ -3579,6 +3719,62 @@ mod tests {
             RebalancingSchedulers::new(&pool),
         ));
         (service, receiver)
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_scan_enqueues_persisted_unwrapped_wallet_balance() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mut balances = BTreeMap::new();
+        balances.insert(symbol.clone(), FractionalShares::new(float!(5)));
+        let now = Utc::now();
+        let inventory_view = InventoryView::default().set_inflight_equity_at_location(
+            InFlightEquityLocation::BaseWalletUnwrapped,
+            &balances,
+            now,
+            now,
+        );
+
+        let mut config = test_config();
+        config.assets.equities.symbols.insert(
+            symbol.clone(),
+            EquityAssetConfig {
+                tokenized_equity: Address::random(),
+                tokenized_equity_derivative: Address::random(),
+                vault_ids: Vec::new(),
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Enabled,
+                wrapped_equity_recovery: OperationMode::Enabled,
+                operational_limit: None,
+            },
+        );
+
+        let pool = crate::test_utils::setup_test_db().await;
+        crate::conductor::setup_apalis_tables(&pool).await.unwrap();
+        let (sender, _receiver) = mpsc::channel(10);
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(inventory_view, event_sender));
+        let service = RebalancingService::new(
+            config,
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory,
+            sender,
+            Arc::new(MockWrapper::new()),
+            RebalancingSchedulers::new(&pool),
+        );
+
+        service.enqueue_recovery_for_current_wallet_balances().await;
+
+        let (jobs,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+            .bind(std::any::type_name::<UnwrappedEquityRecoveryJob>())
+            .fetch_one(service.unwrapped_equity_recovery_queue.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            jobs, 1,
+            "startup recovery scan must enqueue persisted positive unwrapped wallet balances",
+        );
     }
 
     #[tokio::test]

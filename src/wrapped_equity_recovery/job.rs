@@ -10,8 +10,8 @@
 //! Steps:
 //!
 //! 1. Claim the `equity_in_progress` guard for the symbol. If another task
-//!    already holds it, the job exits at debug log; the next inventory
-//!    poll re-evaluates.
+//!    already holds it, the job reschedules itself with a delay so an
+//!    unchanged wallet balance is not stranded waiting for another snapshot.
 //! 2. Read the inventory view's wallet balance + active mint/redemption
 //!    maps to pick a `DispatchDecision`.
 //! 3. Send `Detect` followed by the path-specific command sequence:
@@ -27,6 +27,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -37,7 +38,7 @@ use super::aggregate::{
     WrappedEquityRecovery, WrappedEquityRecoveryCommand, WrappedEquityRecoveryError,
     WrappedEquityRecoveryId,
 };
-use crate::conductor::job::{Job, JobQueue, Label};
+use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::equity_redemption::{EquityRedemption, RedemptionAggregateId};
 use crate::inventory::BroadcastingInventory;
 use crate::inventory::view::{InFlightEquityLocation, InventoryView};
@@ -55,6 +56,10 @@ pub(crate) struct WrappedEquityRecoveryCtx {
     pub(crate) mint_store: Arc<Store<TokenizedEquityMint>>,
     pub(crate) redemption_store: Arc<Store<EquityRedemption>>,
     pub(crate) equity_in_progress: Arc<RwLock<HashSet<Symbol>>>,
+    /// Queue used for delayed self-reschedule when the shared equity guard is
+    /// held by another recovery/transfer job.
+    pub(crate) queue: WrappedEquityRecoveryJobQueue,
+    pub(crate) reschedule_interval: Duration,
 }
 
 /// Why a single recovery job attempt failed. Errors propagate up through
@@ -132,6 +137,9 @@ pub(crate) enum WrappedEquityRecoveryJobError {
             st0x_event_sorcery::LifecycleError<crate::equity_redemption::EquityRedemption>,
         >,
     ),
+
+    #[error("failed to reschedule recovery job after guard contention: {0}")]
+    Reschedule(#[from] QueuePushError),
 }
 
 /// Apalis job payload. The reactor pushes one of these per symbol with a
@@ -168,8 +176,12 @@ impl Job<WrappedEquityRecoveryCtx> for WrappedEquityRecoveryJob {
                 target: "rebalance",
                 %symbol,
                 recovery_id = %self.recovery_id,
-                "Skipping wrapped equity recovery: equity_in_progress already held",
+                "Rescheduling wrapped equity recovery: equity_in_progress already held",
             );
+            ctx.queue
+                .clone()
+                .push_with_delay(self.clone(), ctx.reschedule_interval)
+                .await?;
             return Ok(());
         };
 
@@ -439,4 +451,137 @@ fn claim_guard(set: &Arc<RwLock<HashSet<Symbol>>>, symbol: &Symbol) -> Option<In
         symbol: symbol.clone(),
         set: Arc::clone(set),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::Address;
+    use std::sync::{Arc, RwLock};
+    use tokio::sync::broadcast;
+    use uuid::Uuid;
+
+    use st0x_event_sorcery::test_store;
+
+    use super::super::aggregate::WrappedEquityRecoveryServices;
+    use super::*;
+    use crate::conductor::setup_apalis_tables;
+    use crate::inventory::BroadcastingInventory;
+    use crate::inventory::view::InventoryView;
+    use crate::onchain::mock::MockRaindex;
+    use crate::onchain::raindex::Raindex;
+    use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
+    use crate::tokenization::mock::MockTokenizer;
+    use crate::wrapper::Wrapper;
+    use crate::wrapper::mock::MockWrapper;
+
+    #[tokio::test]
+    async fn guard_contention_reschedules_without_dropping_the_recovery() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let equity_in_progress = Arc::new(RwLock::new(HashSet::from([symbol.clone()])));
+
+        let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        setup_apalis_tables(&pool).await.unwrap();
+
+        let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
+        let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
+        let transfer_services = EquityTransferServices {
+            raindex: raindex.clone(),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: wrapper.clone(),
+        };
+        let mint_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
+        let redemption_store = Arc::new(test_store(pool.clone(), transfer_services));
+        let transfer = Arc::new(CrossVenueEquityTransfer::new(
+            raindex.clone(),
+            Arc::new(MockTokenizer::new()),
+            wrapper.clone(),
+            Address::random(),
+            mint_store.clone(),
+            redemption_store.clone(),
+        ));
+        let store = Arc::new(test_store(
+            pool.clone(),
+            WrappedEquityRecoveryServices {
+                raindex,
+                wrapper,
+                transfer,
+            },
+        ));
+
+        let (sender, _receiver) = broadcast::channel(16);
+        let inventory = Arc::new(BroadcastingInventory::new(InventoryView::default(), sender));
+        let ctx = WrappedEquityRecoveryCtx {
+            inventory,
+            store,
+            mint_store,
+            redemption_store,
+            equity_in_progress,
+            queue: WrappedEquityRecoveryJobQueue::new(&pool),
+            reschedule_interval: Duration::from_secs(1),
+        };
+        let job = WrappedEquityRecoveryJob {
+            symbol: symbol.clone(),
+            recovery_id: WrappedEquityRecoveryId(Uuid::new_v4()),
+        };
+
+        job.perform(&ctx).await.unwrap();
+
+        let state = ctx.store.load(&job.recovery_id).await.unwrap();
+        assert!(
+            state.is_none(),
+            "guard-held perform() must not start recovery; aggregate should be absent, got {state:?}",
+        );
+
+        let (rescheduled,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+            .bind(std::any::type_name::<WrappedEquityRecoveryJob>())
+            .fetch_one(ctx.queue.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            rescheduled, 1,
+            "guard contention must reschedule the wrapped recovery job, not mark it done",
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_dedup_matches_symbol_exactly_not_as_substring() {
+        let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
+        setup_apalis_tables(&pool).await.unwrap();
+
+        let mut queue = WrappedEquityRecoveryJobQueue::new(&pool);
+        queue
+            .push(WrappedEquityRecoveryJob {
+                symbol: Symbol::new("GOOGL").unwrap(),
+                recovery_id: WrappedEquityRecoveryId(Uuid::new_v4()),
+            })
+            .await
+            .unwrap();
+
+        // The exact query the reactor uses to dedupe wrapped-recovery enqueues.
+        const DEDUP_QUERY: &str = "SELECT COUNT(*) FROM Jobs \
+             WHERE job_type = ? \
+             AND status IN ('Pending', 'Queued', 'Running') \
+             AND json_extract(job, '$.symbol') = ?";
+        let job_type = std::any::type_name::<WrappedEquityRecoveryJob>();
+
+        let (exact,): (i64,) = sqlx::query_as(DEDUP_QUERY)
+            .bind(job_type)
+            .bind("GOOGL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(exact, 1, "exact symbol must match the queued GOOGL job");
+
+        let (substring,): (i64,) = sqlx::query_as(DEDUP_QUERY)
+            .bind(job_type)
+            .bind("GOOG")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            substring, 0,
+            "a substring ticker (GOOG) must not match the queued GOOGL job",
+        );
+    }
 }
