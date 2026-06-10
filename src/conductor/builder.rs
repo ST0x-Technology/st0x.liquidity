@@ -55,6 +55,9 @@ use crate::trading::offchain::hedge::{HedgeCtx, HedgeJobQueue, PlaceHedge};
 use crate::trading::onchain::trade_accountant::{
     AccountForDexTrade, AccountantCtx, DexTradeAccountingJobQueue, TradeAccountingError,
 };
+use crate::unwrapped_equity_recovery::{
+    UnwrappedEquityRecoveryCtx, UnwrappedEquityRecoveryJob, UnwrappedEquityRecoveryJobQueue,
+};
 use crate::vault_registry::{
     SeedVaultRegistry, SeedVaultRegistryCtx, SeedVaultRegistryJobQueue, VaultRegistry,
 };
@@ -102,6 +105,8 @@ pub(crate) fn spawn<Prov, Exec>(
     check_positions_queue: CheckPositionsJobQueue,
     wrapped_equity_recovery_queue: WrappedEquityRecoveryJobQueue,
     wrapped_equity_recovery_ctx: Option<Arc<WrappedEquityRecoveryCtx>>,
+    unwrapped_equity_recovery_queue: UnwrappedEquityRecoveryJobQueue,
+    unwrapped_equity_recovery_ctx: Option<Arc<UnwrappedEquityRecoveryCtx>>,
     equity_check_scheduler: EquityRebalancingCheckScheduler,
     usdc_check_scheduler: UsdcRebalancingCheckScheduler,
     transfer_usdc_to_hedging_queue: TransferUsdcToHedgingJobQueue,
@@ -304,6 +309,8 @@ where
         check_positions_queue,
         wrapped_equity_recovery_queue,
         wrapped_equity_recovery_ctx,
+        unwrapped_equity_recovery_queue,
+        unwrapped_equity_recovery_ctx,
         equity_check_scheduler,
         usdc_check_scheduler,
         transfer_usdc_to_hedging_queue,
@@ -356,6 +363,8 @@ where
     check_positions_queue: CheckPositionsJobQueue,
     wrapped_equity_recovery_queue: WrappedEquityRecoveryJobQueue,
     wrapped_equity_recovery_ctx: Option<Arc<WrappedEquityRecoveryCtx>>,
+    unwrapped_equity_recovery_queue: UnwrappedEquityRecoveryJobQueue,
+    unwrapped_equity_recovery_ctx: Option<Arc<UnwrappedEquityRecoveryCtx>>,
     equity_check_scheduler: EquityRebalancingCheckScheduler,
     usdc_check_scheduler: UsdcRebalancingCheckScheduler,
     transfer_usdc_to_hedging_queue: TransferUsdcToHedgingJobQueue,
@@ -395,6 +404,8 @@ where
             check_positions_queue,
             wrapped_equity_recovery_queue,
             wrapped_equity_recovery_ctx,
+            unwrapped_equity_recovery_queue,
+            unwrapped_equity_recovery_ctx,
             equity_check_scheduler,
             usdc_check_scheduler,
             transfer_usdc_to_hedging_queue,
@@ -426,6 +437,8 @@ where
         #[cfg(any(test, feature = "test-support"))]
         let failure_injector_for_wrapped_equity_recovery = failure_injector.clone();
         #[cfg(any(test, feature = "test-support"))]
+        let failure_injector_for_unwrapped_equity_recovery = failure_injector.clone();
+        #[cfg(any(test, feature = "test-support"))]
         let failure_injector_for_check_positions = failure_injector.clone();
         #[cfg(any(test, feature = "test-support"))]
         let failure_injector_for_transfer_usdc_to_hedging = failure_injector.clone();
@@ -441,6 +454,7 @@ where
         let failure_notify_for_usdc_rebalancing_check = failure_notify.clone();
         let failure_notify_for_seed_vault_registry = failure_notify.clone();
         let failure_notify_for_wrapped_equity_recovery = failure_notify.clone();
+        let failure_notify_for_unwrapped_equity_recovery = failure_notify.clone();
         let failure_notify_for_check_positions = failure_notify.clone();
         let failure_notify_for_transfer_usdc_to_hedging = failure_notify.clone();
         let failure_notify_for_transfer_usdc_to_market_making = failure_notify.clone();
@@ -458,6 +472,7 @@ where
         let fail_stop_for_usdc_rebalancing_check = fail_stop.clone();
         let fail_stop_for_seed_vault_registry = fail_stop.clone();
         let fail_stop_for_wrapped_equity_recovery = fail_stop.clone();
+        let fail_stop_for_unwrapped_equity_recovery = fail_stop.clone();
         let fail_stop_for_check_positions = fail_stop.clone();
         let fail_stop_for_transfer_usdc_to_hedging = fail_stop.clone();
         let fail_stop_for_transfer_usdc_to_market_making = fail_stop.clone();
@@ -608,6 +623,16 @@ where
                 failure_injector_for_wrapped_equity_recovery,
             );
 
+            let apalis_monitor = register_unwrapped_equity_recovery_worker(
+                apalis_monitor,
+                unwrapped_equity_recovery_ctx,
+                unwrapped_equity_recovery_queue,
+                fail_stop_for_unwrapped_equity_recovery,
+                failure_notify_for_unwrapped_equity_recovery,
+                #[cfg(any(test, feature = "test-support"))]
+                failure_injector_for_unwrapped_equity_recovery,
+            );
+
             let apalis_monitor = register_transfer_usdc_to_hedging_worker(
                 apalis_monitor,
                 transfer_usdc_to_hedging_ctx,
@@ -689,6 +714,38 @@ fn register_wrapped_equity_recovery_worker(
     monitor.register(move |index| {
         build_supervised_worker!(
             ::<WrappedEquityRecoveryCtx, WrappedEquityRecoveryJob>,
+            index,
+            recovery_queue.clone(),
+            recovery_ctx.clone(),
+            fail_stop.clone(),
+            failure_notify.clone(),
+            #[cfg(any(test, feature = "test-support"))]
+            failure_injector.clone(),
+        )
+    })
+}
+
+/// Conditionally registers the unwrapped-equity recovery worker. Same
+/// pattern as `register_wrapped_equity_recovery_worker`.
+fn register_unwrapped_equity_recovery_worker(
+    monitor: Monitor,
+    recovery_ctx: Option<Arc<UnwrappedEquityRecoveryCtx>>,
+    recovery_queue: UnwrappedEquityRecoveryJobQueue,
+    fail_stop: CircuitBreakerConfig,
+    failure_notify: Arc<tokio::sync::Notify>,
+    #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
+) -> Monitor {
+    let Some(recovery_ctx) = recovery_ctx else {
+        debug!(
+            "Unwrapped-equity recovery worker not registered: rebalancing disabled \
+             (no recovery ctx). Detected tSTOCK on the bot wallet will not be recovered."
+        );
+        return monitor;
+    };
+
+    monitor.register(move |index| {
+        build_supervised_worker!(
+            ::<UnwrappedEquityRecoveryCtx, UnwrappedEquityRecoveryJob>,
             index,
             recovery_queue.clone(),
             recovery_ctx.clone(),

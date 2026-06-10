@@ -9,3 +9,8 @@
 
 pub(crate) mod aggregate;
 mod job;
+
+pub(crate) use aggregate::{UnwrappedEquityRecovery, UnwrappedEquityRecoveryServices};
+pub(crate) use job::{
+    UnwrappedEquityRecoveryCtx, UnwrappedEquityRecoveryJob, UnwrappedEquityRecoveryJobQueue,
+};
