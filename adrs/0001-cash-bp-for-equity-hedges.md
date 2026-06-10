@@ -1,4 +1,4 @@
-# ADR 1: Use Alpaca `cash` (not `non_marginable_buying_power`) for equity hedge preflight
+# ADR 0001: Use Alpaca `cash` (not `non_marginable_buying_power`) for equity hedge preflight
 
 ## Status
 
