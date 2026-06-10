@@ -249,18 +249,30 @@ optional `tokenizer: Option<Arc<dyn Tokenizer>>`, shutdown token).
 
 ```
 Phase 1: connect_http (with RPC probe) | setup_apalis_tables | build CQRS stores
-Phase 2: seed_vault_registry (inline) | setup_rebalancing (optional)
-Phase 3: requeue_orphaned jobs | hydrate inventory | recover pending orders
+Phase 2: seed_vault_registry (inline, must complete before downstream wiring)
+Phase 3: setup_rebalancing (optional) | requeue_orphaned jobs | hydrate inventory |
+         recover pending orders
 Phase 4: builder::spawn() starts supervisor + apalis workers
 ```
 
 There is no WebSocket and no pre-runtime backfill pass. `Conductor::run()`
-creates a single HTTP provider before spawn; `OrderFillMonitor` clones it and,
-on each tick, derives the confirmation cutoff and enqueues a `BackfillRange` for
-any gap since the persisted checkpoint. The backfill and trade-accounting
-workers start together in Phase 4. Ingestion is checkpoint-driven `eth_getLogs`
-polling, not a live subscription, so no events are missed across downtime: the
-monitor always resumes from the persisted checkpoint and re-scans any gap.
+creates a single HTTP provider before spawn; `OrderFillMonitor` clones it and
+uses it for each poll tick.
+
+Vault registry seeding (`SeedVaultRegistry`) runs inline during Phase 2 so that
+`RaindexService`, trade accounting, and inventory polling start with a populated
+registry. The same `SeedVaultRegistry` job is also registered as an apalis
+worker so the queue can retry on failure if seeding is re-triggered later (e.g.
+from a recovery flow).
+
+Ingestion is checkpoint-driven `eth_getLogs` polling, not a live subscription,
+so no events are missed across downtime. Deriving the cutoff
+(`tip - required_confirmations`) is not a startup phase -- the
+`OrderFillMonitor` poll loop reads the chain tip every tick and enqueues a
+`BackfillRange` job for the gap since the persisted checkpoint. The backfill and
+trade-accounting workers start together in Phase 4; catch-up backfill runs
+continuously after spawn while the monitor always resumes from the persisted
+checkpoint and re-scans any gap.
 
 Backfill reads the last successful checkpoint from SQLite. The configured
 `deployment_block` seeds only the first run; subsequent runs start at

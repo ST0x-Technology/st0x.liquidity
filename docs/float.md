@@ -84,7 +84,7 @@ let negated = (-a)?;
 | `FractionalShares`  | `FractionalShares(Decimal)` | `FractionalShares(Float)` |
 | `Usdc` (threshold)  | `Usdc(Decimal)`             | `Usdc(Float)`             |
 | `Usdc` (onchain/io) | `Usdc(Decimal)`             | `Usdc(Float)`             |
-| `Dollars`           | `Dollars(Decimal)`          | `Dollars(Float)`          |
+| `Usd`               | `Usd(Decimal)`              | `Usd(Float)`              |
 | Pyth prices         | `Decimal`                   | `Float`                   |
 | Inventory balances  | `Decimal`                   | `Float`                   |
 | Position events     | `Decimal`                   | `Float`                   |
