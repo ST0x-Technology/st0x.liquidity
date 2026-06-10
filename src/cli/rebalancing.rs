@@ -19,6 +19,7 @@ use st0x_execution::{
 };
 use st0x_finance::Usdc;
 use st0x_raindex::{RaindexService, RaindexVaultId};
+use st0x_wrapper::{Wrapper, WrapperService};
 
 use super::{TransferDirection, TransferType};
 use crate::alpaca_wallet::AlpacaWalletService;
@@ -26,6 +27,7 @@ use crate::bindings::IERC20;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId};
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, Equity, EquityTransferServices};
+use crate::rebalancing::to_wrapped_equities;
 use crate::rebalancing::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
 use crate::rebalancing::usdc::CrossVenueCashTransfer;
 use crate::rebalancing::usdc::UsdcTransferError;
@@ -38,7 +40,6 @@ use crate::tokenized_equity_mint::{
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceId};
 use crate::vault_lookup::{VaultLookup, VaultRegistryLookup};
 use crate::vault_registry::VaultRegistry;
-use crate::wrapper::{Wrapper, WrapperService};
 use st0x_config::{BrokerCtx, Ctx};
 
 struct EquityTransferCliServices {
@@ -83,7 +84,7 @@ async fn build_equity_transfer_services(
 
     let wrapper: Arc<dyn Wrapper> = Arc::new(WrapperService::new(
         base_caller.clone(),
-        ctx.assets.equities.symbols.clone(),
+        to_wrapped_equities(&ctx.assets.equities.symbols),
     ));
 
     let vault_lookup: Arc<dyn VaultLookup> = Arc::new(VaultRegistryLookup::new(

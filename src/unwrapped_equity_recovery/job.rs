@@ -675,6 +675,7 @@ mod tests {
 
     use st0x_event_sorcery::test_store;
     use st0x_raindex::{Raindex, RaindexVaultId};
+    use st0x_wrapper::{MockWrapper, Wrapper};
 
     use crate::conductor::setup_apalis_tables;
     use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand};
@@ -684,8 +685,6 @@ mod tests {
     use crate::tokenization::mock::{MockCompletionOutcome, MockDetectionOutcome, MockTokenizer};
     use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintCommand};
     use crate::vault_lookup::MockVaultLookup;
-    use crate::wrapper::Wrapper;
-    use crate::wrapper::mock::MockWrapper;
 
     use super::super::aggregate::UnwrappedEquityRecoveryServices;
     use super::*;

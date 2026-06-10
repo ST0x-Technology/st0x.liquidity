@@ -6270,6 +6270,7 @@ dependencies = [
  "st0x-float-serde",
  "st0x-hedge",
  "st0x-raindex",
+ "st0x-wrapper",
  "task-supervisor",
  "temp-env",
  "tempfile",
@@ -6309,6 +6310,22 @@ dependencies = [
  "tracing",
  "tracing-test",
  "url",
+]
+
+[[package]]
+name = "st0x-wrapper"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "alloy-primitives",
+ "async-trait",
+ "rain-math-float",
+ "st0x-evm",
+ "st0x-execution",
+ "st0x-float-macro",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

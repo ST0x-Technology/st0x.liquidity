@@ -34,6 +34,7 @@ use st0x_execution::{
     ExecutionError, Executor, FractionalShares, MarketOrder, Symbol, TryIntoExecutor,
 };
 use st0x_raindex::{RaindexService, RaindexVaultId};
+use st0x_wrapper::WrapperService;
 
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::conductor::exit::{ConductorExit, MonitorTaskError};
@@ -63,7 +64,7 @@ use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferService
 use crate::rebalancing::usdc::{TransferUsdcToHedgingCtx, TransferUsdcToMarketMakingCtx};
 use crate::rebalancing::{
     RebalancerServices, RebalancingCqrsFrameworks, RebalancingSchedulers, RebalancingService,
-    RebalancingServiceConfig,
+    RebalancingServiceConfig, to_wrapped_equities,
 };
 use crate::symbol::cache::SymbolCache;
 use crate::tokenization::Tokenizer;
@@ -84,7 +85,6 @@ use crate::wrapped_equity_recovery::{
     WrappedEquityRecovery, WrappedEquityRecoveryCtx, WrappedEquityRecoveryJobQueue,
     WrappedEquityRecoveryServices,
 };
-use crate::wrapper::WrapperService;
 
 pub(crate) use builder::CqrsFrameworks;
 use manifest::QueryManifest;
@@ -949,7 +949,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
 
         let wrapper = Arc::new(WrapperService::new(
             base_wallet.clone(),
-            deps.ctx.assets.equities.symbols.clone(),
+            to_wrapped_equities(&deps.ctx.assets.equities.symbols),
         ));
 
         let equity_transfer_services = EquityTransferServices {
@@ -2242,6 +2242,7 @@ mod tests {
     };
     use st0x_finance::{Usd, Usdc};
     use st0x_float_macro::float;
+    use st0x_wrapper::{MockWrapper, RATIO_ONE, UnderlyingPerWrapped};
 
     use super::*;
     use crate::bindings::IRaindexV6::{
@@ -2257,8 +2258,6 @@ mod tests {
     use crate::trading::onchain::inclusion::EmittedOnChain;
     use crate::unwrapped_equity_recovery::UnwrappedEquityRecoveryJob;
     use crate::unwrapped_equity_recovery::aggregate::UnwrappedEquityRecoveryId;
-    use crate::wrapper::mock::MockWrapper;
-    use crate::wrapper::{RATIO_ONE, UnderlyingPerWrapped};
 
     fn one_to_one_ratio() -> UnderlyingPerWrapped {
         UnderlyingPerWrapped::new(RATIO_ONE).unwrap()

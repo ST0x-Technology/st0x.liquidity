@@ -26,6 +26,7 @@ use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::EvmError;
 use st0x_execution::{FractionalShares, SharesConversionError, Symbol};
 use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
+use st0x_wrapper::{UnderlyingPerWrapped, Wrapper, WrapperError};
 
 use super::RebalancingService;
 use super::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
@@ -42,7 +43,6 @@ use crate::tokenized_equity_mint::{
     TokenizedEquityMintCommand,
 };
 use crate::vault_lookup::{VaultLookup, VaultLookupError};
-use crate::wrapper::{UnderlyingPerWrapped, Wrapper, WrapperError};
 
 /// A quantity of equity in a specific symbol.
 #[derive(Debug)]
@@ -1556,6 +1556,7 @@ mod tests {
     use st0x_float_macro::float;
 
     use st0x_config::{AssetsConfig, EquitiesConfig};
+    use st0x_wrapper::MockWrapper;
 
     use super::*;
     use crate::inventory::{
@@ -1568,7 +1569,6 @@ mod tests {
     };
     use crate::vault_lookup::MockVaultLookup;
     use crate::vault_registry::VaultRegistry;
-    use crate::wrapper::mock::MockWrapper;
 
     fn mock_vault_lookup() -> MockVaultLookup {
         MockVaultLookup::new()

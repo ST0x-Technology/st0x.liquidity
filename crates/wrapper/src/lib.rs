@@ -1,10 +1,12 @@
 //! Token wrapping/unwrapping abstractions for ERC-4626 vaults.
-
-mod ratio;
-mod share;
-
-#[cfg(test)]
-pub(crate) mod mock;
+//!
+//! This crate provides the generic [`Wrapper`] trait for wrapping and unwrapping
+//! tokenized equity against ERC-4626 vaults, plus the shared domain types
+//! ([`WrapperError`], [`UnderlyingPerWrapped`], [`RatioError`], [`WrappedEquity`]).
+//!
+//! The default (no-feature) build ships only the trait and domain types. The
+//! ERC-4626 implementation ([`WrapperService`]) is gated behind the `erc4626`
+//! feature, and the test mock (`MockWrapper`) behind the `mock` feature.
 
 use alloy::contract::Error as ContractError;
 use alloy::primitives::{Address, TxHash, U256};
@@ -13,15 +15,39 @@ use async_trait::async_trait;
 use st0x_evm::EvmError;
 use st0x_execution::Symbol;
 
-pub(crate) use ratio::{RatioError, UnderlyingPerWrapped};
-pub(crate) use share::WrapperService;
+mod ratio;
 
-#[cfg(test)]
-pub(crate) use ratio::RATIO_ONE;
+#[cfg(feature = "erc4626")]
+mod service;
+
+#[cfg(feature = "mock")]
+mod mock;
+
+pub use ratio::{RATIO_ONE, RatioError, UnderlyingPerWrapped};
+
+#[cfg(feature = "erc4626")]
+pub use service::WrapperService;
+
+#[cfg(feature = "mock")]
+pub use mock::MockWrapper;
+
+/// The underlying and derivative (ERC-4626 vault) token addresses for a wrappable
+/// equity symbol.
+///
+/// Narrow replacement for the integration crate's view of `EquityAssetConfig`:
+/// `st0x-wrapper` only needs the two token addresses, not the full asset config,
+/// so it stays independent of `st0x-config`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WrappedEquity {
+    /// The tokenized equity (underlying) token.
+    pub underlying: Address,
+    /// The tokenized equity derivative (ERC-4626 vault / wrapped) token.
+    pub derivative: Address,
+}
 
 /// Error type for wrapper operations.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum WrapperError {
+pub enum WrapperError {
     #[error("Symbol not configured: {0}")]
     SymbolNotConfigured(Symbol),
     #[error("Missing Deposit event in transaction receipt")]
@@ -38,7 +64,7 @@ pub(crate) enum WrapperError {
 
 /// Trait for wrapping and unwrapping tokens via ERC-4626 vaults.
 #[async_trait]
-pub(crate) trait Wrapper: Send + Sync {
+pub trait Wrapper: Send + Sync {
     /// Gets the underlying-per-wrapped ratio for a symbol.
     async fn get_ratio_for_symbol(
         &self,

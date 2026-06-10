@@ -2,18 +2,14 @@
 //! and builders for onchain trades and offchain executions.
 
 use alloy::network::TransactionBuilder;
-use alloy::primitives::{Address, B256, Bytes, LogData, TxHash, address, bytes, fixed_bytes};
+use alloy::primitives::{Address, B256, LogData, address, bytes, fixed_bytes};
+use alloy::providers::Provider;
 use alloy::providers::ext::AnvilApi as _;
-use alloy::providers::{Provider, RootProvider};
-use alloy::rpc::client::RpcClient;
-use alloy::rpc::types::{Log, TransactionReceipt, TransactionRequest};
-use async_trait::async_trait;
+use alloy::rpc::types::{Log, TransactionRequest};
 use chrono::Utc;
 use rain_math_float::Float;
 use sqlx::SqlitePool;
-use std::sync::Arc;
 
-use st0x_evm::{Evm, EvmError, Wallet};
 use st0x_execution::{Direction, FractionalShares, Positive};
 
 use crate::bindings::IRaindexV6::{EvaluableV4, IOV2, OrderV4};
@@ -54,68 +50,6 @@ pub(crate) async fn deploy_tofu_singleton<P: Provider>(provider: &P) {
         .anvil_set_code(TOFU_TOKEN_DECIMALS, runtime)
         .await
         .unwrap();
-}
-
-/// Panicking wallet stub for tests that construct `RebalancingCtx`
-/// without needing real chain connectivity. Provider type matches
-/// production (`RootProvider`) so it fits `Arc<dyn Wallet<Provider =
-/// RootProvider>>`.
-pub(crate) struct StubWallet {
-    address: Address,
-    provider: RootProvider,
-}
-
-impl StubWallet {
-    pub(crate) fn stub(address: Address) -> Arc<dyn Wallet<Provider = RootProvider>> {
-        Arc::new(Self {
-            address,
-            provider: RootProvider::new(
-                RpcClient::builder().http("http://stub.invalid".parse().unwrap()),
-            ),
-        })
-    }
-}
-
-#[async_trait]
-impl Evm for StubWallet {
-    type Provider = RootProvider;
-
-    fn provider(&self) -> &RootProvider {
-        &self.provider
-    }
-}
-
-#[async_trait]
-impl Wallet for StubWallet {
-    fn address(&self) -> Address {
-        self.address
-    }
-
-    async fn send_pending(
-        &self,
-        _contract: Address,
-        _calldata: Bytes,
-        _note: &str,
-    ) -> Result<TxHash, EvmError> {
-        panic!(
-            "StubWallet::send_pending called - use a real wallet in tests that need transactions"
-        )
-    }
-
-    async fn await_receipt(&self, _tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
-        panic!(
-            "StubWallet::await_receipt called - use a real wallet in tests that need transactions"
-        )
-    }
-
-    async fn send(
-        &self,
-        _contract: Address,
-        _calldata: Bytes,
-        _note: &str,
-    ) -> Result<TransactionReceipt, EvmError> {
-        panic!("StubWallet::send called - use a real wallet in tests that need transactions")
-    }
 }
 
 /// Returns a test `OrderV4` instance that is shared across multiple

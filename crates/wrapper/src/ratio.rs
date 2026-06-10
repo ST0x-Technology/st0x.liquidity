@@ -6,10 +6,10 @@
 
 use alloy::primitives::U256;
 
-use crate::shares::{FractionalShares, SharesConversionError};
+use st0x_execution::{FractionalShares, SharesConversionError};
 
 /// One unit in ratio representation (10^18).
-pub(crate) const RATIO_ONE: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
+pub const RATIO_ONE: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
 
 /// Ratio of underlying tokens per wrapped token.
 ///
@@ -18,14 +18,14 @@ pub(crate) const RATIO_ONE: U256 = U256::from_limbs([1_000_000_000_000_000_000, 
 /// A ratio of 1.0 means 1 wrapped token = 1 underlying token.
 /// A ratio of 1.05 means 1 wrapped token = 1.05 underlying tokens (5% appreciation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct UnderlyingPerWrapped {
+pub struct UnderlyingPerWrapped {
     /// Underlying tokens per wrapped share with 18 decimals precision.
     /// Obtained from vault's `convertToAssets(10^18)`.
     ratio: U256,
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum RatioError {
+pub enum RatioError {
     #[error("Division by zero: ratio is zero")]
     DivisionByZero,
     #[error("Arithmetic overflow during conversion")]
@@ -41,7 +41,7 @@ impl UnderlyingPerWrapped {
     ///
     /// * `ratio` - The number of underlying tokens per wrapped share,
     ///   with 18 decimals of precision (e.g., 1_000_000_000_000_000_000 = 1.0).
-    pub(crate) fn new(ratio: U256) -> Result<Self, RatioError> {
+    pub fn new(ratio: U256) -> Result<Self, RatioError> {
         if ratio.is_zero() {
             return Err(RatioError::DivisionByZero);
         }
@@ -52,7 +52,7 @@ impl UnderlyingPerWrapped {
     /// Converts wrapped token amount to underlying amount.
     ///
     /// Formula: underlying = wrapped * ratio / 10^18
-    pub(crate) fn to_underlying(self, wrapped: U256) -> Result<U256, RatioError> {
+    pub fn to_underlying(self, wrapped: U256) -> Result<U256, RatioError> {
         let numerator = wrapped
             .checked_mul(self.ratio)
             .ok_or(RatioError::Overflow)?;
@@ -63,7 +63,7 @@ impl UnderlyingPerWrapped {
     /// Converts wrapped FractionalShares to underlying FractionalShares.
     ///
     /// Handles the conversion chain: FractionalShares -> U256 -> apply ratio -> FractionalShares.
-    pub(crate) fn to_underlying_fractional(
+    pub fn to_underlying_fractional(
         self,
         wrapped: FractionalShares,
     ) -> Result<FractionalShares, RatioError> {

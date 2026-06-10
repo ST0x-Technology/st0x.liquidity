@@ -22,6 +22,7 @@ use st0x_event_sorcery::{
 };
 use st0x_execution::{FractionalShares, Positive, SharesConversionError, Symbol};
 use st0x_finance::{HasZero, Usd, Usdc};
+use st0x_wrapper::{Wrapper, WrapperError};
 
 use self::usdc::UsdcRebalanceOperation;
 use crate::conductor::job::QueuePushError;
@@ -54,7 +55,6 @@ use crate::usdc_rebalance::{
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 use crate::wrapped_equity_recovery::aggregate::WrappedEquityRecoveryId;
 use crate::wrapped_equity_recovery::{WrappedEquityRecoveryJob, WrappedEquityRecoveryJobQueue};
-use crate::wrapper::{Wrapper, WrapperError};
 
 pub(crate) use equity::{EquityRebalancingCheck, EquityRebalancingCheckScheduler};
 pub(crate) use usdc::{UsdcRebalancingCheck, UsdcRebalancingCheckScheduler};
@@ -3648,6 +3648,7 @@ mod tests {
     };
     use st0x_finance::{Usd, Usdc};
     use st0x_float_macro::float;
+    use st0x_wrapper::MockWrapper;
 
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
@@ -3665,7 +3666,6 @@ mod tests {
         TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
     };
     use crate::vault_registry::VaultRegistryCommand;
-    use crate::wrapper::mock::MockWrapper;
 
     fn test_config() -> RebalancingServiceConfig {
         RebalancingServiceConfig {

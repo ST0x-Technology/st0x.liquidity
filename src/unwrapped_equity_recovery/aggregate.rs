@@ -47,12 +47,12 @@ use uuid::Uuid;
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_raindex::Raindex;
+use st0x_wrapper::{Wrapper, WrapperError};
 
 use crate::equity_redemption::RedemptionAggregateId;
 use crate::rebalancing::equity::CrossVenueEquityTransfer;
 use crate::tokenized_equity_mint::{IssuerRequestId, TOKENIZED_EQUITY_DECIMALS};
 use crate::vault_lookup::VaultLookup;
-use crate::wrapper::Wrapper;
 
 /// Aggregate identifier. Each detection creates a fresh UUID; multiple
 /// recoveries for the same symbol are independent aggregates.
@@ -698,18 +698,13 @@ async fn confirm_orphan_wrap_or_fail(
         Err(error) => {
             warn!(target: "rebalance", %symbol, %wrap_tx_hash, ?error, "Unwrapped equity recovery: confirm_wrap failed");
             match error {
-                crate::wrapper::WrapperError::MissingDepositEvent => {
+                WrapperError::MissingDepositEvent
+                | WrapperError::Evm(st0x_evm::EvmError::TransactionDropped { .. }) => {
                     Ok(vec![UnwrappedEquityRecoveryEvent::RecoveryFailed {
                         reason: format!("wrapper.confirm_wrap failed: {error}"),
                         failed_at: Utc::now(),
                     }])
                 }
-                crate::wrapper::WrapperError::Evm(st0x_evm::EvmError::TransactionDropped {
-                    ..
-                }) => Ok(vec![UnwrappedEquityRecoveryEvent::RecoveryFailed {
-                    reason: format!("wrapper.confirm_wrap failed: {error}"),
-                    failed_at: Utc::now(),
-                }]),
                 _ => Err(UnwrappedEquityRecoveryError::RetryableWrapConfirmation { wrap_tx_hash }),
             }
         }
@@ -819,12 +814,12 @@ mod tests {
     use st0x_event_sorcery::EventSourced;
     use st0x_execution::{FractionalShares, Symbol};
     use st0x_raindex::RaindexVaultId;
+    use st0x_wrapper::MockWrapper;
 
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::tokenization::mock::MockTokenizer;
     use crate::vault_lookup::{MockVaultLookup, VaultLookup};
-    use crate::wrapper::mock::MockWrapper;
 
     use super::*;
 
