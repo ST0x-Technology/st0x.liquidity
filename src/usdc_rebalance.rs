@@ -121,6 +121,17 @@ pub(crate) enum RebalanceDirection {
     BaseToAlpaca,
 }
 
+/// Why an operator reconciled a USDC rebalance stranded in the post-burn
+/// terminal `DepositFailed` state. The funds were handled out-of-band, so the
+/// reconcile records the reason rather than re-driving the failed deposit.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum ReconcileReason {
+    /// The minted USDC was moved to its destination manually.
+    FundsMovedManually,
+    /// The deposit was credited at the destination outside the bot's view.
+    DepositCreditedOffline,
+}
+
 /// Errors that can occur during USDC rebalance operations.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum UsdcRebalanceError {
@@ -284,6 +295,13 @@ pub(crate) enum UsdcRebalanceCommand {
     },
     /// Record deposit failure. Valid only from `DepositInitiated` state.
     FailDeposit { reason: String },
+    /// Reconcile a USDC rebalance stranded in the post-burn terminal
+    /// `DepositFailed` state to a guard-clearing terminal `Reconciled` state.
+    /// The minted USDC was handled out-of-band, so this resolves the transfer
+    /// (clearing the in-progress guard and reconciling source-venue inflight)
+    /// rather than re-driving the Alpaca deposit. Valid ONLY from
+    /// `DepositFailed`.
+    ReconcileStuckRebalance { reason: ReconcileReason },
 }
 
 /// Events emitted by the USDC rebalance aggregate.
@@ -418,6 +436,19 @@ pub(crate) enum UsdcRebalanceEvent {
         reason: String,
         failed_at: DateTime<Utc>,
     },
+    /// An operator reconciled a post-burn `DepositFailed` rebalance to the
+    /// guard-clearing terminal `Reconciled` state. Carries `direction` so the
+    /// reactor derives the source venue without in-memory tracking (which may
+    /// be absent after a restart), plus `amount` and `initiated_at` so the
+    /// projection preserves the real post-burn transfer instead of defaulting
+    /// it to a zero-value transfer starting at reconciliation time.
+    OperatorReconciled {
+        direction: RebalanceDirection,
+        amount: Usdc,
+        reason: ReconcileReason,
+        initiated_at: DateTime<Utc>,
+        reconciled_at: DateTime<Utc>,
+    },
 }
 
 impl DomainEvent for UsdcRebalanceEvent {
@@ -444,6 +475,7 @@ impl DomainEvent for UsdcRebalanceEvent {
             Self::DepositInitiated { .. } => "UsdcRebalanceEvent::DepositInitiated",
             Self::DepositConfirmed { .. } => "UsdcRebalanceEvent::DepositConfirmed",
             Self::DepositFailed { .. } => "UsdcRebalanceEvent::DepositFailed",
+            Self::OperatorReconciled { .. } => "UsdcRebalanceEvent::OperatorReconciled",
         }
         .to_string()
     }
@@ -619,9 +651,25 @@ pub(crate) enum UsdcRebalance {
         initiated_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
     },
+    /// An operator reconciled a post-burn `DepositFailed` rebalance
+    /// out-of-band (clearable terminal state). The in-progress guard clears and
+    /// source-venue inflight is reconciled with post-burn semantics. Retains
+    /// `amount` and `initiated_at` so the projection still reports the real
+    /// transfer rather than a zero-value one starting at `reconciled_at`.
+    Reconciled {
+        direction: RebalanceDirection,
+        amount: Usdc,
+        reason: ReconcileReason,
+        initiated_at: DateTime<Utc>,
+        reconciled_at: DateTime<Utc>,
+    },
 }
 
 impl UsdcRebalance {
+    // A single state-dispatch match mapping each state to its DTO tuple, one
+    // trivial arm per state. Splitting it would scatter the mapping across
+    // pointless helpers; per the project guidance, suppress the length lint.
+    #[expect(clippy::too_many_lines)]
     pub(crate) fn to_dto(&self, id: &UsdcRebalanceId) -> TransferOperation {
         let (direction, amount, status, started_at, updated_at) = match self {
             Self::Converting {
@@ -818,6 +866,22 @@ impl UsdcRebalance {
                     *deposit_confirmed_at,
                 )
             }
+
+            Self::Reconciled {
+                direction,
+                amount,
+                initiated_at,
+                reconciled_at,
+                ..
+            } => (
+                direction,
+                *amount,
+                UsdcBridgeStatus::Completed {
+                    completed_at: *reconciled_at,
+                },
+                *initiated_at,
+                *reconciled_at,
+            ),
         };
 
         TransferOperation::UsdcBridge(UsdcBridgeOperation {
@@ -895,8 +959,11 @@ impl UsdcRebalance {
                     RebalanceDirection::AlpacaToBase => false,
                 }
             }
-            // Withdrawal failure is always pre-burn: reconcile to source and clear.
-            Self::WithdrawalFailed { .. } => false,
+            // Withdrawal failure is always pre-burn: reconcile to source and
+            // clear. Operator reconciliation is the explicit clearing terminal
+            // for a post-burn `DepositFailed`, so the guard must not re-latch on
+            // startup for it either.
+            Self::WithdrawalFailed { .. } | Self::Reconciled { .. } => false,
         }
     }
 
@@ -970,7 +1037,8 @@ impl UsdcRebalance {
             | Self::BridgingFailed { direction, .. }
             | Self::DepositInitiated { direction, .. }
             | Self::DepositConfirmed { direction, .. }
-            | Self::DepositFailed { direction, .. } => direction.clone(),
+            | Self::DepositFailed { direction, .. }
+            | Self::Reconciled { direction, .. } => direction.clone(),
         }
     }
 }
@@ -1085,7 +1153,10 @@ impl EventSourced for UsdcRebalance {
     // v2/v3) to clear stale snapshots and rebuild from events, so any persisted
     // `Attested` snapshot is regenerated under the current schema rather than
     // relying on serde's missing-Option-as-None leniency.
-    const SCHEMA_VERSION: u64 = 4;
+    // v5: added the terminal `Reconciled` state (and `OperatorReconciled` event)
+    // for operator reconciliation of a post-burn `DepositFailed`. Bumped to
+    // clear stale snapshots so they rebuild from events under the new schema.
+    const SCHEMA_VERSION: u64 = 5;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use UsdcRebalanceEvent::*;
@@ -1534,6 +1605,37 @@ impl EventSourced for UsdcRebalance {
                 failed_at: *failed_at,
             },
 
+            (
+                OperatorReconciled {
+                    direction,
+                    amount,
+                    reason,
+                    initiated_at,
+                    reconciled_at,
+                },
+                // Mirrors the states `transition_reconcile_stuck_rebalance`
+                // accepts: a post-burn terminal failure that strands the guard.
+                Self::DepositFailed { .. }
+                | Self::BridgingFailed {
+                    burn_tx_hash: Some(_),
+                    ..
+                }
+                | Self::BridgingFailed {
+                    cctp_nonce: Some(_),
+                    ..
+                }
+                | Self::ConversionFailed {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    ..
+                },
+            ) => Self::Reconciled {
+                direction: direction.clone(),
+                amount: *amount,
+                reason: *reason,
+                initiated_at: *initiated_at,
+                reconciled_at: *reconciled_at,
+            },
+
             _ => return Ok(None),
         };
 
@@ -1622,6 +1724,11 @@ impl EventSourced for UsdcRebalance {
             InitiateDeposit { .. } => Err(UsdcRebalanceError::BridgingNotCompleted),
 
             ConfirmDeposit | FailDeposit { .. } => Err(UsdcRebalanceError::DepositNotInitiated),
+
+            ReconcileStuckRebalance { .. } => Err(UsdcRebalanceError::InvalidCommand {
+                command: "ReconcileStuckRebalance".to_string(),
+                state: "Uninitialized".to_string(),
+            }),
         }
     }
 
@@ -1682,6 +1789,7 @@ impl EventSourced for UsdcRebalance {
             InitiateDeposit { deposit } => self.transition_initiate_deposit(deposit),
             ConfirmDeposit => self.transition_confirm_deposit(),
             FailDeposit { reason } => self.transition_fail_deposit(reason),
+            ReconcileStuckRebalance { reason } => self.transition_reconcile_stuck_rebalance(reason),
         }
     }
 }
@@ -1920,7 +2028,8 @@ impl UsdcRebalance {
             | Self::BridgingFailed { .. }
             | Self::DepositInitiated { .. }
             | Self::DepositConfirmed { .. }
-            | Self::DepositFailed { .. } => Err(UsdcRebalanceError::InvalidCommand {
+            | Self::DepositFailed { .. }
+            | Self::Reconciled { .. } => Err(UsdcRebalanceError::InvalidCommand {
                 command: "BeginBridging".to_string(),
                 state: "bridging already started".to_string(),
             }),
@@ -1956,7 +2065,8 @@ impl UsdcRebalance {
             | Self::BridgingFailed { .. }
             | Self::DepositInitiated { .. }
             | Self::DepositConfirmed { .. }
-            | Self::DepositFailed { .. } => Err(UsdcRebalanceError::InvalidCommand {
+            | Self::DepositFailed { .. }
+            | Self::Reconciled { .. } => Err(UsdcRebalanceError::InvalidCommand {
                 command: "InitiateBridging".to_string(),
                 state: "Bridging".to_string(),
             }),
@@ -1997,7 +2107,8 @@ impl UsdcRebalance {
             | Self::BridgingFailed { .. }
             | Self::DepositInitiated { .. }
             | Self::DepositConfirmed { .. }
-            | Self::DepositFailed { .. } => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
+            | Self::DepositFailed { .. }
+            | Self::Reconciled { .. } => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
         }
     }
 
@@ -2032,7 +2143,8 @@ impl UsdcRebalance {
             | Self::BridgingFailed { .. }
             | Self::DepositInitiated { .. }
             | Self::DepositConfirmed { .. }
-            | Self::DepositFailed { .. } => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
+            | Self::DepositFailed { .. }
+            | Self::Reconciled { .. } => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
         }
     }
 
@@ -2064,7 +2176,8 @@ impl UsdcRebalance {
             | Self::BridgingFailed { .. }
             | Self::DepositInitiated { .. }
             | Self::DepositConfirmed { .. }
-            | Self::DepositFailed { .. } => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
+            | Self::DepositFailed { .. }
+            | Self::Reconciled { .. } => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
         }
     }
 
@@ -2113,7 +2226,8 @@ impl UsdcRebalance {
             | Self::BridgingFailed { .. }
             | Self::DepositInitiated { .. }
             | Self::DepositConfirmed { .. }
-            | Self::DepositFailed { .. } => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
+            | Self::DepositFailed { .. }
+            | Self::Reconciled { .. } => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
         }
     }
 
@@ -2179,7 +2293,8 @@ impl UsdcRebalance {
             }]),
             Self::DepositInitiated { .. }
             | Self::DepositConfirmed { .. }
-            | Self::DepositFailed { .. } => Err(UsdcRebalanceError::InvalidCommand {
+            | Self::DepositFailed { .. }
+            | Self::Reconciled { .. } => Err(UsdcRebalanceError::InvalidCommand {
                 command: "InitiateDeposit".to_string(),
                 state: format!("{self:?}"),
             }),
@@ -2206,12 +2321,12 @@ impl UsdcRebalance {
                 direction: direction.clone(),
                 deposit_confirmed_at: Utc::now(),
             }]),
-            Self::DepositConfirmed { .. } | Self::DepositFailed { .. } => {
-                Err(UsdcRebalanceError::InvalidCommand {
-                    command: "ConfirmDeposit".to_string(),
-                    state: format!("{self:?}"),
-                })
-            }
+            Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. }
+            | Self::Reconciled { .. } => Err(UsdcRebalanceError::InvalidCommand {
+                command: "ConfirmDeposit".to_string(),
+                state: format!("{self:?}"),
+            }),
         }
     }
 
@@ -2239,13 +2354,81 @@ impl UsdcRebalance {
                 reason,
                 failed_at: Utc::now(),
             }]),
-            Self::DepositConfirmed { .. } | Self::DepositFailed { .. } => {
-                Err(UsdcRebalanceError::InvalidCommand {
-                    command: "FailDeposit".to_string(),
-                    state: format!("{self:?}"),
-                })
-            }
+            Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. }
+            | Self::Reconciled { .. } => Err(UsdcRebalanceError::InvalidCommand {
+                command: "FailDeposit".to_string(),
+                state: format!("{self:?}"),
+            }),
         }
+    }
+
+    /// Reconciles a stuck post-burn rebalance to the guard-clearing terminal
+    /// `Reconciled` state. The CCTP burn/mint already moved the funds off the
+    /// source venue, so the operator settles them out-of-band and this clears
+    /// the `usdc_in_progress` guard rather than re-driving the failed leg.
+    ///
+    /// Valid only from a post-burn terminal failure that strands the guard with
+    /// no other exit:
+    ///
+    /// - `DepositFailed` -- only reachable from `DepositInitiated`, hence always
+    ///   post-mint.
+    /// - `BridgingFailed` with a recorded `burn_tx_hash` or `cctp_nonce` -- both
+    ///   are only ever populated after the burn reaches CCTP, so either proves
+    ///   the failure is post-burn (mirrors the reactor's post-burn classifier).
+    ///   A pre-burn `BridgingFailed` (both `None`) carries no burned funds and
+    ///   already reconciles to source on its own.
+    /// - A `BaseToAlpaca` `ConversionFailed` -- that conversion is the
+    ///   post-deposit USDC->USD leg, so it is post-mint. The `AlpacaToBase`
+    ///   `ConversionFailed` is the pre-withdrawal leg (pre-burn) and reconciles
+    ///   to source on its own.
+    ///
+    /// Every other state is rejected: an in-progress transfer is still being
+    /// driven (resume it instead), a pre-burn failure already reconciles to
+    /// source, and a terminal success or `Reconciled` has nothing to reconcile.
+    fn transition_reconcile_stuck_rebalance(
+        &self,
+        reason: ReconcileReason,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        let (direction, amount, initiated_at) = match self {
+            Self::DepositFailed {
+                direction,
+                amount,
+                initiated_at,
+                ..
+            }
+            | Self::ConversionFailed {
+                direction: direction @ RebalanceDirection::BaseToAlpaca,
+                amount,
+                initiated_at,
+                ..
+            } => (direction.clone(), *amount, *initiated_at),
+            Self::BridgingFailed {
+                direction,
+                amount,
+                burn_tx_hash,
+                cctp_nonce,
+                initiated_at,
+                ..
+            } if burn_tx_hash.is_some() || cctp_nonce.is_some() => {
+                (direction.clone(), *amount, *initiated_at)
+            }
+            _ => {
+                return Err(UsdcRebalanceError::InvalidCommand {
+                    command: "ReconcileStuckRebalance".to_string(),
+                    state: format!("{self:?}"),
+                });
+            }
+        };
+
+        Ok(vec![OperatorReconciled {
+            direction,
+            amount,
+            reason,
+            initiated_at,
+            reconciled_at: Utc::now(),
+        }])
     }
 }
 
@@ -4862,6 +5045,530 @@ mod tests {
         ));
     }
 
+    /// Event history that lands a BaseToAlpaca aggregate in the post-burn
+    /// terminal `DepositFailed` state, for the operator-reconcile tests.
+    fn deposit_failed_history() -> Vec<UsdcRebalanceEvent> {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        vec![
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(100.00)),
+                withdrawal_ref: TransferRef::OnchainTx(burn_tx),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::WithdrawalConfirmed {
+                confirmed_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::BridgingInitiated {
+                burn_tx_hash: burn_tx,
+                burned_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::BridgeAttestationReceived {
+                attestation: vec![0x01],
+                cctp_nonce: TEST_CCTP_NONCE,
+                message: None,
+                mint_scan_from_block: Some(100),
+                attested_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::Bridged {
+                mint_tx_hash: mint_tx,
+                amount_received: Usdc::new(float!(99.99)),
+                fee_collected: Usdc::new(float!(0.01)),
+                minted_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::DepositInitiated {
+                deposit_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                deposit_initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::DepositFailed {
+                deposit_ref: Some(TransferRef::OnchainTx(mint_tx)),
+                reason: "deposit rejected".to_string(),
+                failed_at: Utc::now(),
+            },
+        ]
+    }
+
+    /// Event history that lands a BaseToAlpaca aggregate in a post-burn terminal
+    /// `BridgingFailed` state (a burn tx is recorded but the bridge never
+    /// completed), for the operator-reconcile tests.
+    fn post_burn_bridging_failed_history() -> Vec<UsdcRebalanceEvent> {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+
+        vec![
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(100.00)),
+                withdrawal_ref: TransferRef::OnchainTx(burn_tx),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::WithdrawalConfirmed {
+                confirmed_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::BridgingInitiated {
+                burn_tx_hash: burn_tx,
+                burned_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::BridgingFailed {
+                burn_tx_hash: Some(burn_tx),
+                cctp_nonce: None,
+                reason: "attestation never arrived".to_string(),
+                failed_at: Utc::now(),
+            },
+        ]
+    }
+
+    /// Event history that lands a BaseToAlpaca aggregate in the post-deposit
+    /// (post-mint) terminal `ConversionFailed` state -- the USDC->USD leg failed
+    /// after the deposit confirmed -- for the operator-reconcile tests.
+    fn base_to_alpaca_conversion_failed_history() -> Vec<UsdcRebalanceEvent> {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        vec![
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(100.00)),
+                withdrawal_ref: TransferRef::OnchainTx(burn_tx),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::WithdrawalConfirmed {
+                confirmed_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::BridgingInitiated {
+                burn_tx_hash: burn_tx,
+                burned_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::BridgeAttestationReceived {
+                attestation: vec![0x01],
+                cctp_nonce: TEST_CCTP_NONCE,
+                message: None,
+                mint_scan_from_block: Some(100),
+                attested_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::Bridged {
+                mint_tx_hash: mint_tx,
+                amount_received: Usdc::new(float!(99.99)),
+                fee_collected: Usdc::new(float!(0.01)),
+                minted_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::DepositInitiated {
+                deposit_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                deposit_initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::DepositConfirmed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                deposit_confirmed_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::ConversionInitiated {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(99.99)),
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::ConversionFailed {
+                reason: "USDC->USD conversion rejected".to_string(),
+                failed_at: Utc::now(),
+            },
+        ]
+    }
+
+    /// Drives `ReconcileStuckRebalance` against a history that ends in a
+    /// guard-stranding post-burn failure and asserts it emits a single
+    /// `OperatorReconciled` preserving the source amount and initiation
+    /// timestamp, then materializes the clearing terminal `Reconciled`.
+    async fn assert_reconcile_emits_operator_reconciled(
+        history: Vec<UsdcRebalanceEvent>,
+        expected_direction: RebalanceDirection,
+    ) {
+        // The source failure carries the real post-burn amount and original
+        // initiation timestamp; reconciliation must preserve both so the
+        // projection does not collapse the transfer to a zero-value one.
+        let (source_amount, source_initiated_at) = match replay::<UsdcRebalance>(history.clone())
+            .expect("history should replay")
+            .expect("history should materialize a failure state")
+        {
+            UsdcRebalance::DepositFailed {
+                amount,
+                initiated_at,
+                ..
+            }
+            | UsdcRebalance::BridgingFailed {
+                amount,
+                initiated_at,
+                ..
+            }
+            | UsdcRebalance::ConversionFailed {
+                amount,
+                initiated_at,
+                ..
+            } => (amount, initiated_at),
+            other => panic!("fixture should end in a post-burn failure, got {other:?}"),
+        };
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(history.clone())
+            .when(UsdcRebalanceCommand::ReconcileStuckRebalance {
+                reason: ReconcileReason::FundsMovedManually,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::OperatorReconciled {
+            direction,
+            amount,
+            reason,
+            initiated_at,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected OperatorReconciled, got {:?}", events[0]);
+        };
+        assert_eq!(*direction, expected_direction);
+        assert_eq!(*amount, source_amount);
+        assert_eq!(*reason, ReconcileReason::FundsMovedManually);
+        assert_eq!(*initiated_at, source_initiated_at);
+
+        // Applying the event must drive the aggregate to the clearing terminal
+        // Reconciled state -- the evolve arm, not just the command handler.
+        let state = replay::<UsdcRebalance>([history, events].concat())
+            .expect("event stream should replay")
+            .expect("event stream should materialize aggregate state");
+        assert!(
+            matches!(state, UsdcRebalance::Reconciled { .. }),
+            "reconciled aggregate should be Reconciled, got {state:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_stuck_rebalance_from_post_burn_bridging_failed_emits_operator_reconciled() {
+        assert_reconcile_emits_operator_reconciled(
+            post_burn_bridging_failed_history(),
+            RebalanceDirection::BaseToAlpaca,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_stuck_rebalance_from_base_to_alpaca_conversion_failed_emits_reconciled() {
+        assert_reconcile_emits_operator_reconciled(
+            base_to_alpaca_conversion_failed_history(),
+            RebalanceDirection::BaseToAlpaca,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_stuck_rebalance_from_deposit_failed_emits_operator_reconciled() {
+        let history = deposit_failed_history();
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(history.clone())
+            .when(UsdcRebalanceCommand::ReconcileStuckRebalance {
+                reason: ReconcileReason::FundsMovedManually,
+            })
+            .await
+            .events();
+
+        // The DepositFailed source state carries the real post-burn amount and
+        // original initiation timestamp; reconciliation must preserve both so
+        // the projection does not collapse the transfer to a zero-value one.
+        let UsdcRebalance::DepositFailed {
+            amount: failed_amount,
+            initiated_at: failed_initiated_at,
+            ..
+        } = replay::<UsdcRebalance>(history.clone())
+            .expect("history should replay")
+            .expect("history should materialize DepositFailed")
+        else {
+            panic!("fixture should end in DepositFailed");
+        };
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::OperatorReconciled {
+            direction,
+            amount,
+            reason,
+            initiated_at,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected OperatorReconciled, got {:?}", events[0]);
+        };
+        assert_eq!(*direction, RebalanceDirection::BaseToAlpaca);
+        assert_eq!(*amount, failed_amount);
+        assert_eq!(*reason, ReconcileReason::FundsMovedManually);
+        assert_eq!(*initiated_at, failed_initiated_at);
+
+        // Applying the event must drive the aggregate to the clearing terminal
+        // Reconciled state -- the evolve arm, not just the command handler.
+        let state = replay::<UsdcRebalance>([history, events].concat())
+            .expect("event stream should replay")
+            .expect("event stream should materialize aggregate state");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::Reconciled {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    reason: ReconcileReason::FundsMovedManually,
+                    ..
+                }
+            ),
+            "reconciled aggregate should be Reconciled, got {state:?}"
+        );
+    }
+
+    #[test]
+    fn reconciled_does_not_hold_rebalance_guard() {
+        let reconciled = UsdcRebalance::Reconciled {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: Usdc::new(float!(100.00)),
+            reason: ReconcileReason::FundsMovedManually,
+            initiated_at: Utc::now(),
+            reconciled_at: Utc::now(),
+        };
+        assert!(
+            !reconciled.holds_rebalance_guard(),
+            "operator-reconciled terminal must clear the guard"
+        );
+    }
+
+    #[test]
+    fn reconciled_direction_reads_persisted_direction() {
+        let reconciled = UsdcRebalance::Reconciled {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc::new(float!(100.00)),
+            reason: ReconcileReason::DepositCreditedOffline,
+            initiated_at: Utc::now(),
+            reconciled_at: Utc::now(),
+        };
+        assert_eq!(reconciled.direction(), RebalanceDirection::AlpacaToBase);
+    }
+
+    #[tokio::test]
+    async fn reconcile_stuck_rebalance_rejected_from_bridged() {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc::new(float!(100.00)),
+                    withdrawal_ref: TransferRef::OnchainTx(burn_tx),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash: burn_tx,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgeAttestationReceived {
+                    attestation: vec![0x01],
+                    cctp_nonce: TEST_CCTP_NONCE,
+                    message: None,
+                    mint_scan_from_block: Some(100),
+                    attested_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::Bridged {
+                    mint_tx_hash: mint_tx,
+                    amount_received: Usdc::new(float!(99.99)),
+                    fee_collected: Usdc::new(float!(0.01)),
+                    minted_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::ReconcileStuckRebalance {
+                reason: ReconcileReason::FundsMovedManually,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn reconcile_stuck_rebalance_rejected_from_deposit_initiated() {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc::new(float!(100.00)),
+                    withdrawal_ref: TransferRef::OnchainTx(burn_tx),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash: burn_tx,
+                    burned_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgeAttestationReceived {
+                    attestation: vec![0x01],
+                    cctp_nonce: TEST_CCTP_NONCE,
+                    message: None,
+                    mint_scan_from_block: Some(100),
+                    attested_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::Bridged {
+                    mint_tx_hash: mint_tx,
+                    amount_received: Usdc::new(float!(99.99)),
+                    fee_collected: Usdc::new(float!(0.01)),
+                    minted_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::DepositInitiated {
+                    deposit_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                    deposit_initiated_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::ReconcileStuckRebalance {
+                reason: ReconcileReason::FundsMovedManually,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn reconcile_stuck_rebalance_rejected_from_initiated() {
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(100.00)),
+                withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
+                    "0x0000000000000000000000000000000000000000000000000000000000000001"
+                )),
+                initiated_at: Utc::now(),
+            }])
+            .when(UsdcRebalanceCommand::ReconcileStuckRebalance {
+                reason: ReconcileReason::FundsMovedManually,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn reconcile_stuck_rebalance_rejected_from_already_reconciled() {
+        let mut history = deposit_failed_history();
+        history.push(UsdcRebalanceEvent::OperatorReconciled {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: Usdc::new(float!(100.00)),
+            reason: ReconcileReason::FundsMovedManually,
+            initiated_at: Utc::now(),
+            reconciled_at: Utc::now(),
+        });
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(history)
+            .when(UsdcRebalanceCommand::ReconcileStuckRebalance {
+                reason: ReconcileReason::DepositCreditedOffline,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn reconcile_stuck_rebalance_rejected_from_pre_burn_bridging_failed() {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+
+        // A pre-burn BridgingFailed (no burn tx, no CCTP nonce) carries no
+        // burned funds: the failure already reconciles to source, so reconcile
+        // must reject it rather than zero source inflight without crediting
+        // available (which would lose the never-burned funds).
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc::new(float!(100.00)),
+                    withdrawal_ref: TransferRef::OnchainTx(burn_tx),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::BridgingFailed {
+                    burn_tx_hash: None,
+                    cctp_nonce: None,
+                    reason: "burn reverted before broadcast".to_string(),
+                    failed_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::ReconcileStuckRebalance {
+                reason: ReconcileReason::FundsMovedManually,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn reconcile_stuck_rebalance_rejected_from_alpaca_to_base_conversion_failed() {
+        // AlpacaToBase ConversionFailed is the pre-withdrawal (pre-burn)
+        // USD->USDC leg: no funds left the source, so reconcile must reject it.
+        // It reconciles to source on its own via the normal failure path.
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::ConversionInitiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc::new(float!(100.00)),
+                    order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::ConversionFailed {
+                    reason: "USD->USDC conversion rejected".to_string(),
+                    failed_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::ReconcileStuckRebalance {
+                reason: ReconcileReason::FundsMovedManually,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { .. })
+        ));
+    }
+
     #[tokio::test]
     async fn test_deposit_failed_rejects_confirm_deposit() {
         let burn_tx =
@@ -5934,6 +6641,36 @@ mod tests {
         ));
         assert_eq!(bridge.started_at, initiated_at);
         assert_eq!(bridge.updated_at, failed_at);
+    }
+
+    #[test]
+    fn to_dto_reconciled_preserves_amount_and_original_initiated_at() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let initiated_at = Utc::now();
+        let reconciled_at = initiated_at + chrono::Duration::seconds(120);
+        let state = UsdcRebalance::Reconciled {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: Usdc::new(float!(750)),
+            reason: ReconcileReason::FundsMovedManually,
+            initiated_at,
+            reconciled_at,
+        };
+
+        let dto = state.to_dto(&id);
+        let TransferOperation::UsdcBridge(bridge) = dto else {
+            panic!("expected UsdcBridge variant");
+        };
+
+        // The funds genuinely left the source venue via CCTP burn, so the
+        // projection must report the real transfer amount and its original
+        // start time -- not a zero-value transfer beginning at reconciliation.
+        assert_eq!(bridge.amount, Usdc::new(float!(750)));
+        assert_eq!(bridge.started_at, initiated_at);
+        assert_eq!(bridge.updated_at, reconciled_at);
+        assert!(matches!(
+            bridge.status,
+            UsdcBridgeStatus::Completed { completed_at } if completed_at == reconciled_at
+        ));
     }
 
     #[test]

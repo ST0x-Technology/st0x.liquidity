@@ -37,7 +37,9 @@ use crate::tokenization::{
 use crate::tokenized_equity_mint::{
     IssuerRequestId, TokenizedEquityMint, TokenizedEquityMintCommand,
 };
-use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceId};
+use crate::usdc_rebalance::{
+    RebalanceDirection, ReconcileReason, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
+};
 use crate::vault_lookup::{VaultLookup, VaultRegistryLookup};
 use crate::vault_registry::VaultRegistry;
 use st0x_config::{BrokerCtx, Ctx};
@@ -452,6 +454,82 @@ async fn run_usdc_transfer<Writer: Write>(
         TransferDirection::ToAlpaca => "USDC transfer to Alpaca completed successfully",
     };
     writeln!(stdout, "{completion}")?;
+
+    Ok(())
+}
+
+/// Reconciles a USDC transfer stranded in a post-burn terminal failure to the
+/// clearing terminal `Reconciled` state, releasing the in-progress guard.
+///
+/// The burned/minted USDC was handled out-of-band, so this resolves the
+/// transfer (clearing the in-progress guard and reconciling source-venue
+/// inflight via the reactor) rather than re-driving the failed leg. Builds a
+/// standalone `UsdcRebalance` store and sends `ReconcileStuckRebalance`
+/// directly -- no broker/bridge/vault is needed because reconciliation only
+/// loads and sends. Rejects an unknown id (refusing to act on the wrong
+/// transfer/database) and an aggregate that is not a guard-stranding post-burn
+/// failure (the command itself rejects the latter, but the preflight gives a
+/// clearer operator-facing error first).
+pub(super) async fn reconcile_usdc_transfer_command<Writer: Write>(
+    stdout: &mut Writer,
+    id: Uuid,
+    reason: ReconcileReason,
+    pool: &SqlitePool,
+) -> anyhow::Result<()> {
+    let id = UsdcRebalanceId(id);
+    writeln!(stdout, "Reconciling stuck USDC transfer id: {id}")?;
+
+    let usdc_store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+        .build(())
+        .await?;
+
+    let Some(state) = usdc_store.load(&id).await? else {
+        anyhow::bail!(
+            "reconcile-usdc-transfer: no transfer found for id {id}. Refusing to act -- check \
+             the id and that you are pointed at the right database."
+        );
+    };
+
+    // Authoritative gate is the aggregate command; this preflight mirrors its
+    // accepted set (DepositFailed, post-burn BridgingFailed, BaseToAlpaca
+    // ConversionFailed) only to give the operator a clearer error first.
+    let is_post_burn_failure = matches!(
+        state,
+        UsdcRebalance::DepositFailed { .. }
+            | UsdcRebalance::BridgingFailed {
+                burn_tx_hash: Some(_),
+                ..
+            }
+            | UsdcRebalance::BridgingFailed {
+                cctp_nonce: Some(_),
+                ..
+            }
+            | UsdcRebalance::ConversionFailed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                ..
+            }
+    );
+
+    if !is_post_burn_failure {
+        anyhow::bail!(
+            "reconcile-usdc-transfer: transfer {id} is in state {state:?}, not a post-burn \
+             terminal failure that strands the in-progress guard (DepositFailed, post-burn \
+             BridgingFailed, or a BaseToAlpaca ConversionFailed). Refusing to act."
+        );
+    }
+
+    usdc_store
+        .send(
+            &id,
+            UsdcRebalanceCommand::ReconcileStuckRebalance { reason },
+        )
+        .await?;
+
+    writeln!(
+        stdout,
+        "Reconciled USDC transfer {id} (reason: {reason:?}); the in-progress guard will clear \
+         and USDC rebalancing resumes."
+    )?;
 
     Ok(())
 }
@@ -903,7 +981,7 @@ mod tests {
     use super::*;
     use crate::inventory::ImbalanceThreshold;
     use crate::test_utils::setup_test_db;
-    use crate::usdc_rebalance::{TransferRef, UsdcRebalanceCommand};
+    use crate::usdc_rebalance::{ReconcileReason, TransferRef, UsdcRebalanceCommand};
     use st0x_config::EvmCtx;
     use st0x_config::ExecutionThreshold;
     use st0x_config::RebalancingCtx;
@@ -1177,6 +1255,69 @@ mod tests {
         assert!(
             err_msg.contains("no transfer found for id"),
             "resume of an unknown id must refuse, not start a new burn; got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_usdc_transfer_rejects_unknown_id() {
+        let pool = setup_test_db().await;
+        let unknown_id = Uuid::from_u128(0xFEED_FACE);
+
+        let mut stdout = Vec::new();
+        let result = reconcile_usdc_transfer_command(
+            &mut stdout,
+            unknown_id,
+            ReconcileReason::FundsMovedManually,
+            &pool,
+        )
+        .await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("no transfer found for id"),
+            "reconcile of an unknown id must refuse; got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_usdc_transfer_rejects_in_progress_aggregate() {
+        // An Initiated (in-progress, pre-burn) aggregate is not a guard-stranding
+        // post-burn failure, so the preflight must reject it before sending the
+        // reconcile command.
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(7777);
+
+        let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        store
+            .send(
+                &UsdcRebalanceId(id),
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc::new(Float::parse("100".to_string()).unwrap()),
+                    withdrawal: TransferRef::OnchainTx(b256!(
+                        "0x00000000000000000000000000000000000000000000000000000000000000b1"
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut stdout = Vec::new();
+        let result = reconcile_usdc_transfer_command(
+            &mut stdout,
+            id,
+            ReconcileReason::FundsMovedManually,
+            &pool,
+        )
+        .await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not a post-burn terminal failure that strands the in-progress guard"),
+            "reconcile of an in-progress aggregate must refuse; got: {err_msg}"
         );
     }
 

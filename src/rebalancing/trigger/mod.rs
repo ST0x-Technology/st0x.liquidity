@@ -3589,6 +3589,7 @@ impl RebalancingService {
                 | BridgingFailed { .. }
                 | DepositFailed { .. }
                 | ConversionFailed { .. }
+                | OperatorReconciled { .. }
                 | ConversionConfirmed {
                     direction: RebalanceDirection::BaseToAlpaca,
                     ..
@@ -8217,6 +8218,290 @@ mod tests {
         );
     }
 
+    /// An operator reconciling a post-burn `DepositFailed` must clear the guard,
+    /// remove tracking, and zero the source-venue (MarketMaking for BaseToAlpaca)
+    /// inflight WITHOUT crediting available -- post-burn semantics, because the
+    /// minted USDC physically left the source.
+    #[tokio::test]
+    async fn operator_reconcile_clears_guard_and_zeroes_source_inflight_post_burn() {
+        let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
+        let (reactor, _receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        for event in [
+            make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(400)),
+            make_usdc_withdrawal_confirmed(),
+            make_usdc_bridging_initiated(),
+            make_usdc_bridge_attestation_received(),
+            make_usdc_bridged(),
+            make_usdc_deposit_initiated(),
+            make_usdc_deposit_failed(),
+        ] {
+            harness
+                .receive::<UsdcRebalance>(id.clone(), event)
+                .await
+                .unwrap();
+        }
+
+        // Sanity: the burn moved 400 from MarketMaking available to inflight, and
+        // the post-burn deposit failure preserved it.
+        assert_usdc_inventory_balances(&trigger, usdc(500), usdc(400), usdc(100), Usdc::ZERO).await;
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_operator_reconciled(RebalanceDirection::BaseToAlpaca),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "operator reconcile must remove tracking"
+        );
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "operator reconcile must clear the USDC guard"
+        );
+        assert_eq!(
+            trigger.inventory.read().await.active_usdc_rebalance(),
+            None,
+            "operator reconcile must clear the active rebalance ID"
+        );
+        // Available unchanged (500), inflight zeroed -- funds left the source.
+        assert_usdc_inventory_balances(&trigger, usdc(500), Usdc::ZERO, usdc(100), Usdc::ZERO)
+            .await;
+    }
+
+    /// Post-restart the reactor has no in-memory tracking, yet an operator
+    /// reconcile must still clear the guard and zero the source inflight derived
+    /// from the event's `direction` -- never panic on absent tracking.
+    #[tokio::test]
+    async fn operator_reconcile_works_when_tracking_absent() {
+        let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
+        let (reactor, _receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        // Seed the source (MarketMaking) inflight to mimic a post-restart state
+        // where the burn already moved 400 into inflight, but in-memory tracking
+        // was not rebuilt and the guard was merely re-asserted. Also carry a
+        // stale active rebalance id so the test proves the Clear terminal action
+        // drops it.
+        {
+            let mut inventory = trigger.inventory.write().await;
+            *inventory = inventory
+                .clone()
+                .update_usdc(
+                    Inventory::transfer(Venue::MarketMaking, TransferOp::Start, usdc(400)),
+                    Utc::now(),
+                )
+                .unwrap()
+                .set_active_usdc_rebalance(id.clone());
+        }
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        assert!(!trigger.usdc_tracking.read().await.contains_key(&id));
+        assert_eq!(
+            trigger.inventory.read().await.active_usdc_rebalance(),
+            Some(&id)
+        );
+        // Sanity: 400 moved from MarketMaking available to inflight.
+        assert_usdc_inventory_balances(&trigger, usdc(500), usdc(400), usdc(100), Usdc::ZERO).await;
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_operator_reconciled(RebalanceDirection::BaseToAlpaca),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "operator reconcile must clear the guard even with tracking absent"
+        );
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "operator reconcile must not resurrect in-memory tracking"
+        );
+        assert_eq!(
+            trigger.inventory.read().await.active_usdc_rebalance(),
+            None,
+            "operator reconcile must clear the stale active rebalance id"
+        );
+        // Available unchanged (500), inflight zeroed via the event's direction.
+        assert_usdc_inventory_balances(&trigger, usdc(500), Usdc::ZERO, usdc(100), Usdc::ZERO)
+            .await;
+    }
+
+    /// Mirror of `operator_reconcile_works_when_tracking_absent` for the other
+    /// direction: `AlpacaToBase` must zero the Hedging (source) inflight derived
+    /// from the event's `direction` -- not MarketMaking -- and still clear the
+    /// guard and the stale active id with tracking absent post-restart.
+    #[tokio::test]
+    async fn operator_reconcile_alpaca_to_base_clears_hedging_source_when_tracking_absent() {
+        // Hedging is the offchain venue (second arg), so seed it with enough to
+        // move 400 into inflight.
+        let inventory = InventoryView::default().with_usdc(usdc(100), usdc(900));
+        let (reactor, _receiver) = make_trigger_with_inventory(inventory).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        // Burn already moved 400 from the Hedging venue into inflight; tracking
+        // was not rebuilt and a stale active id lingers.
+        {
+            let mut inventory = trigger.inventory.write().await;
+            *inventory = inventory
+                .clone()
+                .update_usdc(
+                    Inventory::transfer(Venue::Hedging, TransferOp::Start, usdc(400)),
+                    Utc::now(),
+                )
+                .unwrap()
+                .set_active_usdc_rebalance(id.clone());
+        }
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        assert!(!trigger.usdc_tracking.read().await.contains_key(&id));
+        // Sanity: 400 moved from Hedging available (900 -> 500) to inflight.
+        assert_usdc_inventory_balances(&trigger, usdc(100), Usdc::ZERO, usdc(500), usdc(400)).await;
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_operator_reconciled(RebalanceDirection::AlpacaToBase),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "operator reconcile must clear the guard even with tracking absent"
+        );
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "operator reconcile must not resurrect in-memory tracking"
+        );
+        assert_eq!(
+            trigger.inventory.read().await.active_usdc_rebalance(),
+            None,
+            "operator reconcile must clear the stale active rebalance id"
+        );
+        // Hedging inflight zeroed via the event's direction; MarketMaking and
+        // Hedging available are both untouched (post-burn: no credit).
+        assert_usdc_inventory_balances(&trigger, usdc(100), Usdc::ZERO, usdc(500), Usdc::ZERO)
+            .await;
+    }
+
+    /// A `Reconciled` aggregate is a clearing terminal: startup guard recovery
+    /// must NOT re-latch the guard for it (the opposite of a post-burn failure).
+    #[tokio::test]
+    async fn recover_usdc_guard_does_not_relatch_for_reconciled() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        // Drive a BaseToAlpaca aggregate to DepositFailed, then reconcile it.
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: usdc(400),
+                    withdrawal: TransferRef::OnchainTx(burn_tx),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .await
+            .unwrap();
+        store
+            .send(&id, UsdcRebalanceCommand::InitiateBridging { burn_tx })
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ReceiveAttestation {
+                    attestation: vec![0x01],
+                    cctp_nonce: B256::left_padding_from(&42u64.to_be_bytes()),
+                    message: valid_cctp_message(),
+                    mint_scan_from_block: 100,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmBridging {
+                    mint_tx,
+                    amount_received: usdc(399),
+                    fee_collected: usdc(1),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::InitiateDeposit {
+                    deposit: TransferRef::OnchainTx(mint_tx),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailDeposit {
+                    reason: "deposit rejected".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+                },
+            )
+            .await
+            .unwrap();
+
+        let (service, _receiver) = make_trigger_with_inventory(InventoryView::default()).await;
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert!(
+            !service.usdc_in_progress.load(Ordering::SeqCst),
+            "a Reconciled aggregate must not re-latch the USDC guard on startup"
+        );
+        // A Reconciled aggregate is a terminal no-op: startup recovery must not
+        // enqueue any fresh transfer work in either direction.
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&service).await,
+            0,
+            "a Reconciled aggregate must not enqueue a USDC->Hedging transfer on startup"
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&service).await,
+            0,
+            "a Reconciled aggregate must not enqueue a USDC->MarketMaking transfer on startup"
+        );
+    }
+
     /// For BaseToAlpaca the conversion is the post-deposit USDC->USD leg, so a
     /// `ConversionFailed` there is post-mint: it must preserve inflight + the
     /// guard, even though `ConversionInitiated` resets the tracked stage to a
@@ -8770,6 +9055,16 @@ mod tests {
             deposit_ref: Some(TransferRef::OnchainTx(TxHash::random())),
             reason: "Deposit rejected".to_string(),
             failed_at: Utc::now(),
+        }
+    }
+
+    fn make_usdc_operator_reconciled(direction: RebalanceDirection) -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::OperatorReconciled {
+            direction,
+            amount: usdc(400),
+            reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+            initiated_at: Utc::now(),
+            reconciled_at: Utc::now(),
         }
     }
 
