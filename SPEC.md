@@ -1514,6 +1514,10 @@ enum EquityRedemption {
         raindex_withdraw_tx: Option<TxHash>,
         redemption_tx: Option<TxHash>,
         tokenization_request_id: Option<TokenizationRequestId>,
+        // Why the redemption failed (operator --reason, rejection reason);
+        // None for automated failures and pre-field aggregates.
+        reason: Option<String>,
+        started_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
     },
 }
@@ -1542,6 +1546,8 @@ enum EquityRedemptionCommand {
     Complete,
     // Alpaca rejected the redemption
     RejectRedemption { reason: String },
+    // Operator or timeout-driven failure before the tokens leave custody
+    FailTransfer { reason: String },
 }
 ```
 
@@ -1589,12 +1595,25 @@ enum EquityRedemptionEvent {
         completed_at: DateTime<Utc>,
     },
     RedemptionRejected {
+        reason: String,
         rejected_at: DateTime<Utc>,
     },
 }
 
-enum DetectionFailure { Timeout, ApiError { status_code: Option<u16> } }
+enum DetectionFailure {
+    Timeout,
+    ApiError { status_code: Option<u16> },
+    // Operator-initiated force-fail of a TokensSent redemption; carries the
+    // operator's --reason so the audit trail records why.
+    Operator { reason: String },
+}
 ```
+
+The operator `fail` verb (`fail-transfer --type redemption`) dispatches per
+state: a redemption stuck before tokens leave custody takes `FailTransfer`, a
+`TokensSent` redemption takes `FailDetection { failure: Operator { reason } }`,
+and a `Pending` redemption takes `RejectRedemption { reason }`. In every case
+the replayed `Failed` state materializes the operator's reason.
 
 ##### Aggregate Services
 
