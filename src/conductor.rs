@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use task_supervisor::SupervisorHandle;
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{Mutex, broadcast};
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
@@ -70,8 +70,8 @@ use crate::rebalancing::usdc::{
     TransferUsdcToHedgingCtx, TransferUsdcToMarketMakingCtx, UsdcSettlementParams,
 };
 use crate::rebalancing::{
-    RebalancerServices, RebalancingCqrsFrameworks, RebalancingSchedulers, RebalancingService,
-    RebalancingServiceConfig, to_wrapped_equities,
+    RebalancerServices, RebalancingSchedulers, RebalancingService, RebalancingServiceConfig,
+    to_wrapped_equities,
 };
 use crate::symbol::cache::SymbolCache;
 use crate::tokenization::Tokenizer;
@@ -158,12 +158,6 @@ pub(crate) struct Conductor {
     supervisor: SupervisorHandle,
     /// Runs the apalis job queue workers that process trade accounting jobs.
     monitor: JoinHandle<Result<(), MonitorTaskError>>,
-    /// Periodic rebalancing loop. Absent when rebalancing is not configured.
-    rebalancer: Option<JoinHandle<()>>,
-    /// Cancelled during graceful shutdown to stop the rebalancer from
-    /// accepting new operations. The in-flight operation completes before
-    /// the task exits.
-    rebalancer_shutdown_token: CancellationToken,
     /// Periodically removes terminal rows from the persistent job queue.
     job_cleanup: JoinHandle<()>,
     /// Cancelled by the outer shutdown handler to trigger graceful drain.
@@ -407,8 +401,6 @@ impl Conductor {
             position,
             position_projection,
             snapshot,
-            rebalancer,
-            rebalancer_shutdown_token,
             wallet_polling,
             tokenizer,
             service: rebalancing_service,
@@ -571,8 +563,6 @@ impl Conductor {
             .maybe_rebalancing_service(rebalancing_service)
             .seed_vault_registry_queue(seed_vault_registry_queue)
             .seed_vault_registry_ctx(seed_vault_registry_ctx)
-            .maybe_rebalancer(rebalancer)
-            .rebalancer_shutdown_token(rebalancer_shutdown_token)
             .job_cleanup(job_cleanup)
             .call();
 
@@ -629,32 +619,9 @@ impl Conductor {
             warn!(target: "shutdown", %error, "Supervisor exited with error during drain");
         }
 
-        // Signal the rebalancer to stop accepting new operations, then
-        // wait for the in-flight operation (e.g. a vault deposit) to
-        // finish. This ensures onchain TXs complete and their CQRS events
-        // are persisted before shutdown.
-        self.rebalancer_shutdown_token.cancel();
-
-        if let Some(handle) = self.rebalancer.take() {
-            info!(target: "shutdown", "Draining rebalancer (waiting for in-flight operation)");
-
-            let abort_handle = handle.abort_handle();
-
-            match tokio::time::timeout(std::time::Duration::from_secs(60), handle).await {
-                Ok(Ok(())) => {
-                    info!(target: "shutdown", "Rebalancer drained cleanly");
-                }
-                Ok(Err(join_error)) => {
-                    warn!(target: "shutdown", %join_error, "Rebalancer task panicked during drain");
-                }
-                Err(_timeout) => {
-                    warn!(target: "shutdown", "Rebalancer drain timed out after 60s -- aborting");
-                    abort_handle.abort();
-                }
-            }
-        }
-
-        // Abort remaining non-critical background tasks.
+        // Abort remaining non-critical background tasks. Equity and USDC
+        // transfers run as apalis jobs, so their in-flight operations drain
+        // with the rest of the queue in Phase 2.
         self.abort_background_tasks();
 
         // Phase 2: now that producers are stopped, signal apalis to drain
@@ -676,9 +643,6 @@ impl Conductor {
     }
 
     fn abort_background_tasks(&self) {
-        if let Some(ref handle) = self.rebalancer {
-            handle.abort();
-        }
         self.job_cleanup.abort();
     }
 }
@@ -943,8 +907,6 @@ struct RebalancingInfrastructure {
     position: Arc<Store<Position>>,
     position_projection: Arc<Projection<Position>>,
     snapshot: Arc<Store<InventorySnapshot>>,
-    rebalancer: JoinHandle<()>,
-    rebalancer_shutdown_token: CancellationToken,
     tokenizer: Arc<dyn Tokenizer>,
     service: Arc<RebalancingService>,
     recovery_transfer: Arc<CrossVenueEquityTransfer>,
@@ -971,15 +933,12 @@ struct RebalancingDeps {
 
 /// Position + rebalancing-adjacent infrastructure produced during conductor
 /// startup. When rebalancing is disabled, the optional fields are `None` and
-/// the position aggregate is built standalone; otherwise the rebalancer owns
-/// position construction and surfaces its handles here for the conductor to
-/// supervise.
+/// the position aggregate is built standalone; otherwise the rebalancing
+/// setup owns position construction and surfaces its handles here.
 struct PositionAndRebalancing {
     position: Arc<Store<Position>>,
     position_projection: Arc<Projection<Position>>,
     snapshot: Arc<Store<InventorySnapshot>>,
-    rebalancer: Option<JoinHandle<()>>,
-    rebalancer_shutdown_token: CancellationToken,
     wallet_polling: Option<crate::inventory::WalletPollingCtx>,
     tokenizer: Option<Arc<dyn Tokenizer>>,
     service: Option<Arc<RebalancingService>>,
@@ -1038,8 +997,6 @@ impl PositionAndRebalancing {
                 position: infra.position,
                 position_projection: infra.position_projection,
                 snapshot: infra.snapshot,
-                rebalancer: Some(infra.rebalancer),
-                rebalancer_shutdown_token: infra.rebalancer_shutdown_token,
                 wallet_polling: Some(wallet_polling),
                 tokenizer: Some(infra.tokenizer),
                 service: Some(infra.service),
@@ -1071,8 +1028,6 @@ impl PositionAndRebalancing {
                 position,
                 position_projection,
                 snapshot,
-                rebalancer: None,
-                rebalancer_shutdown_token: CancellationToken::new(),
                 wallet_polling: None,
                 tokenizer: None,
                 service: None,
@@ -1107,9 +1062,6 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         };
 
         let market_maker_wallet = base_wallet.address();
-
-        const OPERATION_CHANNEL_CAPACITY: usize = 100;
-        let (operation_sender, operation_receiver) = mpsc::channel(OPERATION_CHANNEL_CAPACITY);
 
         let vault_lookup: Arc<dyn VaultLookup> = Arc::new(VaultRegistryLookup::new(
             deps.vault_registry_projection,
@@ -1172,12 +1124,9 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             deps.ctx.evm.orderbook,
             market_maker_wallet,
             deps.inventory.clone(),
-            operation_sender,
             wrapper.clone(),
             deps.schedulers,
         ));
-
-        let equity_in_progress = Arc::clone(&rebalancing_service.equity_in_progress);
 
         let broadcaster = Arc::new(Broadcaster::new(deps.event_sender, deps.pool.clone()));
         let manifest = QueryManifest::new(rebalancing_service.clone(), broadcaster);
@@ -1236,12 +1185,6 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             .recover_usdc_guard(&deps.pool, &built.usdc)
             .await?;
 
-        let frameworks = RebalancingCqrsFrameworks {
-            mint: built.mint,
-            redemption: built.redemption,
-            usdc: built.usdc,
-        };
-
         let alpaca_wallet = Arc::new(AlpacaWalletService::new(
             alpaca_auth.base_url().to_string(),
             alpaca_auth.account_id,
@@ -1252,11 +1195,9 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         let services = RebalancerServices::new(
             alpaca_auth.clone(),
             Arc::clone(&alpaca_wallet),
-            deps.ctx.assets.equities.symbols.clone(),
             ethereum_wallet,
             base_wallet,
             raindex_service,
-            Arc::clone(&tokenizer),
             UsdcSettlementParams {
                 attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
                 required_confirmations: deps.ctx.evm.required_confirmations,
@@ -1278,26 +1219,23 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             .and_then(|cash| cash.vault_ids.first().copied())
             .ok_or(CtxError::MissingCashVaultId)?;
 
-        let mint_store = frameworks.mint.clone();
-        let redemption_store = frameworks.redemption.clone();
+        let mint_store = built.mint;
+        let redemption_store = built.redemption;
 
-        let spawned = services.spawn(
+        let usdc_handles = services.into_usdc_transfer_handles(
             market_maker_wallet,
             RaindexVaultId(usdc_vault_id),
-            vault_lookup,
-            operation_receiver,
-            frameworks,
-            equity_in_progress,
+            built.usdc,
         );
 
         let transfer_usdc_to_hedging_ctx = Arc::new(TransferUsdcToHedgingCtx {
-            transfer: spawned.resume_base_to_alpaca,
+            transfer: usdc_handles.resume_base_to_alpaca,
             timeout: rebalancing_ctx.transfer_attempt_timeout,
             job_queue: transfer_usdc_to_hedging_queue,
         });
 
         let transfer_usdc_to_market_making_ctx = Arc::new(TransferUsdcToMarketMakingCtx {
-            transfer: spawned.resume_alpaca_to_base,
+            transfer: usdc_handles.resume_alpaca_to_base,
             job_queue: transfer_usdc_to_market_making_queue,
         });
 
@@ -1313,8 +1251,6 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             position: built.position,
             position_projection: built.position_projection,
             snapshot: built.snapshot,
-            rebalancer: spawned.handle,
-            rebalancer_shutdown_token: spawned.shutdown_token,
             tokenizer,
             service: rebalancing_service,
             recovery_transfer,
@@ -2492,8 +2428,8 @@ mod tests {
     use crate::inventory::{ImbalanceThreshold, Inventory, InventoryView, Venue};
     use crate::offchain::order::OrderPlacementResult;
     use crate::onchain::trade::OnchainTrade;
-    use crate::rebalancing::equity::TransferEquityToMarketMaking;
-    use crate::rebalancing::{RebalancingSchedulers, RebalancingService, TriggeredOperation};
+    use crate::rebalancing::equity::{TransferEquityToHedging, TransferEquityToMarketMaking};
+    use crate::rebalancing::{RebalancingSchedulers, RebalancingService};
     use crate::test_utils::{
         OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db, setup_test_pools,
     };
@@ -2512,8 +2448,6 @@ mod tests {
         Conductor {
             supervisor,
             monitor,
-            rebalancer: None,
-            rebalancer_shutdown_token: CancellationToken::new(),
             job_cleanup,
             shutdown_token: CancellationToken::new(),
             apalis_shutdown_token: CancellationToken::new(),
@@ -2579,6 +2513,16 @@ mod tests {
             .fetch_one(apalis_pool)
             .await
             .unwrap()
+    }
+
+    async fn pending_job_count<Job>(apalis_pool: &apalis_sqlite::SqlitePool) -> i64 {
+        sqlx_apalis::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<Job>())
+        .fetch_one(apalis_pool)
+        .await
+        .unwrap()
     }
 
     async fn wait_for_job_count(apalis_pool: &apalis_sqlite::SqlitePool, expected_count: i64) {
@@ -4029,7 +3973,6 @@ mod tests {
             imbalanced_inventory(&symbol),
             event_sender,
         ));
-        let (operation_sender, mut operation_receiver) = mpsc::channel(10);
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
 
@@ -4054,7 +3997,6 @@ mod tests {
             orderbook,
             order_owner,
             inventory,
-            operation_sender,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
         ));
@@ -4110,14 +4052,6 @@ mod tests {
             !job.issuer_request_id.0.is_nil(),
             "enqueue must assign a fresh issuer_request_id"
         );
-
-        assert!(
-            matches!(
-                operation_receiver.try_recv(),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-            ),
-            "Mints must not be dispatched over the mpsc channel"
-        );
     }
 
     #[tokio::test]
@@ -4154,7 +4088,6 @@ mod tests {
 
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(initial_inventory, event_sender));
-        let (operation_sender, _operation_receiver) = mpsc::channel(10);
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
 
@@ -4173,7 +4106,6 @@ mod tests {
             orderbook,
             order_owner,
             Arc::clone(&inventory),
-            operation_sender,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
         ));
@@ -4269,7 +4201,6 @@ mod tests {
 
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(initial_inventory, event_sender));
-        let (operation_sender, mut receiver) = mpsc::channel(10);
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
 
@@ -4294,7 +4225,6 @@ mod tests {
             orderbook,
             order_owner,
             inventory,
-            operation_sender,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
         ));
@@ -4326,12 +4256,19 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            matches!(
-                receiver.try_recv(),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-            ),
-            "Balanced position event should not trigger rebalancing"
+        crate::rebalancing::drain_pending_jobs(&reactor)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            pending_job_count::<TransferEquityToMarketMaking>(&apalis_pool).await,
+            0,
+            "Balanced position event should not enqueue a mint job"
+        );
+        assert_eq!(
+            pending_job_count::<TransferEquityToHedging>(&apalis_pool).await,
+            0,
+            "Balanced position event should not enqueue a redemption job"
         );
     }
 
@@ -4340,7 +4277,8 @@ mod tests {
     /// trigger wired into the position store via `build_position_cqrs`.
     async fn setup_near_upper_threshold_position() -> (
         Arc<Store<Position>>,
-        mpsc::Receiver<TriggeredOperation>,
+        SqlitePool,
+        apalis_sqlite::SqlitePool,
         Symbol,
         Arc<RebalancingService>,
     ) {
@@ -4400,7 +4338,6 @@ mod tests {
 
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(initial_inventory, event_sender));
-        let (operation_sender, receiver) = mpsc::channel(10);
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
 
@@ -4425,7 +4362,6 @@ mod tests {
             orderbook,
             order_owner,
             inventory,
-            operation_sender,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
         ));
@@ -4437,22 +4373,18 @@ mod tests {
             .await
             .unwrap();
 
-        (position_store, receiver, symbol, reactor)
+        (position_store, pool, apalis_pool, symbol, reactor)
     }
 
     #[tokio::test]
     async fn position_event_causing_imbalance_triggers_redemption() {
-        let (position_store, mut receiver, symbol, reactor) =
+        let (position_store, _pool, apalis_pool, symbol, reactor) =
             setup_near_upper_threshold_position().await;
-        let test_token = address!("0x1234567890123456789012345678901234567890");
 
-        // No position commands yet -> no triggers fired.
-        assert!(
-            matches!(
-                receiver.try_recv(),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-            ),
-            "No commands executed yet, channel should be empty"
+        assert_eq!(
+            pending_job_count::<TransferEquityToHedging>(&apalis_pool).await,
+            0,
+            "No commands executed yet, no redemption job should be enqueued"
         );
 
         // +20 onchain: 85 onchain, 35 offchain, total=120, target=60, excess=25.
@@ -4479,26 +4411,18 @@ mod tests {
             .await
             .unwrap();
 
-        let triggered = receiver.try_recv().unwrap();
-        let TriggeredOperation::Redemption {
-            symbol: redeemed_symbol,
-            quantity,
-            wrapped_token,
-            ..
-        } = triggered
-        else {
-            panic!("Expected Redemption, got {triggered:?}");
-        };
-        assert_eq!(redeemed_symbol, symbol);
-        assert_eq!(quantity, FractionalShares::new(float!(25)));
-        assert_eq!(wrapped_token, test_token);
+        assert_eq!(
+            pending_job_count::<TransferEquityToHedging>(&apalis_pool).await,
+            1,
+            "Expected a TransferEquityToHedging job enqueued by the trigger \
+             on the imbalancing position event"
+        );
     }
 
     #[tokio::test]
     async fn in_progress_guard_blocks_duplicate_trigger() {
-        let (position_store, mut receiver, symbol, reactor) =
+        let (position_store, _pool, apalis_pool, symbol, reactor) =
             setup_near_upper_threshold_position().await;
-        let test_token = address!("0x1234567890123456789012345678901234567890");
 
         // First fill pushes over: 85/120 = 70.8% > 70% -> triggers Redemption(25).
         position_store
@@ -4523,19 +4447,11 @@ mod tests {
             .await
             .unwrap();
 
-        let first = receiver.try_recv().unwrap();
-        let TriggeredOperation::Redemption {
-            symbol: redeemed_symbol,
-            quantity,
-            wrapped_token,
-            ..
-        } = first
-        else {
-            panic!("Expected Redemption, got {first:?}");
-        };
-        assert_eq!(redeemed_symbol, symbol);
-        assert_eq!(quantity, FractionalShares::new(float!(25)));
-        assert_eq!(wrapped_token, test_token);
+        assert_eq!(
+            pending_job_count::<TransferEquityToHedging>(&apalis_pool).await,
+            1,
+            "First imbalancing fill should enqueue a redemption job"
+        );
 
         // Second fill while in-progress NOT cleared -> no second trigger.
         position_store
@@ -4560,12 +4476,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            matches!(
-                receiver.try_recv(),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-            ),
-            "In-progress guard should block duplicate trigger"
+        assert_eq!(
+            pending_job_count::<TransferEquityToHedging>(&apalis_pool).await,
+            1,
+            "In-progress guard should block a duplicate redemption job"
         );
     }
 
@@ -5590,9 +5504,6 @@ mod tests {
         let mut conductor = Conductor {
             supervisor,
             monitor,
-            rebalancer: None,
-            rebalancer_shutdown_token: CancellationToken::new(),
-
             job_cleanup,
             shutdown_token: shutdown_token.clone(),
             apalis_shutdown_token,
@@ -5620,9 +5531,6 @@ mod tests {
         let mut conductor = Conductor {
             supervisor,
             monitor,
-            rebalancer: None,
-            rebalancer_shutdown_token: CancellationToken::new(),
-
             job_cleanup,
             shutdown_token: shutdown_token.clone(),
             apalis_shutdown_token,

@@ -127,8 +127,6 @@ pub(crate) fn spawn<Prov, Exec>(
     seed_vault_registry_queue: SeedVaultRegistryJobQueue,
     seed_vault_registry_ctx: Arc<SeedVaultRegistryCtx>,
     job_cleanup: JoinHandle<()>,
-    rebalancer: Option<JoinHandle<()>>,
-    rebalancer_shutdown_token: CancellationToken,
 ) -> Conductor
 where
     Prov: Provider + Clone + Send + Sync + 'static,
@@ -137,8 +135,6 @@ where
     crate::offchain::order::JobError: From<Exec::Error>,
 {
     info!("Starting conductor orchestration");
-
-    log_optional_task_status("rebalancer", rebalancer.is_some());
 
     let order_owner = context.ctx.order_owner();
     let evm = ReadOnlyEvm::new(context.provider.clone());
@@ -367,8 +363,6 @@ where
     Conductor {
         supervisor,
         monitor,
-        rebalancer,
-        rebalancer_shutdown_token,
         job_cleanup,
         shutdown_token: context.shutdown_token,
         apalis_shutdown_token: apalis_shutdown_token_for_struct,
