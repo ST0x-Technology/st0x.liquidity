@@ -53,7 +53,6 @@ alloy-signer-turnkey = "=1.0.41"
 anyhow = "1.0.102"
 apalis-board = { version = "1.0.0-rc.8", features = ["axum", "ui"] }
 apalis-workflow = "0.1.0-rc.9"
-apca = "0.30.0"
 approx = "0.5.1"
 async-trait = "0.1.81"
 axum = { version = "0.8.9", features = ["ws", "json"] }
@@ -131,7 +130,7 @@ ts-rs = { version = "11.1.0", features = [
 ] }
 url = { version = "2.5.4", features = ["serde"] }
 urlencoding = "2.1"
-uuid = { version = "1.11", features = ["serde", "v4"] }
+uuid = { version = "1.11", features = ["serde", "v4", "v5"] }
 # Pin wasm-bindgen version for compatibility with rain.wasm transitive dependency
 # (bumped in lockstep with the rain.orderbook / rain.math.float bump, whose
 # newer crates require >=0.2.122).

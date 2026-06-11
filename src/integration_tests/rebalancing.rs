@@ -37,14 +37,17 @@ use st0x_wrapper::MockWrapper;
 
 use super::{ExpectedEvent, assert_events, fetch_events};
 use crate::bindings::{IERC20, TestERC20};
+use crate::conductor::job::Job;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId};
 use crate::inventory::{BroadcastingInventory, ImbalanceThreshold, InventoryView, Venue};
 use crate::offchain::order::OffchainOrderId;
 use crate::onchain::mock::MockRaindex;
 use crate::position::{Position, PositionCommand, TradeId};
-use crate::rebalancing::equity::mock::MockCrossVenueEquityTransfer;
-use crate::rebalancing::equity::{CrossVenueEquityTransfer, Equity, EquityTransferServices};
-use crate::rebalancing::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
+use crate::rebalancing::equity::{
+    CrossVenueEquityTransfer, EquityTransferServices, MintTransferError,
+    TransferEquityToMarketMaking, TransferEquityToMarketMakingCtx,
+    TransferEquityToMarketMakingJobError,
+};
 use crate::rebalancing::usdc::{TransferUsdcToHedging, TransferUsdcToMarketMaking};
 use crate::rebalancing::{
     Rebalancer, RebalancingSchedulers, RebalancingService, RebalancingServiceConfig,
@@ -57,7 +60,7 @@ use crate::tokenization::alpaca::tests::{
     tokenization_requests_path,
 };
 use crate::tokenization::mock::MockTokenizer;
-use crate::tokenized_equity_mint::TokenizedEquityMint;
+use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMint};
 use crate::vault_lookup::{MockVaultLookup, VaultLookup};
 use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryId};
 
@@ -84,6 +87,27 @@ async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol, token: Address)
     )
     .await
     .unwrap();
+}
+
+/// Fetches the single pending `TransferEquityToMarketMaking` job payload from
+/// the apalis Jobs table, as the registered worker would receive it.
+async fn fetch_pending_equity_mint_job(pool: &SqlitePool) -> TransferEquityToMarketMaking {
+    let payload: Vec<u8> =
+        sqlx::query_scalar("SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?")
+            .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+            .fetch_one(pool)
+            .await
+            .expect("expected exactly one pending TransferEquityToMarketMaking job");
+
+    serde_json::from_slice(&payload).expect("deserialize TransferEquityToMarketMaking payload")
+}
+
+async fn pending_equity_mint_job_count(pool: &SqlitePool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?")
+        .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+        .fetch_one(pool)
+        .await
+        .unwrap()
 }
 
 fn mock_vault_lookup_for_symbol(symbol: &Symbol, token: Address) -> Arc<dyn VaultLookup> {
@@ -283,9 +307,12 @@ fn setup_redemption_mocks(server: &MockServer, expected_tx_hash: TxHash) -> (Moc
     (detection_mock, completion_mock)
 }
 
-fn sample_pending_response(id: &str) -> serde_json::Value {
+fn sample_pending_response(
+    tokenization_request_id: &str,
+    issuer_request_id: &IssuerRequestId,
+) -> serde_json::Value {
     json!({
-        "tokenization_request_id": id,
+        "tokenization_request_id": tokenization_request_id,
         "type": "mint",
         "status": "pending",
         "underlying_symbol": "AAPL",
@@ -294,14 +321,18 @@ fn sample_pending_response(id: &str) -> serde_json::Value {
         "issuer": "st0x",
         "network": "base",
         "wallet_address": "0x0000000000000000000000000000000000000000",
-        "issuer_request_id": "issuer_123",
+        "issuer_request_id": issuer_request_id.to_string(),
         "created_at": "2024-01-15T10:30:00Z"
     })
 }
 
-fn sample_completed_response(id: &str, tx_hash: TxHash) -> serde_json::Value {
+fn sample_completed_response(
+    tokenization_request_id: &str,
+    issuer_request_id: &IssuerRequestId,
+    tx_hash: TxHash,
+) -> serde_json::Value {
     json!({
-        "tokenization_request_id": id,
+        "tokenization_request_id": tokenization_request_id,
         "type": "mint",
         "status": "completed",
         "underlying_symbol": "AAPL",
@@ -310,7 +341,7 @@ fn sample_completed_response(id: &str, tx_hash: TxHash) -> serde_json::Value {
         "issuer": "st0x",
         "network": "base",
         "wallet_address": "0x0000000000000000000000000000000000000000",
-        "issuer_request_id": "issuer_123",
+        "issuer_request_id": issuer_request_id.to_string(),
         "tx_hash": tx_hash,
         "created_at": "2024-01-15T10:30:00Z"
     })
@@ -539,10 +570,10 @@ async fn build_equity_transfer_with_service(
 
 /// Verifies the full equity mint rebalancing pipeline: position CQRS commands
 /// flow through the RebalancingService (registered as a Query processor),
-/// update the InventoryView, detect an equity imbalance, and dispatch a Mint
-/// operation through the Rebalancer to the CrossVenueEquityTransfer which
-/// drives the TokenizedEquityMint aggregate to completion via the Alpaca
-/// tokenization API.
+/// update the InventoryView, detect an equity imbalance, and enqueue a
+/// `TransferEquityToMarketMaking` apalis job whose `perform` drives the
+/// TokenizedEquityMint aggregate to completion on the real
+/// CrossVenueEquityTransfer via the Alpaca tokenization API.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn equity_offchain_imbalance_triggers_mint() {
@@ -553,7 +584,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
         service,
         inventory: _,
         position_cqrs,
-        receiver,
+        receiver: _receiver,
     } = setup_equity_trigger().await;
 
     // Build inventory: 20 onchain, 80 offchain = 20% ratio -> TooMuchOffchain.
@@ -620,45 +651,6 @@ async fn equity_offchain_imbalance_triggers_mint() {
 
     let wallet_hex = format!("{:#x}", signer.address());
 
-    // json_body_partial acts as an implicit assertion: the mock only matches if
-    // the request contains these exact fields. mint_mock.assert() below then
-    // verifies the mock was called, confirming the correct qty was sent.
-    let mint_mock = server.mock(|when, then| {
-        when.method(POST)
-            .path(tokenization_mint_path())
-            .json_body_includes(
-                json!({
-                    "underlying_symbol": "AAPL",
-                    "qty": "30.5",
-                    "wallet_address": wallet_hex,
-                })
-                .to_string(),
-            );
-        then.status(200)
-            .header("content-type", "application/json")
-            .json_body(sample_pending_response("mint_int_test"));
-    });
-
-    let poll_mock = server.mock(|when, then| {
-        when.method(GET).path(tokenization_requests_path());
-        then.status(200)
-            .header("content-type", "application/json")
-            .json_body(json!([sample_completed_response(
-                "mint_int_test",
-                mint_tx_hash
-            )]));
-    });
-
-    let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
-
-    let rebalancer = Rebalancer::new(
-        equity_transfer as _,
-        mock_equity as _,
-        receiver,
-        Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
-        tokio_util::sync::CancellationToken::new(),
-    );
-
     // One more onchain sell triggers the CQRS -> trigger -> Mint flow now that
     // VaultRegistry is seeded. Inventory: 19 onchain, 80 offchain = 19.2%.
     position_cqrs
@@ -681,13 +673,47 @@ async fn equity_offchain_imbalance_triggers_mint() {
         .unwrap();
     drain_pending_jobs(&service).await.unwrap();
 
-    // Both trigger and position_cqrs hold Arc<RebalancingService> which owns the
-    // mpsc sender. Both must be dropped to close the channel so rebalancer.run()
-    // can exit after processing all queued operations.
-    drop(service);
-    drop(position_cqrs);
+    // The trigger enqueues the mint as an apalis job; run its perform against
+    // the real equity transfer, exactly as the registered worker would.
+    let job = fetch_pending_equity_mint_job(&pool).await;
 
-    rebalancer.run().await;
+    // json_body_partial acts as an implicit assertion: the mock only matches if
+    // the request contains these exact fields. mint_mock.assert() below then
+    // verifies the mock was called, confirming the correct qty was sent.
+    let mint_mock = server.mock(|when, then| {
+        when.method(POST)
+            .path(tokenization_mint_path())
+            .json_body_includes(
+                json!({
+                    "underlying_symbol": "AAPL",
+                    "qty": "30.5",
+                    "wallet_address": wallet_hex,
+                })
+                .to_string(),
+            );
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(sample_pending_response(
+                "mint_int_test",
+                &job.issuer_request_id,
+            ));
+    });
+
+    let poll_mock = server.mock(|when, then| {
+        when.method(GET).path(tokenization_requests_path());
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!([sample_completed_response(
+                "mint_int_test",
+                &job.issuer_request_id,
+                mint_tx_hash
+            )]));
+    });
+
+    let ctx = TransferEquityToMarketMakingCtx {
+        transfer: equity_transfer,
+    };
+    Job::perform(&job, &ctx).await.unwrap();
 
     mint_mock.assert();
     poll_mock.assert();
@@ -868,9 +894,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
     .await;
     seed_vault_registry(&pool, &symbol, token_address).await;
 
-    let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
     let rebalancer = Rebalancer::new(
-        Arc::clone(&mock_equity) as _,
         equity_transfer as _,
         receiver,
         Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
@@ -1038,9 +1062,9 @@ async fn equity_onchain_imbalance_triggers_redemption() {
         "Detected should capture the request ID from the API response"
     );
     assert_eq!(
-        mock_equity.mint_calls(),
+        pending_equity_mint_job_count(&pool).await,
         0,
-        "Mint should not have been called"
+        "No mint job should have been enqueued"
     );
 }
 
@@ -1542,8 +1566,8 @@ async fn usdc_none_disables_usdc_rebalancing() {
 
 /// Tests that when the Alpaca mint API returns an HTTP error, the
 /// `TokenizedEquityMint` aggregate returns an error without emitting any
-/// events. The rebalancer swallows the error, so no mint events appear
-/// in the event store.
+/// events. The job's perform propagates the pre-receipt failure (so apalis
+/// retries it), and no mint events appear in the event store.
 #[tokio::test]
 async fn mint_api_failure_produces_rejected_event() {
     let EquityTriggerFixture {
@@ -1553,7 +1577,7 @@ async fn mint_api_failure_produces_rejected_event() {
         service,
         inventory: _,
         position_cqrs,
-        receiver,
+        receiver: _receiver,
     } = setup_equity_trigger().await;
 
     // Build inventory: 20 onchain, 80 offchain = 20% ratio -> TooMuchOffchain
@@ -1588,16 +1612,6 @@ async fn mint_api_failure_produces_rejected_event() {
         then.status(500).body("Internal Server Error");
     });
 
-    let mock_equity = Arc::new(MockCrossVenueEquityTransfer::new());
-
-    let rebalancer = Rebalancer::new(
-        equity_transfer as _,
-        mock_equity as _,
-        receiver,
-        Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
-        tokio_util::sync::CancellationToken::new(),
-    );
-
     // One more sell triggers the CQRS -> trigger -> Mint flow
     position_cqrs
         .send(
@@ -1619,10 +1633,19 @@ async fn mint_api_failure_produces_rejected_event() {
         .unwrap();
     drain_pending_jobs(&service).await.unwrap();
 
-    drop(service);
-    drop(position_cqrs);
-
-    rebalancer.run().await;
+    let job = fetch_pending_equity_mint_job(&pool).await;
+    let ctx = TransferEquityToMarketMakingCtx {
+        transfer: equity_transfer,
+    };
+    let error = Job::perform(&job, &ctx).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            TransferEquityToMarketMakingJobError::Transfer(MintTransferError::PreReceipt(_))
+        ),
+        "an Alpaca API failure before tokens exist must propagate as a \
+         pre-receipt transfer error so apalis retries the job, got {error:?}"
+    );
 
     mint_mock.assert();
 
@@ -2056,7 +2079,7 @@ async fn mint_accepted_sets_offchain_inflight() {
         service,
         inventory,
         position_cqrs,
-        mut receiver,
+        receiver: _receiver,
     } = setup_equity_trigger().await;
 
     // Build inventory: 20 onchain, 80 offchain = 20% ratio -> TooMuchOffchain
@@ -2119,22 +2142,6 @@ async fn mint_accepted_sets_offchain_inflight() {
     )
     .await;
 
-    // Mock the mint API to accept but never complete (stays pending forever)
-    server.mock(|when, then| {
-        when.method(POST).path(tokenization_mint_path());
-        then.status(200)
-            .header("content-type", "application/json")
-            .json_body(sample_pending_response("inflight_test"));
-    });
-
-    // Mock the poll endpoint to keep returning pending
-    server.mock(|when, then| {
-        when.method(GET).path(tokenization_requests_path());
-        then.status(200)
-            .header("content-type", "application/json")
-            .json_body(json!([sample_pending_response("inflight_test")]));
-    });
-
     // Trigger the imbalance via a position command to dispatch the Mint
     position_cqrs
         .send(
@@ -2156,36 +2163,45 @@ async fn mint_accepted_sets_offchain_inflight() {
         .unwrap();
     drain_pending_jobs(&service).await.unwrap();
 
-    // Receive the dispatched Mint operation and get the quantity
-    let operation = receiver
-        .try_recv()
-        .expect("Trigger should dispatch a Mint operation for the imbalance");
-    let TriggeredOperation::Mint {
-        symbol: mint_symbol,
-        quantity: mint_quantity,
-    } = operation
-    else {
-        panic!("Expected Mint operation, got {operation:?}");
-    };
-    assert_eq!(mint_symbol, symbol);
+    // Fetch the enqueued mint job and get the quantity
+    let job = fetch_pending_equity_mint_job(&pool).await;
+    assert_eq!(job.symbol, symbol);
+    let mint_quantity = job.quantity;
 
-    // Execute the mint transfer. This calls the Alpaca API, gets MintAccepted,
+    // Mock the mint API to accept but never complete (stays pending forever)
+    server.mock(|when, then| {
+        when.method(POST).path(tokenization_mint_path());
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(sample_pending_response(
+                "inflight_test",
+                &job.issuer_request_id,
+            ));
+    });
+
+    // Mock the poll endpoint to keep returning pending
+    server.mock(|when, then| {
+        when.method(GET).path(tokenization_requests_path());
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!([sample_pending_response(
+                "inflight_test",
+                &job.issuer_request_id
+            )]));
+    });
+
+    // Execute the mint job. This calls the Alpaca API, gets MintAccepted,
     // which triggers on_mint -> Inventory::transfer(Hedging, Start, qty).
     // The poll will return pending, so the mint aggregate will time out or loop,
     // but MintAccepted has already fired by then. We spawn and cancel to
     // get just the MintAccepted event through.
     let transfer_handle = tokio::spawn({
         let equity_transfer = Arc::clone(&equity_transfer);
-        let mint_symbol = mint_symbol.clone();
         async move {
-            let _ = CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
-                equity_transfer.as_ref(),
-                Equity {
-                    symbol: mint_symbol,
-                    quantity: mint_quantity,
-                },
-            )
-            .await;
+            let ctx = TransferEquityToMarketMakingCtx {
+                transfer: equity_transfer,
+            };
+            let _ = Job::perform(&job, &ctx).await;
         }
     });
 
@@ -2256,7 +2272,7 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
         service,
         inventory,
         position_cqrs,
-        mut receiver,
+        receiver: _receiver,
     } = setup_equity_trigger().await;
 
     // Build inventory: 20 onchain, 80 offchain = 20% ratio -> TooMuchOffchain
@@ -2317,32 +2333,6 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
 
     let wallet_hex = format!("{:#x}", signer.address());
 
-    let mint_mock = server.mock(|when, then| {
-        when.method(POST)
-            .path(tokenization_mint_path())
-            .json_body_includes(
-                json!({
-                    "underlying_symbol": "AAPL",
-                    "qty": "30.5",
-                    "wallet_address": wallet_hex,
-                })
-                .to_string(),
-            );
-        then.status(200)
-            .header("content-type", "application/json")
-            .json_body(sample_pending_response("completed_mint_test"));
-    });
-
-    let poll_mock = server.mock(|when, then| {
-        when.method(GET).path(tokenization_requests_path());
-        then.status(200)
-            .header("content-type", "application/json")
-            .json_body(json!([sample_completed_response(
-                "completed_mint_test",
-                mint_tx_hash
-            )]));
-    });
-
     // Trigger the mint via a position command
     position_cqrs
         .send(
@@ -2364,17 +2354,40 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
         .unwrap();
     drain_pending_jobs(&service).await.unwrap();
 
-    // Receive the dispatched Mint operation
-    let operation = receiver
-        .try_recv()
-        .expect("Trigger should dispatch a Mint operation");
-    let TriggeredOperation::Mint {
-        symbol: mint_symbol,
-        quantity: mint_quantity,
-    } = operation
-    else {
-        panic!("Expected Mint operation, got {operation:?}");
-    };
+    // Fetch the enqueued mint job
+    let job = fetch_pending_equity_mint_job(&pool).await;
+    assert_eq!(job.symbol, symbol);
+    let mint_quantity = job.quantity;
+
+    let mint_mock = server.mock(|when, then| {
+        when.method(POST)
+            .path(tokenization_mint_path())
+            .json_body_includes(
+                json!({
+                    "underlying_symbol": "AAPL",
+                    "qty": "30.5",
+                    "wallet_address": wallet_hex,
+                })
+                .to_string(),
+            );
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(sample_pending_response(
+                "completed_mint_test",
+                &job.issuer_request_id,
+            ));
+    });
+
+    let poll_mock = server.mock(|when, then| {
+        when.method(GET).path(tokenization_requests_path());
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!([sample_completed_response(
+                "completed_mint_test",
+                &job.issuer_request_id,
+                mint_tx_hash
+            )]));
+    });
 
     // Record initial onchain available before the mint executes
     let initial_onchain_available = {
@@ -2382,16 +2395,11 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
         inv.equity_available(&symbol, Venue::MarketMaking).unwrap()
     };
 
-    // Execute the full mint lifecycle through CrossVenueTransfer
-    CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
-        equity_transfer.as_ref(),
-        Equity {
-            symbol: mint_symbol,
-            quantity: mint_quantity,
-        },
-    )
-    .await
-    .unwrap();
+    // Execute the full mint lifecycle through the job's perform
+    let ctx = TransferEquityToMarketMakingCtx {
+        transfer: Arc::clone(&equity_transfer) as _,
+    };
+    Job::perform(&job, &ctx).await.unwrap();
 
     mint_mock.assert();
     poll_mock.assert();

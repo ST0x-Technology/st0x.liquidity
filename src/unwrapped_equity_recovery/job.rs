@@ -682,7 +682,9 @@ mod tests {
     use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
     use crate::tokenization::Tokenizer;
     use crate::tokenization::mock::{MockCompletionOutcome, MockDetectionOutcome, MockTokenizer};
-    use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintCommand};
+    use crate::tokenized_equity_mint::{
+        TokenizedEquityMint, TokenizedEquityMintCommand, issuer_request_id,
+    };
     use crate::vault_lookup::MockVaultLookup;
 
     use super::super::aggregate::UnwrappedEquityRecoveryServices;
@@ -860,7 +862,7 @@ mod tests {
     #[tokio::test]
     async fn resume_from_detected_validates_active_aggregate_quantity() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let mint_id = IssuerRequestId::new("missing-mint");
+        let mint_id = issuer_request_id("missing-mint");
 
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
@@ -1006,7 +1008,7 @@ mod tests {
     #[test]
     fn decide_dispatch_resolves_all_four_paths() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let mint_id = IssuerRequestId::new("ISS001");
+        let mint_id = issuer_request_id("ISS001");
         let redemption_id = RedemptionAggregateId("RED001".to_string());
 
         assert!(
@@ -1117,7 +1119,7 @@ mod tests {
     #[tokio::test]
     async fn validate_active_mint_quantity_accepts_exact_match() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let mint_id = IssuerRequestId::new("ISS001");
+        let mint_id = issuer_request_id("ISS001");
         let ctx = test_ctx(InventoryView::default(), HashSet::new()).await;
 
         ctx.mint_store
@@ -1145,7 +1147,7 @@ mod tests {
     #[tokio::test]
     async fn validate_active_mint_quantity_rejects_mismatch() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let mint_id = IssuerRequestId::new("ISS001");
+        let mint_id = issuer_request_id("ISS001");
         let ctx = test_ctx(InventoryView::default(), HashSet::new()).await;
 
         ctx.mint_store
@@ -1229,7 +1231,7 @@ mod tests {
     #[tokio::test]
     async fn perform_fresh_active_validation_failure_is_retryable_error() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let mint_id = IssuerRequestId::new("missing-mint");
+        let mint_id = issuer_request_id("missing-mint");
         let view = view_with_unwrapped_balance(&symbol, FractionalShares::new(float!(5)))
             .set_active_mint(symbol.clone(), mint_id);
         let ctx = test_ctx(view, HashSet::new()).await;
@@ -1332,7 +1334,7 @@ mod tests {
     #[tokio::test]
     async fn perform_conflict_fails_recovery_without_retrying() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let mint_id = IssuerRequestId::new("ISS001");
+        let mint_id = issuer_request_id("ISS001");
         let redemption_id = RedemptionAggregateId("RED001".to_string());
         let view = view_with_unwrapped_balance(&symbol, FractionalShares::new(float!(5)))
             .set_active_mint(symbol.clone(), mint_id.clone())
@@ -1480,7 +1482,7 @@ mod tests {
     #[tokio::test]
     async fn perform_drives_active_mint_path_to_dispatched_to_mint() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let mint_id = IssuerRequestId::new("ISS001");
+        let mint_id = issuer_request_id("ISS001");
         let view = view_with_unwrapped_balance(&symbol, FractionalShares::new(float!(5)))
             .set_active_mint(symbol.clone(), mint_id.clone());
         let ctx = test_ctx(view, HashSet::new()).await;

@@ -183,7 +183,6 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
         let shutdown_token = CancellationToken::new();
 
         let rebalancer = Rebalancer::new(
-            Arc::clone(&equity) as _,
             equity as _,
             operation_receiver,
             equity_in_progress,
