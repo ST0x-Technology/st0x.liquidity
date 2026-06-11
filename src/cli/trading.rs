@@ -25,7 +25,7 @@ use crate::offchain::order::{
     build_offchain_order_cqrs,
 };
 use crate::onchain::accumulator::check_execution_readiness;
-use crate::onchain::pyth::FeedIdCache;
+use crate::onchain::pyth::PythFeedIds;
 use crate::onchain::{OnChainError, OnchainTrade, TradeValidationError};
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::symbol::cache::SymbolCache;
@@ -362,7 +362,7 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
     order_placer: Arc<dyn OrderPlacer>,
 ) -> anyhow::Result<()> {
     let evm_ctx = &ctx.evm;
-    let feed_id_cache = FeedIdCache::new();
+    let pyth_feed_ids = PythFeedIds::new(ctx.pyth_feed_ids());
     let order_owner = ctx.order_owner();
     let read_evm = ReadOnlyEvm::new(provider.clone());
 
@@ -371,7 +371,7 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone + 'st
         &read_evm,
         cache,
         evm_ctx,
-        &feed_id_cache,
+        &pyth_feed_ids,
         order_owner,
     )
     .await
