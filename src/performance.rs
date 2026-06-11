@@ -44,6 +44,7 @@ use crate::offchain::order::{OffchainOrder, OffchainOrderEvent, OffchainOrderId}
 use crate::position::{Position, PositionEvent, TradeId};
 
 pub(crate) mod rebalance;
+pub(crate) mod reliability;
 
 /// Waterfall rows returned per report; the full cycle count is still
 /// reported via `total_cycles`.
@@ -164,6 +165,8 @@ pub(crate) enum PerformanceError {
     CoveredCount(#[from] std::num::TryFromIntError),
     #[error("read-model row had an earliest_block_timestamp but no covered fills")]
     InconsistentCoveredBatch,
+    #[error("job queue or failure aggregation produced a count outside usize range: {value}")]
+    AggregateCount { value: i64 },
     #[error("read-model row carried an unparseable offchain order id")]
     OrderId(#[from] uuid::Error),
 }

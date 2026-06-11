@@ -236,6 +236,92 @@ pub struct AttestationSample {
     pub duration_ms: i64,
 }
 
+/// Response of `GET /performance/reliability`.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ReliabilityReport {
+    /// Error/warning log volume over time, oldest bucket first.
+    pub log_buckets: Vec<LogVolumeBucket>,
+    /// Error/warning counts per log target, highest count first.
+    pub log_targets: Vec<LogTargetCount>,
+    /// Money-at-risk lifecycle failure events in range, by event type.
+    pub failure_events: Vec<FailureEventCount>,
+    /// Current job queue health per job type. This is an instantaneous
+    /// snapshot of the queue, NOT windowed by the report range: counts span
+    /// all rows currently in the `Jobs` table regardless of `from`/`to`, so a
+    /// short range shows all-time `done`/`failed` next to windowed failures
+    /// and logs. Queue types with no rows are absent rather than zero.
+    pub job_queues: Vec<JobQueueHealth>,
+    /// `true` when the error/warning log scan hit its entry cap, so
+    /// `log_buckets` and `log_targets` undercount the noisiest windows. Lets
+    /// the dashboard render an honest partial-data state. Failure events are
+    /// aggregated in SQL and are never capped.
+    pub log_entries_truncated: bool,
+}
+
+/// Error and warning counts within one time bucket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct LogVolumeBucket {
+    pub start: DateTime<Utc>,
+    #[ts(type = "number")]
+    pub errors: usize,
+    #[ts(type = "number")]
+    pub warnings: usize,
+}
+
+/// How often one log target emitted at one level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct LogTargetCount {
+    pub target: String,
+    pub level: String,
+    #[ts(type = "number")]
+    pub count: usize,
+}
+
+/// Occurrences of one lifecycle failure event type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct FailureEventCount {
+    pub event_type: String,
+    #[ts(type = "number")]
+    pub count: usize,
+    pub last_at: DateTime<Utc>,
+}
+
+/// Snapshot of one apalis job queue's health.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct JobQueueHealth {
+    pub job_type: String,
+    #[ts(type = "number")]
+    pub pending: usize,
+    #[ts(type = "number")]
+    pub running: usize,
+    #[ts(type = "number")]
+    pub done: usize,
+    /// Terminal failures from retry exhaustion. apalis writes status `Killed`
+    /// (not `Failed`) once a job exhausts `max_attempts`, carrying
+    /// `attempts >= max_attempts`, so this counts `Killed AND attempts >=
+    /// max_attempts`. Disjoint from `awaiting_retry` and `killed`.
+    #[ts(type = "number")]
+    pub failed: usize,
+    /// Failed jobs apalis will retry (status `Failed`, attempts <
+    /// max_attempts): live backlog, also included in `oldest_pending_run_at`.
+    #[ts(type = "number")]
+    pub awaiting_retry: usize,
+    /// Jobs killed before exhausting retries (status `Killed`, attempts <
+    /// max_attempts), e.g. an explicit non-retryable abort. Disjoint from the
+    /// exhaustion-driven `failed` count.
+    #[ts(type = "number")]
+    pub killed: usize,
+    /// Jobs that needed more than one attempt.
+    #[ts(type = "number")]
+    pub retried: usize,
+    pub oldest_pending_run_at: Option<DateTime<Utc>>,
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
