@@ -274,7 +274,10 @@ pub(crate) enum TokenizedEquityMintCommand {
     DepositToVault {
         vault_deposit_tx_hash: TxHash,
     },
-    /// Operator or timeout-driven failure from `MintAccepted` state.
+    /// Operator or timeout-driven failure from `MintAccepted` state, or operator
+    /// force-fail from `MintRequested` (requested at the provider but never
+    /// accepted). Both emit `MintAcceptanceFailed`; the pre-acceptance case
+    /// moved no shares to inflight, so there is nothing to restore.
     FailAcceptance {
         reason: String,
     },
@@ -333,8 +336,14 @@ pub(crate) enum TokenizedEquityMintEvent {
         tokenization_request_id: TokenizationRequestId,
         accepted_at: DateTime<Utc>,
     },
-    /// Mint failed after acceptance but before tokens were received.
-    /// Shares were moved to inflight, can be safely restored to offchain available.
+    /// Mint failed before tokens were received. Two cases:
+    /// - failed after `MintAccepted`: shares were moved to inflight (Hedging),
+    ///   so the inventory reactor restores them to offchain available (Cancel).
+    /// - operator force-fail from `MintRequested` (pre-acceptance): NO shares
+    ///   were moved to inflight, so there is nothing to restore.
+    ///
+    /// `mint_inventory_update` gates the Cancel on the tracking stage having
+    /// reached `Accepted`, so the pre-acceptance case is a no-op there.
     MintAcceptanceFailed {
         reason: String,
         failed_at: DateTime<Utc>,
@@ -1486,12 +1495,21 @@ impl EventSourced for TokenizedEquityMint {
             }
 
             MintAcceptanceFailed { reason, failed_at } => {
-                let Self::MintAccepted {
+                // Emitted from `MintAccepted` (post-acceptance failure) or
+                // `MintRequested` (operator force-fail before acceptance); both
+                // carry the symbol/quantity/requested_at the `Failed` state needs.
+                let (Self::MintAccepted {
                     symbol,
                     quantity,
                     requested_at,
                     ..
-                } = entity
+                }
+                | Self::MintRequested {
+                    symbol,
+                    quantity,
+                    requested_at,
+                    ..
+                }) = entity
                 else {
                     return Ok(None);
                 };
@@ -2066,16 +2084,31 @@ impl EventSourced for TokenizedEquityMint {
             },
 
             TokenizedEquityMintCommand::FailAcceptance { reason } => match self {
-                Self::MintAccepted { .. } => Ok(vec![MintAcceptanceFailed {
-                    reason,
-                    failed_at: Utc::now(),
-                }]),
+                // `MintRequested` is pre-acceptance: a mint stuck there (requested
+                // at the provider but never accepted) is force-failed by the
+                // operator. Acceptance never happened, so `MintAcceptanceFailed`
+                // is the honest terminal -- the same event the post-acceptance
+                // failure emits, broadened in `evolve` to also start from here.
+                Self::MintRequested { .. } | Self::MintAccepted { .. } => {
+                    Ok(vec![MintAcceptanceFailed {
+                        reason,
+                        failed_at: Utc::now(),
+                    }])
+                }
                 Self::DepositedIntoRaindex { .. } => {
                     Err(TokenizedEquityMintError::AlreadyCompleted)
                 }
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
                 Self::Reconciled { .. } => Err(TokenizedEquityMintError::AlreadyReconciled),
-                _ => Err(TokenizedEquityMintError::AlreadyInProgress),
+                // Past acceptance and mid-pipeline: failing acceptance no longer
+                // applies. Listed explicitly (not `_`) so a new state variant is
+                // a compile error here rather than a silent AlreadyInProgress.
+                Self::TokensReceived { .. }
+                | Self::WrapSubmitted { .. }
+                | Self::TokensWrapped { .. }
+                | Self::VaultDepositSubmitted { .. } => {
+                    Err(TokenizedEquityMintError::AlreadyInProgress)
+                }
             },
 
             TokenizedEquityMintCommand::FailWrapping { reason } => match self {
@@ -2500,21 +2533,43 @@ mod tests {
     }
 
     #[test]
-    fn test_evolve_acceptance_failed_rejects_non_accepted_states() {
-        let requested = TokenizedEquityMint::MintRequested {
+    fn test_evolve_acceptance_failed_rejects_inapplicable_states() {
+        // MintAcceptanceFailed applies from MintRequested (operator force-fail)
+        // and MintAccepted (post-acceptance failure); it must NOT apply to a
+        // state past acceptance -- a mid-pipeline TokensReceived or a terminal
+        // Failed mint.
+        let already_failed = TokenizedEquityMint::Failed {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(100.5),
-            wallet: Address::random(),
+            reason: "previous failure".to_string(),
             requested_at: Utc::now(),
+            failed_at: Utc::now(),
         };
+        // Mid-pipeline (past acceptance) and a terminal failure: the two classes
+        // of state that must reject the event. TokensReceived stands in for the
+        // mid-pipeline states (WrapSubmitted/TokensWrapped/VaultDepositSubmitted),
+        // which the production `evolve` treats identically (anything that is not
+        // MintRequested/MintAccepted maps to None).
+        let tokens_received = replay::<TokenizedEquityMint>(vec![
+            mint_requested_event(),
+            mint_accepted_event(),
+            tokens_received_event(),
+        ])
+        .unwrap()
+        .unwrap();
 
         let event = TokenizedEquityMintEvent::MintAcceptanceFailed {
             reason: "Should not apply".to_string(),
             failed_at: Utc::now(),
         };
 
-        let result = TokenizedEquityMint::evolve(&requested, &event).unwrap();
-        assert_eq!(result, None);
+        for state in [already_failed, tokens_received] {
+            assert_eq!(
+                TokenizedEquityMint::evolve(&state, &event).unwrap(),
+                None,
+                "MintAcceptanceFailed must not apply to {state:?}"
+            );
+        }
     }
 
     #[test]
@@ -3220,6 +3275,74 @@ mod tests {
         assert!(
             matches!(entity, TokenizedEquityMint::Failed { .. }),
             "Expected Failed state, got: {entity:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_acceptance_from_requested_force_fails_to_failed() {
+        // A mint stuck at MintRequested (requested but never accepted) can be
+        // operator-force-failed via FailAcceptance, emitting MintAcceptanceFailed
+        // and terminating in Failed.
+        let history = vec![mint_requested_event()];
+
+        let reason = "stuck pre-acceptance; operator force-fail";
+        let events = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
+            .given(history.clone())
+            .when(TokenizedEquityMintCommand::FailAcceptance {
+                reason: reason.to_string(),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let TokenizedEquityMintEvent::MintAcceptanceFailed {
+            reason: event_reason,
+            ..
+        } = &events[0]
+        else {
+            panic!("expected MintAcceptanceFailed, got {:?}", events[0]);
+        };
+        assert_eq!(event_reason, reason);
+
+        let state = replay::<TokenizedEquityMint>([history, events].concat())
+            .expect("event stream should replay")
+            .expect("event stream should materialize a state");
+        let TokenizedEquityMint::Failed {
+            reason: state_reason,
+            ..
+        } = state
+        else {
+            panic!("force-fail from MintRequested must terminate in Failed, got {state:?}");
+        };
+        assert_eq!(
+            state_reason, reason,
+            "the operator reason must survive into the Failed terminal state"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_acceptance_from_mid_pipeline_is_rejected() {
+        // FailAcceptance broadened to accept MintRequested/MintAccepted; a mint
+        // that moved past acceptance (TokensReceived) must still be rejected, so
+        // the success arm did not over-widen.
+        let error = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
+            .given(vec![
+                mint_requested_event(),
+                mint_accepted_event(),
+                tokens_received_event(),
+            ])
+            .when(TokenizedEquityMintCommand::FailAcceptance {
+                reason: "should be rejected".to_string(),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(TokenizedEquityMintError::AlreadyInProgress)
+            ),
+            "FailAcceptance from a mid-pipeline state must be AlreadyInProgress, got {error:?}"
         );
     }
 
