@@ -35,6 +35,9 @@ use error_decoding::{decode_reverted_receipt, decode_rpc_revert};
 pub mod nonce;
 pub use nonce::ResettableNonceManager;
 
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+mod submit;
+
 #[cfg(feature = "local-signer")]
 pub mod local;
 #[cfg(feature = "turnkey")]
@@ -176,6 +179,25 @@ pub enum EvmError {
         tx_hash: alloy::primitives::TxHash,
         elapsed_secs: u64,
     },
+    /// A stuck under-gassed pending transaction occupies the wallet's
+    /// next nonce, and `attempts` fee-bumped resubmits at that nonce all
+    /// came back "replacement transaction underpriced". The replacement
+    /// fee never exceeded the stuck transaction's fee within the bounded
+    /// escalation budget -- surfaced as a hard error rather than bumping
+    /// the fee without limit.
+    #[error(
+        "replacement transaction still underpriced after {attempts} \
+         fee-bumped resubmits"
+    )]
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    ReplacementUnderpriced { attempts: u32 },
+    /// Bumping the EIP-1559 fee for a replacement transaction overflowed
+    /// `u128`. Only reachable if the RPC returns an absurd fee estimate;
+    /// surfaced as a hard error rather than silently wrapping a financial
+    /// value.
+    #[error("replacement fee bump overflowed u128 (network fee estimate too large)")]
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    ReplacementFeeOverflow,
     #[cfg(feature = "local-signer")]
     #[error("invalid private key: {0}")]
     InvalidPrivateKey(#[from] alloy::signers::k256::ecdsa::Error),
@@ -202,6 +224,10 @@ impl EvmError {
             | Self::WalletConfigParse(_) => false,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::ReceiptTimeout { .. } => false,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::ReplacementUnderpriced { .. } => false,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::ReplacementFeeOverflow => false,
             #[cfg(feature = "local-signer")]
             Self::InvalidPrivateKey(_) => false,
             #[cfg(feature = "turnkey")]
@@ -221,6 +247,29 @@ impl EvmError {
             Self::Transport(rpc_error) => rpc_error
                 .as_error_resp()
                 .is_some_and(|payload| payload.message.contains("nonce too low")),
+            _ => false,
+        }
+    }
+
+    /// Returns `true` if this is a "replacement transaction underpriced"
+    /// RPC error. It occurs when a different transaction already sits in
+    /// the mempool at the target nonce and the new submission's fee does
+    /// not exceed it by the node's required replacement margin (geth needs
+    /// at least 10% higher). Recovering means resubmitting at the same
+    /// nonce with a bumped fee.
+    ///
+    /// Deliberately does NOT match "already known": that error means the
+    /// *identical* transaction (same hash) is already pending, which is an
+    /// idempotent re-send, not a fee problem. Bumping the fee for it would
+    /// needlessly replace an already-accepted transaction.
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    pub(crate) fn is_replacement_underpriced(&self) -> bool {
+        match self {
+            Self::Transport(rpc_error) => rpc_error.as_error_resp().is_some_and(|payload| {
+                payload
+                    .message
+                    .contains("replacement transaction underpriced")
+            }),
             _ => false,
         }
     }

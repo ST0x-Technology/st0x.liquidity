@@ -14,14 +14,16 @@ use alloy::providers::fillers::{
     BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
 };
 use alloy::providers::{Identity, Provider, ProviderBuilder};
-use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
+use alloy::rpc::types::TransactionReceipt;
 use alloy::signers::{Error as SignerError, Result as SignerResult, Signer};
 use async_trait::async_trait;
+use futures::lock::Mutex;
 use reqwest::header::CONTENT_TYPE;
 use serde::Deserialize;
 use serde::Serialize;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
-use tracing::{error, info, trace, warn};
+use tracing::{info, trace};
 use turnkey_api_key_stamper::{Stamp, StampHeader, TurnkeyP256ApiKey};
 use turnkey_client::generated::{
     Activity, ActivityResponse, ActivityStatus, SignRawPayloadIntentV2, SignRawPayloadRequest,
@@ -31,6 +33,7 @@ use turnkey_client::generated::{
 use turnkey_client::{RetryConfig, TurnkeyClientError};
 
 use crate::nonce::ResettableNonceManager;
+use crate::submit::send_with_recovery;
 use crate::{Evm, EvmError, TryIntoWallet, Wallet, WalletCtx};
 
 /// Turnkey organization identifier (non-secret, lives in plaintext
@@ -159,6 +162,10 @@ pub struct TurnkeyWallet<P: Provider> {
     /// `signing_provider` so we can call [`invalidate()`] on "nonce
     /// too low" errors without needing to traverse the filler chain.
     nonce_manager: ResettableNonceManager,
+    /// Serializes sends from this wallet so concurrent callers cannot
+    /// build two transactions at the same nonce. Shared across clones so
+    /// every handle to the same address contends on one lock.
+    send_lock: Arc<Mutex<()>>,
     address: Address,
     required_confirmations: u64,
 }
@@ -222,6 +229,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
             provider: base_provider,
             signing_provider,
             nonce_manager,
+            send_lock: Arc::new(Mutex::new(())),
             address,
             required_confirmations,
         })
@@ -261,6 +269,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> TurnkeyWallet<P> {
             provider: base_provider,
             signing_provider,
             nonce_manager,
+            send_lock: Arc::new(Mutex::new(())),
             address,
             required_confirmations,
         })
@@ -655,44 +664,16 @@ where
     ) -> Result<TxHash, EvmError> {
         info!(target: "wallet", %contract, note, "Submitting Turnkey contract call");
 
-        let tx = TransactionRequest::default()
-            .to(contract)
-            .input(calldata.into());
-
-        let pending = match self.signing_provider.send_transaction(tx.clone()).await {
-            Ok(pending) => pending,
-            Err(error) => {
-                let error = EvmError::from(error);
-
-                if !error.is_nonce_too_low() {
-                    warn!(target: "wallet", %contract, note, %error, "Transaction \
-                        send failed -- invalidating nonce cache to prevent nonce gap");
-                    self.nonce_manager.invalidate();
-                    return Err(error);
-                }
-
-                warn!(target: "wallet", %contract, note, "Nonce too low — \
-                    invalidating cache and retrying (external nonce change detected)");
-                self.nonce_manager.invalidate();
-
-                self.signing_provider
-                    .send_transaction(tx)
-                    .await
-                    .map_err(|error| {
-                        let error = EvmError::from(error);
-                        error!(target: "wallet", %error, "Nonce-too-low retry also failed \
-                            -- invalidating nonce cache");
-                        self.nonce_manager.invalidate();
-                        error
-                    })?
-            }
-        };
-
-        let tx_hash = *pending.tx_hash();
-
-        info!(target: "wallet", %tx_hash, note, "Transaction submitted");
-
-        Ok(tx_hash)
+        send_with_recovery(
+            &self.signing_provider,
+            &self.nonce_manager,
+            &self.send_lock,
+            self.address,
+            contract,
+            calldata,
+            note,
+        )
+        .await
     }
 
     async fn await_receipt(&self, tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
