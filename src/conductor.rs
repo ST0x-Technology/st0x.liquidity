@@ -3334,6 +3334,95 @@ mod tests {
         );
     }
 
+    /// Re-delivering the identical (tx_hash, log_index) trade through the
+    /// accounting pipeline must be single-effect: one OnChainTrade fill
+    /// event, one Position fill transition, one offchain order -- the
+    /// duplicate short-circuits at the aggregate-load guard. This is the
+    /// dedup invariant every duplicate-input source (replayed logs,
+    /// duplicate apalis jobs, restart re-backfill) funnels through.
+    #[tokio::test]
+    async fn duplicate_trade_event_is_single_effect() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+
+        let trade_event = make_trade_event(30);
+
+        let first = process_queued_trade(
+            &MockExecutor::new(),
+            &trade_event,
+            test_trade_with_amount(float!(1.5), 30),
+            &cqrs,
+            true,
+        )
+        .await
+        .unwrap();
+        let offchain_order_id =
+            first.expect("1.5 shares should trigger execution with 1-share threshold");
+
+        let second = process_queued_trade(
+            &MockExecutor::new(),
+            &trade_event,
+            test_trade_with_amount(float!(1.5), 30),
+            &cqrs,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            second, None,
+            "Duplicate trade must short-circuit without placing another order"
+        );
+
+        let (onchain_fills,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
+                .bind("OnChainTradeEvent::Filled")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(onchain_fills, 1, "Duplicate must not re-witness the trade");
+
+        let (position_fills,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
+                .bind("PositionEvent::OnChainOrderFilled")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            position_fills, 1,
+            "Duplicate must not double-count the position"
+        );
+
+        let position = cqrs
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .expect("position should exist");
+        assert!(
+            position.net.inner().eq(float!(1.5)).unwrap(),
+            "Position net must reflect the trade exactly once"
+        );
+        assert_eq!(
+            position.pending_offchain_order_id,
+            Some(offchain_order_id),
+            "The pending order must still be the first attempt's"
+        );
+
+        let all_orders = offchain_order_projection.load_all().await.unwrap();
+        assert_eq!(
+            all_orders.len(),
+            1,
+            "Exactly one offchain order should exist after the duplicate, got {}",
+            all_orders.len(),
+        );
+    }
+
     #[tokio::test]
     async fn trade_above_threshold_skips_counter_trade_without_offchain_inventory() {
         let (pool, apalis_pool) = setup_test_pools().await;
