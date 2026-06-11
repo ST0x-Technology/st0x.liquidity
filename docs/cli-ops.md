@@ -288,13 +288,13 @@ that no recent CCTP burn was submitted from the market-maker wallet (e.g. via
   NOT run `fail-usdc-transfer` (strands the burned funds) and do NOT run
   `transfer reconcile` (its preflight rejects `BridgingSubmitting` -- it only
   accepts persisted post-burn terminals such as `DepositFailed`). Instead, run
-  `transfer resume`: its `find_recent_burn` scan adopts the orphan burn,
-  persists `BridgingInitiated`, and the transfer continues normally.
+  `transfer resume --kind usdc`: its `find_recent_burn` scan adopts the orphan
+  burn, persists `BridgingInitiated`, and the transfer continues normally.
 
 `transfer reconcile` is the path for persisted post-burn terminal failures (e.g.
 `DepositFailed`, `BridgingFailed` with a burn tx recorded). The legacy flat
-`resume-usdc-transfer` / `reconcile-usdc-transfer` names remain valid until
-deprecation.
+`resume-usdc-transfer` / `reconcile-usdc-transfer` names have been removed; only
+the grouped `transfer resume` / `transfer reconcile` forms exist.
 
     stox fail-usdc-transfer --id <uuid> --reason "pre-burn crash, burn not attempted"
 
@@ -305,6 +305,5 @@ nix run .#simulate-failures
 ```
 
 The backend creates failed mint and redemption transfers whose mock Alpaca
-provider later completes, then prints the exact (legacy-named)
-`recheck-transfer` commands for that run's generated config, secrets, database,
-and mock API port.
+provider later completes, then prints the exact `transfer recheck` commands for
+that run's generated config, secrets, database, and mock API port.

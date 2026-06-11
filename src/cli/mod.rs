@@ -52,7 +52,7 @@ pub enum ConvertDirection {
     ToUsdc,
 }
 
-/// Transfer type for the fail-transfer command.
+/// Transfer type for the `transfer fail` command.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum TransferType {
     /// Tokenized equity mint (Alpaca -> onchain)
@@ -127,7 +127,6 @@ pub enum PositionRecoveryCommand {
     ///
     /// Operates directly on the local CQRS state via aggregate commands; does not
     /// require the running bot.
-    #[command(alias = "fail-pending-offchain-order")]
     ReleaseHedge {
         /// Position symbol (e.g., MSTR)
         #[arg(short = 's', long = "symbol")]
@@ -144,7 +143,6 @@ pub enum PositionRecoveryCommand {
     ///
     /// Operates directly on the local CQRS state via aggregate commands; does not
     /// require the running bot.
-    #[command(alias = "set-position")]
     #[command(group(
         ArgGroup::new("target")
             .required(true)
@@ -346,44 +344,6 @@ pub enum Commands {
         amount: Usdc,
     },
 
-    /// Resume an interrupted USDC transfer by its id (Raindex <-> Alpaca)
-    ///
-    /// Re-drives a transfer whose CLI invocation was interrupted after the burn.
-    /// The id is printed by `transfer-usdc` at start. An unknown id is rejected
-    /// (never starts a fresh burn) and `--direction` must match the original;
-    /// the resume always uses the aggregate's persisted amount.
-    #[command(hide = true)]
-    ResumeUsdcTransfer {
-        /// Id of the transfer to resume (printed by `transfer-usdc`)
-        #[arg(long = "id")]
-        id: Uuid,
-        /// Direction of the original transfer (must match the persisted transfer)
-        #[arg(short = 'd', long = "direction")]
-        direction: TransferDirection,
-        /// Required for compatibility with old recovery hints; ignored -- the
-        /// resume uses the persisted amount
-        #[arg(short = 'a', long = "amount")]
-        amount: Usdc,
-    },
-
-    /// Reconcile a USDC transfer stranded in a post-burn terminal failure
-    ///
-    /// Drives a USDC rebalance stranded in a post-burn terminal failure
-    /// (`DepositFailed`, a post-burn `BridgingFailed`, or a `BaseToAlpaca`
-    /// `ConversionFailed`) to the clearing terminal `Reconciled` state: the
-    /// funds were handled out-of-band, so this resolves the transfer (clearing
-    /// the in-progress guard and reconciling source-venue inflight) rather than
-    /// re-driving it. Rejects an unknown id or any other state.
-    #[command(hide = true)]
-    ReconcileUsdcTransfer {
-        /// Id of the stuck transfer to reconcile
-        #[arg(long = "id")]
-        id: Uuid,
-        /// Why the transfer is being reconciled
-        #[arg(short = 'r', long = "reason", default_value = "funds-moved-manually")]
-        reason: ReconcileReasonArg,
-    },
-
     /// Mark a pre-burn USDC rebalance as failed, clearing the in-progress guard.
     ///
     /// Valid only from `BridgingSubmitting` or `WithdrawalComplete`. Refused for
@@ -401,7 +361,7 @@ pub enum Commands {
     /// - Post-burn terminal failures (e.g. `DepositFailed`) use
     ///   `transfer reconcile`. In-flight post-burn states (`Bridging`,
     ///   `AwaitingAttestation`, `Attested`, `Bridged`, `DepositInitiated`)
-    ///   should be resumed with `transfer resume`.
+    ///   should be resumed with `transfer resume --kind usdc`.
     FailUsdcTransfer {
         /// USDC rebalance aggregate ID (UUID)
         #[arg(short = 'i', long = "id")]
@@ -547,21 +507,6 @@ pub enum Commands {
         from: CctpChain,
     },
 
-    /// Recover a stuck CCTP transfer by completing the mint on the destination chain.
-    ///
-    /// Use this when a CCTP burn succeeded but the mint wasn't completed (e.g., due to
-    /// attestation polling being interrupted). Provide the burn transaction hash and
-    /// specify the source chain to recover the transfer.
-    #[command(hide = true)]
-    CctpRecover {
-        /// Transaction hash of the burn transaction on the source chain
-        #[arg(long = "burn-tx")]
-        burn_tx: TxHash,
-        /// Source chain where the burn occurred
-        #[arg(long = "source-chain")]
-        source_chain: CctpChain,
-    },
-
     /// Reset USDC allowance for the orderbook to zero.
     ///
     /// Use this to investigate approval behavior or when switching orderbook addresses.
@@ -670,65 +615,7 @@ pub enum Commands {
         yes: bool,
     },
 
-    /// Manually fail a stuck mint or redemption transfer
-    ///
-    /// Marks a transfer aggregate as failed, transitioning it to a terminal
-    /// state. Use when a transfer is permanently stuck (e.g., timed out,
-    /// unrecoverable error) and needs operator intervention.
-    #[command(hide = true)]
-    FailTransfer {
-        /// Transfer type: "mint" or "redemption"
-        #[arg(short = 't', long = "type")]
-        transfer_type: TransferType,
-        /// Aggregate ID (issuer_request_id for mint, redemption ID for redemption)
-        #[arg(short = 'i', long = "id")]
-        id: String,
-        /// Reason for failure
-        #[arg(
-            short = 'r',
-            long = "reason",
-            default_value = "Manually failed via CLI"
-        )]
-        reason: String,
-    },
-
-    /// Re-check a failed mint or redemption and complete it if the provider settled it
-    ///
-    /// Delegates to the running bot's REST API so recovery dispatches through
-    /// the in-process reactor (correcting live inventory). Requires the bot to
-    /// be running and serving its API on the configured `server_port`.
-    #[command(hide = true)]
-    RecheckTransfer {
-        /// Transfer type: "mint" or "redemption"
-        #[arg(short = 't', long = "type")]
-        transfer_type: TransferType,
-        /// Aggregate ID (issuer_request_id for mint, redemption ID for redemption)
-        #[arg(short = 'i', long = "id")]
-        id: String,
-    },
-
-    /// Rebuild a materialized view by replaying all events from scratch
-    ///
-    /// Use as an escape hatch when a view becomes corrupted (e.g., due to
-    /// lost updates from optimistic lock conflicts). Deletes the view row(s)
-    /// and replays all events to reconstruct correct state.
-    #[command(hide = true)]
-    RebuildView {
-        /// Aggregate type to rebuild (position, offchain-order, vault-registry)
-        #[arg(short = 'a', long = "aggregate")]
-        aggregate: AggregateView,
-        /// Specific aggregate ID to rebuild (e.g., AAPL for position).
-        /// Mutually exclusive with --all.
-        #[arg(long = "id", conflicts_with = "all", required_unless_present = "all")]
-        id: Option<String>,
-        /// Rebuild all views for the aggregate type.
-        /// Mutually exclusive with --id.
-        #[arg(long = "all", conflicts_with = "id", required_unless_present = "id")]
-        all: bool,
-    },
-
     /// Recover stuck positions through aggregate commands.
-    #[command(alias = "repair")]
     Position {
         #[command(subcommand)]
         command: PositionRecoveryCommand,
@@ -1253,9 +1140,7 @@ async fn run_command_with_writers<W: Write>(
 
 // One flat match mapping every CLI command to its internal Simple/Provider
 // dispatch. Kept as a single match (per the repo's "don't split simple-but-long
-// matches" rule) rather than fragmented into per-group helpers; the grouped
-// subcommands added in the recovery-CLI rename pushed it just over the limit.
-#[allow(clippy::too_many_lines)]
+// matches" rule) rather than fragmented into per-group helpers.
 fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand> {
     match command {
         Commands::Buy {
@@ -1334,14 +1219,6 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
         Commands::TransferUsdc { direction, amount } => {
             Err(ProviderCommand::TransferUsdc { direction, amount })
         }
-        Commands::ResumeUsdcTransfer {
-            id,
-            direction,
-            // Ignored: a resume always uses the persisted aggregate amount. The
-            // flag stays required on the legacy name so old invocations keep
-            // their exact shape.
-            amount: _,
-        } => Err(ProviderCommand::ResumeUsdcTransfer { id, direction }),
         Commands::VaultDeposit {
             amount,
             token,
@@ -1364,13 +1241,6 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
         Commands::CctpBridge { amount, all, from } => {
             Err(ProviderCommand::CctpBridge { amount, all, from })
         }
-        Commands::CctpRecover {
-            burn_tx,
-            source_chain,
-        } => Err(ProviderCommand::CctpRecover {
-            burn_tx,
-            source_chain,
-        }),
         Commands::ResetAllowance { chain } => Err(ProviderCommand::ResetAllowance { chain }),
         Commands::AlpacaTokenize {
             symbol,
@@ -1395,25 +1265,7 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
         }
         Commands::OrderStatus { order_id } => Ok(SimpleCommand::OrderStatus { order_id }),
         Commands::Submit { to, data, yes } => Ok(SimpleCommand::Submit { to, data, yes }),
-        Commands::RebuildView { aggregate, id, all } => {
-            Ok(SimpleCommand::RebuildView { aggregate, id, all })
-        }
         Commands::Position { command } => Ok(SimpleCommand::Position { command }),
-        Commands::FailTransfer {
-            transfer_type,
-            id,
-            reason,
-        } => Ok(SimpleCommand::FailTransfer {
-            transfer_type,
-            id,
-            reason,
-        }),
-        Commands::RecheckTransfer { transfer_type, id } => {
-            Ok(SimpleCommand::RecheckTransfer { transfer_type, id })
-        }
-        Commands::ReconcileUsdcTransfer { id, reason } => {
-            Ok(SimpleCommand::ReconcileUsdcTransfer { id, reason })
-        }
         Commands::FailUsdcTransfer { id, reason } => {
             Ok(SimpleCommand::FailUsdcTransfer { id, reason })
         }
@@ -2089,164 +1941,6 @@ mod tests {
     }
 
     #[test]
-    fn recheck_transfer_command_parses_type_and_id() {
-        let cli = Cli::try_parse_from([
-            "st0x-cli",
-            "recheck-transfer",
-            "--type",
-            "mint",
-            "--id",
-            "ISS001",
-        ])
-        .unwrap();
-
-        match cli.command {
-            Commands::RecheckTransfer { transfer_type, id } => {
-                assert!(matches!(transfer_type, TransferType::Mint));
-                assert_eq!(id, "ISS001");
-            }
-            other => panic!("expected recheck-transfer command, got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn resume_usdc_transfer_command_parses_id_direction_and_amount() {
-        let id = Uuid::from_u128(42);
-        let cli = Cli::try_parse_from([
-            "st0x-cli",
-            "resume-usdc-transfer",
-            "--id",
-            &id.to_string(),
-            "--direction",
-            "to-raindex",
-            "--amount",
-            "100",
-        ])
-        .unwrap();
-
-        match cli.command {
-            Commands::ResumeUsdcTransfer {
-                id: parsed_id,
-                direction,
-                amount,
-            } => {
-                assert_eq!(parsed_id, id);
-                assert!(matches!(direction, TransferDirection::ToRaindex));
-                assert_eq!(
-                    amount,
-                    Usdc::new(rain_math_float::Float::parse("100".to_string()).unwrap())
-                );
-            }
-            other => panic!("expected resume-usdc-transfer command, got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn reconcile_usdc_transfer_command_parses_id_and_reason() {
-        let id = Uuid::from_u128(77);
-        let cli = Cli::try_parse_from([
-            "st0x-cli",
-            "reconcile-usdc-transfer",
-            "--id",
-            &id.to_string(),
-            "--reason",
-            "deposit-credited-offline",
-        ])
-        .unwrap();
-
-        match cli.command {
-            Commands::ReconcileUsdcTransfer {
-                id: parsed_id,
-                reason,
-            } => {
-                assert_eq!(parsed_id, id);
-                assert!(matches!(reason, ReconcileReasonArg::DepositCreditedOffline));
-            }
-            other => panic!("expected reconcile-usdc-transfer command, got: {other:?}"),
-        }
-    }
-
-    /// The hidden legacy flat command keeps its default reason so existing
-    /// runbooks/scripts that omit --reason still work.
-    #[test]
-    fn legacy_reconcile_usdc_transfer_keeps_default_reason() {
-        let id = Uuid::from_u128(78);
-        let cli = Cli::try_parse_from([
-            "st0x-cli",
-            "reconcile-usdc-transfer",
-            "--id",
-            &id.to_string(),
-        ])
-        .unwrap();
-
-        match cli.command {
-            Commands::ReconcileUsdcTransfer { reason, .. } => {
-                assert!(matches!(reason, ReconcileReasonArg::FundsMovedManually));
-            }
-            other => panic!("expected reconcile-usdc-transfer command, got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn classify_reconcile_usdc_transfer_command_as_simple() {
-        // reconcile-usdc-transfer only loads + sends to the event store, so it
-        // must route without an RPC provider.
-        let command = Commands::ReconcileUsdcTransfer {
-            id: Uuid::from_u128(42),
-            reason: ReconcileReasonArg::FundsMovedManually,
-        };
-
-        match classify_command(command) {
-            Ok(SimpleCommand::ReconcileUsdcTransfer { reason, .. }) => {
-                assert!(matches!(reason, ReconcileReasonArg::FundsMovedManually));
-            }
-            Ok(_) => panic!("expected reconcile-usdc-transfer simple command"),
-            Err(
-                ProviderCommand::ProcessTx { .. }
-                | ProviderCommand::TransferUsdc { .. }
-                | ProviderCommand::ResumeUsdcTransfer { .. }
-                | ProviderCommand::CctpBridge { .. }
-                | ProviderCommand::CctpRecover { .. }
-                | ProviderCommand::ResetAllowance { .. }
-                | ProviderCommand::AlpacaTokenize { .. }
-                | ProviderCommand::AlpacaRedeem { .. }
-                | ProviderCommand::DividendBump { .. }
-                | ProviderCommand::AlpacaTokenizationRequests,
-            ) => panic!("expected simple command classification, got provider command"),
-        }
-    }
-
-    #[test]
-    fn classify_recheck_transfer_command_as_simple() {
-        // The recheck-transfer command must route without an RPC provider:
-        // it delegates to the running bot's REST API rather than touching chain.
-        let command = Commands::RecheckTransfer {
-            transfer_type: TransferType::Redemption,
-            id: "redemption-1".to_string(),
-        };
-
-        match classify_command(command) {
-            Ok(SimpleCommand::RecheckTransfer { transfer_type, id }) => {
-                assert!(matches!(transfer_type, TransferType::Redemption));
-                assert_eq!(id, "redemption-1");
-            }
-            Ok(_) => panic!("expected recheck-transfer simple command"),
-            Err(
-                ProviderCommand::ProcessTx { .. }
-                | ProviderCommand::TransferUsdc { .. }
-                | ProviderCommand::ResumeUsdcTransfer { .. }
-                | ProviderCommand::CctpBridge { .. }
-                | ProviderCommand::CctpRecover { .. }
-                | ProviderCommand::ResetAllowance { .. }
-                | ProviderCommand::AlpacaTokenize { .. }
-                | ProviderCommand::AlpacaRedeem { .. }
-                | ProviderCommand::DividendBump { .. }
-                | ProviderCommand::AlpacaTokenizationRequests,
-            ) => panic!("expected simple command classification, got provider command"),
-        }
-    }
-
-    #[test]
     fn classify_fail_usdc_transfer_routes_without_provider() {
         // fail-usdc-transfer only loads + sends to the event store, so it
         // must route without an RPC provider.
@@ -2434,84 +2128,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_fail_pending_offchain_order_alias_requires_reason() {
-        // The legacy alias shares the canonical command's arguments, so it
-        // loses the defaulted reason along with `position release-hedge`.
-        let order_id = OffchainOrderId::new();
-        let error = Cli::try_parse_from([
-            "st0x-cli",
-            "repair",
-            "fail-pending-offchain-order",
-            "--symbol",
-            "MSTR",
-            "--order-id",
-            &order_id.to_string(),
-        ])
-        .unwrap_err();
-        assert_eq!(
-            error.kind(),
-            clap::error::ErrorKind::MissingRequiredArgument
-        );
-        assert!(
-            error.to_string().contains("reason"),
-            "the missing argument must be --reason, got: {error}",
-        );
-    }
-
-    #[test]
-    fn legacy_fail_transfer_keeps_default_reason() {
-        // The hidden legacy flat command keeps its default reason so existing
-        // runbooks/scripts that omit --reason still work.
-        let cli =
-            Cli::try_parse_from(["st0x-cli", "fail-transfer", "--type", "mint", "--id", "m1"])
-                .unwrap();
-        match cli.command {
-            Commands::FailTransfer { reason, .. } => {
-                assert_eq!(reason, "Manually failed via CLI");
-            }
-            _ => panic!("expected legacy FailTransfer command"),
-        }
-    }
-
-    #[test]
-    fn repair_fail_pending_offchain_order_parses() {
-        let order_id = OffchainOrderId::new();
+    fn position_set_zero_parses() {
         let cli = Cli::try_parse_from([
             "st0x-cli",
-            "repair",
-            "fail-pending-offchain-order",
-            "--symbol",
-            "MSTR",
-            "--order-id",
-            &order_id.to_string(),
-            "--reason",
-            "operator repair",
-        ])
-        .unwrap();
-
-        match cli.command {
-            Commands::Position {
-                command:
-                    PositionRecoveryCommand::ReleaseHedge {
-                        symbol,
-                        order_id: parsed_order_id,
-                        reason,
-                    },
-            } => {
-                assert_eq!(symbol, Symbol::new("MSTR").unwrap());
-                assert_eq!(parsed_order_id, order_id);
-                assert_eq!(reason, "operator repair");
-            }
-            other => panic!("expected repair command, got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn repair_set_position_zero_parses() {
-        let cli = Cli::try_parse_from([
-            "st0x-cli",
-            "repair",
-            "set-position",
+            "position",
+            "set",
             "--symbol",
             "SPYM",
             "--zero",
@@ -2520,8 +2141,8 @@ mod tests {
         ])
         .unwrap();
 
-        match cli.command {
-            Commands::Position {
+        match classify_command(cli.command) {
+            Ok(SimpleCommand::Position {
                 command:
                     PositionRecoveryCommand::Set {
                         symbol,
@@ -2531,7 +2152,7 @@ mod tests {
                         price,
                         reason,
                     },
-            } => {
+            }) => {
                 assert_eq!(symbol, Symbol::new("SPYM").unwrap());
                 assert!(zero);
                 assert_eq!(long, None);
@@ -2539,16 +2160,16 @@ mod tests {
                 assert!(price.is_none());
                 assert_eq!(reason, "manual rebalance completed");
             }
-            other => panic!("expected repair set-position command, got: {other:?}"),
+            _ => panic!("expected position set simple command"),
         }
     }
 
     #[test]
-    fn repair_set_position_long_and_short_parse_positive_amounts() {
+    fn position_set_long_and_short_parse_positive_amounts() {
         let long = Cli::try_parse_from([
             "st0x-cli",
-            "repair",
-            "set-position",
+            "position",
+            "set",
             "--symbol",
             "SPYM",
             "--long",
@@ -2558,21 +2179,21 @@ mod tests {
         ])
         .unwrap();
 
-        match long.command {
-            Commands::Position {
+        match classify_command(long.command) {
+            Ok(SimpleCommand::Position {
                 command:
                     PositionRecoveryCommand::Set {
                         long: Some(quantity),
                         ..
                     },
-            } => assert_eq!(quantity, positive_shares("100")),
-            other => panic!("expected repair set-position --long, got: {other:?}"),
+            }) => assert_eq!(quantity, positive_shares("100")),
+            _ => panic!("expected position set --long simple command"),
         }
 
         let short = Cli::try_parse_from([
             "st0x-cli",
-            "repair",
-            "set-position",
+            "position",
+            "set",
             "--symbol",
             "SPYM",
             "--short",
@@ -2582,29 +2203,27 @@ mod tests {
         ])
         .unwrap();
 
-        match short.command {
-            Commands::Position {
+        match classify_command(short.command) {
+            Ok(SimpleCommand::Position {
                 command:
                     PositionRecoveryCommand::Set {
                         short: Some(quantity),
                         ..
                     },
-            } => assert_eq!(quantity, positive_shares("12.5")),
-            other => panic!("expected repair set-position --short, got: {other:?}"),
+            }) => assert_eq!(quantity, positive_shares("12.5")),
+            _ => panic!("expected position set --short simple command"),
         }
     }
 
     #[test]
-    fn repair_set_position_rejects_missing_reason() {
-        let error = Cli::try_parse_from([
-            "st0x-cli",
-            "repair",
-            "set-position",
-            "--symbol",
-            "SPYM",
-            "--zero",
-        ])
-        .unwrap_err();
+    fn position_set_rejects_missing_reason() {
+        let error =
+            Cli::try_parse_from(["st0x-cli", "position", "set", "--symbol", "SPYM", "--zero"])
+                .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
         let rendered = error.to_string();
         assert!(
             rendered.contains("reason"),
@@ -2613,18 +2232,18 @@ mod tests {
     }
 
     #[test]
-    fn repair_set_position_rejects_multiple_targets() {
+    fn position_set_rejects_multiple_targets() {
         let error = Cli::try_parse_from([
             "st0x-cli",
-            "repair",
-            "set-position",
+            "position",
+            "set",
             "--symbol",
             "SPYM",
             "--zero",
             "--long",
             "1",
             "--reason",
-            "operator repair",
+            "operator correction",
         ])
         .unwrap_err();
         let rendered = error.to_string();
@@ -2637,17 +2256,17 @@ mod tests {
     }
 
     #[test]
-    fn repair_set_position_rejects_zero_long_amount() {
+    fn position_set_rejects_zero_long_amount() {
         let error = Cli::try_parse_from([
             "st0x-cli",
-            "repair",
-            "set-position",
+            "position",
+            "set",
             "--symbol",
             "SPYM",
             "--long",
             "0",
             "--reason",
-            "operator repair",
+            "operator correction",
         ])
         .unwrap_err();
         let rendered = error.to_string();
@@ -2660,7 +2279,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_repair_command_as_simple() {
+    fn classify_position_command_as_simple() {
         let order_id = OffchainOrderId::new();
         let command = Commands::Position {
             command: PositionRecoveryCommand::ReleaseHedge {
@@ -2683,7 +2302,7 @@ mod tests {
                 assert_eq!(parsed_order_id, order_id);
                 assert_eq!(reason, "operator repair");
             }
-            Ok(_) => panic!("expected repair simple command"),
+            Ok(_) => panic!("expected position simple command"),
             Err(
                 ProviderCommand::ProcessTx { .. }
                 | ProviderCommand::TransferUsdc { .. }
@@ -2700,7 +2319,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_command_with_writers_executes_repair_set_position() {
+    async fn run_command_with_writers_executes_position_set() {
         let ctx = create_test_ctx();
         let pool = setup_test_db().await;
         let symbol = Symbol::new("SPYM").unwrap();
@@ -2963,6 +2582,25 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "guarantees id and direction")]
+    fn classify_usdc_resume_without_id_or_direction_is_unreachable() {
+        // The production path is doubly guarded (clap `required_if_eq` plus
+        // `validate_command`), but `classify_command` is called directly in
+        // tests; constructing the impossible shape by hand must hit the
+        // documented `unreachable!`, pinning that invariant independently.
+        let command = Commands::Transfer {
+            command: TransferCommand::Resume {
+                kind: TransferResumeKind::Usdc,
+                id: None,
+                direction: None,
+                amount: None,
+            },
+        };
+
+        let _ = classify_command(command);
+    }
+
+    #[test]
     fn transfer_reconcile_parses_and_classifies_as_simple() {
         let id = Uuid::from_u128(77);
         let cli = Cli::try_parse_from([
@@ -3013,7 +2651,7 @@ mod tests {
                 assert_eq!(id, "ISS001");
                 assert_eq!(reason, "stuck forever");
             }
-            _ => panic!("expected fail-transfer simple command"),
+            _ => panic!("expected transfer fail simple command"),
         }
     }
 
@@ -3058,7 +2696,7 @@ mod tests {
                 assert_eq!(id.as_deref(), Some("AAPL"));
                 assert!(!all);
             }
-            _ => panic!("expected rebuild-view simple command"),
+            _ => panic!("expected view rebuild simple command"),
         }
     }
 
@@ -3084,31 +2722,6 @@ mod tests {
                 assert!(matches!(source_chain, CctpChain::Ethereum));
             }
             _ => panic!("expected cctp complete-mint provider command"),
-        }
-    }
-
-    #[test]
-    fn position_set_zero_parses_under_new_name() {
-        let cli = Cli::try_parse_from([
-            "st0x-cli",
-            "position",
-            "set",
-            "--symbol",
-            "SPYM",
-            "--zero",
-            "--reason",
-            "manual rebalance completed",
-        ])
-        .unwrap();
-
-        match classify_command(cli.command) {
-            Ok(SimpleCommand::Position {
-                command: PositionRecoveryCommand::Set { symbol, zero, .. },
-            }) => {
-                assert_eq!(symbol, Symbol::new("SPYM").unwrap());
-                assert!(zero);
-            }
-            _ => panic!("expected position set to classify as a simple position command"),
         }
     }
 
@@ -3286,168 +2899,40 @@ mod tests {
         );
     }
 
-    #[test]
-    fn legacy_repair_alias_still_parses() {
-        let cli = Cli::try_parse_from([
-            "st0x-cli",
-            "repair",
-            "set-position",
-            "--symbol",
-            "SPYM",
-            "--zero",
-            "--reason",
-            "legacy alias",
-        ])
-        .unwrap();
-
-        assert!(matches!(
-            classify_command(cli.command),
-            Ok(SimpleCommand::Position {
-                command: PositionRecoveryCommand::Set { .. }
-            })
-        ));
-    }
-
-    /// The legacy flat resume keeps its exact shape: `--amount` stays required
-    /// (even though the resume ignores it for the persisted amount), so old
-    /// invocations and old recovery hints behave identically.
-    #[test]
-    fn legacy_resume_without_amount_is_rejected() {
-        let result = Cli::try_parse_from([
-            "st0x-cli",
-            "resume-usdc-transfer",
-            "--id",
-            &Uuid::from_u128(7).to_string(),
-            "--direction",
-            "to-raindex",
-        ]);
-
-        let error = result.unwrap_err();
-        assert_eq!(
-            error.kind(),
-            clap::error::ErrorKind::MissingRequiredArgument,
-            "legacy resume-usdc-transfer must keep requiring --amount",
-        );
-    }
-
-    #[test]
-    fn legacy_flat_transfer_names_still_parse() {
-        let resume_id = Uuid::from_u128(7);
-        let resume = Cli::try_parse_from([
-            "st0x-cli",
-            "resume-usdc-transfer",
-            "--id",
-            &resume_id.to_string(),
-            "--direction",
-            "to-raindex",
-            "--amount",
-            "100",
-        ])
-        .unwrap();
-        assert!(matches!(
-            classify_command(resume.command),
-            Err(ProviderCommand::ResumeUsdcTransfer { .. })
-        ));
-
-        let fail = Cli::try_parse_from([
-            "st0x-cli",
-            "fail-transfer",
-            "--type",
-            "mint",
-            "--id",
-            "ISS001",
-        ])
-        .unwrap();
-        match classify_command(fail.command) {
-            Ok(SimpleCommand::FailTransfer { reason, .. }) => {
-                assert_eq!(reason, "Manually failed via CLI");
-            }
-            _ => panic!("expected legacy fail-transfer to classify as FailTransfer"),
-        }
-
-        let recheck = Cli::try_parse_from([
-            "st0x-cli",
-            "recheck-transfer",
-            "--type",
-            "redemption",
-            "--id",
-            "redemption-1",
-        ])
-        .unwrap();
-        assert!(matches!(
-            classify_command(recheck.command),
-            Ok(SimpleCommand::RecheckTransfer { .. })
-        ));
-
-        let reconcile_id = Uuid::from_u128(8);
-        let reconcile = Cli::try_parse_from([
-            "st0x-cli",
-            "reconcile-usdc-transfer",
-            "--id",
-            &reconcile_id.to_string(),
-            "--reason",
-            "funds-moved-manually",
-        ])
-        .unwrap();
-        assert!(matches!(
-            classify_command(reconcile.command),
-            Ok(SimpleCommand::ReconcileUsdcTransfer { .. })
-        ));
-    }
-
-    #[test]
-    fn legacy_flat_view_and_cctp_names_still_parse() {
-        let rebuild = Cli::try_parse_from([
-            "st0x-cli",
-            "rebuild-view",
-            "--aggregate",
-            "position",
-            "--all",
-        ])
-        .unwrap();
-        assert!(matches!(
-            classify_command(rebuild.command),
-            Ok(SimpleCommand::RebuildView { .. })
-        ));
-
-        let cctp = Cli::try_parse_from([
-            "st0x-cli",
-            "cctp-recover",
-            "--burn-tx",
-            &TxHash::ZERO.to_string(),
-            "--source-chain",
-            "base",
-        ])
-        .unwrap();
-        assert!(matches!(
-            classify_command(cctp.command),
-            Err(ProviderCommand::CctpRecover { .. })
-        ));
-    }
-
     /// The legacy `--type`/`-t` discriminator must keep working on the new
-    /// grouped names, so mechanically translated runbook invocations parse.
+    /// grouped `transfer fail`, so mechanically translated runbook invocations
+    /// parse and carry the right `TransferType`.
     #[test]
-    fn grouped_transfer_commands_accept_legacy_type_flag() {
-        let fail_long = Cli::try_parse_from([
+    fn transfer_fail_accepts_type_alias() {
+        let long = Cli::try_parse_from([
             "st0x-cli", "transfer", "fail", "--type", "mint", "--id", "ISS001", "--reason", "stuck",
         ])
         .unwrap();
-        assert!(matches!(
-            classify_command(fail_long.command),
-            Ok(SimpleCommand::FailTransfer { .. })
-        ));
+        match classify_command(long.command) {
+            Ok(SimpleCommand::FailTransfer { transfer_type, .. }) => {
+                assert!(matches!(transfer_type, TransferType::Mint));
+            }
+            _ => panic!("expected transfer fail simple command via --type"),
+        }
 
-        let fail_short = Cli::try_parse_from([
+        let short = Cli::try_parse_from([
             "st0x-cli", "transfer", "fail", "-t", "mint", "--id", "ISS001", "-r", "stuck",
         ])
         .unwrap();
-        assert!(matches!(
-            classify_command(fail_short.command),
-            Ok(SimpleCommand::FailTransfer { .. })
-        ));
+        match classify_command(short.command) {
+            Ok(SimpleCommand::FailTransfer { transfer_type, .. }) => {
+                assert!(matches!(transfer_type, TransferType::Mint));
+            }
+            _ => panic!("expected transfer fail simple command via -t"),
+        }
+    }
 
-        let recheck_long = Cli::try_parse_from([
+    /// The legacy `--type`/`-t` discriminator must keep working on the new
+    /// grouped `transfer recheck`, so mechanically translated runbook
+    /// invocations parse and carry the right `TransferType`.
+    #[test]
+    fn transfer_recheck_accepts_type_alias() {
+        let long = Cli::try_parse_from([
             "st0x-cli",
             "transfer",
             "recheck",
@@ -3457,12 +2942,14 @@ mod tests {
             "redemption-1",
         ])
         .unwrap();
-        assert!(matches!(
-            classify_command(recheck_long.command),
-            Ok(SimpleCommand::RecheckTransfer { .. })
-        ));
+        match classify_command(long.command) {
+            Ok(SimpleCommand::RecheckTransfer { transfer_type, .. }) => {
+                assert!(matches!(transfer_type, TransferType::Redemption));
+            }
+            _ => panic!("expected transfer recheck simple command via --type"),
+        }
 
-        let recheck_short = Cli::try_parse_from([
+        let short = Cli::try_parse_from([
             "st0x-cli",
             "transfer",
             "recheck",
@@ -3472,10 +2959,48 @@ mod tests {
             "redemption-1",
         ])
         .unwrap();
-        assert!(matches!(
-            classify_command(recheck_short.command),
-            Ok(SimpleCommand::RecheckTransfer { .. })
-        ));
+        match classify_command(short.command) {
+            Ok(SimpleCommand::RecheckTransfer { transfer_type, .. }) => {
+                assert!(matches!(transfer_type, TransferType::Redemption));
+            }
+            _ => panic!("expected transfer recheck simple command via -t"),
+        }
+    }
+
+    /// The legacy recovery names were removed (no back-compat). Pin that each
+    /// removed flat command and clap alias now fails to parse, so a future
+    /// merge cannot silently re-introduce one. One representative per removed
+    /// namespace: flat top-level commands, the `repair` group alias, and the
+    /// `set-position`/`fail-pending-offchain-order` subcommand aliases.
+    #[test]
+    fn removed_legacy_recovery_names_no_longer_parse() {
+        for argv in [
+            ["st0x-cli", "fail-transfer", "--id", "ISS001"].as_slice(),
+            ["st0x-cli", "recheck-transfer", "--id", "ISS001"].as_slice(),
+            ["st0x-cli", "resume-usdc-transfer", "--id", "x"].as_slice(),
+            ["st0x-cli", "reconcile-usdc-transfer", "--id", "x"].as_slice(),
+            ["st0x-cli", "rebuild-view", "--all"].as_slice(),
+            ["st0x-cli", "cctp-recover", "--burn-tx", "0x0"].as_slice(),
+            ["st0x-cli", "repair", "set-position", "--symbol", "SPYM"].as_slice(),
+            ["st0x-cli", "position", "set-position", "--symbol", "SPYM"].as_slice(),
+            [
+                "st0x-cli",
+                "position",
+                "fail-pending-offchain-order",
+                "--symbol",
+                "MSTR",
+                "--order-id",
+                "00000000-0000-0000-0000-000000000000",
+            ]
+            .as_slice(),
+        ] {
+            let error = Cli::try_parse_from(argv.iter().copied()).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::InvalidSubcommand,
+                "removed name still parses: {argv:?}",
+            );
+        }
     }
 
     #[tokio::test]

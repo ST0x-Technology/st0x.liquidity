@@ -1059,8 +1059,8 @@ impl UsdcRebalance {
     }
 
     /// The rebalance direction, present in every non-initial state and invariant
-    /// across the whole lifecycle. Used by the CLI `resume-usdc-transfer` command
-    /// to validate the operator-supplied `--direction` against the persisted
+    /// across the whole lifecycle. Used by the CLI `transfer resume --kind usdc`
+    /// command to validate the operator-supplied `--direction` against the persisted
     /// transfer, so a wrong flag is rejected rather than mis-driving the aggregate
     /// through the opposite-direction resume path.
     ///
@@ -1107,7 +1107,7 @@ impl UsdcRebalance {
     ///   startup via `resumable_post_burn_transfer`).
     ///
     /// All three are accepted by `transition_reconcile_stuck_rebalance` (the
-    /// CLI `reconcile-usdc-transfer` target), hold the guard on restart
+    /// CLI `transfer reconcile` target), hold the guard on restart
     /// (`holds_rebalance_guard` returns `true`), and are NOT auto-re-armed:
     /// without a tracking seed the sweep has no entry to iterate and the guard
     /// stays latched forever after a CLI reconcile.

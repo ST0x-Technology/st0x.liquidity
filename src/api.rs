@@ -1472,7 +1472,7 @@ async fn recheck_transfer(
 /// Distinguishes not-recoverable conditions (the persisted aggregate state
 /// does not permit provider-completion recovery -- retrying will not help) and
 /// transient upstream failures (the provider was unreachable -- retry later)
-/// from genuinely internal failures, so the operator running `recheck-transfer`
+/// from genuinely internal failures, so the operator running `transfer recheck`
 /// during an incident learns whether to retry without reading bot logs. Bodies
 /// for the not-recoverable variants carry the typed error's message, which only
 /// references aggregate/request ids; internal failures stay generic so they do

@@ -160,7 +160,7 @@ export const stuckReasonLabel = (reason: string): string =>
     .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
     .join(' ')
 
-/// Maps a transfer kind to the `recheck-transfer --type` flag value, or null
+/// Maps a transfer kind to the `transfer recheck --kind` flag value, or null
 /// for kinds that are not equity transfers (e.g. usdc_bridge).
 const recheckTransferType = (kind: string): string | null => {
   switch (kind) {
@@ -173,14 +173,14 @@ const recheckTransferType = (kind: string): string | null => {
   }
 }
 
-/// A `recheck-transfer` command for a stranded transfer. The `mode`
+/// A `transfer recheck` command for a stranded transfer. The `mode`
 /// distinguishes a local simulation command from one an operator runs on the
 /// deployed server, so the UI can label them differently.
 export type RecoveryCommand =
   | { mode: 'simulation'; command: string }
   | { mode: 'production'; command: string }
 
-/// Builds the `recheck-transfer` CLI command shown to operators for a stranded
+/// Builds the `transfer recheck` CLI command shown to operators for a stranded
 /// transfer, or null for kinds with no recovery path (e.g. usdc_bridge).
 ///
 /// Simulation builds set `simulateSourceId` (`PUBLIC_SIMULATE_SOURCE_ID`, set
@@ -203,12 +203,12 @@ export const recoveryCommand = (params: {
     const basePath = `/tmp/st0x-simulate-failures-${params.backendPort}`
     return {
       mode: 'simulation',
-      command: `nix develop --command cargo run --features mock --bin cli -- --config ${basePath}.config.toml --secrets ${basePath}.secrets.toml recheck-transfer --type ${transferType} --id ${params.id}`,
+      command: `nix develop --command cargo run --features mock --bin cli -- --config ${basePath}.config.toml --secrets ${basePath}.secrets.toml transfer recheck --kind ${transferType} --id ${params.id}`,
     }
   }
 
   return {
     mode: 'production',
-    command: `stox recheck-transfer --type ${transferType} --id ${params.id}`,
+    command: `stox transfer recheck --kind ${transferType} --id ${params.id}`,
   }
 }

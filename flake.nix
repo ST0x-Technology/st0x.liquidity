@@ -348,7 +348,7 @@
               # Same live dashboard stack as `simulate`, but first creates
               # stuck mint and redemption rebalances whose Alpaca mock
               # provider later completes. The backend logs the
-              # recheck-transfer commands needed to recover them.
+              # `transfer recheck` commands needed to recover them.
               "simulate-failures" = mkSimulation {
                 name = "simulate-failures";
                 testFilter = "simulate_failures";
