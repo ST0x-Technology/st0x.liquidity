@@ -26,9 +26,8 @@ use crate::alpaca_wallet::AlpacaWalletService;
 use crate::bindings::IERC20;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId};
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
-use crate::rebalancing::equity::{CrossVenueEquityTransfer, Equity, EquityTransferServices};
+use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
 use crate::rebalancing::to_wrapped_equities;
-use crate::rebalancing::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
 use crate::rebalancing::usdc::CrossVenueCashTransfer;
 use crate::rebalancing::usdc::UsdcTransferError;
 use crate::tokenization::{
@@ -178,14 +177,10 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
         TransferDirection::ToAlpaca => {
             writeln!(stdout, "   Sending tokens for redemption...")?;
 
-            CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
-                &equity_transfer,
-                Equity {
-                    symbol: symbol.clone(),
-                    quantity,
-                },
-            )
-            .await?;
+            let aggregate_id = RedemptionAggregateId::new(Uuid::new_v4().to_string());
+            equity_transfer
+                .resume_equity_to_hedging(&aggregate_id, symbol, quantity)
+                .await?;
 
             writeln!(stdout, "✅ Redemption completed successfully")?;
         }

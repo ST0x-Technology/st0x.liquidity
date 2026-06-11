@@ -1,8 +1,8 @@
 //! Integration tests for the inventory rebalancing pipeline: position changes
 //! flow through the RebalancingService (wired as a CQRS query processor),
-//! update the InventoryView, detect equity or USDC imbalances, and dispatch
-//! operations through the Rebalancer to drive mints, redemptions, and USDC
-//! transfers to completion.
+//! update the InventoryView, detect equity or USDC imbalances, and enqueue
+//! apalis transfer jobs that drive mints, redemptions, and USDC transfers to
+//! completion.
 
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, B256, TxHash, U256, address, keccak256};
@@ -17,8 +17,7 @@ use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::error::TryRecvError;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 
 use rain_math_float::Float;
 use st0x_config::{
@@ -46,14 +45,13 @@ use crate::offchain::order::OffchainOrderId;
 use crate::onchain::mock::MockRaindex;
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::rebalancing::equity::{
-    CrossVenueEquityTransfer, EquityTransferServices, MintTransferError,
-    TransferEquityToMarketMaking, TransferEquityToMarketMakingCtx,
+    CrossVenueEquityTransfer, EquityTransferServices, MintTransferError, TransferEquityToHedging,
+    TransferEquityToHedgingCtx, TransferEquityToMarketMaking, TransferEquityToMarketMakingCtx,
     TransferEquityToMarketMakingJobError,
 };
 use crate::rebalancing::usdc::{TransferUsdcToHedging, TransferUsdcToMarketMaking};
 use crate::rebalancing::{
-    Rebalancer, RebalancingSchedulers, RebalancingService, RebalancingServiceConfig,
-    TriggeredOperation, drain_pending_jobs,
+    RebalancingSchedulers, RebalancingService, RebalancingServiceConfig, drain_pending_jobs,
 };
 use crate::test_utils::setup_test_pools;
 use crate::tokenization::Tokenizer;
@@ -107,6 +105,27 @@ async fn fetch_pending_equity_mint_job(pool: &SqlitePool) -> TransferEquityToMar
 async fn pending_equity_mint_job_count(pool: &SqlitePool) -> i64 {
     sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?")
         .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Fetches the single pending `TransferEquityToHedging` job payload from the
+/// apalis Jobs table, as the registered worker would receive it.
+async fn fetch_pending_equity_redemption_job(pool: &SqlitePool) -> TransferEquityToHedging {
+    let payload: Vec<u8> =
+        sqlx::query_scalar("SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?")
+            .bind(std::any::type_name::<TransferEquityToHedging>())
+            .fetch_one(pool)
+            .await
+            .expect("expected exactly one pending TransferEquityToHedging job");
+
+    serde_json::from_slice(&payload).expect("deserialize TransferEquityToHedging payload")
+}
+
+async fn pending_equity_redemption_job_count(pool: &SqlitePool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?")
+        .bind(std::any::type_name::<TransferEquityToHedging>())
         .fetch_one(pool)
         .await
         .unwrap()
@@ -216,7 +235,6 @@ struct EquityTriggerFixture {
     service: Arc<RebalancingService>,
     inventory: Arc<BroadcastingInventory>,
     position_cqrs: Arc<Store<Position>>,
-    receiver: mpsc::Receiver<TriggeredOperation>,
 }
 
 async fn setup_equity_trigger() -> EquityTriggerFixture {
@@ -235,7 +253,6 @@ async fn setup_equity_trigger() -> EquityTriggerFixture {
             .with_usdc(Usdc::new(float!(1000000)), Usdc::new(float!(1000000))),
         event_sender,
     ));
-    let (sender, receiver) = mpsc::channel(10);
 
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
 
@@ -247,7 +264,6 @@ async fn setup_equity_trigger() -> EquityTriggerFixture {
         TEST_ORDERBOOK,
         TEST_ORDER_OWNER,
         Arc::clone(&inventory),
-        sender,
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
     ));
@@ -261,7 +277,6 @@ async fn setup_equity_trigger() -> EquityTriggerFixture {
         service,
         inventory,
         position_cqrs,
-        receiver,
     }
 }
 
@@ -586,7 +601,6 @@ async fn equity_offchain_imbalance_triggers_mint() {
         service,
         inventory: _,
         position_cqrs,
-        receiver: _receiver,
     } = setup_equity_trigger().await;
 
     // Build inventory: 20 onchain, 80 offchain = 20% ratio -> TooMuchOffchain.
@@ -814,14 +828,20 @@ async fn equity_offchain_imbalance_triggers_mint() {
         "mint_int_test",
         "MintAccepted should capture the request ID from the API response"
     );
+
+    assert_eq!(
+        pending_equity_redemption_job_count(&pool).await,
+        0,
+        "No redemption job should have been enqueued"
+    );
 }
 
 /// Verifies the full equity redemption rebalancing pipeline: position CQRS
 /// commands flow through the RebalancingService, detect too much onchain equity,
-/// and dispatch a Redemption operation through the Rebalancer to the real
-/// CrossVenueEquityTransfer. The transfer sends tokens on Anvil, then drives the
-/// EquityRedemption aggregate through TokensSent -> Detected -> Completed via
-/// the mocked Alpaca tokenization API.
+/// and enqueue a `TransferEquityToHedging` apalis job whose `perform` drives the
+/// redemption on the real CrossVenueEquityTransfer. The transfer sends tokens on
+/// Anvil, then drives the EquityRedemption aggregate through TokensSent ->
+/// Detected -> Completed via the mocked Alpaca tokenization API.
 ///
 /// Uses Anvil snapshot/revert to discover the deterministic tx_hash before
 /// setting up httpmock responses, so the mock detection endpoint can match
@@ -836,7 +856,6 @@ async fn equity_onchain_imbalance_triggers_redemption() {
         service,
         inventory: _,
         position_cqrs,
-        receiver,
     } = setup_equity_trigger().await;
     let server = MockServer::start();
     let (_anvil, endpoint, key) = setup_anvil();
@@ -896,13 +915,6 @@ async fn equity_onchain_imbalance_triggers_redemption() {
     .await;
     seed_vault_registry(&pool, &symbol, token_address).await;
 
-    let rebalancer = Rebalancer::new(
-        equity_transfer as _,
-        receiver,
-        Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
-        tokio_util::sync::CancellationToken::new(),
-    );
-
     position_cqrs
         .send(
             &symbol,
@@ -923,9 +935,15 @@ async fn equity_onchain_imbalance_triggers_redemption() {
         .unwrap();
     drain_pending_jobs(&service).await.unwrap();
 
-    drop(service);
-    drop(position_cqrs);
-    rebalancer.run().await;
+    // The trigger enqueues the redemption as an apalis job; run its perform
+    // against the real equity transfer, exactly as the registered worker would.
+    let job = fetch_pending_equity_redemption_job(&pool).await;
+    assert_eq!(job.symbol, symbol);
+
+    let ctx = TransferEquityToHedgingCtx {
+        transfer: equity_transfer,
+    };
+    Job::perform(&job, &ctx).await.unwrap();
 
     let erc20 = IERC20::new(token_address, &provider);
     assert_eq!(
@@ -1072,7 +1090,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
 
 /// Verifies USDC rebalancing dispatch: a USDC imbalance for the Alpaca->Base
 /// direction enqueues a `TransferUsdcToMarketMaking` apalis job with the
-/// expected amount. No work flows through the Rebalancer mpsc channel.
+/// expected amount.
 #[tokio::test]
 async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
     let (pool, apalis_pool) = setup_test_pools().await;
@@ -1092,8 +1110,6 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
     })
     .await;
 
-    let (sender, _receiver) = mpsc::channel(10);
-
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
     let wrapper = Arc::new(MockWrapper::new());
 
@@ -1103,7 +1119,6 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
         TEST_ORDERBOOK,
         TEST_ORDER_OWNER,
         Arc::clone(&inventory),
-        sender,
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
     );
@@ -1179,8 +1194,6 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
     })
     .await;
 
-    let (sender, _receiver) = mpsc::channel(10);
-
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
     let wrapper = Arc::new(MockWrapper::new());
 
@@ -1190,7 +1203,6 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
         TEST_ORDERBOOK,
         TEST_ORDER_OWNER,
         Arc::clone(&inventory),
-        sender,
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
     );
@@ -1198,8 +1210,7 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
     trigger.check_and_trigger_usdc().await;
 
     // Base->Alpaca is dispatched via the TransferUsdcToHedging apalis job
-    // queue, not the Rebalancer mpsc channel. Assert exactly one pending row
-    // with the expected payload.
+    // queue. Assert exactly one pending row with the expected payload.
     let job_type = std::any::type_name::<TransferUsdcToHedging>();
 
     let pending: i64 = sqlx_apalis::query_scalar(
@@ -1278,8 +1289,6 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
         event_sender,
     ));
 
-    let (sender, receiver) = mpsc::channel(10);
-
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
     let wrapper = Arc::new(MockWrapper::new());
 
@@ -1296,7 +1305,6 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
         TEST_ORDERBOOK,
         TEST_ORDER_OWNER,
         Arc::clone(&inventory),
-        sender,
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
     ));
@@ -1383,7 +1391,6 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
     drop(service);
     drop(snapshot_store);
     drop(polling_service);
-    drop(receiver);
 
     let to_hedging: i64 = sqlx_apalis::query_scalar(
         "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
@@ -1432,8 +1439,6 @@ async fn balanced_usdc_without_reserve_triggers_no_rebalancing() {
     })
     .await;
 
-    let (sender, mut receiver) = mpsc::channel(10);
-
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
     let wrapper = Arc::new(MockWrapper::new());
 
@@ -1443,17 +1448,14 @@ async fn balanced_usdc_without_reserve_triggers_no_rebalancing() {
         TEST_ORDERBOOK,
         TEST_ORDER_OWNER,
         Arc::clone(&inventory),
-        sender,
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
     );
 
     trigger.check_and_trigger_usdc().await;
 
-    drop(trigger);
-
     assert!(
-        matches!(receiver.try_recv(), Err(TryRecvError::Disconnected)),
+        drain_pending_usdc_transfer_jobs(&pool).await.is_empty(),
         "Balanced 500/500 split should not trigger any USDC rebalancing"
     );
 }
@@ -1491,8 +1493,6 @@ async fn usdc_alpaca_to_base_skips_when_withdrawable_cash_missing_with_reserve()
         cash.reserved = Some(Positive::new(Usd::new(float!(100))).unwrap());
     }
 
-    let (sender, mut receiver) = mpsc::channel(10);
-
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
     let wrapper = Arc::new(MockWrapper::new());
 
@@ -1502,17 +1502,14 @@ async fn usdc_alpaca_to_base_skips_when_withdrawable_cash_missing_with_reserve()
         TEST_ORDERBOOK,
         TEST_ORDER_OWNER,
         Arc::clone(&inventory),
-        sender,
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
     );
 
     trigger.check_and_trigger_usdc().await;
 
-    drop(trigger);
-
     assert!(
-        matches!(receiver.try_recv(), Err(TryRecvError::Disconnected)),
+        drain_pending_usdc_transfer_jobs(&pool).await.is_empty(),
         "Missing withdrawable cash + reserve configured must suppress Alpaca-to-Base rebalancing even with a real imbalance"
     );
 }
@@ -1537,8 +1534,6 @@ async fn usdc_none_disables_usdc_rebalancing() {
     })
     .await;
 
-    let (sender, mut receiver) = mpsc::channel(10);
-
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
     let wrapper = Arc::new(MockWrapper::new());
 
@@ -1551,17 +1546,14 @@ async fn usdc_none_disables_usdc_rebalancing() {
         TEST_ORDERBOOK,
         TEST_ORDER_OWNER,
         Arc::clone(&inventory),
-        sender,
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
     );
 
     trigger.check_and_trigger_usdc().await;
 
-    drop(trigger);
-
     assert!(
-        matches!(receiver.try_recv(), Err(TryRecvError::Disconnected)),
+        drain_pending_usdc_transfer_jobs(&pool).await.is_empty(),
         "No USDC operation should be dispatched when usdc threshold is None"
     );
 }
@@ -1579,7 +1571,6 @@ async fn mint_api_failure_produces_rejected_event() {
         service,
         inventory: _,
         position_cqrs,
-        receiver: _receiver,
     } = setup_equity_trigger().await;
 
     // Build inventory: 20 onchain, 80 offchain = 20% ratio -> TooMuchOffchain
@@ -1658,8 +1649,8 @@ async fn mint_api_failure_produces_rejected_event() {
     .to_string();
 
     // When the mint API returns HTTP 500, the TokenizedEquityMint aggregate
-    // returns Err(RequestFailed) without emitting any events. The rebalancer
-    // swallows the error (logs it), so no TokenizedEquityMint events appear.
+    // returns Err(RequestFailed) without emitting any events, so no
+    // TokenizedEquityMint events appear.
     assert_events(
         &pool,
         &[
@@ -1745,7 +1736,6 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         disabled_assets: HashSet::new(),
     };
 
-    let (sender, _receiver) = mpsc::channel(10);
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
     let wrapper = Arc::new(MockWrapper::new());
 
@@ -1755,7 +1745,6 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         TEST_ORDERBOOK,
         TEST_ORDER_OWNER,
         Arc::clone(&inventory),
-        sender,
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
     );
@@ -1875,7 +1864,6 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
         disabled_assets: HashSet::new(),
     };
 
-    let (sender, _receiver) = mpsc::channel(10);
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
     let wrapper = Arc::new(MockWrapper::new());
 
@@ -1885,7 +1873,6 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
         TEST_ORDERBOOK,
         TEST_ORDER_OWNER,
         Arc::clone(&inventory),
-        sender,
         wrapper,
         RebalancingSchedulers::new(&apalis_pool),
     );
@@ -1954,7 +1941,6 @@ async fn threshold_config_controls_trigger_sensitivity() {
         })
         .await;
 
-        let (sender, mut receiver) = mpsc::channel(10);
         let wide_config = RebalancingServiceConfig {
             equity: ImbalanceThreshold {
                 target: float!(0.5),
@@ -1984,7 +1970,6 @@ async fn threshold_config_controls_trigger_sensitivity() {
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             Arc::clone(&inventory),
-            sender,
             wrapper,
             RebalancingSchedulers::new(&apalis_pool),
         );
@@ -1993,10 +1978,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
         drop(trigger);
 
         assert!(
-            matches!(
-                receiver.try_recv().unwrap_err(),
-                mpsc::error::TryRecvError::Disconnected
-            ),
+            drain_pending_usdc_transfer_jobs(&pool).await.is_empty(),
             "Wide threshold (10%-90%) should not trigger at 35% onchain ratio"
         );
     }
@@ -2016,7 +1998,6 @@ async fn threshold_config_controls_trigger_sensitivity() {
         })
         .await;
 
-        let (sender, _receiver) = mpsc::channel(10);
         let tight_config = RebalancingServiceConfig {
             equity: ImbalanceThreshold {
                 target: float!(0.5),
@@ -2046,7 +2027,6 @@ async fn threshold_config_controls_trigger_sensitivity() {
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             Arc::clone(&inventory),
-            sender,
             wrapper,
             RebalancingSchedulers::new(&apalis_pool),
         );
@@ -2081,7 +2061,6 @@ async fn mint_accepted_sets_offchain_inflight() {
         service,
         inventory,
         position_cqrs,
-        receiver: _receiver,
     } = setup_equity_trigger().await;
 
     // Build inventory: 20 onchain, 80 offchain = 20% ratio -> TooMuchOffchain
@@ -2274,7 +2253,6 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
         service,
         inventory,
         position_cqrs,
-        receiver: _receiver,
     } = setup_equity_trigger().await;
 
     // Build inventory: 20 onchain, 80 offchain = 20% ratio -> TooMuchOffchain
@@ -2445,7 +2423,6 @@ async fn transfer_failed_cancels_redemption_inflight() {
         service,
         inventory,
         position_cqrs,
-        receiver: _,
     } = setup_equity_trigger().await;
 
     // Build inventory: 80 onchain, 20 offchain = 80% ratio -> TooMuchOnchain
