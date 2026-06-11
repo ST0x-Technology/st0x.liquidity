@@ -298,6 +298,44 @@ the grouped `transfer resume` / `transfer reconcile` forms exist.
 
     stox fail-usdc-transfer --id <uuid> --reason "pre-burn crash, burn not attempted"
 
+### Reconciling Stuck Failed Transfers
+
+Use `transfer reconcile` when an operation is stranded in a terminal failure and
+its residue was already handled out-of-band, so it should be declared resolved
+rather than re-driven. It operates directly on the local CQRS state (the bot
+need not be running) and goes through the aggregate command flow. `--reason` is
+required and persisted as the audit record.
+
+```
+# USDC rebalance stuck in a post-burn DepositFailed (minted USDC moved manually)
+stox transfer reconcile --kind usdc --id <usdc-rebalance-id> \
+  --reason funds-moved-manually        # or deposit-credited-offline
+
+# Equity mint stuck in Failed (tokens were wrapped/deposited manually)
+stox transfer reconcile --kind mint --id <issuer-request-id> \
+  --reason "wrapped + deposited via wrap-equity/vault-deposit"
+
+# Equity redemption stuck in Failed (equity resolved out-of-band)
+stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
+  --reason "redeemed manually"
+```
+
+- `--kind usdc` drives a stuck post-burn USDC rebalance to the clearing terminal
+  `Reconciled` state, releasing the rebalancing guard. It is accepted from any
+  of the post-burn terminal failures: `DepositFailed` (any direction), a
+  post-burn `BridgingFailed` (one carrying a `burn_tx_hash` or `cctp_nonce`),
+  and a `BaseToAlpaca` `ConversionFailed`. Its `--reason` must be one of
+  `funds-moved-manually` or `deposit-credited-offline`; any other value is
+  rejected. Valid only from a post-burn terminal failure.
+- `--kind mint` / `--kind redemption` mark an equity transfer stuck in `Failed`
+  as terminal `Reconciled`. This is a pure bookkeeping transition: it emits no
+  reactor effect and dispatches no inventory update. One nuance for redemptions
+  that ended in `DetectionFailed` / `RedemptionRejected` -- their stranded
+  exposure is seeded into live inflight at startup, and reconcile clears that
+  seeding only on the **next** bot restart (the running process keeps the seeded
+  amount until then). Valid only from `Failed`; a transfer in any other state is
+  rejected. The `--reason` is free text.
+
 For local dashboard testing, run:
 
 ```

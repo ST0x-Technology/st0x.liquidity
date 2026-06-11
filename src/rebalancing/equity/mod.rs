@@ -190,9 +190,10 @@ impl EquityTransferServices {
     /// Constructs a services instance whose methods all panic.
     ///
     /// Safe for sending commands that never invoke services (e.g., the
-    /// `FailWrapping`, `FailAcceptance`, `FailRaindexDeposit`, and
-    /// `FailTransfer` commands). Used by the CLI `transfer fail`
-    /// subcommand where no real broker/RPC connection exists.
+    /// `FailWrapping`, `FailAcceptance`, `FailRaindexDeposit`, `FailTransfer`,
+    /// and `Reconcile` commands). Used by the CLI `transfer fail` and
+    /// `transfer reconcile` subcommands where no real broker/RPC connection
+    /// exists.
     pub(crate) fn panicking() -> Self {
         Self {
             raindex: Arc::new(PanickingRaindex),
@@ -933,7 +934,8 @@ impl CrossVenueEquityTransfer {
                     return Ok(());
                 }
                 TokenizedEquityMint::DepositedIntoRaindex { .. }
-                | TokenizedEquityMint::Failed { .. } => return Ok(()),
+                | TokenizedEquityMint::Failed { .. }
+                | TokenizedEquityMint::Reconciled { .. } => return Ok(()),
                 entity @ TokenizedEquityMint::MintRequested { .. } => {
                     return Err(MintError::UnexpectedState {
                         issuer_request_id: issuer_request_id.clone(),
@@ -1187,7 +1189,9 @@ impl CrossVenueEquityTransfer {
                         .resume_pending_redemption(aggregate_id, &tokenization_request_id)
                         .await;
                 }
-                EquityRedemption::Completed { .. } | EquityRedemption::Failed { .. } => {
+                EquityRedemption::Completed { .. }
+                | EquityRedemption::Failed { .. }
+                | EquityRedemption::Reconciled { .. } => {
                     return Ok(());
                 }
             }
@@ -1267,7 +1271,9 @@ impl CrossVenueEquityTransfer {
     ) -> Result<bool, RedemptionError> {
         Ok(matches!(
             self.load_redemption_entity(aggregate_id).await?,
-            EquityRedemption::Completed { .. } | EquityRedemption::Failed { .. }
+            EquityRedemption::Completed { .. }
+                | EquityRedemption::Failed { .. }
+                | EquityRedemption::Reconciled { .. }
         ))
     }
 
@@ -1287,7 +1293,9 @@ impl CrossVenueEquityTransfer {
         let entity = self.load_mint_entity(issuer_request_id).await?;
 
         let (symbol, quantity) = match &entity {
-            TokenizedEquityMint::DepositedIntoRaindex { .. } => {
+            // Both terminals are already settled: nothing to recheck.
+            TokenizedEquityMint::DepositedIntoRaindex { .. }
+            | TokenizedEquityMint::Reconciled { .. } => {
                 return Ok(RecheckOutcome::AlreadyCompleted);
             }
             TokenizedEquityMint::Failed {
@@ -1438,7 +1446,10 @@ impl CrossVenueEquityTransfer {
         let entity = self.load_redemption_entity(aggregate_id).await?;
 
         let (symbol, tokenization_request_id, redemption_tx) = match &entity {
-            EquityRedemption::Completed { .. } => return Ok(RecheckOutcome::AlreadyCompleted),
+            // Both terminals are already settled: nothing to recheck.
+            EquityRedemption::Completed { .. } | EquityRedemption::Reconciled { .. } => {
+                return Ok(RecheckOutcome::AlreadyCompleted);
+            }
             EquityRedemption::Failed {
                 symbol,
                 redemption_tx: Some(redemption_tx),
@@ -2064,6 +2075,301 @@ mod tests {
             Some(FractionalShares::new(float!(10))),
             "recovered quantity should land in MarketMaking available"
         );
+    }
+
+    /// A reconciled mint is terminal: `resume_mint` must be a clean no-op for
+    /// an apalis retry, leaving the aggregate in `Reconciled`.
+    #[tokio::test]
+    async fn resume_mint_is_noop_on_reconciled_mint() {
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let id = issuer_request_id("ISS-RECONCILED");
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(10),
+                    wallet: transfer.wallet,
+                },
+            )
+            .await
+            .unwrap();
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::FailAcceptance {
+                    reason: "stranded mid-flight".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::Reconcile {
+                    reason: "wrapped manually via wrap-equity".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer
+            .resume_mint(&id)
+            .await
+            .expect("a reconciled mint must be a clean no-op for the job retry");
+
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::Reconciled { .. }),
+            "resume must leave a reconciled mint terminal, got: {entity:?}"
+        );
+    }
+
+    /// A reconciled redemption is terminal: `resume_redemption` must be a clean
+    /// no-op for an apalis retry, leaving the aggregate in `Reconciled`.
+    #[tokio::test]
+    async fn resume_redemption_is_noop_on_reconciled_redemption() {
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let id = redemption_aggregate_id("redeem-reconciled");
+        let symbol = Symbol::new("TEST").unwrap();
+        let token = transfer
+            .vault_lookup
+            .vault_token_for_symbol(&symbol)
+            .await
+            .unwrap();
+        let amount = FractionalShares::new(float!(50))
+            .to_u256_18_decimals()
+            .unwrap();
+
+        transfer
+            .withdraw_from_raindex(
+                &id,
+                &symbol,
+                FractionalShares::new(float!(50)),
+                token,
+                amount,
+            )
+            .await
+            .unwrap();
+        transfer.unwrap_and_send(&id).await.unwrap();
+        transfer
+            .redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::FailDetection {
+                    failure: DetectionFailure::Timeout,
+                },
+            )
+            .await
+            .unwrap();
+        transfer
+            .redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::Reconcile {
+                    reason: "deposited manually via vault-deposit".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer
+            .resume_redemption(&id)
+            .await
+            .expect("a reconciled redemption must be a clean no-op for the job retry");
+
+        let entity = transfer.redemption_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::Reconciled { .. }),
+            "resume must leave a reconciled redemption terminal, got: {entity:?}"
+        );
+    }
+
+    /// A reconciled mint is already settled, so the operator recheck path
+    /// reports `AlreadyCompleted` without attempting provider recovery.
+    #[tokio::test]
+    async fn recover_mint_reports_already_completed_on_reconciled_mint() {
+        let (transfer, service, pool) = transfer_with_rebalancing_service().await;
+
+        let id = issuer_request_id("mint-recover-reconciled");
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(10),
+                    wallet: transfer.wallet,
+                },
+            )
+            .await
+            .unwrap();
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::FailAcceptance {
+                    reason: "stranded mid-flight".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::Reconcile {
+                    reason: "wrapped manually via wrap-equity".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let outcome = transfer.recover_mint(&id, &pool, &service).await.unwrap();
+        assert!(
+            matches!(outcome, RecheckOutcome::AlreadyCompleted),
+            "a reconciled mint must recheck as AlreadyCompleted, got {outcome:?}"
+        );
+    }
+
+    /// A reconciled redemption is already settled, so the operator recheck path
+    /// reports `AlreadyCompleted` without attempting provider recovery.
+    #[tokio::test]
+    async fn recover_redemption_reports_already_completed_on_reconciled_redemption() {
+        let (transfer, service, _pool) = transfer_with_rebalancing_service().await;
+
+        let id = redemption_aggregate_id("redeem-recover-reconciled");
+        let symbol = Symbol::new("TEST").unwrap();
+        let token = transfer
+            .vault_lookup
+            .vault_token_for_symbol(&symbol)
+            .await
+            .unwrap();
+        let amount = FractionalShares::new(float!(50))
+            .to_u256_18_decimals()
+            .unwrap();
+
+        transfer
+            .withdraw_from_raindex(
+                &id,
+                &symbol,
+                FractionalShares::new(float!(50)),
+                token,
+                amount,
+            )
+            .await
+            .unwrap();
+        transfer.unwrap_and_send(&id).await.unwrap();
+        transfer
+            .redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::FailDetection {
+                    failure: DetectionFailure::Timeout,
+                },
+            )
+            .await
+            .unwrap();
+        transfer
+            .redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::Reconcile {
+                    reason: "deposited manually via vault-deposit".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let outcome = transfer.recover_redemption(&id, &service).await.unwrap();
+        assert!(
+            matches!(outcome, RecheckOutcome::AlreadyCompleted),
+            "a reconciled redemption must recheck as AlreadyCompleted, got {outcome:?}"
+        );
+    }
+
+    /// Builds a transfer wired to a real `RebalancingService` sharing the same
+    /// command stores, so a seeded aggregate is visible to the `recover_*`
+    /// recheck entry points.
+    async fn transfer_with_rebalancing_service() -> (
+        CrossVenueEquityTransfer,
+        Arc<RebalancingService>,
+        SqlitePool,
+    ) {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let (event_sender, _event_receiver) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(
+            InventoryView::default(),
+            event_sender,
+        ));
+
+        let service = Arc::new(RebalancingService::new(
+            RebalancingServiceConfig {
+                equity: ImbalanceThreshold {
+                    target: float!(0.5),
+                    deviation: float!(0.2),
+                },
+                usdc: None,
+                transfer_timeout: Duration::from_secs(1800),
+                assets: AssetsConfig {
+                    equities: EquitiesConfig::default(),
+                    cash: None,
+                },
+            },
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            address!("0x0000000000000000000000000000000000000001"),
+            address!("0x0000000000000000000000000000000000000002"),
+            inventory,
+            Arc::new(MockWrapper::new()),
+            RebalancingSchedulers::new(&apalis_pool),
+        ));
+
+        let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+            .with(service.clone())
+            .build(mock_services())
+            .await
+            .unwrap();
+        let redemption_store = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .with(service.clone())
+            .build(mock_services())
+            .await
+            .unwrap();
+        service
+            .set_stores(
+                mint_store.clone(),
+                redemption_store.clone(),
+                Arc::new(test_store::<UsdcRebalance>(pool.clone(), ())),
+            )
+            .await;
+
+        let transfer = CrossVenueEquityTransfer::new(
+            Arc::new(MockRaindex::new()),
+            Arc::new(mock_vault_lookup()),
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockWrapper::new()),
+            address!("0x0000000000000000000000000000000000000001"),
+            mint_store,
+            redemption_store,
+        );
+
+        (transfer, service, pool)
     }
 
     async fn create_equity_transfer(

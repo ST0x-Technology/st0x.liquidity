@@ -1182,6 +1182,9 @@ pub(crate) async fn fail_transfer_command<W: Write>(
                 Failed { .. } => {
                     anyhow::bail!("Mint {id} already failed");
                 }
+                Reconciled { .. } => {
+                    anyhow::bail!("Mint {id} already reconciled");
+                }
             };
 
             st0x_event_sorcery::send_command::<TokenizedEquityMint>(
@@ -1233,6 +1236,9 @@ pub(crate) async fn fail_transfer_command<W: Write>(
                 Failed { .. } => {
                     anyhow::bail!("Redemption {id} already failed");
                 }
+                Reconciled { .. } => {
+                    anyhow::bail!("Redemption {id} already reconciled");
+                }
             };
 
             st0x_event_sorcery::send_command::<EquityRedemption>(
@@ -1263,6 +1269,90 @@ fn connect_error(url: &str, error: reqwest::Error) -> anyhow::Error {
     } else {
         anyhow::Error::new(error)
     }
+}
+
+/// Reconciles a mint or redemption stranded in the terminal `Failed` state to
+/// the terminal `Reconciled` state.
+///
+/// Loads the aggregate, verifies it is in `Failed` (bails with a clear operator
+/// error otherwise -- the aggregate command also gates this, but the preflight
+/// gives a clearer message first), and sends the `Reconcile` command. This is a
+/// pure bookkeeping resolution: the residual equity was handled out-of-band
+/// (e.g. via wrap-equity/vault-deposit), so there is no inventory side-effect.
+pub(crate) async fn reconcile_equity_transfer_command<W: Write>(
+    stdout: &mut W,
+    transfer_type: TransferType,
+    id: &str,
+    reason: String,
+    pool: &SqlitePool,
+) -> anyhow::Result<()> {
+    let services = EquityTransferServices::panicking();
+
+    match transfer_type {
+        TransferType::Mint => {
+            let mint_id: IssuerRequestId = id.parse().map_err(|error| {
+                anyhow::anyhow!("transfer reconcile: invalid mint id {id:?}: {error}")
+            })?;
+
+            let entity = st0x_event_sorcery::load_entity::<TokenizedEquityMint>(pool, &mint_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Mint aggregate not found: {id}"))?;
+
+            if !matches!(entity, TokenizedEquityMint::Failed { .. }) {
+                anyhow::bail!(
+                    "transfer reconcile: mint {id} is not in the Failed state. Refusing to act \
+                     -- reconcile only resolves a transfer stuck in the Failed terminal; check \
+                     its current state on the dashboard."
+                );
+            }
+
+            st0x_event_sorcery::send_command::<TokenizedEquityMint>(
+                pool,
+                &mint_id,
+                TokenizedEquityMintCommand::Reconcile { reason },
+                services,
+            )
+            .await?;
+
+            writeln!(stdout, "Mint {id} reconciled")?;
+        }
+
+        TransferType::Redemption => {
+            let redemption_id: RedemptionAggregateId = id.parse().map_err(|error| {
+                anyhow::anyhow!("transfer reconcile: invalid redemption id {id:?}: {error}")
+            })?;
+
+            let entity = st0x_event_sorcery::load_entity::<EquityRedemption>(pool, &redemption_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Redemption aggregate not found: {id}"))?;
+
+            if !matches!(entity, EquityRedemption::Failed { .. }) {
+                anyhow::bail!(
+                    "transfer reconcile: redemption {id} is not in the Failed state. Refusing to \
+                     act -- reconcile only resolves a transfer stuck in the Failed terminal; \
+                     check its current state on the dashboard."
+                );
+            }
+
+            st0x_event_sorcery::send_command::<EquityRedemption>(
+                pool,
+                &redemption_id,
+                EquityRedemptionCommand::Reconcile { reason },
+                services,
+            )
+            .await?;
+
+            writeln!(
+                stdout,
+                "Redemption {id} reconciled. If it had ended in DetectionFailed/RedemptionRejected, \
+                 its stranded exposure was seeded into live inflight at startup; reconcile only \
+                 stops it being re-seeded on the next restart, so a running bot still needs a \
+                 restart before rebalancing resumes for this symbol."
+            )?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Re-checks a stuck transfer by calling the running bot's
@@ -1411,7 +1501,7 @@ mod tests {
     use crate::onchain::mock::MockRaindex;
     use crate::test_utils::setup_test_db;
     use crate::tokenization::mock::MockTokenizer;
-    use crate::tokenized_equity_mint::TokenizationRequestId;
+    use crate::tokenized_equity_mint::{TokenizationRequestId, issuer_request_id};
     use crate::usdc_rebalance::{ReconcileReason, TransferRef, UsdcRebalanceCommand};
     use crate::vault_lookup::MockVaultLookup;
 
@@ -3494,6 +3584,351 @@ mod tests {
             "infrastructure errors must not get the stale-state hint; got: {message}"
         );
         assert!(message.contains("db on fire"), "got: {message}");
+    }
+
+    /// Drives a redemption through the real command flow to its terminal
+    /// `Reconciled` state: stuck in `TokensSent`, force-failed, then reconciled.
+    async fn seed_redemption_to_reconciled(pool: &SqlitePool, id: &RedemptionAggregateId) {
+        seed_redemption_to_tokens_sent(pool, id).await;
+        send_redemption_command(
+            pool,
+            id,
+            EquityRedemptionCommand::FailDetection {
+                failure: DetectionFailure::Timeout,
+            },
+        )
+        .await;
+        send_redemption_command(
+            pool,
+            id,
+            EquityRedemptionCommand::Reconcile {
+                reason: "deposited manually via vault-deposit".to_string(),
+            },
+        )
+        .await;
+    }
+
+    /// Drives a mint through the real command flow to its `Failed` terminal:
+    /// requested, then acceptance force-failed. (`redemption_services()` returns
+    /// the shared `EquityTransferServices`, used by both aggregate stores.)
+    async fn seed_mint_to_failed(pool: &SqlitePool, id: &IssuerRequestId) {
+        let store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+            .build(redemption_services())
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(10),
+                    wallet: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                TokenizedEquityMintCommand::FailAcceptance {
+                    reason: "seed: timed out".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn send_mint_command(
+        pool: &SqlitePool,
+        id: &IssuerRequestId,
+        command: TokenizedEquityMintCommand,
+    ) {
+        let store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+            .build(redemption_services())
+            .await
+            .unwrap();
+        store.send(id, command).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconcile_equity_mint_rejects_unknown_id() {
+        let pool = setup_test_db().await;
+
+        let mut stdout = Vec::new();
+        let result = reconcile_equity_transfer_command(
+            &mut stdout,
+            TransferType::Mint,
+            &issuer_request_id("cli-no-such-mint").to_string(),
+            "handled out-of-band".to_string(),
+            &pool,
+        )
+        .await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not found"),
+            "reconcile of an unknown mint must refuse; got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_equity_mint_rejects_non_failed() {
+        let pool = setup_test_db().await;
+        let id = issuer_request_id("cli-mint-reconcile-non-failed");
+        send_mint_command(
+            &pool,
+            &id,
+            TokenizedEquityMintCommand::RequestMint {
+                issuer_request_id: id.clone(),
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: float!(10),
+                wallet: Address::ZERO,
+            },
+        )
+        .await;
+
+        let mut stdout = Vec::new();
+        let result = reconcile_equity_transfer_command(
+            &mut stdout,
+            TransferType::Mint,
+            &id.to_string(),
+            "handled out-of-band".to_string(),
+            &pool,
+        )
+        .await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not in the Failed state"),
+            "reconcile of a non-failed mint must refuse; got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_equity_mint_succeeds_from_failed() {
+        let pool = setup_test_db().await;
+        let id = issuer_request_id("cli-mint-reconcile-from-failed");
+        seed_mint_to_failed(&pool, &id).await;
+
+        let mut stdout = Vec::new();
+        reconcile_equity_transfer_command(
+            &mut stdout,
+            TransferType::Mint,
+            &id.to_string(),
+            "wrapped manually via wrap-equity".to_string(),
+            &pool,
+        )
+        .await
+        .unwrap();
+
+        let entity = st0x_event_sorcery::load_entity::<TokenizedEquityMint>(&pool, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        let TokenizedEquityMint::Reconciled {
+            reconcile_reason, ..
+        } = entity
+        else {
+            panic!("a reconciled mint must reach the Reconciled terminal, got: {entity:?}");
+        };
+        assert_eq!(reconcile_reason, "wrapped manually via wrap-equity");
+    }
+
+    #[tokio::test]
+    async fn reconcile_equity_mint_refuses_double_reconcile() {
+        let pool = setup_test_db().await;
+        let id = issuer_request_id("cli-mint-double-reconcile");
+        seed_mint_to_failed(&pool, &id).await;
+        send_mint_command(
+            &pool,
+            &id,
+            TokenizedEquityMintCommand::Reconcile {
+                reason: "wrapped manually via wrap-equity".to_string(),
+            },
+        )
+        .await;
+
+        let mut stdout = Vec::new();
+        let result = reconcile_equity_transfer_command(
+            &mut stdout,
+            TransferType::Mint,
+            &id.to_string(),
+            "second reconcile attempt".to_string(),
+            &pool,
+        )
+        .await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not in the Failed state"),
+            "a second reconcile of an already-reconciled mint must refuse; got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_transfer_mint_refuses_already_reconciled() {
+        let pool = setup_test_db().await;
+        let id = issuer_request_id("cli-mint-already-reconciled");
+        seed_mint_to_failed(&pool, &id).await;
+        send_mint_command(
+            &pool,
+            &id,
+            TokenizedEquityMintCommand::Reconcile {
+                reason: "wrapped manually via wrap-equity".to_string(),
+            },
+        )
+        .await;
+
+        let mut stdout = Vec::new();
+        let result = fail_transfer_command(
+            &mut stdout,
+            &pool,
+            TransferType::Mint,
+            &id.to_string(),
+            "should be refused",
+        )
+        .await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("already reconciled"),
+            "failing an already-reconciled mint must refuse; got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_equity_redemption_rejects_unknown_id() {
+        let pool = setup_test_db().await;
+
+        let mut stdout = Vec::new();
+        let result = reconcile_equity_transfer_command(
+            &mut stdout,
+            TransferType::Redemption,
+            &redemption_aggregate_id("cli-no-such-redemption").to_string(),
+            "handled out-of-band".to_string(),
+            &pool,
+        )
+        .await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not found"),
+            "reconcile of an unknown redemption must refuse; got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_equity_redemption_rejects_non_failed() {
+        let pool = setup_test_db().await;
+        let id = redemption_aggregate_id("cli-reconcile-non-failed");
+        seed_redemption_to_tokens_sent(&pool, &id).await;
+
+        let mut stdout = Vec::new();
+        let result = reconcile_equity_transfer_command(
+            &mut stdout,
+            TransferType::Redemption,
+            &id.to_string(),
+            "handled out-of-band".to_string(),
+            &pool,
+        )
+        .await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not in the Failed state"),
+            "reconcile of a non-failed redemption must refuse; got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_equity_redemption_succeeds_from_failed() {
+        let pool = setup_test_db().await;
+        let id = redemption_aggregate_id("cli-reconcile-from-failed");
+        seed_redemption_to_tokens_sent(&pool, &id).await;
+        send_redemption_command(
+            &pool,
+            &id,
+            EquityRedemptionCommand::FailDetection {
+                failure: DetectionFailure::Timeout,
+            },
+        )
+        .await;
+
+        let mut stdout = Vec::new();
+        reconcile_equity_transfer_command(
+            &mut stdout,
+            TransferType::Redemption,
+            &id.to_string(),
+            "deposited manually via vault-deposit".to_string(),
+            &pool,
+        )
+        .await
+        .unwrap();
+
+        let entity = st0x_event_sorcery::load_entity::<EquityRedemption>(&pool, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        let EquityRedemption::Reconciled {
+            reconcile_reason, ..
+        } = entity
+        else {
+            panic!("a reconciled redemption must reach the Reconciled terminal, got: {entity:?}");
+        };
+        assert_eq!(reconcile_reason, "deposited manually via vault-deposit");
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("restart"),
+            "redemption reconcile success line must warn a restart is still required; got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_equity_redemption_refuses_double_reconcile() {
+        let pool = setup_test_db().await;
+        let id = redemption_aggregate_id("cli-redemption-double-reconcile");
+        seed_redemption_to_reconciled(&pool, &id).await;
+
+        let mut stdout = Vec::new();
+        let result = reconcile_equity_transfer_command(
+            &mut stdout,
+            TransferType::Redemption,
+            &id.to_string(),
+            "second reconcile attempt".to_string(),
+            &pool,
+        )
+        .await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not in the Failed state"),
+            "a second reconcile of an already-reconciled redemption must refuse; got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_transfer_redemption_refuses_already_reconciled() {
+        let pool = setup_test_db().await;
+        let id = redemption_aggregate_id("cli-already-reconciled");
+        seed_redemption_to_reconciled(&pool, &id).await;
+
+        let mut stdout = Vec::new();
+        let result = fail_transfer_command(
+            &mut stdout,
+            &pool,
+            TransferType::Redemption,
+            &id.to_string(),
+            "should be refused",
+        )
+        .await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("already reconciled"),
+            "failing an already-reconciled redemption must refuse; got: {err_msg}"
+        );
     }
 
     /// A redemption already in a terminal state must be refused, not

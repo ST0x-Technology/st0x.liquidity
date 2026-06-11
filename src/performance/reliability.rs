@@ -500,7 +500,8 @@ fn equity_redemption_failure(
         | EquityRedemptionEvent::TokensSent { .. }
         | EquityRedemptionEvent::Detected { .. }
         | EquityRedemptionEvent::Completed { .. }
-        | EquityRedemptionEvent::ProviderCompletionRecovered { .. } => None,
+        | EquityRedemptionEvent::ProviderCompletionRecovered { .. }
+        | EquityRedemptionEvent::OperatorReconciled { .. } => None,
     }
 }
 
@@ -528,7 +529,8 @@ fn tokenized_equity_mint_failure(
         | TokenizedEquityMintEvent::TokensWrapped { .. }
         | TokenizedEquityMintEvent::VaultDepositSubmitted { .. }
         | TokenizedEquityMintEvent::DepositedIntoRaindex { .. }
-        | TokenizedEquityMintEvent::ProviderCompletionRecovered { .. } => None,
+        | TokenizedEquityMintEvent::ProviderCompletionRecovered { .. }
+        | TokenizedEquityMintEvent::OperatorReconciled { .. } => None,
     }
 }
 
