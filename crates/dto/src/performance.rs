@@ -201,6 +201,78 @@ pub struct AttestationSample {
     pub duration_ms: i64,
 }
 
+/// Response of `GET /performance/reliability`.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ReliabilityReport {
+    /// Error/warning log volume over time, oldest bucket first.
+    pub log_buckets: Vec<LogVolumeBucket>,
+    /// Error/warning counts per log target, highest count first.
+    pub log_targets: Vec<LogTargetCount>,
+    /// Money-at-risk lifecycle failure events in range, by event type.
+    pub failure_events: Vec<FailureEventCount>,
+    /// Current job queue health per job type.
+    pub job_queues: Vec<JobQueueHealth>,
+}
+
+/// Error and warning counts within one time bucket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct LogVolumeBucket {
+    pub start: DateTime<Utc>,
+    #[ts(type = "number")]
+    pub errors: usize,
+    #[ts(type = "number")]
+    pub warnings: usize,
+}
+
+/// How often one log target emitted at one level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct LogTargetCount {
+    pub target: String,
+    pub level: String,
+    #[ts(type = "number")]
+    pub count: usize,
+}
+
+/// Occurrences of one lifecycle failure event type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct FailureEventCount {
+    pub event_type: String,
+    #[ts(type = "number")]
+    pub count: usize,
+    pub last_at: DateTime<Utc>,
+}
+
+/// Snapshot of one apalis job queue's health.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct JobQueueHealth {
+    pub job_type: String,
+    #[ts(type = "number")]
+    pub pending: usize,
+    #[ts(type = "number")]
+    pub running: usize,
+    #[ts(type = "number")]
+    pub done: usize,
+    /// Terminal failures still in status Failed (attempts exhausted ones
+    /// become `killed`).
+    #[ts(type = "number")]
+    pub failed: usize,
+    /// Failed jobs apalis will retry (attempts < max_attempts): live
+    /// backlog, also included in `oldest_pending_run_at`.
+    #[ts(type = "number")]
+    pub awaiting_retry: usize,
+    #[ts(type = "number")]
+    pub killed: usize,
+    /// Jobs that needed more than one attempt.
+    #[ts(type = "number")]
+    pub retried: usize,
+    pub oldest_pending_run_at: Option<DateTime<Utc>>,
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
