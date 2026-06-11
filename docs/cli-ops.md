@@ -248,12 +248,17 @@ Not covered by `transfer recheck` yet:
 - USDC rebalancing failures. Those use the USDC/CCTP state machine and have
   their own recovery commands. A manual `transfer-usdc` prints its transfer id
   and, if interrupted after the burn, is resumed with
-  `stox transfer resume --id <id> --direction <to-raindex|to-alpaca>`. The
-  `--direction` must match the original (a mismatch is rejected to avoid
+  `stox transfer resume --kind usdc --id <id> --direction <to-raindex|to-alpaca>`.
+  The `--direction` must match the original (a mismatch is rejected to avoid
   mis-driving) and an unknown id is rejected rather than starting a fresh burn;
   a resume uses the aggregate's persisted amount, so no amount is taken. Run it
   only when the bot is not concurrently driving that same id, since it drives
   the aggregate directly rather than through the bot's resume lock.
+- Interrupted equity transfers (mints/redemptions) are resumed in bulk with
+  `stox transfer resume --kind equity`, which calls the running bot's
+  `/transfers/resume` endpoint (always resumes ALL interrupted transfers, no
+  per-id filter; each succeeds or fails independently and failures are reported
+  as counts with a non-zero exit). Requires the bot to be running.
 
 ### Clearing a pre-burn guard latch
 
