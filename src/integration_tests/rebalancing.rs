@@ -38,7 +38,9 @@ use st0x_wrapper::MockWrapper;
 use super::{ExpectedEvent, assert_events, fetch_events};
 use crate::bindings::{IERC20, TestERC20};
 use crate::conductor::job::Job;
-use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId};
+use crate::equity_redemption::{
+    EquityRedemption, EquityRedemptionCommand, redemption_aggregate_id,
+};
 use crate::inventory::{BroadcastingInventory, ImbalanceThreshold, InventoryView, Venue};
 use crate::offchain::order::OffchainOrderId;
 use crate::onchain::mock::MockRaindex;
@@ -2474,7 +2476,7 @@ async fn transfer_failed_cancels_redemption_inflight() {
         .await
         .unwrap();
 
-    let redemption_id = RedemptionAggregateId::new("redemption-transfer-failed");
+    let redemption_id = redemption_aggregate_id("redemption-transfer-failed");
 
     // Redeem: creates VaultWithdrawPending
     redemption_store

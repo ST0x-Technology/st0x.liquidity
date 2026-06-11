@@ -15,6 +15,7 @@ pub(crate) mod mock;
 #[cfg(test)]
 pub(crate) use job::TransferEquityToMarketMakingJobError;
 pub(crate) use job::{
+    TransferEquityToHedging, TransferEquityToHedgingCtx, TransferEquityToHedgingJobQueue,
     TransferEquityToMarketMaking, TransferEquityToMarketMakingCtx,
     TransferEquityToMarketMakingJobQueue,
 };
@@ -28,7 +29,6 @@ use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, error, info, instrument, warn};
-use uuid::Uuid;
 
 use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::EvmError;
@@ -1570,38 +1570,76 @@ impl CrossVenueEquityTransfer {
     }
 }
 
+impl CrossVenueEquityTransfer {
+    /// Market-Making -> Hedging: drives the redemption lifecycle (withdraw
+    /// tokenized equity from the Raindex vault, unwrap, send to Alpaca for
+    /// redemption) for the given `aggregate_id`, whether fresh or
+    /// interrupted.
+    ///
+    /// The id is chosen by the caller at enqueue time so apalis retries (and
+    /// bot restarts that re-pick the job row) re-enter the same aggregate: an
+    /// absent aggregate starts a new redemption, an in-flight one resumes
+    /// from its persisted state, and a terminal one is a no-op.
+    #[instrument(target = "rebalance", skip_all, fields(%aggregate_id, %symbol, %quantity))]
+    pub(crate) async fn resume_equity_to_hedging(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+        symbol: &Symbol,
+        quantity: FractionalShares,
+    ) -> Result<(), RedemptionError> {
+        let existing = self.redemption_store.load(aggregate_id).await?;
+
+        match existing {
+            None => self.start_redemption(aggregate_id, symbol, quantity).await,
+            Some(_) => self.resume_redemption(aggregate_id).await,
+        }
+    }
+
+    async fn start_redemption(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+        symbol: &Symbol,
+        quantity: FractionalShares,
+    ) -> Result<(), RedemptionError> {
+        let token = self.vault_lookup.vault_token_for_symbol(symbol).await?;
+        let amount = quantity.to_u256_18_decimals()?;
+
+        info!(target: "rebalance", %token, %amount, %aggregate_id, "Starting equity transfer to hedging venue");
+
+        self.withdraw_from_raindex(aggregate_id, symbol, quantity, token, amount)
+            .await?;
+
+        info!(target: "rebalance", "Withdrawn from Raindex, unwrapping and sending to Alpaca");
+
+        let redemption_tx = self.unwrap_and_send(aggregate_id).await?;
+
+        info!(target: "rebalance", %redemption_tx, "Tokens sent, polling for detection");
+        let request_id = self.poll_detection(aggregate_id, &redemption_tx).await?;
+
+        info!(target: "rebalance", %request_id, "Redemption detected, awaiting completion");
+        self.poll_completion(aggregate_id, &request_id).await?;
+
+        info!(target: "rebalance", "Equity transfer to hedging venue completed successfully");
+        Ok(())
+    }
+}
+
 /// Market-Making -> Hedging: withdraw tokenized equity from Raindex vault
-/// and send to Alpaca for redemption.
+/// and send to Alpaca for redemption. Thin delegation kept while the
+/// `Rebalancer` mpsc channel still routes redemptions; the channel and this
+/// impl go away once the trigger enqueues [`TransferEquityToHedging`]
+/// directly.
 #[async_trait]
 impl CrossVenueTransfer<MarketMakingVenue, HedgingVenue> for CrossVenueEquityTransfer {
     type Asset = Equity;
     type Error = RedemptionError;
 
-    #[instrument(target = "rebalance", skip_all, fields(symbol = %asset.symbol, quantity = %asset.quantity))]
     async fn transfer(&self, asset: Self::Asset) -> Result<(), Self::Error> {
         let Equity { symbol, quantity } = asset;
+        let aggregate_id = RedemptionAggregateId::generate();
 
-        let token = self.vault_lookup.vault_token_for_symbol(&symbol).await?;
-        let amount = quantity.to_u256_18_decimals()?;
-        let aggregate_id = RedemptionAggregateId::new(Uuid::new_v4().to_string());
-
-        info!(target: "rebalance", %token, %amount, %aggregate_id, "Starting equity transfer to hedging venue");
-
-        self.withdraw_from_raindex(&aggregate_id, &symbol, quantity, token, amount)
-            .await?;
-
-        info!(target: "rebalance", "Withdrawn from Raindex, unwrapping and sending to Alpaca");
-
-        let redemption_tx = self.unwrap_and_send(&aggregate_id).await?;
-
-        info!(target: "rebalance", %redemption_tx, "Tokens sent, polling for detection");
-        let request_id = self.poll_detection(&aggregate_id, &redemption_tx).await?;
-
-        info!(target: "rebalance", %request_id, "Redemption detected, awaiting completion");
-        self.poll_completion(&aggregate_id, &request_id).await?;
-
-        info!(target: "rebalance", "Equity transfer to hedging venue completed successfully");
-        Ok(())
+        self.start_redemption(&aggregate_id, &symbol, quantity)
+            .await
     }
 }
 
@@ -1624,6 +1662,7 @@ mod tests {
     use st0x_wrapper::MockWrapper;
 
     use super::*;
+    use crate::equity_redemption::redemption_aggregate_id;
     use crate::inventory::{
         BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, Venue,
     };
@@ -2170,7 +2209,7 @@ mod tests {
         )
         .await;
 
-        let id = RedemptionAggregateId::new("redemption-resume");
+        let id = redemption_aggregate_id("redemption-resume");
         let symbol = Symbol::new("TEST").unwrap();
         let token = transfer
             .vault_lookup
@@ -2200,6 +2239,119 @@ mod tests {
             matches!(entity, EquityRedemption::Completed { .. }),
             "Expected completed redemption after resume, got: {entity:?}"
         );
+    }
+
+    /// A fresh id runs the full redemption flow through the job entry point.
+    #[tokio::test]
+    async fn resume_equity_to_hedging_starts_fresh_redemption() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+            MockTokenizer::new()
+                .with_detection_outcome(MockDetectionOutcome::Detected)
+                .with_completion_outcome(MockCompletionOutcome::Completed),
+        );
+        let transfer = create_equity_transfer(
+            tokenizer,
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let id = redemption_aggregate_id("redeem-fresh");
+        transfer
+            .resume_equity_to_hedging(
+                &id,
+                &Symbol::new("TEST").unwrap(),
+                FractionalShares::new(float!(50)),
+            )
+            .await
+            .unwrap();
+
+        let entity = transfer.redemption_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::Completed { .. }),
+            "Expected completed redemption, got: {entity:?}"
+        );
+    }
+
+    /// Re-running the job entry point with an id whose aggregate already
+    /// exists must resume from the persisted state (the crash-recovery path)
+    /// rather than re-running the vault withdrawal from scratch.
+    #[tokio::test]
+    async fn resume_equity_to_hedging_resumes_existing_aggregate() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+            MockTokenizer::new()
+                .with_detection_outcome(MockDetectionOutcome::Detected)
+                .with_completion_outcome(MockCompletionOutcome::Completed),
+        );
+        let transfer = create_equity_transfer(
+            tokenizer,
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let id = redemption_aggregate_id("redeem-crash-resume");
+        let symbol = Symbol::new("TEST").unwrap();
+        let quantity = FractionalShares::new(float!(50));
+        let token = transfer
+            .vault_lookup
+            .vault_token_for_symbol(&symbol)
+            .await
+            .unwrap();
+        let amount = quantity.to_u256_18_decimals().unwrap();
+
+        // First attempt crashes after the withdrawal: the aggregate is
+        // persisted mid-flight.
+        transfer
+            .withdraw_from_raindex(&id, &symbol, quantity, token, amount)
+            .await
+            .unwrap();
+
+        // The re-enqueued job runs the same entry point with the same id; a
+        // fresh Redeem command here would fail on the already-initialized
+        // aggregate, so completing proves the resume path was taken.
+        transfer
+            .resume_equity_to_hedging(&id, &symbol, quantity)
+            .await
+            .unwrap();
+
+        let entity = transfer.redemption_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::Completed { .. }),
+            "Expected completed redemption after job re-run, got: {entity:?}"
+        );
+    }
+
+    /// A terminal aggregate is a no-op for the job entry point: apalis
+    /// retries after a partial failure must not error once the aggregate has
+    /// already completed.
+    #[tokio::test]
+    async fn resume_equity_to_hedging_is_noop_on_completed_redemption() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+            MockTokenizer::new()
+                .with_detection_outcome(MockDetectionOutcome::Detected)
+                .with_completion_outcome(MockCompletionOutcome::Completed),
+        );
+        let transfer = create_equity_transfer(
+            tokenizer,
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+
+        let id = redemption_aggregate_id("redeem-done");
+        let symbol = Symbol::new("TEST").unwrap();
+        let quantity = FractionalShares::new(float!(50));
+
+        transfer
+            .resume_equity_to_hedging(&id, &symbol, quantity)
+            .await
+            .unwrap();
+
+        transfer
+            .resume_equity_to_hedging(&id, &symbol, quantity)
+            .await
+            .expect("a completed redemption must be a clean no-op for the job retry");
     }
 
     #[tokio::test]

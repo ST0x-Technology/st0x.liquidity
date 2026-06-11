@@ -677,7 +677,9 @@ mod tests {
     use st0x_raindex::{Raindex, RaindexVaultId};
     use st0x_wrapper::{MockWrapper, Wrapper};
 
-    use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand};
+    use crate::equity_redemption::{
+        EquityRedemption, EquityRedemptionCommand, redemption_aggregate_id,
+    };
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
     use crate::tokenization::Tokenizer;
@@ -1009,7 +1011,7 @@ mod tests {
     fn decide_dispatch_resolves_all_four_paths() {
         let symbol = Symbol::new("AAPL").unwrap();
         let mint_id = issuer_request_id("ISS001");
-        let redemption_id = RedemptionAggregateId("RED001".to_string());
+        let redemption_id = redemption_aggregate_id("RED001");
 
         assert!(
             matches!(
@@ -1182,7 +1184,7 @@ mod tests {
     #[tokio::test]
     async fn validate_active_redemption_reports_missing_aggregate() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let redemption_id = RedemptionAggregateId("RED-NONEXISTENT".to_string());
+        let redemption_id = redemption_aggregate_id("RED-NONEXISTENT");
         let ctx = test_ctx(InventoryView::default(), HashSet::new()).await;
 
         let snapshot = RecoverySnapshot {
@@ -1335,7 +1337,7 @@ mod tests {
     async fn perform_conflict_fails_recovery_without_retrying() {
         let symbol = Symbol::new("AAPL").unwrap();
         let mint_id = issuer_request_id("ISS001");
-        let redemption_id = RedemptionAggregateId("RED001".to_string());
+        let redemption_id = redemption_aggregate_id("RED001");
         let view = view_with_unwrapped_balance(&symbol, FractionalShares::new(float!(5)))
             .set_active_mint(symbol.clone(), mint_id.clone())
             .set_active_redemption(symbol.clone(), redemption_id.clone());
@@ -1561,7 +1563,7 @@ mod tests {
     #[tokio::test]
     async fn perform_drives_active_redemption_path_to_dispatched_to_redemption() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let redemption_id = RedemptionAggregateId("RED001".to_string());
+        let redemption_id = redemption_aggregate_id("RED001");
         let view = view_with_unwrapped_balance(&symbol, FractionalShares::new(float!(5)))
             .set_active_redemption(symbol.clone(), redemption_id.clone());
         let tokenizer = Arc::new(
