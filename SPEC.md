@@ -2797,6 +2797,9 @@ failure already reconciles to source on its own. Because `Reconciled` is a
 clearable terminal, a restart does not re-latch the guard, and automatic USDC
 rebalancing resumes.
 
+The operator-facing verb vocabulary that this command and the rest of the
+recovery CLI follow is defined in the "Operator Recovery Surface" section below.
+
 ##### Manual Reconciliation Required
 
 Some failure scenarios may leave assets in states requiring manual intervention:
@@ -2843,6 +2846,91 @@ enum Resolution {
 
 This would provide complete audit trail for all manual interventions and allow
 proper tracking of asset movements that required manual resolution.
+
+### Operator Recovery Surface
+
+The CLI exposes operator commands for recovering stuck or failed operations.
+These commands share one vocabulary so each command's intent is unambiguous.
+This section is the source of truth for that vocabulary; the rename onto it is
+implemented incrementally (see the recovery-CLI unification epic), with legacy
+command names kept as hidden aliases during the transition.
+
+**Commands are grouped by the object they act on:**
+
+- `transfer` -- cross-venue mint, redemption, and USDC-rebalance operations.
+- `position` -- the long-lived per-symbol Position aggregate.
+- `view` -- materialized read-side projections.
+- `cctp` -- raw wallet-level CCTP bridge primitives (touch no aggregate).
+
+**Each command uses exactly one of six verbs (one verb = one intent), with two
+named exemptions defined after the list:**
+
+- `resume` -- drive an interrupted, non-terminal operation forward along its
+  normal path. Never forces a transition and is idempotent against double-spend.
+- `recheck` -- re-query the external provider for ground truth and apply it; may
+  un-fail a terminal `Failed` operation or resume a non-terminal one along its
+  normal path. Requires the running bot (REST). Realized today for equity mints
+  and redemptions only; USDC rebalances have no provider recheck (use `resume`
+  while non-terminal, `reconcile` after a post-burn terminal failure).
+- `fail` -- force a stuck non-terminal operation to its clean `Failed` terminal
+  so the system stops waiting on it.
+- `reconcile` -- declare an already-terminal-failed operation resolved
+  out-of-band, releasing its guard and inflight accounting. Applies once funds
+  have left the source venue, whether stuck in transit or failed after arrival
+  (the terminal state strands a guard); pre-departure failures strand nothing
+  and need no reconcile.
+- `set` -- overwrite aggregate-derived state to an operator-asserted value, with
+  a mandatory audit reason.
+- `rebuild` -- recompute a projection from the event log; emits no events.
+
+Two commands sit deliberately outside the six-verb set, named for their exact
+effect rather than a generic intent:
+
+- `cctp complete-mint` -- the `cctp` group exposes raw on-chain primitives that
+  touch no aggregate, so its commands are named for the on-chain action they
+  perform and are exempt from the recovery-verb vocabulary.
+- `position release-hedge` -- release a Position's stuck pending-offchain-order
+  pointer so normal hedging can retry; the rename of the legacy
+  `fail-pending-offchain-order`. `fail` would be the wrong verb here: the
+  Position itself never fails -- only its orphaned order does.
+
+**Standing rules:**
+
+- **All state-mutating recovery commands go through the CQRS aggregate-command
+  flow.** The CLI sends an aggregate command through the store, which routes it
+  to the aggregate's command handler to emit events; no recovery command writes
+  the `events` table directly. The non-mutating verb `rebuild` and the exempt
+  `cctp` group never touch the events table either: `rebuild` recomputes a
+  read-side projection from the existing event log, and `cctp` commands are pure
+  on-chain operations with no aggregate -- which is precisely why `reconcile`
+  exists to bring the aggregate back in sync after an out-of-band `cctp` action.
+- **`recover` is not a CLI verb.** It historically meant three different things
+  (raw mint completion, provider-truth un-failing, and on-chain mint adoption),
+  so it carries no information. The raw bridge primitive is named
+  `cctp complete-mint`; until the rename step of the unification epic lands it
+  remains live under its legacy name `cctp-recover`, which the rename keeps as a
+  hidden alias.
+- **Execution mode is part of each command's contract.** Help text states which
+  mode the command uses: direct-DB (the operator must ensure the bot is not
+  concurrently driving the same id); direct-DB plus a live RPC provider
+  (`transfer resume`, today `resume-usdc-transfer`, drives the on-chain flow
+  against the local aggregate store, with the same no-concurrent-bot caveat);
+  live RPC only (`cctp complete-mint` touches no database state -- the caveat is
+  the bot concurrently driving the same on-chain mint); or the running bot
+  (REST). `recheck` is the only command that requires the bot.
+- **`--reason` MUST be required, with no default, on every event-emitting
+  destructive verb** (`fail`, `reconcile`, `set`, and `position release-hedge`).
+  A defaulted reason is an audit-hostile record and violates the
+  no-silent-defaults rule. The pre-existing `fail-pending-offchain-order` and
+  `fail-transfer` predate this rule and carry defaulted reasons, and
+  `reconcile-usdc-transfer` shipped with one just before this rule was codified;
+  a later step of the unification epic removes all three defaults.
+- **`fail` and `reconcile` are distinct and must not be conflated.** `fail` is
+  for an operation the system is still waiting on (force it to a clean
+  terminal); `reconcile` is for an operation that already failed and whose guard
+  must clear because the funds were handled out-of-band. The USDC
+  `ReconcileStuckRebalance` command (see above) is the first realization of the
+  `reconcile` verb.
 
 ### Event Processing Flow
 
