@@ -38,12 +38,20 @@ pub(crate) fn build_ctx<P: Provider + Clone>(
     /// `chain.endpoint()`. Used by chaos tests to route the bot
     /// through a fault-injecting proxy.
     rpc_url_override: Option<url::Url>,
+    /// Override the broker base URL the bot connects to. Default is
+    /// `broker.base_url()`. Used by chaos tests to route broker calls
+    /// through a fault-injecting proxy.
+    broker_url_override: Option<url::Url>,
 ) -> anyhow::Result<Ctx> {
+    let broker_url = broker_url_override.map_or_else(
+        || broker.base_url(),
+        |url| url.to_string().trim_end_matches('/').to_owned(),
+    );
     let broker_ctx = BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
         api_key: TEST_API_KEY.to_owned(),
         api_secret: TEST_API_SECRET.to_owned(),
         account_id: AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b")),
-        mode: Some(AlpacaBrokerApiMode::Mock(broker.base_url())),
+        mode: Some(AlpacaBrokerApiMode::Mock(broker_url)),
         asset_cache_ttl: Duration::from_secs(3600),
         time_in_force: TimeInForce::Day,
         counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
