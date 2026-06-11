@@ -2637,8 +2637,10 @@ know about cross-venue inventory.
   await retry or manual recovery)
 - `TokenizedEquityMintEvent::MintRejected` - No balance change (rejected before
   shares left Alpaca)
-- `TokenizedEquityMintEvent::MintAcceptanceFailed` - Reconciles inflight back to
-  Alpaca available
+- `TokenizedEquityMintEvent::MintAcceptanceFailed` - When emitted after
+  `MintAccepted`, reconciles the started inflight back to Alpaca available. When
+  emitted by an operator force-fail from `MintRequested` (pre-acceptance), no
+  inflight was ever started, so there is no balance change
 - `EquityRedemptionEvent::WithdrawnFromRaindex` - Moves tokens to inflight
   (leaving Raindex vault)
 - `EquityRedemptionEvent::TokensUnwrapped` - No balance change (conversion
