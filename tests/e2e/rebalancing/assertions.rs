@@ -1302,13 +1302,21 @@ async fn assert_usdc_rebalancing_onchain_state<P: Provider>(
             // mid-flight state, not baseline.
             U256::ZERO
         }
-        UsdcRebalanceType::BaseToAlpaca => ethereum_usdc_balance_before_rebalance
-            .checked_add(event_amounts.bridged_amount_received)
-            .ok_or_else(|| anyhow::anyhow!("Ethereum USDC overflow on BaseToAlpaca mint"))?,
+        UsdcRebalanceType::BaseToAlpaca => {
+            // The CCTP mint credits `bridged_amount_received` to the bot's
+            // Ethereum wallet, then the deposit-send leg forwards exactly that
+            // same amount on to Alpaca's deposit address -- a net-zero change --
+            // so the wallet ends at the pre-rebalance reading. (Before this send
+            // leg the minted USDC stayed in the wallet; the leg now moves it to
+            // Alpaca.) The BaseToAlpaca mint lands after the on-chain
+            // withdraw/burn, so `before` is captured pre-mint at baseline.
+            ethereum_usdc_balance_before_rebalance
+        }
     };
     assert_eq!(
         ethereum_usdc_balance_after_rebalance, expected_ethereum_post_units,
-        "Ethereum USDC balance should reconcile exactly with CCTP transfer amount"
+        "Ethereum USDC balance should reconcile exactly: the CCTP mint credits \
+         the wallet and the deposit-send forwards it to Alpaca, returning to zero"
     );
 
     Ok(())

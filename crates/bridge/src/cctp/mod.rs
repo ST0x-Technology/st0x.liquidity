@@ -388,6 +388,8 @@ pub enum CctpError {
     MessageSentEventNotFound,
     #[error("MintAndWithdraw event not found in transaction receipt")]
     MintAndWithdrawEventNotFound,
+    #[error("transaction {tx_hash} receipt has no block number")]
+    TxReceiptMissingBlock { tx_hash: TxHash },
     #[error("Message too short for nonce extraction: got {length} bytes, need at least 44")]
     MessageTooShort { length: usize },
     #[error("Message too short for receiveMessage recovery: got {length} bytes, need at least 148")]
@@ -826,6 +828,55 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     pub async fn base_usdc_balance(&self, holder: Address) -> Result<U256, CctpError> {
         self.base
             .usdc_balance::<OpenChainErrorRegistry>(holder)
+            .await
+    }
+
+    /// Returns the block in which `tx_hash` was mined on Ethereum, the chain
+    /// where BaseToEthereum mints land.
+    ///
+    /// The BaseToAlpaca deposit leg uses this to bound
+    /// [`find_recent_usdc_transfer`](Self::find_recent_usdc_transfer) from the
+    /// known mint tx: the deposit send to Alpaca lands at or after the mint, so
+    /// the mint's block is the scan lower bound.
+    pub async fn ethereum_tx_block(&self, tx_hash: TxHash) -> Result<u64, CctpError> {
+        self.ethereum.tx_block(tx_hash).await
+    }
+
+    /// Sends `amount` (USDC smallest unit, 6 decimals) of Ethereum USDC from the
+    /// bot wallet to `to`, waiting for confirmation, and returns the tx hash.
+    ///
+    /// Used by the BaseToAlpaca deposit leg to forward minted USDC to Alpaca's
+    /// deposit address. The CCTP mint credits the bot's own wallet, so an explicit
+    /// transfer is required to fund Alpaca -- the mint alone does not deposit.
+    pub async fn send_usdc_on_ethereum(
+        &self,
+        to: Address,
+        amount: U256,
+    ) -> Result<TxHash, CctpError> {
+        self.ethereum
+            .send_usdc::<OpenChainErrorRegistry>(to, amount)
+            .await
+    }
+
+    /// Scans Ethereum for a USDC `Transfer(from, to, value == amount)` at or
+    /// after `from_block`, returning the most recent matching tx hash.
+    ///
+    /// Pre-send idempotency guard for the BaseToAlpaca deposit leg: a crash
+    /// between the deposit send and recording it lands the aggregate back in
+    /// `Bridged`, and this detects the already-submitted send so resume adopts it
+    /// instead of forwarding the minted USDC a second time. Returns a retryable
+    /// [`CctpError::ScanInconclusive`] rather than `Ok(None)` when the queried node
+    /// is not confirmations-deep past `from_block`, so the caller never re-sends
+    /// off a stale empty scan.
+    pub async fn find_recent_usdc_transfer(
+        &self,
+        from: Address,
+        to: Address,
+        amount: U256,
+        from_block: u64,
+    ) -> Result<Option<TxHash>, CctpError> {
+        self.ethereum
+            .find_recent_usdc_transfer(from, to, amount, from_block)
             .await
     }
 }
@@ -3314,6 +3365,94 @@ mod tests {
                 .unwrap(),
             None,
             "a mint below the scan bound must not be adopted",
+        );
+    }
+
+    #[tokio::test]
+    async fn find_recent_usdc_transfer_matches_on_from_to_value_and_scan_bound() {
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _) = setup_anvil();
+
+        let usdc_address = deploy_mock_usdc(&ethereum_endpoint, &private_key)
+            .await
+            .unwrap();
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            usdc_address,
+        )
+        .await
+        .unwrap();
+
+        let sender = bridge.ethereum.owner();
+        let recipient = address!("0x000000000000000000000000000000000000bEEF");
+        let never_funded = address!("0x000000000000000000000000000000000000dEaD");
+        let amount = U256::from(7_000_000u64); // 7 USDC
+
+        // Capture the head before the send, exactly as the deposit leg captures
+        // the mint's block as the scan lower bound.
+        let from_block = bridge.ethereum.current_block().await.unwrap();
+
+        let send_tx = bridge
+            .ethereum
+            .send_usdc::<NoOpErrorRegistry>(recipient, amount)
+            .await
+            .unwrap();
+
+        // The deposit send (`>= from_block`) lands at `send_block`; the first
+        // block strictly above it is the exclusion bound for the below-bound case.
+        let above_block = bridge.ethereum.current_block().await.unwrap() + 1;
+
+        // The scan is finality-gated: it returns Ok(None) only once the head is
+        // a small margin past the bound. Advance the head with unrelated sends so
+        // the absence assertions resolve to None, not a retryable ScanInconclusive.
+        for _ in 0..4 {
+            bridge
+                .ethereum
+                .send_usdc::<NoOpErrorRegistry>(never_funded, amount)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            bridge
+                .find_recent_usdc_transfer(sender, recipient, amount, from_block)
+                .await
+                .unwrap(),
+            Some(send_tx),
+            "scan must adopt the exact (from, to, value) transfer at/after the bound",
+        );
+
+        let other_recipient = address!("0x000000000000000000000000000000000000Cafe");
+        assert_eq!(
+            bridge
+                .find_recent_usdc_transfer(sender, other_recipient, amount, from_block)
+                .await
+                .unwrap(),
+            None,
+            "a transfer to a different recipient must not be adopted",
+        );
+
+        assert_eq!(
+            bridge
+                .find_recent_usdc_transfer(sender, recipient, amount + U256::from(1), from_block)
+                .await
+                .unwrap(),
+            None,
+            "a transfer whose value differs must not be adopted",
+        );
+
+        // Scanning from a bound above the send's block excludes it (mirroring the
+        // find_recent_mint below-bound exclusion); the head is already far enough
+        // past `above_block` for the absence to resolve to None.
+        assert_eq!(
+            bridge
+                .find_recent_usdc_transfer(sender, recipient, amount, above_block)
+                .await
+                .unwrap(),
+            None,
+            "a transfer below the scan bound must not be adopted",
         );
     }
 
