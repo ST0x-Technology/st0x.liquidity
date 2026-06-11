@@ -248,3 +248,19 @@ wrapped_equity_recovery = "enabled"
 vault_id = "0xfab"
 tokenized_equity = "0x323804af6f3bb463d688b854667c6870a0fc06ad"
 tokenized_equity_derivative = "0x9FfF48B4535AF3765Ac9E1b164720EDc01DF8EE7"
+
+# Trading is enabled despite SPCX's Fri/Mon restriction (no fractional trading
+# until ~5 min after the first market trade, no extended hours). The hedge leg
+# is a market order with extended_hours=false, so the no-extended-hours rule is
+# always satisfied. A fractional hedge rejected during the restricted window is
+# not lost: the failed order leaves the position's net exposure intact, and the
+# periodic position scan (~60s) re-places the hedge each cycle until it fills
+# once fractional trading opens -> the exposure self-heals within ~5-6 min of
+# open rather than requiring a per-symbol trading-window in the bot.
+[assets.equities.SPCX]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+vault_id = "0xfab"
+tokenized_equity = "0xc585AeB8B76c5F5e4215470A7625258e86ED7746"
+tokenized_equity_derivative = "0x19F89aaEf8a93f38A974beca9776f09aB844887F"
