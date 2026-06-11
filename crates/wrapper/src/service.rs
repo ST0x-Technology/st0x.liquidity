@@ -223,6 +223,13 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
         receiver: Address,
         owner: Address,
     ) -> Result<TxHash, WrapperError> {
+        let max_redeem: U256 = self
+            .wallet
+            .call::<OpenChainErrorRegistry, _>(wrapped_token, IERC4626::maxRedeemCall { owner })
+            .await?;
+
+        check_redeem_within_max(wrapped_token, wrapped_amount, max_redeem)?;
+
         info!(target: "orderbook", %wrapped_token, %wrapped_amount, "Sending ERC4626 redeem");
         let tx_hash = self
             .wallet
@@ -270,6 +277,31 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
     fn owner(&self) -> Address {
         self.wallet.address()
     }
+}
+
+/// Preflight check that a requested redeem does not exceed the vault's
+/// `maxRedeem(owner)`.
+///
+/// Returns [`WrapperError::RedeemExceedsMax`] when `requested > max_redeem`, so
+/// the caller can fail fast before submitting any transaction. We deliberately do
+/// not clamp `requested` down to `max_redeem`: a request that exceeds `maxRedeem`
+/// signals inventory/balance drift (the bot believes it holds more wrapped shares
+/// than the wallet actually owns), and the financial-integrity rule requires range
+/// violations to error rather than be silently capped.
+fn check_redeem_within_max(
+    wrapped_token: Address,
+    requested: U256,
+    max_redeem: U256,
+) -> Result<(), WrapperError> {
+    if requested > max_redeem {
+        return Err(WrapperError::RedeemExceedsMax {
+            wrapped_token,
+            requested,
+            max_redeem,
+        });
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -447,6 +479,56 @@ mod tests {
                     if symbol.to_string() == "XYZ"
             ),
             "expected SymbolNotConfigured for XYZ, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn check_redeem_within_max_allows_requested_below_max() {
+        let wrapped_token = Address::random();
+        let requested = U256::from(50u64);
+        let max_redeem = U256::from(100u64);
+
+        check_redeem_within_max(wrapped_token, requested, max_redeem)
+            .expect("redeem within max must be allowed");
+    }
+
+    #[test]
+    fn check_redeem_within_max_allows_requested_equal_to_max() {
+        let wrapped_token = Address::random();
+        let amount = U256::from(100u64);
+
+        check_redeem_within_max(wrapped_token, amount, amount)
+            .expect("redeem equal to max must be allowed");
+    }
+
+    #[test]
+    fn check_redeem_within_max_allows_zero_against_zero_max() {
+        let wrapped_token = Address::random();
+
+        check_redeem_within_max(wrapped_token, U256::ZERO, U256::ZERO)
+            .expect("zero redeem against zero max must be allowed");
+    }
+
+    #[test]
+    fn check_redeem_within_max_rejects_requested_above_max() {
+        let wrapped_token = Address::random();
+        // Mirrors the observed MSTR drift: requested 5.4336 vs maxRedeem 5.0989
+        // (scaled to 18 decimals).
+        let requested = U256::from(5_433_600_000_000_000_000u128);
+        let max_redeem = U256::from(5_098_900_000_000_000_000u128);
+
+        let error = check_redeem_within_max(wrapped_token, requested, max_redeem).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                WrapperError::RedeemExceedsMax {
+                    wrapped_token: token,
+                    requested: req,
+                    max_redeem: max,
+                } if token == wrapped_token && req == requested && max == max_redeem
+            ),
+            "expected RedeemExceedsMax carrying the requested/max amounts, got: {error:?}"
         );
     }
 }
