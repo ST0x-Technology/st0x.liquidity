@@ -154,7 +154,21 @@ pub(crate) struct RebalancingServiceConfig {
     pub(crate) usdc: Option<ImbalanceThreshold>,
     pub(crate) transfer_timeout: Duration,
     pub(crate) assets: AssetsConfig,
-    pub(crate) disabled_assets: HashSet<Symbol>,
+}
+
+impl RebalancingServiceConfig {
+    /// Whitelist gate for the equity rebalancing trigger: only symbols
+    /// explicitly configured with `rebalancing = "enabled"` are eligible.
+    /// Symbols observed in inventory but absent from the config are skipped
+    /// cleanly instead of falling through to the `WrapperService`
+    /// `SymbolNotConfigured` error backstop.
+    fn is_equity_rebalancing_enabled(&self, symbol: &Symbol) -> bool {
+        self.assets
+            .equities
+            .symbols
+            .get(symbol)
+            .is_some_and(|config| config.rebalancing == OperationMode::Enabled)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2215,10 +2229,6 @@ impl RebalancingService {
     }
 
     fn is_wrapped_equity_recovery_enabled(&self, symbol: &Symbol) -> bool {
-        if self.config.disabled_assets.contains(symbol) {
-            return false;
-        }
-
         self.config
             .assets
             .equities
@@ -2234,7 +2244,12 @@ impl RebalancingService {
     ) -> Result<(), equity::EquityTriggerError> {
         self.expire_stuck_operations_with_logging().await;
 
-        if self.config.disabled_assets.contains(symbol) {
+        if !self.config.is_equity_rebalancing_enabled(symbol) {
+            debug!(
+                target: "rebalance",
+                %symbol,
+                "Skipped equity trigger: rebalancing not enabled for symbol"
+            );
             return Ok(());
         }
 
@@ -3865,7 +3880,7 @@ mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
     use rain_math_float::Float;
     use sqlx::SqlitePool;
-    use std::collections::{BTreeMap, HashSet};
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -3897,6 +3912,7 @@ mod tests {
     use crate::inventory::{InventoryError, InventoryView, TransferOp, Venue};
     use crate::offchain::order::OffchainOrderId;
     use crate::position::{Position, PositionCommand, PositionEvent, TradeId, TriggerReason};
+    use crate::test_utils::rebalancing_enabled_equities;
     use crate::tokenized_equity_mint::{TokenizationRequestId, issuer_request_id};
     use crate::usdc_rebalance::{
         TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
@@ -3915,7 +3931,7 @@ mod tests {
             }),
             transfer_timeout: Duration::from_secs(30 * 60),
             assets: AssetsConfig {
-                equities: EquitiesConfig::default(),
+                equities: rebalancing_enabled_equities(&["AAPL", "TSLA", "GOOG", "RKLB"]),
                 cash: Some(CashAssetConfig {
                     vault_ids: Vec::new(),
                     rebalancing: OperationMode::Enabled,
@@ -3923,7 +3939,6 @@ mod tests {
                     reserved: None,
                 }),
             },
-            disabled_assets: HashSet::new(),
         }
     }
 
@@ -4005,6 +4020,114 @@ mod tests {
         assert_eq!(
             jobs, 1,
             "startup recovery scan must enqueue persisted positive unwrapped wallet balances",
+        );
+    }
+
+    #[tokio::test]
+    async fn wrapped_equity_recovery_enqueues_when_rebalancing_disabled() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mut balances = BTreeMap::new();
+        balances.insert(symbol.clone(), FractionalShares::new(float!(5)));
+        let now = Utc::now();
+        let inventory_view = InventoryView::default().set_inflight_equity_at_location(
+            InFlightEquityLocation::BaseWalletUnwrapped,
+            &balances,
+            now,
+            now,
+        );
+
+        let mut config = test_config();
+        config.assets.equities.symbols.insert(
+            symbol.clone(),
+            EquityAssetConfig {
+                tokenized_equity: Address::random(),
+                tokenized_equity_derivative: Address::random(),
+                pyth_feed_id: None,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Disabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Enabled,
+                operational_limit: None,
+            },
+        );
+
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(inventory_view, event_sender));
+        let service = RebalancingService::new(
+            config,
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory,
+            Arc::new(MockWrapper::new()),
+            RebalancingSchedulers::new(&apalis_pool),
+        );
+
+        service.enqueue_recovery_for_current_wallet_balances().await;
+
+        let (jobs,): (i64,) = sqlx_apalis::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+            .bind(std::any::type_name::<UnwrappedEquityRecoveryJob>())
+            .fetch_one(service.unwrapped_equity_recovery_queue.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            jobs, 1,
+            "wrapped equity recovery must not depend on rebalancing being enabled",
+        );
+    }
+
+    #[tokio::test]
+    async fn wrapped_equity_recovery_skips_when_recovery_disabled() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mut balances = BTreeMap::new();
+        balances.insert(symbol.clone(), FractionalShares::new(float!(5)));
+        let now = Utc::now();
+        let inventory_view = InventoryView::default().set_inflight_equity_at_location(
+            InFlightEquityLocation::BaseWalletWrapped,
+            &balances,
+            now,
+            now,
+        );
+
+        let mut config = test_config();
+        config.assets.equities.symbols.insert(
+            symbol.clone(),
+            EquityAssetConfig {
+                tokenized_equity: Address::random(),
+                tokenized_equity_derivative: Address::random(),
+                pyth_feed_id: None,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Disabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
+
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        let inventory = Arc::new(BroadcastingInventory::new(inventory_view, event_sender));
+        let service = RebalancingService::new(
+            config,
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory,
+            Arc::new(MockWrapper::new()),
+            RebalancingSchedulers::new(&apalis_pool),
+        );
+
+        service.enqueue_recovery_for_current_wallet_balances().await;
+
+        let (jobs,): (i64,) = sqlx_apalis::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+            .bind(std::any::type_name::<WrappedEquityRecoveryJob>())
+            .fetch_one(service.wrapped_equity_recovery_queue.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            jobs, 0,
+            "recovery-disabled symbols must not enqueue wallet recovery jobs",
         );
     }
 
@@ -5433,7 +5556,6 @@ mod tests {
                     equities: EquitiesConfig::default(),
                     cash: None,
                 },
-                disabled_assets: HashSet::new(),
             },
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             TEST_ORDERBOOK,
@@ -5457,35 +5579,55 @@ mod tests {
         );
     }
 
+    /// Builds an imbalanced (too much offchain -> Mint) trigger whose equity
+    /// assets config is overridden, with the symbol seeded in the vault
+    /// registry and a permissive `MockWrapper` so the only thing standing
+    /// between the imbalance and a dispatched mint job is the config
+    /// whitelist itself.
+    async fn make_imbalanced_trigger_with_equities(
+        symbol: &Symbol,
+        equities: EquitiesConfig,
+    ) -> Arc<RebalancingService> {
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
+                Utc::now(),
+            )
+            .unwrap()
+            .update_equity(
+                symbol,
+                Inventory::available(Venue::Hedging, Operator::Add, shares(80)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let config = RebalancingServiceConfig {
+            assets: AssetsConfig {
+                equities,
+                cash: None,
+            },
+            ..test_config()
+        };
+
+        make_trigger_with_inventory_and_registry_config(inventory, symbol, config).await
+    }
+
+    /// A symbol configured with `rebalancing = "disabled"` must be skipped by
+    /// the whitelist even when its inventory is imbalanced.
     #[tokio::test]
     async fn disabled_asset_skips_equity_trigger() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let (event_sender, _) = broadcast::channel::<Statement>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(
-            InventoryView::default(),
-            event_sender,
-        ));
-        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
-        let wrapper = Arc::new(MockWrapper::new());
 
-        let trigger = RebalancingService::new(
-            RebalancingServiceConfig {
-                equity: test_config().equity,
-                usdc: test_config().usdc,
-                transfer_timeout: test_config().transfer_timeout,
-                assets: AssetsConfig {
-                    equities: EquitiesConfig::default(),
-                    cash: None,
-                },
-                disabled_assets: HashSet::from([symbol.clone()]),
-            },
-            Arc::new(test_store::<VaultRegistry>(pool, ())),
-            TEST_ORDERBOOK,
-            TEST_ORDER_OWNER,
-            inventory,
-            wrapper,
-            RebalancingSchedulers::new(&apalis_pool),
-        );
+        let mut equities = rebalancing_enabled_equities(&["AAPL"]);
+        equities
+            .symbols
+            .get_mut(&symbol)
+            .expect("AAPL is configured")
+            .rebalancing = OperationMode::Disabled;
+
+        let trigger = make_imbalanced_trigger_with_equities(&symbol, equities).await;
 
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
 
@@ -5499,6 +5641,52 @@ mod tests {
             0,
             "Disabled asset should not trigger equity rebalancing"
         );
+    }
+
+    /// A symbol observed in inventory but absent from the equity assets
+    /// config must be skipped by the whitelist before any vault or wrapper
+    /// work -- not dispatched and only caught by the `WrapperService`
+    /// `SymbolNotConfigured` error backstop.
+    #[tokio::test]
+    async fn unconfigured_symbol_skips_equity_trigger() {
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let trigger =
+            make_imbalanced_trigger_with_equities(&symbol, EquitiesConfig::default()).await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "Unconfigured symbol should be skipped by the whitelist, not dispatched"
+        );
+        assert_eq!(
+            count_pending_equity_redemption_jobs(&trigger).await,
+            0,
+            "Unconfigured symbol should be skipped by the whitelist, not dispatched"
+        );
+    }
+
+    /// Positive control for the whitelist: the same imbalance with the symbol
+    /// configured `rebalancing = "enabled"` dispatches the mint job.
+    #[tokio::test]
+    async fn whitelisted_symbol_passes_equity_trigger() {
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let trigger =
+            make_imbalanced_trigger_with_equities(&symbol, rebalancing_enabled_equities(&["AAPL"]))
+                .await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        let jobs = take_pending_equity_mint_jobs(&trigger).await;
+        assert_eq!(
+            jobs.len(),
+            1,
+            "Whitelisted symbol with an imbalance should dispatch a mint job"
+        );
+        assert_eq!(jobs[0].symbol, symbol);
     }
 
     #[tokio::test]
@@ -11370,7 +11558,6 @@ mod tests {
                     equities: EquitiesConfig::default(),
                     cash: None,
                 },
-                disabled_assets: HashSet::new(),
             },
             Arc::new(test_store::<VaultRegistry>(pool, ())),
             TEST_ORDERBOOK,

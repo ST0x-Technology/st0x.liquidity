@@ -1614,7 +1614,6 @@ mod tests {
     use alloy::primitives::{Address, B256, address};
     use chrono::Utc;
     use sqlx::SqlitePool;
-    use std::collections::HashSet;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::broadcast;
@@ -1796,7 +1795,6 @@ mod tests {
                     equities: EquitiesConfig::default(),
                     cash: None,
                 },
-                disabled_assets: HashSet::new(),
             },
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             address!("0x0000000000000000000000000000000000000001"),
@@ -1938,7 +1936,6 @@ mod tests {
                     equities: EquitiesConfig::default(),
                     cash: None,
                 },
-                disabled_assets: HashSet::new(),
             },
             Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
             address!("0x0000000000000000000000000000000000000001"),
