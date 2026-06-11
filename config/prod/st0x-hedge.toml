@@ -120,7 +120,7 @@ pyth_feed_id = "0x8d6a29bb5ed522931d711bb12c4bbf92af986936e52af582032913b5ffcbf4
 trading = "enabled"
 rebalancing = "enabled"
 wrapped_equity_recovery = "enabled"
-vault_id = "0xfab4"
+vault_id = "0xfab"
 tokenized_equity = "0xc941C1506B7555Ba8C506Fb6c9b9CC259902d612"
 tokenized_equity_derivative = "0x78c31580c97101694c70022c83d570150c11e935"
 
