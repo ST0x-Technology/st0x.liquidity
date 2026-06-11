@@ -37,6 +37,9 @@ use crate::inventory::{
     Operator, PendingRequestOwnership, PendingRequestOwnershipSnapshot, TransferOp, Venue,
 };
 use crate::position::{Position, PositionEvent};
+use crate::rebalancing::equity::{
+    TransferEquityToMarketMaking, TransferEquityToMarketMakingJobQueue,
+};
 use crate::rebalancing::usdc::{
     TransferUsdcToHedging, TransferUsdcToHedgingJobQueue, TransferUsdcToMarketMaking,
     TransferUsdcToMarketMakingJobQueue,
@@ -69,6 +72,7 @@ pub(crate) struct RebalancingSchedulers {
     pub(crate) unwrapped_equity_recovery: UnwrappedEquityRecoveryJobQueue,
     pub(crate) transfer_usdc_to_hedging: TransferUsdcToHedgingJobQueue,
     pub(crate) transfer_usdc_to_market_making: TransferUsdcToMarketMakingJobQueue,
+    pub(crate) transfer_equity_to_market_making: TransferEquityToMarketMakingJobQueue,
 }
 
 impl RebalancingSchedulers {
@@ -80,6 +84,7 @@ impl RebalancingSchedulers {
             unwrapped_equity_recovery: UnwrappedEquityRecoveryJobQueue::new(pool),
             transfer_usdc_to_hedging: TransferUsdcToHedgingJobQueue::new(pool),
             transfer_usdc_to_market_making: TransferUsdcToMarketMakingJobQueue::new(pool),
+            transfer_equity_to_market_making: TransferEquityToMarketMakingJobQueue::new(pool),
         }
     }
 }
@@ -463,6 +468,11 @@ pub(crate) struct RebalancingService {
     /// directly rather than dispatching through the `Rebalancer` mpsc channel.
     pub(super) transfer_usdc_to_hedging_queue: TransferUsdcToHedgingJobQueue,
     pub(super) transfer_usdc_to_market_making_queue: TransferUsdcToMarketMakingJobQueue,
+    /// Queue for the equity mint apalis job (hedging -> market-making).
+    /// `check_and_trigger_equity` enqueues into this directly for the mint
+    /// direction rather than dispatching through the `Rebalancer` mpsc
+    /// channel.
+    pub(super) transfer_equity_to_market_making_queue: TransferEquityToMarketMakingJobQueue,
     /// Tracks symbol/quantity for in-flight mints. The initial `MintRequested`
     /// event carries this data; follow-up events don't.
     mint_tracking: Arc<RwLock<HashMap<IssuerRequestId, MintTracking>>>,
@@ -546,6 +556,7 @@ impl RebalancingService {
             wrapped_equity_recovery: wrapped_equity_recovery_queue,
             unwrapped_equity_recovery: unwrapped_equity_recovery_queue,
             transfer_usdc_to_hedging: transfer_usdc_to_hedging_queue,
+            transfer_equity_to_market_making: transfer_equity_to_market_making_queue,
             transfer_usdc_to_market_making: transfer_usdc_to_market_making_queue,
         } = schedulers;
         Self {
@@ -565,6 +576,7 @@ impl RebalancingService {
             unwrapped_equity_recovery_queue,
             transfer_usdc_to_hedging_queue,
             transfer_usdc_to_market_making_queue,
+            transfer_equity_to_market_making_queue,
             mint_tracking: Arc::new(RwLock::new(HashMap::new())),
             redemption_tracking: Arc::new(RwLock::new(HashMap::new())),
             usdc_tracking: Arc::new(RwLock::new(HashMap::new())),
@@ -2396,13 +2408,13 @@ impl RebalancingService {
 
         // Re-check immediately before dispatch: an OffChainOrderPlaced for this
         // symbol may have landed during the awaits in build_equity_operation.
-        // try_send_operation is synchronous, so no await intervenes between this
-        // check and the send, keeping the race window as tight as possible.
         // This narrows but cannot fully close the gap: the in-memory set is a
         // reactor-lagged projection of the position aggregate's
         // pending_offchain_order_id, so a just-committed OffChainOrderPlaced
-        // not yet seen by the reactor is invisible here. Closing that fully
-        // needs a source-side reservation, not a reactor-lagged projection.
+        // not yet seen by the reactor is invisible here (and the mint path
+        // awaits its Jobs-table dedupe query between this check and the
+        // push). Closing that fully needs a source-side reservation, not a
+        // reactor-lagged projection.
         if self.has_pending_offchain_order(symbol).await {
             debug!(
                 target: "rebalance",
@@ -2412,11 +2424,21 @@ impl RebalancingService {
             return Ok(());
         }
 
-        if !self.try_send_operation(&operation, "equity") {
+        let dispatched = match operation {
+            TriggeredOperation::Mint { symbol, quantity } => {
+                self.enqueue_transfer_equity_to_market_making(symbol, quantity)
+                    .await
+            }
+            operation @ TriggeredOperation::Redemption { .. } => {
+                self.try_send_operation(&operation, "equity")
+            }
+        };
+
+        if !dispatched {
             return Ok(());
         }
 
-        debug!(target: "rebalance", %symbol, ?operation, "Triggered equity rebalancing");
+        debug!(target: "rebalance", %symbol, "Triggered equity rebalancing");
         guard.defuse();
         Ok(())
     }
@@ -2510,7 +2532,8 @@ impl RebalancingService {
             "SELECT id, CAST(strftime('%s', 'now') AS INTEGER) - run_at AS age_secs \
              FROM Jobs \
              WHERE job_type IN (?, ?) \
-             AND status IN ('Pending', 'Queued', 'Running') \
+             AND (status IN ('Pending', 'Queued', 'Running') \
+                  OR (status = 'Failed' AND attempts < max_attempts)) \
              ORDER BY run_at ASC \
              LIMIT 1",
         )
@@ -2672,6 +2695,127 @@ impl RebalancingService {
                     %error,
                     %amount,
                     "Failed to enqueue TransferUsdcToMarketMaking job",
+                );
+                false
+            }
+        }
+    }
+
+    /// Returns the oldest non-terminal equity mint job for this symbol (the
+    /// row id and its age in seconds), if any.
+    ///
+    /// The in-memory `equity_in_progress` guard resets on restart, so without
+    /// this check a crash between `queue.push` and the first persisted
+    /// `TokenizedEquityMint` event would let the next imbalance check enqueue
+    /// a second mint for the same imbalance. The payload is a `serde_json`
+    /// BLOB (apalis `JsonCodec`), so the symbol is filtered via
+    /// `json_extract`.
+    async fn in_flight_equity_mint(
+        pool: &apalis_sqlite::SqlitePool,
+        symbol: &Symbol,
+    ) -> Result<Option<(String, i64)>, sqlx_apalis::Error> {
+        sqlx_apalis::query_as(
+            "SELECT id, CAST(strftime('%s', 'now') AS INTEGER) - run_at AS age_secs \
+             FROM Jobs \
+             WHERE job_type = ? \
+             AND json_extract(job, '$.symbol') = ? \
+             AND (status IN ('Pending', 'Queued', 'Running') \
+                  OR (status = 'Failed' AND attempts < max_attempts)) \
+             ORDER BY run_at ASC \
+             LIMIT 1",
+        )
+        .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+        .bind(symbol.to_string())
+        .fetch_optional(pool)
+        .await
+    }
+
+    /// Enqueues a [`TransferEquityToMarketMaking`] apalis job for a
+    /// hedging->market-making equity mint. Generates a fresh
+    /// `IssuerRequestId` at push time so apalis retries (and bot restarts
+    /// that re-pick the job row) hit the same aggregate. Returns `true` on
+    /// successful enqueue.
+    async fn enqueue_transfer_equity_to_market_making(
+        &self,
+        symbol: Symbol,
+        quantity: FractionalShares,
+    ) -> bool {
+        // A non-terminal row in flight longer than this is treated as likely
+        // stuck: the suppression is logged at warn (with the row id and age)
+        // so it is actionable rather than silently freezing the symbol.
+        const STUCK_TRANSFER_WARN_AFTER_SECS: i64 = 15 * 60;
+
+        let mut queue = self.transfer_equity_to_market_making_queue.clone();
+
+        match Self::in_flight_equity_mint(queue.pool(), &symbol).await {
+            Ok(Some((row_id, age_secs))) if age_secs >= STUCK_TRANSFER_WARN_AFTER_SECS => {
+                warn!(
+                    target: "rebalance",
+                    %row_id,
+                    age_secs,
+                    threshold_secs = STUCK_TRANSFER_WARN_AFTER_SECS,
+                    %symbol,
+                    %quantity,
+                    "Skipped equity mint enqueue: an in-flight mint for this symbol looks \
+                     stuck and is suppressing new rebalances; investigate before it \
+                     starves market making",
+                );
+                return false;
+            }
+            Ok(Some((row_id, age_secs))) => {
+                debug!(
+                    target: "rebalance",
+                    %row_id,
+                    age_secs,
+                    %symbol,
+                    %quantity,
+                    "Skipped equity mint enqueue: a non-terminal mint for this symbol \
+                     already exists; apalis will resume it",
+                );
+                return false;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    target: "rebalance",
+                    %error,
+                    %symbol,
+                    "Failed to query for in-flight equity mints; \
+                     skipping enqueue to avoid double-pushing",
+                );
+                return false;
+            }
+        }
+
+        let issuer_request_id = IssuerRequestId::generate();
+
+        let push = queue
+            .push(TransferEquityToMarketMaking {
+                issuer_request_id: issuer_request_id.clone(),
+                symbol: symbol.clone(),
+                quantity,
+            })
+            .await;
+
+        match push {
+            Ok(()) => {
+                debug!(
+                    target: "rebalance",
+                    %issuer_request_id,
+                    %symbol,
+                    %quantity,
+                    "Enqueued TransferEquityToMarketMaking job for equity mint",
+                );
+                true
+            }
+
+            Err(QueuePushError(error)) => {
+                warn!(
+                    target: "rebalance",
+                    %error,
+                    %symbol,
+                    %quantity,
+                    "Failed to enqueue TransferEquityToMarketMaking job",
                 );
                 false
             }
@@ -3850,7 +3994,7 @@ mod tests {
     use crate::inventory::{InventoryError, InventoryView, TransferOp, Venue};
     use crate::offchain::order::OffchainOrderId;
     use crate::position::{Position, PositionCommand, PositionEvent, TradeId, TriggerReason};
-    use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
+    use crate::tokenized_equity_mint::{TokenizationRequestId, issuer_request_id};
     use crate::usdc_rebalance::{
         TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
     };
@@ -3970,7 +4114,7 @@ mod tests {
     async fn recover_mint_state_restores_tracking_and_inflight() {
         let (trigger, _receiver) = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let mint_id = IssuerRequestId::new("mint-recovery");
+        let mint_id = issuer_request_id("mint-recovery");
         let accepted_at = Utc::now();
 
         trigger
@@ -4082,7 +4226,7 @@ mod tests {
     async fn recovery_after_explicit_mint_failure_moves_equity_to_market_making() {
         let (trigger, _receiver) = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let mint_id = IssuerRequestId::new("mint-explicit-recovery");
+        let mint_id = issuer_request_id("mint-explicit-recovery");
         let tok = TokenizationRequestId("TOK-1".to_string());
 
         // An explicit MintAcceptanceFailed cancelled the in-flight back to
@@ -4135,7 +4279,7 @@ mod tests {
     async fn recovery_after_timeout_mint_failure_clears_tombstone_and_moves_equity() {
         let (trigger, _receiver) = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let mint_id = IssuerRequestId::new("mint-timeout-recovery");
+        let mint_id = issuer_request_id("mint-timeout-recovery");
         let tok = TokenizationRequestId("TOK-1".to_string());
 
         // A timeout cleared the in-flight without crediting available (Hedging
@@ -4316,7 +4460,7 @@ mod tests {
     async fn abandon_mint_recovery_guard_clears_active_mint() {
         let (trigger, _receiver) = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let mint_id = IssuerRequestId::new("mint-resume-failure");
+        let mint_id = issuer_request_id("mint-resume-failure");
         let tok = TokenizationRequestId("TOK-1".to_string());
 
         *trigger.inventory.write().await =
@@ -4374,8 +4518,8 @@ mod tests {
     async fn mint_recovery_claim_refuses_a_different_mint_without_mutating() {
         let (trigger, _receiver) = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let recovering = IssuerRequestId::new("recovering-mint");
-        let other = IssuerRequestId::new("other-mint");
+        let recovering = issuer_request_id("recovering-mint");
+        let other = issuer_request_id("other-mint");
         let tok = TokenizationRequestId("TOK-1".to_string());
 
         // Explicit-failure shape (available 100, in-flight 0) but a *different*
@@ -4415,7 +4559,7 @@ mod tests {
     async fn mint_recovery_claim_succeeds_for_self_owned_slot() {
         let (trigger, _receiver) = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let recovering = IssuerRequestId::new("recovering-mint");
+        let recovering = issuer_request_id("recovering-mint");
         let tok = TokenizationRequestId("TOK-1".to_string());
 
         // The slot is still owned by the recovering mint itself (e.g. a
@@ -4558,8 +4702,8 @@ mod tests {
     async fn abandon_mint_recovery_guard_keeps_active_mint_owned_by_other_id() {
         let (trigger, _receiver) = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let recovering_id = IssuerRequestId::new("recovering-mint");
-        let other_id = IssuerRequestId::new("other-active-mint");
+        let recovering_id = issuer_request_id("recovering-mint");
+        let other_id = issuer_request_id("other-active-mint");
 
         // A different aggregate owns the symbol's active-mint slot (e.g. a
         // concurrent mint). Abandoning the recovering mint's guard must NOT clear
@@ -4583,7 +4727,7 @@ mod tests {
     async fn rollback_after_explicit_mint_dispatch_failure_restores_available() {
         let (trigger, _receiver) = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let mint_id = IssuerRequestId::new("mint-explicit-rollback");
+        let mint_id = issuer_request_id("mint-explicit-rollback");
         let tok = TokenizationRequestId("TOK-1".to_string());
 
         // Explicit failure cancelled the in-flight back to available: 100/0.
@@ -4646,7 +4790,7 @@ mod tests {
     async fn rollback_after_timeout_mint_dispatch_failure_restores_tombstone() {
         let (trigger, _receiver) = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let mint_id = IssuerRequestId::new("mint-timeout-rollback");
+        let mint_id = issuer_request_id("mint-timeout-rollback");
         let tok = TokenizationRequestId("TOK-1".to_string());
         let tombstone_at = Utc::now();
 
@@ -4980,7 +5124,7 @@ mod tests {
     async fn pending_request_ownership_exposes_active_mint_ids() {
         let (trigger, _receiver) = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let mint_id = IssuerRequestId::new("owned-mint");
+        let mint_id = issuer_request_id("owned-mint");
         let tokenization_request_id = TokenizationRequestId("owned-tokenization".to_string());
 
         *trigger.inventory.write().await =
@@ -5038,7 +5182,7 @@ mod tests {
                 .contains(&tokenization_request_id)
         );
 
-        let success_mint_id = IssuerRequestId::new("owned-success-mint");
+        let success_mint_id = issuer_request_id("owned-success-mint");
         let success_tokenization_request_id =
             TokenizationRequestId("owned-success-tokenization".to_string());
 
@@ -5654,6 +5798,60 @@ mod tests {
         .expect("count pending TransferUsdcToMarketMaking jobs")
     }
 
+    /// Counts pending `TransferEquityToMarketMaking` rows in the apalis Jobs
+    /// table backing this service. Used by trigger tests that previously
+    /// asserted on the mpsc receiver for mints and now must assert on the
+    /// queue.
+    async fn count_pending_equity_mint_jobs(service: &RebalancingService) -> i64 {
+        let job_type = std::any::type_name::<TransferEquityToMarketMaking>();
+        sqlx_apalis::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(job_type)
+        .fetch_one(service.transfer_equity_to_market_making_queue.pool())
+        .await
+        .expect("count pending TransferEquityToMarketMaking jobs")
+    }
+
+    /// Drains every pending equity mint row from the service's Jobs table and
+    /// returns the parsed payloads. Marking rows `Done` lets repeated trigger
+    /// cycles in the same test see fresh state.
+    async fn take_pending_equity_mint_jobs(
+        service: &RebalancingService,
+    ) -> Vec<TransferEquityToMarketMaking> {
+        let pool = service
+            .transfer_equity_to_market_making_queue
+            .pool()
+            .clone();
+        let job_type = std::any::type_name::<TransferEquityToMarketMaking>();
+
+        let rows: Vec<(String, Vec<u8>)> = sqlx_apalis::query_as(
+            "SELECT id, job FROM Jobs \
+             WHERE status = 'Pending' AND job_type = ? \
+             ORDER BY run_at",
+        )
+        .bind(job_type)
+        .fetch_all(&pool)
+        .await
+        .expect("query pending TransferEquityToMarketMaking jobs");
+
+        let mut jobs = Vec::with_capacity(rows.len());
+        for (row_id, payload) in rows {
+            let job: TransferEquityToMarketMaking =
+                serde_json::from_slice(&payload).expect("deserialize TransferEquityToMarketMaking");
+
+            sqlx_apalis::query("UPDATE Jobs SET status = 'Done' WHERE id = ?")
+                .bind(&row_id)
+                .execute(&pool)
+                .await
+                .expect("mark equity mint job row Done");
+
+            jobs.push(job);
+        }
+
+        jobs
+    }
+
     /// Drains every pending USDC transfer row (both directions) from the
     /// service's Jobs table and returns them parsed as
     /// [`UsdcRebalanceOperation`]. Marking rows `Done` lets repeated trigger
@@ -5793,7 +5991,7 @@ mod tests {
         // handle it (either by auto-registering or by decoupling the
         // inventory update failure from the rebalancing check).
         let symbol = Symbol::new("AAPL").unwrap();
-        let (sender, mut receiver) = mpsc::channel(10);
+        let (sender, _receiver) = mpsc::channel(10);
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default().with_usdc(usdc(1_000_000), usdc(1_000_000)),
@@ -5840,7 +6038,7 @@ mod tests {
         }
 
         // Drain any intermediate triggers and do a final check.
-        while receiver.try_recv().is_ok() {}
+        take_pending_equity_mint_jobs(&trigger).await;
         trigger.clear_equity_in_progress(&symbol);
 
         // One more event to trigger the check after the imbalance is built up.
@@ -5851,11 +6049,13 @@ mod tests {
             .unwrap();
         drain_pending_jobs(&trigger).await.unwrap();
 
-        let triggered = receiver.try_recv();
-        assert!(
-            matches!(triggered, Ok(TriggeredOperation::Mint { .. })),
-            "Expected Mint for imbalanced inventory starting from empty, got {triggered:?}"
+        let jobs = take_pending_equity_mint_jobs(&trigger).await;
+        assert_eq!(
+            jobs.len(),
+            1,
+            "Expected a mint job enqueued for imbalanced inventory starting from empty"
         );
+        assert_eq!(jobs[0].symbol, symbol);
     }
 
     #[tokio::test]
@@ -6256,7 +6456,7 @@ mod tests {
             )
             .unwrap();
 
-        let (trigger, mut receiver) =
+        let (trigger, _receiver) =
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let harness = ReactorHarness::new(trigger.clone());
 
@@ -6268,12 +6468,10 @@ mod tests {
             .unwrap();
         drain_pending_jobs(&trigger).await.unwrap();
 
-        // Mint should be triggered because too much offchain.
-        let triggered = receiver.try_recv();
-        assert!(
-            matches!(triggered, Ok(TriggeredOperation::Mint { .. })),
-            "Expected Mint operation, got {triggered:?}"
-        );
+        // A mint job should be enqueued because too much offchain.
+        let jobs = take_pending_equity_mint_jobs(&trigger).await;
+        assert_eq!(jobs.len(), 1, "Expected a mint job for the imbalance");
+        assert_eq!(jobs[0].symbol, symbol);
     }
 
     #[tokio::test]
@@ -6326,7 +6524,7 @@ mod tests {
 
     fn make_mint_accepted() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintAccepted {
-            issuer_request_id: IssuerRequestId::new("ISS123"),
+            issuer_request_id: issuer_request_id("ISS123"),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
             accepted_at: Utc::now(),
         }
@@ -6408,16 +6606,17 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, mut receiver) =
+        let (reactor, _receiver) =
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
 
         // Initially, trigger should detect imbalance (too much offchain).
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        let initial_check = receiver.try_recv();
-        assert!(
-            matches!(initial_check, Ok(TriggeredOperation::Mint { .. })),
-            "Expected initial imbalance to trigger Mint, got {initial_check:?}"
+        let initial_jobs = take_pending_equity_mint_jobs(&trigger).await;
+        assert_eq!(
+            initial_jobs.len(),
+            1,
+            "Expected initial imbalance to enqueue a mint job"
         );
 
         // Clear in-progress so we can test again.
@@ -6439,12 +6638,10 @@ mod tests {
 
         // With inflight, imbalance detection should not trigger anything.
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        assert!(
-            matches!(
-                receiver.try_recv().unwrap_err(),
-                mpsc::error::TryRecvError::Empty
-            ),
-            "Expected no operation due to inflight"
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "Expected no mint job due to inflight"
         );
     }
 
@@ -6544,7 +6741,7 @@ mod tests {
         }
 
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = IssuerRequestId::new("mint-1");
+        let id = issuer_request_id("mint-1");
 
         harness
             .receive::<TokenizedEquityMint>(id.clone(), make_mint_requested(&symbol, float!(10)))
@@ -6621,17 +6818,18 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, mut receiver) =
+        let (reactor, _receiver) =
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = IssuerRequestId::new("mint-blocks");
+        let id = issuer_request_id("mint-blocks");
 
         // Verify imbalance triggers before reactor events
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        assert!(
-            matches!(receiver.try_recv(), Ok(TriggeredOperation::Mint { .. })),
-            "Should trigger Mint before reactor events"
+        assert_eq!(
+            take_pending_equity_mint_jobs(&trigger).await.len(),
+            1,
+            "Should enqueue a mint job before reactor events"
         );
         trigger.clear_equity_in_progress(&symbol);
 
@@ -6648,8 +6846,9 @@ mod tests {
 
         // Now check: inflight should block imbalance detection
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
             "Inflight from MintAccepted should block imbalance detection"
         );
     }
@@ -6677,7 +6876,7 @@ mod tests {
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = IssuerRequestId::new("mint-transfer");
+        let id = issuer_request_id("mint-transfer");
 
         // Full mint flow: MintRequested -> MintAccepted -> TokensReceived
         harness
@@ -6724,11 +6923,11 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, mut receiver) =
+        let (reactor, _receiver) =
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = IssuerRequestId::new("mint-fail");
+        let id = issuer_request_id("mint-fail");
 
         // MintRequested -> MintAccepted -> MintAcceptanceFailed
         harness
@@ -6748,9 +6947,10 @@ mod tests {
 
         // After cancellation, inflight is cleared, imbalance should trigger again
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        assert!(
-            matches!(receiver.try_recv(), Ok(TriggeredOperation::Mint { .. })),
-            "Imbalance should re-trigger after MintAcceptanceFailed cancels inflight"
+        assert_eq!(
+            take_pending_equity_mint_jobs(&trigger).await.len(),
+            1,
+            "Imbalance should re-enqueue a mint job after MintAcceptanceFailed cancels inflight"
         );
     }
 
@@ -6784,7 +6984,7 @@ mod tests {
             guard.insert(symbol.clone());
         }
 
-        let id = IssuerRequestId::new("mint-deposit");
+        let id = issuer_request_id("mint-deposit");
 
         // Full happy-path: MintRequested -> MintAccepted -> TokensReceived -> DepositedIntoRaindex
         harness
@@ -6841,7 +7041,7 @@ mod tests {
             guard.insert(symbol.clone());
         }
 
-        let id = IssuerRequestId::new("mint-wrapping-fail");
+        let id = issuer_request_id("mint-wrapping-fail");
 
         harness
             .receive::<TokenizedEquityMint>(id.clone(), make_mint_requested(&symbol, float!(30)))
@@ -6887,7 +7087,7 @@ mod tests {
             guard.insert(symbol.clone());
         }
 
-        let id = IssuerRequestId::new("mint-deposit-fail");
+        let id = issuer_request_id("mint-deposit-fail");
 
         harness
             .receive::<TokenizedEquityMint>(id.clone(), make_mint_requested(&symbol, float!(30)))
@@ -7328,7 +7528,7 @@ mod tests {
             )
             .unwrap();
 
-        let (reactor, mut receiver) =
+        let (reactor, _receiver) =
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let id = InventorySnapshotId {
@@ -7338,9 +7538,10 @@ mod tests {
 
         // Verify initial imbalance triggers
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        assert!(
-            matches!(receiver.try_recv(), Ok(TriggeredOperation::Mint { .. })),
-            "20% ratio should trigger Mint"
+        assert_eq!(
+            take_pending_equity_mint_jobs(&trigger).await.len(),
+            1,
+            "20% ratio should enqueue a mint job"
         );
         trigger.clear_equity_in_progress(&symbol);
 
@@ -7361,8 +7562,9 @@ mod tests {
 
         // After snapshot: 20 onchain, 20 offchain = balanced
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
-        assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
             "50% ratio should be balanced after offchain equity snapshot"
         );
     }
@@ -14188,7 +14390,7 @@ mod tests {
             owner: TEST_ORDER_OWNER,
         };
 
-        let mint_id = IssuerRequestId::new("mint-stale-regression");
+        let mint_id = issuer_request_id("mint-stale-regression");
 
         // MintRequested starts inflight at Hedging venue
         harness
@@ -14574,7 +14776,7 @@ mod tests {
         )
         .await;
         let trigger = reactor.clone();
-        let id = IssuerRequestId::new("timed-out-mint-recheck");
+        let id = issuer_request_id("timed-out-mint-recheck");
 
         trigger.mint_tracking.write().await.insert(
             id.clone(),
@@ -14640,7 +14842,7 @@ mod tests {
         )
         .await;
         let trigger = reactor.clone();
-        let id = IssuerRequestId::new("timed-out-mint-late-request");
+        let id = issuer_request_id("timed-out-mint-late-request");
 
         trigger.mint_tracking.write().await.insert(
             id.clone(),
@@ -14700,7 +14902,7 @@ mod tests {
     async fn timed_out_mint_cleanup_clears_active_mint_id() {
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
-        let id = IssuerRequestId::new("timed-out-mint-active-id");
+        let id = issuer_request_id("timed-out-mint-active-id");
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(50), shares(50))
             .update_equity(
@@ -14750,7 +14952,7 @@ mod tests {
         )
         .await;
         let trigger = reactor.clone();
-        let id = IssuerRequestId::new("mint-sync-gate-tombstone");
+        let id = issuer_request_id("mint-sync-gate-tombstone");
         let sync_guard = trigger.mint_event_sync.lock().await;
         let trigger_for_task = Arc::clone(&trigger);
         let task_symbol = symbol.clone();
@@ -15191,7 +15393,7 @@ mod tests {
         )
         .await;
         let trigger = reactor.clone();
-        let id = IssuerRequestId::new("recovery-timeout-sweep");
+        let id = issuer_request_id("recovery-timeout-sweep");
 
         trigger.mint_tracking.write().await.insert(
             id.clone(),
@@ -15254,7 +15456,7 @@ mod tests {
         let stale_time = Utc::now()
             - ChronoDuration::from_std(TIMEOUT_TOMBSTONE_RETENTION).unwrap()
             - ChronoDuration::seconds(1);
-        let mint_id = IssuerRequestId::new("stale-mint");
+        let mint_id = issuer_request_id("stale-mint");
         let redemption_id = RedemptionAggregateId::new("stale-redemption");
         let usdc_id = UsdcRebalanceId(Uuid::new_v4());
 
@@ -15324,7 +15526,7 @@ mod tests {
         )
         .await;
         let trigger = reactor.clone();
-        let id = IssuerRequestId::new("mint-active-id");
+        let id = issuer_request_id("mint-active-id");
 
         trigger
             .on_mint(id.clone(), make_mint_requested(&symbol, float!(10)))
@@ -15358,7 +15560,7 @@ mod tests {
         )
         .await;
         let trigger = reactor.clone();
-        let id = IssuerRequestId::new("mint-clear-id");
+        let id = issuer_request_id("mint-clear-id");
 
         trigger
             .on_mint(id.clone(), make_mint_requested(&symbol, float!(10)))
@@ -15548,7 +15750,7 @@ mod tests {
             .with_equity(symbol.clone(), shares(20), shares(80))
             .with_usdc(usdc(1_000_000), usdc(1_000_000));
 
-        let (reactor, mut receiver) =
+        let (reactor, _receiver) =
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
 
@@ -15559,11 +15761,61 @@ mod tests {
         .await
         .unwrap();
 
-        let dispatched = receiver.try_recv().unwrap();
-        let TriggeredOperation::Mint { symbol: minted, .. } = dispatched else {
-            panic!("Expected Mint, got {dispatched:?}");
+        let dispatched = take_pending_equity_mint_jobs(&trigger).await;
+        let [job] = dispatched.as_slice() else {
+            panic!("Expected exactly one mint job, got {dispatched:?}");
         };
-        assert_eq!(minted, symbol);
+        assert_eq!(job.symbol, symbol);
+    }
+
+    /// A crash between `queue.push` and the first persisted mint event leaves
+    /// a pending job row while the in-memory guard resets. The Jobs-table
+    /// dedupe must suppress a second enqueue for the same symbol while
+    /// leaving other symbols free to enqueue.
+    #[tokio::test]
+    async fn equity_mint_enqueue_dedupes_per_symbol_against_jobs_table() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(80))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+
+        let (reactor, _receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+        assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 1);
+
+        // Simulate a restart: the in-memory guard resets while the job row
+        // is still pending.
+        trigger.clear_equity_in_progress(&symbol);
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            1,
+            "a pending mint row for the symbol must suppress a duplicate enqueue"
+        );
+
+        // A different symbol is not suppressed by AAPL's pending row.
+        let enqueued = trigger
+            .enqueue_transfer_equity_to_market_making(Symbol::new("TSLA").unwrap(), shares(30))
+            .await;
+        assert!(
+            enqueued,
+            "a pending mint row for one symbol must not block other symbols"
+        );
+        assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 2);
     }
 
     #[tokio::test]
@@ -15637,6 +15889,11 @@ mod tests {
         assert!(
             matches!(actual, Err(TryRecvError::Empty)),
             "Balanced inventory should not dispatch a TriggeredOperation, got {actual:?}"
+        );
+        assert_eq!(
+            count_pending_equity_mint_jobs(&trigger).await,
+            0,
+            "Balanced inventory should not enqueue a mint job"
         );
     }
 

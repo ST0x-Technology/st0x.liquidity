@@ -41,6 +41,10 @@ use st0x_hedge::cli::seed_mint_at_tokens_wrapped_for_test;
 use self::assertions::*;
 use crate::assert::{StoredEvent, assert_single_clean_aggregate};
 
+fn issuer_request_id(label: &str) -> String {
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, label.as_bytes()).to_string()
+}
+
 fn aggregate_id_for_event(events: &[crate::assert::StoredEvent], event_type: &str) -> String {
     events
         .iter()
@@ -2627,9 +2631,11 @@ async fn active_mint_in_tokens_wrapped_recovers_into_raindex_vault() -> anyhow::
 
     sqlx::migrate!("./migrations").run(&pool).await?;
 
+    let recovery_mint_id = issuer_request_id("ISS-RECOVERY-E2E");
+
     seed_mint_at_tokens_wrapped_for_test(
         &pool,
-        "ISS-RECOVERY-E2E",
+        &recovery_mint_id,
         "AAPL",
         infra.base_chain.owner,
         TxHash::random(),
@@ -2717,7 +2723,7 @@ async fn active_mint_in_tokens_wrapped_recovers_into_raindex_vault() -> anyhow::
 
     let seeded_mint_events: Vec<StoredEvent> = mint_events
         .into_iter()
-        .filter(|event| event.aggregate_id == "ISS-RECOVERY-E2E")
+        .filter(|event| event.aggregate_id == recovery_mint_id)
         .collect();
 
     assert_event_subsequence(

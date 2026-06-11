@@ -819,6 +819,7 @@ mod tests {
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::tokenization::mock::MockTokenizer;
+    use crate::tokenized_equity_mint::issuer_request_id;
     use crate::vault_lookup::{MockVaultLookup, VaultLookup};
 
     use super::*;
@@ -1490,7 +1491,7 @@ mod tests {
         let events = detected()
             .transition(
                 UnwrappedEquityRecoveryCommand::DispatchToMint {
-                    mint_id: IssuerRequestId::new("ISS-NONEXISTENT"),
+                    mint_id: issuer_request_id("ISS-NONEXISTENT"),
                 },
                 &services,
             )
