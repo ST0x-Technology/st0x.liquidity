@@ -3129,6 +3129,7 @@ mod tests {
             trading = "enabled"
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
         "#
         );
 
