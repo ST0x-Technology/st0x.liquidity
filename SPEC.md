@@ -1609,7 +1609,7 @@ enum DetectionFailure {
 }
 ```
 
-The operator `fail` verb (`fail-transfer --type redemption`) dispatches per
+The operator `fail` verb (`transfer fail --kind redemption`) dispatches per
 state: a redemption stuck before tokens leave custody takes `FailTransfer`, a
 `TokensSent` redemption takes `FailDetection { failure: Operator { reason } }`,
 and a `Pending` redemption takes `RejectRedemption { reason }`. In every case
@@ -2800,8 +2800,8 @@ until manual recovery.
 **Operator reconciliation of a stranded post-burn failure**: A USDC rebalance
 that fails after the CCTP burn holds the rebalancing guard, blocking further
 USDC rebalancing. Because the burned/minted USDC was handled out-of-band, this
-is reconciled rather than re-driven: the `reconcile-usdc-transfer` CLI command
-sends `ReconcileStuckRebalance`, which emits `OperatorReconciled` and drives the
+is reconciled rather than re-driven: the `transfer reconcile` CLI command sends
+`ReconcileStuckRebalance`, which emits `OperatorReconciled` and drives the
 aggregate to a new clearing terminal state, `Reconciled`. The reactor then
 clears the in-progress guard, removes tracking, and reconciles source-venue
 inflight with **post-burn semantics** -- it zeroes the source-venue inflight
@@ -2870,9 +2870,9 @@ proper tracking of asset movements that required manual resolution.
 
 The CLI exposes operator commands for recovering stuck or failed operations.
 These commands share one vocabulary so each command's intent is unambiguous.
-This section is the source of truth for that vocabulary; the rename onto it is
-implemented incrementally (see the recovery-CLI unification epic), with legacy
-command names kept as hidden aliases during the transition.
+This section is the source of truth for that vocabulary. The grouped command
+surface is the only operator recovery interface; the pre-rename flat command
+names were removed with no back-compat.
 
 **Commands are grouped by the object they act on:**
 
@@ -2912,9 +2912,9 @@ effect rather than a generic intent:
   touch no aggregate, so its commands are named for the on-chain action they
   perform and are exempt from the recovery-verb vocabulary.
 - `position release-hedge` -- release a Position's stuck pending-offchain-order
-  pointer so normal hedging can retry; the rename of the legacy
-  `fail-pending-offchain-order`. `fail` would be the wrong verb here: the
-  Position itself never fails -- only its orphaned order does.
+  pointer so normal hedging can retry; it replaced the removed
+  `fail-pending-offchain-order` command. `fail` would be the wrong verb here:
+  the Position itself never fails -- only its orphaned order does.
 
 **Standing rules:**
 
@@ -2929,31 +2929,24 @@ effect rather than a generic intent:
 - **`recover` is not a CLI verb.** It historically meant three different things
   (raw mint completion, provider-truth un-failing, and on-chain mint adoption),
   so it carries no information. The raw bridge primitive is named
-  `cctp complete-mint`; until the rename step of the unification epic lands it
-  remains live under its legacy name `cctp-recover`, which the rename keeps as a
-  hidden alias.
+  `cctp complete-mint`; the legacy `cctp-recover` name has been removed.
 - **Execution mode is part of each command's contract.** Help text states which
   mode the command uses: direct-DB (the operator must ensure the bot is not
   concurrently driving the same id); direct-DB plus a live RPC provider
-  (`transfer resume --kind usdc`, today `resume-usdc-transfer`, drives the
-  on-chain flow against the local aggregate store, with the same
-  no-concurrent-bot caveat); live RPC only (`cctp complete-mint` touches no
-  database state -- the caveat is the bot concurrently driving the same on-chain
-  mint); or the running bot (REST). `recheck` and
-  `transfer resume --kind equity` are the only commands that require the bot.
+  (`transfer resume --kind usdc` drives the on-chain flow against the local
+  aggregate store, with the same no-concurrent-bot caveat); live RPC only
+  (`cctp complete-mint` touches no database state -- the caveat is the bot
+  concurrently driving the same on-chain mint); or the running bot (REST).
+  `recheck` and `transfer resume --kind equity` are the only commands that
+  require the bot.
 - **`--reason` MUST be required, with no default, on every event-emitting
   destructive verb** (`fail`, `reconcile`, `set`, and `position release-hedge`).
   A defaulted reason is an audit-hostile record and violates the
-  no-silent-defaults rule. The pre-existing `fail-pending-offchain-order` and
-  `fail-transfer` predate this rule and carry defaulted reasons, and
-  `reconcile-usdc-transfer` shipped with one just before this rule was codified.
-  The rename step carried those defaults onto the renamed forms unchanged; the
-  defaults-removal step then strips them from the grouped verbs and, with them,
-  from `fail-pending-offchain-order` (a clap alias shares its canonical
-  command's arguments, so the alias cannot keep a default its canonical form
-  lost). Only the hidden flat `fail-transfer` / `reconcile-usdc-transfer`
-  variants retain their defaulted reasons, for runbook compatibility, until the
-  deprecation step deletes the legacy names.
+  no-silent-defaults rule. Earlier transitional steps carried defaulted reasons
+  on now-removed legacy command names; with those names deleted, every grouped
+  destructive verb requires an explicit `--reason`, and a present-but-blank
+  value is rejected (at parse time for the string-valued verbs, by the enum
+  domain for `reconcile`).
 - **`fail` and `reconcile` are distinct and must not be conflated.** `fail` is
   for an operation the system is still waiting on (force it to a clean
   terminal); `reconcile` is for an operation that already failed and whose guard

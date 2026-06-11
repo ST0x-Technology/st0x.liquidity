@@ -192,7 +192,7 @@ impl EquityTransferServices {
     ///
     /// Safe for sending commands that never invoke services (e.g., the
     /// `FailWrapping`, `FailAcceptance`, `FailRaindexDeposit`, and
-    /// `FailTransfer` commands). Used by the CLI `fail-transfer`
+    /// `FailTransfer` commands). Used by the CLI `transfer fail`
     /// subcommand where no real broker/RPC connection exists.
     pub(crate) fn panicking() -> Self {
         Self {
@@ -1788,7 +1788,7 @@ mod tests {
     /// Recovery must not double-count an in-flight that is ALREADY established.
     ///
     /// The realistic stuck state -- what the simulate-failures harness and the
-    /// CLI `fail-transfer` ops tool both produce -- is: `MintAccepted` ran
+    /// CLI `transfer fail` ops tool both produce -- is: `MintAccepted` ran
     /// `start` so the quantity sits in Hedging in-flight, but the failure was
     /// recorded out-of-process so the reactor never ran `cancel`. Recovery then
     /// runs against an in-flight already at the mint quantity; re-establishing

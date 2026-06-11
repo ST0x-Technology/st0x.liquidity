@@ -957,7 +957,7 @@ impl RebalancingService {
     /// re-arming it would re-drive a known-failing transfer on every restart and
     /// bypass the retry budget, contradicting [`JobQueue::requeue_orphaned`]'s
     /// policy of leaving `Failed` rows latched. The operator path for such a
-    /// transfer is the manual `resume-usdc-transfer` CLI, not an automatic re-arm.
+    /// transfer is the manual `transfer resume --kind usdc` CLI, not an automatic re-arm.
     ///
     /// A recoverable post-burn `BridgingFailed` is the exception: it gates on
     /// [`Self::transfer_in_flight_for_id`] instead (only an in-flight row blocks),
@@ -2896,7 +2896,7 @@ impl RebalancingService {
     }
 
     /// Rebuilds in-memory tracking for a failed mint being recovered via
-    /// `recheck-transfer`, so the live reactor applies the
+    /// `transfer recheck`, so the live reactor applies the
     /// `ProviderCompletionRecovered` inventory effect and the terminal
     /// cleanup once the recovery event is dispatched.
     ///
@@ -2940,7 +2940,7 @@ impl RebalancingService {
         // A third shape the timeout/explicit branches below do not cover: the
         // failure left the in-flight already established (a `Start` ran but the
         // failure never cancelled it back to available -- e.g. an out-of-process
-        // `fail-transfer`, or a reactor that recorded the failure without
+        // `transfer fail`, or a reactor that recorded the failure without
         // running `cancel`). That is already the canonical pre-complete shape,
         // so re-establishing it with another `Start` would double-count
         // (quantity -> 2*quantity) and strand the quantity in-flight after the
@@ -3076,7 +3076,7 @@ impl RebalancingService {
     }
 
     /// Rebuilds in-memory tracking for a failed redemption being recovered
-    /// via `recheck-transfer`. See [`Self::rebuild_mint_tracking_for_recovery`]
+    /// via `transfer recheck`. See [`Self::rebuild_mint_tracking_for_recovery`]
     /// for why inventory balances are left untouched on the explicit-failure
     /// path: a failed redemption never cancelled its in-flight transfer, so the
     /// recovery event's inventory arm completes that still-pending transfer.
@@ -10131,7 +10131,8 @@ mod tests {
     /// retry budget (a terminal `Failed` row) must NOT be re-armed -- re-driving
     /// it every restart would bypass the retry budget and silently retry a
     /// known-failing transfer. It latches for operator reconciliation (recoverable
-    /// via the `resume-usdc-transfer` CLI), matching `requeue_orphaned`'s policy of
+    /// via the `transfer resume --kind usdc` CLI), matching `requeue_orphaned`'s
+    /// policy of
     /// leaving `Failed` rows alone.
     #[tokio::test]
     async fn recover_usdc_guard_does_not_rearm_when_job_already_failed() {

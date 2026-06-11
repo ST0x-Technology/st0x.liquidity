@@ -2015,7 +2015,7 @@ mod tests {
         store.send(id, command).await.unwrap();
     }
 
-    /// `fail-transfer --type redemption` on a redemption stuck in `TokensSent`
+    /// `transfer fail --kind redemption` on a redemption stuck in `TokensSent`
     /// must dispatch `FailDetection { Operator }` and persist the operator's
     /// `--reason`, recoverable from the replayed `Failed` state.
     #[tokio::test]
@@ -2056,7 +2056,7 @@ mod tests {
         );
     }
 
-    /// `fail-transfer --type redemption` on a redemption stuck in `Pending`
+    /// `transfer fail --kind redemption` on a redemption stuck in `Pending`
     /// (Alpaca detected the transfer but never completed it) must dispatch
     /// `RejectRedemption` and persist the operator's `--reason`.
     #[tokio::test]
