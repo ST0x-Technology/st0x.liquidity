@@ -435,6 +435,95 @@ pub async fn connect_db(db_path: &std::path::Path) -> anyhow::Result<SqlitePool>
     Ok(SqlitePool::connect_with(options).await?)
 }
 
+/// Polls the apalis `Jobs` table until a job of the given type reaches
+/// `Running`, panicking if the bot dies or the timeout passes first.
+/// Used by crash tests to time an abort to the middle of a job's
+/// `perform`.
+pub async fn poll_for_running_job(
+    bot: &mut JoinHandle<anyhow::Result<()>>,
+    db_path: &std::path::Path,
+    job_type: &str,
+    timeout: Duration,
+) {
+    let connect_opts = SqliteConnectOptions::new().filename(db_path);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let context = format!("Running {job_type} job");
+
+    loop {
+        sleep_or_crash(bot, &context).await;
+
+        let Ok(pool) = SqlitePool::connect_with(connect_opts.clone()).await else {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out after {timeout:?} waiting for {context} (database not ready)",
+            );
+            continue;
+        };
+
+        let running: Result<(i64,), _> =
+            sqlx::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type = ? AND status = 'Running'")
+                .bind(job_type)
+                .fetch_one(&pool)
+                .await;
+
+        pool.close().await;
+
+        if matches!(running, Ok((count,)) if count >= 1) {
+            return;
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Timed out after {timeout:?} waiting for {context}",
+        );
+    }
+}
+
+/// Polls until the backfill checkpoint has advanced to at least
+/// `block`, panicking if the bot dies or the timeout passes first. Once
+/// the checkpoint passes a fill's block, the fill's accounting job row
+/// is the only remaining record of it -- crash tests use this to pin
+/// that premise before killing the bot.
+pub async fn poll_for_backfill_checkpoint(
+    bot: &mut JoinHandle<anyhow::Result<()>>,
+    db_path: &std::path::Path,
+    block: u64,
+    timeout: Duration,
+) {
+    let connect_opts = SqliteConnectOptions::new().filename(db_path);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let context = format!("backfill checkpoint >= {block}");
+
+    loop {
+        sleep_or_crash(bot, &context).await;
+
+        let Ok(pool) = SqlitePool::connect_with(connect_opts.clone()).await else {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out after {timeout:?} waiting for {context} (database not ready)",
+            );
+            continue;
+        };
+
+        let checkpoint: Result<(Option<i64>,), _> =
+            sqlx::query_as("SELECT MAX(last_processed_block) FROM backfill_checkpoints")
+                .fetch_one(&pool)
+                .await;
+
+        pool.close().await;
+
+        if matches!(checkpoint, Ok((Some(last),)) if u64::try_from(last).is_ok_and(|last| last >= block))
+        {
+            return;
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Timed out after {timeout:?} waiting for {context}",
+        );
+    }
+}
+
 /// Counts CQRS events for a specific aggregate type.
 pub async fn count_events(pool: &SqlitePool, aggregate_type: &str) -> anyhow::Result<i64> {
     let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM events WHERE aggregate_type = ?")

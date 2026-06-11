@@ -150,6 +150,20 @@ impl ChaosProxy {
             pending_stale_tips: 0,
         });
     }
+
+    /// Convenience: hold the responses of the next `count`
+    /// `eth_getTransactionReceipt` calls for `duration` each. The receipt
+    /// fetch is the first RPC call the trade-accounting job makes, so a
+    /// held receipt pins that job mid-`perform` -- used by crash tests to
+    /// widen the in-flight window they kill the bot inside.
+    pub(crate) async fn delay_transaction_receipts(&self, duration: Duration, count: usize) {
+        *self.config.lock().await = Some(ChaosConfig {
+            method: "eth_getTransactionReceipt".to_owned(),
+            behaviour: ChaosBehaviour::Delay { duration },
+            remaining: count,
+            pending_stale_tips: 0,
+        });
+    }
 }
 
 impl Drop for ChaosProxy {
