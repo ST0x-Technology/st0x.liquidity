@@ -3105,6 +3105,7 @@ mod tests {
 
             deployment_block = 1
             required_confirmations = 3
+            ingestion_cutoff = "safe"
 
             [broker]
             counter_trade_slippage_bps = 10000
@@ -3591,6 +3592,7 @@ mod tests {
             trading = "enabled"
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
         "#
         );
 
