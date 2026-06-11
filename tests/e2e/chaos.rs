@@ -37,6 +37,7 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use reqwest::Client;
 use serde_json::{Value, json};
+use sqlx::ConnectOptions;
 use tokio::sync::Mutex;
 use tracing::warn;
 use url::Url;
@@ -372,6 +373,51 @@ async fn handle_http(
     }
 
     response
+}
+
+/// Holds SQLite's write lock on the bot's database file from a second
+/// connection, modelling a co-located process (e.g. the reporter)
+/// contending for the WAL write lock. Readers are unaffected under WAL;
+/// every bot write blocks until release or the bot pool's busy timeout
+/// expires.
+///
+/// Prefer [`DbLock::release`] for a deterministic, explicit unlock. There is
+/// deliberately no `Drop` impl: dropping the raw `SqliteConnection` -- including
+/// on a test panic between acquire and release -- closes it, which rolls back
+/// the open `BEGIN IMMEDIATE` and releases the WAL lock. A blocking `ROLLBACK`
+/// inside `Drop` would instead risk panicking on the tokio runtime.
+pub(crate) struct DbLock {
+    connection: sqlx::SqliteConnection,
+}
+
+impl DbLock {
+    /// Opens a raw connection to the database file and takes the write
+    /// lock via `BEGIN IMMEDIATE`.
+    pub(crate) async fn acquire(db_path: &std::path::Path) -> anyhow::Result<Self> {
+        // Wait for the bot pool to yield the WAL write lock instead of
+        // failing immediately. SQLite's default busy timeout is 0ms, so
+        // without this `BEGIN IMMEDIATE` races the running pipeline and the
+        // acquire can spuriously return SQLITE_BUSY -- surfacing as a test
+        // failure rather than the contention the test means to exercise.
+        let mut connection = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(db_path)
+            .busy_timeout(Duration::from_secs(5))
+            .connect()
+            .await?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut connection)
+            .await?;
+
+        Ok(Self { connection })
+    }
+
+    /// Releases the write lock.
+    pub(crate) async fn release(mut self) -> anyhow::Result<()> {
+        sqlx::query("ROLLBACK")
+            .execute(&mut self.connection)
+            .await?;
+        Ok(())
+    }
 }
 
 /// Consumes one unit of the armed latency budget if this request matches
