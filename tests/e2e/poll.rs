@@ -534,6 +534,20 @@ pub async fn count_events(pool: &SqlitePool, aggregate_type: &str) -> anyhow::Re
     Ok(row.0)
 }
 
+/// Counts CQRS events of a specific event type (e.g. `OnChainTradeEvent::Filled`),
+/// not the whole aggregate. Use this when an aggregate emits more than one event
+/// variant and only one of them should be counted -- `OnChainTrade`, for
+/// instance, emits both `Filled` and `Enriched`, so an aggregate-type count
+/// double-counts once enrichment fires.
+pub async fn count_events_by_type(pool: &SqlitePool, event_type: &str) -> anyhow::Result<i64> {
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
+        .bind(event_type)
+        .fetch_one(pool)
+        .await?;
+
+    Ok(row.0)
+}
+
 /// Fetches all domain events ordered by insertion.
 pub async fn fetch_all_domain_events(
     pool: &SqlitePool,
