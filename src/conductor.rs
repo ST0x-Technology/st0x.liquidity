@@ -62,6 +62,7 @@ use crate::onchain::backfill::BackfillJobQueue;
 use crate::onchain::trade::{RaindexTradeEvent, extract_owned_vaults, extract_vaults_from_clear};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeError, OnChainTradeId};
 use crate::performance::HedgeLatencyProjection;
+use crate::performance::rebalance::RebalanceTimingProjection;
 use crate::position::{Position, PositionCommand, PositionError, TradeId};
 use crate::rebalancing::equity::{
     CrossVenueEquityTransfer, EquityTransferServices, ResumeTokenizationAggregate,
@@ -1185,7 +1186,13 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
 
         let broadcaster = Arc::new(Broadcaster::new(deps.event_sender, deps.pool.clone()));
         let hedge_latency = Arc::new(HedgeLatencyProjection::new(deps.pool.clone()));
-        let manifest = QueryManifest::new(rebalancing_service.clone(), broadcaster, hedge_latency);
+        let rebalance_timing = Arc::new(RebalanceTimingProjection::new(deps.pool.clone()));
+        let manifest = QueryManifest::new(
+            rebalancing_service.clone(),
+            broadcaster,
+            hedge_latency,
+            rebalance_timing,
+        );
 
         let built = manifest
             .build(deps.pool.clone(), equity_transfer_services)

@@ -1670,7 +1670,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                 from_block,
                 ..
             }) => {
-                Self::require_base_to_alpaca(id, &direction)?;
+                Self::require_base_to_alpaca(id, direction)?;
                 let amount_u256 = usdc_to_u256(amount)?;
                 self.resume_withdrawal_submitting(id, amount, amount_u256, from_block)
                     .await?;
@@ -1680,7 +1680,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
             Some(UsdcRebalance::Withdrawing {
                 direction, amount, ..
             }) => {
-                Self::require_base_to_alpaca(id, &direction)?;
+                Self::require_base_to_alpaca(id, direction)?;
                 self.cqrs
                     .send(
                         id,
@@ -1695,7 +1695,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
             Some(UsdcRebalance::WithdrawalComplete {
                 direction, amount, ..
             }) => {
-                Self::require_base_to_alpaca(id, &direction)?;
+                Self::require_base_to_alpaca(id, direction)?;
                 self.continue_from_withdrawal_complete(id, amount).await
             }
 
@@ -1705,7 +1705,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                 from_block,
                 ..
             }) => {
-                Self::require_base_to_alpaca(id, &direction)?;
+                Self::require_base_to_alpaca(id, direction)?;
                 let amount_u256 = usdc_to_u256(amount)?;
                 let burn_receipt = self
                     .resume_bridging_submitting(id, amount_u256, from_block)
@@ -1720,7 +1720,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                 burn_tx_hash,
                 ..
             }) => {
-                Self::require_base_to_alpaca(id, &direction)?;
+                Self::require_base_to_alpaca(id, direction)?;
                 self.continue_from_bridging(id, amount, burn_tx_hash).await
             }
 
@@ -1731,7 +1731,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                 retry_deadline_at,
                 ..
             }) => {
-                Self::require_base_to_alpaca(id, &direction)?;
+                Self::require_base_to_alpaca(id, direction)?;
                 self.continue_from_awaiting_attestation(id, amount, burn_tx_hash, retry_deadline_at)
                     .await
             }
@@ -1745,7 +1745,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                 mint_scan_from_block,
                 ..
             }) => {
-                Self::require_base_to_alpaca(id, &direction)?;
+                Self::require_base_to_alpaca(id, direction)?;
                 self.continue_from_attested(
                     id,
                     direction,
@@ -1764,7 +1764,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                 mint_tx_hash,
                 ..
             }) => {
-                Self::require_base_to_alpaca(id, &direction)?;
+                Self::require_base_to_alpaca(id, direction)?;
                 self.continue_from_bridged_resume(id, amount_received, mint_tx_hash)
                     .await
             }
@@ -1775,7 +1775,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                 deposit_ref,
                 ..
             }) => {
-                Self::require_base_to_alpaca(id, &direction)?;
+                Self::require_base_to_alpaca(id, direction)?;
                 // The recorded `deposit_ref` is the USDC SEND tx (minted USDC
                 // forwarded to Alpaca's deposit address), not the mint tx. The
                 // send already moved funds before `InitiateDeposit` was recorded,
@@ -1815,12 +1815,12 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                 order_id,
                 ..
             }) => {
-                Self::require_base_to_alpaca(id, &direction)?;
+                Self::require_base_to_alpaca(id, direction)?;
                 self.resume_converting(id, order_id).await
             }
 
             Some(UsdcRebalance::ConversionComplete { direction, .. }) => {
-                Self::require_base_to_alpaca(id, &direction)?;
+                Self::require_base_to_alpaca(id, direction)?;
                 Ok(())
             }
 
@@ -1833,7 +1833,7 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                 burn_tx_hash,
                 ..
             }) => {
-                Self::require_base_to_alpaca(id, &direction)?;
+                Self::require_base_to_alpaca(id, direction)?;
                 self.recover_from_bridging_failed(id, burn_tx_hash).await
             }
 
@@ -1934,14 +1934,14 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
 
     fn require_base_to_alpaca(
         id: &UsdcRebalanceId,
-        direction: &RebalanceDirection,
+        direction: RebalanceDirection,
     ) -> Result<(), UsdcTransferError> {
         if matches!(direction, RebalanceDirection::BaseToAlpaca) {
             Ok(())
         } else {
             Err(UsdcTransferError::ResumeDirectionMismatch {
                 id: id.clone(),
-                direction: direction.clone(),
+                direction,
             })
         }
     }

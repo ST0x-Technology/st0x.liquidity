@@ -22,6 +22,7 @@ use crate::dashboard::Broadcaster;
 use crate::equity_redemption::EquityRedemption;
 use crate::inventory::InventorySnapshot;
 use crate::performance::HedgeLatencyProjection;
+use crate::performance::rebalance::RebalanceTimingProjection;
 use crate::position::Position;
 use crate::rebalancing::{RebalancingService, equity::EquityTransferServices};
 use crate::tokenized_equity_mint::TokenizedEquityMint;
@@ -36,6 +37,7 @@ pub(super) struct QueryManifest {
     rebalancing_service: Arc<RebalancingService>,
     broadcaster: Arc<Broadcaster>,
     hedge_latency: Arc<HedgeLatencyProjection>,
+    rebalance_timing: Arc<RebalanceTimingProjection>,
 }
 
 /// Built CQRS frameworks from the wiring process.
@@ -57,11 +59,13 @@ impl QueryManifest {
         rebalancing_service: Arc<RebalancingService>,
         broadcaster: Arc<Broadcaster>,
         hedge_latency: Arc<HedgeLatencyProjection>,
+        rebalance_timing: Arc<RebalanceTimingProjection>,
     ) -> Self {
         Self {
             rebalancing_service,
             broadcaster,
             hedge_latency,
+            rebalance_timing,
         }
     }
 
@@ -79,6 +83,7 @@ impl QueryManifest {
             rebalancing_service,
             broadcaster,
             hedge_latency,
+            rebalance_timing,
         } = self;
 
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
@@ -103,6 +108,7 @@ impl QueryManifest {
         let usdc = StoreBuilder::<UsdcRebalance>::new(pool.clone())
             .with(rebalancing_service.clone())
             .with(broadcaster)
+            .with(rebalance_timing)
             .build(())
             .await?;
 
@@ -197,7 +203,13 @@ mod tests {
 
         let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
         let hedge_latency = Arc::new(HedgeLatencyProjection::new(pool.clone()));
-        let manifest = QueryManifest::new(rebalancing_service, broadcaster, hedge_latency);
+        let rebalance_timing = Arc::new(RebalanceTimingProjection::new(pool.clone()));
+        let manifest = QueryManifest::new(
+            rebalancing_service,
+            broadcaster,
+            hedge_latency,
+            rebalance_timing,
+        );
 
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
@@ -246,7 +258,13 @@ mod tests {
         ));
         let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
         let hedge_latency = Arc::new(HedgeLatencyProjection::new(pool.clone()));
-        let manifest = QueryManifest::new(rebalancing_service, broadcaster, hedge_latency);
+        let rebalance_timing = Arc::new(RebalanceTimingProjection::new(pool.clone()));
+        let manifest = QueryManifest::new(
+            rebalancing_service,
+            broadcaster,
+            hedge_latency,
+            rebalance_timing,
+        );
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
             vault_lookup: Arc::new(MockVaultLookup::new()),
@@ -354,7 +372,13 @@ mod tests {
         ));
         let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
         let hedge_latency = Arc::new(HedgeLatencyProjection::new(pool.clone()));
-        let manifest = QueryManifest::new(rebalancing_service.clone(), broadcaster, hedge_latency);
+        let rebalance_timing = Arc::new(RebalanceTimingProjection::new(pool.clone()));
+        let manifest = QueryManifest::new(
+            rebalancing_service.clone(),
+            broadcaster,
+            hedge_latency,
+            rebalance_timing,
+        );
         let services = EquityTransferServices {
             raindex: Arc::new(MockRaindex::new()),
             vault_lookup: Arc::new(MockVaultLookup::new()),
