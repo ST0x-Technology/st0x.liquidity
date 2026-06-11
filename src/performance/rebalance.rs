@@ -271,7 +271,7 @@ fn fold_operation(
     })
 }
 
-fn event_timestamp(event: &UsdcRebalanceEvent) -> DateTime<Utc> {
+pub(super) fn event_timestamp(event: &UsdcRebalanceEvent) -> DateTime<Utc> {
     match event {
         UsdcRebalanceEvent::ConversionInitiated { initiated_at, .. }
         | UsdcRebalanceEvent::Initiated { initiated_at, .. } => *initiated_at,

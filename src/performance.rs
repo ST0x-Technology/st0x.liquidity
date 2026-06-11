@@ -23,6 +23,7 @@ use crate::offchain::order::{OffchainOrderEvent, OffchainOrderId};
 use crate::position::PositionEvent;
 
 pub(crate) mod rebalance;
+pub(crate) mod reliability;
 
 /// Waterfall rows returned per report; the full cycle count is still
 /// reported via `total_cycles`.
