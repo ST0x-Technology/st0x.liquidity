@@ -121,6 +121,15 @@ pub(crate) enum RebalanceDirection {
     BaseToAlpaca,
 }
 
+impl From<&RebalanceDirection> for st0x_dto::UsdcBridgeDirection {
+    fn from(direction: &RebalanceDirection) -> Self {
+        match direction {
+            RebalanceDirection::AlpacaToBase => Self::AlpacaToBase,
+            RebalanceDirection::BaseToAlpaca => Self::BaseToAlpaca,
+        }
+    }
+}
+
 /// Why an operator reconciled a USDC rebalance stranded in the post-burn
 /// terminal `DepositFailed` state. The funds were handled out-of-band, so the
 /// reconcile records the reason rather than re-driving the failed deposit.

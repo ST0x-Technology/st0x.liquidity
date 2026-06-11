@@ -89,7 +89,7 @@ pub enum EquityRedemptionStatus {
 }
 
 /// Direction for USDC bridge transfers.
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum UsdcBridgeDirection {
     AlpacaToBase,
