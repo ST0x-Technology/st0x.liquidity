@@ -18,6 +18,7 @@ use st0x_execution::{
 use crate::position::{Position, PositionError};
 
 pub(crate) mod accumulator;
+pub(crate) mod approvals;
 pub(crate) mod backfill;
 mod clear;
 pub(crate) mod io;

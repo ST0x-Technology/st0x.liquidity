@@ -55,6 +55,7 @@ use crate::onchain::USDC_BASE;
 #[cfg(test)]
 use crate::onchain::accumulator::check_all_positions;
 use crate::onchain::accumulator::{ExecutionCtx, check_execution_readiness};
+use crate::onchain::approvals::{build_approval_targets, grant_startup_approvals};
 use crate::onchain::backfill::BackfillJobQueue;
 use crate::onchain::trade::{RaindexTradeEvent, extract_owned_vaults, extract_vaults_from_clear};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
@@ -274,6 +275,14 @@ impl Conductor {
         // below as an apalis worker so the queue retries on failure if
         // seeding is re-triggered later (e.g. from a recovery flow).
         crate::conductor::job::Job::perform(&SeedVaultRegistry, &seed_vault_registry_ctx).await?;
+
+        // Grant one-time idempotent MAX approvals to the trusted spenders (our
+        // ERC-4626 wrapper vaults and the Raindex orderbook) before any worker
+        // or rebalancer runs, so wrap/deposit never reverts with
+        // ERC20InsufficientAllowance. Fails fast -- the bot must not come up
+        // healthy with these missing. Only runs when a wallet is configured;
+        // without one the bot cannot submit on-chain transactions at all.
+        grant_startup_token_approvals(&ctx).await?;
 
         let rebalancing = match ctx.rebalancing_ctx() {
             Ok(ctx) => Some(ctx.clone()),
@@ -617,6 +626,54 @@ fn base_wallet_wrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Addr
         .filter(|(symbol, _)| ctx.is_trading_enabled(symbol) || ctx.is_rebalancing_enabled(symbol))
         .map(|(symbol, config)| (symbol.clone(), config.tokenized_equity_derivative))
         .collect()
+}
+
+/// Grants one-time idempotent MAX ERC20 approvals to the trusted spenders at
+/// startup: each configured equity's underlying -> wrapper vault and wrapped ->
+/// orderbook, plus USDC -> orderbook. Resolves token addresses through a
+/// [`WrapperService`] built from the equity config, and submits through the
+/// base wallet so confirmations and nonce handling match every other on-chain
+/// write.
+///
+/// Skips entirely when no wallet is configured -- a standalone bot without a
+/// wallet never wraps or deposits, so it has no allowances to grant.
+async fn grant_startup_token_approvals(ctx: &Ctx) -> anyhow::Result<()> {
+    let base_wallet = match ctx.wallet() {
+        Ok(wallet_ctx) => wallet_ctx.base_wallet().clone(),
+        Err(CtxError::WalletNotConfigured) => {
+            info!(
+                target: "orderbook",
+                "No wallet configured -- skipping startup token approvals"
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    let wrapper = WrapperService::new(
+        base_wallet.clone(),
+        to_wrapped_equities(&ctx.assets.equities.symbols),
+    );
+
+    let symbols = ctx
+        .assets
+        .equities
+        .symbols
+        .keys()
+        .filter(|symbol| ctx.is_trading_enabled(symbol) || ctx.is_rebalancing_enabled(symbol))
+        .cloned();
+
+    let targets = build_approval_targets(&wrapper, symbols, ctx.evm.orderbook, USDC_BASE)?;
+
+    grant_startup_approvals(&base_wallet, &targets).await?;
+
+    info!(
+        target: "orderbook",
+        target_count = targets.len(),
+        "Startup token approvals ensured"
+    );
+
+    Ok(())
 }
 
 /// Context for vault discovery operations during trade processing.
