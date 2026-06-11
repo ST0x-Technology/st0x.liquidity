@@ -103,9 +103,18 @@ pub(crate) struct ChaosProxy {
     pub endpoint: Url,
     /// Shared mutable config; `None` means transparent forwarding.
     config: SharedConfig,
-    /// Serve loop's handle. Aborted on drop so the proxy dies with its
-    /// parent test.
-    server_task: tokio::task::AbortHandle,
+    /// Shared logs cache, retained so a severed-and-restored proxy keeps
+    /// its replay state.
+    logs_cache: LogsCache,
+    /// Upstream endpoint, retained so [`ChaosProxy::restore`] can respawn
+    /// the serve loop after a severance.
+    upstream: Url,
+    /// Listening port, retained so [`ChaosProxy::restore`] rebinds the
+    /// same address the bot is configured with.
+    port: u16,
+    /// Serve loop's join handle. Aborted on sever/drop; awaited by
+    /// `restore` before rebinding so the listener is fully released first.
+    server_task: tokio::task::JoinHandle<()>,
 }
 
 impl ChaosProxy {
@@ -118,25 +127,62 @@ impl ChaosProxy {
         let endpoint: Url = format!("http://127.0.0.1:{port}").parse()?;
 
         let config: SharedConfig = Arc::new(Mutex::new(None));
+        let logs_cache: LogsCache = Arc::new(Mutex::new(HashMap::new()));
+
         let state = ProxyState {
             config: config.clone(),
-            logs_cache: Arc::new(Mutex::new(HashMap::new())),
-            upstream,
+            logs_cache: logs_cache.clone(),
+            upstream: upstream.clone(),
             client: Client::new(),
         };
-
-        let app = Router::new().fallback(handle_rpc).with_state(state);
-        let handle = tokio::spawn(async move {
-            if let Err(error) = axum::serve(listener, app).await {
-                warn!(?error, "chaos proxy server stopped");
-            }
-        });
+        let server_task = serve_proxy(
+            listener,
+            Router::new().fallback(handle_rpc).with_state(state),
+        );
 
         Ok(Self {
             endpoint,
             config,
-            server_task: handle.abort_handle(),
+            logs_cache,
+            upstream,
+            port,
+            server_task,
         })
+    }
+
+    fn state(&self) -> ProxyState {
+        ProxyState {
+            config: self.config.clone(),
+            logs_cache: self.logs_cache.clone(),
+            upstream: self.upstream.clone(),
+            client: Client::new(),
+        }
+    }
+
+    /// Severs connectivity: the serve loop is aborted and the listener
+    /// dropped, so every connection to the proxy's endpoint is refused --
+    /// the component behind it is down while the rest of the world stays
+    /// up.
+    pub(crate) fn sever(&self) {
+        self.server_task.abort();
+    }
+
+    /// Restores connectivity after [`ChaosProxy::sever`]: rebinds the
+    /// same port and respawns the serve loop with the retained upstream
+    /// and chaos state.
+    pub(crate) async fn restore(&mut self) -> anyhow::Result<()> {
+        // `abort()` only schedules cancellation, so await the severed task's
+        // completion before rebinding -- otherwise the old listener may still
+        // hold the port and race the rebind (SO_REUSEADDR mitigates but does
+        // not eliminate that).
+        self.server_task.abort();
+        let _ = (&mut self.server_task).await;
+        let listener = rebind(self.port)?;
+        self.server_task = serve_proxy(
+            listener,
+            Router::new().fallback(handle_rpc).with_state(self.state()),
+        );
+        Ok(())
     }
 
     /// Convenience: reply to the next `count` `eth_getLogs` calls with
@@ -200,6 +246,27 @@ impl Drop for ChaosProxy {
     }
 }
 
+/// Spawns a proxy serve loop on the given listener, returning its join
+/// handle so callers can both abort it (sever) and await its shutdown
+/// (before rebinding the same port).
+fn serve_proxy(listener: tokio::net::TcpListener, app: Router) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, app).await {
+            warn!(?error, "chaos proxy server stopped");
+        }
+    })
+}
+
+/// Rebinds a previously-used local port for a restored proxy.
+/// `SO_REUSEADDR` is required: the severed proxy's connections linger in
+/// TIME_WAIT and would otherwise fail the rebind.
+fn rebind(port: u16) -> anyhow::Result<tokio::net::TcpListener> {
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.bind(format!("127.0.0.1:{port}").parse()?)?;
+    Ok(socket.listen(1024)?)
+}
+
 /// Knob describing which plain-HTTP requests to delay and for how many.
 #[derive(Debug, Clone)]
 struct LatencyConfig {
@@ -234,9 +301,15 @@ pub(crate) struct LatencyProxy {
     pub endpoint: Url,
     /// Shared mutable config; `None` means transparent forwarding.
     config: SharedLatencyConfig,
-    /// Serve loop's handle. Aborted on drop so the proxy dies with its
-    /// parent test.
-    server_task: tokio::task::AbortHandle,
+    /// Upstream endpoint, retained so [`LatencyProxy::restore`] can
+    /// respawn the serve loop after a severance.
+    upstream: Url,
+    /// Listening port, retained so [`LatencyProxy::restore`] rebinds the
+    /// same address the bot is configured with.
+    port: u16,
+    /// Serve loop's join handle. Aborted on sever/drop; awaited by
+    /// `restore` before rebinding so the listener is fully released first.
+    server_task: tokio::task::JoinHandle<()>,
 }
 
 impl LatencyProxy {
@@ -251,25 +324,65 @@ impl LatencyProxy {
         let config: SharedLatencyConfig = Arc::new(Mutex::new(None));
         let state = LatencyProxyState {
             config: config.clone(),
-            upstream,
-            // Bound the forward leg so an unresponsive upstream cannot hang the
-            // proxy task indefinitely; the injected latency is a separate sleep,
-            // not this request, so 10s is ample headroom for the real forward.
-            client: Client::builder().timeout(Duration::from_secs(10)).build()?,
+            upstream: upstream.clone(),
+            client: Self::forward_client()?,
         };
-
-        let app = Router::new().fallback(handle_http).with_state(state);
-        let handle = tokio::spawn(async move {
-            if let Err(error) = axum::serve(listener, app).await {
-                warn!(?error, "latency proxy server stopped");
-            }
-        });
+        let server_task = serve_proxy(
+            listener,
+            Router::new().fallback(handle_http).with_state(state),
+        );
 
         Ok(Self {
             endpoint,
             config,
-            server_task: handle.abort_handle(),
+            upstream,
+            port,
+            server_task,
         })
+    }
+
+    /// Forward client for the proxy's upstream leg, bounded by a 10s timeout so
+    /// an unresponsive upstream cannot hang the proxy task indefinitely; the
+    /// injected latency is a separate sleep, not this request.
+    fn forward_client() -> anyhow::Result<Client> {
+        Ok(Client::builder().timeout(Duration::from_secs(10)).build()?)
+    }
+
+    /// Builds a fresh handler state with the timeout-bounded forward client, so
+    /// a restored proxy keeps the same hang-protection as the original.
+    fn state(&self) -> anyhow::Result<LatencyProxyState> {
+        Ok(LatencyProxyState {
+            config: self.config.clone(),
+            upstream: self.upstream.clone(),
+            client: Self::forward_client()?,
+        })
+    }
+
+    /// Severs connectivity: the serve loop is aborted and the listener
+    /// dropped, so every connection to the proxy's endpoint is refused --
+    /// the broker is down while the chain stays up.
+    pub(crate) fn sever(&self) {
+        self.server_task.abort();
+    }
+
+    /// Restores connectivity after [`LatencyProxy::sever`]: rebinds the
+    /// same port and respawns the serve loop with the retained upstream
+    /// and latency state.
+    pub(crate) async fn restore(&mut self) -> anyhow::Result<()> {
+        // `abort()` only schedules cancellation, so await the severed task's
+        // completion before rebinding -- otherwise the old listener may still
+        // hold the port and race the rebind (SO_REUSEADDR mitigates but does
+        // not eliminate that).
+        self.server_task.abort();
+        let _ = (&mut self.server_task).await;
+        let listener = rebind(self.port)?;
+        self.server_task = serve_proxy(
+            listener,
+            Router::new()
+                .fallback(handle_http)
+                .with_state(self.state()?),
+        );
+        Ok(())
     }
 
     /// Convenience: hold the responses of the next `count` broker order
