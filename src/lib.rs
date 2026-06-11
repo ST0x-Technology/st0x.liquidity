@@ -50,10 +50,6 @@ mod inventory;
 mod offchain;
 mod onchain;
 mod onchain_trade;
-// Forward-dead until rai-991-performance-latency-endpoint (RAI-991), the next
-// PR in the stack, adds the /performance/latencies endpoint consuming this
-// read model.
-#[allow(dead_code)]
 mod performance;
 mod position;
 mod position_check;
