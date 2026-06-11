@@ -16,12 +16,13 @@ use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use st0x_dto::{HedgeLatencies, TradingVenue};
+use st0x_dto::{HedgeLatencies, RebalanceTimings, TradingVenue};
 use st0x_execution::FractionalShares;
 
 use crate::AppState;
 use crate::dashboard::transfer_loader::{InvalidTransferKind, TransferKind};
 use crate::equity_redemption::{EquityRedemptionEvent, RedemptionAggregateId};
+use crate::performance::rebalance::load_rebalance_timings;
 use crate::performance::{ReportRange, hedge_latency_report, load_hedge_performance};
 use crate::rebalancing::RebalancingService;
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, RecheckError, RecheckOutcome};
@@ -1465,17 +1466,17 @@ fn recheck_error_response(error: &RecheckError) -> (StatusCode, String) {
     }
 }
 
-/// Query window for `GET /performance/latencies`. Defaults to the last
-/// 7 days ending now.
+/// Date-range query window shared by the `/performance/*` endpoints.
+/// Defaults to the last 7 days ending now.
 #[derive(Debug, Deserialize)]
-struct PerformanceLatenciesQuery {
+struct PerformanceRangeQuery {
     from: Option<DateTime<Utc>>,
     to: Option<DateTime<Utc>>,
 }
 
 async fn performance_latencies(
     State(state): State<AppState>,
-    Query(query): Query<PerformanceLatenciesQuery>,
+    Query(query): Query<PerformanceRangeQuery>,
 ) -> Result<Json<HedgeLatencies>, StatusCode> {
     let to = query.to.unwrap_or_else(Utc::now);
     let from = query.from.unwrap_or(to - chrono::Duration::days(7));
@@ -1494,10 +1495,29 @@ async fn performance_latencies(
     )))
 }
 
+async fn performance_rebalances(
+    State(state): State<AppState>,
+    Query(query): Query<PerformanceRangeQuery>,
+) -> Result<Json<RebalanceTimings>, StatusCode> {
+    let to = query.to.unwrap_or_else(Utc::now);
+    let from = query.from.unwrap_or(to - chrono::Duration::days(7));
+    if from >= to {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let timings = load_rebalance_timings(&state.pool, &ReportRange { from, to })
+        .await
+        .inspect_err(|error| error!(%error, "Failed to load rebalance timings"))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(timings))
+}
+
 pub(crate) fn routes() -> Router<AppState> {
     Router::new()
         .route("/health", get(health))
         .route("/performance/latencies", get(performance_latencies))
+        .route("/performance/rebalances", get(performance_rebalances))
         .route("/logs", get(logs))
         .route("/orders/pending", get(pending_orders))
         .route("/trades", get(trades))
@@ -1977,6 +1997,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn performance_rebalances_returns_empty_report_on_fresh_database() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/performance/rebalances")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response).await;
+        let report: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(report["totalOperations"], serde_json::json!(0));
+        assert_eq!(report["operations"], serde_json::json!([]));
+        assert_eq!(report["stageSummary"], serde_json::json!([]));
+        assert_eq!(report["attestationTrend"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
     async fn performance_latencies_rejects_inverted_range() {
         let ctx = create_test_ctx_with_order_owner(Address::ZERO);
         let app = build_app(empty_app_state(ctx).await);
@@ -1995,6 +2039,77 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn performance_rebalances_rejects_inverted_range() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/performance/rebalances\
+                         ?from=2026-01-02T00:00:00Z&to=2026-01-01T00:00:00Z",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn performance_rebalances_reports_seeded_operations() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let now = chrono::Utc::now();
+        let payload = serde_json::json!({
+            "WithdrawalSubmitting": {
+                "direction": "BaseToAlpaca",
+                "amount": "500",
+                "from_block": 1,
+                "submitting_at": now.to_rfc3339(),
+            }
+        });
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, \
+              payload, metadata) \
+             VALUES ('UsdcRebalance', '11111111-2222-3333-4444-555555555555', 1, \
+              'UsdcRebalanceEvent::WithdrawalSubmitting', '1.0', $1, '{}')",
+        )
+        .bind(payload.to_string())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let app = build_app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/performance/rebalances")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response).await;
+        let report: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(report["totalOperations"], serde_json::json!(1));
+        assert_eq!(
+            report["operations"][0]["status"],
+            serde_json::json!("in_progress")
+        );
+        assert_eq!(
+            report["operations"][0]["direction"],
+            serde_json::json!("base_to_alpaca")
+        );
     }
 
     #[tokio::test]

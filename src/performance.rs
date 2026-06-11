@@ -22,6 +22,8 @@ use st0x_execution::Symbol;
 use crate::offchain::order::{OffchainOrderEvent, OffchainOrderId};
 use crate::position::PositionEvent;
 
+pub(crate) mod rebalance;
+
 /// Waterfall rows returned per report; the full cycle count is still
 /// reported via `total_cycles`.
 const MAX_CYCLE_REPORTS: usize = 100;

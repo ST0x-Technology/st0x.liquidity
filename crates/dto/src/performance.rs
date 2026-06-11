@@ -1,11 +1,13 @@
-//! Performance tab DTOs: hedge latency pipeline metrics.
+//! Performance tab DTOs: hedge latency pipeline and rebalance timing metrics.
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use ts_rs::TS;
 use uuid::Uuid;
 
-use st0x_finance::Symbol;
+use st0x_finance::{Symbol, Usdc};
+
+use crate::UsdcBridgeDirection;
 
 /// Response of `GET /performance/latencies`.
 #[derive(Debug, Clone, Serialize, TS)]
@@ -117,6 +119,88 @@ pub struct OpenExposureReport {
     pub oldest_fill_block_timestamp: DateTime<Utc>,
 }
 
+/// Response of `GET /performance/rebalances`.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct RebalanceTimings {
+    /// Most recent operations (stage breakdown rows), newest first.
+    pub operations: Vec<RebalanceOperationTiming>,
+    /// Total operations in range before the `operations` cap was applied.
+    #[ts(type = "number")]
+    pub total_operations: usize,
+    /// Percentiles per stage across all operations in range.
+    pub stage_summary: Vec<RebalanceStageStats>,
+    /// CCTP attestation duration over time, oldest first.
+    pub attestation_trend: Vec<AttestationSample>,
+}
+
+/// One USDC rebalance operation's per-stage timing breakdown.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct RebalanceOperationTiming {
+    pub operation_id: String,
+    pub direction: Option<UsdcBridgeDirection>,
+    #[ts(type = "string | null")]
+    pub amount: Option<Usdc>,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub status: RebalanceTimingStatus,
+    pub stages: Vec<RebalanceStageTiming>,
+    /// First event to terminal success, when completed.
+    #[ts(type = "number | null")]
+    pub total_ms: Option<i64>,
+}
+
+/// Where a rebalance operation currently stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum RebalanceTimingStatus {
+    InProgress,
+    Completed,
+    Failed,
+}
+
+/// Timing of one stage within a rebalance operation.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct RebalanceStageTiming {
+    pub stage: RebalanceStageName,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    #[ts(type = "number | null")]
+    pub duration_ms: Option<i64>,
+    pub failed: bool,
+}
+
+/// Stages of the USDC rebalance pipeline, in flow order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum RebalanceStageName {
+    Conversion,
+    Withdrawal,
+    Burn,
+    Attestation,
+    Mint,
+    Deposit,
+}
+
+/// Percentiles for one rebalance stage.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct RebalanceStageStats {
+    pub stage: RebalanceStageName,
+    pub stats: LatencyStats,
+}
+
+/// One completed CCTP attestation: burn time and how long Circle took.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct AttestationSample {
+    pub burned_at: DateTime<Utc>,
+    #[ts(type = "number")]
+    pub duration_ms: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -175,6 +259,57 @@ mod tests {
         assert_eq!(json["executionMs"], json!(null));
         assert_eq!(json["exposureWindowMs"], json!(null));
         assert_eq!(json["status"], json!("pending"));
+    }
+
+    #[test]
+    fn rebalance_operation_timing_serializes_camel_case() {
+        let operation = RebalanceOperationTiming {
+            operation_id: "op-1".to_string(),
+            direction: Some(UsdcBridgeDirection::AlpacaToBase),
+            amount: Some(Usdc::new(st0x_float_macro::float!(1000))),
+            started_at: DateTime::from_timestamp(1_750_000_000, 0).unwrap(),
+            completed_at: DateTime::from_timestamp(1_750_000_730, 0),
+            status: RebalanceTimingStatus::Completed,
+            stages: vec![RebalanceStageTiming {
+                stage: RebalanceStageName::Attestation,
+                started_at: DateTime::from_timestamp(1_750_000_070, 0).unwrap(),
+                ended_at: DateTime::from_timestamp(1_750_000_670, 0),
+                duration_ms: Some(600_000),
+                failed: false,
+            }],
+            total_ms: Some(730_000),
+        };
+
+        let json = serde_json::to_value(&operation).expect("serialization should succeed");
+        assert_eq!(json["operationId"], json!("op-1"));
+        assert_eq!(json["direction"], json!("alpaca_to_base"));
+        assert_eq!(json["amount"], json!("1000"));
+        assert_eq!(json["status"], json!("completed"));
+        assert_eq!(json["totalMs"], json!(730_000));
+        assert_eq!(json["stages"][0]["stage"], json!("attestation"));
+        assert_eq!(json["stages"][0]["durationMs"], json!(600_000));
+        assert_eq!(json["stages"][0]["failed"], json!(false));
+    }
+
+    #[test]
+    fn rebalance_operation_timing_serializes_null_optional_fields() {
+        let operation = RebalanceOperationTiming {
+            operation_id: "op-2".to_string(),
+            direction: None,
+            amount: None,
+            started_at: DateTime::from_timestamp(1_750_000_000, 0).unwrap(),
+            completed_at: None,
+            status: RebalanceTimingStatus::InProgress,
+            stages: Vec::new(),
+            total_ms: None,
+        };
+
+        let json = serde_json::to_value(&operation).expect("serialization should succeed");
+        assert_eq!(json["direction"], json!(null));
+        assert_eq!(json["amount"], json!(null));
+        assert_eq!(json["completedAt"], json!(null));
+        assert_eq!(json["totalMs"], json!(null));
+        assert_eq!(json["status"], json!("in_progress"));
     }
 
     #[test]
