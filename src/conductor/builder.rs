@@ -222,7 +222,7 @@ where
     let counter_trade_submission_lock = Arc::new(tokio::sync::Mutex::new(()));
 
     let hedge_order_placer: Option<Arc<dyn crate::offchain::order::OrderPlacer>> =
-        if context.ctx.extended_hours_counter_trading {
+        if context.ctx.assets.any_extended_hours_enabled() {
             Some(Arc::new(crate::offchain::order::ExecutorOrderPlacer(
                 context.executor.clone(),
             )))
@@ -264,7 +264,6 @@ where
         counter_trade_submission_lock,
         poll_status_queue: poll_status_queue.clone(),
         hedge_queue: hedge_queue.clone(),
-        extended_hours_counter_trading: context.ctx.extended_hours_counter_trading,
     };
 
     let maintenance_interval = context.executor.maintenance_interval();

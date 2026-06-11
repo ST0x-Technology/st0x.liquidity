@@ -1507,7 +1507,6 @@ mod tests {
             },
             travel_rule: None,
             rest_api: None,
-            extended_hours_counter_trading: false,
             redemption_wallet: None,
         }
     }
@@ -2125,7 +2124,6 @@ mod tests {
                 server_port = 8080
                 board_port = 8081
                 apalis_finished_job_cleanup_interval_secs = 3600
-                extended_hours_counter_trading = false
 
                 [assets.equities]
 

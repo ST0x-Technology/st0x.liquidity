@@ -351,7 +351,6 @@ mod tests {
             counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
             poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(&pool),
             hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(&pool),
-            extended_hours_counter_trading: false,
         };
 
         let job_queue = DexTradeAccountingJobQueue::new(&pool);
@@ -480,7 +479,6 @@ mod tests {
             counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
             poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(&pool),
             hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(&pool),
-            extended_hours_counter_trading: false,
         };
 
         let job_queue = DexTradeAccountingJobQueue::new(&pool);

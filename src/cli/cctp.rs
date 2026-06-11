@@ -287,7 +287,6 @@ mod tests {
             },
             travel_rule: None,
             rest_api: None,
-            extended_hours_counter_trading: false,
             redemption_wallet: None,
         }
     }

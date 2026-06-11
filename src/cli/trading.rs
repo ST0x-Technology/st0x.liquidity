@@ -547,7 +547,6 @@ pub(super) async fn process_found_trade<W: Write>(
         executor_type,
         &ctx.assets,
         trading_enabled,
-        false,
     )
     .await?
     else {
@@ -769,7 +768,6 @@ mod tests {
             },
             travel_rule: None,
             rest_api: None,
-            extended_hours_counter_trading: false,
             redemption_wallet: None,
         }
     }
