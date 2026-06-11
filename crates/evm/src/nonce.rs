@@ -39,9 +39,10 @@ impl ResettableNonceManager {
     /// per-address `Arc<Mutex>` but not yet locked it, it will write to
     /// an orphaned mutex while a new entry is created for subsequent
     /// callers. This can cause a one-time nonce collision under concurrent
-    /// sends during invalidation. The window is narrow and only opens
-    /// during an already-degraded state (external nonce change). Acceptable
-    /// for single-address usage; revisit if multi-address support is added.
+    /// sends during invalidation. The wallet send path closes this window
+    /// by serializing all sends from one wallet behind a mutex (see
+    /// `submit::send_with_recovery`), so only one send assigns a nonce at
+    /// a time; this note documents the manager's behavior in isolation.
     pub fn invalidate(&self) {
         self.nonces.clear();
     }
