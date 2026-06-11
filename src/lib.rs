@@ -225,6 +225,20 @@ async fn run_bot_session_inner(
         failure_injector,
     )));
 
+    // If this session future is cancelled before `await_shutdown` reaches its
+    // own graceful path (the spawned session task being aborted -- how the e2e
+    // chaos tests simulate a process crash), the conductor `JoinHandle` and the
+    // server supervisor handle would simply be dropped. Dropping a `JoinHandle`
+    // detaches its task rather than aborting it, so the conductor would keep
+    // trading against the database and the bound server port would leak. This
+    // guard aborts the conductor and shuts the supervisor down on drop, so a
+    // cancelled session actually stops. The graceful path already stops both
+    // before this guard drops, making it a no-op there.
+    let _session_guard = SessionTaskGuard {
+        conductor: bot_task.abort_handle(),
+        server_supervisor: server_supervisor.clone(),
+    };
+
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("failed to register SIGTERM handler")?;
     let shutdown_signal = async move {
@@ -245,6 +259,26 @@ async fn run_bot_session_inner(
 
     info!(target: "startup", "Shutdown complete");
     Ok(())
+}
+
+/// Drop guard that aborts the conductor task and shuts the server supervisor
+/// down when a bot session is cancelled before [`await_shutdown`] runs.
+///
+/// Dropping a `JoinHandle` detaches its task rather than aborting it, so without
+/// this a cancelled session would leave the conductor trading against the
+/// database and leak the bound server port. The graceful shutdown path stops
+/// both before this guard drops, so on the normal path the abort hits an
+/// already-finished task and the second `shutdown` is ignored.
+struct SessionTaskGuard {
+    conductor: AbortHandle,
+    server_supervisor: SupervisorHandle,
+}
+
+impl Drop for SessionTaskGuard {
+    fn drop(&mut self) {
+        self.conductor.abort();
+        let _ = self.server_supervisor.shutdown();
+    }
 }
 
 /// Long-running axum HTTP server, supervised so a bind/serve failure
