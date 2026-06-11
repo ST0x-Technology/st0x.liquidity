@@ -16,12 +16,13 @@ use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use st0x_dto::TradingVenue;
+use st0x_dto::{HedgeLatencies, TradingVenue};
 use st0x_execution::FractionalShares;
 
 use crate::AppState;
 use crate::dashboard::transfer_loader::{InvalidTransferKind, TransferKind};
 use crate::equity_redemption::{EquityRedemptionEvent, RedemptionAggregateId};
+use crate::performance::{ReportRange, hedge_latency_report, load_hedge_performance};
 use crate::rebalancing::RebalancingService;
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, RecheckError, RecheckOutcome};
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMintEvent};
@@ -1487,9 +1488,37 @@ fn recheck_error_response(error: &RecheckError) -> (StatusCode, String) {
     }
 }
 
+/// Query window for `GET /performance/latencies`. Defaults to the last
+/// 7 days ending now.
+#[derive(Debug, Deserialize)]
+struct PerformanceLatenciesQuery {
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+}
+
+async fn performance_latencies(
+    State(state): State<AppState>,
+    Query(query): Query<PerformanceLatenciesQuery>,
+) -> Result<Json<HedgeLatencies>, StatusCode> {
+    let to = query.to.unwrap_or_else(Utc::now);
+    let from = query.from.unwrap_or(to - chrono::Duration::days(7));
+    if from >= to {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let report_range = ReportRange { from, to };
+    let performances = load_hedge_performance(&state.pool, &report_range)
+        .await
+        .inspect_err(|error| error!(%error, "Failed to load hedge performance"))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(hedge_latency_report(&performances, &report_range)))
+}
+
 pub(crate) fn routes() -> Router<AppState> {
     Router::new()
         .route("/health", get(health))
+        .route("/performance/latencies", get(performance_latencies))
         .route("/logs", get(logs))
         .route("/orders/pending", get(pending_orders))
         .route("/trades", get(trades))
@@ -1893,6 +1922,184 @@ mod tests {
     const THREE_ENTRY_LOG: &str = r#"{"timestamp":"2026-04-20T10:00:00Z","level":"INFO","target":"st0x_hedge","message":"Bot started"}
 {"timestamp":"2026-04-20T10:00:01Z","level":"DEBUG","target":"st0x_hedge","message":"Polling"}
 {"timestamp":"2026-04-20T10:00:02Z","level":"WARN","target":"st0x_hedge","message":"Slow response"}"#;
+
+    #[tokio::test]
+    async fn performance_latencies_returns_empty_report_on_fresh_database() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/performance/latencies")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response).await;
+        let report: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(report["summary"]["fillCount"], serde_json::json!(0));
+        assert_eq!(report["totalCycles"], serde_json::json!(0));
+        assert_eq!(report["cycles"], serde_json::json!([]));
+        assert_eq!(report["openExposures"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn performance_latencies_reports_seeded_fills() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let now = chrono::Utc::now();
+        // The hedge-latency read model recomputes open exposure from the
+        // reactor-maintained tables: a fill with no covering cycle is uncovered,
+        // so a single hedge_fill row is both one detection sample (zero latency)
+        // and one open-exposure entry.
+        let timestamp = now.to_rfc3339();
+        sqlx::query(
+            "INSERT INTO hedge_fill (symbol, tx_hash, log_index, block_timestamp, seen_at) \
+             VALUES ('AAPL', '0x01', 0, $1, $1)",
+        )
+        .bind(&timestamp)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let app = build_app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/performance/latencies")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response).await;
+        let report: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(report["summary"]["fillCount"], serde_json::json!(1));
+        assert_eq!(
+            report["openExposures"][0]["symbol"],
+            serde_json::json!("AAPL")
+        );
+        assert_eq!(
+            report["summary"]["stages"]["detection"]["p50Ms"],
+            serde_json::json!(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn performance_latencies_rejects_inverted_range() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/performance/latencies\
+                         ?from=2026-01-02T00:00:00Z&to=2026-01-01T00:00:00Z",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// `from == to` is an empty interval and must be rejected with 400.
+    #[tokio::test]
+    async fn performance_latencies_rejects_equal_from_and_to() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/performance/latencies\
+                         ?from=2026-01-01T00:00:00Z&to=2026-01-01T00:00:00Z",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Seeds a fill with a non-zero detection latency (seen_at > block_timestamp)
+    /// and verifies the value survives reactor write -> SQL load -> report assembly
+    /// -> JSON serialization, ending up in `summary.stages.detection.p50Ms`.
+    #[tokio::test]
+    async fn performance_latencies_reports_nonzero_detection_latency() {
+        use crate::performance::HedgeLatencyProjection;
+        use st0x_event_sorcery::ReactorHarness;
+        use st0x_execution::{Direction, FractionalShares};
+        use st0x_float_macro::float;
+
+        use crate::position::{Position, PositionEvent, TradeId};
+
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+
+        let harness = ReactorHarness::new(HedgeLatencyProjection::new(state.pool.clone()));
+
+        // Fill with block_timestamp at T=0 and seen_at at T+3s: detection
+        // latency must be exactly 3000 ms.
+        let block_ts = chrono::Utc::now() - chrono::Duration::minutes(5);
+        let seen_ts = block_ts + chrono::Duration::seconds(3);
+
+        harness
+            .receive::<Position>(
+                st0x_execution::Symbol::new("AAPL").unwrap(),
+                PositionEvent::OnChainOrderFilled {
+                    trade_id: TradeId {
+                        tx_hash: alloy::primitives::TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: block_ts,
+                    seen_at: seen_ts,
+                },
+            )
+            .await
+            .unwrap();
+
+        let app = build_app(state);
+
+        // Use a wide range spanning both timestamps.
+        let from = (block_ts - chrono::Duration::hours(1))
+            .to_rfc3339()
+            .replace("+00:00", "Z");
+        let to = (seen_ts + chrono::Duration::hours(1))
+            .to_rfc3339()
+            .replace("+00:00", "Z");
+        let uri = format!("/performance/latencies?from={from}&to={to}");
+
+        let response = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response).await;
+        let report: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        assert_eq!(
+            report["summary"]["stages"]["detection"]["p50Ms"],
+            serde_json::json!(3000)
+        );
+    }
 
     #[tokio::test]
     async fn test_health_endpoint() {
