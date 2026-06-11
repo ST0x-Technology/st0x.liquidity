@@ -3,8 +3,14 @@ import { describe, expect, it } from 'vitest'
 import type { HedgeCycleReport } from '$lib/api/HedgeCycleReport'
 import type { LatencyBucket } from '$lib/api/LatencyBucket'
 import type { LatencyStats } from '$lib/api/LatencyStats'
+import type { RebalanceOperationTiming } from '$lib/api/RebalanceOperationTiming'
 
-import { layoutPercentileSeries, layoutWaterfall } from './charts'
+import {
+  layoutAttestationTrend,
+  layoutPercentileSeries,
+  layoutRebalanceBars,
+  layoutWaterfall,
+} from './charts'
 
 const cycle = (overrides: Partial<HedgeCycleReport>): HedgeCycleReport => ({
   symbol: 'AAPL',
@@ -28,6 +34,7 @@ describe('layoutWaterfall', () => {
       plotWidth: 100,
       sort: 'slowest',
       maxRows: 10,
+      now: new Date('2026-06-02T00:00:00Z'),
     })
 
     expect(rows).toHaveLength(1)
@@ -63,6 +70,7 @@ describe('layoutWaterfall', () => {
       plotWidth: 100,
       sort: 'slowest',
       maxRows: 2,
+      now: new Date('2026-06-02T00:00:00Z'),
     })
 
     expect(rows.map((row) => row.id)).toEqual(['slow', 'mid'])
@@ -82,12 +90,13 @@ describe('layoutWaterfall', () => {
       plotWidth: 100,
       sort: 'newest',
       maxRows: 10,
+      now: new Date('2026-06-02T00:00:00Z'),
     })
 
     expect(rows.map((row) => row.id)).toEqual(['later', 'earlier'])
   })
 
-  it('renders a pending cycle without submission or execution segments', () => {
+  it('renders a pending cycle as live exposure up to now', () => {
     const pending = cycle({
       status: 'pending',
       submittedAt: null,
@@ -98,9 +107,142 @@ describe('layoutWaterfall', () => {
       plotWidth: 100,
       sort: 'slowest',
       maxRows: 10,
+      now: new Date('2026-06-01T00:01:00Z'),
     })
 
     expect(rows[0]?.segments.map((segment) => segment.name)).toEqual(['unhedged'])
+    // Earliest fill was at 00:00:00; the exposure is still open at now.
+    expect(rows[0]?.totalMs).toBe(60_000)
+  })
+
+  it('returns an empty array for no cycles', () => {
+    expect(
+      layoutWaterfall([], {
+        plotWidth: 100,
+        sort: 'slowest',
+        maxRows: 10,
+        now: new Date('2026-06-02T00:00:00Z'),
+      }),
+    ).toEqual([])
+  })
+})
+
+const operation = (
+  overrides: Partial<RebalanceOperationTiming>,
+): RebalanceOperationTiming => ({
+  operationId: 'op-1',
+  direction: 'alpaca_to_base',
+  amount: '1000',
+  startedAt: '2026-06-01T00:00:00Z',
+  completedAt: '2026-06-01T00:12:10Z',
+  status: 'completed',
+  stages: [
+    {
+      stage: 'withdrawal',
+      startedAt: '2026-06-01T00:00:00Z',
+      endedAt: '2026-06-01T00:00:30Z',
+      durationMs: 30_000,
+      failed: false,
+    },
+    {
+      stage: 'attestation',
+      startedAt: '2026-06-01T00:01:00Z',
+      endedAt: '2026-06-01T00:11:00Z',
+      durationMs: 600_000,
+      failed: false,
+    },
+    {
+      stage: 'deposit',
+      startedAt: '2026-06-01T00:11:30Z',
+      endedAt: null,
+      durationMs: null,
+      failed: false,
+    },
+  ],
+  totalMs: 730_000,
+  ...overrides,
+})
+
+describe('layoutRebalanceBars', () => {
+  it('lays out completed stages proportionally and skips open ones', () => {
+    const rows = layoutRebalanceBars([operation({})], {
+      plotWidth: 100,
+      maxRows: 10,
+    })
+
+    expect(rows).toHaveLength(1)
+    // The DTO's elapsed time wins over the sum of completed stages so an
+    // open stage does not understate the operation.
+    expect(rows[0]?.totalMs).toBe(730_000)
+    expect(rows[0]?.segments.map((segment) => segment.stage)).toEqual([
+      'withdrawal',
+      'attestation',
+    ])
+    const lastSegment = rows[0]?.segments.at(-1)
+    // Completed stages cover 630s of the 730s elapsed total; the unfilled
+    // remainder represents the still-open deposit stage.
+    expect((lastSegment?.x ?? 0) + (lastSegment?.width ?? 0)).toBeCloseTo(
+      (630_000 / 730_000) * 100,
+    )
+  })
+
+  it('caps rows preserving newest-first input order', () => {
+    const rows = layoutRebalanceBars(
+      [
+        operation({ operationId: 'newest' }),
+        operation({ operationId: 'older' }),
+        operation({ operationId: 'oldest' }),
+      ],
+      {
+        plotWidth: 100,
+        maxRows: 2,
+      },
+    )
+
+    expect(rows.map((row) => row.id)).toEqual(['newest', 'older'])
+  })
+})
+
+describe('layoutAttestationTrend', () => {
+  it('centers a single sample', () => {
+    const layout = layoutAttestationTrend(
+      [
+        {
+          burnedAt: '2026-06-01T00:00:00Z',
+          durationMs: 300_000,
+        },
+      ],
+      {
+        plotWidth: 100,
+        plotHeight: 50,
+      },
+    )
+
+    expect(layout.points[0]?.x).toBeCloseTo(50)
+  })
+
+  it('scales durations to the slowest sample', () => {
+    const layout = layoutAttestationTrend(
+      [
+        {
+          burnedAt: '2026-06-01T00:00:00Z',
+          durationMs: 300_000,
+        },
+        {
+          burnedAt: '2026-06-02T00:00:00Z',
+          durationMs: 600_000,
+        },
+      ],
+      {
+        plotWidth: 100,
+        plotHeight: 50,
+      },
+    )
+
+    expect(layout.maxMs).toBe(600_000)
+    expect(layout.points[0]?.y).toBeCloseTo(25)
+    expect(layout.points[1]?.y).toBeCloseTo(0)
+    expect(layout.points[1]?.x).toBeCloseTo(100)
   })
 })
 

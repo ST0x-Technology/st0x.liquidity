@@ -2,10 +2,17 @@
   import { onMount } from 'svelte'
   import * as Card from '$lib/components/ui/card'
   import type { HedgeLatencies } from '$lib/api/HedgeLatencies'
+  import type { RebalanceStageName } from '$lib/api/RebalanceStageName'
+  import type { RebalanceTimings } from '$lib/api/RebalanceTimings'
   import type { ReliabilityReport } from '$lib/api/ReliabilityReport'
   import type { StageLatencies } from '$lib/api/StageLatencies'
+  import type { UsdcBridgeDirection } from '$lib/api/UsdcBridgeDirection'
   import { reactive } from '$lib/frp.svelte'
-  import { fetchHedgeLatencies, fetchReliabilityReport } from '$lib/performance/api'
+  import {
+    fetchHedgeLatencies,
+    fetchRebalanceTimings,
+    fetchReliabilityReport,
+  } from '$lib/performance/api'
   import {
     detectionCard,
     errorsCard,
@@ -15,10 +22,14 @@
   import {
     type WaterfallSegmentName,
     type WaterfallSort,
+    layoutAttestationTrend,
     layoutPercentileSeries,
+    layoutRebalanceBars,
     layoutWaterfall,
   } from '$lib/performance/charts'
   import { type SloStatus, formatDurationMs } from '$lib/performance/slo'
+
+  const { onOpenLogs }: { onOpenLogs?: (target: string) => void } = $props()
 
   const POLL_INTERVAL_MS = 30_000
   const CARD_WINDOW_HOURS = 24
@@ -28,7 +39,12 @@
   const error = reactive<string | null>(null)
   const lastRefreshed = reactive<Date | null>(null)
 
+  // Discard out-of-date responses: a slow earlier fetch resolving after a
+  // newer one must not overwrite fresher data (same pattern as pnl-panel).
+  let cardFetchSeq = 0
+
   const refresh = async () => {
+    const seq = ++cardFetchSeq
     const to = new Date()
     const from = new Date(to.getTime() - CARD_WINDOW_HOURS * 3_600_000)
 
@@ -37,11 +53,13 @@
         fetchHedgeLatencies({ from, to }),
         fetchReliabilityReport({ from, to }),
       ])
+      if (seq !== cardFetchSeq) return
       latencies.update(() => latencyReport)
       reliability.update(() => reliabilityReport)
       lastRefreshed.update(() => to)
       error.update(() => null)
     } catch (fetchError) {
+      if (seq !== cardFetchSeq) return
       error.update(() =>
         fetchError instanceof Error ? fetchError.message : 'Unknown error',
       )
@@ -77,19 +95,30 @@
 
   const chartRange = reactive<RangePreset>('1W')
   const chartLatencies = reactive<HedgeLatencies | null>(null)
+  const chartRebalances = reactive<RebalanceTimings | null>(null)
   const chartError = reactive<string | null>(null)
 
+  let chartFetchSeq = 0
+
   const refreshCharts = async () => {
+    const seq = ++chartFetchSeq
     const to = new Date()
+    const range = {
+      from: rangeStart(chartRange.current, to),
+      to,
+    }
 
     try {
-      const report = await fetchHedgeLatencies({
-        from: rangeStart(chartRange.current, to),
-        to,
-      })
-      chartLatencies.update(() => report)
+      const [latencyReport, rebalanceReport] = await Promise.all([
+        fetchHedgeLatencies(range),
+        fetchRebalanceTimings(range),
+      ])
+      if (seq !== chartFetchSeq) return
+      chartLatencies.update(() => latencyReport)
+      chartRebalances.update(() => rebalanceReport)
       chartError.update(() => null)
     } catch (fetchError) {
+      if (seq !== chartFetchSeq) return
       chartError.update(() =>
         fetchError instanceof Error ? fetchError.message : 'Unknown error',
       )
@@ -180,6 +209,7 @@
       plotWidth: WATERFALL_PLOT_WIDTH,
       sort: waterfallSort.current,
       maxRows: WATERFALL_MAX_ROWS,
+      now: lastRefreshed.current ?? new Date(),
     }),
   )
 
@@ -214,6 +244,49 @@
 
   const rangeButtonClass = (active: boolean): string =>
     `rounded px-2 py-1 text-xs font-medium transition-colors ${active ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground hover:text-foreground'}`
+
+  const REBALANCE_PLOT_WIDTH = 600
+  const REBALANCE_MAX_ROWS = 15
+  const TREND_PLOT_WIDTH = 600
+  const TREND_PLOT_HEIGHT = 80
+
+  const STAGE_COLORS: Record<RebalanceStageName, string> = {
+    conversion: '#c084fc',
+    withdrawal: '#38bdf8',
+    burn: '#fb923c',
+    attestation: '#fbbf24',
+    mint: '#34d399',
+    deposit: '#818cf8',
+  }
+
+  const rebalanceRows = $derived(
+    layoutRebalanceBars(chartRebalances.current?.operations ?? [], {
+      plotWidth: REBALANCE_PLOT_WIDTH,
+      maxRows: REBALANCE_MAX_ROWS,
+    }),
+  )
+
+  const attestationTrend = $derived(
+    layoutAttestationTrend(chartRebalances.current?.attestationTrend ?? [], {
+      plotWidth: TREND_PLOT_WIDTH,
+      plotHeight: TREND_PLOT_HEIGHT,
+    }),
+  )
+
+  const directionLabel = (direction: UsdcBridgeDirection | null): string => {
+    if (direction === 'alpaca_to_base') {
+      return 'Alpaca → Base'
+    }
+
+    if (direction === 'base_to_alpaca') {
+      return 'Base → Alpaca'
+    }
+
+    return '—'
+  }
+
+  const sparklineMax = (sparkline: number[]): number =>
+    Math.max(1, ...sparkline)
 </script>
 
 <div class="flex h-full flex-col gap-4 overflow-y-auto">
@@ -429,6 +502,154 @@
               >
                 {xLabel.label}
               </text>
+            {/each}
+          </svg>
+        </div>
+      {/if}
+    </Card.Content>
+  </Card.Root>
+
+  <Card.Root>
+    <Card.Header class="pb-2">
+      <Card.Title class="text-sm font-medium">
+        Errors &amp; warnings by module (24h)
+      </Card.Title>
+    </Card.Header>
+    <Card.Content>
+      {#if (reliability.current?.logTargets.length ?? 0) === 0}
+        <p class="py-6 text-center text-sm text-muted-foreground">
+          No errors or warnings in the last {CARD_WINDOW_HOURS}h.
+        </p>
+      {:else}
+        <div class="flex flex-col gap-1">
+          {#each reliability.current?.logTargets ?? [] as row (`${row.target}:${row.level}`)}
+            <div class="flex items-center gap-2 text-xs">
+              <span
+                class={`w-12 shrink-0 font-semibold ${row.level === 'ERROR' ? 'text-red-400' : 'text-amber-400'}`}
+              >
+                {row.level}
+              </span>
+              <span class="w-36 shrink-0 truncate font-mono">{row.target}</span>
+              <svg
+                viewBox={`0 0 ${String(row.sparkline.length * 6)} 14`}
+                class="h-3.5 w-28 shrink-0"
+                preserveAspectRatio="none"
+              >
+                {#each row.sparkline as bucketCount, bucketIndex (bucketIndex)}
+                  <rect
+                    x={bucketIndex * 6}
+                    y={14 - (bucketCount / sparklineMax(row.sparkline)) * 12 - 1}
+                    width="4"
+                    height={(bucketCount / sparklineMax(row.sparkline)) * 12 + 1}
+                    fill={row.level === 'ERROR' ? '#f87171' : '#fbbf24'}
+                    opacity={bucketCount === 0 ? 0.15 : 0.9}
+                  />
+                {/each}
+              </svg>
+              <span class="w-10 shrink-0 text-right tabular-nums">{row.count}</span>
+              <button
+                class="text-muted-foreground underline-offset-2 hover:text-foreground
+                  hover:underline"
+                onclick={() => {
+                  onOpenLogs?.(row.target)
+                }}
+              >
+                logs →
+              </button>
+            </div>
+          {/each}
+        </div>
+      {/if}
+
+      {#if (reliability.current?.failureEvents.length ?? 0) > 0}
+        <div class="mt-4 border-t pt-2">
+          <p class="mb-1 text-xs font-medium text-red-400">
+            Lifecycle failures (money-at-risk)
+          </p>
+          {#each reliability.current?.failureEvents ?? [] as failure (failure.eventType)}
+            <div class="flex items-center gap-2 text-xs">
+              <span class="w-72 shrink-0 truncate font-mono">{failure.eventType}</span>
+              <span class="w-10 shrink-0 text-right tabular-nums">{failure.count}</span>
+              <span class="text-muted-foreground">
+                last {new Date(failure.lastAt).toLocaleString()}
+              </span>
+            </div>
+          {/each}
+        </div>
+      {/if}
+    </Card.Content>
+  </Card.Root>
+
+  <Card.Root>
+    <Card.Header class="pb-2">
+      <Card.Title class="text-sm font-medium">Rebalance stage breakdown</Card.Title>
+      <div class="flex flex-wrap gap-3 text-xs text-muted-foreground">
+        {#each Object.entries(STAGE_COLORS) as [stage, color] (stage)}
+          <span class="flex items-center gap-1">
+            <span class="inline-block h-2 w-2 rounded-sm" style:background={color}
+            ></span>
+            {stage}
+          </span>
+        {/each}
+      </div>
+    </Card.Header>
+    <Card.Content>
+      {#if rebalanceRows.length === 0}
+        <p class="py-6 text-center text-sm text-muted-foreground">
+          No rebalance operations in the selected range.
+        </p>
+      {:else}
+        <div class="flex flex-col gap-1">
+          {#each rebalanceRows as row (row.id)}
+            <div class="flex items-center gap-2 text-xs">
+              <span class="w-28 shrink-0">{directionLabel(row.direction)}</span>
+              <span class="w-20 shrink-0 text-right tabular-nums text-muted-foreground">
+                {row.amount ?? '—'} USDC
+              </span>
+              <svg
+                viewBox={`0 0 ${String(REBALANCE_PLOT_WIDTH)} 14`}
+                class="h-3.5 min-w-0 flex-1"
+                preserveAspectRatio="none"
+              >
+                {#each row.segments as segment, segmentIndex (segmentIndex)}
+                  <rect
+                    x={segment.x}
+                    y="2"
+                    width={Math.max(segment.width, segment.ms > 0 ? 1 : 0)}
+                    height="10"
+                    rx="1"
+                    fill={segment.failed ? '#f87171' : STAGE_COLORS[segment.stage]}
+                  >
+                    <title>{segment.stage}: {formatDurationMs(segment.ms)}</title>
+                  </rect>
+                {/each}
+              </svg>
+              <span class="w-16 shrink-0 text-right tabular-nums text-muted-foreground">
+                {formatDurationMs(row.totalMs)}
+              </span>
+            </div>
+          {/each}
+        </div>
+      {/if}
+
+      {#if attestationTrend.points.length > 0}
+        <div class="mt-4 border-t pt-2">
+          <p class="mb-1 text-xs font-medium text-muted-foreground">
+            CCTP attestation time trend (max {formatDurationMs(attestationTrend.maxMs)})
+          </p>
+          <svg
+            viewBox={`0 0 ${String(TREND_PLOT_WIDTH)} ${String(TREND_PLOT_HEIGHT)}`}
+            class="h-20 w-full"
+            preserveAspectRatio="none"
+          >
+            <polyline
+              points={attestationTrend.path}
+              fill="none"
+              stroke="#fbbf24"
+              stroke-width="1.5"
+            />
+            {#each attestationTrend.points as point, pointIndex (pointIndex)}
+              <circle cx={point.x} cy={point.y} r="2" fill="#fbbf24" />
             {/each}
           </svg>
         </div>
