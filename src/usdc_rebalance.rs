@@ -666,6 +666,28 @@ pub(crate) enum UsdcRebalance {
 }
 
 impl UsdcRebalance {
+    /// Whether a failed rebalance failed POST-burn -- the only USDC failures
+    /// `transfer reconcile --kind usdc` accepts (a pre-burn failure strands
+    /// nothing and the CLI rejects it). MUST stay in sync with the reconcilable
+    /// set in `transition_reconcile_stuck_rebalance`. A new (non-failure or
+    /// future) state defaults to `false`, i.e. not reconcilable -- the safe
+    /// default for surfacing the command on the dashboard.
+    fn is_post_burn_failure(&self) -> bool {
+        match self {
+            Self::DepositFailed { .. }
+            | Self::ConversionFailed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                ..
+            } => true,
+            Self::BridgingFailed {
+                burn_tx_hash,
+                cctp_nonce,
+                ..
+            } => burn_tx_hash.is_some() || cctp_nonce.is_some(),
+            _ => false,
+        }
+    }
+
     // A single state-dispatch match mapping each state to its DTO tuple, one
     // trivial arm per state. Splitting it would scatter the mapping across
     // pointless helpers; per the project guidance, suppress the length lint.
@@ -742,6 +764,7 @@ impl UsdcRebalance {
                 *amount,
                 UsdcBridgeStatus::Failed {
                     failed_at: *failed_at,
+                    post_burn: self.is_post_burn_failure(),
                 },
                 *initiated_at,
                 *failed_at,
@@ -6731,7 +6754,42 @@ mod tests {
 
         assert!(matches!(
             bridge.status,
-            UsdcBridgeStatus::Failed { failed_at: fa } if fa == failed_at
+            UsdcBridgeStatus::Failed {
+                failed_at: fa,
+                post_burn: true
+            } if fa == failed_at
+        ));
+        assert_eq!(bridge.started_at, initiated_at);
+        assert_eq!(bridge.updated_at, failed_at);
+    }
+
+    #[test]
+    fn to_dto_withdrawal_failed_maps_to_pre_burn_failed_status() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let initiated_at = Utc::now();
+        let failed_at = initiated_at + chrono::Duration::seconds(60);
+        let state = UsdcRebalance::WithdrawalFailed {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc::new(float!(750)),
+            withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            reason: "withdrawal rejected".to_string(),
+            initiated_at,
+            failed_at,
+        };
+
+        let dto = state.to_dto(&id);
+        let TransferOperation::UsdcBridge(bridge) = dto else {
+            panic!("expected UsdcBridge variant");
+        };
+
+        // A withdrawal failure strands nothing on-chain, so the CLI rejects
+        // `transfer reconcile --kind usdc` -- the discriminator must be false.
+        assert!(matches!(
+            bridge.status,
+            UsdcBridgeStatus::Failed {
+                failed_at: fa,
+                post_burn: false
+            } if fa == failed_at
         ));
         assert_eq!(bridge.started_at, initiated_at);
         assert_eq!(bridge.updated_at, failed_at);

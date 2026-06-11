@@ -122,8 +122,22 @@ pub enum UsdcBridgeStatus {
     Withdrawing,
     Bridging,
     Depositing,
-    Completed { completed_at: DateTime<Utc> },
-    Failed { failed_at: DateTime<Utc> },
+    Completed {
+        completed_at: DateTime<Utc>,
+    },
+    Failed {
+        failed_at: DateTime<Utc>,
+        // True when the failure happened post-burn (`DepositFailed`, a post-burn
+        // `BridgingFailed`, or a `BaseToAlpaca ConversionFailed`) -- the only USDC
+        // failures `transfer reconcile --kind usdc` accepts. False for pre-burn
+        // failures, which strand nothing and the CLI rejects, so the dashboard can
+        // offer reconcile per-object only when this is true. NOTE: a plain `//`
+        // comment, not `///` -- ts-rs emits doc comments into the generated TS
+        // binding, and a field-level doc lands awkwardly inside the object type
+        // literal (`{ failedAt: string, /** ... */ postBurn: boolean }`), which
+        // trips the dashboard's type-aware eslint. Keep the rationale here in Rust.
+        post_burn: bool,
+    },
 }
 
 impl TransferOperation {
@@ -330,7 +344,16 @@ mod tests {
         assert!(
             bridge_operation(UsdcBridgeStatus::Completed { completed_at: now }, now).is_terminal()
         );
-        assert!(bridge_operation(UsdcBridgeStatus::Failed { failed_at: now }, now).is_terminal());
+        assert!(
+            bridge_operation(
+                UsdcBridgeStatus::Failed {
+                    failed_at: now,
+                    post_burn: true
+                },
+                now
+            )
+            .is_terminal()
+        );
 
         assert!(!bridge_operation(UsdcBridgeStatus::Converting, now).is_terminal());
         assert!(!bridge_operation(UsdcBridgeStatus::Withdrawing, now).is_terminal());
