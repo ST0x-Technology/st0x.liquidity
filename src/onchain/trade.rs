@@ -11,18 +11,18 @@ use alloy::sol_types::SolEvent;
 use chrono::{DateTime, Utc};
 use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use st0x_config::EvmCtx;
 use st0x_evm::Evm;
-use st0x_execution::{Direction, FractionalShares, HasZero};
+use st0x_execution::{Direction, FractionalShares, HasZero, Symbol};
 use st0x_float_serde::format_float_with_fallback;
 
 use super::pyth::{extract_pyth_price, raw_price_to_pyth_price};
 use crate::bindings::IRaindexV6::{ClearV3, OrderV4, TakeOrderV3};
 use crate::onchain::OnChainError;
 use crate::onchain::io::{TokenizedSymbol, TradeDetails, Usdc, WrappedTokenizedShares};
-use crate::onchain::pyth::FeedIdCache;
+use crate::onchain::pyth::PythFeedIds;
 use crate::onchain_trade::PythPrice;
 use crate::symbol::cache::SymbolCache;
 
@@ -163,6 +163,54 @@ pub struct OnchainTrade {
     pub(crate) pyth_price: Option<PythPrice>,
 }
 
+/// Reads the Pyth reference price for a trade, returning `None` (after a
+/// warning) when enrichment cannot proceed. Enrichment is best-effort: a missing
+/// feed, a log without a block number, or an RPC failure all skip enrichment
+/// without affecting the trade or its hedge.
+async fn enrich_with_pyth_price<P: Provider>(
+    provider: &P,
+    pyth_feed_ids: &PythFeedIds,
+    base_symbol: &Symbol,
+    block_number: Option<u64>,
+    tx_hash: TxHash,
+) -> Option<PythPrice> {
+    let Some(feed_id) = pyth_feed_ids.get(base_symbol) else {
+        // A symbol with no configured feed is an intentional configuration
+        // choice, not an anomaly, so this is logged at debug to avoid
+        // per-trade warn spam for unconfigured symbols.
+        debug!(
+            target: "hedge",
+            symbol = %base_symbol,
+            %tx_hash,
+            "No configured Pyth feed for symbol; skipping trade enrichment"
+        );
+        return None;
+    };
+
+    let Some(block_number) = block_number else {
+        warn!(
+            target: "hedge",
+            symbol = %base_symbol,
+            %tx_hash,
+            "Trade log missing block number; skipping Pyth enrichment"
+        );
+        return None;
+    };
+
+    match extract_pyth_price(provider, feed_id, block_number)
+        .await
+        .and_then(|raw_price| raw_price_to_pyth_price(&raw_price))
+    {
+        Ok(pyth_price) => Some(pyth_price),
+        Err(error) => {
+            // `?error` preserves the full source chain (PythError::Rpc boxes
+            // the underlying transport error, which Display alone drops).
+            warn!(target: "hedge", %tx_hash, ?error, "Pyth price extraction failed");
+            None
+        }
+    }
+}
+
 impl OnchainTrade {
     /// Core parsing logic for converting blockchain events to trades
     pub(crate) async fn try_from_order_and_fill_details<EvmImpl: Evm>(
@@ -171,7 +219,7 @@ impl OnchainTrade {
         order: OrderV4,
         fill: OrderFill,
         log: Log,
-        feed_id_cache: &FeedIdCache,
+        pyth_feed_ids: &PythFeedIds,
     ) -> Result<Option<Self>, OnChainError> {
         let tx_hash = log.transaction_hash.ok_or(TradeValidationError::NoTxHash)?;
         let log_index = log.log_index.ok_or(TradeValidationError::NoLogIndex)?;
@@ -225,21 +273,14 @@ impl OnchainTrade {
         };
         let equity_symbol = TokenizedSymbol::<WrappedTokenizedShares>::parse(&equity_symbol_str)?;
 
-        let pyth_price = match extract_pyth_price(
-            tx_hash,
+        let pyth_price = enrich_with_pyth_price(
             evm.provider(),
-            &equity_symbol.base().to_string(),
-            feed_id_cache,
+            pyth_feed_ids,
+            equity_symbol.base(),
+            log.block_number,
+            tx_hash,
         )
-        .await
-        .and_then(|raw_price| raw_price_to_pyth_price(&raw_price))
-        {
-            Ok(pyth_price) => Some(pyth_price),
-            Err(error) => {
-                warn!(target: "hedge", %tx_hash, %error, "Pyth price extraction failed");
-                None
-            }
-        };
+        .await;
 
         let price = Usdc::new(price_per_share_usdc)?;
 
@@ -270,7 +311,7 @@ impl OnchainTrade {
         evm: &EvmImpl,
         cache: &SymbolCache,
         ctx: &EvmCtx,
-        feed_id_cache: &FeedIdCache,
+        pyth_feed_ids: &PythFeedIds,
         order_owner: Address,
     ) -> Result<Option<Self>, OnChainError> {
         let receipt = evm
@@ -302,7 +343,7 @@ impl OnchainTrade {
 
         for log in trades {
             if let Some(trade) =
-                try_convert_log_to_onchain_trade(log, evm, cache, ctx, feed_id_cache, order_owner)
+                try_convert_log_to_onchain_trade(log, evm, cache, ctx, pyth_feed_ids, order_owner)
                     .await?
             {
                 return Ok(Some(trade));
@@ -326,7 +367,7 @@ async fn try_convert_log_to_onchain_trade<EvmImpl: Evm>(
     evm: &EvmImpl,
     cache: &SymbolCache,
     ctx: &EvmCtx,
-    feed_id_cache: &FeedIdCache,
+    pyth_feed_ids: &PythFeedIds,
     order_owner: Address,
 ) -> Result<Option<OnchainTrade>, OnChainError> {
     let log_with_metadata = Log {
@@ -347,7 +388,7 @@ async fn try_convert_log_to_onchain_trade<EvmImpl: Evm>(
             evm,
             clear_event.data().clone(),
             log_with_metadata,
-            feed_id_cache,
+            pyth_feed_ids,
             order_owner,
         )
         .await;
@@ -360,7 +401,7 @@ async fn try_convert_log_to_onchain_trade<EvmImpl: Evm>(
             take_order_event.data().clone(),
             log_with_metadata,
             order_owner,
-            feed_id_cache,
+            pyth_feed_ids,
         )
         .await;
     }
@@ -425,17 +466,138 @@ pub(crate) enum TradeValidationError {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, U256, address, b256, fixed_bytes, uint};
+    use std::collections::HashMap;
+
+    use alloy::primitives::{Address, Bytes, U256, address, b256, fixed_bytes, uint};
     use alloy::providers::{ProviderBuilder, mock::Asserter};
+    use alloy::sol_types::SolCall;
     use rain_math_float::Float;
 
     use st0x_evm::ReadOnlyEvm;
 
     use super::*;
+    use crate::bindings::IPyth::getPriceUnsafeCall;
     use crate::bindings::IRaindexV6;
+    use crate::bindings::PythStructs::Price;
     use crate::symbol::cache::SymbolCache;
     use st0x_config::EvmCtx;
     use st0x_float_macro::float;
+
+    #[tokio::test]
+    async fn enrich_with_pyth_price_returns_price_when_feed_configured() {
+        let price = Price {
+            price: 15_445_005,
+            conf: 21_005,
+            expo: -5,
+            publishTime: U256::from(1_781_166_017u64),
+        };
+        let asserter = Asserter::new();
+        asserter.push_success(&Bytes::from(getPriceUnsafeCall::abi_encode_returns(&price)));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let symbol = Symbol::new("COIN").unwrap();
+        let feed_ids = PythFeedIds::new(HashMap::from([(symbol.clone(), B256::random())]));
+
+        let pyth_price = enrich_with_pyth_price(
+            &provider,
+            &feed_ids,
+            &symbol,
+            Some(47_198_127),
+            TxHash::random(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(pyth_price.value, "15445005");
+        assert_eq!(pyth_price.conf, "21005");
+        assert_eq!(pyth_price.expo, -5);
+        assert_eq!(
+            pyth_price.publish_time,
+            DateTime::from_timestamp(1_781_166_017, 0).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn enrich_with_pyth_price_skips_when_no_feed_configured() {
+        // No responses pushed: an unconfigured feed must not trigger any RPC.
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let feed_ids = PythFeedIds::default();
+
+        let result = enrich_with_pyth_price(
+            &provider,
+            &feed_ids,
+            &Symbol::new("COIN").unwrap(),
+            Some(1),
+            TxHash::random(),
+        )
+        .await;
+
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn enrich_with_pyth_price_returns_none_on_invalid_timestamp() {
+        // The eth_call succeeds but decodes to an unrepresentable publishTime;
+        // raw_price_to_pyth_price rejects it, and enrichment swallows the error.
+        let price = Price {
+            price: 15_445_005,
+            conf: 21_005,
+            expo: -5,
+            publishTime: U256::MAX,
+        };
+        let asserter = Asserter::new();
+        asserter.push_success(&Bytes::from(getPriceUnsafeCall::abi_encode_returns(&price)));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let symbol = Symbol::new("COIN").unwrap();
+        let feed_ids = PythFeedIds::new(HashMap::from([(symbol.clone(), B256::random())]));
+
+        let result = enrich_with_pyth_price(
+            &provider,
+            &feed_ids,
+            &symbol,
+            Some(47_198_127),
+            TxHash::random(),
+        )
+        .await;
+
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn enrich_with_pyth_price_returns_none_on_rpc_error() {
+        // A configured feed and a valid block, but the eth_call fails: enrichment
+        // must swallow the error and return None so trade recording is unaffected.
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("eth_call boom");
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let symbol = Symbol::new("COIN").unwrap();
+        let feed_ids = PythFeedIds::new(HashMap::from([(symbol.clone(), B256::random())]));
+
+        let result = enrich_with_pyth_price(
+            &provider,
+            &feed_ids,
+            &symbol,
+            Some(47_198_127),
+            TxHash::random(),
+        )
+        .await;
+
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn enrich_with_pyth_price_skips_when_block_number_missing() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let symbol = Symbol::new("COIN").unwrap();
+        let feed_ids = PythFeedIds::new(HashMap::from([(symbol.clone(), B256::random())]));
+
+        let result =
+            enrich_with_pyth_price(&provider, &feed_ids, &symbol, None, TxHash::random()).await;
+
+        assert_eq!(result, None);
+    }
 
     #[test]
     fn test_float_constants_from_v5_interface() {
@@ -629,7 +791,7 @@ mod tests {
         asserter.push_success(&serde_json::Value::Null);
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let cache = SymbolCache::default();
-        let feed_id_cache = FeedIdCache::default();
+        let pyth_feed_ids = PythFeedIds::default();
         let ctx = EvmCtx {
             rpc_url: "http://localhost:8545".parse().unwrap(),
             orderbook: Address::ZERO,
@@ -646,7 +808,7 @@ mod tests {
             &ReadOnlyEvm::new(provider),
             &cache,
             &ctx,
-            &feed_id_cache,
+            &pyth_feed_ids,
             Address::ZERO,
         )
         .await;

@@ -62,6 +62,15 @@ pub enum OperationMode {
 pub struct EquityAssetConfig {
     pub tokenized_equity: Address,
     pub tokenized_equity_derivative: Address,
+    /// Pyth price feed ID for this equity, used to record a reference price for
+    /// trade enrichment via a historic `getPriceUnsafe` call.
+    ///
+    /// Optional: when absent, trade enrichment is skipped for this symbol (with
+    /// a warning) but hedging is unaffected. The feed an order reads can change
+    /// over time (oracle migrations), so this is the current feed per symbol and
+    /// must be refreshed if the order migrates to a different feed.
+    #[serde(default, deserialize_with = "deserialize_feed_id")]
+    pub pyth_feed_id: Option<B256>,
     #[serde(
         default,
         alias = "vault_id",
@@ -130,6 +139,29 @@ fn parse_padded_b256(hex_str: &str) -> Result<B256, String> {
 
     let padded = format!("{stripped:0>64}");
     padded.parse::<B256>().map_err(|err| err.to_string())
+}
+
+/// Deserializes a Pyth feed ID from a full 32-byte hex string.
+///
+/// Only invoked when the key is present (the field is `#[serde(default)]`), so a
+/// present-but-malformed value is rejected while an absent one yields `None`.
+/// Unlike vault IDs, feed IDs are not left-padded: a feed ID is always the full
+/// 32 bytes, so a short value is a configuration mistake and is rejected.
+fn deserialize_feed_id<'de, D>(deserializer: D) -> Result<Option<B256>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+
+    if raw.is_empty() {
+        return Err(serde::de::Error::custom(
+            "pyth_feed_id must not be empty; omit the field to disable enrichment",
+        ));
+    }
+
+    raw.parse::<B256>()
+        .map(Some)
+        .map_err(|err| serde::de::Error::custom(format!("invalid pyth_feed_id `{raw}`: {err}")))
 }
 
 /// Deserializes vault IDs from either a single hex string or an array of hex
@@ -929,6 +961,21 @@ impl Ctx {
         self.order_owner
     }
 
+    /// Returns the configured Pyth feed IDs keyed by base equity symbol.
+    ///
+    /// Built from the `pyth_feed_id` field of each `[assets.equities.*]` entry.
+    /// Used to record a reference price for trade enrichment.
+    pub fn pyth_feed_ids(&self) -> HashMap<Symbol, B256> {
+        self.assets
+            .equities
+            .symbols
+            .iter()
+            .filter_map(|(symbol, config)| {
+                config.pyth_feed_id.map(|feed_id| (symbol.clone(), feed_id))
+            })
+            .collect()
+    }
+
     /// Returns whether trading is enabled for the given equity.
     ///
     /// Fail-closed: assets not present in the config are treated as
@@ -1250,7 +1297,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, address};
+    use alloy::primitives::{Address, address, b256};
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -2932,6 +2979,137 @@ mod tests {
         let _: Config = toml::from_str(config_str).unwrap();
     }
 
+    fn equity_config_with_feed_line(feed_line: &str) -> Config {
+        let toml_str = format!(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            deployment_block = 1
+            required_confirmations = 3
+
+            [assets.equities.AAPL]
+            tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            {feed_line}
+            trading = "enabled"
+            rebalancing = "disabled"
+            wrapped_equity_recovery = "disabled"
+        "#
+        );
+
+        toml::from_str(&toml_str).unwrap()
+    }
+
+    #[test]
+    fn equity_pyth_feed_id_parses_when_present() {
+        let config = equity_config_with_feed_line(
+            r#"pyth_feed_id = "0xfee33f2a978bf32dd6b662b65ba8083c6773b494f8401194ec1870c640860245""#,
+        );
+
+        let aapl = config
+            .assets
+            .equities
+            .symbols
+            .get(&Symbol::new("AAPL").unwrap())
+            .unwrap();
+
+        assert_eq!(
+            aapl.pyth_feed_id,
+            Some(alloy::primitives::b256!(
+                "0xfee33f2a978bf32dd6b662b65ba8083c6773b494f8401194ec1870c640860245"
+            ))
+        );
+    }
+
+    #[test]
+    fn equity_pyth_feed_id_is_none_when_absent() {
+        let config = equity_config_with_feed_line("");
+
+        let aapl = config
+            .assets
+            .equities
+            .symbols
+            .get(&Symbol::new("AAPL").unwrap())
+            .unwrap();
+
+        assert_eq!(aapl.pyth_feed_id, None);
+    }
+
+    #[test]
+    fn equity_pyth_feed_id_rejects_malformed_value() {
+        let toml_str = r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            deployment_block = 1
+            required_confirmations = 3
+
+            [assets.equities.AAPL]
+            tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            pyth_feed_id = "0xdeadbeef"
+            trading = "enabled"
+            rebalancing = "disabled"
+            wrapped_equity_recovery = "disabled"
+        "#;
+
+        let Err(error) = toml::from_str::<Config>(toml_str) else {
+            panic!("expected malformed pyth_feed_id to fail parsing");
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid pyth_feed_id `0xdeadbeef`"),
+            "expected parse error to name the field and the offending value, got: {error}"
+        );
+    }
+
+    #[test]
+    fn pyth_feed_ids_returns_only_symbols_with_configured_feed() {
+        fn equity(pyth_feed_id: Option<B256>) -> EquityAssetConfig {
+            EquityAssetConfig {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: Address::ZERO,
+                pyth_feed_id,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                operational_limit: None,
+            }
+        }
+
+        let configured = Symbol::new("COIN").unwrap();
+        let unconfigured = Symbol::new("AMZN").unwrap();
+        let feed_id = b256!("0xfee33f2a978bf32dd6b662b65ba8083c6773b494f8401194ec1870c640860245");
+
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.assets
+            .equities
+            .symbols
+            .insert(configured.clone(), equity(Some(feed_id)));
+        ctx.assets
+            .equities
+            .symbols
+            .insert(unconfigured.clone(), equity(None));
+
+        let feed_ids = ctx.pyth_feed_ids();
+
+        assert_eq!(feed_ids.len(), 1);
+        assert_eq!(feed_ids.get(&configured), Some(&feed_id));
+        assert_eq!(feed_ids.get(&unconfigured), None);
+    }
+
     #[test]
     fn e2e_secrets_toml_is_valid() {
         let secrets_str = include_str!("../../../e2e/secrets.toml");
@@ -3431,6 +3609,7 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: Address::ZERO,
+                pyth_feed_id: None,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
@@ -3478,6 +3657,7 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: Address::ZERO,
+                pyth_feed_id: None,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
@@ -3528,6 +3708,7 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: Address::ZERO,
+                pyth_feed_id: None,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Disabled,

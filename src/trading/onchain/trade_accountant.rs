@@ -24,7 +24,7 @@ use crate::conductor::job::{Job, JobQueue, Label};
 use crate::conductor::{
     TradeProcessingCqrs, VaultDiscoveryCtx, discover_vaults_for_trade, process_queued_trade,
 };
-use crate::onchain::pyth::FeedIdCache;
+use crate::onchain::pyth::PythFeedIds;
 use crate::onchain::trade::{RaindexTradeEvent, TradeValidationError};
 use crate::onchain::{OnChainError, OnchainTrade};
 use crate::symbol::cache::SymbolCache;
@@ -48,7 +48,7 @@ pub struct AccountForDexTrade {
 pub(crate) struct AccountantCtx<Node, Exec> {
     pub(crate) ctx: Ctx,
     pub(crate) cache: SymbolCache,
-    pub(crate) feed_id_cache: FeedIdCache,
+    pub(crate) pyth_feed_ids: PythFeedIds,
     pub(crate) orderbook: Address,
     pub(crate) evm: ReadOnlyEvm<Node>,
     pub(crate) cqrs: TradeProcessingCqrs,
@@ -99,7 +99,7 @@ where
                     &ctx.evm,
                     *clear_event.clone(),
                     reconstructed_log,
-                    &ctx.feed_id_cache,
+                    &ctx.pyth_feed_ids,
                     order_owner,
                 )
                 .await
@@ -112,7 +112,7 @@ where
                     *take_event.clone(),
                     reconstructed_log,
                     order_owner,
-                    &ctx.feed_id_cache,
+                    &ctx.pyth_feed_ids,
                 )
                 .await
             }
@@ -337,7 +337,7 @@ mod tests {
             orderbook: ctx.evm.orderbook,
             ctx,
             cache: SymbolCache::default(),
-            feed_id_cache: FeedIdCache::default(),
+            pyth_feed_ids: PythFeedIds::default(),
             evm: st0x_evm::ReadOnlyEvm::new(provider),
             cqrs,
             vault_registry,
@@ -464,7 +464,7 @@ mod tests {
             orderbook: ctx.evm.orderbook,
             ctx,
             cache: SymbolCache::default(),
-            feed_id_cache: FeedIdCache::default(),
+            pyth_feed_ids: PythFeedIds::default(),
             evm: st0x_evm::ReadOnlyEvm::new(provider),
             cqrs,
             vault_registry,

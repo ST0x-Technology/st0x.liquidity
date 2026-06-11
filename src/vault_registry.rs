@@ -1191,6 +1191,7 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: TEST_TOKEN,
+                pyth_feed_id: None,
                 vault_ids: vec![TEST_VAULT_ID],
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
@@ -1250,6 +1251,7 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: Address::ZERO,
+                pyth_feed_id: None,
                 vault_ids: vec![TEST_VAULT_ID],
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
@@ -1262,6 +1264,7 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: Address::ZERO,
                 tokenized_equity_derivative: Address::ZERO,
+                pyth_feed_id: None,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,

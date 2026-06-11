@@ -221,9 +221,9 @@ hedging pipeline:
 ### AccountantCtx
 
 Defined in `src/trading/onchain/trade_accountant.rs`. Bundles all dependencies
-the job needs: config, symbol cache, Pyth feed ID cache, EVM provider, orderbook
-address, CQRS frameworks, vault registry, executor, database pool, and job
-queue. Wrapped in `Arc` and injected via apalis `Data`.
+the job needs: config, symbol cache, configured Pyth feed IDs (`PythFeedIds`),
+EVM provider, orderbook address, CQRS frameworks, vault registry, executor,
+database pool, and job queue. Wrapped in `Arc` and injected via apalis `Data`.
 
 ## Conductor assembly
 

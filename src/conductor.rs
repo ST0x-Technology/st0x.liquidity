@@ -2481,6 +2481,7 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: aapl_token,
                 tokenized_equity_derivative: Address::random(),
+                pyth_feed_id: None,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Disabled,
@@ -2493,6 +2494,7 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: tsla_token,
                 tokenized_equity_derivative: Address::random(),
+                pyth_feed_id: None,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
@@ -2505,6 +2507,7 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: spym_token,
                 tokenized_equity_derivative: Address::random(),
+                pyth_feed_id: None,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Disabled,
@@ -2556,6 +2559,7 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: Address::random(),
                 tokenized_equity_derivative: aapl_wrapped_token,
+                pyth_feed_id: None,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Disabled,
@@ -2568,6 +2572,7 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: Address::random(),
                 tokenized_equity_derivative: tsla_wrapped_token,
+                pyth_feed_id: None,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
@@ -2580,6 +2585,7 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: Address::random(),
                 tokenized_equity_derivative: spym_wrapped_token,
+                pyth_feed_id: None,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Disabled,

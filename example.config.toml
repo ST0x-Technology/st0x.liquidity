@@ -72,6 +72,11 @@ usdc = { mode = "enabled", target = 0.5, deviation = 0.3 }
 [assets.equities.EXAMPLE]
 tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+# Optional Pyth price feed ID (full 32-byte hex) used to record a reference
+# price for trade enrichment. When omitted, enrichment is skipped for this
+# symbol (hedging is unaffected). Must match the feed the order reads; refresh
+# it if the order migrates to a different Pyth feed.
+# pyth_feed_id = "0xfee33f2a978bf32dd6b662b65ba8083c6773b494f8401194ec1870c640860245"
 trading = "enabled"
 rebalancing = "disabled"
 # Auto-recovery for wrapped equity tokens detected in bot wallets:

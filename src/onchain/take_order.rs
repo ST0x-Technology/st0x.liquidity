@@ -7,7 +7,7 @@ use st0x_evm::Evm;
 
 use super::OnChainError;
 use crate::bindings::IRaindexV6::{TakeOrderConfigV4, TakeOrderV3};
-use crate::onchain::pyth::FeedIdCache;
+use crate::onchain::pyth::PythFeedIds;
 use crate::onchain::trade::{OnchainTrade, OrderFill};
 use crate::symbol::cache::SymbolCache;
 
@@ -20,7 +20,7 @@ impl OnchainTrade {
         event: TakeOrderV3,
         log: Log,
         target_order_owner: Address,
-        feed_id_cache: &FeedIdCache,
+        pyth_feed_ids: &PythFeedIds,
     ) -> Result<Option<Self>, OnChainError> {
         if event.config.order.owner != target_order_owner {
             return Ok(None);
@@ -45,7 +45,7 @@ impl OnchainTrade {
             output_amount: event.input,
         };
 
-        Self::try_from_order_and_fill_details(cache, evm, order, fill, log, feed_id_cache).await
+        Self::try_from_order_and_fill_details(cache, evm, order, fill, log, pyth_feed_ids).await
     }
 }
 
@@ -63,7 +63,7 @@ mod tests {
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
     use crate::bindings::IRaindexV6::{SignedContextV1, TakeOrderConfigV4, TakeOrderV3};
     use crate::onchain::io::WrappedTokenizedShares;
-    use crate::onchain::pyth::FeedIdCache;
+    use crate::onchain::pyth::PythFeedIds;
     use crate::symbol::cache::SymbolCache;
     use crate::test_utils::{get_test_log, get_test_order};
     use crate::tokenized_symbol;
@@ -143,7 +143,7 @@ mod tests {
         ));
 
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let feed_id_cache = FeedIdCache::default();
+        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_take_order_if_target_owner(
             &cache,
@@ -151,7 +151,7 @@ mod tests {
             take_event,
             log,
             target_order_owner,
-            &feed_id_cache,
+            &pyth_feed_ids,
         )
         .await
         .unwrap();
@@ -182,7 +182,7 @@ mod tests {
 
         let asserter = Asserter::new();
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let feed_id_cache = FeedIdCache::default();
+        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_take_order_if_target_owner(
             &cache,
@@ -190,7 +190,7 @@ mod tests {
             take_event,
             log,
             different_target_owner,
-            &feed_id_cache,
+            &pyth_feed_ids,
         )
         .await
         .unwrap();
@@ -249,7 +249,7 @@ mod tests {
         ));
 
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let feed_id_cache = FeedIdCache::default();
+        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_take_order_if_target_owner(
             &cache,
@@ -257,7 +257,7 @@ mod tests {
             take_event,
             log,
             target_order_owner,
-            &feed_id_cache,
+            &pyth_feed_ids,
         )
         .await
         .unwrap();
@@ -320,7 +320,7 @@ mod tests {
         ));
 
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let feed_id_cache = FeedIdCache::default();
+        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_take_order_if_target_owner(
             &cache,
@@ -328,7 +328,7 @@ mod tests {
             take_event,
             log,
             target_order_owner,
-            &feed_id_cache,
+            &pyth_feed_ids,
         )
         .await
         .unwrap();
@@ -390,7 +390,7 @@ mod tests {
         ));
 
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let feed_id_cache = FeedIdCache::default();
+        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_take_order_if_target_owner(
             &cache,
@@ -398,7 +398,7 @@ mod tests {
             take_event,
             log,
             target_order_owner,
-            &feed_id_cache,
+            &pyth_feed_ids,
         )
         .await;
 
@@ -440,7 +440,7 @@ mod tests {
 
         let asserter = Asserter::new();
         let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
-        let feed_id_cache = FeedIdCache::default();
+        let pyth_feed_ids = PythFeedIds::default();
 
         let result = OnchainTrade::try_from_take_order_if_target_owner(
             &cache,
@@ -448,7 +448,7 @@ mod tests {
             take_event,
             log,
             target_order_owner,
-            &feed_id_cache,
+            &pyth_feed_ids,
         )
         .await;
 

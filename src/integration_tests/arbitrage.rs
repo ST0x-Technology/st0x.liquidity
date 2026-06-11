@@ -47,7 +47,7 @@ use crate::offchain::order::{
 };
 use crate::onchain::OnchainTrade;
 use crate::onchain::USDC_BASE;
-use crate::onchain::pyth::FeedIdCache;
+use crate::onchain::pyth::PythFeedIds;
 use crate::onchain::trade::RaindexTradeEvent;
 use crate::position::{Position, PositionCommand};
 use crate::symbol::cache::SymbolCache;
@@ -244,7 +244,7 @@ struct AnvilOrderBook<P> {
     usdc_addr: Address,
     equity_tokens: HashMap<String, Address>,
     symbol_cache: SymbolCache,
-    feed_id_cache: FeedIdCache,
+    pyth_feed_ids: PythFeedIds,
 }
 
 /// Places USDC contract code and storage directly at the canonical `USDC_BASE` address
@@ -365,7 +365,7 @@ async fn setup_anvil_orderbook() -> AnvilOrderBook<impl alloy::providers::Provid
         usdc_addr: USDC_BASE,
         equity_tokens: HashMap::new(),
         symbol_cache: SymbolCache::default(),
-        feed_id_cache: FeedIdCache::default(),
+        pyth_feed_ids: PythFeedIds::default(),
     }
 }
 
@@ -424,7 +424,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
             take_event,
             log_metadata,
             order_owner,
-            &self.feed_id_cache,
+            &self.pyth_feed_ids,
         )
         .await
         .unwrap()
@@ -2170,6 +2170,7 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
                 EquityAssetConfig {
                     tokenized_equity: Address::ZERO,
                     tokenized_equity_derivative: Address::ZERO,
+                    pyth_feed_id: None,
                     vault_ids: Vec::new(),
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Disabled,
@@ -2377,6 +2378,7 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
                 EquityAssetConfig {
                     tokenized_equity: Address::ZERO,
                     tokenized_equity_derivative: Address::ZERO,
+                    pyth_feed_id: None,
                     vault_ids: Vec::new(),
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Disabled,

@@ -252,6 +252,7 @@ mod tests {
             EquityAssetConfig {
                 tokenized_equity: underlying,
                 tokenized_equity_derivative: derivative,
+                pyth_feed_id: None,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Disabled,

@@ -1,57 +1,99 @@
-//! Pyth oracle price feed integration for onchain price lookups via
-//! transaction traces.
+//! Pyth oracle price feed integration for onchain price lookups.
+//!
+//! Records the reference price an order observed by reading the Pyth contract's
+//! `getPriceUnsafe` getter, pinned at the trade's block via a historic
+//! `eth_call`. This captures the same stored price the order read without
+//! relying on transaction traces (`debug_traceTransaction`), which are slow and
+//! unreliably supported by load-balanced RPC providers.
 
-use alloy::primitives::{Address, B256, Bytes, TxHash, U256, address};
+use std::collections::HashMap;
+
+use alloy::eips::BlockId;
+use alloy::primitives::{Address, B256, U256, address};
 use alloy::providers::Provider;
-use alloy::providers::ext::DebugApi;
-use alloy::rpc::types::trace::geth::{
-    CallFrame, GethDebugBuiltInTracerType, GethDebugTracerType, GethDebugTracingOptions, GethTrace,
-};
-use alloy::sol_types::{SolCall, SolType};
 use chrono::DateTime;
 #[cfg(test)]
-use rain_math_float::Float;
-use rain_math_float::FloatError;
+use rain_math_float::{Float, FloatError};
 #[cfg(test)]
 use st0x_float_macro::float;
-use tracing::{debug, warn};
+use tracing::debug;
 
-use crate::bindings::IPyth::{
-    getEmaPriceNoOlderThanCall, getEmaPriceUnsafeCall, getPriceNoOlderThanCall, getPriceUnsafeCall,
-};
+use st0x_execution::Symbol;
+
+use crate::bindings::IPyth;
 use crate::bindings::PythStructs::Price;
-
-mod feed_id_cache;
-pub use feed_id_cache::FeedIdCache;
 
 pub const BASE_PYTH_CONTRACT_ADDRESS: Address =
     address!("0x8250f4aF4B972684F7b336503E2D6dFeDeB1487a");
 
+/// Static mapping from base equity symbol to its Pyth price feed ID, sourced
+/// from configuration. A symbol absent from the map has no configured feed, so
+/// its trades are recorded without Pyth enrichment.
+#[derive(Clone, Default, Debug)]
+pub struct PythFeedIds(HashMap<Symbol, B256>);
+
+impl PythFeedIds {
+    pub fn new(feed_ids: HashMap<Symbol, B256>) -> Self {
+        Self(feed_ids)
+    }
+
+    /// Returns the configured Pyth feed ID for the given base symbol, if any.
+    pub fn get(&self, symbol: &Symbol) -> Option<B256> {
+        let Self(feed_ids) = self;
+
+        feed_ids.get(symbol).copied()
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PythError {
-    #[error("No Pyth oracle call found in transaction trace")]
-    NoPythCall,
-    #[error("No Pyth call found matching price feed ID {0}")]
-    NoMatchingFeedId(B256),
-    #[error("Failed to decode Pyth return data: {0}")]
-    AbiDecode(#[from] alloy::sol_types::Error),
-    #[error("Trace is not CallTracer variant")]
-    InvalidTraceVariant,
-    #[error("RPC error while fetching trace: {0}")]
+    #[error("RPC error while reading Pyth price")]
     Rpc(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("Invalid timestamp value: {0}")]
     InvalidTimestamp(U256),
-    #[error("Exponent conversion failed: {0}")]
-    ExponentConversion(#[from] std::num::TryFromIntError),
-    #[error("Float error: {0}")]
-    Float(#[from] FloatError),
 }
 
-#[derive(Debug, Clone)]
-pub struct PythCall {
-    pub price_feed_id: B256,
-    pub output: Bytes,
-    pub depth: u32,
+/// Reads the Pyth price for `feed_id` as stored on the Base Pyth contract at
+/// `block_number`, via a historic `getPriceUnsafe` call.
+///
+/// `getPriceUnsafe` never reverts on staleness; it returns the feed's stored
+/// state as of the END of `block_number`. This matches what the order observed
+/// at its block unless a Pyth update for this feed landed in the same block
+/// after the trade transaction — a rare case that yields a slightly newer
+/// reference price. The value feeds analytics only and does not influence the
+/// hedge decision (hedging uses the realized execution price), so the
+/// end-of-block approximation is acceptable. Note this read currently runs
+/// synchronously on the trade-conversion path, so a slow RPC adds hedge
+/// latency; moving enrichment off the pre-hedge path is a tracked follow-up.
+pub async fn extract_pyth_price<P>(
+    provider: &P,
+    feed_id: B256,
+    block_number: u64,
+) -> Result<Price, PythError>
+where
+    P: Provider,
+{
+    debug!(target: "hedge", %feed_id, block_number, "Reading Pyth price via getPriceUnsafe");
+
+    let pyth = IPyth::new(BASE_PYTH_CONTRACT_ADDRESS, provider);
+
+    let price = pyth
+        .getPriceUnsafe(feed_id)
+        .block(BlockId::number(block_number))
+        .call()
+        .await
+        .map_err(|error| PythError::Rpc(Box::new(error)))?;
+
+    debug!(
+        target: "hedge",
+        %feed_id,
+        price = %price.price,
+        expo = price.expo,
+        conf = %price.conf,
+        "Read Pyth price"
+    );
+
+    Ok(price)
 }
 
 /// Converts a raw Pyth SDK `Price` into the CQRS `PythPrice` struct,
@@ -95,63 +137,6 @@ fn scale_with_exponent(value: &impl ToString, exponent: i32) -> Result<Float, Fl
     }
 }
 
-pub fn find_pyth_calls(trace: &GethTrace) -> Result<Vec<PythCall>, PythError> {
-    match trace {
-        GethTrace::CallTracer(call_frame) => Ok(traverse_call_frame(call_frame, 0)),
-        _ => Err(PythError::InvalidTraceVariant),
-    }
-}
-
-fn traverse_call_frame(frame: &CallFrame, depth: u32) -> Vec<PythCall> {
-    let current_call = frame
-        .to
-        .filter(|&to| to == BASE_PYTH_CONTRACT_ADDRESS)
-        .filter(|_| is_pyth_method_selector(&frame.input))
-        .and(frame.output.as_ref())
-        .and_then(|output| {
-            extract_price_feed_id(&frame.input).map(|feed_id| PythCall {
-                price_feed_id: feed_id,
-                output: output.clone(),
-                depth,
-            })
-        });
-
-    let nested_calls = frame
-        .calls
-        .iter()
-        .flat_map(|nested_call| traverse_call_frame(nested_call, depth + 1));
-
-    current_call.into_iter().chain(nested_calls).collect()
-}
-
-fn is_pyth_method_selector(input: &Bytes) -> bool {
-    if input.len() < 4 {
-        return false;
-    }
-
-    let selector = &input[0..4];
-
-    selector == getPriceNoOlderThanCall::SELECTOR
-        || selector == getPriceUnsafeCall::SELECTOR
-        || selector == getEmaPriceNoOlderThanCall::SELECTOR
-        || selector == getEmaPriceUnsafeCall::SELECTOR
-}
-
-fn extract_price_feed_id(input: &Bytes) -> Option<B256> {
-    if input.len() < 36 {
-        return None;
-    }
-
-    let feed_id_bytes = &input[4..36];
-    Some(B256::from_slice(feed_id_bytes))
-}
-
-pub fn decode_pyth_price(output: &Bytes) -> Result<Price, PythError> {
-    let price = Price::abi_decode(output)?;
-
-    Ok(price)
-}
-
 #[cfg(test)]
 impl Price {
     fn to_float(&self) -> Result<Float, FloatError> {
@@ -159,421 +144,66 @@ impl Price {
     }
 }
 
-pub async fn extract_pyth_price<P>(
-    tx_hash: TxHash,
-    provider: &P,
-    symbol: &str,
-    cache: &FeedIdCache,
-) -> Result<Price, PythError>
-where
-    P: Provider,
-{
-    debug!(target: "hedge", %tx_hash, "Fetching transaction trace");
-    let trace = fetch_transaction_trace(tx_hash, provider).await?;
-
-    debug!(target: "hedge", "Parsing trace for Pyth oracle calls");
-    let pyth_calls = find_pyth_calls(&trace)?;
-
-    let (first_call, rest) = parse_non_empty_pyth_calls(&pyth_calls, tx_hash)?;
-
-    let matching_call = find_matching_pyth_call(first_call, rest, symbol, cache, tx_hash).await?;
-
-    extract_and_log_price(matching_call, symbol, tx_hash)
-}
-
-fn parse_non_empty_pyth_calls(
-    pyth_calls: &[PythCall],
-    tx_hash: TxHash,
-) -> Result<(&PythCall, &[PythCall]), PythError> {
-    let Some((first, rest)) = pyth_calls.split_first() else {
-        warn!(target: "hedge", %tx_hash, "No Pyth call found in transaction");
-        return Err(PythError::NoPythCall);
-    };
-
-    debug!(target: "hedge", count = pyth_calls.len(), "Found Pyth call(s) in trace");
-    Ok((first, rest))
-}
-
-async fn find_matching_pyth_call<'a>(
-    first_call: &'a PythCall,
-    rest: &'a [PythCall],
-    symbol: &str,
-    cache: &FeedIdCache,
-    tx_hash: TxHash,
-) -> Result<&'a PythCall, PythError> {
-    let cached_feed_id = cache.get(symbol).await;
-
-    if let Some(feed_id) = cached_feed_id {
-        find_call_by_cached_feed_id(first_call, rest, feed_id, symbol, tx_hash)
-    } else {
-        cache_new_feed_id(cache, symbol, first_call).await;
-        Ok(first_call)
-    }
-}
-
-fn find_call_by_cached_feed_id<'a>(
-    first_call: &'a PythCall,
-    rest: &'a [PythCall],
-    feed_id: B256,
-    symbol: &str,
-    tx_hash: TxHash,
-) -> Result<&'a PythCall, PythError> {
-    debug!(target: "hedge", symbol, %feed_id, "Found cached feed ID");
-
-    std::iter::once(first_call)
-        .chain(rest.iter())
-        .find(|call| call.price_feed_id == feed_id)
-        .ok_or_else(|| {
-            warn!(
-                target: "hedge",
-                symbol, %feed_id, %tx_hash,
-                "No Pyth call found matching cached feed ID"
-            );
-            PythError::NoMatchingFeedId(feed_id)
-        })
-}
-
-async fn cache_new_feed_id(cache: &FeedIdCache, symbol: &str, call: &PythCall) {
-    debug!(target: "hedge", symbol, "No cached feed ID, using first Pyth call and caching");
-    cache.insert(symbol.to_string(), call.price_feed_id).await;
-    debug!(
-        target: "hedge",
-        symbol, feed_id = %call.price_feed_id,
-        "Cached new feed ID mapping"
-    );
-}
-
-fn extract_and_log_price(
-    matching_call: &PythCall,
-    symbol: &str,
-    tx_hash: TxHash,
-) -> Result<Price, PythError> {
-    debug!(
-        target: "hedge",
-        "Using Pyth call at depth {} with feed ID {} for price extraction",
-        matching_call.depth, matching_call.price_feed_id
-    );
-
-    let price = decode_pyth_price(&matching_call.output).map_err(|error| {
-        warn!(target: "hedge", %tx_hash, symbol, %error, "Failed to extract Pyth price");
-        error
-    })?;
-
-    debug!(
-        target: "hedge",
-        symbol,
-        feed_id = %matching_call.price_feed_id,
-        price = %price.price,
-        expo = price.expo,
-        conf = %price.conf,
-        "Extracted Pyth price"
-    );
-
-    Ok(price)
-}
-
-async fn fetch_transaction_trace<P>(tx_hash: TxHash, provider: &P) -> Result<GethTrace, PythError>
-where
-    P: Provider,
-{
-    let options = GethDebugTracingOptions {
-        tracer: Some(GethDebugTracerType::BuiltInTracer(
-            GethDebugBuiltInTracerType::CallTracer,
-        )),
-        ..Default::default()
-    };
-
-    let trace = provider
-        .debug_trace_transaction(tx_hash, options)
-        .await
-        .map_err(|error| PythError::Rpc(Box::new(error)))?;
-
-    Ok(trace)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use alloy::primitives::{Address, U256};
+    use alloy::primitives::{Bytes, b256};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
-    use alloy::rpc::types::trace::geth::FourByteFrame;
+    use alloy::sol_types::SolCall;
 
     use st0x_float_macro::float;
     use st0x_float_serde::format_float_with_fallback;
 
-    fn create_test_call_frame(
-        to: Address,
-        input: Vec<u8>,
-        output: Option<Vec<u8>>,
-        nested_calls: Vec<CallFrame>,
-    ) -> CallFrame {
-        CallFrame {
-            from: Address::ZERO,
-            gas: U256::from(100_000u64),
-            gas_used: U256::from(50_000u64),
-            to: Some(to),
-            input: Bytes::from(input),
-            output: output.map(Bytes::from),
-            error: None,
-            revert_reason: None,
-            calls: nested_calls,
-            logs: vec![],
-            value: Some(U256::ZERO),
-            typ: "CALL".to_string(),
-        }
+    use super::*;
+    use crate::bindings::IPyth::getPriceUnsafeCall;
+
+    /// Encodes a `Price` as the ABI return data of `getPriceUnsafe`, matching
+    /// what an `eth_call` to the Pyth contract would return.
+    fn encode_price_return(price: &Price) -> Bytes {
+        Bytes::from(getPriceUnsafeCall::abi_encode_returns(price))
     }
 
-    #[test]
-    fn test_find_pyth_calls_single_call_at_root() {
-        let pyth_selector = crate::bindings::IPyth::getPriceNoOlderThanCall::SELECTOR;
-        let mut input = pyth_selector.to_vec();
-        let feed_id = B256::repeat_byte(0xaa);
-        input.extend_from_slice(feed_id.as_slice());
-
-        let output = vec![0x01, 0x02, 0x03, 0x04];
-
-        let call_frame = create_test_call_frame(
-            BASE_PYTH_CONTRACT_ADDRESS,
-            input,
-            Some(output.clone()),
-            vec![],
-        );
-
-        let trace = GethTrace::CallTracer(call_frame);
-        let result = find_pyth_calls(&trace).unwrap();
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].price_feed_id, feed_id);
-        assert_eq!(result[0].output.as_ref(), &output);
-        assert_eq!(result[0].depth, 0);
-    }
-
-    #[test]
-    fn test_find_pyth_calls_nested() {
-        let pyth_selector = crate::bindings::IPyth::getPriceUnsafeCall::SELECTOR;
-        let mut input = pyth_selector.to_vec();
-        let feed_id = B256::repeat_byte(0xbb);
-        input.extend_from_slice(feed_id.as_slice());
-
-        let output = vec![0xaa, 0xbb, 0xcc];
-
-        let nested_pyth_call = create_test_call_frame(
-            BASE_PYTH_CONTRACT_ADDRESS,
-            input,
-            Some(output.clone()),
-            vec![],
-        );
-
-        let root_call = create_test_call_frame(
-            Address::repeat_byte(0x11),
-            vec![0x01, 0x02, 0x03, 0x04],
-            Some(vec![0x05, 0x06]),
-            vec![nested_pyth_call],
-        );
-
-        let trace = GethTrace::CallTracer(root_call);
-        let result = find_pyth_calls(&trace).unwrap();
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].price_feed_id, feed_id);
-        assert_eq!(result[0].output.as_ref(), &output);
-        assert_eq!(result[0].depth, 1);
-    }
-
-    #[test]
-    fn test_find_pyth_calls_multiple() {
-        let pyth_selector1 = crate::bindings::IPyth::getPriceNoOlderThanCall::SELECTOR;
-        let pyth_selector2 = crate::bindings::IPyth::getEmaPriceNoOlderThanCall::SELECTOR;
-
-        let mut input1 = pyth_selector1.to_vec();
-        let feed_id1 = B256::repeat_byte(0xcc);
-        input1.extend_from_slice(feed_id1.as_slice());
-
-        let mut input2 = pyth_selector2.to_vec();
-        let feed_id2 = B256::repeat_byte(0xdd);
-        input2.extend_from_slice(feed_id2.as_slice());
-
-        let output1 = vec![0x01, 0x02];
-        let output2 = vec![0x03, 0x04];
-
-        let pyth_call1 = create_test_call_frame(
-            BASE_PYTH_CONTRACT_ADDRESS,
-            input1,
-            Some(output1.clone()),
-            vec![],
-        );
-        let pyth_call2 = create_test_call_frame(
-            BASE_PYTH_CONTRACT_ADDRESS,
-            input2,
-            Some(output2.clone()),
-            vec![],
-        );
-
-        let root_call = create_test_call_frame(
-            Address::repeat_byte(0x11),
-            vec![0x01, 0x02],
-            Some(vec![0x05]),
-            vec![pyth_call1, pyth_call2],
-        );
-
-        let trace = GethTrace::CallTracer(root_call);
-        let result = find_pyth_calls(&trace).unwrap();
-
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].price_feed_id, feed_id1);
-        assert_eq!(result[0].output.as_ref(), &output1);
-        assert_eq!(result[0].depth, 1);
-        assert_eq!(result[1].price_feed_id, feed_id2);
-        assert_eq!(result[1].output.as_ref(), &output2);
-        assert_eq!(result[1].depth, 1);
-    }
-
-    #[test]
-    fn test_find_pyth_calls_no_pyth_calls() {
-        let call_frame = create_test_call_frame(
-            Address::repeat_byte(0x11),
-            vec![0x01, 0x02, 0x03, 0x04],
-            Some(vec![0x05, 0x06]),
-            vec![],
-        );
-
-        let trace = GethTrace::CallTracer(call_frame);
-        let result = find_pyth_calls(&trace).unwrap();
-
-        assert_eq!(result.len(), 0);
-    }
-
-    #[test]
-    fn test_find_pyth_calls_wrong_selector() {
-        let wrong_selector = vec![0xff, 0xff, 0xff, 0xff];
-        let mut input = wrong_selector;
-        input.extend_from_slice(&[0u8; 32]);
-
-        let call_frame =
-            create_test_call_frame(BASE_PYTH_CONTRACT_ADDRESS, input, Some(vec![0x01]), vec![]);
-
-        let trace = GethTrace::CallTracer(call_frame);
-        let result = find_pyth_calls(&trace).unwrap();
-
-        assert_eq!(result.len(), 0);
-    }
-
-    #[test]
-    fn test_find_pyth_calls_no_output() {
-        let pyth_selector = crate::bindings::IPyth::getPriceNoOlderThanCall::SELECTOR;
-        let mut input = pyth_selector.to_vec();
-        input.extend_from_slice(&[0u8; 32]);
-
-        let call_frame = create_test_call_frame(BASE_PYTH_CONTRACT_ADDRESS, input, None, vec![]);
-
-        let trace = GethTrace::CallTracer(call_frame);
-        let result = find_pyth_calls(&trace).unwrap();
-
-        assert_eq!(result.len(), 0);
-    }
-
-    #[test]
-    fn test_find_pyth_calls_deeply_nested() {
-        let pyth_selector = crate::bindings::IPyth::getPriceNoOlderThanCall::SELECTOR;
-        let mut input = pyth_selector.to_vec();
-        let feed_id = B256::repeat_byte(0xee);
-        input.extend_from_slice(feed_id.as_slice());
-
-        let output = vec![0xde, 0xad];
-
-        let level_3_pyth = create_test_call_frame(
-            BASE_PYTH_CONTRACT_ADDRESS,
-            input,
-            Some(output.clone()),
-            vec![],
-        );
-
-        let level_2 = create_test_call_frame(
-            Address::repeat_byte(0x22),
-            vec![0x01],
-            Some(vec![0x02]),
-            vec![level_3_pyth],
-        );
-
-        let level_1 = create_test_call_frame(
-            Address::repeat_byte(0x11),
-            vec![0x03],
-            Some(vec![0x04]),
-            vec![level_2],
-        );
-
-        let trace = GethTrace::CallTracer(level_1);
-        let result = find_pyth_calls(&trace).unwrap();
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].price_feed_id, feed_id);
-        assert_eq!(result[0].output.as_ref(), &output);
-        assert_eq!(result[0].depth, 2);
-    }
-
-    #[test]
-    fn test_is_pyth_method_selector_valid_selectors() {
-        let selectors = [
-            crate::bindings::IPyth::getPriceNoOlderThanCall::SELECTOR,
-            crate::bindings::IPyth::getPriceUnsafeCall::SELECTOR,
-            crate::bindings::IPyth::getEmaPriceNoOlderThanCall::SELECTOR,
-            crate::bindings::IPyth::getEmaPriceUnsafeCall::SELECTOR,
-        ];
-
-        for selector in selectors {
-            let mut input = selector.to_vec();
-            let feed_id = B256::repeat_byte(0xff);
-            input.extend_from_slice(feed_id.as_slice());
-
-            assert!(
-                is_pyth_method_selector(&Bytes::from(input)),
-                "Selector {selector:?} should be recognized"
-            );
-        }
-    }
-
-    #[test]
-    fn test_is_pyth_method_selector_invalid() {
-        let invalid_input = Bytes::from(vec![0xff, 0xff, 0xff, 0xff]);
-        assert!(!is_pyth_method_selector(&invalid_input));
-
-        let short_input = Bytes::from(vec![0x01, 0x02]);
-        assert!(!is_pyth_method_selector(&short_input));
-
-        let empty_input = Bytes::from(vec![]);
-        assert!(!is_pyth_method_selector(&empty_input));
-    }
-
-    #[test]
-    fn test_decode_pyth_price_valid() {
+    #[tokio::test]
+    async fn extract_pyth_price_reads_getpriceunsafe_result() {
+        // Real prod values for the COIN feed at block 47198127, verified to
+        // match a debug_traceTransaction of the same fill.
         let price = Price {
-            price: 100_000,
-            conf: 500,
+            price: 15_445_005,
+            conf: 21_005,
             expo: -5,
-            publishTime: U256::from(1_700_000_000u64),
+            publishTime: U256::from(1_781_166_017u64),
         };
 
-        let encoded = Price::abi_encode(&price);
-        let encoded_bytes = Bytes::from(encoded);
+        // NOTE: `Asserter` pops queued responses without inspecting the request,
+        // so this test verifies decoding but NOT that `feed_id` and
+        // `block_number` are forwarded into the call (the `.block(...)` pinning).
+        // That forwarding is a plain alloy call-builder construction; an
+        // Anvil-fork test asserting a historical-block read is a follow-up.
+        let asserter = Asserter::new();
+        asserter.push_success(&encode_price_return(&price));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        let decoded = decode_pyth_price(&encoded_bytes).unwrap();
+        let feed_id = b256!("0xfee33f2a978bf32dd6b662b65ba8083c6773b494f8401194ec1870c640860245");
 
-        assert_eq!(decoded.price, 100_000);
-        assert_eq!(decoded.conf, 500);
-        assert_eq!(decoded.expo, -5);
-        assert_eq!(
-            decoded.publishTime,
-            alloy::primitives::U256::from(1_700_000_000u64)
-        );
+        let result = extract_pyth_price(&provider, feed_id, 47_198_127)
+            .await
+            .unwrap();
+
+        assert_eq!(result.price, 15_445_005);
+        assert_eq!(result.conf, 21_005);
+        assert_eq!(result.expo, -5);
+        assert_eq!(result.publishTime, U256::from(1_781_166_017u64));
     }
 
-    #[test]
-    fn test_decode_pyth_price_malformed() {
-        let malformed = Bytes::from(vec![0x01, 0x02, 0x03]);
-        let result = decode_pyth_price(&malformed);
+    #[tokio::test]
+    async fn extract_pyth_price_propagates_rpc_error() {
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("eth_call boom");
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        assert!(matches!(result, Err(PythError::AbiDecode(_))));
+        let result = extract_pyth_price(&provider, B256::random(), 1).await;
+
+        assert!(matches!(result, Err(PythError::Rpc(_))));
     }
 
     #[test]
@@ -676,28 +306,6 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_and_convert_roundtrip() {
-        let original_price = Price {
-            price: 999_999_999,
-            conf: 5000,
-            expo: -8,
-            publishTime: U256::from(1_700_123_456u64),
-        };
-
-        let encoded = Price::abi_encode(&original_price);
-        let encoded_bytes = Bytes::from(encoded);
-
-        let decoded = decode_pyth_price(&encoded_bytes).unwrap();
-        let exact = decoded.to_float().unwrap();
-
-        assert_eq!(decoded.price, original_price.price);
-        assert_eq!(decoded.conf, original_price.conf);
-        assert_eq!(decoded.expo, original_price.expo);
-        assert_eq!(decoded.publishTime, original_price.publishTime);
-        assert_eq!(format_float_with_fallback(&exact), "9.99999999");
-    }
-
-    #[test]
     fn test_scale_with_exponent_negative() {
         let result = scale_with_exponent(&123_456_789, -8).unwrap();
         assert!(result.eq(float!(1.23456789)).unwrap());
@@ -727,35 +335,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_price_feed_id_valid() {
-        let pyth_selector = crate::bindings::IPyth::getPriceNoOlderThanCall::SELECTOR;
-        let mut input = pyth_selector.to_vec();
-        let expected_feed_id = B256::repeat_byte(0xaa);
-        input.extend_from_slice(expected_feed_id.as_slice());
-
-        let bytes = Bytes::from(input);
-        let result = extract_price_feed_id(&bytes).unwrap();
-
-        assert_eq!(result, expected_feed_id);
-    }
-
-    #[test]
-    fn test_extract_price_feed_id_too_short() {
-        let short_input = Bytes::from(vec![0x01, 0x02, 0x03]);
-        let result = extract_price_feed_id(&short_input);
-
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_find_pyth_calls_invalid_trace_variant() {
-        let trace = GethTrace::FourByteTracer(FourByteFrame::default());
-        let result = find_pyth_calls(&trace);
-
-        assert!(matches!(result, Err(PythError::InvalidTraceVariant)));
-    }
-
-    #[test]
     fn test_raw_price_to_pyth_price() {
         let price = Price {
             price: 18_250_000_000,
@@ -773,29 +352,6 @@ mod tests {
             pyth_price.publish_time,
             DateTime::from_timestamp(1_700_000_000, 0).unwrap()
         );
-    }
-
-    #[tokio::test]
-    async fn test_pyth_pricing_invalid_timestamp_propagates_error() {
-        let call_frame = create_test_call_frame(
-            Address::repeat_byte(0x11),
-            vec![0x01, 0x02],
-            Some(vec![0x05]),
-            vec![],
-        );
-        let trace = GethTrace::CallTracer(call_frame);
-
-        let asserter = Asserter::new();
-        asserter.push_success(&serde_json::to_value(&trace).unwrap());
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-
-        let tx_hash = B256::repeat_byte(0xff);
-        let cache = FeedIdCache::new();
-
-        assert!(matches!(
-            extract_pyth_price(tx_hash, &provider, "TEST", &cache).await,
-            Err(PythError::NoPythCall)
-        ));
     }
 
     #[test]
