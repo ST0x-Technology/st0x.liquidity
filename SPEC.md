@@ -315,6 +315,61 @@ queue for idempotency. The complete database schema is defined in
 - Configuration management with environment variables and config files
 - Proper error propagation and custom error types
 
+### Performance Observability
+
+The dashboard exposes a Performance tab measuring the _technological_ health of
+the system (latency and reliability), complementing the P&L tab's economic view.
+All phase-1 metrics are derived read-only from the CQRS event store; no new
+write paths touch the trading path.
+
+#### Hedge latency pipeline
+
+Each onchain fill flows through a measurable pipeline. Metric definitions:
+
+- **Detection latency** (per onchain fill): block timestamp of the fill to the
+  moment the bot observes it (`PositionEvent::OnChainOrderFilled.seen_at` minus
+  `block_timestamp`). High detection latency masquerades as inventory leaks
+  during operations.
+- **Decision latency** (per hedge order): observation of the fill that crossed
+  the execution threshold to hedge placement (`OffChainOrderPlaced.placed_at`
+  minus the latest covered fill's `seen_at`).
+- **Submission latency** (per hedge order): hedge placement to broker acceptance
+  (`OffchainOrderEvent::Submitted.submitted_at` minus `placed_at`).
+- **Execution latency** (per hedge order): broker acceptance to broker fill
+  (`Filled.filled_at` minus `submitted_at`).
+- **Total exposure window** (per hedge order): earliest covered fill's block
+  timestamp to broker fill. This is the headline metric: the period during which
+  the system carries unhedged delta, where technical latency becomes financial
+  risk.
+
+Because hedges trigger on execution thresholds, a single hedge order may cover
+several accumulated onchain fills. Attribution folds each Position aggregate's
+event stream in sequence order: fills accumulate as _uncovered_ until an
+`OffChainOrderPlaced` event consumes the batch. The batch stays parked with the
+in-flight order until it reaches a terminal state: a failed hedge returns its
+fills to the uncovered pool, so the retry that eventually closes the risk
+inherits the attribution (and its exposure window spans back to the original
+fill). Fills not covered by any in-flight or completed hedge constitute the
+_open exposure_ (reported with the oldest fill's age). Completed hedges use the
+broker's own fill timestamp (from the Position stream) rather than the bot's
+reconciliation time, so execution latency excludes polling delay. A manual
+position adjustment resets attribution, since accumulated fills no longer drive
+hedging decisions.
+
+#### Roundtrip and reliability metrics
+
+- **Rebalance stage timing**: per-stage durations of USDC rebalances
+  (withdrawal, CCTP burn -> attestation -> mint, deposit, conversion) derived
+  from `UsdcRebalanceEvent` timestamps, including attestation-time trends.
+- **Reliability**: error/warning counts by severity, module, and time bucket
+  from the structured log store; lifecycle failure events (failed hedges, failed
+  rebalance stages, rejections) as an impact-weighted category; job queue health
+  (failures, retry distribution, oldest pending age).
+
+Phase 2 adds instrumentation for signals not yet captured: chain tip vs backfill
+checkpoint (block lag), poll-cycle duration and skipped ticks, and RPC/broker
+API latency, persisted in a lightweight telemetry store outside the event store.
+
 ### Risk Management
 
 - Manual override capabilities for emergency situations with proper
