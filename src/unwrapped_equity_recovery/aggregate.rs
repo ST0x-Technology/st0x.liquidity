@@ -816,6 +816,7 @@ mod tests {
     use st0x_raindex::RaindexVaultId;
     use st0x_wrapper::MockWrapper;
 
+    use crate::equity_redemption::redemption_aggregate_id;
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::tokenization::mock::MockTokenizer;
@@ -1513,7 +1514,7 @@ mod tests {
         let events = detected()
             .transition(
                 UnwrappedEquityRecoveryCommand::DispatchToRedemption {
-                    redemption_id: RedemptionAggregateId("nonexistent".to_string()),
+                    redemption_id: redemption_aggregate_id("nonexistent"),
                 },
                 &services,
             )

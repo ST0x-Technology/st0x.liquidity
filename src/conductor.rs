@@ -63,7 +63,8 @@ use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::position_check::{CheckPositionsJobQueue, bootstrap_check_positions};
 use crate::rebalancing::equity::{
-    CrossVenueEquityTransfer, EquityTransferServices, TransferEquityToMarketMakingCtx,
+    CrossVenueEquityTransfer, EquityTransferServices, TransferEquityToHedgingCtx,
+    TransferEquityToMarketMakingCtx,
 };
 use crate::rebalancing::usdc::{
     TransferUsdcToHedgingCtx, TransferUsdcToMarketMakingCtx, UsdcSettlementParams,
@@ -194,6 +195,7 @@ async fn requeue_wired_transfer_orphans(
     usdc_to_hedging_ctx: Option<&Arc<TransferUsdcToHedgingCtx>>,
     usdc_to_market_making_ctx: Option<&Arc<TransferUsdcToMarketMakingCtx>>,
     equity_to_market_making_ctx: Option<&Arc<TransferEquityToMarketMakingCtx>>,
+    equity_to_hedging_ctx: Option<&Arc<TransferEquityToHedgingCtx>>,
 ) -> anyhow::Result<()> {
     if usdc_to_hedging_ctx.is_some() {
         requeue_transfer_orphans(&schedulers.transfer_usdc_to_hedging, "Base->Alpaca").await?;
@@ -208,6 +210,14 @@ async fn requeue_wired_transfer_orphans(
         requeue_transfer_orphans(
             &schedulers.transfer_equity_to_market_making,
             "equity hedging->market-making",
+        )
+        .await?;
+    }
+
+    if equity_to_hedging_ctx.is_some() {
+        requeue_transfer_orphans(
+            &schedulers.transfer_equity_to_hedging,
+            "equity market-making->hedging",
         )
         .await?;
     }
@@ -408,6 +418,7 @@ impl Conductor {
             transfer_usdc_to_hedging_ctx,
             transfer_usdc_to_market_making_ctx,
             transfer_equity_to_market_making_ctx,
+            transfer_equity_to_hedging_ctx,
         } = PositionAndRebalancing::setup(
             rebalancing,
             &ctx,
@@ -426,6 +437,7 @@ impl Conductor {
             transfer_usdc_to_hedging_ctx.as_ref(),
             transfer_usdc_to_market_making_ctx.as_ref(),
             transfer_equity_to_market_making_ctx.as_ref(),
+            transfer_equity_to_hedging_ctx.as_ref(),
         )
         .await?;
 
@@ -552,6 +564,8 @@ impl Conductor {
             .maybe_transfer_usdc_to_market_making_ctx(transfer_usdc_to_market_making_ctx)
             .transfer_equity_to_market_making_queue(schedulers.transfer_equity_to_market_making)
             .maybe_transfer_equity_to_market_making_ctx(transfer_equity_to_market_making_ctx)
+            .transfer_equity_to_hedging_queue(schedulers.transfer_equity_to_hedging)
+            .maybe_transfer_equity_to_hedging_ctx(transfer_equity_to_hedging_ctx)
             .maybe_rebalancing_service(rebalancing_service)
             .seed_vault_registry_queue(seed_vault_registry_queue)
             .seed_vault_registry_ctx(seed_vault_registry_ctx)
@@ -939,6 +953,7 @@ struct RebalancingInfrastructure {
     transfer_usdc_to_hedging_ctx: Arc<TransferUsdcToHedgingCtx>,
     transfer_usdc_to_market_making_ctx: Arc<TransferUsdcToMarketMakingCtx>,
     transfer_equity_to_market_making_ctx: Arc<TransferEquityToMarketMakingCtx>,
+    transfer_equity_to_hedging_ctx: Arc<TransferEquityToHedgingCtx>,
 }
 
 /// Shared infrastructure dependencies needed to spawn rebalancing.
@@ -974,6 +989,7 @@ struct PositionAndRebalancing {
     transfer_usdc_to_hedging_ctx: Option<Arc<TransferUsdcToHedgingCtx>>,
     transfer_usdc_to_market_making_ctx: Option<Arc<TransferUsdcToMarketMakingCtx>>,
     transfer_equity_to_market_making_ctx: Option<Arc<TransferEquityToMarketMakingCtx>>,
+    transfer_equity_to_hedging_ctx: Option<Arc<TransferEquityToHedgingCtx>>,
 }
 
 impl PositionAndRebalancing {
@@ -1035,6 +1051,7 @@ impl PositionAndRebalancing {
                 transfer_equity_to_market_making_ctx: Some(
                     infra.transfer_equity_to_market_making_ctx,
                 ),
+                transfer_equity_to_hedging_ctx: Some(infra.transfer_equity_to_hedging_ctx),
             })
         } else {
             let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
@@ -1065,6 +1082,7 @@ impl PositionAndRebalancing {
                 transfer_usdc_to_hedging_ctx: None,
                 transfer_usdc_to_market_making_ctx: None,
                 transfer_equity_to_market_making_ctx: None,
+                transfer_equity_to_hedging_ctx: None,
             })
         }
     }
@@ -1295,6 +1313,10 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             transfer: recovery_transfer.clone(),
         });
 
+        let transfer_equity_to_hedging_ctx = Arc::new(TransferEquityToHedgingCtx {
+            transfer: recovery_transfer.clone(),
+        });
+
         Ok(RebalancingInfrastructure {
             position: built.position,
             position_projection: built.position_projection,
@@ -1311,6 +1333,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             transfer_usdc_to_hedging_ctx,
             transfer_usdc_to_market_making_ctx,
             transfer_equity_to_market_making_ctx,
+            transfer_equity_to_hedging_ctx,
         })
     })
 }

@@ -64,8 +64,10 @@ use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
+use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use st0x_dto::{EquityRedemptionOperation, EquityRedemptionStatus, TransferOperation};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
@@ -81,27 +83,39 @@ use crate::tokenized_equity_mint::TokenizationRequestId;
 const TOKENIZED_EQUITY_DECIMALS: u8 = 18;
 
 /// Unique identifier for a redemption aggregate instance.
+///
+/// Mirrors [`crate::tokenized_equity_mint::IssuerRequestId`]: a UUID chosen at
+/// enqueue time so apalis retries and bot restarts always target the same
+/// aggregate.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub(crate) struct RedemptionAggregateId(pub(crate) String);
+pub(crate) struct RedemptionAggregateId(pub(crate) Uuid);
 
 impl RedemptionAggregateId {
-    pub(crate) fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
+    pub(crate) fn generate() -> Self {
+        Self(Uuid::new_v4())
     }
 }
 
-impl std::fmt::Display for RedemptionAggregateId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+impl Display for RedemptionAggregateId {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.0)
     }
 }
 
 impl FromStr for RedemptionAggregateId {
-    type Err = std::convert::Infallible;
+    type Err = uuid::Error;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(Self(value.to_string()))
+        Ok(Self(Uuid::parse_str(value)?))
     }
+}
+
+/// Deterministic redemption aggregate id for tests. Maps a human-readable label
+/// to a UUID v5 so test aggregate ids stay valid [`RedemptionAggregateId`]
+/// values.
+#[cfg(test)]
+pub(crate) fn redemption_aggregate_id(label: &str) -> RedemptionAggregateId {
+    RedemptionAggregateId(Uuid::new_v5(&Uuid::NAMESPACE_OID, label.as_bytes()))
 }
 
 /// Errors that can occur during equity redemption operations.
@@ -856,7 +870,7 @@ impl EquityRedemption {
                 pending_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.0.clone()),
+                id: Id::new(id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::Withdrawing,
@@ -870,7 +884,7 @@ impl EquityRedemption {
                 submitted_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.0.clone()),
+                id: Id::new(id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::Withdrawing,
@@ -884,7 +898,7 @@ impl EquityRedemption {
                 withdrawn_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.0.clone()),
+                id: Id::new(id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::Withdrawing,
@@ -904,7 +918,7 @@ impl EquityRedemption {
                 withdrawn_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.0.clone()),
+                id: Id::new(id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::Unwrapping,
@@ -926,7 +940,7 @@ impl EquityRedemption {
                 unwrapped_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.0.clone()),
+                id: Id::new(id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::Unwrapping,
@@ -940,7 +954,7 @@ impl EquityRedemption {
                 sent_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.0.clone()),
+                id: Id::new(id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::Sending,
@@ -955,7 +969,7 @@ impl EquityRedemption {
                 detected_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.0.clone()),
+                id: Id::new(id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::PendingConfirmation,
@@ -970,7 +984,7 @@ impl EquityRedemption {
                 completed_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.0.clone()),
+                id: Id::new(id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::Completed {
@@ -987,7 +1001,7 @@ impl EquityRedemption {
                 failed_at,
                 ..
             } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
-                id: Id::new(id.0.clone()),
+                id: Id::new(id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: EquityRedemptionStatus::Failed {
@@ -1987,16 +2001,20 @@ pub(crate) async fn symbols_with_stuck_redemptions(
 
     let mut result: HashMap<Symbol, FractionalShares> = HashMap::new();
 
-    for (aggregate_id, raw_symbol, raw_quantity, raw_wrapped_amount) in rows {
-        let Some(symbol) = parse_stuck_symbol(&aggregate_id, raw_symbol) else {
+    for (raw_aggregate_id, raw_symbol, raw_quantity, raw_wrapped_amount) in rows {
+        let Ok(aggregate_id) = RedemptionAggregateId::from_str(&raw_aggregate_id) else {
+            warn!(target: "rebalance",
+                %raw_aggregate_id,
+                "Stuck redemption has invalid aggregate id, skipping"
+            );
             continue;
         };
 
-        let Some(quantity) = parse_stuck_quantity(
-            RedemptionAggregateId::new(&aggregate_id),
-            raw_quantity,
-            raw_wrapped_amount,
-        )?
+        let Some(symbol) = parse_stuck_symbol(&raw_aggregate_id, raw_symbol) else {
+            continue;
+        };
+
+        let Some(quantity) = parse_stuck_quantity(aggregate_id, raw_quantity, raw_wrapped_amount)?
         else {
             continue;
         };
@@ -2007,7 +2025,7 @@ pub(crate) async fn symbols_with_stuck_redemptions(
             Err(error) => {
                 warn!(target: "rebalance",
                     %error,
-                    %aggregate_id,
+                    %raw_aggregate_id,
                     "Float overflow summing stuck redemption quantities, \
                      keeping accumulated value"
                 );
@@ -2134,7 +2152,21 @@ pub(crate) async fn interrupted_redemption_ids(
     .fetch_all(pool)
     .await?;
 
-    Ok(rows.into_iter().map(RedemptionAggregateId::new).collect())
+    Ok(rows
+        .into_iter()
+        .filter_map(|aggregate_id| {
+            aggregate_id
+                .parse::<RedemptionAggregateId>()
+                .inspect_err(|error| {
+                    warn!(target: "rebalance",
+                        %error,
+                        %aggregate_id,
+                        "Interrupted redemption has invalid aggregate id, skipping"
+                    );
+                })
+                .ok()
+        })
+        .collect())
 }
 
 fn parse_stuck_symbol(aggregate_id: &str, raw: Option<String>) -> Option<Symbol> {
@@ -2400,7 +2432,7 @@ mod tests {
     #[tokio::test]
     async fn complete_redemption_flow_end_to_end() {
         let store = TestStore::<EquityRedemption>::new(mock_services());
-        let id = RedemptionAggregateId::new("end-to-end");
+        let id = redemption_aggregate_id("end-to-end");
 
         store
             .send(
@@ -2482,7 +2514,7 @@ mod tests {
         };
 
         let store = TestStore::<EquityRedemption>::new(services);
-        let id = RedemptionAggregateId::new("underlying-token-fix");
+        let id = redemption_aggregate_id("underlying-token-fix");
 
         store
             .send(
@@ -2555,7 +2587,7 @@ mod tests {
             wrapper: Arc::new(MockWrapper::new()),
         };
         let store = TestStore::<EquityRedemption>::new(services);
-        let id = RedemptionAggregateId::new("partial-withdraw");
+        let id = redemption_aggregate_id("partial-withdraw");
 
         store
             .send(
@@ -2603,7 +2635,7 @@ mod tests {
             wrapper: Arc::new(MockWrapper::new()),
         };
         let store = TestStore::<EquityRedemption>::new(services);
-        let id = RedemptionAggregateId::new("unwrap-partial-withdraw");
+        let id = redemption_aggregate_id("unwrap-partial-withdraw");
 
         store
             .send(
@@ -2662,7 +2694,7 @@ mod tests {
             wrapper: Arc::new(MockWrapper::new()),
         };
         let store = TestStore::<EquityRedemption>::new(services);
-        let id = RedemptionAggregateId::new("missing-withdraw-transfer");
+        let id = redemption_aggregate_id("missing-withdraw-transfer");
 
         store
             .send(
@@ -3036,7 +3068,7 @@ mod tests {
         };
 
         let store = TestStore::<EquityRedemption>::new(services);
-        let id = RedemptionAggregateId::new("send-fail");
+        let id = redemption_aggregate_id("send-fail");
 
         store
             .send(
@@ -3103,7 +3135,7 @@ mod tests {
         };
 
         let store = TestStore::<EquityRedemption>::new(services);
-        let id = RedemptionAggregateId::new("no-wallet");
+        let id = redemption_aggregate_id("no-wallet");
 
         store
             .send(
@@ -3218,7 +3250,7 @@ mod tests {
     #[tokio::test]
     async fn redeem_when_already_started_returns_already_started() {
         let store = TestStore::<EquityRedemption>::new(mock_services());
-        let id = RedemptionAggregateId::new("redemption-1");
+        let id = redemption_aggregate_id("redemption-1");
 
         store
             .send(
@@ -3255,7 +3287,7 @@ mod tests {
     #[tokio::test]
     async fn redeem_when_pending_returns_already_started() {
         let store = TestStore::<EquityRedemption>::new(mock_services());
-        let id = RedemptionAggregateId::new("redemption-1");
+        let id = redemption_aggregate_id("redemption-1");
 
         store
             .send(
@@ -3337,7 +3369,7 @@ mod tests {
     /// Insert a minimal event row into the events table.
     async fn insert_event(
         pool: &SqlitePool,
-        aggregate_id: &str,
+        aggregate_id: &RedemptionAggregateId,
         sequence: i64,
         event_type: &str,
         payload: &str,
@@ -3348,7 +3380,7 @@ mod tests {
               event_version, payload, metadata) \
              VALUES ('EquityRedemption', ?1, ?2, ?3, '1', ?4, '{}')",
         )
-        .bind(aggregate_id)
+        .bind(aggregate_id.to_string())
         .bind(sequence)
         .bind(event_type)
         .bind(payload)
@@ -3376,7 +3408,7 @@ mod tests {
         // AAPL: WithdrawnFromRaindex -> DetectionFailed (stuck)
         insert_event(
             &pool,
-            "redemption-1",
+            &redemption_aggregate_id("redemption-1"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("AAPL"),
@@ -3384,7 +3416,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "redemption-1",
+            &redemption_aggregate_id("redemption-1"),
             1,
             "EquityRedemptionEvent::DetectionFailed",
             r#"{"DetectionFailed":{"failure":"Timeout","failed_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3408,7 +3440,7 @@ mod tests {
 
         insert_event(
             &pool,
-            "partial-redemption",
+            &redemption_aggregate_id("partial-redemption"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("COIN"),
@@ -3416,7 +3448,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "partial-redemption",
+            &redemption_aggregate_id("partial-redemption"),
             1,
             "EquityRedemptionEvent::TokensUnwrapped",
             &tokens_unwrapped_payload("7.5", "7500000000000000000"),
@@ -3424,7 +3456,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "partial-redemption",
+            &redemption_aggregate_id("partial-redemption"),
             2,
             "EquityRedemptionEvent::DetectionFailed",
             r#"{"DetectionFailed":{"failure":"Timeout","failed_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3447,7 +3479,7 @@ mod tests {
 
         insert_event(
             &pool,
-            "invalid-actual",
+            &redemption_aggregate_id("invalid-actual"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("COIN"),
@@ -3455,7 +3487,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "invalid-actual",
+            &redemption_aggregate_id("invalid-actual"),
             1,
             "EquityRedemptionEvent::TokensUnwrapped",
             &tokens_unwrapped_payload("invalid", "invalid"),
@@ -3463,7 +3495,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "invalid-actual",
+            &redemption_aggregate_id("invalid-actual"),
             2,
             "EquityRedemptionEvent::DetectionFailed",
             r#"{"DetectionFailed":{"failure":"Timeout","failed_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3485,7 +3517,7 @@ mod tests {
         // TSLA: WithdrawnFromRaindex -> RedemptionRejected (stuck)
         insert_event(
             &pool,
-            "redemption-2",
+            &redemption_aggregate_id("redemption-2"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("TSLA"),
@@ -3493,7 +3525,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "redemption-2",
+            &redemption_aggregate_id("redemption-2"),
             1,
             "EquityRedemptionEvent::RedemptionRejected",
             r#"{"RedemptionRejected":{"reason":"test","rejected_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3518,7 +3550,7 @@ mod tests {
         // AAPL: DetectionFailed (stuck)
         insert_event(
             &pool,
-            "stuck",
+            &redemption_aggregate_id("stuck"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("AAPL"),
@@ -3526,7 +3558,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "stuck",
+            &redemption_aggregate_id("stuck"),
             1,
             "EquityRedemptionEvent::DetectionFailed",
             r#"{"DetectionFailed":{"failure":"Timeout","failed_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3536,7 +3568,7 @@ mod tests {
         // MSFT: Completed (not stuck)
         insert_event(
             &pool,
-            "completed",
+            &redemption_aggregate_id("completed"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("MSFT"),
@@ -3544,7 +3576,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "completed",
+            &redemption_aggregate_id("completed"),
             1,
             "EquityRedemptionEvent::Completed",
             r#"{"Completed":{"completed_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3554,7 +3586,7 @@ mod tests {
         // GOOG: TransferFailed (not stuck — tokens still in our wallet)
         insert_event(
             &pool,
-            "transfer-failed",
+            &redemption_aggregate_id("transfer-failed"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("GOOG"),
@@ -3562,7 +3594,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "transfer-failed",
+            &redemption_aggregate_id("transfer-failed"),
             1,
             "EquityRedemptionEvent::TransferFailed",
             r#"{"TransferFailed":{"tx_hash":null,"failed_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3586,7 +3618,7 @@ mod tests {
 
         insert_event(
             &pool,
-            "resume-me",
+            &redemption_aggregate_id("resume-me"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("AAPL"),
@@ -3594,7 +3626,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "resume-me",
+            &redemption_aggregate_id("resume-me"),
             1,
             "EquityRedemptionEvent::TokensSent",
             r#"{"TokensSent":{"redemption_wallet":"0x0000000000000000000000000000000000000001","redemption_tx":"0x0000000000000000000000000000000000000000000000000000000000000002","sent_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3603,7 +3635,7 @@ mod tests {
 
         insert_event(
             &pool,
-            "completed",
+            &redemption_aggregate_id("completed"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("TSLA"),
@@ -3611,7 +3643,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "completed",
+            &redemption_aggregate_id("completed"),
             1,
             "EquityRedemptionEvent::Completed",
             r#"{"Completed":{"completed_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3619,7 +3651,7 @@ mod tests {
         .await;
 
         let result = interrupted_redemption_ids(&pool).await.unwrap();
-        assert_eq!(result, vec![RedemptionAggregateId::new("resume-me")]);
+        assert_eq!(result, vec![redemption_aggregate_id("resume-me")]);
     }
 
     #[tokio::test]
@@ -3637,7 +3669,7 @@ mod tests {
         // AAPL: valid stuck redemption (DetectionFailed)
         insert_event(
             &pool,
-            "valid-stuck",
+            &redemption_aggregate_id("valid-stuck"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("AAPL"),
@@ -3645,7 +3677,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "valid-stuck",
+            &redemption_aggregate_id("valid-stuck"),
             1,
             "EquityRedemptionEvent::DetectionFailed",
             r#"{"DetectionFailed":{"failure":"Timeout","failed_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3655,7 +3687,7 @@ mod tests {
         // NULL symbol: malformed WithdrawnFromRaindex payload missing symbol
         insert_event(
             &pool,
-            "null-symbol",
+            &redemption_aggregate_id("null-symbol"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             r#"{"WithdrawnFromRaindex":{"quantity":"10","token":"0x0000000000000000000000000000000000000001","wrapped_amount":"10000000000000000000","raindex_withdraw_tx":"0x0000000000000000000000000000000000000000000000000000000000000001","withdrawn_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3663,7 +3695,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "null-symbol",
+            &redemption_aggregate_id("null-symbol"),
             1,
             "EquityRedemptionEvent::RedemptionRejected",
             r#"{"RedemptionRejected":{"reason":"test","rejected_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3673,7 +3705,7 @@ mod tests {
         // Invalid symbol: symbol fails Symbol::new validation
         insert_event(
             &pool,
-            "invalid-symbol",
+            &redemption_aggregate_id("invalid-symbol"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload(""),
@@ -3681,7 +3713,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "invalid-symbol",
+            &redemption_aggregate_id("invalid-symbol"),
             1,
             "EquityRedemptionEvent::DetectionFailed",
             r#"{"DetectionFailed":{"failure":"Timeout","failed_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3707,7 +3739,7 @@ mod tests {
 
     #[test]
     fn to_dto_maps_in_progress_variants() {
-        let id = RedemptionAggregateId::new("REDEEM-001");
+        let id = redemption_aggregate_id("REDEEM-001");
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
         let later = now + chrono::Duration::seconds(60);
@@ -3726,7 +3758,7 @@ mod tests {
                 withdrawn.to_dto(&id)
             );
         };
-        assert_eq!(op.id, Id::new("REDEEM-001"));
+        assert_eq!(op.id, Id::new(id.to_string()));
         assert_eq!(op.symbol, symbol);
         assert_eq!(op.quantity, FractionalShares::new(float!(50.25)));
         assert!(
@@ -3807,7 +3839,7 @@ mod tests {
         // AAPL: latest event is WithdrawnFromRaindex (active)
         insert_event(
             &pool,
-            "redemption-active-1",
+            &redemption_aggregate_id("redemption-active-1"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("AAPL"),
@@ -3817,7 +3849,7 @@ mod tests {
         // TSLA: latest event is Detected (active)
         insert_event(
             &pool,
-            "redemption-active-2",
+            &redemption_aggregate_id("redemption-active-2"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("TSLA"),
@@ -3825,7 +3857,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "redemption-active-2",
+            &redemption_aggregate_id("redemption-active-2"),
             1,
             "EquityRedemptionEvent::TokensSent",
             r#"{"TokensSent":{"sent_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3833,7 +3865,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "redemption-active-2",
+            &redemption_aggregate_id("redemption-active-2"),
             2,
             "EquityRedemptionEvent::Detected",
             r#"{"Detected":{"tokenization_request_id":"TOK001","detected_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3853,7 +3885,7 @@ mod tests {
         // AAPL: completed (terminal) — should be excluded
         insert_event(
             &pool,
-            "redemption-terminal-1",
+            &redemption_aggregate_id("redemption-terminal-1"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("AAPL"),
@@ -3861,7 +3893,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "redemption-terminal-1",
+            &redemption_aggregate_id("redemption-terminal-1"),
             1,
             "EquityRedemptionEvent::Completed",
             r#"{"Completed":{"redemption_tx":"0x0000000000000000000000000000000000000000000000000000000000000001","tokenization_request_id":"TOK001","completed_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3871,7 +3903,7 @@ mod tests {
         // TSLA: detection failed (terminal) — should be excluded
         insert_event(
             &pool,
-            "redemption-terminal-2",
+            &redemption_aggregate_id("redemption-terminal-2"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("TSLA"),
@@ -3879,7 +3911,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "redemption-terminal-2",
+            &redemption_aggregate_id("redemption-terminal-2"),
             1,
             "EquityRedemptionEvent::DetectionFailed",
             r#"{"DetectionFailed":{"failure":"Timeout","failed_at":"2026-01-01T00:00:00Z"}}"#,
@@ -3900,7 +3932,7 @@ mod tests {
         // Two active redemptions for the same symbol
         insert_event(
             &pool,
-            "redemption-dup-1",
+            &redemption_aggregate_id("redemption-dup-1"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("AAPL"),
@@ -3908,7 +3940,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "redemption-dup-2",
+            &redemption_aggregate_id("redemption-dup-2"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("AAPL"),
@@ -3927,7 +3959,7 @@ mod tests {
         // Row with NULL symbol in payload (corrupt data)
         insert_event(
             &pool,
-            "redemption-null",
+            &redemption_aggregate_id("redemption-null"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             r#"{"WithdrawnFromRaindex":{}}"#,
@@ -3937,7 +3969,7 @@ mod tests {
         // Valid row alongside the corrupt one
         insert_event(
             &pool,
-            "redemption-valid",
+            &redemption_aggregate_id("redemption-valid"),
             0,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             &withdrawn_payload("NVDA"),
@@ -3951,7 +3983,7 @@ mod tests {
 
     #[test]
     fn to_dto_maps_terminal_variants() {
-        let id = RedemptionAggregateId::new("REDEEM-001");
+        let id = redemption_aggregate_id("REDEEM-001");
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
         let later = now + chrono::Duration::seconds(60);
