@@ -3114,8 +3114,12 @@ effect rather than a generic intent:
   A defaulted reason is an audit-hostile record and violates the
   no-silent-defaults rule. The pre-existing `fail-pending-offchain-order` and
   `fail-transfer` predate this rule and carry defaulted reasons, and
-  `reconcile-usdc-transfer` shipped with one just before this rule was codified;
-  a later step of the unification epic removes all three defaults.
+  `reconcile-usdc-transfer` shipped with one just before this rule was codified.
+  The rename step carries those defaults onto the renamed forms unchanged
+  (`fail-pending-offchain-order` is a clap alias sharing its canonical command's
+  arguments, and the flat `fail-transfer` / `reconcile-usdc-transfer` variants
+  keep their legacy shape for compatibility); the next step of the unification
+  epic removes the defaults everywhere.
 - **`fail` and `reconcile` are distinct and must not be conflated.** `fail` is
   for an operation the system is still waiting on (force it to a clean
   terminal); `reconcile` is for an operation that already failed and whose guard

@@ -1191,6 +1191,44 @@ impl UsdcRebalance {
             | Self::Reconciled { .. } => None,
         }
     }
+
+    /// The persisted effective amount of the transfer (post-conversion /
+    /// post-fee where applicable), as opposed to whatever an operator typed
+    /// on a CLI resume.
+    pub(crate) fn amount(&self) -> Usdc {
+        match self {
+            // Post-conversion / post-bridge, the actually received amount is
+            // the effective one; `amount` is the originally requested figure.
+            Self::ConversionComplete { filled_amount, .. } => *filled_amount,
+            Self::Bridged {
+                amount_received, ..
+            } => *amount_received,
+            // The burn adopts the post-withdrawal-fee `burn_amount` when one was
+            // persisted -- matching the `BridgingInitiated` transition and the
+            // manager's resume scan -- so the effective amount is that, not the
+            // nominal. `None` (aggregates persisted before `burn_amount`) falls
+            // back to the nominal `amount`.
+            Self::BridgingSubmitting {
+                amount,
+                burn_amount,
+                ..
+            } => burn_amount.unwrap_or(*amount),
+            Self::Converting { amount, .. }
+            | Self::ConversionFailed { amount, .. }
+            | Self::WithdrawalSubmitting { amount, .. }
+            | Self::Withdrawing { amount, .. }
+            | Self::WithdrawalComplete { amount, .. }
+            | Self::WithdrawalFailed { amount, .. }
+            | Self::Bridging { amount, .. }
+            | Self::AwaitingAttestation { amount, .. }
+            | Self::Attested { amount, .. }
+            | Self::BridgingFailed { amount, .. }
+            | Self::DepositInitiated { amount, .. }
+            | Self::DepositConfirmed { amount, .. }
+            | Self::DepositFailed { amount, .. }
+            | Self::Reconciled { amount, .. } => *amount,
+        }
+    }
 }
 
 /// Candidate `UsdcRebalance` aggregates whose latest event leaves them
@@ -4105,6 +4143,123 @@ mod tests {
             failed_at: now,
         };
         assert_eq!(deposit_failed.direction(), RebalanceDirection::AlpacaToBase);
+    }
+
+    /// `amount()` must return the persisted EFFECTIVE amount: the conversion
+    /// fill once a conversion completed, the post-withdrawal-fee burn amount once
+    /// a `BridgingSubmitting` carries one, and the requested amount otherwise.
+    #[test]
+    fn amount_reads_persisted_effective_amount() {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000002");
+        let now = Utc::now();
+        let requested = Usdc::new(float!(321));
+
+        let bridged = UsdcRebalance::Bridged {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: requested,
+            amount_received: Usdc::new(float!(320)),
+            fee_collected: Usdc::new(float!(1)),
+            burn_tx_hash: burn_tx,
+            mint_tx_hash: burn_tx,
+            initiated_at: now,
+            minted_at: now,
+        };
+        assert_eq!(
+            bridged.amount(),
+            Usdc::new(float!(320)),
+            "post-bridge the received amount is the effective amount",
+        );
+
+        let conversion_failed = UsdcRebalance::ConversionFailed {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: requested,
+            order_id: ClientOrderId::from_uuid(Uuid::from_u128(11)),
+            reason: "broker rejected".to_string(),
+            initiated_at: now,
+            failed_at: now,
+        };
+        assert_eq!(conversion_failed.amount(), requested);
+
+        let conversion_complete = UsdcRebalance::ConversionComplete {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: requested,
+            filled_amount: Usdc::new(float!(319)),
+            initiated_at: now,
+            converted_at: now,
+        };
+        assert_eq!(
+            conversion_complete.amount(),
+            Usdc::new(float!(319)),
+            "post-conversion the filled amount is the effective amount",
+        );
+
+        let deposit_failed = UsdcRebalance::DepositFailed {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: requested,
+            burn_tx_hash: burn_tx,
+            mint_tx_hash: burn_tx,
+            deposit_ref: None,
+            reason: "deposit reverted".to_string(),
+            initiated_at: now,
+            failed_at: now,
+        };
+        assert_eq!(
+            deposit_failed.amount(),
+            requested,
+            "the common reconcile target state reports the requested amount",
+        );
+
+        let bridging_submitting_with_burn = UsdcRebalance::BridgingSubmitting {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: requested,
+            from_block: 100,
+            initiated_at: now,
+            burn_amount: Some(Usdc::new(float!(318))),
+        };
+        assert_eq!(
+            bridging_submitting_with_burn.amount(),
+            Usdc::new(float!(318)),
+            "BridgingSubmitting reports the persisted burn_amount the manager resumes with",
+        );
+
+        let bridging_submitting_legacy = UsdcRebalance::BridgingSubmitting {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: requested,
+            from_block: 100,
+            initiated_at: now,
+            burn_amount: None,
+        };
+        assert_eq!(
+            bridging_submitting_legacy.amount(),
+            requested,
+            "BridgingSubmitting without a persisted burn_amount falls back to the nominal",
+        );
+
+        let converting = UsdcRebalance::Converting {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: requested,
+            order_id: ClientOrderId::from_uuid(Uuid::from_u128(12)),
+            initiated_at: now,
+        };
+        assert_eq!(
+            converting.amount(),
+            requested,
+            "Converting reports the requested amount until a conversion completes",
+        );
+
+        let bridging = UsdcRebalance::Bridging {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: requested,
+            burn_tx_hash: burn_tx,
+            initiated_at: now,
+            burned_at: now,
+        };
+        assert_eq!(
+            bridging.amount(),
+            requested,
+            "Bridging reports the requested amount until the mint lands",
+        );
     }
 
     #[tokio::test]
