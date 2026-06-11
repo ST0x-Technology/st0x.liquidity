@@ -1,11 +1,11 @@
 //! Chaos tests for RPC fault tolerance.
 //!
 //! These tests wire the bot's onchain provider through a [`ChaosProxy`]
-//! so the test harness can inject transient RPC failures (dropped
-//! responses, 5xx errors, empty `eth_getLogs` results modelling a
-//! load-balancer that routed to a lagging node, delayed responses
-//! modelling a slow node) and assert the bot's recovery logic delivers
-//! the correct end state without losing or duplicating events.
+//! so the test harness can inject RPC faults (empty `eth_getLogs`
+//! results modelling a load-balancer that routed to a lagging node,
+//! delayed responses modelling a slow node, replayed stale logs, and
+//! full connection-refused outages) and assert the bot's recovery logic
+//! delivers the correct end state without losing or duplicating events.
 
 use std::time::Duration;
 
@@ -346,6 +346,107 @@ async fn replayed_get_logs_across_checkpoint_advances_do_not_double_process() ->
     assert_full_hedging_flow(
         &expected_positions,
         &[take1, take2],
+        &infra.base_chain.provider,
+        infra.base_chain.orderbook,
+        infra.base_chain.owner,
+        &infra.broker_service,
+        &infra.db_path.display().to_string(),
+    )
+    .await?;
+
+    bot.abort();
+    Ok(())
+}
+
+/// Top-level hypothesis: a fully severed RPC -- connection refused on
+/// every call -- must not kill the bot, and a fill that lands onchain
+/// during the outage must be ingested from the persisted checkpoint
+/// once connectivity returns, exactly once.
+///
+/// Scenario: the chaos proxy's serve loop is aborted mid-run, so every
+/// poll tick errors with a refused connection (the run loop's
+/// warn-and-retry contract). The take fires directly against Anvil
+/// while the bot is blind -- the chain stays alive, only the bot's
+/// transport is dead. The mid-outage assertion pins that the fill is
+/// genuinely invisible to the bot; after restore, the checkpoint-driven
+/// backfill must surface it without duplication.
+#[test_log::test(tokio::test)]
+async fn rpc_outage_resumes_from_checkpoint_without_losing_fills() -> anyhow::Result<()> {
+    let equity_symbol = "AAPL";
+    let onchain_price = float!(155.00);
+    let broker_fill_price = float!(150.25);
+    let sell_amount = float!(10.75);
+
+    let infra = TestInfra::start(vec![(equity_symbol, broker_fill_price)], vec![]).await?;
+    let mut chaos = ChaosProxy::start(infra.base_chain.endpoint().parse()?).await?;
+
+    let current_block = infra.base_chain.provider.get_block_number().await?;
+    let ctx = build_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .assets(infra.assets_config())
+        .rpc_url_override(chaos.endpoint.clone())
+        .call()?;
+    let mut bot = spawn_bot(ctx);
+
+    // Let the initial backfill complete so the checkpoint sits near the
+    // tip before the outage.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    chaos.sever();
+
+    // The chain keeps moving while the bot is blind.
+    let take_result = infra
+        .base_chain
+        .take_order()
+        .symbol(equity_symbol)
+        .amount(sell_amount)
+        .price(onchain_price)
+        .direction(TakeDirection::SellEquity)
+        .call()
+        .await?;
+
+    // Several failed 1s poll ticks; sleep_or_crash inside the helper
+    // panics if the bot dies, so this also asserts outage survival.
+    wait_for_processing(&mut bot, 4).await;
+
+    // The outage must actually bite: the fill is invisible to the bot.
+    let pool = connect_db(&infra.db_path).await?;
+    let mid_outage_trades = count_events(&pool, "OnChainTrade").await?;
+    pool.close().await;
+    assert_eq!(
+        mid_outage_trades, 0,
+        "The fill must be invisible while the RPC is severed; found \
+         {mid_outage_trades} OnChainTrade events",
+    );
+
+    chaos.restore().await?;
+
+    poll_for_events_with_timeout(
+        &mut bot,
+        &infra.db_path,
+        "OffchainOrderEvent::Filled",
+        1,
+        Duration::from_secs(120),
+    )
+    .await;
+
+    let expected_position = ExpectedPosition::builder()
+        .symbol(equity_symbol)
+        .amount(sell_amount)
+        .direction(TakeDirection::SellEquity)
+        .onchain_price(onchain_price)
+        .broker_fill_price(broker_fill_price)
+        .expected_accumulated_long(float!(0))
+        .expected_accumulated_short(sell_amount)
+        .expected_net(float!(0))
+        .build();
+
+    assert_full_hedging_flow(
+        &[expected_position],
+        &[take_result],
         &infra.base_chain.provider,
         infra.base_chain.orderbook,
         infra.base_chain.owner,

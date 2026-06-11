@@ -367,6 +367,55 @@ mod tests {
         }
     }
 
+    /// A broker outage must not kill the periodic position scan: the
+    /// per-symbol readiness checks error, are logged and swallowed, no
+    /// hedge is enqueued against the dead broker, and the scan
+    /// reschedules itself for the next tick. This invariant is what
+    /// lets a fill recorded during an outage get hedged by the first
+    /// healthy rescan instead of sitting as silent exposure.
+    #[tokio::test]
+    async fn broker_outage_does_not_kill_scan_and_reschedules() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = dry_run_ctx(&["AAPL"]);
+
+        let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &aapl,
+            FractionalShares::new(float!(2.0)),
+            Direction::Buy,
+        )
+        .await;
+
+        let ctx = CheckPositionsCtx {
+            executor: MockExecutor::with_failure("connection refused"),
+            position_projection,
+            hedge_queue: HedgeJobQueue::new(&apalis_pool),
+            check_positions_queue: CheckPositionsJobQueue::new(&apalis_pool),
+            ctx: cfg,
+            pool: pool.clone(),
+            check_interval: Duration::from_secs(60),
+        };
+
+        CheckPositions.perform(&ctx).await.unwrap();
+
+        assert_eq!(
+            count_jobs(&apalis_pool, &hedge_job_type()).await,
+            0,
+            "No hedge can be enqueued against a dead broker"
+        );
+        assert_eq!(
+            count_jobs(&apalis_pool, &check_positions_job_type()).await,
+            1,
+            "The scan must reschedule itself despite the outage"
+        );
+    }
+
     #[tokio::test]
     async fn enqueues_one_hedge_per_ready_symbol() {
         let (pool, apalis_pool) = setup_test_pools().await;
