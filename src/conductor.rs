@@ -319,6 +319,39 @@ async fn requeue_equity_recovery_orphans(
     Ok(())
 }
 
+/// Resets a trading-pipeline queue's orphaned `Running`/`Queued` rows back to
+/// `Pending` at startup, before workers spawn. The trading queues cover the
+/// fill-to-hedge path: trade accounting, hedge placement, status polling,
+/// fill reconciliation, and rejection handling. A row wedged by a dead
+/// process is unrecoverable otherwise (see `JobQueue::requeue_orphaned` for
+/// why apalis never ages it out). Trade accounting is the critical case: its
+/// job row is the only remaining record of an observed fill once the backfill
+/// checkpoint has advanced past the fill's block, so a wedged row there is
+/// permanently unhedged exposure that no rescan will ever surface again.
+async fn requeue_trading_orphans<Task>(
+    queue: &job::JobQueue<Task>,
+    queue_label: &str,
+) -> anyhow::Result<()>
+where
+    Task: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + Unpin + 'static,
+{
+    let count = queue
+        .requeue_orphaned()
+        .await
+        .with_context(|| format!("failed to re-queue orphaned {queue_label} jobs at startup"))?;
+
+    if count > 0 {
+        info!(
+            target: "hedge",
+            count,
+            queue = queue_label,
+            "Re-queued orphaned trading job(s) for crash-safe resume",
+        );
+    }
+
+    Ok(())
+}
+
 impl Conductor {
     pub(crate) async fn run<E>(
         executor_ctx: impl TryIntoExecutor<Executor = E>,
@@ -469,6 +502,18 @@ impl Conductor {
         let mut poll_status_queue = PollOrderStatusJobQueue::new(&apalis_pool);
         let reconcile_queue = ReconcileOrderFillJobQueue::new(&apalis_pool);
         let rejection_queue = HandleOrderRejectionJobQueue::new(&apalis_pool);
+
+        // A previous process may have died mid-job anywhere on the
+        // fill-to-hedge path, leaving apalis `Running` rows no live worker
+        // owns. Reset them before the monitor spawns, exactly like the
+        // transfer/backfill/recovery queues above. Trade accounting is the
+        // one that cannot be recovered any other way: once the backfill
+        // checkpoint advances, its job row is the only record of the fill.
+        requeue_trading_orphans(&job_queue, "trade accounting").await?;
+        requeue_trading_orphans(&hedge_queue, "hedge placement").await?;
+        requeue_trading_orphans(&poll_status_queue, "order status polling").await?;
+        requeue_trading_orphans(&reconcile_queue, "order fill reconciliation").await?;
+        requeue_trading_orphans(&rejection_queue, "order rejection handling").await?;
 
         let wrapped_equity_recovery_queue = WrappedEquityRecoveryJobQueue::new(&apalis_pool);
         let unwrapped_equity_recovery_queue = UnwrappedEquityRecoveryJobQueue::new(&apalis_pool);
@@ -2429,6 +2474,7 @@ mod tests {
         setup_test_db, setup_test_pools,
     };
     use crate::trading::onchain::inclusion::EmittedOnChain;
+    use crate::trading::onchain::trade_accountant::AccountForDexTrade;
     use crate::unwrapped_equity_recovery::UnwrappedEquityRecoveryJob;
     use crate::unwrapped_equity_recovery::aggregate::UnwrappedEquityRecoveryId;
 
@@ -2501,6 +2547,59 @@ mod tests {
                 .unwrap();
         assert_eq!(status, Status::Pending.to_string());
         assert_eq!(lock_by, None);
+    }
+
+    /// A crash mid trade-accounting job leaves a `Running` row that apalis
+    /// never rescues (the deterministic worker name keeps its heartbeat
+    /// fresh), and the backfill checkpoint has already advanced past the
+    /// fill -- the row is the only remaining record of the trade. The
+    /// startup requeue must make it runnable again.
+    #[tokio::test]
+    async fn requeue_trading_orphans_resets_running_accounting_rows() {
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let queue = DexTradeAccountingJobQueue::new(&apalis_pool);
+        let job_type = std::any::type_name::<AccountForDexTrade>();
+
+        // The lock owner must exist: Jobs.lock_by is a foreign key into Workers.
+        sqlx_apalis::query(
+            "INSERT INTO Workers (id, worker_type, storage_name) VALUES (?, 'test', 'test')",
+        )
+        .bind("order-fill-worker-0")
+        .execute(&apalis_pool)
+        .await
+        .unwrap();
+
+        // Insert with a real lock owner, exactly as apalis leaves a crashed
+        // Running row, so clearing lock_by/lock_at is actually exercised --
+        // asserting lock_by is None afterwards would pass vacuously otherwise.
+        sqlx_apalis::query(
+            "INSERT INTO Jobs \
+             (job, id, job_type, status, attempts, max_attempts, run_at, priority, lock_by, lock_at) \
+             VALUES (?, ?, ?, ?, 1, 25, 0, 0, ?, ?)",
+        )
+        .bind(vec![0_u8])
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(job_type)
+        .bind(Status::Running.to_string())
+        .bind("order-fill-worker-0")
+        .bind(0_i64)
+        .execute(&apalis_pool)
+        .await
+        .unwrap();
+
+        requeue_trading_orphans(&queue, "trade accounting")
+            .await
+            .unwrap();
+
+        let (status, lock_by, attempts): (String, Option<String>, i64) =
+            sqlx_apalis::query_as("SELECT status, lock_by, attempts FROM Jobs WHERE job_type = ?")
+                .bind(job_type)
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
+        assert_eq!(status, Status::Pending.to_string());
+        assert_eq!(lock_by, None);
+        assert_eq!(attempts, 1, "requeue must preserve the attempt count");
     }
 
     async fn job_count(apalis_pool: &apalis_sqlite::SqlitePool) -> i64 {
