@@ -99,11 +99,15 @@ pub enum CctpChain {
     Base,
 }
 
-/// Manual repair operations for stuck local CQRS state.
+/// Manual position-recovery operations for stuck local CQRS state.
 #[derive(Debug, Subcommand)]
-pub enum RepairCommand {
-    /// Fail a position's pending offchain order pointer so normal hedging can retry.
-    FailPendingOffchainOrder {
+pub enum PositionRecoveryCommand {
+    /// Release a position's pending offchain order pointer so normal hedging can retry.
+    ///
+    /// Operates directly on the local CQRS state via aggregate commands; does not
+    /// require the running bot.
+    #[command(alias = "fail-pending-offchain-order")]
+    ReleaseHedge {
         /// Position symbol (e.g., MSTR)
         #[arg(short = 's', long = "symbol")]
         symbol: Symbol,
@@ -119,13 +123,17 @@ pub enum RepairCommand {
         reason: String,
     },
     /// Set a position's net exposure after an operator manual correction.
+    ///
+    /// Operates directly on the local CQRS state via aggregate commands; does not
+    /// require the running bot.
+    #[command(alias = "set-position")]
     #[command(group(
         ArgGroup::new("target")
             .required(true)
             .multiple(false)
             .args(["zero", "long", "short"])
     ))]
-    SetPosition {
+    Set {
         /// Position symbol (e.g., SPYM)
         #[arg(short = 's', long = "symbol")]
         symbol: Symbol,
@@ -278,8 +286,8 @@ pub enum Commands {
     /// Re-drives a transfer whose CLI invocation was interrupted after the burn.
     /// The id is printed by `transfer-usdc` at start. An unknown id is rejected
     /// (never starts a fresh burn) and `--direction` must match the original;
-    /// `--amount` is required for symmetry with the printed recovery command but
-    /// is not validated -- the resume uses the aggregate's persisted amount.
+    /// the resume always uses the aggregate's persisted amount.
+    #[command(hide = true)]
     ResumeUsdcTransfer {
         /// Id of the transfer to resume (printed by `transfer-usdc`)
         #[arg(long = "id")]
@@ -287,19 +295,21 @@ pub enum Commands {
         /// Direction of the original transfer (must match the persisted transfer)
         #[arg(short = 'd', long = "direction")]
         direction: TransferDirection,
-        /// Amount printed by `transfer-usdc`; required for symmetry but not
-        /// validated -- the resume uses the persisted amount
+        /// Required for compatibility with old recovery hints; ignored -- the
+        /// resume uses the persisted amount
         #[arg(short = 'a', long = "amount")]
         amount: Usdc,
     },
 
-    /// Reconcile a USDC transfer stuck in the post-burn DepositFailed state
+    /// Reconcile a USDC transfer stranded in a post-burn terminal failure
     ///
-    /// Drives a post-burn `DepositFailed` USDC rebalance to the clearing
-    /// terminal `Reconciled` state: the minted USDC was handled out-of-band, so
-    /// this resolves the transfer (clearing the in-progress guard and
-    /// reconciling source-venue inflight) rather than re-driving the deposit.
-    /// Rejects an unknown id or an aggregate not in `DepositFailed`.
+    /// Drives a USDC rebalance stranded in a post-burn terminal failure
+    /// (`DepositFailed`, a post-burn `BridgingFailed`, or a `BaseToAlpaca`
+    /// `ConversionFailed`) to the clearing terminal `Reconciled` state: the
+    /// funds were handled out-of-band, so this resolves the transfer (clearing
+    /// the in-progress guard and reconciling source-venue inflight) rather than
+    /// re-driving it. Rejects an unknown id or any other state.
+    #[command(hide = true)]
     ReconcileUsdcTransfer {
         /// Id of the stuck transfer to reconcile
         #[arg(long = "id")]
@@ -446,6 +456,7 @@ pub enum Commands {
     /// Use this when a CCTP burn succeeded but the mint wasn't completed (e.g., due to
     /// attestation polling being interrupted). Provide the burn transaction hash and
     /// specify the source chain to recover the transfer.
+    #[command(hide = true)]
     CctpRecover {
         /// Transaction hash of the burn transaction on the source chain
         #[arg(long = "burn-tx")]
@@ -572,6 +583,7 @@ pub enum Commands {
     /// Marks a transfer aggregate as failed, transitioning it to a terminal
     /// state. Use when a transfer is permanently stuck (e.g., timed out,
     /// unrecoverable error) and needs operator intervention.
+    #[command(hide = true)]
     FailTransfer {
         /// Transfer type: "mint" or "redemption"
         #[arg(short = 't', long = "type")]
@@ -593,6 +605,7 @@ pub enum Commands {
     /// Delegates to the running bot's REST API so recovery dispatches through
     /// the in-process reactor (correcting live inventory). Requires the bot to
     /// be running and serving its API on the configured `server_port`.
+    #[command(hide = true)]
     RecheckTransfer {
         /// Transfer type: "mint" or "redemption"
         #[arg(short = 't', long = "type")]
@@ -607,6 +620,7 @@ pub enum Commands {
     /// Use as an escape hatch when a view becomes corrupted (e.g., due to
     /// lost updates from optimistic lock conflicts). Deletes the view row(s)
     /// and replays all events to reconstruct correct state.
+    #[command(hide = true)]
     RebuildView {
         /// Aggregate type to rebuild (position, offchain-order, vault-registry)
         #[arg(short = 'a', long = "aggregate")]
@@ -621,10 +635,154 @@ pub enum Commands {
         all: bool,
     },
 
-    /// Repair stuck local CQRS state through aggregate commands.
-    Repair {
+    /// Recover stuck positions through aggregate commands.
+    #[command(alias = "repair")]
+    Position {
         #[command(subcommand)]
-        command: RepairCommand,
+        command: PositionRecoveryCommand,
+    },
+
+    /// Recover stuck asset transfers (USDC rebalances, mints, redemptions).
+    Transfer {
+        #[command(subcommand)]
+        command: TransferCommand,
+    },
+
+    /// Maintain materialized views.
+    View {
+        #[command(subcommand)]
+        command: ViewCommand,
+    },
+
+    /// Recover stuck CCTP (cross-chain USDC) transfers.
+    Cctp {
+        #[command(subcommand)]
+        command: CctpCommand,
+    },
+}
+
+/// Recover stuck asset transfers between trading venues.
+#[derive(Debug, Subcommand)]
+pub enum TransferCommand {
+    /// Resume an interrupted USDC transfer by its id (Raindex <-> Alpaca).
+    ///
+    /// Re-drives a transfer whose CLI invocation was interrupted after the burn.
+    /// The id is printed by `transfer-usdc` at start. An unknown id is rejected
+    /// (never starts a fresh burn) and `--direction` must match the original.
+    /// The resume uses the aggregate's persisted amount, so no amount is taken.
+    /// Operates on the local CQRS state plus a live RPC provider (re-drives the
+    /// on-chain burn/mint/deposit flow itself). Does not require the running
+    /// bot, but the bot must not be concurrently driving the same id.
+    Resume {
+        /// Id of the transfer to resume (printed by `transfer-usdc`)
+        #[arg(long = "id")]
+        id: Uuid,
+        /// Direction of the original transfer (must match the persisted transfer)
+        #[arg(short = 'd', long = "direction")]
+        direction: TransferDirection,
+    },
+
+    /// Reconcile a USDC transfer stranded in a post-burn terminal failure.
+    ///
+    /// Drives a USDC rebalance stranded in a post-burn terminal failure that
+    /// strands the in-progress guard (`DepositFailed`, a post-burn
+    /// `BridgingFailed`, or a `BaseToAlpaca` `ConversionFailed`) to the clearing
+    /// terminal `Reconciled` state: the funds were handled out-of-band, so this
+    /// resolves the transfer rather than re-driving it. Rejects an unknown id or
+    /// any other state. Operates directly on the local CQRS state; does not
+    /// require the running bot, but the bot must not be concurrently driving
+    /// the same id.
+    Reconcile {
+        /// Id of the stuck transfer to reconcile
+        #[arg(long = "id")]
+        id: Uuid,
+        /// Why the transfer is being reconciled
+        #[arg(short = 'r', long = "reason", default_value = "funds-moved-manually")]
+        reason: ReconcileReasonArg,
+    },
+
+    /// Manually fail a stuck mint or redemption transfer.
+    ///
+    /// Marks a transfer aggregate as failed, transitioning it to a terminal state.
+    /// Use when a transfer is permanently stuck and needs operator intervention.
+    /// Operates directly on the local CQRS state; does not require the running
+    /// bot, but the bot must not be concurrently driving the same id.
+    Fail {
+        /// Transfer type: "mint" or "redemption"
+        #[arg(short = 'k', long = "kind", alias = "type", short_alias = 't')]
+        kind: TransferType,
+        /// Aggregate ID (issuer_request_id for mint, redemption ID for redemption)
+        #[arg(short = 'i', long = "id")]
+        id: String,
+        /// Reason for failure
+        #[arg(
+            short = 'r',
+            long = "reason",
+            default_value = "Manually failed via CLI"
+        )]
+        reason: String,
+    },
+
+    /// Re-check a failed mint or redemption and complete it if the provider settled it.
+    ///
+    /// Delegates to the running bot's REST API so recovery dispatches through the
+    /// in-process reactor (correcting live inventory). Requires the bot to be
+    /// running and serving its API on the configured `server_port`.
+    Recheck {
+        /// Transfer type: "mint" or "redemption"
+        #[arg(short = 'k', long = "kind", alias = "type", short_alias = 't')]
+        kind: TransferType,
+        /// Aggregate ID (issuer_request_id for mint, redemption ID for redemption)
+        #[arg(short = 'i', long = "id")]
+        id: String,
+    },
+}
+
+/// Maintain materialized views derived from the event log.
+#[derive(Debug, Subcommand)]
+pub enum ViewCommand {
+    /// Rebuild a materialized view by replaying all events from scratch.
+    ///
+    /// Use as an escape hatch when a view becomes corrupted (e.g., due to lost
+    /// updates from optimistic lock conflicts). Deletes the view row(s) and
+    /// replays all events to reconstruct correct state. Operates directly on the
+    /// local CQRS state; does not require the running bot.
+    Rebuild {
+        /// Aggregate type to rebuild (position, offchain-order, vault-registry)
+        #[arg(short = 'a', long = "aggregate")]
+        aggregate: AggregateView,
+        /// Specific aggregate ID to rebuild (e.g., AAPL for position).
+        /// Mutually exclusive with --all.
+        #[arg(long = "id", conflicts_with = "all", required_unless_present = "all")]
+        id: Option<String>,
+        /// Rebuild all views for the aggregate type.
+        /// Mutually exclusive with --id.
+        #[arg(long = "all", conflicts_with = "id", required_unless_present = "id")]
+        all: bool,
+    },
+}
+
+/// Recover stuck CCTP (cross-chain USDC) transfers.
+#[derive(Debug, Subcommand)]
+pub enum CctpCommand {
+    /// Complete the mint of a stuck CCTP transfer on the destination chain.
+    ///
+    /// Use this when a CCTP burn succeeded but the mint wasn't completed (e.g.,
+    /// due to attestation polling being interrupted). Provide the burn
+    /// transaction hash and specify the source chain to recover the transfer.
+    ///
+    /// Live RPC only: touches no database state or aggregate. Ensure the bot is
+    /// not concurrently driving the same on-chain mint. After completing the
+    /// mint, bring a stuck `UsdcRebalance` aggregate back in sync: `transfer
+    /// resume` while it is still non-terminal (it adopts the existing mint), or
+    /// `transfer reconcile` if it already reached a post-burn terminal failure.
+    CompleteMint {
+        /// Transaction hash of the burn transaction on the source chain
+        #[arg(long = "burn-tx")]
+        burn_tx: TxHash,
+        /// Source chain where the burn occurred
+        #[arg(long = "source-chain")]
+        source_chain: CctpChain,
     },
 }
 
@@ -759,8 +917,8 @@ enum SimpleCommand {
         id: Option<String>,
         all: bool,
     },
-    Repair {
-        command: RepairCommand,
+    Position {
+        command: PositionRecoveryCommand,
     },
     FailTransfer {
         transfer_type: TransferType,
@@ -893,7 +1051,6 @@ enum ProviderCommand {
     ResumeUsdcTransfer {
         id: Uuid,
         direction: TransferDirection,
-        amount: Usdc,
     },
     CctpBridge {
         amount: Option<Usdc>,
@@ -1016,12 +1173,11 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
         Commands::ResumeUsdcTransfer {
             id,
             direction,
-            amount,
-        } => Err(ProviderCommand::ResumeUsdcTransfer {
-            id,
-            direction,
-            amount,
-        }),
+            // Ignored: a resume always uses the persisted aggregate amount. The
+            // flag stays required on the legacy name so old invocations keep
+            // their exact shape.
+            amount: _,
+        } => Err(ProviderCommand::ResumeUsdcTransfer { id, direction }),
         Commands::VaultDeposit {
             amount,
             token,
@@ -1079,7 +1235,7 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
         Commands::RebuildView { aggregate, id, all } => {
             Ok(SimpleCommand::RebuildView { aggregate, id, all })
         }
-        Commands::Repair { command } => Ok(SimpleCommand::Repair { command }),
+        Commands::Position { command } => Ok(SimpleCommand::Position { command }),
         Commands::FailTransfer {
             transfer_type,
             id,
@@ -1095,6 +1251,37 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
         Commands::ReconcileUsdcTransfer { id, reason } => {
             Ok(SimpleCommand::ReconcileUsdcTransfer { id, reason })
         }
+        Commands::Transfer { command } => match command {
+            TransferCommand::Resume { id, direction } => {
+                Err(ProviderCommand::ResumeUsdcTransfer { id, direction })
+            }
+            TransferCommand::Reconcile { id, reason } => {
+                Ok(SimpleCommand::ReconcileUsdcTransfer { id, reason })
+            }
+            TransferCommand::Fail { kind, id, reason } => Ok(SimpleCommand::FailTransfer {
+                transfer_type: kind,
+                id,
+                reason,
+            }),
+            TransferCommand::Recheck { kind, id } => Ok(SimpleCommand::RecheckTransfer {
+                transfer_type: kind,
+                id,
+            }),
+        },
+        Commands::View { command } => match command {
+            ViewCommand::Rebuild { aggregate, id, all } => {
+                Ok(SimpleCommand::RebuildView { aggregate, id, all })
+            }
+        },
+        Commands::Cctp { command } => match command {
+            CctpCommand::CompleteMint {
+                burn_tx,
+                source_chain,
+            } => Err(ProviderCommand::CctpRecover {
+                burn_tx,
+                source_chain,
+            }),
+        },
     }
 }
 
@@ -1247,8 +1434,8 @@ async fn run_simple_command<W: Write>(
         SimpleCommand::RebuildView { aggregate, id, all } => {
             rebuild_view(stdout, pool, aggregate, id, all).await
         }
-        SimpleCommand::Repair { command } => {
-            run_repair_command(stdout, pool, command, ctx.execution_threshold).await
+        SimpleCommand::Position { command } => {
+            run_position_command(stdout, pool, command, ctx.execution_threshold).await
         }
         SimpleCommand::FailTransfer {
             transfer_type,
@@ -1313,14 +1500,14 @@ async fn rebuild_view<W: Write>(
     Ok(())
 }
 
-async fn run_repair_command<W: Write>(
+async fn run_position_command<W: Write>(
     stdout: &mut W,
     pool: &SqlitePool,
-    command: RepairCommand,
+    command: PositionRecoveryCommand,
     execution_threshold: st0x_config::ExecutionThreshold,
 ) -> anyhow::Result<()> {
     match command {
-        RepairCommand::FailPendingOffchainOrder {
+        PositionRecoveryCommand::ReleaseHedge {
             symbol,
             order_id,
             reason,
@@ -1328,7 +1515,7 @@ async fn run_repair_command<W: Write>(
             repair::fail_pending_offchain_order_command(stdout, pool, &symbol, order_id, reason)
                 .await
         }
-        RepairCommand::SetPosition {
+        PositionRecoveryCommand::Set {
             symbol,
             zero,
             long,
@@ -1351,7 +1538,7 @@ async fn run_repair_command<W: Write>(
     }
 }
 
-/// Operator-chosen target for `repair set-position`, converted from the mutually
+/// Operator-chosen target for `position set`, converted from the mutually
 /// exclusive `--zero`/`--long`/`--short` clap flags at the parser boundary so
 /// internal code carries one valid state instead of three flags.
 enum ManualPositionTarget {
@@ -1410,13 +1597,8 @@ async fn run_provider_command<W: Write>(
         ProviderCommand::TransferUsdc { direction, amount } => {
             rebalancing::transfer_usdc_command(stdout, direction, amount, ctx, pool).await
         }
-        ProviderCommand::ResumeUsdcTransfer {
-            id,
-            direction,
-            amount,
-        } => {
-            rebalancing::resume_usdc_transfer_command(stdout, id, direction, amount, ctx, pool)
-                .await
+        ProviderCommand::ResumeUsdcTransfer { id, direction } => {
+            rebalancing::resume_usdc_transfer_command(stdout, id, direction, ctx, pool).await
         }
         ProviderCommand::CctpBridge { amount, all, from } => {
             cctp::cctp_bridge_command::<OpenChainErrorRegistry, _>(stdout, amount, all, from, ctx)
@@ -1817,9 +1999,9 @@ mod tests {
         .unwrap();
 
         match cli.command {
-            Commands::Repair {
+            Commands::Position {
                 command:
-                    RepairCommand::FailPendingOffchainOrder {
+                    PositionRecoveryCommand::ReleaseHedge {
                         symbol,
                         order_id: parsed_order_id,
                         reason,
@@ -1848,9 +2030,9 @@ mod tests {
         .unwrap();
 
         match cli.command {
-            Commands::Repair {
+            Commands::Position {
                 command:
-                    RepairCommand::SetPosition {
+                    PositionRecoveryCommand::Set {
                         symbol,
                         zero,
                         long,
@@ -1886,9 +2068,9 @@ mod tests {
         .unwrap();
 
         match long.command {
-            Commands::Repair {
+            Commands::Position {
                 command:
-                    RepairCommand::SetPosition {
+                    PositionRecoveryCommand::Set {
                         long: Some(quantity),
                         ..
                     },
@@ -1910,9 +2092,9 @@ mod tests {
         .unwrap();
 
         match short.command {
-            Commands::Repair {
+            Commands::Position {
                 command:
-                    RepairCommand::SetPosition {
+                    PositionRecoveryCommand::Set {
                         short: Some(quantity),
                         ..
                     },
@@ -1989,8 +2171,8 @@ mod tests {
     #[test]
     fn classify_repair_command_as_simple() {
         let order_id = OffchainOrderId::new();
-        let command = Commands::Repair {
-            command: RepairCommand::FailPendingOffchainOrder {
+        let command = Commands::Position {
+            command: PositionRecoveryCommand::ReleaseHedge {
                 symbol: Symbol::new("MSTR").unwrap(),
                 order_id,
                 reason: "operator repair".to_string(),
@@ -1998,9 +2180,9 @@ mod tests {
         };
 
         match classify_command(command) {
-            Ok(SimpleCommand::Repair {
+            Ok(SimpleCommand::Position {
                 command:
-                    RepairCommand::FailPendingOffchainOrder {
+                    PositionRecoveryCommand::ReleaseHedge {
                         symbol,
                         order_id: parsed_order_id,
                         reason,
@@ -2030,8 +2212,8 @@ mod tests {
         let ctx = create_test_ctx();
         let pool = setup_test_db().await;
         let symbol = Symbol::new("SPYM").unwrap();
-        let command = Commands::Repair {
-            command: RepairCommand::SetPosition {
+        let command = Commands::Position {
+            command: PositionRecoveryCommand::Set {
                 symbol: symbol.clone(),
                 zero: false,
                 long: Some(positive_shares("100")),
@@ -2066,6 +2248,437 @@ mod tests {
         let expected = (FractionalShares::ZERO - positive_shares("12.5").inner()).unwrap();
 
         assert_eq!(target, expected);
+    }
+
+    #[test]
+    fn transfer_resume_parses_and_classifies_as_resume_provider() {
+        let id = Uuid::from_u128(42);
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "transfer",
+            "resume",
+            "--id",
+            &id.to_string(),
+            "--direction",
+            "to-raindex",
+        ])
+        .unwrap();
+
+        match classify_command(cli.command) {
+            Err(ProviderCommand::ResumeUsdcTransfer {
+                id: parsed_id,
+                direction,
+            }) => {
+                assert_eq!(parsed_id, id);
+                assert!(matches!(direction, TransferDirection::ToRaindex));
+            }
+            _ => panic!("expected resume provider command"),
+        }
+    }
+
+    #[test]
+    fn transfer_reconcile_parses_and_classifies_as_simple() {
+        let id = Uuid::from_u128(77);
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "transfer",
+            "reconcile",
+            "--id",
+            &id.to_string(),
+            "--reason",
+            "deposit-credited-offline",
+        ])
+        .unwrap();
+
+        match classify_command(cli.command) {
+            Ok(SimpleCommand::ReconcileUsdcTransfer {
+                id: parsed_id,
+                reason,
+            }) => {
+                assert_eq!(parsed_id, id);
+                assert!(matches!(reason, ReconcileReasonArg::DepositCreditedOffline));
+            }
+            _ => panic!("expected reconcile simple command"),
+        }
+    }
+
+    #[test]
+    fn transfer_fail_parses_and_classifies_as_simple() {
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "transfer",
+            "fail",
+            "--kind",
+            "mint",
+            "--id",
+            "ISS001",
+            "--reason",
+            "stuck forever",
+        ])
+        .unwrap();
+
+        match classify_command(cli.command) {
+            Ok(SimpleCommand::FailTransfer {
+                transfer_type,
+                id,
+                reason,
+            }) => {
+                assert!(matches!(transfer_type, TransferType::Mint));
+                assert_eq!(id, "ISS001");
+                assert_eq!(reason, "stuck forever");
+            }
+            _ => panic!("expected fail-transfer simple command"),
+        }
+    }
+
+    #[test]
+    fn transfer_recheck_parses_and_classifies_as_simple() {
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "transfer",
+            "recheck",
+            "--kind",
+            "redemption",
+            "--id",
+            "redemption-1",
+        ])
+        .unwrap();
+
+        match classify_command(cli.command) {
+            Ok(SimpleCommand::RecheckTransfer { transfer_type, id }) => {
+                assert!(matches!(transfer_type, TransferType::Redemption));
+                assert_eq!(id, "redemption-1");
+            }
+            _ => panic!("expected recheck simple command"),
+        }
+    }
+
+    #[test]
+    fn view_rebuild_parses_and_classifies_as_simple() {
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "view",
+            "rebuild",
+            "--aggregate",
+            "position",
+            "--id",
+            "AAPL",
+        ])
+        .unwrap();
+
+        match classify_command(cli.command) {
+            Ok(SimpleCommand::RebuildView { aggregate, id, all }) => {
+                assert!(matches!(aggregate, AggregateView::Position));
+                assert_eq!(id.as_deref(), Some("AAPL"));
+                assert!(!all);
+            }
+            _ => panic!("expected rebuild-view simple command"),
+        }
+    }
+
+    #[test]
+    fn cctp_complete_mint_parses_and_classifies_as_provider() {
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "cctp",
+            "complete-mint",
+            "--burn-tx",
+            &TxHash::ZERO.to_string(),
+            "--source-chain",
+            "ethereum",
+        ])
+        .unwrap();
+
+        match classify_command(cli.command) {
+            Err(ProviderCommand::CctpRecover {
+                burn_tx,
+                source_chain,
+            }) => {
+                assert_eq!(burn_tx, TxHash::ZERO);
+                assert!(matches!(source_chain, CctpChain::Ethereum));
+            }
+            _ => panic!("expected cctp complete-mint provider command"),
+        }
+    }
+
+    #[test]
+    fn position_set_zero_parses_under_new_name() {
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "position",
+            "set",
+            "--symbol",
+            "SPYM",
+            "--zero",
+            "--reason",
+            "manual rebalance completed",
+        ])
+        .unwrap();
+
+        match classify_command(cli.command) {
+            Ok(SimpleCommand::Position {
+                command: PositionRecoveryCommand::Set { symbol, zero, .. },
+            }) => {
+                assert_eq!(symbol, Symbol::new("SPYM").unwrap());
+                assert!(zero);
+            }
+            _ => panic!("expected position set to classify as a simple position command"),
+        }
+    }
+
+    #[test]
+    fn position_release_hedge_parses_under_new_name() {
+        let order_id = OffchainOrderId::new();
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "position",
+            "release-hedge",
+            "--symbol",
+            "MSTR",
+            "--order-id",
+            &order_id.to_string(),
+        ])
+        .unwrap();
+
+        match classify_command(cli.command) {
+            Ok(SimpleCommand::Position {
+                command:
+                    PositionRecoveryCommand::ReleaseHedge {
+                        symbol,
+                        order_id: parsed_order_id,
+                        reason,
+                    },
+            }) => {
+                assert_eq!(symbol, Symbol::new("MSTR").unwrap());
+                assert_eq!(parsed_order_id, order_id);
+                assert_eq!(
+                    reason, "Manually failed pending offchain order via CLI",
+                    "omitted --reason must fall back to the documented legacy default",
+                );
+            }
+            _ => panic!("expected position release-hedge to classify as a simple position command"),
+        }
+    }
+
+    #[test]
+    fn legacy_repair_alias_still_parses() {
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "repair",
+            "set-position",
+            "--symbol",
+            "SPYM",
+            "--zero",
+            "--reason",
+            "legacy alias",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            classify_command(cli.command),
+            Ok(SimpleCommand::Position {
+                command: PositionRecoveryCommand::Set { .. }
+            })
+        ));
+    }
+
+    /// The legacy flat resume keeps its exact shape: `--amount` stays required
+    /// (even though the resume ignores it for the persisted amount), so old
+    /// invocations and old recovery hints behave identically.
+    #[test]
+    fn legacy_resume_without_amount_is_rejected() {
+        let result = Cli::try_parse_from([
+            "st0x-cli",
+            "resume-usdc-transfer",
+            "--id",
+            &Uuid::from_u128(7).to_string(),
+            "--direction",
+            "to-raindex",
+        ]);
+
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "legacy resume-usdc-transfer must keep requiring --amount",
+        );
+    }
+
+    #[test]
+    fn legacy_flat_transfer_names_still_parse() {
+        let resume_id = Uuid::from_u128(7);
+        let resume = Cli::try_parse_from([
+            "st0x-cli",
+            "resume-usdc-transfer",
+            "--id",
+            &resume_id.to_string(),
+            "--direction",
+            "to-raindex",
+            "--amount",
+            "100",
+        ])
+        .unwrap();
+        assert!(matches!(
+            classify_command(resume.command),
+            Err(ProviderCommand::ResumeUsdcTransfer { .. })
+        ));
+
+        let fail = Cli::try_parse_from([
+            "st0x-cli",
+            "fail-transfer",
+            "--type",
+            "mint",
+            "--id",
+            "ISS001",
+        ])
+        .unwrap();
+        assert!(matches!(
+            classify_command(fail.command),
+            Ok(SimpleCommand::FailTransfer { .. })
+        ));
+
+        let recheck = Cli::try_parse_from([
+            "st0x-cli",
+            "recheck-transfer",
+            "--type",
+            "redemption",
+            "--id",
+            "redemption-1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            classify_command(recheck.command),
+            Ok(SimpleCommand::RecheckTransfer { .. })
+        ));
+
+        let reconcile_id = Uuid::from_u128(8);
+        let reconcile = Cli::try_parse_from([
+            "st0x-cli",
+            "reconcile-usdc-transfer",
+            "--id",
+            &reconcile_id.to_string(),
+            "--reason",
+            "funds-moved-manually",
+        ])
+        .unwrap();
+        assert!(matches!(
+            classify_command(reconcile.command),
+            Ok(SimpleCommand::ReconcileUsdcTransfer { .. })
+        ));
+    }
+
+    #[test]
+    fn legacy_flat_view_and_cctp_names_still_parse() {
+        let rebuild = Cli::try_parse_from([
+            "st0x-cli",
+            "rebuild-view",
+            "--aggregate",
+            "position",
+            "--all",
+        ])
+        .unwrap();
+        assert!(matches!(
+            classify_command(rebuild.command),
+            Ok(SimpleCommand::RebuildView { .. })
+        ));
+
+        let cctp = Cli::try_parse_from([
+            "st0x-cli",
+            "cctp-recover",
+            "--burn-tx",
+            &TxHash::ZERO.to_string(),
+            "--source-chain",
+            "base",
+        ])
+        .unwrap();
+        assert!(matches!(
+            classify_command(cctp.command),
+            Err(ProviderCommand::CctpRecover { .. })
+        ));
+    }
+
+    /// The legacy `--type`/`-t` discriminator must keep working on the new
+    /// grouped names, so mechanically translated runbook invocations parse.
+    #[test]
+    fn grouped_transfer_commands_accept_legacy_type_flag() {
+        let fail_long = Cli::try_parse_from([
+            "st0x-cli", "transfer", "fail", "--type", "mint", "--id", "ISS001",
+        ])
+        .unwrap();
+        assert!(matches!(
+            classify_command(fail_long.command),
+            Ok(SimpleCommand::FailTransfer { .. })
+        ));
+
+        let fail_short = Cli::try_parse_from([
+            "st0x-cli", "transfer", "fail", "-t", "mint", "--id", "ISS001",
+        ])
+        .unwrap();
+        assert!(matches!(
+            classify_command(fail_short.command),
+            Ok(SimpleCommand::FailTransfer { .. })
+        ));
+
+        let recheck_long = Cli::try_parse_from([
+            "st0x-cli",
+            "transfer",
+            "recheck",
+            "--type",
+            "redemption",
+            "--id",
+            "redemption-1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            classify_command(recheck_long.command),
+            Ok(SimpleCommand::RecheckTransfer { .. })
+        ));
+
+        let recheck_short = Cli::try_parse_from([
+            "st0x-cli",
+            "transfer",
+            "recheck",
+            "-t",
+            "redemption",
+            "--id",
+            "redemption-1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            classify_command(recheck_short.command),
+            Ok(SimpleCommand::RecheckTransfer { .. })
+        ));
+    }
+
+    /// The new grouped destructive commands keep the documented legacy default
+    /// reasons until the next epic step removes them.
+    #[test]
+    fn grouped_transfer_commands_keep_legacy_default_reasons() {
+        let fail = Cli::try_parse_from([
+            "st0x-cli", "transfer", "fail", "--kind", "mint", "--id", "ISS001",
+        ])
+        .unwrap();
+        match classify_command(fail.command) {
+            Ok(SimpleCommand::FailTransfer { reason, .. }) => {
+                assert_eq!(reason, "Manually failed via CLI");
+            }
+            _ => panic!("expected transfer fail to classify as FailTransfer"),
+        }
+
+        let reconcile = Cli::try_parse_from([
+            "st0x-cli",
+            "transfer",
+            "reconcile",
+            "--id",
+            &Uuid::from_u128(9).to_string(),
+        ])
+        .unwrap();
+        match classify_command(reconcile.command) {
+            Ok(SimpleCommand::ReconcileUsdcTransfer { reason, .. }) => {
+                assert!(matches!(reason, ReconcileReasonArg::FundsMovedManually));
+            }
+            _ => panic!("expected transfer reconcile to classify as ReconcileUsdcTransfer"),
+        }
     }
 
     #[tokio::test]
