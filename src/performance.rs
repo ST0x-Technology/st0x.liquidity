@@ -879,16 +879,20 @@ impl ReportRange {
     }
 
     /// Bucket width mirroring the P&L tab's cadence: daily up to a month,
-    /// weekly up to half a year, otherwise ~monthly.
+    /// weekly up to half a year, otherwise ~monthly -- with hourly buckets for
+    /// short windows so a 24h report still shows a trend.
     ///
-    /// Uses the P&L tab's INCLUSIVE day count -- `floor(span_in_days) + 1` --
-    /// stepping up past 31 and 183 days, rather than the exclusive span. A
-    /// range whose endpoints are exactly 31 (or 183) days apart spans 32 (184)
-    /// calendar days, so it must already step to the coarser cadence, matching
-    /// the P&L tab at the exact boundary.
+    /// The daily/weekly/monthly thresholds use the P&L tab's INCLUSIVE day
+    /// count -- `floor(span_in_days) + 1`, stepping up past 31 and 183 days --
+    /// rather than the exclusive span. A range whose endpoints are exactly 31
+    /// (or 183) days apart spans 32 (184) calendar days, so it must already
+    /// step to the coarser cadence, matching the P&L tab at the exact boundary.
     fn bucket_width(&self) -> Duration {
-        let inclusive_days = (self.to - self.from).num_days() + 1;
-        if inclusive_days <= 31 {
+        let span = self.to - self.from;
+        let inclusive_days = span.num_days() + 1;
+        if span <= Duration::days(2) {
+            Duration::hours(1)
+        } else if inclusive_days <= 31 {
             Duration::days(1)
         } else if inclusive_days <= 183 {
             Duration::days(7)
@@ -1773,6 +1777,25 @@ mod tests {
             from: timestamp(from_offset),
             to: timestamp(to_offset),
         }
+    }
+
+    #[test]
+    fn bucket_width_is_hourly_for_24h_range() {
+        let range = report_range(0, 86_400);
+        assert_eq!(range.bucket_width(), Duration::hours(1));
+    }
+
+    #[test]
+    fn bucket_width_is_hourly_at_exactly_2_days() {
+        let range = report_range(0, 2 * 86_400);
+        assert_eq!(range.bucket_width(), Duration::hours(1));
+    }
+
+    #[test]
+    fn bucket_width_is_daily_just_past_2_days() {
+        // 2 days + 1 second exceeds the hourly threshold.
+        let range = report_range(0, 2 * 86_400 + 1);
+        assert_eq!(range.bucket_width(), Duration::days(1));
     }
 
     /// Drive `Position` events through the reactor and return the full
