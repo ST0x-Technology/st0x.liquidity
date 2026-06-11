@@ -380,6 +380,9 @@ async fn resumption_after_shutdown() -> anyhow::Result<()> {
     bot.abort();
     let _ = bot.await;
 
+    // Each processed trade persists Filled + Acknowledged (ADR 0005).
+    const ONCHAIN_EVENTS_PER_TRADE: i64 = 2;
+
     // Phase 2: Execute 1 more take-order while bot is down
     let take2 = infra
         .base_chain
@@ -409,8 +412,8 @@ async fn resumption_after_shutdown() -> anyhow::Result<()> {
     let post_restart_offchain_events = count_events(&pool, "OffchainOrder").await?;
     assert_eq!(
         post_restart_onchain_events,
-        pre_shutdown_onchain_events + 1,
-        "Restart should persist exactly one new OnChainTrade event",
+        pre_shutdown_onchain_events + ONCHAIN_EVENTS_PER_TRADE,
+        "Restart should persist exactly one new witnessed-and-acknowledged trade",
     );
     assert_eq!(
         post_restart_position_events,
@@ -744,10 +747,11 @@ async fn market_hours_transitions() -> anyhow::Result<()> {
         "No offchain order events should be emitted when market is closed"
     );
 
-    let onchain_events = count_events(&pool, "OnChainTrade").await?;
+    let onchain_fills =
+        crate::poll::count_events_of_type(&pool, "OnChainTradeEvent::Filled").await?;
     assert_eq!(
-        onchain_events, 1,
-        "Exactly one OnChainTrade event should be persisted while market is closed"
+        onchain_fills, 1,
+        "Exactly one witnessed fill should be persisted while market is closed"
     );
     pool.close().await;
 

@@ -41,6 +41,15 @@ pub struct Position {
     /// rebalance cycle gets a fresh idempotency key.
     #[serde(default)]
     pub last_failed_offchain_order_id: Option<OffchainOrderId>,
+    /// The most recently applied onchain fill, rejected if re-driven.
+    /// Guards the resume path's crash window between this position
+    /// write and the `OnChainTrade` acknowledgement marker (ADR 0005).
+    /// One slot suffices: accounting jobs are serialized per symbol and
+    /// re-deliveries drain in enqueue order, so only the most recent
+    /// trade can ever be re-driven against an unmarked acknowledgement;
+    /// the upstream marker blocks all longer-range duplicates.
+    #[serde(default)]
+    pub last_acknowledged_trade_id: Option<TradeId>,
     pub threshold: ExecutionThreshold,
     #[serde(
         serialize_with = "st0x_float_serde::serialize_option_float",
@@ -62,6 +71,10 @@ impl std::fmt::Debug for Position {
                 "last_failed_offchain_order_id",
                 &self.last_failed_offchain_order_id,
             )
+            .field(
+                "last_acknowledged_trade_id",
+                &self.last_acknowledged_trade_id,
+            )
             .field("threshold", &self.threshold)
             .field("last_price_usdc", &DebugOptionFloat(&self.last_price_usdc))
             .field("last_updated", &self.last_updated)
@@ -80,7 +93,7 @@ impl EventSourced for Position {
 
     const AGGREGATE_TYPE: &'static str = "Position";
     const PROJECTION: Table = Table("position_view");
-    const SCHEMA_VERSION: u64 = 2;
+    const SCHEMA_VERSION: u64 = 3;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use PositionEvent::*;
@@ -96,6 +109,7 @@ impl EventSourced for Position {
                 accumulated_short: FractionalShares::ZERO,
                 pending_offchain_order_id: None,
                 last_failed_offchain_order_id: None,
+                last_acknowledged_trade_id: None,
                 threshold: *threshold,
                 last_price_usdc: None,
                 last_updated: Some(*initialized_at),
@@ -111,6 +125,7 @@ impl EventSourced for Position {
 
         match event {
             OnChainOrderFilled {
+                trade_id,
                 amount,
                 direction: Buy,
                 price_usdc,
@@ -119,12 +134,14 @@ impl EventSourced for Position {
             } => Ok(Some(Self {
                 net: (entity.net + *amount)?,
                 accumulated_long: (entity.accumulated_long + *amount)?,
+                last_acknowledged_trade_id: Some(trade_id.clone()),
                 last_price_usdc: Some(*price_usdc),
                 last_updated: Some(*seen_at),
                 ..entity.clone()
             })),
 
             OnChainOrderFilled {
+                trade_id,
                 direction: Sell,
                 amount,
                 price_usdc,
@@ -133,6 +150,7 @@ impl EventSourced for Position {
             } => Ok(Some(Self {
                 net: (entity.net - *amount)?,
                 accumulated_short: (entity.accumulated_short + *amount)?,
+                last_acknowledged_trade_id: Some(trade_id.clone()),
                 last_price_usdc: Some(*price_usdc),
                 last_updated: Some(*seen_at),
                 ..entity.clone()
@@ -332,14 +350,26 @@ impl EventSourced for Position {
                 price_usdc,
                 block_timestamp,
                 ..
-            } => Ok(vec![PositionEvent::OnChainOrderFilled {
-                trade_id,
-                amount,
-                direction,
-                price_usdc,
-                block_timestamp,
-                seen_at: Utc::now(),
-            }]),
+            } => {
+                if self.last_acknowledged_trade_id.as_ref() == Some(&trade_id) {
+                    warn!(
+                        target: "hedge",
+                        symbol = %self.symbol, %trade_id,
+                        "Rejecting re-driven onchain fill: trade already \
+                         applied to this position"
+                    );
+                    return Err(PositionError::DuplicateTrade { trade_id });
+                }
+
+                Ok(vec![PositionEvent::OnChainOrderFilled {
+                    trade_id,
+                    amount,
+                    direction,
+                    price_usdc,
+                    block_timestamp,
+                    seen_at: Utc::now(),
+                }])
+            }
 
             PlaceOffChainOrder {
                 offchain_order_id,
@@ -2570,6 +2600,7 @@ mod tests {
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
             last_failed_offchain_order_id: None,
+            last_acknowledged_trade_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
@@ -2597,6 +2628,7 @@ mod tests {
             accumulated_short: FractionalShares::new(float!(2.567)),
             pending_offchain_order_id: None,
             last_failed_offchain_order_id: None,
+            last_acknowledged_trade_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
@@ -2624,6 +2656,7 @@ mod tests {
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
             last_failed_offchain_order_id: None,
+            last_acknowledged_trade_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
@@ -2654,6 +2687,7 @@ mod tests {
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
             last_failed_offchain_order_id: None,
+            last_acknowledged_trade_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
@@ -2684,6 +2718,7 @@ mod tests {
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
             last_failed_offchain_order_id: None,
+            last_acknowledged_trade_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
@@ -2713,6 +2748,7 @@ mod tests {
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
             last_failed_offchain_order_id: None,
+            last_acknowledged_trade_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
@@ -2743,6 +2779,7 @@ mod tests {
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
             last_failed_offchain_order_id: None,
+            last_acknowledged_trade_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
@@ -2773,6 +2810,7 @@ mod tests {
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
             last_failed_offchain_order_id: None,
+            last_acknowledged_trade_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: None,
             last_updated: Some(Utc::now()),
@@ -2853,6 +2891,7 @@ mod tests {
             accumulated_short: FractionalShares::ZERO,
             pending_offchain_order_id: None,
             last_failed_offchain_order_id: None,
+            last_acknowledged_trade_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
