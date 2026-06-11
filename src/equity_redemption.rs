@@ -209,6 +209,12 @@ pub(crate) enum EquityRedemptionError {
     /// Attempted to modify a failed redemption operation
     #[error("Already failed")]
     AlreadyFailed,
+    /// Attempted to reconcile a redemption that is not in the `Failed` state
+    #[error("Cannot reconcile: redemption is not in the Failed state")]
+    NotFailed,
+    /// Attempted to act on a redemption already resolved out-of-band (`Reconciled`)
+    #[error("Already reconciled")]
+    AlreadyReconciled,
 }
 
 #[derive(Debug, Clone)]
@@ -256,6 +262,11 @@ pub(crate) enum EquityRedemptionCommand {
     /// Prepares sending tokens (pure, no side effects).
     /// Valid from `TokensUnwrapped`.
     PrepareSend,
+    /// Reconcile a redemption stranded in the terminal `Failed` state to the
+    /// terminal `Reconciled` state. The residual equity was handled out-of-band
+    /// (e.g. via wrap-equity/vault-deposit), so this is a bookkeeping resolution
+    /// rather than a re-drive. Valid ONLY from `Failed`.
+    Reconcile { reason: String },
 }
 
 /// Why redemption detection failed.
@@ -383,6 +394,12 @@ pub(crate) enum EquityRedemptionEvent {
     ProviderCompletionRecovered {
         tokenization_request_id: TokenizationRequestId,
         recovered_at: DateTime<Utc>,
+    },
+    /// An operator reconciled a terminal `Failed` redemption out-of-band. Marks
+    /// the transfer resolved without re-driving the failed leg.
+    OperatorReconciled {
+        reason: String,
+        reconciled_at: DateTime<Utc>,
     },
 }
 
@@ -614,6 +631,16 @@ impl PartialEq for EquityRedemptionEvent {
                     recovered_at: t2,
                 },
             ) => id1 == id2 && t1 == t2,
+            (
+                Self::OperatorReconciled {
+                    reason: r1,
+                    reconciled_at: t1,
+                },
+                Self::OperatorReconciled {
+                    reason: r2,
+                    reconciled_at: t2,
+                },
+            ) => r1 == r2 && t1 == t2,
             _ => false,
         }
     }
@@ -647,6 +674,7 @@ impl DomainEvent for EquityRedemptionEvent {
             ProviderCompletionRecovered { .. } => {
                 "EquityRedemptionEvent::ProviderCompletionRecovered".to_string()
             }
+            OperatorReconciled { .. } => "EquityRedemptionEvent::OperatorReconciled".to_string(),
         }
     }
 
@@ -834,6 +862,28 @@ pub(crate) enum EquityRedemption {
         started_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
     },
+
+    /// An operator reconciled a terminal `Failed` redemption out-of-band
+    /// (terminal state). Retains the identifying fields carried by `Failed` so
+    /// the projection still reports the real transfer instead of a zero-value
+    /// record.
+    Reconciled {
+        symbol: Symbol,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        quantity: Float,
+        raindex_withdraw_tx: Option<TxHash>,
+        redemption_tx: Option<TxHash>,
+        tokenization_request_id: Option<TokenizationRequestId>,
+        /// The failure reason carried over from the `Failed` state.
+        failure_reason: Option<String>,
+        /// The operator-supplied reconciliation reason.
+        reconcile_reason: String,
+        started_at: DateTime<Utc>,
+        reconciled_at: DateTime<Utc>,
+    },
 }
 
 impl EquityRedemption {
@@ -852,7 +902,8 @@ impl EquityRedemption {
             | Self::TokensSent { quantity, .. }
             | Self::Pending { quantity, .. }
             | Self::Completed { quantity, .. }
-            | Self::Failed { quantity, .. } => *quantity,
+            | Self::Failed { quantity, .. }
+            | Self::Reconciled { quantity, .. } => *quantity,
         }
     }
 
@@ -1004,6 +1055,26 @@ impl EquityRedemption {
                 started_at: *started_at,
                 updated_at: *failed_at,
             }),
+
+            // Reconciliation is a terminal operator resolution, so it maps to the
+            // existing `Completed` DTO status (no new status needed) -- mirrors the
+            // USDC `Reconciled -> Completed` mapping.
+            Self::Reconciled {
+                symbol,
+                quantity,
+                started_at,
+                reconciled_at,
+                ..
+            } => TransferOperation::EquityRedemption(EquityRedemptionOperation {
+                id: Id::new(id.0.clone()),
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(*quantity),
+                status: EquityRedemptionStatus::Completed {
+                    completed_at: *reconciled_at,
+                },
+                started_at: *started_at,
+                updated_at: *reconciled_at,
+            }),
         }
     }
 }
@@ -1025,7 +1096,11 @@ impl EventSourced for EquityRedemption {
     // (`Operator` failures) and `RedemptionRejected` events instead of always
     // `None`. Bumped to clear stale snapshots so historical rejections rebuild
     // from events under the corrected evolve logic.
-    const SCHEMA_VERSION: u64 = 4;
+    // v5: added the terminal `Reconciled` state and the `OperatorReconciled`
+    // event for operator reconciliation of stuck `Failed` redemptions. Additive
+    // only; bumped to clear stale snapshots so they rebuild from events under the
+    // new schema (existing events replay unchanged).
+    const SCHEMA_VERSION: u64 = 5;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use EquityRedemptionEvent::*;
@@ -1515,6 +1590,37 @@ impl EventSourced for EquityRedemption {
                     completed_at: *recovered_at,
                 })
             }
+
+            OperatorReconciled {
+                reason,
+                reconciled_at,
+            } => {
+                let Self::Failed {
+                    symbol,
+                    quantity,
+                    raindex_withdraw_tx,
+                    redemption_tx,
+                    tokenization_request_id,
+                    reason: failure_reason,
+                    started_at,
+                    ..
+                } = entity
+                else {
+                    return Ok(None);
+                };
+
+                Some(Self::Reconciled {
+                    symbol: symbol.clone(),
+                    quantity: *quantity,
+                    raindex_withdraw_tx: *raindex_withdraw_tx,
+                    redemption_tx: *redemption_tx,
+                    tokenization_request_id: tokenization_request_id.clone(),
+                    failure_reason: failure_reason.clone(),
+                    reconcile_reason: reason.clone(),
+                    started_at: *started_at,
+                    reconciled_at: *reconciled_at,
+                })
+            }
         })
     }
 
@@ -1549,6 +1655,7 @@ impl EventSourced for EquityRedemption {
             | Complete
             | RejectRedemption { .. }
             | RecoverProviderCompletion { .. }
+            | Reconcile { .. }
             | FailTransfer { .. } => Err(EquityRedemptionError::NotStarted),
         }
     }
@@ -1565,6 +1672,7 @@ impl EventSourced for EquityRedemption {
             Redeem { .. } => match self {
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
                 _ => Err(EquityRedemptionError::AlreadyStarted),
             },
 
@@ -1618,6 +1726,7 @@ impl EventSourced for EquityRedemption {
                 }
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
                 _ => Err(EquityRedemptionError::AlreadyStarted),
             },
 
@@ -1654,6 +1763,7 @@ impl EventSourced for EquityRedemption {
                 }
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
                 _ => Err(EquityRedemptionError::AlreadyStarted),
             },
 
@@ -1663,6 +1773,7 @@ impl EventSourced for EquityRedemption {
                 }]),
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
                 _ => Err(EquityRedemptionError::CannotUnwrapAlreadyStarted),
             },
 
@@ -1693,6 +1804,7 @@ impl EventSourced for EquityRedemption {
                 }
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
                 _ => Err(EquityRedemptionError::CannotUnwrapAlreadyStarted),
             },
 
@@ -1747,6 +1859,7 @@ impl EventSourced for EquityRedemption {
                 }
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
                 _ => Err(EquityRedemptionError::CannotUnwrapAlreadyStarted),
             },
 
@@ -1756,6 +1869,7 @@ impl EventSourced for EquityRedemption {
                 }]),
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
                 _ => Err(EquityRedemptionError::TokensNotUnwrapped),
             },
 
@@ -1802,6 +1916,7 @@ impl EventSourced for EquityRedemption {
                 }
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
                 _ => Err(EquityRedemptionError::TokensNotUnwrapped),
             },
 
@@ -1821,6 +1936,7 @@ impl EventSourced for EquityRedemption {
                 | Self::SendPending { .. } => Err(EquityRedemptionError::TokensNotSent),
                 Self::Pending { .. } => Err(EquityRedemptionError::AlreadyDetected),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
             },
 
@@ -1845,6 +1961,7 @@ impl EventSourced for EquityRedemption {
                 | Self::SendPending { .. } => Err(EquityRedemptionError::TokensNotSent),
                 Self::Pending { .. } => Err(EquityRedemptionError::AlreadyDetected),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
             },
 
@@ -1862,6 +1979,7 @@ impl EventSourced for EquityRedemption {
                 }]),
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
             },
 
             RejectRedemption { reason } => match self {
@@ -1886,6 +2004,7 @@ impl EventSourced for EquityRedemption {
                 }
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
             },
 
             RecoverProviderCompletion {
@@ -1899,6 +2018,7 @@ impl EventSourced for EquityRedemption {
                     recovered_at: Utc::now(),
                 }]),
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
                 _ => Err(EquityRedemptionError::TokensNotSent),
             },
 
@@ -1923,7 +2043,24 @@ impl EventSourced for EquityRedemption {
                 }
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
                 _ => Err(EquityRedemptionError::AlreadyStarted),
+            },
+
+            Reconcile { reason } => match self {
+                Self::Failed { symbol, .. } => {
+                    warn!(
+                        target: "rebalance",
+                        %symbol, %reason,
+                        "Reconciling stuck failed redemption out-of-band"
+                    );
+                    Ok(vec![OperatorReconciled {
+                        reason,
+                        reconciled_at: Utc::now(),
+                    }])
+                }
+                Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
+                _ => Err(EquityRedemptionError::NotFailed),
             },
         }
     }
@@ -3709,6 +3846,70 @@ mod tests {
         );
     }
 
+    /// A redemption that was `DetectionFailed` and then operator-reconciled must
+    /// not re-seed stranded inflight at the next startup: its latest event is
+    /// `OperatorReconciled`, which the query's terminal allowlist excludes.
+    #[tokio::test]
+    async fn stuck_redemptions_excludes_operator_reconciled() {
+        let pool = crate::test_utils::setup_test_db().await;
+
+        // AAPL: DetectionFailed, still stuck.
+        insert_event(
+            &pool,
+            "stuck",
+            0,
+            "EquityRedemptionEvent::WithdrawnFromRaindex",
+            &withdrawn_payload("AAPL"),
+        )
+        .await;
+        insert_event(
+            &pool,
+            "stuck",
+            1,
+            "EquityRedemptionEvent::DetectionFailed",
+            r#"{"DetectionFailed":{"failure":"Timeout","failed_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .await;
+
+        // MSFT: DetectionFailed then operator-reconciled, no longer stuck.
+        insert_event(
+            &pool,
+            "reconciled",
+            0,
+            "EquityRedemptionEvent::WithdrawnFromRaindex",
+            &withdrawn_payload("MSFT"),
+        )
+        .await;
+        insert_event(
+            &pool,
+            "reconciled",
+            1,
+            "EquityRedemptionEvent::DetectionFailed",
+            r#"{"DetectionFailed":{"failure":"Timeout","failed_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .await;
+        insert_event(
+            &pool,
+            "reconciled",
+            2,
+            "EquityRedemptionEvent::OperatorReconciled",
+            r#"{"OperatorReconciled":{"reason":"deposited manually via vault-deposit","reconciled_at":"2026-01-01T00:01:00Z"}}"#,
+        )
+        .await;
+
+        let result = symbols_with_stuck_redemptions(&pool).await.unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "only the un-reconciled DetectionFailed redemption should seed inflight: {result:?}"
+        );
+        assert!(result.contains_key(&Symbol::new("AAPL").unwrap()));
+        assert!(
+            !result.contains_key(&Symbol::new("MSFT").unwrap()),
+            "an operator-reconciled redemption must not re-seed stranded inflight"
+        );
+    }
+
     #[tokio::test]
     async fn interrupted_redemption_ids_returns_only_non_terminal_redemptions() {
         let pool = crate::test_utils::setup_test_db().await;
@@ -4212,6 +4413,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recover_provider_completion_rejected_for_reconciled_redemption() {
+        let mut history = failed_redemption_history();
+        history.push(EquityRedemptionEvent::OperatorReconciled {
+            reason: "deposited manually".to_string(),
+            reconciled_at: Utc::now(),
+        });
+
+        let error = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(history)
+            .when(EquityRedemptionCommand::RecoverProviderCompletion {
+                tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(EquityRedemptionError::AlreadyReconciled)
+            ),
+            "a reconciled redemption must report AlreadyReconciled, not recover, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn fail_transfer_from_withdrawn_transitions_to_failed() {
         let events = TestHarness::<EquityRedemption>::with(mock_services())
             .given(vec![withdrawn_from_raindex_event()])
@@ -4278,5 +4504,128 @@ mod tests {
             error,
             LifecycleError::Apply(EquityRedemptionError::NotStarted)
         ));
+    }
+
+    fn failed_redemption_history() -> Vec<EquityRedemptionEvent> {
+        vec![
+            withdrawn_from_raindex_event(),
+            tokens_sent_event(),
+            EquityRedemptionEvent::DetectionFailed {
+                failure: DetectionFailure::Operator {
+                    reason: "operator forced terminal".to_string(),
+                },
+                failed_at: Utc::now(),
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn reconcile_from_failed_emits_operator_reconciled_and_replays_to_reconciled() {
+        let history = failed_redemption_history();
+
+        let events = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(history.clone())
+            .when(EquityRedemptionCommand::Reconcile {
+                reason: "deposited manually via vault-deposit".to_string(),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let EquityRedemptionEvent::OperatorReconciled { reason, .. } = &events[0] else {
+            panic!("Expected OperatorReconciled, got {:?}", events[0]);
+        };
+        assert_eq!(reason, "deposited manually via vault-deposit");
+
+        let state = replay::<EquityRedemption>([history, events].concat())
+            .expect("event stream should replay")
+            .expect("event stream should materialize a state");
+        let EquityRedemption::Reconciled {
+            reconcile_reason,
+            quantity,
+            ..
+        } = state
+        else {
+            panic!("reconciled redemption should be Reconciled, got {state:?}");
+        };
+        assert_eq!(reconcile_reason, "deposited manually via vault-deposit");
+        assert!(
+            quantity.eq(float!(50.25)).unwrap(),
+            "reconciled state must preserve the requested quantity, got {quantity:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_from_non_failed_is_rejected() {
+        let error = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(vec![withdrawn_from_raindex_event(), tokens_sent_event()])
+            .when(EquityRedemptionCommand::Reconcile {
+                reason: "should be rejected".to_string(),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(EquityRedemptionError::NotFailed)
+            ),
+            "reconcile from a non-failed redemption must be rejected, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_from_reconciled_state_is_rejected() {
+        let mut history = failed_redemption_history();
+        history.push(EquityRedemptionEvent::OperatorReconciled {
+            reason: "already reconciled".to_string(),
+            reconciled_at: Utc::now(),
+        });
+
+        let error = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(history)
+            .when(EquityRedemptionCommand::Reconcile {
+                reason: "second attempt".to_string(),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(EquityRedemptionError::AlreadyReconciled)
+            ),
+            "reconcile from an already-reconciled redemption reports AlreadyReconciled, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn reconciled_to_dto_reports_completed_preserving_quantity() {
+        let reconciled = EquityRedemption::Reconciled {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: float!(50.25),
+            raindex_withdraw_tx: Some(TxHash::random()),
+            redemption_tx: Some(TxHash::random()),
+            tokenization_request_id: None,
+            failure_reason: None,
+            reconcile_reason: "deposited manually".to_string(),
+            started_at: Utc::now(),
+            reconciled_at: Utc::now(),
+        };
+
+        let TransferOperation::EquityRedemption(operation) =
+            reconciled.to_dto(&RedemptionAggregateId::new("RED-001"))
+        else {
+            panic!("expected an EquityRedemption operation");
+        };
+        assert!(
+            matches!(operation.status, EquityRedemptionStatus::Completed { .. }),
+            "reconciled redemption must map to the Completed DTO status, got {:?}",
+            operation.status
+        );
+        assert_eq!(
+            operation.quantity.to_string(),
+            FractionalShares::new(float!(50.25)).to_string()
+        );
     }
 }

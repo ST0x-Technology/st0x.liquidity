@@ -235,7 +235,8 @@ impl MintTracking {
             | TokenizedEquityMintEvent::MintAcceptanceFailed { .. }
             | TokenizedEquityMintEvent::WrappingFailed { .. }
             | TokenizedEquityMintEvent::DepositedIntoRaindex { .. }
-            | TokenizedEquityMintEvent::RaindexDepositFailed { .. } => {}
+            | TokenizedEquityMintEvent::RaindexDepositFailed { .. }
+            | TokenizedEquityMintEvent::OperatorReconciled { .. } => {}
         }
     }
 }
@@ -385,6 +386,7 @@ impl RedemptionTracking {
             | EquityRedemptionEvent::DetectionFailed { .. }
             | EquityRedemptionEvent::RedemptionRejected { .. }
             | EquityRedemptionEvent::ProviderCompletionRecovered { .. }
+            | EquityRedemptionEvent::OperatorReconciled { .. }
             | EquityRedemptionEvent::Completed { .. } => {}
         }
 
@@ -413,7 +415,8 @@ fn mint_event_tokenization_request_id(
         | TokenizedEquityMintEvent::WrappingFailed { .. }
         | TokenizedEquityMintEvent::VaultDepositSubmitted { .. }
         | TokenizedEquityMintEvent::DepositedIntoRaindex { .. }
-        | TokenizedEquityMintEvent::RaindexDepositFailed { .. } => None,
+        | TokenizedEquityMintEvent::RaindexDepositFailed { .. }
+        | TokenizedEquityMintEvent::OperatorReconciled { .. } => None,
     }
 }
 
@@ -2060,13 +2063,17 @@ impl RebalancingService {
                 Self::complete_equity_transfer_update(Venue::Hedging, quantity),
             ),
             DepositedIntoRaindex { .. } => Some(Self::last_rebalancing_update()),
+            // Reconciliation is a pure bookkeeping terminal transition from
+            // `Failed`: the failure already settled inventory, so there is
+            // nothing to update.
             MintRequested { .. }
             | MintRejected { .. }
             | WrapSubmitted { .. }
             | TokensWrapped { .. }
             | VaultDepositSubmitted { .. }
             | WrappingFailed { .. }
-            | RaindexDepositFailed { .. } => None,
+            | RaindexDepositFailed { .. }
+            | OperatorReconciled { .. } => None,
         }
     }
 
@@ -2159,6 +2166,9 @@ impl RebalancingService {
             | TokensSent { .. }
             | DetectionFailed { .. }
             | Detected { .. }
+            // Reconciliation is a pure bookkeeping terminal transition from
+            // `Failed`: the failure already settled inventory, so nothing to do.
+            | OperatorReconciled { .. }
             | RedemptionRejected { .. } => None,
         }
     }
@@ -2198,7 +2208,7 @@ impl RebalancingService {
             | SendPending {
                 unwrapped_amount, ..
             } => FractionalShares::from_u256_18_decimals(*unwrapped_amount),
-            Completed { .. } | Failed { .. } => Ok(FractionalShares::ZERO),
+            Completed { .. } | Failed { .. } | Reconciled { .. } => Ok(FractionalShares::ZERO),
         }
     }
 
@@ -2889,7 +2899,7 @@ impl RebalancingService {
                 }
                 *inventory = updated.set_active_mint(symbol.clone(), id.clone());
             }
-            DepositedIntoRaindex { .. } | Failed { .. } => {}
+            DepositedIntoRaindex { .. } | Failed { .. } | Reconciled { .. } => {}
         }
 
         Ok(())
@@ -3343,7 +3353,7 @@ impl RebalancingService {
                 )?;
                 *inventory = updated.set_active_redemption(symbol.clone(), id.clone());
             }
-            Completed { .. } | Failed { .. } => {}
+            Completed { .. } | Failed { .. } | Reconciled { .. } => {}
         }
 
         Ok(())
@@ -3538,7 +3548,8 @@ impl RebalancingService {
             | MintRejected { .. }
             | MintAcceptanceFailed { .. }
             | RaindexDepositFailed { .. }
-            | WrappingFailed { .. } => true,
+            | WrappingFailed { .. }
+            | OperatorReconciled { .. } => true,
 
             MintRequested { .. }
             | MintAccepted { .. }
@@ -3566,7 +3577,8 @@ impl RebalancingService {
             | ProviderCompletionRecovered { .. }
             | TransferFailed { .. }
             | DetectionFailed { .. }
-            | RedemptionRejected { .. } => true,
+            | RedemptionRejected { .. }
+            | OperatorReconciled { .. } => true,
 
             VaultWithdrawPending { .. }
             | VaultWithdrawSubmitted { .. }
@@ -6313,6 +6325,18 @@ mod tests {
     }
 
     #[test]
+    fn operator_reconciled_is_terminal_mint_event() {
+        // Gates clear_equity_in_progress: a reconciled mint must read as terminal
+        // so the in-progress flag is released and rebalancing can resume.
+        assert!(RebalancingService::is_terminal_mint_event(
+            &TokenizedEquityMintEvent::OperatorReconciled {
+                reason: "credited offline".to_string(),
+                reconciled_at: Utc::now(),
+            }
+        ));
+    }
+
+    #[test]
     fn extract_mint_info_returns_symbol_and_quantity() {
         let symbol = Symbol::new("AAPL").unwrap();
         let event = make_mint_requested(&symbol, float!(42.5));
@@ -8880,6 +8904,18 @@ mod tests {
     fn detection_failure_is_terminal_redemption_event() {
         assert!(RebalancingService::is_terminal_redemption_event(
             &make_detection_failed()
+        ));
+    }
+
+    #[test]
+    fn operator_reconciled_is_terminal_redemption_event() {
+        // Gates clear_equity_in_progress: a reconciled redemption must read as
+        // terminal so the in-progress flag is released and rebalancing resumes.
+        assert!(RebalancingService::is_terminal_redemption_event(
+            &EquityRedemptionEvent::OperatorReconciled {
+                reason: "deposited manually".to_string(),
+                reconciled_at: Utc::now(),
+            }
         ));
     }
 

@@ -116,6 +116,12 @@ pub(crate) enum TokenizedEquityMintError {
     /// Attempted to modify a failed mint operation
     #[error("Already failed")]
     AlreadyFailed,
+    /// Attempted to reconcile a mint that is not in the `Failed` state
+    #[error("Cannot reconcile: mint is not in the Failed state")]
+    NotFailed,
+    /// Attempted to act on a mint already resolved out-of-band (`Reconciled`)
+    #[error("Already reconciled")]
+    AlreadyReconciled,
     /// Tokenizer API failed to submit the mint request.
     /// Tokenizer errors can't be wrapped with #[from] because they may
     /// contain types that don't implement Serialize/Deserialize (required
@@ -266,6 +272,19 @@ pub(crate) enum TokenizedEquityMintCommand {
         tx_hash: TxHash,
         fees: Option<Float>,
     },
+    /// Reconcile a mint stranded in the terminal `Failed` state to the terminal
+    /// `Reconciled` state. The residual tokens/equity were handled out-of-band
+    /// (e.g. via wrap-equity/vault-deposit), so this is a bookkeeping resolution
+    /// rather than a re-drive. Valid ONLY from `Failed`.
+    ///
+    /// Accepts any `Failed` variant, including a pre-departure `MintRejected`
+    /// failure that stranded nothing. Such a mint needs no reconcile (the
+    /// dashboard already excludes it from the stuck list); reconciling it is a
+    /// harmless no-residue bookkeeping close, so the operator decides whether it
+    /// is warranted rather than the aggregate second-guessing the failure cause.
+    Reconcile {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -371,6 +390,12 @@ pub(crate) enum TokenizedEquityMintEvent {
         fees: Option<Float>,
         recovered_at: DateTime<Utc>,
     },
+    /// An operator reconciled a terminal `Failed` mint out-of-band. Marks the
+    /// transfer resolved without re-driving the failed leg.
+    OperatorReconciled {
+        reason: String,
+        reconciled_at: DateTime<Utc>,
+    },
 }
 
 impl PartialEq for TokenizedEquityMintEvent {
@@ -423,6 +448,16 @@ impl PartialEq for TokenizedEquityMintEvent {
                 Self::RaindexDepositFailed {
                     reason: reason_b,
                     failed_at: time_b,
+                },
+            )
+            | (
+                Self::OperatorReconciled {
+                    reason: reason_a,
+                    reconciled_at: time_a,
+                },
+                Self::OperatorReconciled {
+                    reason: reason_b,
+                    reconciled_at: time_b,
                 },
             ) => reason_a == reason_b && time_a == time_b,
             (
@@ -584,6 +619,9 @@ impl DomainEvent for TokenizedEquityMintEvent {
             }
             Self::ProviderCompletionRecovered { .. } => {
                 "TokenizedEquityMintEvent::ProviderCompletionRecovered".to_string()
+            }
+            Self::OperatorReconciled { .. } => {
+                "TokenizedEquityMintEvent::OperatorReconciled".to_string()
             }
         }
     }
@@ -751,6 +789,25 @@ pub(crate) enum TokenizedEquityMint {
         reason: String,
         requested_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
+    },
+
+    /// An operator reconciled a terminal `Failed` mint out-of-band (terminal
+    /// state). Retains the identifying symbol/quantity and the original failure
+    /// reason so the projection still reports the real transfer instead of a
+    /// zero-value record.
+    Reconciled {
+        symbol: Symbol,
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        quantity: Float,
+        /// The failure reason carried over from the `Failed` state.
+        failure_reason: String,
+        /// The operator-supplied reconciliation reason.
+        reconcile_reason: String,
+        requested_at: DateTime<Utc>,
+        reconciled_at: DateTime<Utc>,
     },
 }
 
@@ -1048,6 +1105,31 @@ impl PartialEq for TokenizedEquityMint {
                     && req_a == req_b
                     && fail_a == fail_b
             }
+            (
+                Self::Reconciled {
+                    symbol: sym_a,
+                    quantity: qty_a,
+                    failure_reason: fail_reason_a,
+                    reconcile_reason: rec_reason_a,
+                    requested_at: req_a,
+                    reconciled_at: reconciled_a,
+                },
+                Self::Reconciled {
+                    symbol: sym_b,
+                    quantity: qty_b,
+                    failure_reason: fail_reason_b,
+                    reconcile_reason: rec_reason_b,
+                    requested_at: req_b,
+                    reconciled_at: reconciled_b,
+                },
+            ) => {
+                sym_a == sym_b
+                    && qty_a.eq(*qty_b).unwrap_or(false)
+                    && fail_reason_a == fail_reason_b
+                    && rec_reason_a == rec_reason_b
+                    && req_a == req_b
+                    && reconciled_a == reconciled_b
+            }
             _ => false,
         }
     }
@@ -1068,7 +1150,8 @@ impl TokenizedEquityMint {
             | Self::TokensWrapped { quantity, .. }
             | Self::VaultDepositSubmitted { quantity, .. }
             | Self::DepositedIntoRaindex { quantity, .. }
-            | Self::Failed { quantity, .. } => *quantity,
+            | Self::Failed { quantity, .. }
+            | Self::Reconciled { quantity, .. } => *quantity,
         }
     }
 
@@ -1184,6 +1267,26 @@ impl TokenizedEquityMint {
                 started_at: *requested_at,
                 updated_at: *failed_at,
             }),
+
+            // Reconciliation is a terminal operator resolution, so it maps to the
+            // existing `Completed` DTO status (no new status needed) -- mirrors the
+            // USDC `Reconciled -> Completed` mapping.
+            Self::Reconciled {
+                symbol,
+                quantity,
+                requested_at,
+                reconciled_at,
+                ..
+            } => TransferOperation::EquityMint(EquityMintOperation {
+                id: Id::new(issuer_request_id.clone()),
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(*quantity),
+                status: Completed {
+                    completed_at: *reconciled_at,
+                },
+                started_at: *requested_at,
+                updated_at: *reconciled_at,
+            }),
         }
     }
 }
@@ -1248,7 +1351,11 @@ impl EventSourced for TokenizedEquityMint {
     const PROJECTION: Nil = Nil;
     // v3: removed the vestigial `receipt_id` field and added the
     // `ProviderCompletionRecovered` event for in-process failed-transfer recovery.
-    const SCHEMA_VERSION: u64 = 3;
+    // v4: added the terminal `Reconciled` state and the `OperatorReconciled`
+    // event for operator reconciliation of stuck `Failed` mints. Additive only;
+    // bumped to clear stale snapshots so they rebuild from events under the new
+    // schema (existing events replay unchanged).
+    const SCHEMA_VERSION: u64 = 4;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use TokenizedEquityMintEvent::*;
@@ -1611,6 +1718,31 @@ impl EventSourced for TokenizedEquityMint {
                 }),
                 _ => None,
             },
+
+            OperatorReconciled {
+                reason,
+                reconciled_at,
+            } => {
+                let Self::Failed {
+                    symbol,
+                    quantity,
+                    reason: failure_reason,
+                    requested_at,
+                    ..
+                } = entity
+                else {
+                    return Ok(None);
+                };
+
+                Some(Self::Reconciled {
+                    symbol: symbol.clone(),
+                    quantity: *quantity,
+                    failure_reason: failure_reason.clone(),
+                    reconcile_reason: reason.clone(),
+                    requested_at: *requested_at,
+                    reconciled_at: *reconciled_at,
+                })
+            }
         })
     }
 
@@ -1807,6 +1939,7 @@ impl EventSourced for TokenizedEquityMint {
                     Err(TokenizedEquityMintError::AlreadyCompleted)
                 }
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(TokenizedEquityMintError::AlreadyReconciled),
             },
 
             TokenizedEquityMintCommand::SubmitWrap { wrap_tx_hash } => match self {
@@ -1824,6 +1957,7 @@ impl EventSourced for TokenizedEquityMint {
                     Err(TokenizedEquityMintError::AlreadyCompleted)
                 }
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(TokenizedEquityMintError::AlreadyReconciled),
             },
 
             TokenizedEquityMintCommand::SubmitVaultDeposit {
@@ -1841,6 +1975,7 @@ impl EventSourced for TokenizedEquityMint {
                     Err(TokenizedEquityMintError::AlreadyCompleted)
                 }
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(TokenizedEquityMintError::AlreadyReconciled),
             },
 
             TokenizedEquityMintCommand::WrapTokens {
@@ -1863,6 +1998,7 @@ impl EventSourced for TokenizedEquityMint {
                     Err(TokenizedEquityMintError::AlreadyCompleted)
                 }
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(TokenizedEquityMintError::AlreadyReconciled),
             },
 
             TokenizedEquityMintCommand::DepositToVault {
@@ -1882,6 +2018,7 @@ impl EventSourced for TokenizedEquityMint {
                     Err(TokenizedEquityMintError::AlreadyCompleted)
                 }
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(TokenizedEquityMintError::AlreadyReconciled),
             },
 
             TokenizedEquityMintCommand::FailAcceptance { reason } => match self {
@@ -1893,6 +2030,7 @@ impl EventSourced for TokenizedEquityMint {
                     Err(TokenizedEquityMintError::AlreadyCompleted)
                 }
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(TokenizedEquityMintError::AlreadyReconciled),
                 _ => Err(TokenizedEquityMintError::AlreadyInProgress),
             },
 
@@ -1919,6 +2057,7 @@ impl EventSourced for TokenizedEquityMint {
                     Err(TokenizedEquityMintError::AlreadyCompleted)
                 }
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(TokenizedEquityMintError::AlreadyReconciled),
                 _ => Err(TokenizedEquityMintError::AlreadyInProgress),
             },
 
@@ -1933,6 +2072,7 @@ impl EventSourced for TokenizedEquityMint {
                     Err(TokenizedEquityMintError::AlreadyCompleted)
                 }
                 Self::Failed { .. } => Err(TokenizedEquityMintError::AlreadyFailed),
+                Self::Reconciled { .. } => Err(TokenizedEquityMintError::AlreadyReconciled),
                 _ => Err(TokenizedEquityMintError::AlreadyInProgress),
             },
 
@@ -1952,10 +2092,27 @@ impl EventSourced for TokenizedEquityMint {
                     fees,
                     recovered_at: Utc::now(),
                 }]),
+                Self::Reconciled { .. } => Err(TokenizedEquityMintError::AlreadyReconciled),
                 Self::DepositedIntoRaindex { .. } => {
                     Err(TokenizedEquityMintError::AlreadyCompleted)
                 }
                 _ => Err(TokenizedEquityMintError::AlreadyInProgress),
+            },
+
+            TokenizedEquityMintCommand::Reconcile { reason } => match self {
+                Self::Failed { symbol, .. } => {
+                    warn!(
+                        target: "rebalance",
+                        %symbol, %reason,
+                        "Reconciling stuck failed mint out-of-band"
+                    );
+                    Ok(vec![OperatorReconciled {
+                        reason,
+                        reconciled_at: Utc::now(),
+                    }])
+                }
+                Self::Reconciled { .. } => Err(TokenizedEquityMintError::AlreadyReconciled),
+                _ => Err(TokenizedEquityMintError::NotFailed),
             },
         }
     }
@@ -1967,7 +2124,7 @@ mod tests {
     use sqlx::SqlitePool;
     use std::sync::Arc;
 
-    use st0x_event_sorcery::{AggregateError, LifecycleError, TestHarness, TestStore};
+    use st0x_event_sorcery::{AggregateError, LifecycleError, TestHarness, TestStore, replay};
     use st0x_float_macro::float;
     use st0x_raindex::RaindexVaultId;
     use st0x_wrapper::MockWrapper;
@@ -2952,6 +3109,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recover_provider_completion_rejected_for_reconciled_mint() {
+        let mut history = failed_mint_history();
+        history.push(TokenizedEquityMintEvent::OperatorReconciled {
+            reason: "credited offline".to_string(),
+            reconciled_at: Utc::now(),
+        });
+
+        let error = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
+            .given(history)
+            .when(TokenizedEquityMintCommand::RecoverProviderCompletion {
+                issuer_request_id: IssuerRequestId::new("ISS001"),
+                wallet: Address::ZERO,
+                tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
+                tx_hash: TxHash::ZERO,
+                fees: None,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(TokenizedEquityMintError::AlreadyReconciled)
+            ),
+            "a reconciled mint must report AlreadyReconciled, not recover, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn fail_acceptance_from_accepted_transitions_to_failed() {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
         let id = IssuerRequestId::new("ISS001");
@@ -3092,6 +3278,161 @@ mod tests {
         assert!(
             result.is_err(),
             "FailAcceptance should fail from Failed state"
+        );
+    }
+
+    fn failed_mint_history() -> Vec<TokenizedEquityMintEvent> {
+        vec![
+            mint_requested_event(),
+            mint_accepted_event(),
+            TokenizedEquityMintEvent::MintAcceptanceFailed {
+                reason: "timed out".to_string(),
+                failed_at: Utc::now(),
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn reconcile_from_failed_emits_operator_reconciled_and_replays_to_reconciled() {
+        let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
+        let id = IssuerRequestId::new("ISS001");
+
+        store.send(&id, mint_command()).await.unwrap();
+        store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::FailAcceptance {
+                    reason: "timed out".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::Reconcile {
+                    reason: "wrapped manually via wrap-equity".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let entity = store.load(&id).await.unwrap().unwrap();
+        let TokenizedEquityMint::Reconciled {
+            failure_reason,
+            reconcile_reason,
+            quantity,
+            ..
+        } = entity
+        else {
+            panic!("Expected Reconciled state, got: {entity:?}");
+        };
+        assert_eq!(failure_reason, "timed out");
+        assert_eq!(reconcile_reason, "wrapped manually via wrap-equity");
+        assert!(
+            quantity.eq(float!(10)).unwrap(),
+            "reconciled state must preserve the requested quantity, got {quantity:?}"
+        );
+    }
+
+    #[test]
+    fn evolve_operator_reconciled_from_failed_yields_reconciled() {
+        let failed = replay::<TokenizedEquityMint>(failed_mint_history())
+            .unwrap()
+            .unwrap();
+        let reconciled_at = Utc::now();
+
+        let next = TokenizedEquityMint::evolve(
+            &failed,
+            &TokenizedEquityMintEvent::OperatorReconciled {
+                reason: "credited offline".to_string(),
+                reconciled_at,
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(
+            matches!(
+                next,
+                TokenizedEquityMint::Reconciled {
+                    ref reconcile_reason,
+                    ..
+                } if reconcile_reason == "credited offline"
+            ),
+            "OperatorReconciled from Failed must yield Reconciled, got {next:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_from_non_failed_is_rejected() {
+        let error = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
+            .given(vec![mint_requested_event(), mint_accepted_event()])
+            .when(TokenizedEquityMintCommand::Reconcile {
+                reason: "should be rejected".to_string(),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(TokenizedEquityMintError::NotFailed)
+            ),
+            "reconcile from a non-failed mint must be rejected as NotFailed, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_from_reconciled_state_is_rejected() {
+        let mut history = failed_mint_history();
+        history.push(TokenizedEquityMintEvent::OperatorReconciled {
+            reason: "already reconciled".to_string(),
+            reconciled_at: Utc::now(),
+        });
+
+        let error = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
+            .given(history)
+            .when(TokenizedEquityMintCommand::Reconcile {
+                reason: "second attempt".to_string(),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(TokenizedEquityMintError::AlreadyReconciled)
+            ),
+            "reconcile from an already-reconciled mint reports AlreadyReconciled, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn reconciled_to_dto_reports_completed_preserving_quantity() {
+        let reconciled = TokenizedEquityMint::Reconciled {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: float!(10),
+            failure_reason: "timed out".to_string(),
+            reconcile_reason: "credited offline".to_string(),
+            requested_at: Utc::now(),
+            reconciled_at: Utc::now(),
+        };
+
+        let TransferOperation::EquityMint(operation) =
+            reconciled.to_dto(&IssuerRequestId::new("ISS001"))
+        else {
+            panic!("expected an EquityMint operation");
+        };
+        assert!(
+            matches!(operation.status, EquityMintStatus::Completed { .. }),
+            "reconciled mint must map to the Completed DTO status, got {:?}",
+            operation.status
+        );
+        assert_eq!(
+            operation.quantity.to_string(),
+            FractionalShares::new(float!(10)).to_string()
         );
     }
 }

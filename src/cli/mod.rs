@@ -90,6 +90,18 @@ pub enum TransferResumeKind {
     Equity,
 }
 
+/// What kind of transfer to reconcile.
+///
+/// `usdc` reconciles a post-burn `DepositFailed` USDC rebalance; `mint` and
+/// `redemption` reconcile an equity transfer stuck in `Failed`. All operate
+/// directly on the local CQRS state via aggregate commands.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum ReconcileKind {
+    Usdc,
+    Mint,
+    Redemption,
+}
+
 /// Aggregate types that have materialized views.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum AggregateView {
@@ -602,23 +614,31 @@ pub enum TransferCommand {
         direction: Option<TransferDirection>,
     },
 
-    /// Reconcile a USDC transfer stranded in a post-burn terminal failure.
+    /// Reconcile a transfer stuck in a terminal failure to a resolved terminal.
     ///
-    /// Drives a USDC rebalance stranded in a post-burn terminal failure that
-    /// strands the in-progress guard (`DepositFailed`, a post-burn
+    /// `--kind usdc` drives a USDC rebalance stranded in a post-burn terminal
+    /// failure that strands the in-progress guard (`DepositFailed`, a post-burn
     /// `BridgingFailed`, or a `BaseToAlpaca` `ConversionFailed`) to the clearing
-    /// terminal `Reconciled` state: the funds were handled out-of-band, so this
-    /// resolves the transfer rather than re-driving it. Rejects an unknown id or
-    /// any other state. Operates directly on the local CQRS state; does not
-    /// require the running bot, but the bot must not be concurrently driving
-    /// the same id.
+    /// terminal `Reconciled` state (the funds were handled out-of-band).
+    /// `--kind mint` / `--kind redemption` mark an equity transfer stuck in
+    /// `Failed` as `Reconciled` once its residue was handled out-of-band (e.g.
+    /// via wrap-equity/vault-deposit) -- a pure bookkeeping resolution. Rejects
+    /// an unknown id or an aggregate not in the expected failure state. Operates
+    /// directly on the local CQRS state; does not require the running bot, but
+    /// the bot must not be concurrently driving the same id.
     Reconcile {
-        /// Id of the stuck transfer to reconcile
+        /// What to reconcile: `usdc`, `mint`, or `redemption`
+        #[arg(short = 'k', long = "kind")]
+        kind: ReconcileKind,
+        /// Aggregate id (USDC rebalance id for `usdc`, issuer_request_id for
+        /// `mint`, redemption id for `redemption`)
         #[arg(long = "id")]
-        id: Uuid,
-        /// Why the transfer is being reconciled (required; persisted as the audit record)
-        #[arg(short = 'r', long = "reason")]
-        reason: ReconcileReasonArg,
+        id: String,
+        /// Why the transfer is being reconciled (required; persisted as the audit
+        /// record). For `usdc` this must be one of `funds-moved-manually` or
+        /// `deposit-credited-offline`; for `mint`/`redemption` it is free text.
+        #[arg(short = 'r', long = "reason", value_parser = parse_non_empty_reason)]
+        reason: String,
     },
 
     /// Manually fail a stuck mint or redemption transfer.
@@ -847,9 +867,34 @@ enum SimpleCommand {
     },
     ResumeInterruptedTransfers,
     ReconcileUsdcTransfer {
-        id: Uuid,
-        reason: ReconcileReasonArg,
+        /// Raw operator-supplied `--id` from `transfer reconcile --kind usdc`,
+        /// parsed into a `Uuid` in the handler so a malformed id surfaces a
+        /// clear operator error.
+        id: String,
+        /// Raw operator-supplied `--reason` from `transfer reconcile --kind
+        /// usdc`, parsed into [`ReconcileReasonArg`] in the handler so an
+        /// unknown value surfaces a clear error.
+        reason: String,
     },
+    ReconcileEquityTransfer {
+        transfer_type: TransferType,
+        id: String,
+        reason: String,
+    },
+}
+
+/// Parses the operator `--reason` string for a USDC reconcile into the typed
+/// [`ReconcileReasonArg`]. Returns an error for an unknown reason so the
+/// operator gets a clear message instead of a silent fallback.
+fn parse_usdc_reconcile_reason(reason: &str) -> anyhow::Result<ReconcileReasonArg> {
+    match reason {
+        "funds-moved-manually" => Ok(ReconcileReasonArg::FundsMovedManually),
+        "deposit-credited-offline" => Ok(ReconcileReasonArg::DepositCreditedOffline),
+        other => anyhow::bail!(
+            "transfer reconcile --kind usdc: unknown --reason {other:?} \
+             (expected `funds-moved-manually` or `deposit-credited-offline`)"
+        ),
+    }
 }
 
 #[cfg(feature = "test-support")]
@@ -1198,9 +1243,22 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
                 // invoking classify directly must pass clap-parsed input.
                 unreachable!("clap `required_if_eq(\"kind\",\"usdc\")` guarantees id and direction")
             }
-            TransferCommand::Reconcile { id, reason } => {
-                Ok(SimpleCommand::ReconcileUsdcTransfer { id, reason })
-            }
+            // Classification stays pure (routing only): the usdc id/reason are
+            // parsed and validated in the handler so a bad value surfaces a clear
+            // operator error rather than a panic here.
+            TransferCommand::Reconcile { kind, id, reason } => match kind {
+                ReconcileKind::Usdc => Ok(SimpleCommand::ReconcileUsdcTransfer { id, reason }),
+                ReconcileKind::Mint => Ok(SimpleCommand::ReconcileEquityTransfer {
+                    transfer_type: TransferType::Mint,
+                    id,
+                    reason,
+                }),
+                ReconcileKind::Redemption => Ok(SimpleCommand::ReconcileEquityTransfer {
+                    transfer_type: TransferType::Redemption,
+                    id,
+                    reason,
+                }),
+            },
             TransferCommand::Fail { kind, id, reason } => Ok(SimpleCommand::FailTransfer {
                 transfer_type: kind,
                 id,
@@ -1392,7 +1450,22 @@ async fn run_simple_command<W: Write>(
             rebalancing::resume_interrupted_transfers_command(stdout, ctx).await
         }
         SimpleCommand::ReconcileUsdcTransfer { id, reason } => {
+            let id = id.parse::<Uuid>().map_err(|error| {
+                anyhow::anyhow!("transfer reconcile --kind usdc: invalid id {id:?}: {error}")
+            })?;
+            // A blank reason was already rejected by `parse_non_empty_reason` at
+            // clap parse time; this enum-domain parse is the secondary check that
+            // also constrains the value to the usdc vocabulary.
+            let reason = parse_usdc_reconcile_reason(&reason)?;
             rebalancing::reconcile_usdc_transfer_command(stdout, id, reason.into(), pool).await
+        }
+        SimpleCommand::ReconcileEquityTransfer {
+            transfer_type,
+            id,
+            reason,
+        } => {
+            rebalancing::reconcile_equity_transfer_command(stdout, transfer_type, &id, reason, pool)
+                .await
         }
     }
 }
@@ -1830,10 +1903,19 @@ mod tests {
 
     #[test]
     fn transfer_reconcile_requires_reason() {
+        // Supply --kind and --id so the only missing required arg is --reason,
+        // isolating the audit-record requirement from the other required flags.
         let id = Uuid::from_u128(7);
-        let error =
-            Cli::try_parse_from(["st0x-cli", "transfer", "reconcile", "--id", &id.to_string()])
-                .unwrap_err();
+        let error = Cli::try_parse_from([
+            "st0x-cli",
+            "transfer",
+            "reconcile",
+            "--kind",
+            "usdc",
+            "--id",
+            &id.to_string(),
+        ])
+        .unwrap_err();
         assert_eq!(
             error.kind(),
             clap::error::ErrorKind::MissingRequiredArgument
@@ -2197,12 +2279,14 @@ mod tests {
     }
 
     #[test]
-    fn transfer_reconcile_parses_and_classifies_as_simple() {
+    fn transfer_reconcile_usdc_parses_and_classifies_as_simple() {
         let id = Uuid::from_u128(77);
         let cli = Cli::try_parse_from([
             "st0x-cli",
             "transfer",
             "reconcile",
+            "--kind",
+            "usdc",
             "--id",
             &id.to_string(),
             "--reason",
@@ -2215,10 +2299,107 @@ mod tests {
                 id: parsed_id,
                 reason,
             }) => {
-                assert_eq!(parsed_id, id);
-                assert!(matches!(reason, ReconcileReasonArg::DepositCreditedOffline));
+                assert_eq!(parsed_id, id.to_string());
+                assert_eq!(reason, "deposit-credited-offline");
             }
-            _ => panic!("expected reconcile simple command"),
+            _ => panic!("expected reconcile usdc simple command"),
+        }
+    }
+
+    #[test]
+    fn transfer_reconcile_mint_parses_and_classifies_as_equity() {
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "transfer",
+            "reconcile",
+            "--kind",
+            "mint",
+            "--id",
+            "ISS001",
+            "--reason",
+            "wrapped manually via wrap-equity",
+        ])
+        .unwrap();
+
+        match classify_command(cli.command) {
+            Ok(SimpleCommand::ReconcileEquityTransfer {
+                transfer_type,
+                id,
+                reason,
+            }) => {
+                assert!(matches!(transfer_type, TransferType::Mint));
+                assert_eq!(id, "ISS001");
+                assert_eq!(reason, "wrapped manually via wrap-equity");
+            }
+            _ => panic!("expected reconcile equity (mint) simple command"),
+        }
+    }
+
+    #[test]
+    fn transfer_reconcile_redemption_parses_and_classifies_as_equity() {
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "transfer",
+            "reconcile",
+            "--kind",
+            "redemption",
+            "--id",
+            "RED-001",
+            "--reason",
+            "deposited manually",
+        ])
+        .unwrap();
+
+        match classify_command(cli.command) {
+            Ok(SimpleCommand::ReconcileEquityTransfer {
+                transfer_type,
+                id,
+                reason,
+            }) => {
+                assert!(matches!(transfer_type, TransferType::Redemption));
+                assert_eq!(id, "RED-001");
+                assert_eq!(reason, "deposited manually");
+            }
+            _ => panic!("expected reconcile equity (redemption) simple command"),
+        }
+    }
+
+    #[test]
+    fn transfer_reconcile_usdc_rejects_unknown_reason() {
+        let error = parse_usdc_reconcile_reason("bogus-reason").unwrap_err();
+        assert!(
+            error.to_string().contains("unknown --reason"),
+            "unknown usdc reconcile reason must surface a clear error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn transfer_reconcile_rejects_blank_reason() {
+        // `OperatorReconciled { reason }` is the permanent audit record; a
+        // present-but-blank reason must be rejected at parse time for every
+        // kind, not just usdc (whose enum domain rejects it).
+        for kind in ["usdc", "mint", "redemption"] {
+            let error = Cli::try_parse_from([
+                "st0x-cli",
+                "transfer",
+                "reconcile",
+                "--kind",
+                kind,
+                "--id",
+                "x",
+                "--reason",
+                "   ",
+            ])
+            .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "blank --reason must be rejected for --kind {kind}",
+            );
+            assert!(
+                error.to_string().contains("must not be blank"),
+                "unexpected error for --kind {kind}: {error}",
+            );
         }
     }
 
