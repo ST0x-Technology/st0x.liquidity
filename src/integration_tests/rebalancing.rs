@@ -14,7 +14,7 @@ use httpmock::Mock;
 use httpmock::prelude::*;
 use serde_json::json;
 use sqlx::SqlitePool;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -208,7 +208,6 @@ fn test_trigger_config() -> RebalancingServiceConfig {
                 reserved: None,
             }),
         },
-        disabled_assets: HashSet::new(),
     }
 }
 
@@ -1748,7 +1747,6 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         }),
         transfer_timeout: Duration::from_secs(30 * 60),
         assets,
-        disabled_assets: HashSet::new(),
     };
 
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
@@ -1876,7 +1874,6 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
         }),
         transfer_timeout: Duration::from_secs(30 * 60),
         assets,
-        disabled_assets: HashSet::new(),
     };
 
     let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
@@ -1975,7 +1972,6 @@ async fn threshold_config_controls_trigger_sensitivity() {
                     reserved: None,
                 }),
             },
-            disabled_assets: HashSet::new(),
         };
         let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
         let wrapper = Arc::new(MockWrapper::new());
@@ -2034,7 +2030,6 @@ async fn threshold_config_controls_trigger_sensitivity() {
                     reserved: None,
                 }),
             },
-            disabled_assets: HashSet::new(),
         };
         let vault_registry = Arc::new(test_store::<VaultRegistry>(pool.clone(), ()));
         let wrapper = Arc::new(MockWrapper::new());
