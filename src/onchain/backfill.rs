@@ -408,6 +408,8 @@ fn generate_batch_ranges(start_block: u64, end_block: u64) -> Vec<(u64, u64)> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use alloy::primitives::{
         Address, B256, FixedBytes, IntoLogData, TxHash, U256, address, fixed_bytes, uint,
     };
@@ -1070,6 +1072,107 @@ mod tests {
             log_index: Some(1),
             removed: false,
         }
+    }
+
+    /// A burst-sized batch must enqueue exactly one job per
+    /// `(tx_hash, log_index)` in chronological `(block_number, log_index)`
+    /// order regardless of the order the node returned the logs in. The
+    /// sort matters under load: jobs drain through a `concurrency(1)`
+    /// worker, so out-of-order enqueue means out-of-order position
+    /// accumulation against a live hedging threshold.
+    #[tokio::test]
+    async fn burst_batch_enqueues_one_job_per_log_in_chronological_order() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
+        let order = get_test_order();
+        let evm_ctx = EvmCtx {
+            rpc_url: Url::parse("http://localhost:8545").unwrap(),
+            orderbook: address!("0x1111111111111111111111111111111111111111"),
+            deployment_block: 1,
+            required_confirmations: 0,
+        };
+
+        // 30 take logs, 3 per block across 10 blocks, served by the
+        // mock node in reverse-chronological order.
+        let logs: Vec<Log> = (0..30u64)
+            .map(|index| {
+                let take_event = create_test_take_event(
+                    &order,
+                    uint!(100_000_000_U256),
+                    uint!(1_000_000_000_000_000_000_U256),
+                );
+                let mut hash_bytes = [0u8; 32];
+                hash_bytes[0] = 0xab;
+                hash_bytes[31] = u8::try_from(index).unwrap();
+
+                let mut log = create_test_log(
+                    evm_ctx.orderbook,
+                    &take_event,
+                    10 + index / 3,
+                    FixedBytes::from(hash_bytes),
+                );
+                log.log_index = Some(index % 3);
+                log
+            })
+            .collect();
+        let reversed: Vec<&Log> = logs.iter().rev().collect();
+
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::json!([]));
+        push_tip_response(&asserter);
+        asserter.push_success(&serde_json::json!(reversed));
+        push_tip_response(&asserter);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        backfill_events(
+            &provider,
+            &evm_ctx,
+            &pool,
+            100,
+            test_retry_strategy(),
+            job_queue,
+        )
+        .await
+        .unwrap();
+
+        let payloads: Vec<Vec<u8>> = sqlx::query_scalar("SELECT job FROM Jobs ORDER BY rowid ASC")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(payloads.len(), 30, "one job per log, none dropped");
+
+        let jobs: Vec<AccountForDexTrade> = payloads
+            .iter()
+            .map(|payload| serde_json::from_slice(payload).unwrap())
+            .collect();
+
+        let enqueue_order: Vec<(u64, u64)> = jobs
+            .iter()
+            .map(|job| (job.trade.block_number, job.trade.log_index))
+            .collect();
+        let mut chronological = enqueue_order.clone();
+        chronological.sort_unstable();
+        assert_eq!(
+            enqueue_order, chronological,
+            "Jobs must be enqueued in chronological (block, log_index) \
+             order despite the node serving them reversed"
+        );
+
+        // The 30 enqueued jobs map one-to-one onto the 30 distinct input logs:
+        // no two logs collapsed onto a shared (tx_hash, log_index) key and --
+        // together with the count check above -- none was enqueued twice. Note
+        // the inputs are all distinct, so this guards the 1:1 mapping, not an
+        // enqueue-time dedup; per-fill dedup proper lives downstream in
+        // `process_queued_trade`.
+        let distinct: HashSet<(TxHash, u64)> = jobs
+            .iter()
+            .map(|job| (job.trade.tx_hash, job.trade.log_index))
+            .collect();
+        assert_eq!(
+            distinct.len(),
+            30,
+            "the 30 jobs must carry 30 distinct (tx_hash, log_index) keys"
+        );
     }
 
     #[tokio::test]
