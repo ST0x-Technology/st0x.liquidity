@@ -240,6 +240,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Enabled,
                     wrapped_equity_recovery,
+                    extended_hours_counter_trading: OperationMode::Disabled,
                     operational_limit: None,
                 },
             ))
@@ -331,6 +332,7 @@ where
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery,
+                    extended_hours_counter_trading: OperationMode::Disabled,
                     operational_limit: None,
                 },
             ))

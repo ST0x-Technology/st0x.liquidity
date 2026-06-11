@@ -89,6 +89,10 @@ pub struct EquityAssetConfig {
     pub trading: OperationMode,
     pub rebalancing: OperationMode,
     pub wrapped_equity_recovery: OperationMode,
+    /// When enabled, counter-trades for this equity may be placed during
+    /// extended (pre-/after-market) sessions as limit orders, instead of
+    /// waiting for the regular open. Must be explicitly configured.
+    pub extended_hours_counter_trading: OperationMode,
     pub operational_limit: Option<Positive<FractionalShares>>,
 }
 
@@ -227,10 +231,6 @@ struct Config {
     broker: Option<BrokerConfig>,
     assets: AssetsConfig,
     rest_api: Option<RestApiUrlConfig>,
-    /// When true, place limit orders during extended hours (pre-market /
-    /// after-hours) to hedge positions immediately instead of waiting for
-    /// regular market open. Must be explicitly configured.
-    extended_hours_counter_trading: bool,
 }
 
 /// Plaintext REST API settings (URL only). Credentials live in secrets.
@@ -457,7 +457,6 @@ pub struct Ctx {
     pub assets: AssetsConfig,
     pub travel_rule: Option<TravelRuleConfig>,
     pub rest_api: Option<RestApiCtx>,
-    pub extended_hours_counter_trading: bool,
     /// Alpaca redemption wallet from `[tokenization]`.
     /// `Some` when the config includes a `[tokenization]` section.
     pub redemption_wallet: Option<Address>,
@@ -553,11 +552,7 @@ impl std::fmt::Debug for Ctx {
             .field("assets", &self.assets)
             .field("travel_rule_configured", &self.travel_rule.is_some())
             .field("redemption_wallet", &self.redemption_wallet)
-            .field("rest_api", &self.rest_api)
-            .field(
-                "extended_hours_counter_trading",
-                &self.extended_hours_counter_trading,
-            );
+            .field("rest_api", &self.rest_api);
 
         debug_struct.finish()
     }
@@ -620,7 +615,6 @@ struct ValidatedParts {
     assets: AssetsConfig,
     travel_rule: Option<TravelRuleConfig>,
     rest_api: Option<RestApiCtx>,
-    extended_hours_counter_trading: bool,
     redemption_wallet: Option<Address>,
     /// Wallet construction inputs. Always present — `parse_and_validate`
     /// returns `WalletNotConfigured` when both config and secrets lack
@@ -863,7 +857,6 @@ fn parse_and_validate(
                 RestApiCtx::new(cfg.url, key_id, key_secret).map_err(CtxError::RestApiClient)
             })
             .transpose()?,
-        extended_hours_counter_trading: config.extended_hours_counter_trading,
         redemption_wallet,
         wallet_inputs,
         wallet_meta,
@@ -924,7 +917,6 @@ impl Ctx {
             assets: parts.assets,
             travel_rule: parts.travel_rule,
             rest_api: parts.rest_api,
-            extended_hours_counter_trading: parts.extended_hours_counter_trading,
             redemption_wallet: parts.redemption_wallet,
         })
     }
@@ -1022,6 +1014,29 @@ impl Ctx {
     }
 }
 
+impl AssetsConfig {
+    /// Returns whether extended-hours counter-trading is enabled for the
+    /// given equity.
+    ///
+    /// Fail-closed: assets not present in the config are treated as
+    /// disabled.
+    pub fn is_extended_hours_enabled(&self, symbol: &Symbol) -> bool {
+        self.equities
+            .symbols
+            .get(symbol)
+            .is_some_and(|config| config.extended_hours_counter_trading == OperationMode::Enabled)
+    }
+
+    /// Returns whether any configured equity enables extended-hours
+    /// counter-trading.
+    pub fn any_extended_hours_enabled(&self) -> bool {
+        self.equities
+            .symbols
+            .values()
+            .any(|config| config.extended_hours_counter_trading == OperationMode::Enabled)
+    }
+}
+
 /// Test-only constructor for `Ctx` that internalizes fields e2e tests
 /// don't need to control (log level, operational limits, EVM wrapping,
 /// polling intervals). This keeps `Ctx` fields `pub(crate)` while
@@ -1092,7 +1107,6 @@ impl Ctx {
             assets,
             travel_rule,
             rest_api,
-            extended_hours_counter_trading: false,
             redemption_wallet,
         })
     }
@@ -1313,7 +1327,6 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         },
         travel_rule: None,
         rest_api: None,
-        extended_hours_counter_trading: false,
         redemption_wallet: None,
     }
 }
@@ -1344,7 +1357,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -1372,7 +1384,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -1402,7 +1413,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -1533,7 +1543,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -1574,7 +1583,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -1620,7 +1628,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -1663,7 +1670,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -1965,7 +1971,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn extended_hours_counter_trading_is_required() {
+    async fn extended_hours_counter_trading_is_required_per_equity() {
         let config = toml_file(
             r#"
             database_url = ":memory:"
@@ -1973,7 +1979,12 @@ mod tests {
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
 
-            [assets.equities]
+            [assets.equities.AAPL]
+            tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            trading = "enabled"
+            rebalancing = "disabled"
+            wrapped_equity_recovery = "disabled"
 
             [raindex]
             orderbook = "0x1111111111111111111111111111111111111111"
@@ -2008,7 +2019,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 0
-            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -2047,7 +2057,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
             order_fill_poll_interval = 0
 
             [assets.equities]
@@ -2087,7 +2096,6 @@ mod tests {
             server_port = 8080
             board_port = 8080
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -2140,7 +2148,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -2199,7 +2206,6 @@ mod tests {
             database_url = ":memory:"
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
             log_level = "warn"
             server_port = 9090
             order_polling_interval = 30
@@ -2259,7 +2265,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -2350,7 +2355,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -2403,7 +2407,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -2467,7 +2470,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -2526,7 +2528,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -2589,7 +2590,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -2658,7 +2658,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -2709,7 +2708,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -2807,7 +2805,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -2861,7 +2858,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -3001,7 +2997,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -3220,6 +3215,7 @@ mod tests {
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             }
         }
@@ -3330,7 +3326,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
             bogus_field = "should fail"
 
             [raindex]
@@ -3359,7 +3354,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
 
             [assets]
             bogus_field = "should fail"
@@ -3392,7 +3386,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
 
             [assets.equities.AAPL]
             tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -3400,6 +3393,7 @@ mod tests {
             trading = "enabled"
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
             bogus_field = "should fail"
 
             [raindex]
@@ -3428,7 +3422,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
 
             [assets.cash]
             rebalancing = "disabled"
@@ -3516,7 +3509,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
             bogus_field = "should fail"
 
             [raindex]
@@ -3576,6 +3568,7 @@ mod tests {
             trading = "disabled"
             rebalancing = "enabled"
             wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
             operational_limit = 5
 
             [equities.SPYM]
@@ -3584,6 +3577,7 @@ mod tests {
             trading = "disabled"
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
 
             [cash]
             vault_id = "0x0000000000000000000000000000000000000000000000000000000000000fab"
@@ -3622,6 +3616,7 @@ mod tests {
             trading = "disabled"
             rebalancing = "enabled"
             wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
         "#;
 
         let config: AssetsConfig = toml::from_str(toml_str).unwrap();
@@ -3642,6 +3637,7 @@ mod tests {
             trading = "disabled"
             rebalancing = "enabled"
             wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
         "#;
 
         let config: AssetsConfig = toml::from_str(toml_str).unwrap();
@@ -3666,6 +3662,7 @@ mod tests {
             tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
         "#;
 
         let result = toml::from_str::<AssetsConfig>(toml_str);
@@ -3683,6 +3680,7 @@ mod tests {
             tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             trading = "enabled"
             wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
         "#;
 
         let result = toml::from_str::<AssetsConfig>(toml_str);
@@ -3718,6 +3716,7 @@ mod tests {
             trading = "enabled"
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
             operational_limit = 10
 
             [equities.TSLA]
@@ -3726,6 +3725,7 @@ mod tests {
             trading = "enabled"
             rebalancing = "disabled"
             wrapped_equity_recovery = "disabled"
+            extended_hours_counter_trading = "disabled"
         "#;
 
         let config: AssetsConfig = toml::from_str(toml_str).unwrap();
@@ -3754,6 +3754,7 @@ mod tests {
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -3790,6 +3791,68 @@ mod tests {
     }
 
     #[test]
+    fn is_extended_hours_enabled_returns_configured_value() {
+        let mut symbols = HashMap::new();
+        symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            EquityAssetConfig {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: Address::ZERO,
+                pyth_feed_id: None,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Enabled,
+                operational_limit: None,
+            },
+        );
+        symbols.insert(
+            Symbol::new("TSLA").unwrap(),
+            EquityAssetConfig {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: Address::ZERO,
+                pyth_feed_id: None,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Enabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
+                operational_limit: None,
+            },
+        );
+
+        let assets = AssetsConfig {
+            equities: EquitiesConfig {
+                operational_limit: None,
+                symbols,
+            },
+            cash: None,
+        };
+
+        assert!(
+            assets.is_extended_hours_enabled(&Symbol::new("AAPL").unwrap()),
+            "AAPL extended-hours counter-trading should be enabled"
+        );
+        assert!(
+            !assets.is_extended_hours_enabled(&Symbol::new("TSLA").unwrap()),
+            "TSLA extended-hours counter-trading should be disabled"
+        );
+        assert!(
+            !assets.is_extended_hours_enabled(&Symbol::new("UNKNOWN").unwrap()),
+            "Unknown assets should default to disabled (fail-closed)"
+        );
+        assert!(
+            assets.any_extended_hours_enabled(),
+            "At least one equity enables extended-hours counter-trading"
+        );
+        assert!(
+            !AssetsConfig::default().any_extended_hours_enabled(),
+            "No configured equities means no extended-hours counter-trading"
+        );
+    }
+
+    #[test]
     fn is_rebalancing_enabled_returns_configured_value() {
         let mut symbols = HashMap::new();
         symbols.insert(
@@ -3802,6 +3865,7 @@ mod tests {
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -3853,6 +3917,7 @@ mod tests {
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -3984,6 +4049,7 @@ mod tests {
                     trading = "{trading}"
                     rebalancing = "{rebalancing}"
                     wrapped_equity_recovery = "disabled"
+                    extended_hours_counter_trading = "disabled"
                     "#,
                     "", "",
                 );
@@ -4315,7 +4381,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -4350,7 +4415,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -4400,7 +4464,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -4486,7 +4549,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
 
             [assets.equities]
 
@@ -4527,7 +4589,6 @@ mod tests {
             server_port = 8080
             board_port = 8081
             apalis_finished_job_cleanup_interval_secs = 3600
-            extended_hours_counter_trading = false
             position_check_interval = 0
 
             [assets.equities]

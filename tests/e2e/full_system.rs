@@ -104,6 +104,7 @@ fn build_full_system_ctx<P: Provider + Clone>(
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Enabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
+                    extended_hours_counter_trading: OperationMode::Disabled,
                     operational_limit: None,
                 },
             ))
