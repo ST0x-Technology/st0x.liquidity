@@ -19,6 +19,7 @@ mod chaos_crash;
 mod chaos_db;
 mod chaos_load;
 mod chaos_rpc;
+mod chaos_time;
 mod full_system;
 mod hedging;
 mod poll;
