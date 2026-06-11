@@ -110,7 +110,7 @@ where
         // the next restart.
         ctx.finalize_terminal_pending_positions().await;
 
-        if ctx.ctx.extended_hours_counter_trading {
+        if ctx.ctx.assets.any_extended_hours_enabled() {
             // Every regular-hours tick: request cancellation of still-live
             // extended-hours limit orders so they're replaced with market
             // orders. Level-triggered so an order that slipped past the
@@ -161,7 +161,6 @@ where
             self.executor.to_supported_executor(),
             &self.ctx.assets,
             true,
-            self.ctx.extended_hours_counter_trading,
         )
         .await
         .inspect_err(|error| error!(%symbol, %error, "Execution readiness check failed"));
@@ -298,7 +297,9 @@ where
 
     /// While the market is in regular hours, requests broker cancellation of
     /// any still-live extended-hours limit orders so they can be replaced
-    /// with market orders on a subsequent scan.
+    /// with market orders on a subsequent scan. Only symbols with
+    /// extended-hours counter-trading enabled in the per-asset config are
+    /// swept; orders for disabled symbols are left untouched.
     ///
     /// Level-triggered: the sweep runs on every regular-hours tick rather than
     /// only on an observed session transition. Idempotency comes from the
@@ -337,6 +338,10 @@ where
         };
 
         for (symbol, position) in &all_positions {
+            if !self.ctx.assets.is_extended_hours_enabled(symbol) {
+                continue;
+            }
+
             let Some(offchain_order_id) = position.pending_offchain_order_id else {
                 continue;
             };
@@ -637,7 +642,7 @@ mod tests {
         std::any::type_name::<CheckPositions>().to_string()
     }
 
-    fn dry_run_ctx(symbols: &[&str]) -> Ctx {
+    fn dry_run_ctx(symbols: &[&str], extended_hours: OperationMode) -> Ctx {
         let mut equity_symbols = HashMap::new();
         for symbol in symbols {
             equity_symbols.insert(
@@ -650,6 +655,7 @@ mod tests {
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
+                    extended_hours_counter_trading: extended_hours,
                     operational_limit: None,
                 },
             );
@@ -680,7 +686,7 @@ mod tests {
     #[tokio::test]
     async fn broker_outage_does_not_kill_scan_and_reschedules() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let cfg = dry_run_ctx(&["AAPL"]);
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Disabled);
 
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .build(())
@@ -735,7 +741,7 @@ mod tests {
     #[tokio::test]
     async fn enqueues_one_hedge_per_ready_symbol() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let cfg = dry_run_ctx(&["AAPL", "TSLA"]);
+        let cfg = dry_run_ctx(&["AAPL", "TSLA"], OperationMode::Disabled);
         let (ctx, position) = build_ctx(
             pool.clone(),
             apalis_pool.clone(),
@@ -770,7 +776,7 @@ mod tests {
     #[tokio::test]
     async fn no_positions_above_threshold_enqueues_no_hedge_jobs() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let cfg = dry_run_ctx(&["AAPL"]);
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Disabled);
         let (ctx, position) = build_ctx(
             pool.clone(),
             apalis_pool.clone(),
@@ -797,7 +803,7 @@ mod tests {
     #[tokio::test]
     async fn reschedules_itself_with_configured_interval() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let cfg = dry_run_ctx(&["AAPL"]);
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Disabled);
         let interval = Duration::from_secs(42);
         let (ctx, _position) = build_ctx(pool.clone(), apalis_pool.clone(), cfg, interval).await;
 
@@ -892,10 +898,7 @@ mod tests {
         // this the live limit order would rest unconverted for the whole
         // session, leaving the position under-hedged.
         let (pool, apalis_pool) = setup_test_pools().await;
-        let cfg = Ctx {
-            extended_hours_counter_trading: true,
-            ..dry_run_ctx(&["AAPL"])
-        };
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
         let (ctx, position) = build_ctx_with_executor(
             pool.clone(),
             apalis_pool,
@@ -943,10 +946,7 @@ mod tests {
         // -- is the only runtime path that releases the position's pending
         // slot for them.
         let (pool, apalis_pool) = setup_test_pools().await;
-        let cfg = Ctx {
-            extended_hours_counter_trading: false,
-            ..dry_run_ctx(&["AAPL"])
-        };
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Disabled);
         let (ctx, position) = build_ctx_with_executor(
             pool.clone(),
             apalis_pool,
@@ -1015,10 +1015,7 @@ mod tests {
         // CheckPositions::perform, not just release the pending slot --
         // otherwise the next scan re-hedges shares the broker already filled.
         let (pool, apalis_pool) = setup_test_pools().await;
-        let cfg = Ctx {
-            extended_hours_counter_trading: false,
-            ..dry_run_ctx(&["AAPL"])
-        };
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Disabled);
         let (ctx, position) = build_ctx_with_executor(
             pool.clone(),
             apalis_pool,
@@ -1113,10 +1110,7 @@ mod tests {
         // transition on the first tick and stranded the order for the whole
         // session.
         let (pool, apalis_pool) = setup_test_pools().await;
-        let cfg = Ctx {
-            extended_hours_counter_trading: true,
-            ..dry_run_ctx(&["AAPL"])
-        };
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Enabled);
         let (ctx, position) = build_ctx_with_executor(
             pool.clone(),
             apalis_pool,
@@ -1169,10 +1163,7 @@ mod tests {
         // AAPL without failing, and pick AAPL up on a later tick once its
         // aggregate exists -- a failed per-order pass is retried, never lost.
         let (pool, apalis_pool) = setup_test_pools().await;
-        let cfg = Ctx {
-            extended_hours_counter_trading: true,
-            ..dry_run_ctx(&["AAPL", "TSLA"])
-        };
+        let cfg = dry_run_ctx(&["AAPL", "TSLA"], OperationMode::Enabled);
         let (ctx, position) = build_ctx_with_executor(
             pool.clone(),
             apalis_pool,
@@ -1236,11 +1227,11 @@ mod tests {
 
     #[tokio::test]
     async fn extended_hours_disabled_does_not_cancel_live_extended_hours_order() {
-        // With the feature flag off, the cancel-and-replace pass must not run
-        // at all: a live extended-hours order is left untouched even when the
-        // scan observes regular hours.
+        // With extended-hours counter-trading disabled for the asset, the
+        // cancel-and-replace pass must not touch it: a live extended-hours
+        // order is left untouched even when the scan observes regular hours.
         let (pool, apalis_pool) = setup_test_pools().await;
-        let cfg = dry_run_ctx(&["AAPL"]);
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Disabled);
         let (ctx, position) = build_ctx_with_executor(
             pool.clone(),
             apalis_pool,
@@ -1284,11 +1275,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_sweep_only_touches_symbols_with_extended_hours_enabled() {
+        // Per-asset granularity: with AAPL extended-hours enabled and TSLA
+        // disabled, a regular-hours sweep must cancel AAPL's live
+        // extended-hours order while leaving TSLA's untouched.
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let mut cfg = dry_run_ctx(&["AAPL", "TSLA"], OperationMode::Enabled);
+        let tsla = Symbol::new("TSLA").unwrap();
+        cfg.assets
+            .equities
+            .symbols
+            .get_mut(&tsla)
+            .unwrap()
+            .extended_hours_counter_trading = OperationMode::Disabled;
+        let (ctx, position) = build_ctx_with_executor(
+            pool.clone(),
+            apalis_pool,
+            cfg,
+            Duration::from_secs(60),
+            regular_session_executor(),
+        )
+        .await;
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        for symbol in [&aapl, &tsla] {
+            accumulate_position(
+                &position,
+                symbol,
+                FractionalShares::new(float!(2.0)),
+                Direction::Buy,
+            )
+            .await;
+        }
+
+        let aapl_order_id = OffchainOrderId::new();
+        claim_position(&ctx, &aapl, aapl_order_id).await;
+        record_extended_hours_order(&ctx, &aapl, aapl_order_id).await;
+
+        let tsla_order_id = OffchainOrderId::new();
+        claim_position(&ctx, &tsla, tsla_order_id).await;
+        record_extended_hours_order(&ctx, &tsla, tsla_order_id).await;
+
+        CheckPositions::default().perform(&ctx).await.unwrap();
+
+        let aapl_order = ctx
+            .offchain_order
+            .load(&aapl_order_id)
+            .await
+            .unwrap()
+            .expect("AAPL order should exist");
+        assert!(
+            matches!(aapl_order, OffchainOrder::Cancelling { .. }),
+            "the enabled symbol's extended-hours order must be cancelled, got: {aapl_order:?}"
+        );
+
+        let tsla_order = ctx
+            .offchain_order
+            .load(&tsla_order_id)
+            .await
+            .unwrap()
+            .expect("TSLA order should exist");
+        assert!(
+            matches!(
+                tsla_order,
+                OffchainOrder::Submitted {
+                    is_extended_hours: true,
+                    ..
+                }
+            ),
+            "the disabled symbol's extended-hours order must be left untouched, got: {tsla_order:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn skips_trading_disabled_symbols_without_blocking_others() {
         let (pool, apalis_pool) = setup_test_pools().await;
         // RKLB is intentionally absent from the trading config -- the scan
         // must skip it without aborting the rest of the loop.
-        let cfg = dry_run_ctx(&["AAPL", "TSLA"]);
+        let cfg = dry_run_ctx(&["AAPL", "TSLA"], OperationMode::Disabled);
         let (ctx, position) = build_ctx(
             pool.clone(),
             apalis_pool.clone(),

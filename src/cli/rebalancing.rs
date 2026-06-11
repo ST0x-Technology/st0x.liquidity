@@ -1412,7 +1412,6 @@ mod tests {
             travel_rule: None,
             rest_api: None,
             issuance: create_test_issuance_ctx(),
-            extended_hours_counter_trading: false,
             redemption_wallet: None,
         }
     }
@@ -1487,7 +1486,6 @@ mod tests {
             travel_rule: None,
             rest_api: None,
             issuance: create_test_issuance_ctx(),
-            extended_hours_counter_trading: false,
             redemption_wallet: Some(Address::ZERO),
         }
     }
@@ -2850,6 +2848,7 @@ mod tests {
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );

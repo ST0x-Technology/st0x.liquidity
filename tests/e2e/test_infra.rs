@@ -126,6 +126,7 @@ impl<P> TestInfra<P> {
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
+                    extended_hours_counter_trading: OperationMode::Disabled,
                     operational_limit: None,
                 };
                 let Ok(symbol_key) = Symbol::new(symbol.clone()) else {

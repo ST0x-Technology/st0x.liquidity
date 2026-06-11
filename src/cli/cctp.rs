@@ -288,7 +288,6 @@ mod tests {
             travel_rule: None,
             rest_api: None,
             issuance: create_test_issuance_ctx(),
-            extended_hours_counter_trading: false,
             redemption_wallet: None,
         }
     }

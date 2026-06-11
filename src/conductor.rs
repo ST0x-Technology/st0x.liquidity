@@ -167,7 +167,6 @@ pub(crate) struct TradeProcessingCqrs {
     /// the inline path cannot place itself (it has no `OrderPlacer` for the
     /// limit-order price lookup). `CheckPositions` is the backstop.
     pub(crate) hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue,
-    pub(crate) extended_hours_counter_trading: bool,
 }
 
 /// Orchestrates the bot's runtime by composing long-running supervised tasks
@@ -2190,7 +2189,6 @@ where
         executor_type,
         &cqrs.assets,
         asset_enabled,
-        cqrs.extended_hours_counter_trading,
     )
     .await?
     else {
@@ -3374,6 +3372,7 @@ mod tests {
                     trading: OperationMode::Disabled,
                     rebalancing: OperationMode::Enabled,
                     wrapped_equity_recovery: wrapped_equity_recovery_mode,
+                    extended_hours_counter_trading: OperationMode::Disabled,
                     operational_limit: None,
                 },
             ))
@@ -3732,6 +3731,7 @@ mod tests {
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -3745,6 +3745,7 @@ mod tests {
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -3758,6 +3759,7 @@ mod tests {
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -3771,6 +3773,7 @@ mod tests {
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Enabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -3826,6 +3829,7 @@ mod tests {
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -3839,6 +3843,7 @@ mod tests {
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -3852,6 +3857,7 @@ mod tests {
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -3865,6 +3871,7 @@ mod tests {
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Enabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -4326,7 +4333,6 @@ mod tests {
             counter_trade_submission_lock: Arc::new(Mutex::new(())),
             poll_status_queue: PollOrderStatusJobQueue::new(apalis_pool),
             hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(apalis_pool),
-            extended_hours_counter_trading: false,
         }
     }
 
@@ -5421,13 +5427,28 @@ mod tests {
             offchain_order: frameworks.offchain_order.clone(),
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: AssetsConfig {
-                equities: EquitiesConfig::default(),
+                equities: EquitiesConfig {
+                    operational_limit: None,
+                    symbols: HashMap::from([(
+                        Symbol::new("AAPL").unwrap(),
+                        EquityAssetConfig {
+                            tokenized_equity: Address::ZERO,
+                            tokenized_equity_derivative: Address::ZERO,
+                            pyth_feed_id: None,
+                            vault_ids: Vec::new(),
+                            trading: OperationMode::Enabled,
+                            rebalancing: OperationMode::Disabled,
+                            wrapped_equity_recovery: OperationMode::Disabled,
+                            extended_hours_counter_trading: OperationMode::Enabled,
+                            operational_limit: None,
+                        },
+                    )]),
+                },
                 cash: None,
             },
             counter_trade_submission_lock: Arc::new(Mutex::new(())),
             poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
             hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(&apalis_pool),
-            extended_hours_counter_trading: true,
         };
 
         let trade_event = make_trade_event(77);

@@ -7,12 +7,6 @@ apalis_finished_job_cleanup_interval_secs = 3600
 # Each tick enqueues a backfill range over the unprocessed blocks, capped at the
 # configured ingestion_cutoff block. The poll interval defaults to 5 seconds when omitted.
 order_fill_poll_interval = 5
-# When true, counter-trades may be placed during extended (pre-/after-market)
-# sessions as limit orders, instead of waiting for the regular open. Extended
-# sessions have thinner liquidity and wider spreads, so the limit price is
-# derived from the latest trade plus `[broker].counter_trade_slippage_bps`.
-# Leave false to restrict hedging to regular-hours market orders.
-extended_hours_counter_trading = false
 hyperdx.service_name = "st0x-hedge"
 
 # Travel Rule info for Alpaca whitelist creation (required since 2026-03-27).
@@ -100,6 +94,13 @@ rebalancing = "disabled"
 # resumes a stalled mint/redemption that owns the balance, or
 # deposits orphaned tokens back into the Raindex vault.
 wrapped_equity_recovery = "disabled"
+# When enabled, counter-trades for this asset may be placed during extended
+# (pre-/after-market) sessions as limit orders, instead of waiting for the
+# regular open. Extended sessions have thinner liquidity and wider spreads,
+# so the limit price is derived from the latest trade plus
+# `[broker].counter_trade_slippage_bps`. Leave disabled to restrict hedging
+# to regular-hours market orders.
+extended_hours_counter_trading = "disabled"
 # Single vault: vault_ids = "0xab12"
 # Multiple vaults: vault_ids = ["0xab12", "0xcd34"]
 # operational_limit = 100.0

@@ -3,13 +3,13 @@ board_port = 8002
 log_level = "trace"
 database_url = ":memory:"
 apalis_finished_job_cleanup_interval_secs = 3600
-extended_hours_counter_trading = false
 hyperdx.service_name = "st0x-hedge-e2e"
 
 [assets.equities.EXAMPLE]
 trading = "enabled"
 rebalancing = "disabled"
 wrapped_equity_recovery = "disabled"
+extended_hours_counter_trading = "disabled"
 tokenized_equity = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 tokenized_equity_derivative = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 

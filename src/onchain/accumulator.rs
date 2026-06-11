@@ -34,7 +34,6 @@ pub(crate) async fn check_execution_readiness<E: Executor>(
     executor_type: SupportedExecutor,
     assets: &AssetsConfig,
     asset_enabled: bool,
-    extended_hours_enabled: bool,
 ) -> Result<Option<ExecutionCtx>, OnChainError> {
     if !check_asset_enabled(asset_enabled, symbol) {
         return Ok(None);
@@ -58,7 +57,7 @@ pub(crate) async fn check_execution_readiness<E: Executor>(
     };
 
     let Some(market_session) =
-        check_market_session(executor, symbol, extended_hours_enabled).await?
+        check_market_session(executor, symbol, assets.is_extended_hours_enabled(symbol)).await?
     else {
         return Ok(None);
     };
@@ -152,7 +151,7 @@ pub(crate) async fn check_all_positions<E: Executor>(
             // the test-only check_and_execute_accumulated_positions path in
             // conductor.rs. The production CheckPositions sweep goes through
             // check_execution_readiness (src/position_check.rs) with the
-            // configured extended_hours_counter_trading flag.
+            // per-asset extended_hours_counter_trading config.
             let Some(market_session) = check_market_session(executor, symbol, false).await? else {
                 continue;
             };
@@ -256,7 +255,6 @@ mod tests {
                 cash: None,
             },
             true,
-            false,
         )
         .await
         .unwrap();
@@ -289,7 +287,6 @@ mod tests {
                 cash: None,
             },
             true,
-            false,
         )
         .await
         .unwrap();
@@ -322,7 +319,6 @@ mod tests {
                 cash: None,
             },
             true,
-            false,
         )
         .await
         .unwrap()
@@ -421,7 +417,6 @@ mod tests {
                 cash: None,
             },
             true,
-            false,
         )
         .await
         .unwrap();
@@ -459,7 +454,6 @@ mod tests {
                 cash: None,
             },
             true,
-            false,
         )
         .await
         .unwrap()
@@ -500,7 +494,6 @@ mod tests {
                 cash: None,
             },
             true,
-            false,
         )
         .await
         .unwrap();
@@ -536,7 +529,6 @@ mod tests {
                 cash: None,
             },
             true,
-            false,
         )
         .await
         .unwrap();
@@ -558,7 +550,6 @@ mod tests {
                 cash: None,
             },
             true,
-            false,
         )
         .await
         .unwrap()
@@ -600,6 +591,7 @@ mod tests {
                         trading: OperationMode::Enabled,
                         rebalancing: OperationMode::Disabled,
                         wrapped_equity_recovery: OperationMode::Disabled,
+                        extended_hours_counter_trading: OperationMode::Disabled,
                         operational_limit: Some(
                             Positive::new(FractionalShares::new(float!(3.0))).unwrap(),
                         ),
@@ -616,7 +608,6 @@ mod tests {
             SupportedExecutor::DryRun,
             &assets,
             true,
-            false,
         )
         .await
         .unwrap()
@@ -654,7 +645,6 @@ mod tests {
                 equities: EquitiesConfig::default(),
                 cash: None,
             },
-            false,
             false,
         )
         .await
