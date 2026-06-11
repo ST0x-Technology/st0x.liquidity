@@ -376,7 +376,7 @@ mod tests {
         )
         .await;
 
-        let executor = MockExecutor::new().with_market_open(false);
+        let executor = MockExecutor::new().with_market_closed();
 
         let result = check_execution_readiness(
             &executor,
@@ -413,7 +413,7 @@ mod tests {
         )
         .await;
 
-        let executor = MockExecutor::new().with_market_open(true);
+        let executor = MockExecutor::new();
 
         let params = check_execution_readiness(
             &executor,
@@ -444,7 +444,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
 
         // Simulate market closed - accumulate multiple trades
-        let closed_executor = MockExecutor::new().with_market_open(false);
+        let closed_executor = MockExecutor::new().with_market_closed();
 
         // First trade while market closed
         initialize_position_with_fill(
@@ -509,7 +509,7 @@ mod tests {
         );
 
         // Market opens - should now execute
-        let open_executor = MockExecutor::new().with_market_open(true);
+        let open_executor = MockExecutor::new();
 
         let params = check_execution_readiness(
             &open_executor,

@@ -1631,7 +1631,7 @@ mod tests {
     use crate::inventory::{
         BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, Venue,
     };
-    use crate::onchain::mock::MockRaindex;
+    use crate::onchain::mock::{DepositBehavior, MockRaindex};
     use crate::rebalancing::{RebalancingSchedulers, RebalancingServiceConfig};
     use crate::tokenization::mock::{
         MockCompletionOutcome, MockDetectionOutcome, MockTokenizer, MockVerificationOutcome,
@@ -2468,7 +2468,7 @@ mod tests {
     async fn mint_transfer_fails_when_raindex_deposit_fails() {
         let transfer = create_equity_transfer(
             Arc::new(MockTokenizer::new()),
-            Arc::new(MockRaindex::failing_deposit()),
+            Arc::new(MockRaindex::new().with_deposit_behavior(DepositBehavior::FailGeneric)),
             Arc::new(MockWrapper::new()),
         )
         .await;
@@ -2720,7 +2720,9 @@ mod tests {
     async fn resume_mint_recovers_when_deposit_reverts() {
         let transfer = create_equity_transfer(
             Arc::new(MockTokenizer::new()),
-            Arc::new(MockRaindex::reverting_deposit()),
+            Arc::new(
+                MockRaindex::new().with_deposit_behavior(DepositBehavior::FailExecutionReverted),
+            ),
             Arc::new(MockWrapper::new()),
         )
         .await;
@@ -2812,7 +2814,9 @@ mod tests {
 
         let transfer = create_equity_transfer(
             Arc::new(MockTokenizer::new()),
-            Arc::new(MockRaindex::reverting_deposit()),
+            Arc::new(
+                MockRaindex::new().with_deposit_behavior(DepositBehavior::FailExecutionReverted),
+            ),
             Arc::new(mock_wrapper),
         )
         .await;
