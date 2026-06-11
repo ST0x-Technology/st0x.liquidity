@@ -8,6 +8,7 @@
   import TransferPanel from '$lib/components/transfer-panel.svelte'
   import LogPanel from '$lib/components/log-panel.svelte'
   import OrdersPanel from '$lib/components/orders-panel.svelte'
+  import PerformancePanel from '$lib/components/performance-panel.svelte'
   import PnlPanel from '$lib/components/pnl-panel.svelte'
   import { getWebSocketUrl, isDashboardMockMode } from '$lib/env'
   import { reactive } from '$lib/frp.svelte'
@@ -49,7 +50,7 @@
     }
   })
 
-  type Tab = 'dashboard' | 'orders' | 'pnl' | 'logs'
+  type Tab = 'dashboard' | 'orders' | 'pnl' | 'performance' | 'logs'
   type MobilePanel = 'inventory' | 'trades' | 'transfers'
 
   const activeTab = reactive<Tab>('dashboard')
@@ -120,6 +121,17 @@
     </button>
     <button
       class="relative whitespace-nowrap px-3 py-2 text-sm font-medium transition-colors {activeTab.current ===
+      'performance'
+        ? 'text-foreground after:absolute after:bottom-0 after:left-0 after:right-0 after:h-0.5 after:bg-primary'
+        : 'text-muted-foreground hover:text-foreground'}"
+      onclick={() => {
+        activeTab.update((tab) => (tab === 'performance' ? 'dashboard' : 'performance'))
+      }}
+    >
+      Performance
+    </button>
+    <button
+      class="relative whitespace-nowrap px-3 py-2 text-sm font-medium transition-colors {activeTab.current ===
       'logs'
         ? 'text-foreground after:absolute after:bottom-0 after:left-0 after:right-0 after:h-0.5 after:bg-primary'
         : 'text-muted-foreground hover:text-foreground'}"
@@ -158,6 +170,15 @@
       }}
     >
       PnL
+    </button>
+
+    <button
+      class={desktopTabClass(activeTab.current === 'performance')}
+      onclick={() => {
+        activeTab.update(() => 'performance')
+      }}
+    >
+      Performance
     </button>
 
     <button
@@ -200,6 +221,10 @@
   {:else if activeTab.current === 'pnl'}
     <main class="flex-1 overflow-hidden p-2 md:p-4">
       <PnlPanel />
+    </main>
+  {:else if activeTab.current === 'performance'}
+    <main class="flex-1 overflow-hidden p-2 md:p-4">
+      <PerformancePanel />
     </main>
   {:else}
     <main class="flex-1 overflow-hidden p-2 md:p-4">
