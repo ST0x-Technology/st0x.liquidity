@@ -1338,6 +1338,32 @@ mod tests {
         file
     }
 
+    /// Pins the first line of defense against database contention: every
+    /// pooled connection runs WAL (writers never block readers) with a
+    /// 10s busy timeout (transient write locks are absorbed silently).
+    /// If a refactor drops either pragma, every lock blip from a
+    /// co-located process becomes an immediate hard error in the trading
+    /// pipeline, and this test catches the drift.
+    #[tokio::test]
+    async fn configure_sqlite_pool_pins_wal_and_busy_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let database_url = format!("sqlite://{}/config-pin.sqlite", dir.path().display());
+
+        let pool = configure_sqlite_pool(&database_url).await.unwrap();
+
+        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(journal_mode, "wal");
+
+        let busy_timeout_ms: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(busy_timeout_ms, 10_000);
+    }
+
     fn minimal_config_toml() -> NamedTempFile {
         let mut file = NamedTempFile::new().unwrap();
         file.write_all(

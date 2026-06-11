@@ -27,7 +27,8 @@ use tracing::{debug, error, info, warn};
 use st0x_config::{AssetsConfig, BrokerCtx, Ctx, CtxError, ExecutionThreshold, RebalancingCtx};
 use st0x_dto::Statement;
 use st0x_event_sorcery::{
-    Projection, Store, StoreBuilder, compact_events, incremental_vacuum, load_all_ids, load_entity,
+    AggregateError, LifecycleError, Projection, SendError, Store, StoreBuilder, compact_events,
+    incremental_vacuum, load_all_ids, load_entity,
 };
 use st0x_evm::Wallet;
 use st0x_execution::{
@@ -59,7 +60,7 @@ use crate::onchain::accumulator::{ExecutionCtx, check_execution_readiness};
 use crate::onchain::approvals::{build_approval_targets, grant_startup_approvals};
 use crate::onchain::backfill::BackfillJobQueue;
 use crate::onchain::trade::{RaindexTradeEvent, extract_owned_vaults, extract_vaults_from_clear};
-use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
+use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeError, OnChainTradeId};
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::position_check::{CheckPositionsJobQueue, bootstrap_check_positions};
 use crate::rebalancing::equity::{
@@ -1607,11 +1608,21 @@ pub(crate) async fn discover_vaults_for_trade(
 }
 
 /// Returns `true` if the witness was accepted, `false` if rejected.
+/// Executes `OnChainTrade::Witness`, distinguishing domain rejections from
+/// infrastructure failures per the error contract in docs/conductor.md.
+///
+/// Returns `Ok(false)` only for the duplicate-style domain rejections
+/// (already filled/enriched) -- permanent, expected, and safe to skip.
+/// Every other error (database unavailable, aggregate conflict, lifecycle
+/// bug) propagates so the apalis job retries instead of marking the fill
+/// Done: with the backfill checkpoint already advanced, a swallowed
+/// witness failure is a permanently lost fill and silent unhedged
+/// exposure.
 async fn execute_witness_trade(
     onchain_trade: &Store<OnChainTrade>,
     trade: &OnchainTrade,
     block_number: u64,
-) -> bool {
+) -> Result<bool, SendError<OnChainTrade>> {
     let trade_id = OnChainTradeId {
         tx_hash: trade.tx_hash,
         log_index: trade.log_index,
@@ -1627,7 +1638,7 @@ async fn execute_witness_trade(
             symbol = %trade.symbol,
             "Missing block_timestamp for OnChainTrade::Witness"
         );
-        return false;
+        return Ok(false);
     };
 
     let command = OnChainTradeCommand::Witness {
@@ -1647,17 +1658,20 @@ async fn execute_witness_trade(
                 symbol = %trade.symbol,
                 "Successfully executed OnChainTrade::Witness command"
             );
-            true
+            Ok(true)
         }
-        Err(error) => {
+        Err(AggregateError::UserError(LifecycleError::Apply(
+            domain_error @ (OnChainTradeError::AlreadyFilled | OnChainTradeError::AlreadyEnriched),
+        ))) => {
             warn!(
                 tx_hash = ?trade.tx_hash,
                 log_index = trade.log_index,
                 symbol = %trade.symbol,
-                "OnChainTrade::Witness rejected: {error}"
+                "OnChainTrade::Witness rejected as duplicate: {domain_error}"
             );
-            false
+            Ok(false)
         }
+        Err(error) => Err(error),
     }
 }
 
@@ -1771,17 +1785,24 @@ where
         log_index: trade.log_index,
     };
 
-    if let Ok(Some(_)) = cqrs.onchain_trade.load(&trade_id).await {
-        debug!(
-            ?trade_id,
-            symbol = %trade.symbol,
-            "Trade already processed (duplicate event), skipping"
-        );
-        return Ok(None);
+    match cqrs.onchain_trade.load(&trade_id).await {
+        Ok(Some(_)) => {
+            debug!(
+                ?trade_id,
+                symbol = %trade.symbol,
+                "Trade already processed (duplicate event), skipping"
+            );
+            return Ok(None);
+        }
+        Ok(None) => {}
+        // A failed read must not masquerade as "not a duplicate": the
+        // witness write would also fail on a healthy dedupe path, but
+        // propagating here keeps the retry contract explicit.
+        Err(error) => return Err(error.into()),
     }
 
     let witnessed =
-        execute_witness_trade(&cqrs.onchain_trade, &trade, trade_event.block_number).await;
+        execute_witness_trade(&cqrs.onchain_trade, &trade, trade_event.block_number).await?;
 
     if !witnessed {
         return Ok(None);
@@ -2393,7 +2414,7 @@ mod tests {
     use alloy::primitives::{Address, B256, TxHash, U256, address, bytes, fixed_bytes};
     use apalis::prelude::Status;
     use rain_math_float::Float;
-    use sqlx::SqlitePool;
+    use sqlx::{ConnectOptions, SqlitePool};
     use std::future::pending;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3331,6 +3352,82 @@ mod tests {
         assert!(
             matches!(offchain_order, OffchainOrder::Submitted { .. }),
             "Offchain order should be Submitted after successful placement, got: {offchain_order:?}"
+        );
+    }
+
+    /// A database write lock during the Witness write must surface as a
+    /// retryable error, not silently drop the fill. Pre-fix,
+    /// `execute_witness_trade` blanket-matched every `SendError` as a
+    /// domain rejection and returned `false`, so the accounting job was
+    /// marked Done with the checkpoint already advanced -- a SQLITE_BUSY
+    /// blip (the documented bot-vs-reporter contention scenario) became
+    /// silent, permanently unhedged exposure. The lock is held by a
+    /// second raw connection via `BEGIN IMMEDIATE`, exactly how another
+    /// process contends for the WAL write lock; the pool's busy timeout
+    /// is scaled down so the test waits milliseconds, not production's
+    /// 10 seconds -- the surfacing code path is identical.
+    #[tokio::test]
+    async fn db_write_lock_during_witness_propagates_error_for_retry() {
+        let (pool, apalis_pool, db_path, _dir) =
+            crate::test_utils::setup_file_backed_test_db(Duration::from_millis(250)).await;
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+
+        let mut locker = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db_path)
+            .connect()
+            .await
+            .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut locker)
+            .await
+            .unwrap();
+
+        let result = process_queued_trade(
+            &MockExecutor::new(),
+            &make_trade_event(40),
+            test_trade_with_amount(float!(1.5), 40),
+            &cqrs,
+            true,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(TradeAccountingError::OnChainTradeCommand(_))),
+            "A write-locked database during Witness must propagate a \
+             retryable error so apalis re-runs the job; got: {result:?}",
+        );
+
+        sqlx::query("ROLLBACK").execute(&mut locker).await.unwrap();
+
+        // The apalis retry re-delivers the same job against the healthy
+        // database; the fill must flow through exactly once.
+        process_queued_trade(
+            &MockExecutor::new(),
+            &make_trade_event(40),
+            test_trade_with_amount(float!(1.5), 40),
+            &cqrs,
+            true,
+        )
+        .await
+        .unwrap()
+        .expect("retry must place the hedge for the recovered fill");
+
+        let (onchain_fills,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
+                .bind("OnChainTradeEvent::Filled")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            onchain_fills, 1,
+            "Exactly one witnessed fill after the lock cleared and the \
+             retry ran"
         );
     }
 
