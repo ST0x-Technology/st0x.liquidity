@@ -22,8 +22,9 @@ use tracing::{Level, warn};
 use url::Url;
 
 use crate::{
-    EvmConfig, EvmCtx, EvmSecrets, ExecutionThreshold, InvalidThresholdError, RebalancingConfig,
-    RebalancingCtx, RebalancingCtxError, TelemetryConfig, TelemetryCtx, TelemetrySecrets,
+    AlertsConfig, AlertsCtx, AlertsSecrets, EvmConfig, EvmCtx, EvmSecrets, ExecutionThreshold,
+    InvalidThresholdError, RebalancingConfig, RebalancingCtx, RebalancingCtxError, TelemetryConfig,
+    TelemetryCtx, TelemetrySecrets,
 };
 use st0x_float_macro::float;
 
@@ -178,6 +179,7 @@ struct Config {
     apalis_finished_job_cleanup_interval_secs: u64,
     #[serde(rename = "hyperdx")]
     telemetry: Option<TelemetryConfig>,
+    alerts: Option<AlertsConfig>,
     rebalancing: Option<RebalancingConfig>,
     tokenization: Option<TokenizationConfig>,
     wallet: Option<toml::Value>,
@@ -343,6 +345,7 @@ struct Secrets {
     broker: BrokerSecrets,
     #[serde(rename = "hyperdx")]
     telemetry: Option<TelemetrySecrets>,
+    alerts: Option<AlertsSecrets>,
     wallet: Option<toml::Value>,
     rest_api: Option<RestApiSecrets>,
 }
@@ -395,6 +398,9 @@ pub struct Ctx {
     pub apalis_finished_job_cleanup_interval_secs: u64,
     pub broker: BrokerCtx,
     pub telemetry: Option<TelemetryCtx>,
+    /// Optional gas-balance alerting context. `Some` when both `[alerts]`
+    /// config and the Telegram `bot_token` secret are present.
+    pub alerts: Option<AlertsCtx>,
     pub trading_mode: TradingMode,
     /// The onchain address that owns orders on the orderbook.
     /// Always derived from the configured `[wallet]` address.
@@ -492,6 +498,7 @@ impl std::fmt::Debug for Ctx {
             )
             .field("broker", &self.broker)
             .field("telemetry", &self.telemetry)
+            .field("alerts", &self.alerts)
             .field("trading_mode", &self.trading_mode)
             .field("order_owner", &self.order_owner)
             .field("wallet_configured", &self.wallet.is_some())
@@ -557,6 +564,7 @@ struct ValidatedParts {
     apalis_finished_job_cleanup_interval_secs: u64,
     broker: BrokerCtx,
     telemetry: Option<TelemetryCtx>,
+    alerts: Option<AlertsCtx>,
     execution_threshold: ExecutionThreshold,
     trading_mode: TradingMode,
     assets: AssetsConfig,
@@ -615,6 +623,7 @@ fn parse_and_validate(
 
     let broker = BrokerCtx::from_parts(secrets.broker, config.broker.as_ref())?;
     let telemetry = TelemetryCtx::new(config.telemetry, secrets.telemetry)?;
+    let alerts = AlertsCtx::new(config.alerts, secrets.alerts)?;
 
     // Execution threshold is determined by broker capabilities:
     // - Alpaca requires $1 minimum for fractional trading. We use $2 to provide buffer
@@ -782,6 +791,7 @@ fn parse_and_validate(
         apalis_finished_job_cleanup_interval_secs,
         broker,
         telemetry,
+        alerts,
         execution_threshold,
         trading_mode,
         assets: config.assets,
@@ -853,6 +863,7 @@ impl Ctx {
                 .apalis_finished_job_cleanup_interval_secs,
             broker: parts.broker,
             telemetry: parts.telemetry,
+            alerts: parts.alerts,
             trading_mode: parts.trading_mode,
             order_owner,
             wallet: Some(wallet),
@@ -1004,6 +1015,7 @@ impl Ctx {
             apalis_finished_job_cleanup_interval_secs,
             broker,
             telemetry: None,
+            alerts: None,
             trading_mode,
             order_owner,
             wallet,
@@ -1062,6 +1074,8 @@ pub enum CtxError {
     CounterTradeSlippageBpsOutOfRange { configured: u16, min: u16, max: u16 },
     #[error(transparent)]
     Telemetry(#[from] crate::telemetry::TelemetryAssemblyError),
+    #[error(transparent)]
+    Alerts(#[from] crate::alerts::AlertsAssemblyError),
     #[error("operation requires rebalancing mode")]
     NotRebalancing,
     #[error(
@@ -1131,6 +1145,7 @@ impl CtxError {
                 "counter trade slippage bps out of range"
             }
             Self::Telemetry(_) => "telemetry assembly error",
+            Self::Alerts(_) => "alerts assembly error",
             Self::CashOperationalLimitBelowMinimumWithdrawal { .. } => {
                 "cash operational limit below minimum withdrawal"
             }
@@ -1217,6 +1232,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         apalis_finished_job_cleanup_interval_secs: 3600,
         broker: BrokerCtx::DryRun,
         telemetry: None,
+        alerts: None,
         trading_mode: TradingMode::Standalone,
         order_owner,
         wallet: None,
@@ -1602,6 +1618,138 @@ mod tests {
                 }
             ),
             "expected InvalidTravelRule for entity_name, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn alerts_ctx_built_when_section_and_secret_present() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            deployment_block = 1
+            required_confirmations = 3
+
+            [wallet]
+            kind = "private-key"
+            address = "0x0000000000000000000000000000000000000001"
+
+            [alerts]
+            chat_id = -1_001_234_567_890
+            low_balance_threshold = "0.05"
+            poll_interval = 300
+            realert_interval = 3600
+        "#,
+        );
+        let secrets = toml_file(
+            r#"
+            [evm]
+            rpc_url = "http://localhost:8545"
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://mainnet.infura.io"
+
+            [broker]
+            type = "dry-run"
+
+            [alerts]
+            bot_token = "123:abc"
+
+            [wallet]
+            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        "#,
+        );
+
+        let ctx = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap();
+
+        let alerts = ctx.alerts.unwrap();
+        assert_eq!(alerts.chat_id, -1_001_234_567_890);
+        assert_eq!(
+            alerts.low_balance_threshold_wei,
+            alloy::primitives::U256::from(50_000_000_000_000_000_u64)
+        );
+        assert_eq!(alerts.poll_interval, std::time::Duration::from_secs(300));
+        assert_eq!(
+            alerts.realert_interval,
+            std::time::Duration::from_secs(3600)
+        );
+        assert_eq!(alerts.message_thread_id, None);
+    }
+
+    #[tokio::test]
+    async fn alerts_ctx_absent_when_section_omitted() {
+        let config = minimal_config_toml();
+        let secrets = dry_run_secrets_toml();
+        let ctx = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap();
+
+        assert!(ctx.alerts.is_none());
+    }
+
+    #[tokio::test]
+    async fn alerts_config_fails_fast_on_bad_threshold() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+
+            [assets.equities]
+
+            [raindex]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            deployment_block = 1
+            required_confirmations = 3
+
+            [wallet]
+            kind = "private-key"
+            address = "0x0000000000000000000000000000000000000001"
+
+            [alerts]
+            chat_id = 1
+            low_balance_threshold = "not-a-number"
+            poll_interval = 300
+            realert_interval = 3600
+        "#,
+        );
+        let secrets = toml_file(
+            r#"
+            [evm]
+            rpc_url = "http://localhost:8545"
+            base_rpc_url = "https://base.example.com"
+            ethereum_rpc_url = "https://mainnet.infura.io"
+
+            [broker]
+            type = "dry-run"
+
+            [alerts]
+            bot_token = "123:abc"
+
+            [wallet]
+            private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        "#,
+        );
+
+        let error = Ctx::load_files(config.path(), secrets.path())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::Alerts(crate::alerts::AlertsAssemblyError::InvalidThreshold { .. })
+            ),
+            "expected Alerts(InvalidThreshold), got: {error}"
         );
     }
 

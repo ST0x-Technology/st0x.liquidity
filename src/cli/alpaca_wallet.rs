@@ -744,6 +744,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs: 3600,
             broker: BrokerCtx::DryRun,
             telemetry: None,
+            alerts: None,
             trading_mode: TradingMode::Standalone,
             order_owner: Address::ZERO,
             wallet: None,
@@ -824,6 +825,7 @@ mod tests {
                     st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
             }),
             telemetry: None,
+            alerts: None,
             assets: AssetsConfig {
                 equities: EquitiesConfig::default(),
                 cash: None,

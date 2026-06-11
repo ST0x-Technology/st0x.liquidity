@@ -3378,3 +3378,57 @@ requests to the backend.
 
 - Mobile-responsive design (not mobile-first, but usable on mobile - modern
   stack makes this low effort)
+
+## Operational Alerting
+
+The bot raises out-of-band alerts for conditions an operator must react to
+quickly. Alerting is **optional**: when its configuration is absent the bot runs
+normally with no alert channel and the alert monitors are not spawned.
+
+### Gas balance monitoring
+
+The bot pays gas in native ETH for every on-chain transaction (vault ops, CCTP
+bridging, token wrapping, hedge rebalancing). If the market-maker wallet runs
+dry, those transactions silently stop succeeding. To surface this before it
+halts operations, a supervised **gas monitor** watches the wallet's native-ETH
+balance.
+
+**Scope.** The monitor watches the order-owner wallet (derived from the
+`[wallet]` address) on the orderbook chain — Base in production — using the same
+RPC provider the bot already uses for fill polling and contract reads.
+Monitoring the Ethereum-mainnet wallet is a follow-up; it would require wiring
+the mainnet provider into the conductor.
+
+**Behavior.**
+
+- Every `poll_interval` seconds the monitor reads the wallet's native balance.
+- When the balance drops **below** `low_balance_threshold` (a decimal-ETH amount
+  parsed to wei at startup — a malformed value fails fast), it raises an alert:
+  a structured `error!` log (target `gas`) carrying the wallet, chain, current
+  balance and threshold, plus a Telegram notification.
+- **De-duplication.** The monitor alerts once on the transition into the low
+  state, then re-alerts at most once per `realert_interval` while the balance
+  stays low. It never notifies on every poll.
+- **Recovery.** When the balance returns to at or above the threshold, the
+  monitor emits a single `info!` log and recovery notification, then resets.
+- A transient RPC read failure is logged and swallowed (it does not advance the
+  de-dup state and does not raise an alert); the supervised task keeps polling.
+- **Restart behavior.** The de-dup state is held in memory and resets on
+  restart. If the bot restarts while the balance is low, the first poll after
+  restart treats the unknown -> low transition as a new threshold crossing and
+  alerts immediately, regardless of how recently an alert was sent before the
+  restart. Frequent restarts during a prolonged low-balance condition can
+  therefore produce alerts more often than `realert_interval` alone would
+  suggest.
+
+### Telegram channel
+
+Alerts are delivered to Telegram via the Bot API `sendMessage` endpoint. The
+non-secret `[alerts]` config supplies the destination `chat_id`, the
+thresholds/intervals, and an optional `message_thread_id`; the encrypted secrets
+supply the bot `bot_token`. When `message_thread_id` is set, alerts post into
+that forum topic (for topic-enabled supergroups); when omitted they go to the
+chat's default topic. When either half (config or secret) is present without the
+other, startup fails fast rather than running with a half-configured alert
+channel. A notification delivery failure is logged but never crashes the
+monitor.
