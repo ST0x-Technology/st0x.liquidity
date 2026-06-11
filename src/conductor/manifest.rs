@@ -123,7 +123,7 @@ mod tests {
     use alloy::primitives::{Address, TxHash, fixed_bytes};
     use std::collections::{BTreeMap, HashSet};
     use std::time::Duration;
-    use tokio::sync::{broadcast, mpsc};
+    use tokio::sync::broadcast;
 
     use st0x_dto::Statement;
     use st0x_event_sorcery::test_store;
@@ -172,7 +172,6 @@ mod tests {
     #[tokio::test]
     async fn build_frameworks_produces_working_stores() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (operation_sender, _operation_receiver) = mpsc::channel(10);
         let (event_sender, _event_receiver) = broadcast::channel(10);
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
@@ -188,7 +187,6 @@ mod tests {
             Address::ZERO,
             Address::ZERO,
             inventory.clone(),
-            operation_sender,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
         ));
@@ -223,7 +221,6 @@ mod tests {
     #[tokio::test]
     async fn build_frameworks_dispatches_live_snapshot_events_to_view() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (operation_sender, _operation_receiver) = mpsc::channel(10);
         let (event_sender, _event_receiver) = broadcast::channel(10);
 
         let vault_registry = Arc::new(test_store(pool.clone(), ()));
@@ -239,7 +236,6 @@ mod tests {
             Address::ZERO,
             Address::ZERO,
             inventory.clone(),
-            operation_sender,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
         ));
@@ -288,7 +284,6 @@ mod tests {
     #[tokio::test]
     async fn build_frameworks_broadcasts_live_position_updates() {
         let (pool, apalis_pool) = setup_test_pools().await;
-        let (operation_sender, mut operation_receiver) = mpsc::channel(10);
         let (event_sender, mut event_receiver) = broadcast::channel(10);
 
         let symbol = Symbol::new("AAPL").unwrap();
@@ -348,7 +343,6 @@ mod tests {
             orderbook,
             owner,
             inventory,
-            operation_sender,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
         ));
@@ -423,14 +417,6 @@ mod tests {
         assert_eq!(
             pending_mint_jobs, 1,
             "expected the rebalancing subscriber to enqueue a mint job on the position event"
-        );
-
-        assert!(
-            matches!(
-                operation_receiver.try_recv(),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-            ),
-            "mints must not be dispatched over the mpsc channel"
         );
     }
 }
