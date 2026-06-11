@@ -13,10 +13,18 @@ use sqlx::SqlitePool;
 use thiserror::Error;
 use tracing::warn;
 
+use st0x_dto::{
+    HedgeCycleReport, HedgeCycleStatus, HedgeLatencies, LatencyBucket, LatencyStats,
+    LatencySummary, OpenExposureReport, StageLatencies,
+};
 use st0x_execution::Symbol;
 
 use crate::offchain::order::{OffchainOrderEvent, OffchainOrderId};
-use crate::position::{PositionEvent, TradeId};
+use crate::position::PositionEvent;
+
+/// Waterfall rows returned per report; the full cycle count is still
+/// reported via `total_cycles`.
+const MAX_CYCLE_REPORTS: usize = 100;
 
 /// Per-symbol hedge performance assembled from the event store.
 #[derive(Debug, Clone)]
@@ -30,7 +38,6 @@ pub(crate) struct SymbolPerformance {
 /// A single onchain fill as witnessed by the bot.
 #[derive(Debug, Clone)]
 pub(crate) struct FillObservation {
-    pub(crate) trade_id: TradeId,
     pub(crate) block_timestamp: DateTime<Utc>,
     pub(crate) seen_at: DateTime<Utc>,
 }
@@ -122,21 +129,28 @@ pub(crate) enum PerformanceError {
 
 /// Load hedge performance for every symbol with a `Position` aggregate.
 ///
+/// Both event streams are read inside one transaction so the report folds a
+/// consistent snapshot: without it, the bot could commit a hedge's events
+/// between the two reads and the report would misclassify it as pending.
+///
 /// Undeserializable events and aggregates with malformed ids are skipped with
 /// a warning rather than failing the whole report: one bad historical row
 /// must not take down the dashboard's view of every other symbol.
 pub(crate) async fn load_hedge_performance(
     pool: &SqlitePool,
 ) -> Result<Vec<SymbolPerformance>, PerformanceError> {
-    let order_timelines = load_order_timelines(pool).await?;
+    let mut transaction = pool.begin().await?;
+
+    let order_timelines = load_order_timelines(&mut transaction).await?;
 
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT aggregate_id, payload FROM events \
          WHERE aggregate_type = 'Position' \
          ORDER BY aggregate_id, sequence",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *transaction)
     .await?;
+    transaction.commit().await?;
 
     // Keyed by Symbol (BTreeMap for deterministic output ordering): every
     // Position aggregate id is a symbol, so parse at insertion and fail fast
@@ -171,14 +185,14 @@ struct OrderTimeline {
 }
 
 async fn load_order_timelines(
-    pool: &SqlitePool,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
 ) -> Result<HashMap<OffchainOrderId, OrderTimeline>, sqlx::Error> {
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT aggregate_id, payload FROM events \
          WHERE aggregate_type = 'OffchainOrder' \
          ORDER BY aggregate_id, sequence",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut **transaction)
     .await?;
 
     let mut timelines = HashMap::new();
@@ -254,13 +268,11 @@ fn fold_position_stream(
         match event {
             PositionEvent::Initialized { .. } | PositionEvent::ThresholdUpdated { .. } => {}
             PositionEvent::OnChainOrderFilled {
-                trade_id,
                 block_timestamp,
                 seen_at,
                 ..
             } => {
                 let observation = FillObservation {
-                    trade_id,
                     block_timestamp,
                     seen_at,
                 };
@@ -386,6 +398,202 @@ fn covered_fills(uncovered: &[FillObservation]) -> Option<CoveredFills> {
     })
 }
 
+/// Inclusive time range a latency report covers.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReportRange {
+    pub(crate) from: DateTime<Utc>,
+    pub(crate) to: DateTime<Utc>,
+}
+
+impl ReportRange {
+    fn contains(&self, timestamp: DateTime<Utc>) -> bool {
+        self.from <= timestamp && timestamp <= self.to
+    }
+
+    /// Bucket width mirroring the P&L tab's cadence: daily up to a month,
+    /// weekly up to half a year, otherwise ~monthly.
+    fn bucket_width(&self) -> Duration {
+        let span = self.to - self.from;
+        if span <= Duration::days(31) {
+            Duration::days(1)
+        } else if span <= Duration::days(183) {
+            Duration::days(7)
+        } else {
+            Duration::days(30)
+        }
+    }
+}
+
+/// Latency samples (in milliseconds) for each pipeline stage.
+#[derive(Debug, Default)]
+struct StageSamples {
+    detection: Vec<i64>,
+    decision: Vec<i64>,
+    submission: Vec<i64>,
+    execution: Vec<i64>,
+    exposure_window: Vec<i64>,
+}
+
+impl StageSamples {
+    fn push_cycle(&mut self, cycle: &HedgeCycle) {
+        let stages = [
+            (&mut self.decision, cycle.decision_latency()),
+            (&mut self.submission, cycle.submission_latency()),
+            (&mut self.execution, cycle.execution_latency()),
+            (&mut self.exposure_window, cycle.exposure_window()),
+        ];
+        for (samples, latency) in stages {
+            if let Some(latency) = latency {
+                // Clamped like detection latency: clock skew between event
+                // sources must not push negative samples into percentiles.
+                samples.push(latency.num_milliseconds().max(0));
+            }
+        }
+    }
+
+    fn into_stage_latencies(self) -> StageLatencies {
+        StageLatencies {
+            detection: latency_stats(self.detection),
+            decision: latency_stats(self.decision),
+            submission: latency_stats(self.submission),
+            execution: latency_stats(self.execution),
+            exposure_window: latency_stats(self.exposure_window),
+        }
+    }
+}
+
+/// Assemble the dashboard latency report from per-symbol performance.
+///
+/// Fills are windowed by `seen_at`, cycles by `placed_at`. Open exposures
+/// reflect the present state regardless of the requested range.
+pub(crate) fn hedge_latency_report(
+    performances: &[SymbolPerformance],
+    range: &ReportRange,
+) -> HedgeLatencies {
+    let width = range.bucket_width();
+    let bucket_index = |timestamp: DateTime<Utc>| -> i64 {
+        (timestamp - range.from).num_seconds() / width.num_seconds()
+    };
+
+    let mut summary_samples = StageSamples::default();
+    let mut bucket_samples: BTreeMap<i64, StageSamples> = BTreeMap::new();
+    let mut cycles = Vec::new();
+    let mut open_exposures = Vec::new();
+    let mut fill_count = 0;
+
+    for performance in performances {
+        for fill in &performance.fills {
+            if !range.contains(fill.seen_at) {
+                continue;
+            }
+            fill_count += 1;
+            let latency_ms = fill.detection_latency().num_milliseconds();
+            summary_samples.detection.push(latency_ms);
+            bucket_samples
+                .entry(bucket_index(fill.seen_at))
+                .or_default()
+                .detection
+                .push(latency_ms);
+        }
+
+        for cycle in &performance.cycles {
+            if !range.contains(cycle.placed_at) {
+                continue;
+            }
+            summary_samples.push_cycle(cycle);
+            bucket_samples
+                .entry(bucket_index(cycle.placed_at))
+                .or_default()
+                .push_cycle(cycle);
+            cycles.push(cycle_report(&performance.symbol, cycle));
+        }
+
+        if let Some(open) = &performance.open_exposure {
+            open_exposures.push(OpenExposureReport {
+                symbol: performance.symbol.clone(),
+                fill_count: open.fill_count,
+                oldest_fill_block_timestamp: open.oldest_block_timestamp,
+            });
+        }
+    }
+
+    cycles.sort_unstable_by_key(|cycle| std::cmp::Reverse(cycle.placed_at));
+    let total_cycles = cycles.len();
+    cycles.truncate(MAX_CYCLE_REPORTS);
+
+    let buckets = bucket_samples
+        .into_iter()
+        .map(|(index, samples)| LatencyBucket {
+            start: range.from + Duration::seconds(width.num_seconds() * index),
+            stages: samples.into_stage_latencies(),
+        })
+        .collect();
+
+    HedgeLatencies {
+        summary: LatencySummary {
+            fill_count,
+            stages: summary_samples.into_stage_latencies(),
+        },
+        buckets,
+        cycles,
+        total_cycles,
+        open_exposures,
+    }
+}
+
+fn cycle_report(symbol: &Symbol, cycle: &HedgeCycle) -> HedgeCycleReport {
+    let (status, completed_at) = match cycle.outcome {
+        HedgeOutcome::Pending => (HedgeCycleStatus::Pending, None),
+        HedgeOutcome::Filled { filled_at } => (HedgeCycleStatus::Filled, Some(filled_at)),
+        HedgeOutcome::Failed { failed_at } => (HedgeCycleStatus::Failed, Some(failed_at)),
+    };
+
+    HedgeCycleReport {
+        symbol: symbol.clone(),
+        offchain_order_id: cycle.offchain_order_id.as_uuid(),
+        placed_at: cycle.placed_at,
+        covered_fill_count: cycle.covered.as_ref().map_or(0, |covered| covered.count),
+        earliest_fill_block_timestamp: cycle
+            .covered
+            .as_ref()
+            .map(|covered| covered.earliest_block_timestamp),
+        submitted_at: cycle.submitted_at,
+        status,
+        completed_at,
+        decision_ms: cycle
+            .decision_latency()
+            .map(|latency| latency.num_milliseconds()),
+        submission_ms: cycle
+            .submission_latency()
+            .map(|latency| latency.num_milliseconds()),
+        execution_ms: cycle
+            .execution_latency()
+            .map(|latency| latency.num_milliseconds()),
+        exposure_window_ms: cycle
+            .exposure_window()
+            .map(|latency| latency.num_milliseconds()),
+    }
+}
+
+/// Nearest-rank percentiles over the given samples; `None` when empty.
+fn latency_stats(mut samples_ms: Vec<i64>) -> Option<LatencyStats> {
+    samples_ms.sort_unstable();
+    let len = samples_ms.len();
+    let nearest_rank = |numerator: usize, denominator: usize| -> Option<i64> {
+        let rank = (numerator * len).div_ceil(denominator).max(1);
+        samples_ms.get(rank - 1).copied()
+    };
+
+    Some(LatencyStats {
+        p50_ms: nearest_rank(1, 2)?,
+        p90_ms: nearest_rank(9, 10)?,
+        p95_ms: nearest_rank(19, 20)?,
+        p99_ms: nearest_rank(99, 100)?,
+        max_ms: samples_ms.last().copied()?,
+        sample_count: len,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::primitives::TxHash;
@@ -394,7 +602,7 @@ mod tests {
     use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor};
     use st0x_float_macro::float;
 
-    use crate::position::TriggerReason;
+    use crate::position::{TradeId, TriggerReason};
     use crate::test_utils::setup_test_db;
 
     use super::*;
@@ -1210,6 +1418,220 @@ mod tests {
                 filled_at: timestamp(15)
             }
         );
+    }
+
+    #[test]
+    fn latency_stats_uses_nearest_rank() {
+        let stats = latency_stats((1..=100).collect()).unwrap();
+
+        assert_eq!(stats.p50_ms, 50);
+        assert_eq!(stats.p90_ms, 90);
+        assert_eq!(stats.p95_ms, 95);
+        assert_eq!(stats.p99_ms, 99);
+        assert_eq!(stats.max_ms, 100);
+        assert_eq!(stats.sample_count, 100);
+    }
+
+    #[test]
+    fn latency_stats_single_sample_is_every_percentile() {
+        let stats = latency_stats(vec![42]).unwrap();
+
+        assert_eq!(stats.p50_ms, 42);
+        assert_eq!(stats.p90_ms, 42);
+        assert_eq!(stats.p95_ms, 42);
+        assert_eq!(stats.p99_ms, 42);
+        assert_eq!(stats.max_ms, 42);
+        assert_eq!(stats.sample_count, 1);
+    }
+
+    #[test]
+    fn latency_stats_empty_is_none() {
+        assert_eq!(latency_stats(Vec::new()), None);
+    }
+
+    fn report_range(from_offset: i64, to_offset: i64) -> ReportRange {
+        ReportRange {
+            from: timestamp(from_offset),
+            to: timestamp(to_offset),
+        }
+    }
+
+    #[test]
+    fn report_windows_fills_and_cycles_by_range() {
+        let order_id = OffchainOrderId::new();
+        let timelines = HashMap::from([(
+            order_id,
+            OrderTimeline {
+                submitted_at: Some(timestamp(11)),
+                outcome: HedgeOutcome::Filled {
+                    filled_at: timestamp(12),
+                },
+            },
+        )]);
+        let performance = fold_position_stream(
+            symbol(),
+            vec![
+                fill_event(1, 0, 5),
+                placed_event(order_id, 10),
+                // Outside the window below.
+                fill_event(2, 100_000, 100_005),
+            ],
+            &timelines,
+        );
+
+        let report = hedge_latency_report(&[performance], &report_range(0, 1_000));
+
+        assert_eq!(report.summary.fill_count, 1);
+        assert_eq!(report.total_cycles, 1);
+        assert_eq!(report.cycles.len(), 1);
+        assert_eq!(
+            report.summary.stages.detection.as_ref().unwrap().p50_ms,
+            5_000
+        );
+        assert_eq!(
+            report
+                .summary
+                .stages
+                .exposure_window
+                .as_ref()
+                .unwrap()
+                .p50_ms,
+            12_000
+        );
+        // The out-of-window fill still counts as present open exposure.
+        let open = &report.open_exposures[0];
+        assert_eq!(open.fill_count, 1);
+        assert_eq!(open.oldest_fill_block_timestamp, timestamp(100_000));
+    }
+
+    #[test]
+    fn report_buckets_fills_by_day() {
+        let day = 86_400;
+        let first = fold_position_stream(
+            symbol(),
+            vec![fill_event(1, 0, 2), fill_event(2, 3 * day, 3 * day + 4)],
+            &HashMap::new(),
+        );
+
+        let report = hedge_latency_report(&[first], &report_range(0, 10 * day));
+
+        assert_eq!(report.buckets.len(), 2);
+        assert_eq!(report.buckets[0].start, timestamp(0));
+        assert_eq!(report.buckets[1].start, timestamp(3 * day));
+        assert_eq!(
+            report.buckets[0].stages.detection.as_ref().unwrap().p50_ms,
+            2_000
+        );
+        assert_eq!(
+            report.buckets[1].stages.detection.as_ref().unwrap().p50_ms,
+            4_000
+        );
+    }
+
+    #[test]
+    fn report_buckets_weekly_for_ranges_over_a_month() {
+        let day = 86_400;
+        let performance = fold_position_stream(
+            symbol(),
+            vec![fill_event(1, 0, 2), fill_event(2, 10 * day, 10 * day + 4)],
+            &HashMap::new(),
+        );
+
+        let report = hedge_latency_report(&[performance], &report_range(0, 60 * day));
+
+        assert_eq!(report.buckets.len(), 2);
+        assert_eq!(report.buckets[0].start, timestamp(0));
+        assert_eq!(report.buckets[1].start, timestamp(7 * day));
+    }
+
+    #[test]
+    fn report_buckets_monthly_for_ranges_over_half_a_year() {
+        let day = 86_400;
+        let performance = fold_position_stream(
+            symbol(),
+            vec![fill_event(1, 0, 2), fill_event(2, 45 * day, 45 * day + 4)],
+            &HashMap::new(),
+        );
+
+        let report = hedge_latency_report(&[performance], &report_range(0, 300 * day));
+
+        assert_eq!(report.buckets.len(), 2);
+        assert_eq!(report.buckets[0].start, timestamp(0));
+        assert_eq!(report.buckets[1].start, timestamp(30 * day));
+    }
+
+    #[test]
+    fn report_caps_cycle_rows_but_counts_all() {
+        let events = (0..=i64::try_from(MAX_CYCLE_REPORTS).unwrap())
+            .map(|index| placed_event(OffchainOrderId::new(), index))
+            .collect();
+
+        let report = hedge_latency_report(
+            &[fold_position_stream(symbol(), events, &HashMap::new())],
+            &report_range(0, 1_000),
+        );
+
+        assert_eq!(report.total_cycles, MAX_CYCLE_REPORTS + 1);
+        assert_eq!(report.cycles.len(), MAX_CYCLE_REPORTS);
+    }
+
+    #[test]
+    fn report_clamps_negative_stage_latencies_to_zero() {
+        let order_id = OffchainOrderId::new();
+        // Broker clock skew: submitted before placed.
+        let timelines = HashMap::from([(
+            order_id,
+            OrderTimeline {
+                submitted_at: Some(timestamp(1)),
+                outcome: HedgeOutcome::Pending,
+            },
+        )]);
+        let performance = fold_position_stream(
+            symbol(),
+            vec![fill_event(1, 0, 1), placed_event(order_id, 3)],
+            &timelines,
+        );
+
+        let report = hedge_latency_report(&[performance], &report_range(0, 1_000));
+
+        let submission = report.summary.stages.submission.as_ref().unwrap();
+        assert_eq!(submission.p50_ms, 0);
+        assert_eq!(submission.max_ms, 0);
+    }
+
+    #[test]
+    fn report_orders_cycles_newest_first() {
+        let first = OffchainOrderId::new();
+        let second = OffchainOrderId::new();
+        let performance = fold_position_stream(
+            symbol(),
+            vec![
+                fill_event(1, 0, 1),
+                placed_event(first, 5),
+                fill_event(2, 10, 11),
+                placed_event(second, 20),
+            ],
+            &HashMap::new(),
+        );
+
+        let report = hedge_latency_report(&[performance], &report_range(0, 1_000));
+
+        assert_eq!(report.cycles.len(), 2);
+        assert_eq!(report.cycles[0].placed_at, timestamp(20));
+        assert_eq!(report.cycles[1].placed_at, timestamp(5));
+        assert_eq!(report.cycles[0].status, HedgeCycleStatus::Pending);
+    }
+
+    #[test]
+    fn report_empty_input_has_no_stats() {
+        let report = hedge_latency_report(&[], &report_range(0, 1_000));
+
+        assert_eq!(report.summary.fill_count, 0);
+        assert_eq!(report.total_cycles, 0);
+        assert_eq!(report.summary.stages.detection, None);
+        assert_eq!(report.buckets.len(), 0);
+        assert_eq!(report.cycles.len(), 0);
+        assert_eq!(report.open_exposures.len(), 0);
     }
 
     #[tokio::test]
