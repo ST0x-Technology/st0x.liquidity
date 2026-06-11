@@ -3431,6 +3431,98 @@ mod tests {
         );
     }
 
+    /// Reproduction for the fill-loss half of the Witness/Acknowledge
+    /// gap (ADR 0005): a crash between the Witness write and the
+    /// Position acknowledge leaves a genuinely reachable production
+    /// state -- the trade exists in the event store, the position never
+    /// learned of the fill. The re-delivered accounting job (a real path
+    /// since the startup orphan requeue) must complete the position
+    /// update and place the hedge, not dedupe-skip and lose the fill
+    /// forever. Both halves of the test run production code: the
+    /// persisted prefix is the exact first write `process_queued_trade`
+    /// makes, and the retry is `process_queued_trade` itself.
+    #[tokio::test]
+    async fn redelivery_after_crash_between_witness_and_acknowledge_recovers_fill() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let trade_event = make_trade_event(60);
+
+        // The exact first write process_queued_trade makes -- and then
+        // nothing: models the kill between the two aggregate writes.
+        let witnessed = execute_witness_trade(
+            &cqrs.onchain_trade,
+            &test_trade_with_amount(float!(1.5), 60),
+            trade_event.block_number,
+        )
+        .await
+        .unwrap();
+        assert!(witnessed, "premise: the witness write must succeed");
+        assert!(
+            cqrs.position_projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .is_none(),
+            "premise: the position must not have learned of the fill yet"
+        );
+
+        // The re-delivered job after restart.
+        process_queued_trade(
+            &MockExecutor::new(),
+            &trade_event,
+            test_trade_with_amount(float!(1.5), 60),
+            &cqrs,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let position = cqrs
+            .position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect(
+                "the re-delivered job must drive the fill into the position \
+                 instead of dedupe-skipping it into permanent loss",
+            );
+        assert!(
+            position.net.inner().eq(float!(1.5)).unwrap(),
+            "The fill must be accounted exactly once"
+        );
+
+        let orders = offchain_order_projection.load_all().await.unwrap();
+        assert_eq!(
+            orders.len(),
+            1,
+            "The recovered fill must hedge exactly once"
+        );
+        assert_eq!(
+            position.pending_offchain_order_id,
+            Some(orders[0].0),
+            "The position must track the recovered hedge"
+        );
+
+        let (position_fills,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
+                .bind("PositionEvent::OnChainOrderFilled")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            position_fills, 1,
+            "Exactly one position fill event after recovery"
+        );
+    }
+
     /// A broker outage during trade accounting must record the fill and
     /// defer the hedge, never lose it: the first attempt errors at the
     /// market-readiness check (after witness and acknowledge persisted),
