@@ -192,7 +192,7 @@ mod tests {
     use alloy::primitives::address;
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
-    use sqlx::SqlitePool;
+    use sqlx::{ConnectOptions, SqlitePool};
 
     use super::*;
     use crate::test_utils::setup_test_pools;
@@ -315,6 +315,78 @@ mod tests {
             0,
             "no safe block to ingest yet -> no enqueue"
         );
+    }
+
+    /// A write-locked database during the backfill enqueue must surface
+    /// as a typed error (the run loop logs it and retries next tick),
+    /// leave nothing enqueued, and enqueue cleanly once the lock clears.
+    /// The lock is a second connection holding `BEGIN IMMEDIATE` against
+    /// a file-backed database -- the documented bot-vs-reporter WAL
+    /// write contention -- with the pool's busy timeout scaled down so
+    /// the test waits milliseconds instead of production's 10 seconds.
+    #[tokio::test]
+    async fn poll_once_surfaces_enqueue_error_under_db_lock_and_resumes() {
+        let (pool, apalis_pool, db_path, _dir) =
+            crate::test_utils::setup_file_backed_test_db(Duration::from_millis(250)).await;
+        let backfill_queue = BackfillJobQueue::new(&apalis_pool);
+        let evm_ctx = EvmCtx {
+            rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
+            orderbook: address!("0x1111111111111111111111111111111111111111"),
+            deployment_block: 1,
+            required_confirmations: 0,
+        };
+
+        // One tip response per poll_once call.
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::Value::from(50));
+        asserter.push_success(&serde_json::Value::from(50));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let mut monitor = OrderFillMonitor::new(
+            evm_ctx,
+            backfill_queue,
+            pool.clone(),
+            provider,
+            Duration::from_secs(5),
+        );
+
+        let mut locker = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db_path)
+            .connect()
+            .await
+            .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut locker)
+            .await
+            .unwrap();
+
+        // The in-flight check is a read and succeeds under the WAL write
+        // lock; the enqueue INSERT blocks, then errors after the busy
+        // timeout.
+        let result = monitor.poll_once().await;
+        assert!(
+            matches!(result, Err(OrderFillMonitorError::Enqueue(_))),
+            "A write-locked database must surface as a typed enqueue \
+             error; got: {result:?}",
+        );
+        assert_eq!(
+            backfill_job_count(&apalis_pool).await,
+            0,
+            "No backfill range may be enqueued while the lock is held"
+        );
+
+        sqlx::query("ROLLBACK").execute(&mut locker).await.unwrap();
+
+        monitor.poll_once().await.unwrap();
+        assert_eq!(
+            backfill_job_count(&apalis_pool).await,
+            1,
+            "The next tick after the lock clears must enqueue the range"
+        );
+
+        let job = loaded_backfill(&apalis_pool).await;
+        assert_eq!(job.from_block, 1, "checkpoint must not have advanced");
+        assert_eq!(job.to_block, 50);
     }
 
     #[tokio::test]
