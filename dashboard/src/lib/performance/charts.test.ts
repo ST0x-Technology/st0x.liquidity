@@ -8,6 +8,7 @@ import type { RebalanceOperationTiming } from '$lib/api/RebalanceOperationTiming
 import {
   layoutAttestationTrend,
   layoutBlockLagTrend,
+  layoutDependencySparkline,
   layoutPercentileSeries,
   layoutRebalanceBars,
   layoutWaterfall,
@@ -472,6 +473,40 @@ describe('layoutBlockLagTrend', () => {
     expect(layout.points).toEqual([])
     expect(layout.path).toBe('')
     expect(layout.maxLagBlocks).toBe(0)
+  })
+})
+
+describe('layoutDependencySparkline', () => {
+  it('marks error buckets and scales bars to the slowest median', () => {
+    const bars = layoutDependencySparkline(
+      [
+        {
+          start: '2026-06-01T00:00:00Z',
+          calls: 10,
+          errors: 0,
+          p50Ms: 50,
+        },
+        {
+          start: '2026-06-01T01:00:00Z',
+          calls: 8,
+          errors: 2,
+          p50Ms: 200,
+        },
+        {
+          start: '2026-06-01T02:00:00Z',
+          calls: 0,
+          errors: 0,
+          p50Ms: null,
+        },
+      ],
+      { plotHeight: 12 },
+    )
+
+    expect(bars).toEqual([
+      { height: 3, hasErrors: false },
+      { height: 12, hasErrors: true },
+      { height: 0, hasErrors: false },
+    ])
   })
 })
 

@@ -22,7 +22,7 @@ use st0x_execution::FractionalShares;
 use crate::AppState;
 use crate::dashboard::transfer_loader::{InvalidTransferKind, TransferKind};
 use crate::equity_redemption::{EquityRedemptionEvent, RedemptionAggregateId};
-use crate::performance::infra::load_monitor_telemetry;
+use crate::performance::infra::{load_dependency_stats, load_monitor_telemetry};
 use crate::performance::rebalance::load_rebalance_timings;
 use crate::performance::reliability::{
     aggregate_log_entries, load_failure_events, load_job_queue_health,
@@ -1613,16 +1613,28 @@ async fn performance_infra(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let monitor = load_monitor_telemetry(
-        &state.pool,
-        &ReportRange { from, to },
-        state.ctx.evm.orderbook,
-    )
-    .await
-    .inspect_err(|error| error!(%error, "Failed to load monitor telemetry"))
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let range = ReportRange { from, to };
+    // The two loaders hit independent tables, so run them concurrently rather
+    // than paying both round-trips in series.
+    let (monitor, dependencies) = tokio::try_join!(
+        async {
+            load_monitor_telemetry(&state.pool, &range, state.ctx.evm.orderbook)
+                .await
+                .inspect_err(|error| error!(%error, "Failed to load monitor telemetry"))
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        },
+        async {
+            load_dependency_stats(&state.pool, &range)
+                .await
+                .inspect_err(|error| error!(%error, "Failed to load dependency stats"))
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        },
+    )?;
 
-    Ok(Json(InfraReport { monitor }))
+    Ok(Json(InfraReport {
+        monitor,
+        dependencies,
+    }))
 }
 
 pub(crate) fn routes() -> Router<AppState> {
@@ -2236,6 +2248,7 @@ mod tests {
                         "duration": null,
                     },
                 },
+                "dependencies": [],
             })
         );
     }
@@ -2292,6 +2305,15 @@ mod tests {
         )
         .await
         .unwrap();
+        sqlx::query(
+            "INSERT INTO dependency_call_samples \
+             (recorded_at, dependency, operation, duration_ms, outcome, error) \
+             VALUES ($1, 'rpc', 'eth_getLogs', 120, 'error', 'timeout')",
+        )
+        .bind(crate::telemetry::sqlite_timestamp(now))
+        .execute(&state.pool)
+        .await
+        .unwrap();
 
         let app = build_app(state);
         let response = app
@@ -2333,6 +2355,24 @@ mod tests {
         assert_eq!(
             report["monitor"]["poll"]["duration"]["p50Ms"],
             serde_json::json!(40)
+        );
+        assert_eq!(
+            report["dependencies"][0]["dependency"],
+            serde_json::json!("rpc")
+        );
+        assert_eq!(
+            report["dependencies"][0]["operation"],
+            serde_json::json!("eth_getLogs")
+        );
+        assert_eq!(report["dependencies"][0]["calls"], serde_json::json!(1));
+        assert_eq!(report["dependencies"][0]["errors"], serde_json::json!(1));
+        assert_eq!(
+            report["dependencies"][0]["latency"]["p50Ms"],
+            serde_json::json!(120)
+        );
+        assert_eq!(
+            report["dependencies"][0]["buckets"][0]["p50Ms"],
+            serde_json::json!(120)
         );
     }
 

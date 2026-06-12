@@ -394,6 +394,46 @@ pub struct FailureEventCount {
 #[serde(rename_all = "camelCase")]
 pub struct InfraReport {
     pub monitor: MonitorTelemetry,
+    /// Latency/error aggregates per external dependency operation, ordered
+    /// by dependency then operation.
+    pub dependencies: Vec<DependencyStats>,
+}
+
+/// External dependency a call sample was recorded against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyName {
+    Rpc,
+    Broker,
+}
+
+/// Latency and error aggregates for one operation against one dependency.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DependencyStats {
+    pub dependency: DependencyName,
+    pub operation: String,
+    #[ts(type = "number")]
+    pub calls: usize,
+    #[ts(type = "number")]
+    pub errors: usize,
+    /// Whole-range latency percentiles.
+    pub latency: Option<LatencyStats>,
+    /// Per-bucket call/error counts and median latency, oldest first.
+    pub buckets: Vec<DependencyBucket>,
+}
+
+/// One time bucket of dependency calls.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DependencyBucket {
+    pub start: DateTime<Utc>,
+    #[ts(type = "number")]
+    pub calls: usize,
+    #[ts(type = "number")]
+    pub errors: usize,
+    #[ts(type = "number | null")]
+    pub p50_ms: Option<i64>,
 }
 
 /// Ingestion-health telemetry sampled by the order-fill monitor.
