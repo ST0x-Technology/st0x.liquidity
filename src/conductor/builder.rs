@@ -39,7 +39,7 @@ use crate::offchain::order::{
     PollOrderStatusJobQueue, ReconcileOrderFill, ReconcileOrderFillJobQueue,
 };
 use crate::onchain::backfill::{BackfillJobQueue, BackfillRange};
-use crate::onchain::pyth::FeedIdCache;
+use crate::onchain::pyth::PythFeedIds;
 use crate::onchain_trade::OnChainTrade;
 use crate::position::Position;
 use crate::position_check::{CheckPositions, CheckPositionsCtx, CheckPositionsJobQueue};
@@ -253,7 +253,7 @@ where
         orderbook: context.ctx.evm.orderbook,
         ctx: context.ctx.clone(),
         cache: context.cache,
-        feed_id_cache: FeedIdCache::default(),
+        pyth_feed_ids: PythFeedIds::new(context.ctx.pyth_feed_ids()),
         evm: ReadOnlyEvm::new(context.provider.clone()),
         cqrs: trade_cqrs,
         vault_registry: context.frameworks.vault_registry,

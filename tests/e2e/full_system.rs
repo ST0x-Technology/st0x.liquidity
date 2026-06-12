@@ -99,6 +99,7 @@ fn build_full_system_ctx<P: Provider + Clone>(
                 EquityAssetConfig {
                     tokenized_equity: *unwrapped,
                     tokenized_equity_derivative: *wrapped,
+                    pyth_feed_id: None,
                     vault_ids: equity_vault_ids.get(symbol).copied().into_iter().collect(),
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Enabled,

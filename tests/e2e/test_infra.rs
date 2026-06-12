@@ -116,6 +116,7 @@ impl<P> TestInfra<P> {
                 let config = EquityAssetConfig {
                     tokenized_equity: *underlying_addr,
                     tokenized_equity_derivative: *vault_addr,
+                    pyth_feed_id: None,
                     vault_ids: Vec::new(),
                     trading: OperationMode::Enabled,
                     rebalancing: OperationMode::Disabled,

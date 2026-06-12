@@ -278,16 +278,23 @@ queue for idempotency. The complete database schema is defined in
 
 #### Pyth Price Extraction
 
-- Extracts exact oracle prices used during trade execution from transaction
-  traces
-- Uses `debug_traceTransaction` RPC method to analyze transaction execution
-- Parses Pyth oracle contract calls to retrieve precise price data including
-  price value, confidence interval, exponent, and publish timestamp
-- Prices are stored in the `onchain_trade_view` alongside trade records
-- NULL price values indicate extraction failed (e.g., no Pyth call in trace, RPC
-  errors)
-- CLI command for testing: `cargo run --bin cli get-pyth-price <TX_HASH>`
-- Trade processing continues normally even if price extraction fails
+- Records the Pyth oracle reference price for a trade via a historic `eth_call`
+  to `getPriceUnsafe(feed_id)` on the Base Pyth contract, pinned at the trade's
+  block. The service makes no `debug_*`/trace RPC calls.
+- The feed ID per equity is configured (optional `pyth_feed_id` under
+  `[assets.equities.<SYMBOL>]`). A symbol with no configured feed is recorded
+  without enrichment (logged at `debug`); hedging is unaffected.
+- Retrieves price value, confidence interval, exponent, and publish timestamp;
+  prices are stored in the `onchain_trade_view` alongside trade records
+- NULL price values indicate enrichment was skipped (no configured feed, missing
+  block number, RPC error, or invalid publish timestamp)
+- Because `getPriceUnsafe` reads the feed's stored state as of the trade block,
+  the recorded price is an end-of-block reference: it matches what the order
+  observed unless a Pyth update for that feed landed in the same block after the
+  trade. This is acceptable for analytics and never gates hedging.
+- The feed an order reads can change (oracle migrations); `pyth_feed_id` holds
+  the current feed per symbol and is refreshed if the order migrates.
+- Trade processing continues normally even if price enrichment is skipped
 
 #### Reporting and Analysis
 

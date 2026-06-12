@@ -87,6 +87,13 @@ rebalancing = "disabled"
 #   wallets are auto-recovered (resume stalled transfer or deposit orphans).
 # - tokenized_equity: unwrapped tTOKEN contract address on Base.
 # - tokenized_equity_derivative: wrapped wtTOKEN contract address on Base.
+# - pyth_feed_id: Optional Pyth feed ID for trade-enrichment reference prices.
+#   Only the symbols below carry one — they are the feeds confirmed from prod
+#   on-chain reads (COIN, CRCL, MSTR, QQQM, SGOV, TSLA). The remaining symbols
+#   are intentionally left unset until their current feed is confirmed on-chain;
+#   Pyth has multiple feeds per ticker and the feeds migrate, so values are not
+#   taken from the public registry unconfirmed. A missing feed only skips
+#   enrichment (analytics) for that symbol — hedging is unaffected.
 
 [assets.equities.RKLB]
 trading = "enabled"
@@ -98,6 +105,7 @@ tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
 tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
 
 [assets.equities.SGOV]
+pyth_feed_id = "0x8d6a29bb5ed522931d711bb12c4bbf92af986936e52af582032913b5ffcbf4d5"
 trading = "disabled"
 rebalancing = "disabled"
 wrapped_equity_recovery = "disabled"
@@ -113,6 +121,7 @@ tokenized_equity = "0x8fdf41116f755771bfe0747d5f8c3711d5debfbb"
 tokenized_equity_derivative = "0x31c2c14134e6e3b7ef9478297f199331133fc2d8"
 
 [assets.equities.TSLA]
+pyth_feed_id = "0x2a797e196973b72447e0ab8e841d9f5706c37dc581fe66a0bd21bcd256cdb9b9"
 trading = "disabled"
 rebalancing = "disabled"
 wrapped_equity_recovery = "disabled"
@@ -137,6 +146,7 @@ tokenized_equity = "0x7271a3c91bb6070ed09333b84a815949d4f16d14"
 tokenized_equity_derivative = "0xfb5b41acdba20a3230f84be995173cfb98b8d6e7"
 
 [assets.equities.MSTR]
+pyth_feed_id = "0xe1e80251e5f5184f2195008382538e847fafc36f751896889dd3d1b1f6111f09"
 trading = "disabled"
 rebalancing = "disabled"
 wrapped_equity_recovery = "disabled"
@@ -160,6 +170,7 @@ tokenized_equity = "0x9a507314ea2a6c5686c0d07bfecb764dcf324dff"
 tokenized_equity_derivative = "0x1e46d7efef64a833afb1cd49299a7ad5b439f4d8"
 
 [assets.equities.COIN]
+pyth_feed_id = "0xfee33f2a978bf32dd6b662b65ba8083c6773b494f8401194ec1870c640860245"
 trading = "disabled"
 rebalancing = "disabled"
 wrapped_equity_recovery = "disabled"
@@ -176,6 +187,7 @@ tokenized_equity = "0x58ce5024b89b4f73c27814c0f0abbea331c99be8"
 tokenized_equity_derivative = "0xeb7f3e4093c9d68253b6104fbbff561f3ec0442f"
 
 [assets.equities.CRCL]
+pyth_feed_id = "0x92b8527aabe59ea2b12230f7b532769b133ffb118dfbd48ff676f14b273f1365"
 trading = "disabled"
 rebalancing = "disabled"
 wrapped_equity_recovery = "disabled"
@@ -200,6 +212,7 @@ tokenized_equity = "0xfbde45df60249203b12148452fc77c3b5f811eb2"
 tokenized_equity_derivative = "0x2512EC661f0bA089c275EA105E31bAD6FcFcf319"
 
 [assets.equities.QQQM]
+pyth_feed_id = "0x433b196b3b026f46f76b5e901c84c575a7280dcba0f4272edefe0529b599ad64"
 trading = "disabled"
 rebalancing = "disabled"
 wrapped_equity_recovery = "disabled"
