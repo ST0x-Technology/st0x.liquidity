@@ -16,12 +16,13 @@ use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use st0x_dto::TradingVenue;
+use st0x_dto::{HedgeLatencies, TradingVenue};
 use st0x_execution::FractionalShares;
 
 use crate::AppState;
 use crate::dashboard::transfer_loader::{InvalidTransferKind, TransferKind};
 use crate::equity_redemption::{EquityRedemptionEvent, RedemptionAggregateId};
+use crate::performance::{ReportRange, hedge_latency_report, load_hedge_performance};
 use crate::rebalancing::RebalancingService;
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, RecheckError, RecheckOutcome};
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMintEvent};
@@ -1464,9 +1465,39 @@ fn recheck_error_response(error: &RecheckError) -> (StatusCode, String) {
     }
 }
 
+/// Query window for `GET /performance/latencies`. Defaults to the last
+/// 7 days ending now.
+#[derive(Debug, Deserialize)]
+struct PerformanceLatenciesQuery {
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+}
+
+async fn performance_latencies(
+    State(state): State<AppState>,
+    Query(query): Query<PerformanceLatenciesQuery>,
+) -> Result<Json<HedgeLatencies>, StatusCode> {
+    let to = query.to.unwrap_or_else(Utc::now);
+    let from = query.from.unwrap_or(to - chrono::Duration::days(7));
+    if from >= to {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let performances = load_hedge_performance(&state.pool)
+        .await
+        .inspect_err(|error| error!(%error, "Failed to load hedge performance"))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(hedge_latency_report(
+        &performances,
+        &ReportRange { from, to },
+    )))
+}
+
 pub(crate) fn routes() -> Router<AppState> {
     Router::new()
         .route("/health", get(health))
+        .route("/performance/latencies", get(performance_latencies))
         .route("/logs", get(logs))
         .route("/orders/pending", get(pending_orders))
         .route("/trades", get(trades))
@@ -1864,6 +1895,107 @@ mod tests {
     const THREE_ENTRY_LOG: &str = r#"{"timestamp":"2026-04-20T10:00:00Z","level":"INFO","target":"st0x_hedge","message":"Bot started"}
 {"timestamp":"2026-04-20T10:00:01Z","level":"DEBUG","target":"st0x_hedge","message":"Polling"}
 {"timestamp":"2026-04-20T10:00:02Z","level":"WARN","target":"st0x_hedge","message":"Slow response"}"#;
+
+    #[tokio::test]
+    async fn performance_latencies_returns_empty_report_on_fresh_database() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/performance/latencies")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response).await;
+        let report: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(report["summary"]["fillCount"], serde_json::json!(0));
+        assert_eq!(report["totalCycles"], serde_json::json!(0));
+        assert_eq!(report["cycles"], serde_json::json!([]));
+        assert_eq!(report["openExposures"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn performance_latencies_reports_seeded_fills() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let now = chrono::Utc::now();
+        let payload = serde_json::json!({
+            "OnChainOrderFilled": {
+                "trade_id": {
+                    "tx_hash":
+                        "0x1111111111111111111111111111111111111111111111111111111111111111",
+                    "log_index": 1,
+                },
+                "amount": "1",
+                "direction": "buy",
+                "price_usdc": "150",
+                "block_timestamp": now.to_rfc3339(),
+                "seen_at": now.to_rfc3339(),
+            }
+        });
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, \
+              payload, metadata) \
+             VALUES ('Position', 'AAPL', 1, 'PositionEvent::OnChainOrderFilled', \
+              '1.0', $1, '{}')",
+        )
+        .bind(payload.to_string())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let app = build_app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/performance/latencies")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response).await;
+        let report: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(report["summary"]["fillCount"], serde_json::json!(1));
+        assert_eq!(
+            report["openExposures"][0]["symbol"],
+            serde_json::json!("AAPL")
+        );
+        assert_eq!(
+            report["summary"]["stages"]["detection"]["p50Ms"],
+            serde_json::json!(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn performance_latencies_rejects_inverted_range() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let app = build_app(empty_app_state(ctx).await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/performance/latencies\
+                         ?from=2026-01-02T00:00:00Z&to=2026-01-01T00:00:00Z",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 
     #[tokio::test]
     async fn test_health_endpoint() {
