@@ -229,12 +229,14 @@ async fn requeue_startup_orphans(
     usdc_to_hedging_ctx: Option<&Arc<TransferUsdcToHedgingCtx>>,
     usdc_to_market_making_ctx: Option<&Arc<TransferUsdcToMarketMakingCtx>>,
     equity_to_market_making_ctx: Option<&Arc<TransferEquityToMarketMakingCtx>>,
+    equity_to_hedging_ctx: Option<&Arc<TransferEquityToHedgingCtx>>,
 ) -> anyhow::Result<()> {
     requeue_wired_transfer_orphans(
         schedulers,
         usdc_to_hedging_ctx,
         usdc_to_market_making_ctx,
         equity_to_market_making_ctx,
+        equity_to_hedging_ctx,
     )
     .await?;
     requeue_backfill_orphans(backfill_queue).await
