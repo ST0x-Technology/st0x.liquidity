@@ -136,7 +136,6 @@ mod tests {
     use st0x_float_macro::float;
 
     use super::*;
-    use crate::conductor::setup_apalis_tables;
     use crate::offchain::order::noop_order_placer;
     use crate::position::TradeId;
     use crate::test_utils::{OnchainTradeBuilder, setup_test_db};
@@ -148,7 +147,6 @@ mod tests {
 
     async fn build_test_infra() -> TestInfra {
         let pool = setup_test_db().await;
-        setup_apalis_tables(&pool).await.unwrap();
 
         let (offchain_order, _projection) = StoreBuilder::<OffchainOrder>::new(pool.clone())
             .build(noop_order_placer())

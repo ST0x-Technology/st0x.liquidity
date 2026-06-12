@@ -226,7 +226,6 @@ mod tests {
     use crate::conductor::job::Job;
     use crate::offchain::order::{OffchainOrder, OrderPlacementResult, OrderPlacer};
     use crate::position::{Position, PositionCommand, TradeId};
-    use crate::test_utils::setup_test_db;
     use st0x_config::ExecutionThreshold;
 
     fn succeeding_order_placer() -> Arc<dyn OrderPlacer> {
@@ -270,14 +269,13 @@ mod tests {
 
     struct TestInfra {
         ctx: HedgeCtx,
-        pool: sqlx::SqlitePool,
+        apalis_pool: apalis_sqlite::SqlitePool,
         position_projection: Arc<st0x_event_sorcery::Projection<Position>>,
         offchain_order_projection: Arc<st0x_event_sorcery::Projection<OffchainOrder>>,
     }
 
     async fn create_hedge_ctx(order_placer: Arc<dyn OrderPlacer>) -> TestInfra {
-        let pool = setup_test_db().await;
-        crate::conductor::setup_apalis_tables(&pool).await.unwrap();
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .build(())
@@ -293,12 +291,12 @@ mod tests {
         let ctx = HedgeCtx {
             position: position.clone(),
             offchain_order,
-            poll_status_queue: PollOrderStatusJobQueue::new(&pool),
+            poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
         };
 
         TestInfra {
             ctx,
-            pool,
+            apalis_pool,
             position_projection,
             offchain_order_projection,
         }
@@ -488,7 +486,9 @@ mod tests {
     /// order doesn't sit `Submitted` until the next bot restart.
     #[tokio::test]
     async fn retry_after_failed_poll_enqueue_re_enqueues_poll() {
-        let TestInfra { ctx, pool, .. } = create_hedge_ctx(succeeding_order_placer()).await;
+        let TestInfra {
+            ctx, apalis_pool, ..
+        } = create_hedge_ctx(succeeding_order_placer()).await;
         let symbol = Symbol::new("AAPL").unwrap();
 
         fill_position(
@@ -506,9 +506,9 @@ mod tests {
         job.perform(&ctx).await.unwrap();
 
         let poll_jobs_after_first: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+            sqlx_apalis::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
                 .bind(type_name::<PollOrderStatus>())
-                .fetch_one(&pool)
+                .fetch_one(&apalis_pool)
                 .await
                 .unwrap();
         assert_eq!(
@@ -523,9 +523,9 @@ mod tests {
         job.perform(&ctx).await.unwrap();
 
         let poll_jobs_after_retry: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+            sqlx_apalis::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
                 .bind(type_name::<PollOrderStatus>())
-                .fetch_one(&pool)
+                .fetch_one(&apalis_pool)
                 .await
                 .unwrap();
         assert_eq!(

@@ -50,7 +50,7 @@ use crate::rebalancing::{
     Rebalancer, RebalancingSchedulers, RebalancingService, RebalancingServiceConfig,
     TriggeredOperation, drain_pending_jobs,
 };
-use crate::test_utils::setup_test_db;
+use crate::test_utils::setup_test_pools;
 use crate::tokenization::Tokenizer;
 use crate::tokenization::alpaca::tests::{
     TEST_REDEMPTION_WALLET, create_test_service_from_mock, setup_anvil, tokenization_mint_path,
@@ -194,7 +194,7 @@ struct EquityTriggerFixture {
 }
 
 async fn setup_equity_trigger() -> EquityTriggerFixture {
-    let pool = setup_test_db().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
     let symbol = Symbol::new("AAPL").unwrap();
     let aggregate_id = symbol.to_string();
 
@@ -223,7 +223,7 @@ async fn setup_equity_trigger() -> EquityTriggerFixture {
         Arc::clone(&inventory),
         sender,
         wrapper,
-        RebalancingSchedulers::new(&pool),
+        RebalancingSchedulers::new(&apalis_pool),
     ));
 
     let position_cqrs = build_position_cqrs_with_service(&pool, &service).await;
@@ -340,18 +340,20 @@ enum EnqueuedUsdcOperation {
 
 /// Drains every pending USDC transfer row (both directions) from the apalis
 /// Jobs table, marks them Done, and returns them in `run_at` order.
-async fn drain_pending_usdc_transfer_jobs(pool: &SqlitePool) -> Vec<EnqueuedUsdcOperation> {
+async fn drain_pending_usdc_transfer_jobs(
+    apalis_pool: &apalis_sqlite::SqlitePool,
+) -> Vec<EnqueuedUsdcOperation> {
     let to_hedging_type = std::any::type_name::<TransferUsdcToHedging>();
     let to_market_making_type = std::any::type_name::<TransferUsdcToMarketMaking>();
 
-    let rows: Vec<(String, Vec<u8>, String)> = sqlx::query_as(
+    let rows: Vec<(String, Vec<u8>, String)> = sqlx_apalis::query_as(
         "SELECT id, job, job_type FROM Jobs \
          WHERE status = 'Pending' AND (job_type = ? OR job_type = ?) \
          ORDER BY run_at",
     )
     .bind(to_hedging_type)
     .bind(to_market_making_type)
-    .fetch_all(pool)
+    .fetch_all(apalis_pool)
     .await
     .expect("query pending USDC transfer jobs");
 
@@ -367,9 +369,9 @@ async fn drain_pending_usdc_transfer_jobs(pool: &SqlitePool) -> Vec<EnqueuedUsdc
             EnqueuedUsdcOperation::AlpacaToBase { amount: job.amount }
         };
 
-        sqlx::query("UPDATE Jobs SET status = 'Done' WHERE id = ?")
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Done' WHERE id = ?")
             .bind(&row_id)
-            .execute(pool)
+            .execute(apalis_pool)
             .await
             .expect("mark drained USDC transfer job Done");
 
@@ -1047,7 +1049,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
 /// expected amount. No work flows through the Rebalancer mpsc channel.
 #[tokio::test]
 async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
-    let pool = setup_test_db().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
 
     // 100 onchain, 900 offchain = 10% onchain ratio -> below 30% -> TooMuchOffchain
     // Excess = target_onchain - onchain = 500 - 100 = 400 USDC (above $51 minimum)
@@ -1077,19 +1079,19 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
         Arc::clone(&inventory),
         sender,
         wrapper,
-        RebalancingSchedulers::new(&pool),
+        RebalancingSchedulers::new(&apalis_pool),
     );
 
     trigger.check_and_trigger_usdc().await;
 
     let job_type = std::any::type_name::<TransferUsdcToMarketMaking>();
 
-    let pending: i64 = sqlx::query_scalar(
+    let pending: i64 = sqlx_apalis::query_scalar(
         "SELECT COUNT(*) FROM Jobs \
          WHERE status = 'Pending' AND job_type = ?",
     )
     .bind(job_type)
-    .fetch_one(&pool)
+    .fetch_one(&apalis_pool)
     .await
     .unwrap();
 
@@ -1098,12 +1100,12 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
         "Expected exactly one pending TransferUsdcToMarketMaking job"
     );
 
-    let payload: Vec<u8> = sqlx::query_scalar(
+    let payload: Vec<u8> = sqlx_apalis::query_scalar(
         "SELECT job FROM Jobs \
          WHERE status = 'Pending' AND job_type = ?",
     )
     .bind(job_type)
-    .fetch_one(&pool)
+    .fetch_one(&apalis_pool)
     .await
     .unwrap();
 
@@ -1115,12 +1117,13 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
         "Expected excess of $400 (target $500 - actual $100)"
     );
 
-    let opposite: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?")
-            .bind(std::any::type_name::<TransferUsdcToHedging>())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let opposite: i64 = sqlx_apalis::query_scalar(
+        "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+    )
+    .bind(std::any::type_name::<TransferUsdcToHedging>())
+    .fetch_one(&apalis_pool)
+    .await
+    .unwrap();
 
     assert_eq!(
         opposite, 0,
@@ -1133,7 +1136,7 @@ async fn usdc_offchain_imbalance_triggers_alpaca_to_base() {
 /// with excess = 900 - 500 = $400.
 #[tokio::test]
 async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
-    let pool = setup_test_db().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
 
     // 900 onchain, 100 offchain = 90% onchain ratio -> above 70% -> TooMuchOnchain
     // Excess = onchain - target_onchain = 900 - 500 = 400 USDC
@@ -1163,7 +1166,7 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
         Arc::clone(&inventory),
         sender,
         wrapper,
-        RebalancingSchedulers::new(&pool),
+        RebalancingSchedulers::new(&apalis_pool),
     );
 
     trigger.check_and_trigger_usdc().await;
@@ -1173,12 +1176,12 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
     // with the expected payload.
     let job_type = std::any::type_name::<TransferUsdcToHedging>();
 
-    let pending: i64 = sqlx::query_scalar(
+    let pending: i64 = sqlx_apalis::query_scalar(
         "SELECT COUNT(*) FROM Jobs \
          WHERE status = 'Pending' AND job_type = ?",
     )
     .bind(job_type)
-    .fetch_one(&pool)
+    .fetch_one(&apalis_pool)
     .await
     .unwrap();
 
@@ -1187,12 +1190,12 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
         "Expected exactly one pending TransferUsdcToHedging job"
     );
 
-    let payload: Vec<u8> = sqlx::query_scalar(
+    let payload: Vec<u8> = sqlx_apalis::query_scalar(
         "SELECT job FROM Jobs \
          WHERE status = 'Pending' AND job_type = ?",
     )
     .bind(job_type)
-    .fetch_one(&pool)
+    .fetch_one(&apalis_pool)
     .await
     .unwrap();
 
@@ -1204,12 +1207,13 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
         "Expected excess of $400 (actual $900 - target $500)"
     );
 
-    let opposite: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?")
-            .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let opposite: i64 = sqlx_apalis::query_scalar(
+        "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+    )
+    .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+    .fetch_one(&apalis_pool)
+    .await
+    .unwrap();
 
     assert_eq!(
         opposite, 0,
@@ -1240,7 +1244,7 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
     use crate::inventory::InventoryPollingService;
     use crate::inventory::snapshot::{InventorySnapshotCommand, InventorySnapshotId};
 
-    let pool = setup_test_db().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
 
     let (event_sender, _) = broadcast::channel::<Statement>(16);
     let inventory = Arc::new(BroadcastingInventory::new(
@@ -1268,7 +1272,7 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
         Arc::clone(&inventory),
         sender,
         wrapper,
-        RebalancingSchedulers::new(&pool),
+        RebalancingSchedulers::new(&apalis_pool),
     ));
 
     // Build snapshot store with the service as the CQRS subscriber — mirrors
@@ -1355,19 +1359,21 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
     drop(polling_service);
     drop(receiver);
 
-    let to_hedging: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?")
-            .bind(std::any::type_name::<TransferUsdcToHedging>())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let to_hedging: i64 = sqlx_apalis::query_scalar(
+        "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+    )
+    .bind(std::any::type_name::<TransferUsdcToHedging>())
+    .fetch_one(&apalis_pool)
+    .await
+    .unwrap();
 
-    let to_market_making: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?")
-            .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let to_market_making: i64 = sqlx_apalis::query_scalar(
+        "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+    )
+    .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+    .fetch_one(&apalis_pool)
+    .await
+    .unwrap();
 
     assert_eq!(
         to_hedging, 0,
@@ -1385,7 +1391,7 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
 /// `cash_reserve_does_not_shift_rebalancing_ratio`.
 #[tokio::test]
 async fn balanced_usdc_without_reserve_triggers_no_rebalancing() {
-    let pool = setup_test_db().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
 
     let (event_sender, _) = broadcast::channel::<Statement>(16);
     let inventory = Arc::new(BroadcastingInventory::new(
@@ -1413,7 +1419,7 @@ async fn balanced_usdc_without_reserve_triggers_no_rebalancing() {
         Arc::clone(&inventory),
         sender,
         wrapper,
-        RebalancingSchedulers::new(&pool),
+        RebalancingSchedulers::new(&apalis_pool),
     );
 
     trigger.check_and_trigger_usdc().await;
@@ -1434,7 +1440,7 @@ async fn balanced_usdc_without_reserve_triggers_no_rebalancing() {
 /// which covers the balanced case.
 #[tokio::test]
 async fn usdc_alpaca_to_base_skips_when_withdrawable_cash_missing_with_reserve() {
-    let pool = setup_test_db().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
 
     let (event_sender, _) = broadcast::channel::<Statement>(16);
     let inventory = Arc::new(BroadcastingInventory::new(
@@ -1472,7 +1478,7 @@ async fn usdc_alpaca_to_base_skips_when_withdrawable_cash_missing_with_reserve()
         Arc::clone(&inventory),
         sender,
         wrapper,
-        RebalancingSchedulers::new(&pool),
+        RebalancingSchedulers::new(&apalis_pool),
     );
 
     trigger.check_and_trigger_usdc().await;
@@ -1490,7 +1496,7 @@ async fn usdc_alpaca_to_base_skips_when_withdrawable_cash_missing_with_reserve()
 /// `check_and_trigger_usdc` dispatches no operations.
 #[tokio::test]
 async fn usdc_none_disables_usdc_rebalancing() {
-    let pool = setup_test_db().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
 
     let (event_sender, _) = broadcast::channel::<Statement>(16);
     let inventory = Arc::new(BroadcastingInventory::new(
@@ -1521,7 +1527,7 @@ async fn usdc_none_disables_usdc_rebalancing() {
         Arc::clone(&inventory),
         sender,
         wrapper,
-        RebalancingSchedulers::new(&pool),
+        RebalancingSchedulers::new(&apalis_pool),
     );
 
     trigger.check_and_trigger_usdc().await;
@@ -1678,7 +1684,7 @@ async fn mint_api_failure_produces_rejected_event() {
 /// remaining imbalance, and so on until the inventory is balanced.
 #[tokio::test]
 async fn usdc_operational_limits_cap_across_trigger_cycles() {
-    let pool = setup_test_db().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
 
     // 50 onchain, 950 offchain = 5% ratio -> TooMuchOffchain
     // Excess to reach 50% target = 500 - 50 = 450 USDC
@@ -1726,12 +1732,12 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         Arc::clone(&inventory),
         sender,
         wrapper,
-        RebalancingSchedulers::new(&pool),
+        RebalancingSchedulers::new(&apalis_pool),
     );
 
     // Cycle 1: excess = 450, capped to 100
     trigger.check_and_trigger_usdc().await;
-    let cycle1 = drain_pending_usdc_transfer_jobs(&pool).await;
+    let cycle1 = drain_pending_usdc_transfer_jobs(&apalis_pool).await;
     assert_eq!(
         cycle1.as_slice(),
         [EnqueuedUsdcOperation::AlpacaToBase {
@@ -1753,7 +1759,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
 
     // Cycle 2: excess = 350, capped to 100
     trigger.check_and_trigger_usdc().await;
-    let cycle2 = drain_pending_usdc_transfer_jobs(&pool).await;
+    let cycle2 = drain_pending_usdc_transfer_jobs(&apalis_pool).await;
     assert_eq!(
         cycle2.as_slice(),
         [EnqueuedUsdcOperation::AlpacaToBase {
@@ -1775,7 +1781,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
 
     // Cycle 3: excess = 250, capped to 100
     trigger.check_and_trigger_usdc().await;
-    let cycle3 = drain_pending_usdc_transfer_jobs(&pool).await;
+    let cycle3 = drain_pending_usdc_transfer_jobs(&apalis_pool).await;
     assert_eq!(
         cycle3.as_slice(),
         [EnqueuedUsdcOperation::AlpacaToBase {
@@ -1797,7 +1803,9 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
 
     trigger.check_and_trigger_usdc().await;
     assert!(
-        drain_pending_usdc_transfer_jobs(&pool).await.is_empty(),
+        drain_pending_usdc_transfer_jobs(&apalis_pool)
+            .await
+            .is_empty(),
         "Balanced inventory should not trigger"
     );
 }
@@ -1808,7 +1816,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
 /// trigger fires again.
 #[tokio::test]
 async fn usdc_in_progress_blocks_concurrent_triggers() {
-    let pool = setup_test_db().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
 
     // Large imbalance: 100 onchain, 900 offchain
     let (event_sender, _) = broadcast::channel::<Statement>(16);
@@ -1854,13 +1862,15 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
         Arc::clone(&inventory),
         sender,
         wrapper,
-        RebalancingSchedulers::new(&pool),
+        RebalancingSchedulers::new(&apalis_pool),
     );
 
     // First trigger fires: excess = 400, capped to 100
     trigger.check_and_trigger_usdc().await;
     assert_eq!(
-        drain_pending_usdc_transfer_jobs(&pool).await.as_slice(),
+        drain_pending_usdc_transfer_jobs(&apalis_pool)
+            .await
+            .as_slice(),
         [EnqueuedUsdcOperation::AlpacaToBase {
             amount: Usdc::new(float!(100))
         }],
@@ -1870,7 +1880,9 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
     // Without clearing in_progress, second trigger is blocked
     trigger.check_and_trigger_usdc().await;
     assert!(
-        drain_pending_usdc_transfer_jobs(&pool).await.is_empty(),
+        drain_pending_usdc_transfer_jobs(&apalis_pool)
+            .await
+            .is_empty(),
         "In-progress guard should block second trigger"
     );
 
@@ -1880,7 +1892,9 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
     // Trigger fires again: same inventory, same excess = 400, capped to 100
     trigger.check_and_trigger_usdc().await;
     assert_eq!(
-        drain_pending_usdc_transfer_jobs(&pool).await.as_slice(),
+        drain_pending_usdc_transfer_jobs(&apalis_pool)
+            .await
+            .as_slice(),
         [EnqueuedUsdcOperation::AlpacaToBase {
             amount: Usdc::new(float!(100))
         }],
@@ -1894,7 +1908,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
 /// dispatch a rebalancing operation.
 #[tokio::test]
 async fn threshold_config_controls_trigger_sensitivity() {
-    let pool = setup_test_db().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
 
     // Inventory: 350 onchain / 650 offchain = 35% onchain ratio.
     // Wide config (deviation=0.4, bounds: 10%-90%): 35% is within bounds -> no trigger.
@@ -1947,7 +1961,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
             Arc::clone(&inventory),
             sender,
             wrapper,
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         );
 
         trigger.check_and_trigger_usdc().await;
@@ -2009,7 +2023,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
             Arc::clone(&inventory),
             sender,
             wrapper,
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         );
 
         trigger.check_and_trigger_usdc().await;
@@ -2017,7 +2031,9 @@ async fn threshold_config_controls_trigger_sensitivity() {
 
         // Excess = target_onchain - actual_onchain = 500 - 350 = $150
         assert_eq!(
-            drain_pending_usdc_transfer_jobs(&pool).await.as_slice(),
+            drain_pending_usdc_transfer_jobs(&apalis_pool)
+                .await
+                .as_slice(),
             [EnqueuedUsdcOperation::AlpacaToBase {
                 amount: Usdc::new(float!(150))
             }],

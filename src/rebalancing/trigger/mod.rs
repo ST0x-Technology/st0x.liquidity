@@ -72,7 +72,7 @@ pub(crate) struct RebalancingSchedulers {
 }
 
 impl RebalancingSchedulers {
-    pub(crate) fn new(pool: &SqlitePool) -> Self {
+    pub(crate) fn new(pool: &apalis_sqlite::SqlitePool) -> Self {
         Self {
             equity: EquityRebalancingCheckScheduler::new(pool),
             usdc: UsdcRebalancingCheckScheduler::new(pool),
@@ -124,6 +124,8 @@ pub(crate) enum RebalancingServiceError {
     },
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
+    #[error(transparent)]
+    ApalisSqlx(#[from] sqlx_apalis::Error),
     #[error("failed to re-arm a stranded USDC transfer job at startup: {0}")]
     RearmEnqueue(#[from] QueuePushError),
 }
@@ -909,7 +911,7 @@ impl RebalancingService {
             id: UsdcRebalanceId,
         }
 
-        let rows: Result<Vec<(Vec<u8>,)>, _> = sqlx::query_as(
+        let rows: Result<Vec<(Vec<u8>,)>, _> = sqlx_apalis::query_as(
             "SELECT job FROM Jobs \
              WHERE job_type IN (?, ?) \
              AND status IN ('Pending', 'Queued', 'Running')",
@@ -967,21 +969,25 @@ impl RebalancingService {
     /// Unlike the timeout-sweep probe, this PROPAGATES query/decode failures so
     /// startup recovery fails fast rather than silently skipping (or spuriously
     /// firing) a re-arm it could not verify.
-    async fn transfer_has_job_row_for_id(&self, id: &UsdcRebalanceId) -> Result<bool, sqlx::Error> {
+    async fn transfer_has_job_row_for_id(
+        &self,
+        id: &UsdcRebalanceId,
+    ) -> Result<bool, sqlx_apalis::Error> {
         #[derive(serde::Deserialize)]
         struct TransferJobId {
             id: UsdcRebalanceId,
         }
 
-        let rows: Vec<(Vec<u8>,)> = sqlx::query_as("SELECT job FROM Jobs WHERE job_type IN (?, ?)")
-            .bind(std::any::type_name::<TransferUsdcToHedging>())
-            .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
-            .fetch_all(self.transfer_usdc_to_hedging_queue.pool())
-            .await?;
+        let rows: Vec<(Vec<u8>,)> =
+            sqlx_apalis::query_as("SELECT job FROM Jobs WHERE job_type IN (?, ?)")
+                .bind(std::any::type_name::<TransferUsdcToHedging>())
+                .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+                .fetch_all(self.transfer_usdc_to_hedging_queue.pool())
+                .await?;
 
         for (payload,) in rows {
             let job: TransferJobId = serde_json::from_slice(&payload)
-                .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
+                .map_err(|error| sqlx_apalis::Error::Decode(Box::new(error)))?;
             if job.id == *id {
                 return Ok(true);
             }
@@ -1002,13 +1008,16 @@ impl RebalancingService {
     /// same id (which would run two concurrent resumes). Propagates query/decode
     /// failures so startup recovery fails fast rather than silently skipping a
     /// re-arm it could not verify.
-    async fn transfer_live_job_for_id(&self, id: &UsdcRebalanceId) -> Result<bool, sqlx::Error> {
+    async fn transfer_live_job_for_id(
+        &self,
+        id: &UsdcRebalanceId,
+    ) -> Result<bool, sqlx_apalis::Error> {
         #[derive(serde::Deserialize)]
         struct TransferJobId {
             id: UsdcRebalanceId,
         }
 
-        let rows: Vec<(Vec<u8>,)> = sqlx::query_as(
+        let rows: Vec<(Vec<u8>,)> = sqlx_apalis::query_as(
             "SELECT job FROM Jobs \
              WHERE job_type IN (?, ?) \
              AND (status IN ('Pending', 'Queued', 'Running') \
@@ -1021,7 +1030,7 @@ impl RebalancingService {
 
         for (payload,) in rows {
             let job: TransferJobId = serde_json::from_slice(&payload)
-                .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
+                .map_err(|error| sqlx_apalis::Error::Decode(Box::new(error)))?;
             if job.id == *id {
                 return Ok(true);
             }
@@ -1344,9 +1353,9 @@ impl RebalancingService {
     ) -> Result<(), RebalancingServiceError> {
         use InventorySnapshotEvent::*;
         use RebalancingServiceError::{
-            EquityTrigger, Float, MissingUsdcBridgedAmount, MissingUsdcTrackingContext, Projection,
-            RearmEnqueue, RedemptionUnwrappedExceedsTracked, SettledUsdcExceedsInitiatedAmount,
-            SharesConversion, Sqlx,
+            ApalisSqlx, EquityTrigger, Float, MissingUsdcBridgedAmount, MissingUsdcTrackingContext,
+            Projection, RearmEnqueue, RedemptionUnwrappedExceedsTracked,
+            SettledUsdcExceedsInitiatedAmount, SharesConversion, Sqlx,
         };
 
         self.expire_stuck_operations_with_logging().await;
@@ -1362,6 +1371,7 @@ impl RebalancingService {
             | SettledUsdcExceedsInitiatedAmount { .. }
             | RedemptionUnwrappedExceedsTracked { .. }
             | Sqlx(_)
+            | ApalisSqlx(_)
             | RearmEnqueue(_)) => {
                 return Err(other);
             }
@@ -1505,7 +1515,7 @@ impl RebalancingService {
                     // a LIKE substring) so a queued job for a ticker that contains
                     // this symbol as a substring (e.g. GOOGL vs GOOG) can't suppress
                     // a distinct recovery.
-                    let existing: Result<(i64,), _> = sqlx::query_as(
+                    let existing: Result<(i64,), _> = sqlx_apalis::query_as(
                         "SELECT COUNT(*) FROM Jobs \
                          WHERE job_type = ? \
                          AND status IN ('Pending', 'Queued', 'Running') \
@@ -1582,7 +1592,7 @@ impl RebalancingService {
                     // exactly (json_extract, not a LIKE substring) so a queued
                     // job for a ticker that contains this symbol as a substring
                     // (e.g. GOOGL vs GOOG) can't suppress a distinct recovery.
-                    let existing: Result<(i64,), _> = sqlx::query_as(
+                    let existing: Result<(i64,), _> = sqlx_apalis::query_as(
                         "SELECT COUNT(*) FROM Jobs \
                          WHERE job_type = ? \
                          AND status IN ('Pending', 'Queued', 'Running') \
@@ -2368,9 +2378,9 @@ impl RebalancingService {
     /// an opposite-direction transfer run concurrently against the same funds --
     /// churning capital and paying CCTP/withdrawal fees twice.
     async fn in_flight_usdc_transfer(
-        pool: &sqlx::SqlitePool,
-    ) -> Result<Option<(String, i64)>, sqlx::Error> {
-        sqlx::query_as(
+        pool: &apalis_sqlite::SqlitePool,
+    ) -> Result<Option<(String, i64)>, sqlx_apalis::Error> {
+        sqlx_apalis::query_as(
             "SELECT id, CAST(strftime('%s', 'now') AS INTEGER) - run_at AS age_secs \
              FROM Jobs \
              WHERE job_type IN (?, ?) \
@@ -3706,18 +3716,18 @@ mod tests {
             InventoryView::default(),
             event_sender,
         ));
-        let pool = crate::test_utils::setup_test_db().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let wrapper = Arc::new(MockWrapper::new());
 
         let service = Arc::new(RebalancingService::new(
             test_config(),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             inventory,
             sender,
             wrapper,
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         ));
         (service, receiver)
     }
@@ -3750,25 +3760,24 @@ mod tests {
             },
         );
 
-        let pool = crate::test_utils::setup_test_db().await;
-        crate::conductor::setup_apalis_tables(&pool).await.unwrap();
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let (sender, _receiver) = mpsc::channel(10);
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(inventory_view, event_sender));
         let service = RebalancingService::new(
             config,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             inventory,
             sender,
             Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         );
 
         service.enqueue_recovery_for_current_wallet_balances().await;
 
-        let (jobs,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+        let (jobs,): (i64,) = sqlx_apalis::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
             .bind(std::any::type_name::<UnwrappedEquityRecoveryJob>())
             .fetch_one(service.unwrapped_equity_recovery_queue.pool())
             .await
@@ -5185,7 +5194,7 @@ mod tests {
             InventoryView::default(),
             event_sender,
         ));
-        let pool = crate::test_utils::setup_test_db().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let wrapper = Arc::new(MockWrapper::new());
 
         let trigger = RebalancingService::new(
@@ -5199,13 +5208,13 @@ mod tests {
                 },
                 disabled_assets: HashSet::new(),
             },
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             inventory,
             sender,
             wrapper,
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         );
 
         trigger.check_and_trigger_usdc().await;
@@ -5228,7 +5237,7 @@ mod tests {
             InventoryView::default(),
             event_sender,
         ));
-        let pool = crate::test_utils::setup_test_db().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let wrapper = Arc::new(MockWrapper::new());
 
         let trigger = RebalancingService::new(
@@ -5242,13 +5251,13 @@ mod tests {
                 },
                 disabled_assets: HashSet::from([symbol.clone()]),
             },
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             inventory,
             sender,
             wrapper,
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         );
 
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
@@ -5418,17 +5427,17 @@ mod tests {
         let (sender, receiver) = mpsc::channel(10);
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
-        let pool = crate::test_utils::setup_test_db().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
         let service = Arc::new(RebalancingService::new(
             config,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             inventory,
             sender,
             Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         ));
         (service, receiver)
     }
@@ -5445,7 +5454,7 @@ mod tests {
     /// on the mpsc receiver for Base->Alpaca and now must assert on the queue.
     async fn count_pending_transfer_usdc_to_hedging_jobs(service: &RebalancingService) -> i64 {
         let job_type = std::any::type_name::<TransferUsdcToHedging>();
-        sqlx::query_scalar::<_, i64>(
+        sqlx_apalis::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
         )
         .bind(job_type)
@@ -5458,7 +5467,7 @@ mod tests {
         service: &RebalancingService,
     ) -> i64 {
         let job_type = std::any::type_name::<TransferUsdcToMarketMaking>();
-        sqlx::query_scalar::<_, i64>(
+        sqlx_apalis::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
         )
         .bind(job_type)
@@ -5478,7 +5487,7 @@ mod tests {
         let to_hedging_type = std::any::type_name::<TransferUsdcToHedging>();
         let to_mm_type = std::any::type_name::<TransferUsdcToMarketMaking>();
 
-        let rows: Vec<(String, Vec<u8>, String)> = sqlx::query_as(
+        let rows: Vec<(String, Vec<u8>, String)> = sqlx_apalis::query_as(
             "SELECT id, job, job_type FROM Jobs \
              WHERE status = 'Pending' AND (job_type = ? OR job_type = ?) \
              ORDER BY run_at",
@@ -5501,7 +5510,7 @@ mod tests {
                 UsdcRebalanceOperation::AlpacaToBase { amount: job.amount }
             };
 
-            sqlx::query("UPDATE Jobs SET status = 'Done' WHERE id = ?")
+            sqlx_apalis::query("UPDATE Jobs SET status = 'Done' WHERE id = ?")
                 .bind(&row_id)
                 .execute(&pool)
                 .await
@@ -5536,19 +5545,19 @@ mod tests {
         let (sender, receiver) = mpsc::channel(10);
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(inventory, event_sender));
-        let pool = crate::test_utils::setup_test_db().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
         seed_vault_registry(&pool, symbol).await;
 
         let service = Arc::new(RebalancingService::new(
             config,
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             inventory,
             sender,
             wrapper,
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         ));
         let reactor = service;
         (reactor, receiver)
@@ -5612,19 +5621,19 @@ mod tests {
             InventoryView::default().with_usdc(usdc(1_000_000), usdc(1_000_000)),
             event_sender,
         ));
-        let pool = crate::test_utils::setup_test_db().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
         seed_vault_registry(&pool, &symbol).await;
 
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             inventory,
             sender,
             Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         ));
         let reactor = trigger.clone();
 
@@ -6924,7 +6933,7 @@ mod tests {
             "manual adjustment must not clear the pending-hedge gate"
         );
 
-        let pending_equity_checks = sqlx::query_scalar::<_, i64>(
+        let pending_equity_checks = sqlx_apalis::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
         )
         .bind(std::any::type_name::<EquityRebalancingCheck>())
@@ -8689,7 +8698,7 @@ mod tests {
         let pool = trigger.usdc_scheduler.queue().pool().clone();
 
         let pending_before: i64 =
-            sqlx::query_scalar(
+            sqlx_apalis::query_scalar(
                 "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type LIKE '%UsdcRebalancingCheck'",
             )
                 .fetch_one(&pool)
@@ -8708,7 +8717,7 @@ mod tests {
         .unwrap();
 
         let pending_after: i64 =
-            sqlx::query_scalar(
+            sqlx_apalis::query_scalar(
                 "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type LIKE '%UsdcRebalancingCheck'",
             )
                 .fetch_one(&pool)
@@ -9602,7 +9611,7 @@ mod tests {
             })
             .await
             .unwrap();
-        sqlx::query("UPDATE Jobs SET status = 'Failed' WHERE job_type = ?")
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Failed' WHERE job_type = ?")
             .bind(std::any::type_name::<TransferUsdcToHedging>())
             .execute(queue.pool())
             .await
@@ -10073,12 +10082,13 @@ mod tests {
             "a stranded Base->Alpaca AwaitingAttestation must be re-armed as a hedging job",
         );
 
-        let payload: Vec<u8> =
-            sqlx::query_scalar("SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?")
-                .bind(std::any::type_name::<TransferUsdcToHedging>())
-                .fetch_one(service.transfer_usdc_to_hedging_queue.pool())
-                .await
-                .unwrap();
+        let payload: Vec<u8> = sqlx_apalis::query_scalar(
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferUsdcToHedging>())
+        .fetch_one(service.transfer_usdc_to_hedging_queue.pool())
+        .await
+        .unwrap();
         let job: TransferUsdcToHedging = serde_json::from_slice(&payload).unwrap();
         assert_eq!(
             job.id, id,
@@ -10164,7 +10174,7 @@ mod tests {
             })
             .await
             .unwrap();
-        sqlx::query("UPDATE Jobs SET status = 'Failed' WHERE job_type = ?")
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Failed' WHERE job_type = ?")
             .bind(std::any::type_name::<TransferUsdcToHedging>())
             .execute(service.transfer_usdc_to_hedging_queue.pool())
             .await
@@ -10207,12 +10217,13 @@ mod tests {
             "a recoverable post-burn BridgingFailed must be re-armed as a hedging job",
         );
 
-        let payload: Vec<u8> =
-            sqlx::query_scalar("SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?")
-                .bind(std::any::type_name::<TransferUsdcToHedging>())
-                .fetch_one(service.transfer_usdc_to_hedging_queue.pool())
-                .await
-                .unwrap();
+        let payload: Vec<u8> = sqlx_apalis::query_scalar(
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferUsdcToHedging>())
+        .fetch_one(service.transfer_usdc_to_hedging_queue.pool())
+        .await
+        .unwrap();
         let job: TransferUsdcToHedging = serde_json::from_slice(&payload).unwrap();
         assert_eq!(
             job.id, id,
@@ -10259,7 +10270,7 @@ mod tests {
             })
             .await
             .unwrap();
-        sqlx::query(
+        sqlx_apalis::query(
             "UPDATE Jobs SET status = 'Failed', attempts = max_attempts WHERE job_type = ?",
         )
         .bind(std::any::type_name::<TransferUsdcToHedging>())
@@ -10310,7 +10321,7 @@ mod tests {
             })
             .await
             .unwrap();
-        sqlx::query("UPDATE Jobs SET status = 'Failed' WHERE job_type = ?")
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Failed' WHERE job_type = ?")
             .bind(std::any::type_name::<TransferUsdcToHedging>())
             .execute(service.transfer_usdc_to_hedging_queue.pool())
             .await
@@ -10355,7 +10366,7 @@ mod tests {
             })
             .await
             .unwrap();
-        sqlx::query("UPDATE Jobs SET status = 'Done' WHERE job_type = ?")
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Done' WHERE job_type = ?")
             .bind(std::any::type_name::<TransferUsdcToHedging>())
             .execute(service.transfer_usdc_to_hedging_queue.pool())
             .await
@@ -10447,12 +10458,13 @@ mod tests {
             "an Alpaca->Base strand must not be routed to the hedging queue",
         );
 
-        let payload: Vec<u8> =
-            sqlx::query_scalar("SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?")
-                .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
-                .fetch_one(service.transfer_usdc_to_market_making_queue.pool())
-                .await
-                .unwrap();
+        let payload: Vec<u8> = sqlx_apalis::query_scalar(
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+        .fetch_one(service.transfer_usdc_to_market_making_queue.pool())
+        .await
+        .unwrap();
         let job: TransferUsdcToMarketMaking = serde_json::from_slice(&payload).unwrap();
         assert_eq!(
             job.id, id,
@@ -10941,10 +10953,10 @@ mod tests {
         // Regression: when usdc is None, startup must not require assets.cash.vault_id.
         // The trigger returns no USDC rebalancing params, so no USDC vault lookup occurs.
         let (sender, _receiver) = mpsc::channel(10);
-        let pool = crate::test_utils::setup_test_db().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let wrapper = Arc::new(MockWrapper::new());
 
-        let schedulers = RebalancingSchedulers::new(&pool);
+        let schedulers = RebalancingSchedulers::new(&apalis_pool);
         let trigger = RebalancingService::new(
             RebalancingServiceConfig {
                 equity: ImbalanceThreshold {
@@ -11333,7 +11345,7 @@ mod tests {
     #[tokio::test]
     async fn trigger_clears_in_progress_flag_when_terminal_event_received() {
         let (sender, _receiver) = mpsc::channel(10);
-        let pool = crate::test_utils::setup_test_db().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default().with_usdc(usdc(5000), usdc(5000)),
@@ -11342,13 +11354,13 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
             Address::ZERO,
             Address::ZERO,
             inventory,
             sender,
             Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         ));
 
         // Set in_progress flag
@@ -11555,20 +11567,20 @@ mod tests {
         ));
 
         let (sender, mut receiver) = mpsc::channel(10);
-        let pool = crate::test_utils::setup_test_db().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
         // Seed vault registry so token lookup succeeds
         seed_vault_registry(&pool, &symbol).await;
 
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             inventory.clone(),
             sender,
             Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         ));
         let reactor = trigger.clone();
 
@@ -11614,7 +11626,7 @@ mod tests {
     /// Complementary test: verify that trigger DOES fire once both venues have data.
     #[tokio::test]
     async fn trigger_fires_when_both_venues_have_data() {
-        let pool = crate::test_utils::setup_test_db().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let symbol = Symbol::new("RKLB").unwrap();
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
@@ -11627,13 +11639,13 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             inventory.clone(),
             sender,
             Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         ));
         let reactor = trigger.clone();
 
@@ -11696,7 +11708,7 @@ mod tests {
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn logs_show_partial_data_skips_imbalance_check() {
-        let pool = crate::test_utils::setup_test_db().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let symbol = Symbol::new("RKLB").unwrap();
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
@@ -11709,13 +11721,13 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             inventory.clone(),
             sender,
             Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         ));
         let reactor = trigger.clone();
 
@@ -11759,7 +11771,7 @@ mod tests {
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn logs_show_trigger_fires_with_complete_data() {
-        let pool = crate::test_utils::setup_test_db().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let symbol = Symbol::new("RKLB").unwrap();
         let (event_sender, _) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
@@ -11772,13 +11784,13 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             test_config(),
-            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
             TEST_ORDERBOOK,
             TEST_ORDER_OWNER,
             inventory.clone(),
             sender,
             Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         ));
         let reactor = trigger.clone();
 

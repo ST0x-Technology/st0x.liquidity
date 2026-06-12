@@ -1213,6 +1213,16 @@ impl CtxError {
     }
 }
 
+/// Normalizes database URLs so multiple connection pools (sqlx 0.9 for CQRS,
+/// apalis's sqlx 0.8 for workers) address the same in-memory database.
+pub fn effective_sqlite_url(database_url: &str) -> String {
+    if database_url == ":memory:" {
+        "file:st0x-hedge?mode=memory&cache=shared".to_owned()
+    } else {
+        database_url.to_owned()
+    }
+}
+
 pub async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
     // PRAGMAs are set via SqliteConnectOptions so they apply to every
     // connection the pool opens, not just the first one.
@@ -1225,7 +1235,7 @@ pub async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePool, sql
     // process, SQLite will wait up to 10 seconds before failing with
     // "database is locked". Reporter must keep transactions SHORT
     // (single INSERT per trade) to avoid blocking the main bot.
-    let options: SqliteConnectOptions = database_url
+    let options: SqliteConnectOptions = effective_sqlite_url(database_url)
         .parse::<SqliteConnectOptions>()?
         .create_if_missing(true)
         .auto_vacuum(SqliteAutoVacuum::Incremental)

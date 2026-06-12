@@ -143,7 +143,7 @@ mod tests {
         RebalancingSchedulers, RebalancingService, RebalancingServiceConfig, TriggeredOperation,
         drain_pending_jobs,
     };
-    use crate::test_utils::setup_test_db;
+    use crate::test_utils::setup_test_pools;
     use crate::tokenization::mock::MockTokenizer;
     use crate::vault_lookup::MockVaultLookup;
     use crate::vault_registry::{VaultRegistryCommand, VaultRegistryId};
@@ -171,7 +171,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_frameworks_produces_working_stores() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let (operation_sender, _operation_receiver) = mpsc::channel(10);
         let (event_sender, _event_receiver) = broadcast::channel(10);
 
@@ -190,7 +190,7 @@ mod tests {
             inventory.clone(),
             operation_sender,
             Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         ));
 
         let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
@@ -222,7 +222,7 @@ mod tests {
     /// does not `catch_up` reactor subscribers.
     #[tokio::test]
     async fn build_frameworks_dispatches_live_snapshot_events_to_view() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let (operation_sender, _operation_receiver) = mpsc::channel(10);
         let (event_sender, _event_receiver) = broadcast::channel(10);
 
@@ -241,7 +241,7 @@ mod tests {
             inventory.clone(),
             operation_sender,
             Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         ));
         let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
         let manifest = QueryManifest::new(rebalancing_service, broadcaster);
@@ -287,7 +287,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_frameworks_broadcasts_live_position_updates() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let (operation_sender, mut operation_receiver) = mpsc::channel(10);
         let (event_sender, mut event_receiver) = broadcast::channel(10);
 
@@ -350,7 +350,7 @@ mod tests {
             inventory,
             operation_sender,
             Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         ));
         let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
         let manifest = QueryManifest::new(rebalancing_service.clone(), broadcaster);

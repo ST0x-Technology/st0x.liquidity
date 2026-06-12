@@ -1,6 +1,7 @@
 //! Shared test fixtures: database setup, stub orders/logs,
 //! and builders for onchain trades and offchain executions.
 
+use alloy::hex;
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, B256, LogData, address, bytes, fixed_bytes};
 use alloy::providers::Provider;
@@ -9,6 +10,7 @@ use alloy::rpc::types::{Log, TransactionRequest};
 use chrono::Utc;
 use rain_math_float::Float;
 use sqlx::SqlitePool;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use st0x_execution::{Direction, FractionalShares, Positive};
 
@@ -35,9 +37,11 @@ const TOFU_DECIMALS_CREATION_CODE: &str = "0x6080604052348015600e575f80fd5b50610
 /// the codehash, so the runtime must come from executing the canonical creation
 /// code rather than from a recompiled artifact.
 pub(crate) async fn deploy_tofu_singleton<P: Provider>(provider: &P) {
-    let creation_code = alloy::hex::decode(TOFU_DECIMALS_CREATION_CODE).unwrap();
+    let creation_code = hex::decode(TOFU_DECIMALS_CREATION_CODE).unwrap();
+    let tx = TransactionRequest::default().with_deploy_code(creation_code);
+
     let deployed = provider
-        .send_transaction(TransactionRequest::default().with_deploy_code(creation_code))
+        .send_transaction(tx)
         .await
         .unwrap()
         .get_receipt()
@@ -45,6 +49,7 @@ pub(crate) async fn deploy_tofu_singleton<P: Provider>(provider: &P) {
         .unwrap()
         .contract_address
         .unwrap();
+
     let runtime = provider.get_code_at(deployed).await.unwrap();
     provider
         .anvil_set_code(TOFU_TOKEN_DECIMALS, runtime)
@@ -114,13 +119,45 @@ pub(crate) fn get_test_log() -> Log {
     create_log(293)
 }
 
+static TEST_DATABASE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn test_database_url() -> String {
+    let database_id = TEST_DATABASE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("file:st0x-hedge-test-{database_id}?mode=memory&cache=shared")
+}
+
+/// CQRS pool (sqlx 0.9) and apalis worker pool (sqlx 0.8) over the same DB.
+pub(crate) async fn setup_test_pools() -> (SqlitePool, apalis_sqlite::SqlitePool) {
+    let database_url = test_database_url();
+    let pool = st0x_config::configure_sqlite_pool(&database_url)
+        .await
+        .unwrap();
+
+    sqlx::migrate!()
+        .set_ignore_missing(true)
+        .run(&pool)
+        .await
+        .unwrap();
+    let apalis_pool = crate::conductor::connect_apalis_pool(&database_url)
+        .await
+        .unwrap();
+
+    crate::conductor::setup_apalis_tables(&apalis_pool)
+        .await
+        .unwrap();
+
+    (pool, apalis_pool)
+}
+
+/// apalis worker pool (sqlx 0.8) over the same in-memory DB as [`setup_test_db`].
+pub(crate) async fn setup_test_apalis_pool() -> apalis_sqlite::SqlitePool {
+    setup_test_pools().await.1
+}
+
 /// Centralized test database setup to eliminate duplication across test files.
 /// Creates an in-memory SQLite database with all migrations applied.
 pub(crate) async fn setup_test_db() -> SqlitePool {
-    let pool = SqlitePool::connect(":memory:").await.unwrap();
-    sqlx::migrate!().run(&pool).await.unwrap();
-    crate::conductor::setup_apalis_tables(&pool).await.unwrap();
-    pool
+    setup_test_pools().await.0
 }
 
 /// Shared constructor for positive share quantities in tests.

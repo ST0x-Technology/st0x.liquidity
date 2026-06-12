@@ -1659,7 +1659,7 @@ mod tests {
     /// MarketMaking available -- not stay stuck in-flight forever.
     #[tokio::test]
     async fn recover_mint_clears_hedging_inflight() {
-        let pool = crate::test_utils::setup_test_db().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let symbol = Symbol::new("AAPL").unwrap();
         let id = IssuerRequestId::new("mint-recover-inflight");
 
@@ -1722,7 +1722,7 @@ mod tests {
             inventory.clone(),
             operation_sender,
             Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         ));
 
         // Reactor-wired stores -- the production wiring that dispatches committed
@@ -1797,7 +1797,7 @@ mod tests {
     /// must reconcile it to zero idempotently.
     #[tokio::test]
     async fn recover_mint_does_not_double_count_existing_inflight() {
-        let pool = crate::test_utils::setup_test_db().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let symbol = Symbol::new("AAPL").unwrap();
         let id = IssuerRequestId::new("mint-double-count");
 
@@ -1866,7 +1866,7 @@ mod tests {
             inventory.clone(),
             operation_sender,
             Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         ));
 
         let mint_store = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())

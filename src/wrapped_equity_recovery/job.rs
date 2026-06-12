@@ -457,7 +457,6 @@ mod tests {
 
     use super::super::aggregate::WrappedEquityRecoveryServices;
     use super::*;
-    use crate::conductor::setup_apalis_tables;
     use crate::inventory::BroadcastingInventory;
     use crate::inventory::view::InventoryView;
     use crate::onchain::mock::MockRaindex;
@@ -470,9 +469,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let equity_in_progress = Arc::new(RwLock::new(HashSet::from([symbol.clone()])));
 
-        let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
-        setup_apalis_tables(&pool).await.unwrap();
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
         let vault_lookup: Arc<dyn VaultLookup> = Arc::new(MockVaultLookup::new());
@@ -512,7 +509,7 @@ mod tests {
             mint_store,
             redemption_store,
             equity_in_progress,
-            queue: WrappedEquityRecoveryJobQueue::new(&pool),
+            queue: WrappedEquityRecoveryJobQueue::new(&apalis_pool),
             reschedule_interval: Duration::from_secs(1),
         };
         let job = WrappedEquityRecoveryJob {
@@ -528,11 +525,12 @@ mod tests {
             "guard-held perform() must not start recovery; aggregate should be absent, got {state:?}",
         );
 
-        let (rescheduled,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
-            .bind(std::any::type_name::<WrappedEquityRecoveryJob>())
-            .fetch_one(ctx.queue.pool())
-            .await
-            .unwrap();
+        let (rescheduled,): (i64,) =
+            sqlx_apalis::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+                .bind(std::any::type_name::<WrappedEquityRecoveryJob>())
+                .fetch_one(ctx.queue.pool())
+                .await
+                .unwrap();
         assert_eq!(
             rescheduled, 1,
             "guard contention must reschedule the wrapped recovery job, not mark it done",
@@ -541,10 +539,9 @@ mod tests {
 
     #[tokio::test]
     async fn enqueue_dedup_matches_symbol_exactly_not_as_substring() {
-        let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
-        setup_apalis_tables(&pool).await.unwrap();
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
 
-        let mut queue = WrappedEquityRecoveryJobQueue::new(&pool);
+        let mut queue = WrappedEquityRecoveryJobQueue::new(&apalis_pool);
         queue
             .push(WrappedEquityRecoveryJob {
                 symbol: Symbol::new("GOOGL").unwrap(),
@@ -560,18 +557,18 @@ mod tests {
              AND json_extract(job, '$.symbol') = ?";
         let job_type = std::any::type_name::<WrappedEquityRecoveryJob>();
 
-        let (exact,): (i64,) = sqlx::query_as(DEDUP_QUERY)
+        let (exact,): (i64,) = sqlx_apalis::query_as(DEDUP_QUERY)
             .bind(job_type)
             .bind("GOOGL")
-            .fetch_one(&pool)
+            .fetch_one(&apalis_pool)
             .await
             .unwrap();
         assert_eq!(exact, 1, "exact symbol must match the queued GOOGL job");
 
-        let (substring,): (i64,) = sqlx::query_as(DEDUP_QUERY)
+        let (substring,): (i64,) = sqlx_apalis::query_as(DEDUP_QUERY)
             .bind(job_type)
             .bind("GOOG")
-            .fetch_one(&pool)
+            .fetch_one(&apalis_pool)
             .await
             .unwrap();
         assert_eq!(

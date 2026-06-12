@@ -349,7 +349,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use chrono::Utc;
-    use sqlx::SqlitePool;
 
     use st0x_config::ExecutionThreshold;
     use st0x_event_sorcery::StoreBuilder;
@@ -359,16 +358,15 @@ mod tests {
     use st0x_float_macro::float;
 
     use super::*;
-    use crate::conductor::setup_apalis_tables;
     use crate::offchain::order::{OffchainOrderCommand, noop_order_placer};
     use crate::position::{Position, PositionCommand, TradeId};
-    use crate::test_utils::{OnchainTradeBuilder, setup_test_db};
+    use crate::test_utils::{OnchainTradeBuilder, setup_test_pools};
 
     const TEST_POLL_INTERVAL: Duration = Duration::from_secs(15);
 
     struct TestInfra<E: Executor + Clone + Send + Sync + 'static> {
         ctx: PollOrderStatusCtx<E>,
-        pool: SqlitePool,
+        apalis_pool: apalis_sqlite::SqlitePool,
         offchain_order: Arc<st0x_event_sorcery::Store<OffchainOrder>>,
         position: Arc<st0x_event_sorcery::Store<Position>>,
     }
@@ -376,8 +374,7 @@ mod tests {
     async fn build_test_infra<E: Executor + Clone + Send + Sync + 'static>(
         executor: E,
     ) -> TestInfra<E> {
-        let pool = setup_test_db().await;
-        setup_apalis_tables(&pool).await.unwrap();
+        let (pool, apalis_pool) = setup_test_pools().await;
 
         let (offchain_order, offchain_order_projection) =
             StoreBuilder::<OffchainOrder>::new(pool.clone())
@@ -393,15 +390,15 @@ mod tests {
         let ctx = PollOrderStatusCtx {
             executor,
             offchain_order_projection,
-            poll_status_queue: PollOrderStatusJobQueue::new(&pool),
-            reconcile_queue: ReconcileOrderFillJobQueue::new(&pool),
-            rejection_queue: HandleOrderRejectionJobQueue::new(&pool),
+            poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
+            reconcile_queue: ReconcileOrderFillJobQueue::new(&apalis_pool),
+            rejection_queue: HandleOrderRejectionJobQueue::new(&apalis_pool),
             poll_interval: TEST_POLL_INTERVAL,
         };
 
         TestInfra {
             ctx,
-            pool,
+            apalis_pool,
             offchain_order,
             position,
         }
@@ -494,10 +491,10 @@ mod tests {
         offchain_order_id
     }
 
-    async fn count_jobs(pool: &SqlitePool, job_type: &str) -> i64 {
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+    async fn count_jobs(apalis_pool: &apalis_sqlite::SqlitePool, job_type: &str) -> i64 {
+        sqlx_apalis::query_scalar::<_, i64>("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
             .bind(job_type)
-            .fetch_one(pool)
+            .fetch_one(apalis_pool)
             .await
             .unwrap()
     }
@@ -514,12 +511,12 @@ mod tests {
         std::any::type_name::<HandleOrderRejection>()
     }
 
-    async fn min_run_at(pool: &SqlitePool, job_type: &str) -> i64 {
-        sqlx::query_scalar::<_, i64>(
+    async fn min_run_at(apalis_pool: &apalis_sqlite::SqlitePool, job_type: &str) -> i64 {
+        sqlx_apalis::query_scalar::<_, i64>(
             "SELECT MIN(run_at) FROM Jobs WHERE job_type = ? AND status = 'Pending'",
         )
         .bind(job_type)
-        .fetch_one(pool)
+        .fetch_one(apalis_pool)
         .await
         .unwrap()
     }
@@ -540,17 +537,17 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            count_jobs(&infra.pool, reconcile_order_fill_job_type()).await,
+            count_jobs(&infra.apalis_pool, reconcile_order_fill_job_type()).await,
             1,
             "PollOrderStatus must enqueue exactly one ReconcileOrderFill on Filled"
         );
         assert_eq!(
-            count_jobs(&infra.pool, handle_order_rejection_job_type()).await,
+            count_jobs(&infra.apalis_pool, handle_order_rejection_job_type()).await,
             0,
             "Filled state must not enqueue HandleOrderRejection"
         );
         assert_eq!(
-            count_jobs(&infra.pool, poll_order_status_job_type()).await,
+            count_jobs(&infra.apalis_pool, poll_order_status_job_type()).await,
             0,
             "Filled state must not re-enqueue PollOrderStatus"
         );
@@ -580,20 +577,20 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            count_jobs(&infra.pool, poll_order_status_job_type()).await,
+            count_jobs(&infra.apalis_pool, poll_order_status_job_type()).await,
             1,
             "Pending broker state must self-reschedule a PollOrderStatus job"
         );
         assert_eq!(
-            count_jobs(&infra.pool, reconcile_order_fill_job_type()).await,
+            count_jobs(&infra.apalis_pool, reconcile_order_fill_job_type()).await,
             0
         );
         assert_eq!(
-            count_jobs(&infra.pool, handle_order_rejection_job_type()).await,
+            count_jobs(&infra.apalis_pool, handle_order_rejection_job_type()).await,
             0
         );
 
-        let scheduled_at = min_run_at(&infra.pool, poll_order_status_job_type()).await;
+        let scheduled_at = min_run_at(&infra.apalis_pool, poll_order_status_job_type()).await;
         let poll_interval_secs: i64 = TEST_POLL_INTERVAL.as_secs().try_into().unwrap();
         let expected_min = before_now + poll_interval_secs;
         assert!(
@@ -622,17 +619,17 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            count_jobs(&infra.pool, handle_order_rejection_job_type()).await,
+            count_jobs(&infra.apalis_pool, handle_order_rejection_job_type()).await,
             1,
             "Failed broker state must enqueue exactly one HandleOrderRejection"
         );
         assert_eq!(
-            count_jobs(&infra.pool, reconcile_order_fill_job_type()).await,
+            count_jobs(&infra.apalis_pool, reconcile_order_fill_job_type()).await,
             0,
             "Failed state must not enqueue ReconcileOrderFill"
         );
         assert_eq!(
-            count_jobs(&infra.pool, poll_order_status_job_type()).await,
+            count_jobs(&infra.apalis_pool, poll_order_status_job_type()).await,
             0,
             "Terminal state must not re-enqueue PollOrderStatus"
         );
@@ -745,7 +742,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            count_jobs(&infra.pool, reconcile_order_fill_job_type()).await,
+            count_jobs(&infra.apalis_pool, reconcile_order_fill_job_type()).await,
             1,
             "Second order's poll must enqueue ReconcileOrderFill despite first order's failure"
         );
@@ -765,7 +762,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            count_jobs(&infra.pool, poll_order_status_job_type()).await,
+            count_jobs(&infra.apalis_pool, poll_order_status_job_type()).await,
             0,
             "Empty projection must not enqueue any poll jobs"
         );
@@ -788,7 +785,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            count_jobs(&infra.pool, poll_order_status_job_type()).await,
+            count_jobs(&infra.apalis_pool, poll_order_status_job_type()).await,
             1,
             "Submitted order must trigger exactly one PollOrderStatus on recovery"
         );
@@ -823,7 +820,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            count_jobs(&infra.pool, poll_order_status_job_type()).await,
+            count_jobs(&infra.apalis_pool, poll_order_status_job_type()).await,
             1,
             "PartiallyFilled order must trigger one PollOrderStatus on recovery"
         );
@@ -857,7 +854,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            count_jobs(&infra.pool, poll_order_status_job_type()).await,
+            count_jobs(&infra.apalis_pool, poll_order_status_job_type()).await,
             0,
             "Filled order must not be re-polled"
         );
@@ -891,7 +888,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            count_jobs(&infra.pool, poll_order_status_job_type()).await,
+            count_jobs(&infra.apalis_pool, poll_order_status_job_type()).await,
             0,
             "Failed order must not be re-polled"
         );
@@ -931,7 +928,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            count_jobs(&infra.pool, poll_order_status_job_type()).await,
+            count_jobs(&infra.apalis_pool, poll_order_status_job_type()).await,
             2,
             "Two Submitted orders + one Filled must enqueue exactly two polls"
         );
@@ -974,7 +971,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            count_jobs(&infra.pool, poll_order_status_job_type()).await,
+            count_jobs(&infra.apalis_pool, poll_order_status_job_type()).await,
             1,
             "Only the order placed by the currently-configured executor must be re-polled"
         );
@@ -1003,17 +1000,17 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            count_jobs(&infra.pool, poll_order_status_job_type()).await,
+            count_jobs(&infra.apalis_pool, poll_order_status_job_type()).await,
             0,
             "Executor mismatch must drop the job without rescheduling"
         );
         assert_eq!(
-            count_jobs(&infra.pool, reconcile_order_fill_job_type()).await,
+            count_jobs(&infra.apalis_pool, reconcile_order_fill_job_type()).await,
             0,
             "Executor mismatch must not enqueue ReconcileOrderFill"
         );
         assert_eq!(
-            count_jobs(&infra.pool, handle_order_rejection_job_type()).await,
+            count_jobs(&infra.apalis_pool, handle_order_rejection_job_type()).await,
             0,
             "Executor mismatch must not enqueue HandleOrderRejection"
         );
