@@ -9,6 +9,7 @@ pub(crate) mod monitor;
 
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder};
+use alloy::rpc::client::ClientBuilder;
 use anyhow::Context;
 use apalis::prelude::Status;
 use chrono::Utc;
@@ -68,6 +69,9 @@ use crate::rebalancing::{
     RebalancingServiceConfig, to_wrapped_equities,
 };
 use crate::symbol::cache::SymbolCache;
+use crate::telemetry::executor::InstrumentedExecutor;
+use crate::telemetry::rpc::RpcTelemetryLayer;
+use crate::telemetry::{TelemetrySender, spawn_dependency_call_writer};
 use crate::tokenization::Tokenizer;
 use crate::tokenization::alpaca::AlpacaTokenizationService;
 use crate::tokenized_equity_mint::{TokenizedEquityMint, interrupted_mint_ids};
@@ -135,6 +139,8 @@ pub(crate) struct Conductor {
     rebalancer_shutdown_token: CancellationToken,
     /// Periodically removes terminal rows from the persistent job queue.
     job_cleanup: JoinHandle<()>,
+    /// Drains dependency-call telemetry samples into SQLite in batches.
+    telemetry_writer: JoinHandle<()>,
     /// Cancelled by the outer shutdown handler to trigger graceful drain.
     shutdown_token: CancellationToken,
     /// Independent token for apalis — cancelled explicitly in Phase 2 after
@@ -233,12 +239,23 @@ impl Conductor {
         TradeAccountingError: From<E::Error>,
         crate::offchain::order::JobError: From<E::Error>,
     {
-        let executor = executor_ctx.try_into_executor().await?;
+        // Telemetry channel: the RPC layer and instrumented executor emit
+        // dependency-call samples through it; the writer task (spawned below
+        // once the pool's tables are known good) batches them into SQLite.
+        let (telemetry, telemetry_receiver) = TelemetrySender::channel();
+
+        let executor =
+            InstrumentedExecutor::new(executor_ctx.try_into_executor().await?, telemetry.clone());
 
         // Single HTTP transport: drives continuous eth_getLogs fill polling
         // (via the OrderFillMonitor + backfill worker) and all read-only
-        // contract calls. No WebSocket -- see `monitor::order_fills`.
-        let provider = ProviderBuilder::new().connect_http(ctx.evm.rpc_url.clone());
+        // contract calls. No WebSocket -- see `monitor::order_fills`. The
+        // telemetry layer wraps the transport itself, so every JSON-RPC call
+        // from any provider handle is timed.
+        let rpc_client = ClientBuilder::default()
+            .layer(RpcTelemetryLayer::new(telemetry.clone()))
+            .http(ctx.evm.rpc_url.clone());
+        let provider = ProviderBuilder::new().connect_client(rpc_client);
 
         // The HTTP transport connects lazily, so probe it once at startup to
         // fail fast on a misconfigured or unreachable RPC rather than only
@@ -426,6 +443,7 @@ impl Conductor {
             pool.clone(),
             Duration::from_secs(ctx.apalis_finished_job_cleanup_interval_secs),
         );
+        let telemetry_writer = spawn_dependency_call_writer(pool.clone(), telemetry_receiver);
 
         let conductor_ctx = builder::ConductorCtx {
             ctx: ctx.clone(),
@@ -471,6 +489,7 @@ impl Conductor {
             .maybe_rebalancer(rebalancer)
             .rebalancer_shutdown_token(rebalancer_shutdown_token)
             .job_cleanup(job_cleanup)
+            .telemetry_writer(telemetry_writer)
             .call();
 
         // Publish the recovery handle only after all startup work
@@ -577,6 +596,7 @@ impl Conductor {
             handle.abort();
         }
         self.job_cleanup.abort();
+        self.telemetry_writer.abort();
     }
 }
 
@@ -2330,6 +2350,7 @@ mod tests {
             rebalancer: None,
             rebalancer_shutdown_token: CancellationToken::new(),
             job_cleanup,
+            telemetry_writer: tokio::spawn(pending::<()>()),
             shutdown_token: CancellationToken::new(),
             apalis_shutdown_token: CancellationToken::new(),
         }
@@ -5398,6 +5419,7 @@ mod tests {
             rebalancer_shutdown_token: CancellationToken::new(),
 
             job_cleanup,
+            telemetry_writer: tokio::spawn(pending::<()>()),
             shutdown_token: shutdown_token.clone(),
             apalis_shutdown_token,
         };
@@ -5428,6 +5450,7 @@ mod tests {
             rebalancer_shutdown_token: CancellationToken::new(),
 
             job_cleanup,
+            telemetry_writer: tokio::spawn(pending::<()>()),
             shutdown_token: shutdown_token.clone(),
             apalis_shutdown_token,
         };

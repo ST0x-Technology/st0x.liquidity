@@ -118,6 +118,7 @@ pub(crate) fn spawn<Prov, Exec>(
     seed_vault_registry_queue: SeedVaultRegistryJobQueue,
     seed_vault_registry_ctx: Arc<SeedVaultRegistryCtx>,
     job_cleanup: JoinHandle<()>,
+    telemetry_writer: JoinHandle<()>,
     rebalancer: Option<JoinHandle<()>>,
     rebalancer_shutdown_token: CancellationToken,
 ) -> Conductor
@@ -341,6 +342,7 @@ where
         rebalancer,
         rebalancer_shutdown_token,
         job_cleanup,
+        telemetry_writer,
         shutdown_token: context.shutdown_token,
         apalis_shutdown_token: apalis_shutdown_token_for_struct,
     }
