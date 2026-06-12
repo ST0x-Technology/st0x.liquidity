@@ -315,7 +315,7 @@ impl AlpacaTokenizationMock {
 
         state.requests.push(MockTokenizationRequest {
             tokenization_request_id: Uuid::new_v4().to_string(),
-            issuer_request_id: String::new(),
+            issuer_request_id: Uuid::new_v4().to_string(),
             underlying_symbol: symbol.to_string(),
             quantity,
             wallet_address: wallet,
@@ -507,7 +507,7 @@ async fn scan_block_for_redemptions<P: Provider>(
 
             guard.requests.push(MockTokenizationRequest {
                 tokenization_request_id: Uuid::new_v4().to_string(),
-                issuer_request_id: String::new(),
+                issuer_request_id: Uuid::new_v4().to_string(),
                 underlying_symbol: symbol.clone(),
                 quantity,
                 // Use the bot's wallet (order_owner), matching real Alpaca
@@ -611,7 +611,7 @@ fn register_mint_endpoint(server: &MockServer, state: &Arc<Mutex<TokenizationSta
             };
             let issuer_request_id = body["issuer_request_id"]
                 .as_str()
-                .map_or_else(String::new, ToString::to_string);
+                .map_or_else(|| Uuid::new_v4().to_string(), ToString::to_string);
 
             let tokenization_request_id = Uuid::new_v4().to_string();
 

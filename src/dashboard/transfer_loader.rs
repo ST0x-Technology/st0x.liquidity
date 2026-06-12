@@ -357,7 +357,9 @@ mod tests {
 
     use super::*;
     use crate::equity_redemption::EquityRedemptionEvent;
-    use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
+    use crate::tokenized_equity_mint::{
+        IssuerRequestId, TokenizedEquityMintEvent, issuer_request_id,
+    };
     use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceEvent};
 
     fn mint_transfer(status: EquityMintStatus) -> TransferOperation {
@@ -451,19 +453,27 @@ mod tests {
         .unwrap();
     }
 
+    struct SeededTransferIds {
+        active_mint: IssuerRequestId,
+        failed_mint: IssuerRequestId,
+        usdc: Uuid,
+    }
+
     /// Seeds the database with transfer events spanning all three aggregate
     /// types and covering active, recent-terminal, and old-terminal cases.
-    /// Returns the UUID used for the USDC rebalance aggregate.
-    async fn seed_transfer_events(pool: &SqlitePool) -> Uuid {
+    async fn seed_transfer_events(pool: &SqlitePool) -> SeededTransferIds {
         let now = Utc::now();
         let one_hour_ago = now - Duration::hours(1);
         let two_days_ago = now - Duration::hours(48);
+
+        let active_mint_id = issuer_request_id("active-mint-1");
+        let failed_mint_id = issuer_request_id("failed-mint-1");
 
         // 1. Active mint (non-terminal: only MintRequested)
         insert_event(
             pool,
             "TokenizedEquityMint",
-            "active-mint-1",
+            &active_mint_id.to_string(),
             1,
             "TokenizedEquityMintEvent::MintRequested",
             serde_json::to_value(TokenizedEquityMintEvent::MintRequested {
@@ -480,7 +490,7 @@ mod tests {
         insert_event(
             pool,
             "TokenizedEquityMint",
-            "failed-mint-1",
+            &failed_mint_id.to_string(),
             1,
             "TokenizedEquityMintEvent::MintRequested",
             serde_json::to_value(TokenizedEquityMintEvent::MintRequested {
@@ -496,7 +506,7 @@ mod tests {
         insert_event(
             pool,
             "TokenizedEquityMint",
-            "failed-mint-1",
+            &failed_mint_id.to_string(),
             2,
             "TokenizedEquityMintEvent::MintRejected",
             serde_json::to_value(TokenizedEquityMintEvent::MintRejected {
@@ -595,7 +605,11 @@ mod tests {
         )
         .await;
 
-        usdc_id
+        SeededTransferIds {
+            active_mint: active_mint_id,
+            failed_mint: failed_mint_id,
+            usdc: usdc_id,
+        }
     }
 
     #[tokio::test]
@@ -603,7 +617,7 @@ mod tests {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
 
-        let usdc_id = seed_transfer_events(&pool).await;
+        let seeded = seed_transfer_events(&pool).await;
         let loaded = load_transfers(&pool).await;
 
         // Active should contain the in-progress mint and in-progress redemption
@@ -631,7 +645,10 @@ mod tests {
             .find(|transfer| matches!(transfer, TransferOperation::EquityMint(_)))
             .unwrap();
         if let TransferOperation::EquityMint(op) = active_mint {
-            assert_eq!(op.id, Id::<EquityMintTag>::new("active-mint-1".to_string()));
+            assert_eq!(
+                op.id,
+                Id::<EquityMintTag>::new(seeded.active_mint.to_string())
+            );
         }
 
         let has_active_redemption = loaded.active.iter().any(|transfer| {
@@ -722,7 +739,7 @@ mod tests {
         {
             assert_eq!(
                 usdc_op.id,
-                Id::<UsdcBridgeTag>::new(usdc_id.to_string()),
+                Id::<UsdcBridgeTag>::new(seeded.usdc.to_string()),
                 "USDC bridge ID should match the aggregate_id"
             );
         }
@@ -735,7 +752,7 @@ mod tests {
         {
             assert_eq!(
                 mint_op.id,
-                Id::<EquityMintTag>::new("failed-mint-1".to_string()),
+                Id::<EquityMintTag>::new(seeded.failed_mint.to_string()),
                 "failed mint ID should match the aggregate_id"
             );
         }
@@ -784,10 +801,12 @@ mod tests {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
 
+        let bad_mint_id = issuer_request_id("bad-mint-1");
+
         insert_event(
             &pool,
             "TokenizedEquityMint",
-            "bad-mint-1",
+            &bad_mint_id.to_string(),
             1,
             "TokenizedEquityMintEvent::MintRequested",
             serde_json::json!({"malformed": true}),
@@ -800,7 +819,7 @@ mod tests {
         assert_eq!(result.warnings.len(), 1, "expected one warning");
         match result.warnings.as_slice() {
             [TransferWarning::MintReplayFailed { id }] => {
-                assert_eq!(id, &Id::<EquityMintTag>::new("bad-mint-1".to_string()));
+                assert_eq!(id, &Id::<EquityMintTag>::new(bad_mint_id.to_string()));
             }
             other => panic!("expected MintReplayFailed, got: {other:?}"),
         }
@@ -835,12 +854,14 @@ mod tests {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
 
+        let bad_mint_id = issuer_request_id("bad-mint-1");
+
         // Insert an event with a payload that can't be deserialized as a
         // TokenizedEquityMintEvent — this triggers a MintReplayFailed warning.
         insert_event(
             &pool,
             "TokenizedEquityMint",
-            "bad-mint-1",
+            &bad_mint_id.to_string(),
             1,
             "TokenizedEquityMintEvent::MintRequested",
             serde_json::json!({"malformed": true}),
@@ -854,7 +875,7 @@ mod tests {
         assert_eq!(loaded.warnings.len(), 1, "expected one replay warning");
         match loaded.warnings.as_slice() {
             [TransferWarning::MintReplayFailed { id }] => {
-                assert_eq!(id, &Id::<EquityMintTag>::new("bad-mint-1".to_string()));
+                assert_eq!(id, &Id::<EquityMintTag>::new(bad_mint_id.to_string()));
             }
             other => panic!("expected MintReplayFailed, got: {other:?}"),
         }

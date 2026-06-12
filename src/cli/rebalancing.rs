@@ -130,6 +130,7 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
     direction: TransferDirection,
     symbol: &Symbol,
     quantity: FractionalShares,
+    issuer_request_id: Option<Uuid>,
     redemption_wallet_flag: Option<Address>,
     ctx: &Ctx,
     pool: &SqlitePool,
@@ -151,14 +152,25 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
             writeln!(stdout, "   Creating mint request...")?;
             writeln!(stdout, "   Receiving Wallet: {}", cli_services.wallet)?;
 
-            CrossVenueTransfer::<HedgingVenue, MarketMakingVenue>::transfer(
-                &equity_transfer,
-                Equity {
-                    symbol: symbol.clone(),
-                    quantity,
-                },
-            )
-            .await?;
+            let (issuer_request_id, fresh_mint) = issuer_request_id.map_or_else(
+                || (IssuerRequestId::generate(), true),
+                |uuid| (IssuerRequestId(uuid), false),
+            );
+
+            if fresh_mint {
+                writeln!(stdout, "Equity mint issuer_request_id: {issuer_request_id}")?;
+                writeln!(
+                    stdout,
+                    "   If this is interrupted, resume with:\n   \
+                     transfer-equity --direction to-raindex --symbol {symbol} \
+                     --quantity {quantity} --issuer-request-id {issuer_request_id}"
+                )?;
+                stdout.flush()?;
+            }
+
+            equity_transfer
+                .resume_equity_to_market_making(&issuer_request_id, symbol, quantity)
+                .await?;
 
             writeln!(stdout, "✅ Mint completed successfully")?;
         }
@@ -588,7 +600,7 @@ pub(super) async fn alpaca_tokenize_command<Writer: Write, Prov: Provider + Clon
 
     writeln!(stdout, "   Sending mint request to Alpaca...")?;
 
-    let issuer_request_id = IssuerRequestId::new(Uuid::new_v4().to_string());
+    let issuer_request_id = IssuerRequestId::generate();
     let request = tokenization_service
         .request_mint(
             symbol.clone(),
@@ -830,7 +842,9 @@ pub(crate) async fn fail_transfer_command<W: Write>(
 
     match transfer_type {
         TransferType::Mint => {
-            let mint_id = IssuerRequestId::new(id);
+            let mint_id: IssuerRequestId = id
+                .parse()
+                .map_err(|error| anyhow::anyhow!("Invalid mint id {id:?}: {error}"))?;
 
             let entity = st0x_event_sorcery::load_entity::<TokenizedEquityMint>(pool, &mint_id)
                 .await?
@@ -1169,6 +1183,7 @@ mod tests {
             &symbol,
             quantity,
             None,
+            None,
             &ctx,
             &pool,
         )
@@ -1194,6 +1209,7 @@ mod tests {
             TransferDirection::ToRaindex,
             &symbol,
             quantity,
+            None,
             None,
             &ctx,
             &pool,

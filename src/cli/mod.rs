@@ -235,6 +235,9 @@ pub enum Commands {
         /// Number of shares to transfer (supports fractional shares)
         #[arg(short = 'q', long = "quantity")]
         quantity: FractionalShares,
+        /// Issuer request id for mint resume (printed by a fresh to-raindex run)
+        #[arg(long = "issuer-request-id")]
+        issuer_request_id: Option<Uuid>,
         /// Alpaca redemption wallet (overrides [tokenization] config)
         #[arg(long = "redemption-wallet")]
         redemption_wallet: Option<Address>,
@@ -696,6 +699,7 @@ enum SimpleCommand {
         direction: TransferDirection,
         symbol: Symbol,
         quantity: FractionalShares,
+        issuer_request_id: Option<Uuid>,
         redemption_wallet: Option<Address>,
     },
     WrapEquity {
@@ -826,7 +830,7 @@ pub async fn seed_mint_at_tokens_wrapped_for_test(
     };
 
     let symbol = Symbol::new(symbol_str.to_string())?;
-    let mint_id = IssuerRequestId::new(mint_id_str);
+    let mint_id: IssuerRequestId = mint_id_str.parse()?;
     let now = Utc::now();
 
     let events = [
@@ -869,7 +873,7 @@ pub async fn seed_mint_at_tokens_wrapped_for_test(
              (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
              VALUES ('TokenizedEquityMint', ?, ?, ?, ?, ?, '{}')",
         )
-        .bind(raw_id)
+        .bind(raw_id.to_string())
         .bind(sequence)
         .bind(event.event_type())
         .bind(event.event_version())
@@ -972,11 +976,13 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             direction,
             symbol,
             quantity,
+            issuer_request_id,
             redemption_wallet,
         } => Ok(SimpleCommand::TransferEquity {
             direction,
             symbol,
             quantity,
+            issuer_request_id,
             redemption_wallet,
         }),
         Commands::WrapEquity { symbol, quantity } => {
@@ -1151,6 +1157,7 @@ async fn run_simple_command<W: Write>(
             direction,
             symbol,
             quantity,
+            issuer_request_id,
             redemption_wallet,
         } => {
             rebalancing::transfer_equity_command(
@@ -1158,6 +1165,7 @@ async fn run_simple_command<W: Write>(
                 direction,
                 &symbol,
                 quantity,
+                issuer_request_id,
                 redemption_wallet,
                 ctx,
                 pool,

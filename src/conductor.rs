@@ -62,7 +62,9 @@ use crate::onchain::trade::{RaindexTradeEvent, extract_owned_vaults, extract_vau
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::position_check::{CheckPositionsJobQueue, bootstrap_check_positions};
-use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
+use crate::rebalancing::equity::{
+    CrossVenueEquityTransfer, EquityTransferServices, TransferEquityToMarketMakingCtx,
+};
 use crate::rebalancing::usdc::{TransferUsdcToHedgingCtx, TransferUsdcToMarketMakingCtx};
 use crate::rebalancing::{
     RebalancerServices, RebalancingCqrsFrameworks, RebalancingSchedulers, RebalancingService,
@@ -176,6 +178,58 @@ pub(crate) struct Conductor {
 /// in-flight, so a wedged row would silently suppress every future transfer in
 /// that direction. Fails fast on a reset error -- the bot must not come up
 /// looking healthy with crash-safe recovery disabled.
+///
+/// A previous process may have died mid-transfer, leaving an apalis `Running`
+/// row that no live worker owns. Resets orphaned rows for every transfer
+/// queue whose worker is wired (its ctx is present, i.e. rebalancing is
+/// enabled) before the monitor spawns, so any `Running` row is orphaned by
+/// definition. The USDC queues are wedge-prone symmetrically: Base->Alpaca
+/// via the enqueue dedup, Alpaca->Base because `rearm_stranded_transfers`
+/// treats a `Running` row as in-flight and skips it. The equity mint queue
+/// is wedge-prone via its per-symbol enqueue dedup.
+async fn requeue_wired_transfer_orphans(
+    schedulers: &RebalancingSchedulers,
+    usdc_to_hedging_ctx: Option<&Arc<TransferUsdcToHedgingCtx>>,
+    usdc_to_market_making_ctx: Option<&Arc<TransferUsdcToMarketMakingCtx>>,
+    equity_to_market_making_ctx: Option<&Arc<TransferEquityToMarketMakingCtx>>,
+) -> anyhow::Result<()> {
+    if usdc_to_hedging_ctx.is_some() {
+        requeue_transfer_orphans(&schedulers.transfer_usdc_to_hedging, "Base->Alpaca").await?;
+    }
+
+    if usdc_to_market_making_ctx.is_some() {
+        requeue_transfer_orphans(&schedulers.transfer_usdc_to_market_making, "Alpaca->Base")
+            .await?;
+    }
+
+    if equity_to_market_making_ctx.is_some() {
+        requeue_transfer_orphans(
+            &schedulers.transfer_equity_to_market_making,
+            "equity hedging->market-making",
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn requeue_startup_orphans(
+    schedulers: &RebalancingSchedulers,
+    backfill_queue: &BackfillJobQueue,
+    usdc_to_hedging_ctx: Option<&Arc<TransferUsdcToHedgingCtx>>,
+    usdc_to_market_making_ctx: Option<&Arc<TransferUsdcToMarketMakingCtx>>,
+    equity_to_market_making_ctx: Option<&Arc<TransferEquityToMarketMakingCtx>>,
+) -> anyhow::Result<()> {
+    requeue_wired_transfer_orphans(
+        schedulers,
+        usdc_to_hedging_ctx,
+        usdc_to_market_making_ctx,
+        equity_to_market_making_ctx,
+    )
+    .await?;
+    requeue_backfill_orphans(backfill_queue).await
+}
+
 async fn requeue_transfer_orphans<Task>(
     queue: &job::JobQueue<Task>,
     direction_label: &str,
@@ -239,6 +293,21 @@ async fn requeue_backfill_orphans(backfill_queue: &BackfillJobQueue) -> anyhow::
         );
     }
 
+    Ok(())
+}
+
+async fn requeue_equity_recovery_orphans(
+    wrapped_ctx: Option<&Arc<WrappedEquityRecoveryCtx>>,
+    unwrapped_ctx: Option<&Arc<UnwrappedEquityRecoveryCtx>>,
+    wrapped_queue: &WrappedEquityRecoveryJobQueue,
+    unwrapped_queue: &UnwrappedEquityRecoveryJobQueue,
+) -> anyhow::Result<()> {
+    if wrapped_ctx.is_some() {
+        requeue_recovery_orphans(wrapped_queue, "wrapped equity").await?;
+    }
+    if unwrapped_ctx.is_some() {
+        requeue_recovery_orphans(unwrapped_queue, "unwrapped equity").await?;
+    }
     Ok(())
 }
 
@@ -336,6 +405,7 @@ impl Conductor {
             redemption_store,
             transfer_usdc_to_hedging_ctx,
             transfer_usdc_to_market_making_ctx,
+            transfer_equity_to_market_making_ctx,
         } = PositionAndRebalancing::setup(
             rebalancing,
             &ctx,
@@ -348,23 +418,14 @@ impl Conductor {
         )
         .await?;
 
-        // A previous process may have died mid-transfer, leaving an apalis
-        // `Running` row that no live worker owns. Reset orphaned rows for both
-        // transfer directions before the monitor spawns (so any `Running` row is
-        // orphaned by definition). The two queues are wedge-prone symmetrically:
-        // Base->Alpaca via the enqueue dedup, Alpaca->Base because
-        // `rearm_stranded_transfers` treats a `Running` row as in-flight and
-        // skips it. Only meaningful when the transfer worker is wired, i.e.
-        // rebalancing is enabled (both ctxs are set together).
-        if transfer_usdc_to_hedging_ctx.is_some() {
-            requeue_transfer_orphans(&schedulers.transfer_usdc_to_hedging, "Base->Alpaca").await?;
-        }
-        if transfer_usdc_to_market_making_ctx.is_some() {
-            requeue_transfer_orphans(&schedulers.transfer_usdc_to_market_making, "Alpaca->Base")
-                .await?;
-        }
-
-        requeue_backfill_orphans(&backfill_queue).await?;
+        requeue_startup_orphans(
+            &schedulers,
+            &backfill_queue,
+            transfer_usdc_to_hedging_ctx.as_ref(),
+            transfer_usdc_to_market_making_ctx.as_ref(),
+            transfer_equity_to_market_making_ctx.as_ref(),
+        )
+        .await?;
 
         // Hydrate the in-memory InventoryView from persisted snapshot
         // state so the runtime projection has the same data as the
@@ -404,25 +465,15 @@ impl Conductor {
         let wrapped_equity_recovery_queue = WrappedEquityRecoveryJobQueue::new(&apalis_pool);
         let unwrapped_equity_recovery_queue = UnwrappedEquityRecoveryJobQueue::new(&apalis_pool);
 
-        let wrapped_equity_recovery_ctx = match (
+        let wrapped_equity_recovery_ctx = build_wrapped_equity_recovery_ctx(
             wrapped_equity_recovery_store,
             rebalancing_service.clone(),
             mint_store.clone(),
             redemption_store.clone(),
-        ) {
-            (Some(store), Some(service), Some(mint_store), Some(redemption_store)) => {
-                Some(Arc::new(WrappedEquityRecoveryCtx {
-                    inventory: inventory.clone(),
-                    store,
-                    mint_store,
-                    redemption_store,
-                    equity_in_progress: service.equity_in_progress.clone(),
-                    queue: wrapped_equity_recovery_queue.clone(),
-                    reschedule_interval: Duration::from_secs(ctx.inventory_poll_interval),
-                }))
-            }
-            _ => None,
-        };
+            inventory.clone(),
+            wrapped_equity_recovery_queue.clone(),
+            Duration::from_secs(ctx.inventory_poll_interval),
+        );
 
         let unwrapped_equity_recovery_ctx = build_unwrapped_equity_recovery_ctx(
             unwrapped_equity_recovery_store,
@@ -434,12 +485,13 @@ impl Conductor {
             Duration::from_secs(ctx.inventory_poll_interval),
         );
 
-        if wrapped_equity_recovery_ctx.is_some() {
-            requeue_recovery_orphans(&wrapped_equity_recovery_queue, "wrapped equity").await?;
-        }
-        if unwrapped_equity_recovery_ctx.is_some() {
-            requeue_recovery_orphans(&unwrapped_equity_recovery_queue, "unwrapped equity").await?;
-        }
+        requeue_equity_recovery_orphans(
+            wrapped_equity_recovery_ctx.as_ref(),
+            unwrapped_equity_recovery_ctx.as_ref(),
+            &wrapped_equity_recovery_queue,
+            &unwrapped_equity_recovery_queue,
+        )
+        .await?;
 
         let check_positions_queue = CheckPositionsJobQueue::new(&apalis_pool);
 
@@ -496,6 +548,8 @@ impl Conductor {
             .maybe_transfer_usdc_to_hedging_ctx(transfer_usdc_to_hedging_ctx)
             .transfer_usdc_to_market_making_queue(schedulers.transfer_usdc_to_market_making)
             .maybe_transfer_usdc_to_market_making_ctx(transfer_usdc_to_market_making_ctx)
+            .transfer_equity_to_market_making_queue(schedulers.transfer_equity_to_market_making)
+            .maybe_transfer_equity_to_market_making_ctx(transfer_equity_to_market_making_ctx)
             .maybe_rebalancing_service(rebalancing_service)
             .seed_vault_registry_queue(seed_vault_registry_queue)
             .seed_vault_registry_ctx(seed_vault_registry_ctx)
@@ -609,6 +663,34 @@ impl Conductor {
         }
         self.job_cleanup.abort();
     }
+}
+
+/// Builds the [`WrappedEquityRecoveryCtx`] when every dependency the recovery
+/// job needs is present; returns `None` (recovery wiring absent) if any is not.
+fn build_wrapped_equity_recovery_ctx(
+    store: Option<Arc<Store<WrappedEquityRecovery>>>,
+    service: Option<Arc<RebalancingService>>,
+    mint_store: Option<Arc<Store<TokenizedEquityMint>>>,
+    redemption_store: Option<Arc<Store<EquityRedemption>>>,
+    inventory: Arc<BroadcastingInventory>,
+    queue: WrappedEquityRecoveryJobQueue,
+    reschedule_interval: Duration,
+) -> Option<Arc<WrappedEquityRecoveryCtx>> {
+    let (Some(store), Some(service), Some(mint_store), Some(redemption_store)) =
+        (store, service, mint_store, redemption_store)
+    else {
+        return None;
+    };
+
+    Some(Arc::new(WrappedEquityRecoveryCtx {
+        inventory,
+        store,
+        mint_store,
+        redemption_store,
+        equity_in_progress: service.equity_in_progress.clone(),
+        queue,
+        reschedule_interval,
+    }))
 }
 
 /// Builds the [`UnwrappedEquityRecoveryCtx`] when every dependency the recovery
@@ -854,6 +936,7 @@ struct RebalancingInfrastructure {
     redemption_store: Arc<Store<EquityRedemption>>,
     transfer_usdc_to_hedging_ctx: Arc<TransferUsdcToHedgingCtx>,
     transfer_usdc_to_market_making_ctx: Arc<TransferUsdcToMarketMakingCtx>,
+    transfer_equity_to_market_making_ctx: Arc<TransferEquityToMarketMakingCtx>,
 }
 
 /// Shared infrastructure dependencies needed to spawn rebalancing.
@@ -888,6 +971,7 @@ struct PositionAndRebalancing {
     redemption_store: Option<Arc<Store<EquityRedemption>>>,
     transfer_usdc_to_hedging_ctx: Option<Arc<TransferUsdcToHedgingCtx>>,
     transfer_usdc_to_market_making_ctx: Option<Arc<TransferUsdcToMarketMakingCtx>>,
+    transfer_equity_to_market_making_ctx: Option<Arc<TransferEquityToMarketMakingCtx>>,
 }
 
 impl PositionAndRebalancing {
@@ -946,6 +1030,9 @@ impl PositionAndRebalancing {
                 redemption_store: Some(infra.redemption_store),
                 transfer_usdc_to_hedging_ctx: Some(infra.transfer_usdc_to_hedging_ctx),
                 transfer_usdc_to_market_making_ctx: Some(infra.transfer_usdc_to_market_making_ctx),
+                transfer_equity_to_market_making_ctx: Some(
+                    infra.transfer_equity_to_market_making_ctx,
+                ),
             })
         } else {
             let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
@@ -975,6 +1062,7 @@ impl PositionAndRebalancing {
                 redemption_store: None,
                 transfer_usdc_to_hedging_ctx: None,
                 transfer_usdc_to_market_making_ctx: None,
+                transfer_equity_to_market_making_ctx: None,
             })
         }
     }
@@ -1188,6 +1276,10 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             job_queue: transfer_usdc_to_market_making_queue,
         });
 
+        let transfer_equity_to_market_making_ctx = Arc::new(TransferEquityToMarketMakingCtx {
+            transfer: recovery_transfer.clone(),
+        });
+
         Ok(RebalancingInfrastructure {
             position: built.position,
             position_projection: built.position_projection,
@@ -1203,6 +1295,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             redemption_store,
             transfer_usdc_to_hedging_ctx,
             transfer_usdc_to_market_making_ctx,
+            transfer_equity_to_market_making_ctx,
         })
     })
 }
@@ -2330,6 +2423,7 @@ mod tests {
     use crate::inventory::{ImbalanceThreshold, Inventory, InventoryView, Venue};
     use crate::offchain::order::OrderPlacementResult;
     use crate::onchain::trade::OnchainTrade;
+    use crate::rebalancing::equity::TransferEquityToMarketMaking;
     use crate::rebalancing::{RebalancingSchedulers, RebalancingService, TriggeredOperation};
     use crate::test_utils::{
         OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db, setup_test_pools,
@@ -3797,7 +3891,11 @@ mod tests {
         );
     }
 
-    /// Builds an `InventoryView` with an equity imbalance: 20% onchain, 80% offchain.
+    /// Builds an `InventoryView` one onchain share below the 20/80 imbalance used
+    /// in mint assertions: the position fill in
+    /// `position_events_reach_rebalancing_service` adds one onchain share before
+    /// the trigger enqueues the mint job.
+    ///
     /// With a 50% target +/- 20% deviation, 20% < 30% lower bound -> TooMuchOffchain.
     fn imbalanced_inventory(symbol: &Symbol) -> InventoryView {
         InventoryView::default()
@@ -3812,7 +3910,7 @@ mod tests {
                 Inventory::available(
                     Venue::MarketMaking,
                     Operator::Add,
-                    FractionalShares::new(float!(20)),
+                    FractionalShares::new(float!(19)),
                 ),
                 chrono::Utc::now(),
             )
@@ -3922,10 +4020,34 @@ mod tests {
             .await
             .unwrap();
 
-        let triggered = operation_receiver.try_recv();
+        let job_payload: Vec<u8> = sqlx::query_scalar(
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ? LIMIT 1",
+        )
+        .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+        .fetch_one(&pool)
+        .await
+        .expect("Expected a TransferEquityToMarketMaking job enqueued by the trigger");
+
+        let job: TransferEquityToMarketMaking =
+            serde_json::from_slice(&job_payload).expect("deserialize enqueued mint job");
+
+        assert_eq!(job.symbol, symbol);
+        assert_eq!(
+            job.quantity,
+            FractionalShares::new(float!(30)),
+            "20 onchain / 80 offchain imbalance should mint 30 shares to reach target"
+        );
         assert!(
-            matches!(triggered, Ok(TriggeredOperation::Mint { .. })),
-            "Expected Mint operation from trigger on position event, got {triggered:?}"
+            !job.issuer_request_id.0.is_nil(),
+            "enqueue must assign a fresh issuer_request_id"
+        );
+
+        assert!(
+            matches!(
+                operation_receiver.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "Mints must not be dispatched over the mpsc channel"
         );
     }
 

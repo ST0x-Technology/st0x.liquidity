@@ -15,7 +15,6 @@ aes-gcm.workspace = true
 alloy.workspace = true
 alloy-primitives.workspace = true
 anyhow = { workspace = true, optional = true }
-apca.workspace = true
 async-trait.workspace = true
 backon.workspace = true
 base64.workspace = true
@@ -33,16 +32,17 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
-st0x-dto = { version = "0.1.0", path = "../dto" }
-st0x-finance.workspace = true
-st0x-float-macro.workspace = true
-st0x-float-serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
 urlencoding.workspace = true
 uuid.workspace = true
+
+st0x-dto = { version = "0.1.0", path = "../dto" }
+st0x-finance.workspace = true
+st0x-float-macro.workspace = true
+st0x-float-serde.workspace = true
 
 [dev-dependencies]
 httpmock.workspace = true

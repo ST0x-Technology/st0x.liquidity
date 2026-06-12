@@ -979,6 +979,7 @@ mod tests {
     use super::*;
     use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::test_utils::setup_test_db;
+    use crate::tokenized_equity_mint::issuer_request_id;
     use crate::vault_registry::{VaultRegistry, VaultRegistryCommand};
 
     #[derive(Clone, Default)]
@@ -1001,7 +1002,7 @@ mod tests {
             PendingRequestOwnershipSnapshot {
                 mint_issuers: mint_issuer_request_ids
                     .into_iter()
-                    .map(IssuerRequestId::new)
+                    .map(issuer_request_id)
                     .collect(),
                 mint_tokenizations: mint_tokenization_request_ids
                     .into_iter()
@@ -3406,11 +3407,11 @@ mod tests {
         request_type: crate::tokenization::TokenizationRequestType,
         symbol: &str,
         quantity: i64,
-        issuer_request_id: &str,
+        issuer_id_label: &str,
         wallet: Option<Address>,
     ) -> crate::tokenization::TokenizationRequest {
         crate::tokenization::TokenizationRequest {
-            issuer_request_id: Some(IssuerRequestId::new(issuer_request_id)),
+            issuer_request_id: Some(issuer_request_id(issuer_id_label)),
             ..mock_pending_request_with_wallet(request_type, symbol, quantity, wallet)
         }
     }
