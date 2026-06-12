@@ -54,6 +54,22 @@ pub enum WrapperError {
     MissingDepositEvent,
     #[error("Missing Withdraw event in transaction receipt")]
     MissingWithdrawEvent,
+    /// Preflight rejected an unwrap because the requested shares exceed the vault's
+    /// `maxRedeem(owner)`. This signals inventory/balance drift: the bot believes it
+    /// holds more wrapped shares than the wallet actually owns. We fail fast here
+    /// rather than clamp the amount (clamping would silently mask the drift and
+    /// violate the financial-integrity rule that range violations must error, not
+    /// cap). Reconciling the underlying inventory drift — and any non-1:1
+    /// wrapped-ratio handling — is out of scope and tracked separately.
+    #[error(
+        "Redeem of {requested} wrapped shares exceeds vault {wrapped_token} \
+         maxRedeem of {max_redeem} for owner"
+    )]
+    RedeemExceedsMax {
+        wrapped_token: Address,
+        requested: U256,
+        max_redeem: U256,
+    },
     #[error("Contract call error: {0}")]
     Evm(#[from] EvmError),
     #[error("Contract view error: {0}")]
@@ -125,7 +141,15 @@ pub trait Wrapper: Send + Sync {
 
     /// Submit an ERC-4626 redeem without waiting for confirmation.
     ///
-    /// Returns the tx hash immediately. Use
+    /// Preflights the vault's `maxRedeem(owner)` before submitting any
+    /// transaction: if `wrapped_amount` exceeds `maxRedeem`, returns
+    /// [`WrapperError::RedeemExceedsMax`] without sending a tx (no on-chain
+    /// revert, no wasted gas). Exceeding `maxRedeem` signals inventory/balance
+    /// drift — the bot believes it holds more wrapped shares than the wallet
+    /// actually owns — so we fail fast here rather than clamp the amount, per
+    /// the financial-integrity rule that range violations must error, not cap.
+    ///
+    /// On success, returns the tx hash immediately. Use
     /// [`confirm_unwrap`](Wrapper::confirm_unwrap) to wait for
     /// confirmation and extract the actual underlying amount received.
     async fn submit_unwrap(
