@@ -112,9 +112,11 @@ decision.
 
 ## Index
 
-| #                                                       | Title                                                                            | Status   |
-| ------------------------------------------------------- | -------------------------------------------------------------------------------- | -------- |
-| [0001](0001-cash-bp-for-equity-hedges.md)               | Use Alpaca `cash` (not `non_marginable_buying_power`) for equity hedge preflight | Accepted |
-| [0002](0002-axum-and-tower.md)                          | Adopt Axum and lean on Tower for both transport and business logic               | Accepted |
-| [0003](0003-durable-usdc-rebalance-guard-on-restart.md) | Reconstruct the USDC rebalancing guard from persisted state on startup           | Accepted |
-| [0004](0004-typed-identifiers.md)                       | Model identifiers by what determines them; derive the string form                | Accepted |
+| #                                                           | Title                                                                            | Status   |
+| ----------------------------------------------------------- | -------------------------------------------------------------------------------- | -------- |
+| [0001](0001-cash-bp-for-equity-hedges.md)                   | Use Alpaca `cash` (not `non_marginable_buying_power`) for equity hedge preflight | Accepted |
+| [0002](0002-axum-and-tower.md)                              | Adopt Axum and lean on Tower for both transport and business logic               | Accepted |
+| [0003](0003-durable-usdc-rebalance-guard-on-restart.md)     | Reconstruct the USDC rebalancing guard from persisted state on startup           | Accepted |
+| [0004](0004-typed-identifiers.md)                           | Model identifiers by what determines them; derive the string form                | Accepted |
+| [0005](0005-max-token-approvals-on-startup.md)              | Grant one-time MAX token approvals to trusted spenders on startup                | Accepted |
+| [0006](0006-base-to-alpaca-explicit-alpaca-deposit-send.md) | BaseToAlpaca deposit sends USDC to Alpaca explicitly, idempotently               | Accepted |

@@ -2081,9 +2081,12 @@ Base to Alpaca:
 6. Poll Circle attestation service for signature using CCTP nonce (~8 seconds
    for fast transfer)
 7. Submit receiveMessage() tx on Ethereum MessageTransmitter with attestation
+   (mints USDC to the bot's own Ethereum wallet)
 8. Wait for mint tx confirmation (~20 seconds on Ethereum)
-9. Initiate USDC deposit to Alpaca (get transfer_id)
-10. Poll Alpaca API until deposit status is COMPLETE
+9. Send the minted USDC from the bot wallet to Alpaca's deposit address (see
+   "BaseToAlpaca deposit send"; fresh sends directly, resume adopts an existing
+   send)
+10. Poll Alpaca API by the send tx until deposit status is COMPLETE
 11. **Convert USDC to USD**: Place market sell order on USDC/USD pair (sell
     USDC)
 12. Poll Alpaca until conversion order is filled
@@ -3432,3 +3435,39 @@ chat's default topic. When either half (config or secret) is present without the
 other, startup fails fast rather than running with a half-configured alert
 channel. A notification delivery failure is logged but never crashes the
 monitor.
+
+### BaseToAlpaca deposit send
+
+The CCTP mint on the BaseToAlpaca leg sets `mintRecipient` to the bot's own
+market-maker wallet on Ethereum, so the minted USDC lands in the bot wallet --
+NOT at an Alpaca deposit address. Alpaca credits a deposit only when USDC is
+transferred to the per-account deposit address it issues. The deposit leg
+therefore performs an explicit fund-moving send:
+
+1. **Fetch the deposit address.** `get_wallet_address(USDC, ethereum)` returns
+   Alpaca's per-account Ethereum USDC deposit address.
+2. **Send (crash-safe, split fresh vs resume like the CCTP burn).** The fresh
+   path (right after this execution minted) sends the ERC20 transfer of the
+   received amount from the bot wallet to the deposit address DIRECTLY -- no
+   pre-send scan, no finality wait -- since no prior send can exist. The
+   resume-from-`Bridged` path (a crash may have left a prior send) first scans
+   Ethereum for an already-submitted USDC
+   `Transfer(from = bot wallet, to = deposit address, value = amount received)`
+   at or after the mint tx's block (the scan lower bound: the deposit send lands
+   at or after the mint, so no earlier transfer can be this deposit's). If such
+   a transfer exists, it is ADOPTED (no second send); otherwise it sends. A scan
+   failure (an RPC error, or an inconclusive finality-gated scan) returns an
+   error and sends NOTHING -- never a blind re-send -- so a transient fault
+   cannot double-spend.
+3. **Record the send.** The send tx (not the mint tx) is recorded as the deposit
+   reference via `InitiateDeposit`, advancing the aggregate to
+   `DepositInitiated`.
+4. **Poll by the send tx.** Alpaca is polled for the deposit identified by the
+   send tx until it is credited, then `ConfirmDeposit` is emitted and the
+   USDC-to-USD conversion runs.
+
+The resume-path scan is what makes resuming from `Bridged` safe: a crash between
+a fresh direct send and `InitiateDeposit` re-enters the leg from `Bridged`,
+where the scan finds the already-submitted transfer and adopts it instead of
+forwarding the minted USDC twice. Once `InitiateDeposit` is recorded, resume
+re-polls by the recorded send tx without sending again.

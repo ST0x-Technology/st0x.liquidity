@@ -275,6 +275,116 @@ impl<W: Wallet> CctpEndpoint<W> {
         Ok(self.wallet.provider().get_block_number().await?)
     }
 
+    /// Returns the block in which `tx_hash` was mined on this endpoint's chain.
+    ///
+    /// Used to derive the lower bound for [`find_recent_usdc_transfer`] from the
+    /// known mint tx: the deposit send to Alpaca lands at or after the mint's
+    /// block, so the mint block bounds the transfer scan exactly the way the
+    /// captured head bounds [`find_recent_burn`]. Confirmation-aware: it polls via
+    /// `await_receipt` rather than a single-shot lookup, so a load-balanced node
+    /// that has not yet seen the mint does not yield a spurious "block missing".
+    pub(super) async fn tx_block(&self, tx_hash: TxHash) -> Result<u64, CctpError> {
+        let receipt = self.wallet.await_receipt(tx_hash).await?;
+
+        receipt
+            .block_number
+            .ok_or(CctpError::TxReceiptMissingBlock { tx_hash })
+    }
+
+    /// Sends `amount` of this endpoint's USDC from the wallet to `to`, waiting
+    /// for the configured confirmation depth, and returns the transfer tx hash.
+    ///
+    /// This is the fund-moving leg of a BaseToAlpaca deposit: the CCTP mint
+    /// credits the bot wallet, and this transfer forwards the minted USDC to
+    /// Alpaca's deposit address. Reuses [`Wallet::submit`] so nonce handling and
+    /// confirmation depth match every other write path; a revert is decoded via
+    /// `Registry`.
+    pub(super) async fn send_usdc<Registry: IntoErrorRegistry>(
+        &self,
+        to: Address,
+        amount: U256,
+    ) -> Result<TxHash, CctpError> {
+        let receipt = self
+            .wallet
+            .submit::<Registry, _>(
+                self.usdc_address,
+                IERC20::transferCall { to, amount },
+                "USDC deposit to Alpaca",
+            )
+            .await?;
+
+        Ok(receipt.transaction_hash)
+    }
+
+    /// Scans for a USDC `Transfer(from, to, value == amount)` at or after
+    /// `from_block`, returning the most recent matching transaction hash.
+    ///
+    /// Crash-safe deposit-send recovery: the BaseToAlpaca deposit leg records the
+    /// mint block before sending USDC to Alpaca, so on resume this detects an
+    /// already-submitted send instead of re-sending (which would forward the
+    /// minted USDC twice). The deposit send lands at or after the mint, so the
+    /// match is bounded to `from_block` (the mint's block) onward. Matching on the
+    /// indexed `(from, to)` topics plus the exact `value` -- combined with the
+    /// single-USDC-rebalance-in-flight invariant -- guarantees an adopted transfer
+    /// is this deposit's, not an unrelated same-amount transfer.
+    ///
+    /// Returns `Ok(None)` ONLY when the queried node is confirmations-deep past
+    /// `from_block` and repeated scans agree the transfer is absent; a node that
+    /// may be lagging (the dRPC load-balancing hazard) yields a retryable
+    /// [`CctpError::ScanInconclusive`], so the caller never re-sends off a single
+    /// stale empty `eth_getLogs`.
+    pub(super) async fn find_recent_usdc_transfer(
+        &self,
+        from: Address,
+        to: Address,
+        amount: U256,
+        from_block: u64,
+    ) -> Result<Option<TxHash>, CctpError> {
+        let from_topic = FixedBytes::<32>::left_padding_from(from.as_slice());
+        let to_topic = FixedBytes::<32>::left_padding_from(to.as_slice());
+        let filter = Filter::new()
+            .from_block(from_block)
+            .address(self.usdc_address)
+            .event_signature(IERC20::Transfer::SIGNATURE_HASH)
+            .topic1(from_topic)
+            .topic2(to_topic);
+
+        for attempt in 1..=SCAN_ATTEMPTS {
+            let logs = self.wallet.provider().get_logs(&filter).await?;
+
+            for log in logs.iter().rev() {
+                let decoded = log.log_decode::<IERC20::Transfer>()?;
+                let event = decoded.data();
+
+                if event.value == amount
+                    && log.block_number.is_some_and(|block| block >= from_block)
+                    && let Some(tx_hash) = log.transaction_hash
+                {
+                    debug!(target: "bridge", %tx_hash, from_block, "Found existing USDC deposit transfer during resume");
+                    return Ok(Some(tx_hash));
+                }
+            }
+
+            // A single empty eth_getLogs from a load-balanced node is not
+            // authoritative (dRPC lag). Only conclude a true absence once the head
+            // is confirmations-deep past from_block AND repeated scans agree; else
+            // retry, and if still inconclusive return a retryable error so the
+            // caller never re-sends off a stale empty result.
+            let head = self.wallet.provider().get_block_number().await?;
+            let caught_up = head >= from_block.saturating_add(SCAN_FINALITY_MARGIN);
+
+            if caught_up && attempt == SCAN_ATTEMPTS {
+                return Ok(None);
+            }
+
+            if attempt < SCAN_ATTEMPTS {
+                tokio::time::sleep(SCAN_RETRY_BACKOFF).await;
+            }
+        }
+
+        Err(CctpError::ScanInconclusive { from_block })
+    }
+
     /// Claims USDC on this chain by submitting the attestation.
     ///
     /// Parses the `MintAndWithdraw` event from the transaction receipt to extract

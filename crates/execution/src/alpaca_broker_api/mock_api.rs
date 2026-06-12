@@ -514,20 +514,22 @@ impl AlpacaBrokerMock {
         Ok(())
     }
 
-    /// Starts a background watcher that monitors the Ethereum chain for USDC
-    /// mints to the bot's wallet. When detected, it auto-creates INCOMING
-    /// wallet transfer records in mock state so the bot's deposit polling
-    /// succeeds.
+    /// Starts a background watcher that monitors the Ethereum chain for the USDC
+    /// deposit SEND to Alpaca's deposit address. When detected, it auto-creates
+    /// an INCOMING wallet transfer record (keyed on the send tx) in mock state so
+    /// the bot's deposit polling by the send tx succeeds.
     ///
-    /// In the BaseToAlpaca flow, CCTP mints USDC to `mint_recipient` (the
-    /// bot's Ethereum wallet). The bot then polls Alpaca for a deposit
-    /// matching the mint tx hash. This watcher simulates Alpaca detecting
-    /// the on-chain mint and creating the corresponding transfer record.
+    /// In the BaseToAlpaca flow, CCTP mints USDC to the bot's Ethereum wallet
+    /// (`sender`), and the bot then SENDS that USDC to Alpaca's per-account
+    /// deposit address and polls Alpaca for a deposit matching the SEND tx hash
+    /// (not the mint tx). This watcher detects that on-chain
+    /// `Transfer(sender -> alpaca_deposit_address)` and creates the corresponding
+    /// transfer record, simulating Alpaca crediting the deposit.
     pub async fn start_deposit_watcher<P>(
         &self,
         provider: P,
         usdc_address: Address,
-        mint_recipient: Address,
+        sender: Address,
     ) -> anyhow::Result<JoinHandle<()>>
     where
         P: Provider + Clone + Send + Sync + 'static,
@@ -555,7 +557,7 @@ impl AlpacaBrokerMock {
                     last_block + 1,
                     current,
                     usdc_address,
-                    mint_recipient,
+                    sender,
                 )
                 .await;
 
@@ -567,21 +569,29 @@ impl AlpacaBrokerMock {
     }
 }
 
-/// Scans a single block for USDC Transfer events to `mint_recipient`
-/// and records them as incoming wallet transfers in mock state.
+/// Scans a single block for the USDC deposit SEND
+/// (`Transfer(sender -> alpaca_deposit_address)`) and records it as an incoming
+/// wallet transfer (keyed on the send tx) in mock state.
 /// Returns `true` if the block was fully processed, `false` on RPC error.
 ///
-/// Only records transfers where `from == Address::ZERO` (a mint event),
-/// filtering out regular transfers that happen to target `mint_recipient`.
+/// Matches `from == sender` and `to == alpaca_deposit_address` so the recorded
+/// tx hash is the bot's fund-moving deposit send -- exactly the tx the bot polls
+/// by -- not the upstream CCTP mint (whose `to` is the bot wallet itself).
 async fn scan_block_for_deposits<P: Provider>(
     provider: &P,
     state: &Mutex<MockState>,
     block_num: u64,
     usdc_address: Address,
-    mint_recipient: Address,
+    sender: Address,
 ) -> bool {
     let Ok(Some(block)) = provider.get_block_by_number(block_num.into()).full().await else {
         return false;
+    };
+
+    let Ok(deposit_address) = lock(state).alpaca_deposit_address.parse::<Address>() else {
+        // The deposit address is only set once `register_wallet_endpoints` runs;
+        // until then there is nothing to match, so treat the block as processed.
+        return true;
     };
 
     for tx_hash in block.transactions.hashes() {
@@ -594,9 +604,7 @@ async fn scan_block_for_deposits<P: Provider>(
                 continue;
             };
 
-            if log.address() != usdc_address
-                || event.to != mint_recipient
-                || event.from != Address::ZERO
+            if log.address() != usdc_address || event.from != sender || event.to != deposit_address
             {
                 continue;
             }
@@ -629,7 +637,7 @@ async fn scan_block_for_deposits<P: Provider>(
                 amount,
                 asset: "USDC".to_string(),
                 from_address: event.from,
-                to_address: mint_recipient,
+                to_address: deposit_address,
                 status: TransferStatus::Complete,
                 tx_hash: tx_hash_hex,
                 poll_count: 0,
@@ -641,7 +649,7 @@ async fn scan_block_for_deposits<P: Provider>(
     true
 }
 
-/// Scans a range of blocks for deposits, returning true only if
+/// Scans a range of blocks for the deposit send, returning true only if
 /// every block in the range was fully processed.
 async fn scan_deposit_range<P: Provider>(
     provider: &P,
@@ -649,11 +657,10 @@ async fn scan_deposit_range<P: Provider>(
     from: u64,
     to: u64,
     usdc_address: Address,
-    mint_recipient: Address,
+    sender: Address,
 ) -> bool {
     for block_num in from..=to {
-        if !scan_block_for_deposits(provider, state, block_num, usdc_address, mint_recipient).await
-        {
+        if !scan_block_for_deposits(provider, state, block_num, usdc_address, sender).await {
             return false;
         }
     }
