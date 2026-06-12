@@ -16,12 +16,13 @@ use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use st0x_dto::{HedgeLatencies, RebalanceTimings, ReliabilityReport, TradingVenue};
+use st0x_dto::{HedgeLatencies, InfraReport, RebalanceTimings, ReliabilityReport, TradingVenue};
 use st0x_execution::FractionalShares;
 
 use crate::AppState;
 use crate::dashboard::transfer_loader::{InvalidTransferKind, TransferKind};
 use crate::equity_redemption::{EquityRedemptionEvent, RedemptionAggregateId};
+use crate::performance::infra::load_monitor_telemetry;
 use crate::performance::rebalance::rebalance_timing_report;
 use crate::performance::reliability::{
     aggregate_log_entries, load_failure_events, load_job_queue_health,
@@ -1586,12 +1587,35 @@ async fn performance_reliability(
     }))
 }
 
+async fn performance_infra(
+    State(state): State<AppState>,
+    Query(query): Query<PerformanceRangeQuery>,
+) -> Result<Json<InfraReport>, StatusCode> {
+    let to = query.to.unwrap_or_else(Utc::now);
+    let from = query.from.unwrap_or(to - chrono::Duration::days(7));
+    if from >= to {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let monitor = load_monitor_telemetry(
+        &state.pool,
+        &ReportRange { from, to },
+        state.ctx.evm.orderbook,
+    )
+    .await
+    .inspect_err(|error| error!(%error, "Failed to load monitor telemetry"))
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(InfraReport { monitor }))
+}
+
 pub(crate) fn routes() -> Router<AppState> {
     Router::new()
         .route("/health", get(health))
         .route("/performance/latencies", get(performance_latencies))
         .route("/performance/rebalances", get(performance_rebalances))
         .route("/performance/reliability", get(performance_reliability))
+        .route("/performance/infra", get(performance_infra))
         .route("/logs", get(logs))
         .route("/orders/pending", get(pending_orders))
         .route("/trades", get(trades))
@@ -2147,6 +2171,141 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn performance_infra_returns_empty_report_on_fresh_database() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let app = build_app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/performance/infra")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response).await;
+        let report: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        // The full literal: a missing field or a camelCase typo must fail
+        // loudly, not match a `null` produced by indexing into nothing.
+        assert_eq!(
+            report,
+            serde_json::json!({
+                "monitor": {
+                    "currentLagBlocks": null,
+                    "currentLagSampledAt": null,
+                    "blockLag": [],
+                    "poll": {
+                        "cycles": 0,
+                        "errors": 0,
+                        "skippedTicks": 0,
+                        "duration": null,
+                    },
+                },
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn performance_infra_rejects_inverted_range() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let app = build_app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/performance/infra\
+                         ?from=2026-01-02T00:00:00Z&to=2026-01-01T00:00:00Z",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn performance_infra_reports_seeded_telemetry() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let orderbook = ctx.evm.orderbook;
+        let state = empty_app_state(ctx).await;
+        let now = chrono::Utc::now();
+
+        crate::telemetry::record_block_lag(
+            &state.pool,
+            &crate::telemetry::BlockLagSample {
+                sampled_at: now,
+                orderbook,
+                chain_tip: 120,
+                confirmed_tip: 117,
+                last_processed_block: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+        crate::telemetry::record_poll_cycle(
+            &state.pool,
+            crate::telemetry::Monitor::OrderFill,
+            orderbook,
+            now,
+            std::time::Duration::from_millis(40),
+            1,
+            Ok::<(), &std::convert::Infallible>(()),
+        )
+        .await
+        .unwrap();
+
+        let app = build_app(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/performance/infra")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_to_string(response).await;
+        let report: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        // Lag = confirmed_tip (117) - checkpoint (100).
+        assert_eq!(report["monitor"]["currentLagBlocks"], serde_json::json!(17));
+        assert_eq!(
+            report["monitor"]["blockLag"][0]["maxLagBlocks"],
+            serde_json::json!(17)
+        );
+        // The bucket start anchors the dashboard's x-axis: it must parse as
+        // a timestamp inside the report's default 7-day window.
+        let bucket_start = report["monitor"]["blockLag"][0]["start"]
+            .as_str()
+            .expect("bucket start must be a timestamp string");
+        let bucket_start = chrono::DateTime::parse_from_rfc3339(bucket_start)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(
+            bucket_start <= now && now - bucket_start <= chrono::Duration::days(7),
+            "bucket start {bucket_start} must fall inside the default window"
+        );
+        assert_eq!(report["monitor"]["poll"]["cycles"], serde_json::json!(1));
+        assert_eq!(
+            report["monitor"]["poll"]["skippedTicks"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            report["monitor"]["poll"]["duration"]["p50Ms"],
+            serde_json::json!(40)
+        );
     }
 
     #[tokio::test]

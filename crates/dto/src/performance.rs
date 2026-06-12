@@ -344,6 +344,53 @@ pub struct FailureEventCount {
     pub last_at: DateTime<Utc>,
 }
 
+/// Response of `GET /performance/infra`.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct InfraReport {
+    pub monitor: MonitorTelemetry,
+}
+
+/// Ingestion-health telemetry sampled by the order-fill monitor.
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct MonitorTelemetry {
+    /// Latest sampled block lag, regardless of the report range. `None`
+    /// until a sample with a backfill checkpoint exists.
+    #[ts(type = "number | null")]
+    pub current_lag_blocks: Option<i64>,
+    /// When the current lag was sampled, so the dashboard can flag a stale
+    /// monitor (no recent samples) distinctly from a healthy zero lag.
+    pub current_lag_sampled_at: Option<DateTime<Utc>>,
+    /// Worst observed block lag per time bucket, oldest first.
+    pub block_lag: Vec<BlockLagPoint>,
+    pub poll: PollHealth,
+}
+
+/// Worst block lag within one time bucket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockLagPoint {
+    pub start: DateTime<Utc>,
+    #[ts(type = "number")]
+    pub max_lag_blocks: i64,
+}
+
+/// Poll-cycle health of the order-fill monitor within the report range.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct PollHealth {
+    #[ts(type = "number")]
+    pub cycles: usize,
+    #[ts(type = "number")]
+    pub errors: usize,
+    /// Poll ticks silently dropped because the previous cycle overran.
+    #[ts(type = "number")]
+    pub skipped_ticks: usize,
+    /// Poll duration percentiles; `null` with no cycles in range.
+    pub duration: Option<LatencyStats>,
+}
+
 /// Snapshot of one apalis job queue's health.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]

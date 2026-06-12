@@ -7,6 +7,7 @@ import type { RebalanceOperationTiming } from '$lib/api/RebalanceOperationTiming
 
 import {
   layoutAttestationTrend,
+  layoutBlockLagTrend,
   layoutPercentileSeries,
   layoutRebalanceBars,
   layoutWaterfall,
@@ -243,6 +244,107 @@ describe('layoutAttestationTrend', () => {
     expect(layout.points[0]?.y).toBeCloseTo(25)
     expect(layout.points[1]?.y).toBeCloseTo(0)
     expect(layout.points[1]?.x).toBeCloseTo(100)
+  })
+})
+
+describe('layoutBlockLagTrend', () => {
+  it('centers a single bucket', () => {
+    const layout = layoutBlockLagTrend(
+      [
+        {
+          start: '2026-06-01T00:00:00Z',
+          maxLagBlocks: 12,
+        },
+      ],
+      {
+        plotWidth: 100,
+        plotHeight: 50,
+      },
+    )
+
+    expect(layout.points[0]?.x).toBeCloseTo(50)
+    expect(layout.maxLagBlocks).toBe(12)
+  })
+
+  it('centers a single zero-lag bucket on the baseline', () => {
+    // The common just-started state: one bucket, perfectly caught up. Hits
+    // the single-bucket centering and the divide-by-zero floor together.
+    const layout = layoutBlockLagTrend(
+      [
+        {
+          start: '2026-06-01T00:00:00Z',
+          maxLagBlocks: 0,
+        },
+      ],
+      {
+        plotWidth: 100,
+        plotHeight: 50,
+      },
+    )
+
+    expect(layout.points[0]?.x).toBeCloseTo(50)
+    expect(layout.points[0]?.y).toBe(50)
+    expect(layout.maxLagBlocks).toBe(0)
+  })
+
+  it('scales lag to the worst bucket', () => {
+    const layout = layoutBlockLagTrend(
+      [
+        {
+          start: '2026-06-01T00:00:00Z',
+          maxLagBlocks: 10,
+        },
+        {
+          start: '2026-06-01T01:00:00Z',
+          maxLagBlocks: 40,
+        },
+      ],
+      {
+        plotWidth: 100,
+        plotHeight: 50,
+      },
+    )
+
+    expect(layout.maxLagBlocks).toBe(40)
+    expect(layout.points[0]?.x).toBeCloseTo(0)
+    expect(layout.points[0]?.y).toBeCloseTo(37.5)
+    expect(layout.points[1]?.y).toBeCloseTo(0)
+    expect(layout.points[1]?.x).toBeCloseTo(100)
+  })
+
+  it('keeps a flat zero-lag series on the baseline without dividing by zero', () => {
+    const layout = layoutBlockLagTrend(
+      [
+        {
+          start: '2026-06-01T00:00:00Z',
+          maxLagBlocks: 0,
+        },
+        {
+          start: '2026-06-01T01:00:00Z',
+          maxLagBlocks: 0,
+        },
+      ],
+      {
+        plotWidth: 100,
+        plotHeight: 50,
+      },
+    )
+
+    // The reported maximum is the true series maximum, not the y-scale's
+    // divide-by-zero floor: a healthy panel must read "max 0 blocks".
+    expect(layout.maxLagBlocks).toBe(0)
+    expect(layout.points.every((point) => point.y === 50)).toBe(true)
+  })
+
+  it('returns an empty layout for no buckets', () => {
+    const layout = layoutBlockLagTrend([], {
+      plotWidth: 100,
+      plotHeight: 50,
+    })
+
+    expect(layout.points).toEqual([])
+    expect(layout.path).toBe('')
+    expect(layout.maxLagBlocks).toBe(0)
   })
 })
 

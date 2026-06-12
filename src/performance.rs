@@ -24,6 +24,7 @@ use crate::offchain::order::{OffchainOrderEvent, OffchainOrderId};
 use crate::position::PositionEvent;
 
 pub(crate) mod cache;
+pub(crate) mod infra;
 pub(crate) mod rebalance;
 pub(crate) mod reliability;
 
