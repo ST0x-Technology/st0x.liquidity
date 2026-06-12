@@ -718,10 +718,16 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                 }
             }
 
-            Some(DepositConfirmed {
-                direction: AlpacaToBase,
-                ..
-            }) => Ok(()),
+            // Terminal-success no-ops: an AlpacaToBase deposit already
+            // confirmed, or an operator-reconciled transfer resolved
+            // out-of-band -- both have nothing left to drive.
+            Some(
+                DepositConfirmed {
+                    direction: AlpacaToBase,
+                    ..
+                }
+                | Reconciled { .. },
+            ) => Ok(()),
 
             Some(
                 Converting {
@@ -1513,6 +1519,10 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                 | UsdcRebalance::DepositFailed { .. }
                 | UsdcRebalance::ConversionFailed { .. },
             ) => Err(UsdcTransferError::PreviouslyFailedAggregate { id: id.clone() }),
+
+            // Operator-reconciled is a clearing terminal: the transfer was
+            // resolved out-of-band, so a resume has nothing to drive.
+            Some(UsdcRebalance::Reconciled { .. }) => Ok(()),
         }
     }
 

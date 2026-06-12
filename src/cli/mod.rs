@@ -58,6 +58,27 @@ pub enum TransferType {
     Redemption,
 }
 
+/// Why an operator is reconciling a stuck post-burn USDC transfer.
+///
+/// CLI-facing mirror of [`crate::usdc_rebalance::ReconcileReason`]; mapped to
+/// the domain enum in the command handler so clap stays out of the aggregate.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ReconcileReasonArg {
+    /// The minted USDC was moved to its destination manually.
+    FundsMovedManually,
+    /// The deposit was credited at the destination outside the bot's view.
+    DepositCreditedOffline,
+}
+
+impl From<ReconcileReasonArg> for crate::usdc_rebalance::ReconcileReason {
+    fn from(reason: ReconcileReasonArg) -> Self {
+        match reason {
+            ReconcileReasonArg::FundsMovedManually => Self::FundsMovedManually,
+            ReconcileReasonArg::DepositCreditedOffline => Self::DepositCreditedOffline,
+        }
+    }
+}
+
 /// Aggregate types that have materialized views.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum AggregateView {
@@ -270,6 +291,22 @@ pub enum Commands {
         /// validated -- the resume uses the persisted amount
         #[arg(short = 'a', long = "amount")]
         amount: Usdc,
+    },
+
+    /// Reconcile a USDC transfer stuck in the post-burn DepositFailed state
+    ///
+    /// Drives a post-burn `DepositFailed` USDC rebalance to the clearing
+    /// terminal `Reconciled` state: the minted USDC was handled out-of-band, so
+    /// this resolves the transfer (clearing the in-progress guard and
+    /// reconciling source-venue inflight) rather than re-driving the deposit.
+    /// Rejects an unknown id or an aggregate not in `DepositFailed`.
+    ReconcileUsdcTransfer {
+        /// Id of the stuck transfer to reconcile
+        #[arg(long = "id")]
+        id: Uuid,
+        /// Why the transfer is being reconciled
+        #[arg(short = 'r', long = "reason", default_value = "funds-moved-manually")]
+        reason: ReconcileReasonArg,
     },
 
     /// Deposit USDC directly to Alpaca from Ethereum (bypasses vault/CCTP)
@@ -734,6 +771,10 @@ enum SimpleCommand {
         transfer_type: TransferType,
         id: String,
     },
+    ReconcileUsdcTransfer {
+        id: Uuid,
+        reason: ReconcileReasonArg,
+    },
 }
 
 #[cfg(feature = "test-support")]
@@ -1051,6 +1092,9 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
         Commands::RecheckTransfer { transfer_type, id } => {
             Ok(SimpleCommand::RecheckTransfer { transfer_type, id })
         }
+        Commands::ReconcileUsdcTransfer { id, reason } => {
+            Ok(SimpleCommand::ReconcileUsdcTransfer { id, reason })
+        }
     }
 }
 
@@ -1213,6 +1257,9 @@ async fn run_simple_command<W: Write>(
         } => rebalancing::fail_transfer_command(stdout, pool, transfer_type, &id, &reason).await,
         SimpleCommand::RecheckTransfer { transfer_type, id } => {
             rebalancing::recheck_transfer_command(stdout, transfer_type, &id, ctx).await
+        }
+        SimpleCommand::ReconcileUsdcTransfer { id, reason } => {
+            rebalancing::reconcile_usdc_transfer_command(stdout, id, reason.into(), pool).await
         }
     }
 }
@@ -1648,6 +1695,78 @@ mod tests {
                 );
             }
             other => panic!("expected resume-usdc-transfer command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reconcile_usdc_transfer_command_parses_id_and_reason() {
+        let id = Uuid::from_u128(77);
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "reconcile-usdc-transfer",
+            "--id",
+            &id.to_string(),
+            "--reason",
+            "deposit-credited-offline",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::ReconcileUsdcTransfer {
+                id: parsed_id,
+                reason,
+            } => {
+                assert_eq!(parsed_id, id);
+                assert!(matches!(reason, ReconcileReasonArg::DepositCreditedOffline));
+            }
+            other => panic!("expected reconcile-usdc-transfer command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reconcile_usdc_transfer_command_defaults_reason_to_funds_moved_manually() {
+        let id = Uuid::from_u128(78);
+        let cli = Cli::try_parse_from([
+            "st0x-cli",
+            "reconcile-usdc-transfer",
+            "--id",
+            &id.to_string(),
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::ReconcileUsdcTransfer { reason, .. } => {
+                assert!(matches!(reason, ReconcileReasonArg::FundsMovedManually));
+            }
+            other => panic!("expected reconcile-usdc-transfer command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_reconcile_usdc_transfer_command_as_simple() {
+        // reconcile-usdc-transfer only loads + sends to the event store, so it
+        // must route without an RPC provider.
+        let command = Commands::ReconcileUsdcTransfer {
+            id: Uuid::from_u128(42),
+            reason: ReconcileReasonArg::FundsMovedManually,
+        };
+
+        match classify_command(command) {
+            Ok(SimpleCommand::ReconcileUsdcTransfer { reason, .. }) => {
+                assert!(matches!(reason, ReconcileReasonArg::FundsMovedManually));
+            }
+            Ok(_) => panic!("expected reconcile-usdc-transfer simple command"),
+            Err(
+                ProviderCommand::ProcessTx { .. }
+                | ProviderCommand::TransferUsdc { .. }
+                | ProviderCommand::ResumeUsdcTransfer { .. }
+                | ProviderCommand::CctpBridge { .. }
+                | ProviderCommand::CctpRecover { .. }
+                | ProviderCommand::ResetAllowance { .. }
+                | ProviderCommand::AlpacaTokenize { .. }
+                | ProviderCommand::AlpacaRedeem { .. }
+                | ProviderCommand::AlpacaTokenizationRequests,
+            ) => panic!("expected simple command classification, got provider command"),
         }
     }
 

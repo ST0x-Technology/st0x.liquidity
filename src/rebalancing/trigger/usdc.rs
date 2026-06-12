@@ -51,12 +51,20 @@ pub(super) struct UsdcRebalanceTracking {
     pub(super) last_progress_at: DateTime<Utc>,
 }
 
+/// Single source of truth for the direction -> source-venue mapping: the venue
+/// the USDC physically leaves. Both `UsdcRebalanceTracking::source_venue` and the
+/// restart-safe operator-reconciliation path (which has no tracking instance to
+/// call the method on) derive from this, so the two cannot drift.
+fn source_venue(direction: &RebalanceDirection) -> Venue {
+    match direction {
+        RebalanceDirection::AlpacaToBase => Venue::Hedging,
+        RebalanceDirection::BaseToAlpaca => Venue::MarketMaking,
+    }
+}
+
 impl UsdcRebalanceTracking {
     pub(super) fn source_venue(&self) -> Venue {
-        match self.direction {
-            RebalanceDirection::AlpacaToBase => Venue::Hedging,
-            RebalanceDirection::BaseToAlpaca => Venue::MarketMaking,
-        }
+        source_venue(&self.direction)
     }
 
     fn source_transfer_started(&self) -> bool {
@@ -170,7 +178,8 @@ impl UsdcRebalanceStage {
             | ConversionFailed { .. }
             | WithdrawalFailed { .. }
             | BridgingFailed { .. }
-            | DepositFailed { .. } => None,
+            | DepositFailed { .. }
+            | OperatorReconciled { .. } => None,
         }
     }
 
@@ -727,7 +736,38 @@ impl RebalancingService {
                     self.cancel_tracked_usdc_rebalance(id).await?;
                 }
             }
+            // Operator reconciliation of a post-burn `DepositFailed`: the minted
+            // USDC left the source venue, so reconcile inflight with post-burn
+            // semantics -- zero the source-venue inflight WITHOUT crediting
+            // available -- never a `Cancel` (which would wrongly credit
+            // available). Derives the source venue from `direction`, so it works
+            // with tracking absent (post-restart). The caller's Clear terminal
+            // action removes tracking and clears the guard.
+            OperatorReconciled { direction, .. } => {
+                self.reconcile_operator_resolved(direction, Utc::now())
+                    .await?;
+            }
         }
+
+        Ok(())
+    }
+
+    /// Reconciles source-venue USDC inflight for an operator-reconciled,
+    /// post-burn rebalance: zeroes the source-venue inflight while leaving
+    /// `available` unchanged, because the funds physically left the source.
+    /// Derives the source venue from `direction` via the shared `source_venue`
+    /// mapping so it does not depend on in-memory tracking, which may be absent
+    /// after a restart.
+    async fn reconcile_operator_resolved(
+        &self,
+        direction: &RebalanceDirection,
+        now: DateTime<Utc>,
+    ) -> Result<(), RebalancingServiceError> {
+        let mut inventory = self.inventory.write().await;
+        *inventory = inventory
+            .clone()
+            .clear_usdc_inflight(source_venue(direction), now)?;
+        drop(inventory);
 
         Ok(())
     }

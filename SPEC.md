@@ -1647,6 +1647,16 @@ enum TransferRef {
     AlpacaId(AlpacaTransferId),
     OnchainTx(TxHash),
 }
+
+// Typed (not opaque-string) reason an operator reconciled a stranded post-burn
+// rebalance, recorded on `OperatorReconciled` / `Reconciled` for the audit trail.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+enum ReconcileReason {
+    // The minted USDC was moved to its destination manually.
+    FundsMovedManually,
+    // The deposit was credited at the destination outside the bot's view.
+    DepositCreditedOffline,
+}
 ```
 
 **States**:
@@ -1778,6 +1788,18 @@ enum UsdcRebalance {
         initiated_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
     },
+
+    // Guard-clearing terminal: an operator reconciled a stranded post-burn
+    // failure out-of-band. Retains `amount` and `initiated_at` so the
+    // projection still reports the real transfer rather than a zero-value one
+    // starting at `reconciled_at`.
+    Reconciled {
+        direction: RebalanceDirection,
+        amount: Usdc,
+        reason: ReconcileReason,
+        initiated_at: DateTime<Utc>,
+        reconciled_at: DateTime<Utc>,
+    },
 }
 ```
 
@@ -1838,6 +1860,11 @@ enum UsdcRebalanceCommand {
     InitiateDeposit { deposit: TransferRef },
     ConfirmDeposit,
     FailDeposit { reason: String },
+
+    // Reconcile a stranded post-burn failure to the terminal `Reconciled`
+    // state, clearing the rebalancing guard rather than re-driving the failed
+    // leg. Valid only from a post-burn terminal failure (see Business Rules).
+    ReconcileStuckRebalance { reason: ReconcileReason },
 }
 ```
 
@@ -1909,6 +1936,18 @@ enum UsdcRebalanceEvent {
         deposit_ref: Option<TransferRef>,
         failed_tx_hash: Option<TxHash>,
         failed_at: DateTime<Utc>,
+    },
+    // Operator reconciled a stranded post-burn failure. Carries `direction` so
+    // the reactor derives the source venue without in-memory tracking (which
+    // may be absent after a restart), plus `amount` and `initiated_at` so the
+    // projection preserves the real post-burn transfer instead of a zero-value
+    // one starting at reconciliation time.
+    OperatorReconciled {
+        direction: RebalanceDirection,
+        amount: Usdc,
+        reason: ReconcileReason,
+        initiated_at: DateTime<Utc>,
+        reconciled_at: DateTime<Utc>,
     },
 }
 
@@ -1989,6 +2028,18 @@ enum BridgeStage { Burn, Attestation, Mint }
   AlpacaToBase) or before post-deposit conversion (for BaseToAlpaca)
 - Can mark failed from any non-terminal state
 - Each rebalancing has unique UUID allowing multiple parallel operations
+- **Operator reconciliation** (`ReconcileStuckRebalance` -> `OperatorReconciled`
+  -> `Reconciled`): valid ONLY from a post-burn terminal failure that strands
+  the rebalancing guard with no other exit -- `DepositFailed`, a post-burn
+  `BridgingFailed` (a `burn_tx_hash` or `cctp_nonce` is recorded), or a
+  `BaseToAlpaca` `ConversionFailed` (the post-deposit USDC->USD leg). Every
+  other state is rejected: an in-progress transfer must be resumed, and a
+  pre-burn failure already reconciles to source on its own. `Reconciled` is a
+  clearing terminal -- it carries **post-burn semantics**, meaning the reactor
+  zeroes source-venue inflight WITHOUT crediting `available` (the USDC was
+  already burned via CCTP, so the funds genuinely left the source venue; this is
+  NOT a cancel, which would wrongly credit `available`). See "Operator
+  reconciliation of a stranded post-burn failure" under Failure Handling.
 
 ##### Integration Points
 
@@ -2723,6 +2774,25 @@ state (success, or a pre-burn failure that reconciles to source) re-asserts the
 guard at boot and blocks new USDC rebalancing until it settles or an operator
 recovers it. USDC bridges are not auto-resumed on restart, so the guard is held
 until manual recovery.
+
+**Operator reconciliation of a stranded post-burn failure**: A USDC rebalance
+that fails after the CCTP burn holds the rebalancing guard, blocking further
+USDC rebalancing. Because the burned/minted USDC was handled out-of-band, this
+is reconciled rather than re-driven: the `reconcile-usdc-transfer` CLI command
+sends `ReconcileStuckRebalance`, which emits `OperatorReconciled` and drives the
+aggregate to a new clearing terminal state, `Reconciled`. The reactor then
+clears the in-progress guard, removes tracking, and reconciles source-venue
+inflight with **post-burn semantics** -- it zeroes the source-venue inflight
+WITHOUT crediting `available`, because the funds already left the source venue
+(it is NOT a cancel, which would wrongly credit available). The command is valid
+ONLY from a post-burn terminal failure that strands the guard: `DepositFailed`
+(the CCTP mint landed but the destination deposit failed), a post-burn
+`BridgingFailed` (a `burn_tx_hash` or `cctp_nonce` is recorded), or a
+`BaseToAlpaca` `ConversionFailed` (the post-deposit USDC->USD leg). Every other
+state is rejected -- an in-progress transfer must be resumed, and a pre-burn
+failure already reconciles to source on its own. Because `Reconciled` is a
+clearable terminal, a restart does not re-latch the guard, and automatic USDC
+rebalancing resumes.
 
 ##### Manual Reconciliation Required
 
