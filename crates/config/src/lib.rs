@@ -4,6 +4,7 @@
 //! `st0x-cli` (the operator binary) may depend on it. Integration,
 //! shared-metadata, and domain crates must remain config-agnostic.
 
+mod alerts;
 mod evm;
 mod imbalance_threshold;
 mod loader;
@@ -13,6 +14,7 @@ mod telemetry;
 mod threshold;
 mod wallet;
 
+pub use alerts::{AlertsAssemblyError, AlertsConfig, AlertsCtx, AlertsSecrets};
 pub use evm::{EvmConfig, EvmCtx, EvmSecrets};
 pub use imbalance_threshold::{ImbalanceThreshold, InvalidImbalanceThreshold};
 pub use loader::*;

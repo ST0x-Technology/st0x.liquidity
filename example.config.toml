@@ -93,3 +93,19 @@ rebalancing = "enabled"
 # Credentials go in the secrets file under [rest_api].
 # [rest_api]
 # url = "https://api.example.com"
+
+# Optional — low-gas balance alerting for the bot wallet. When absent, no gas
+# monitor runs. When present, every field is required (no silent defaults) and
+# the Telegram bot_token must be set under [alerts] in the secrets file.
+# [alerts]
+# Telegram chat the alerts are delivered to (a negative id for group/channel).
+# chat_id = -1001234567890
+# Native-ETH balance below which an alert fires, as a decimal-ETH string.
+# low_balance_threshold = "0.05"
+# Seconds between native-balance polls.
+# poll_interval = 300
+# Minimum seconds between repeated low-balance alerts while still low.
+# realert_interval = 3600
+# Optional forum topic to deliver alerts into (a forum supergroup's
+# message_thread_id). Omit to post to the chat's default (General) topic.
+# message_thread_id = 42

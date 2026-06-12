@@ -9,7 +9,7 @@ use std::sync::Arc;
 use task_supervisor::SupervisorBuilder;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use st0x_config::{Ctx, ExecutionThreshold};
 use st0x_event_sorcery::{Projection, Store};
@@ -24,8 +24,10 @@ use super::exit::MonitorTaskError;
 use super::job::FailureInjector;
 use super::job::{FAIL_STOP_RECOVERY_TIMEOUT, build_supervised_worker};
 use super::monitor::executor_maintenance::ExecutorMaintenance;
+use super::monitor::gas::{GasMonitor, ProviderBalanceReader};
 use super::monitor::inventory::InventoryMonitor;
 use super::monitor::order_fills::OrderFillMonitor;
+use crate::alerts::TelegramNotifier;
 use crate::inventory::{
     InventoryPollingService, InventorySnapshot, InventorySnapshotId, WalletPollingCtx,
 };
@@ -189,6 +191,11 @@ where
         interval: std::time::Duration::from_secs(context.ctx.inventory_poll_interval),
     };
 
+    // Build the gas monitor before `context.provider` is consumed by the
+    // order-fill monitor / accountant below. `None` when `[alerts]` is
+    // unconfigured -- the monitor is then simply not spawned.
+    let gas_monitor = build_gas_monitor(&context.ctx, context.provider.clone());
+
     let poll_interval = context.ctx.order_polling_interval();
     info!("Constructing order-job context with poll interval: {poll_interval:?}");
 
@@ -285,6 +292,12 @@ where
             "executor-maintenance",
             ExecutorMaintenance::new(context.executor, interval),
         );
+    }
+
+    log_optional_task_status("gas monitor", gas_monitor.is_some());
+
+    if let Some(gas_monitor) = gas_monitor {
+        supervisor_builder = supervisor_builder.with_task("gas-monitor", gas_monitor);
     }
 
     let supervisor = supervisor_builder.build().run();
@@ -679,6 +692,40 @@ where
             }
         })
     }
+}
+
+/// Builds the low-gas balance monitor from the `[alerts]` config, or `None`
+/// when alerting is unconfigured. The monitor watches the order-owner wallet
+/// on the orderbook chain (Base in production), which is the same provider the
+/// conductor already uses for fill polling and contract reads.
+fn build_gas_monitor<Prov>(ctx: &Ctx, provider: Prov) -> Option<GasMonitor>
+where
+    Prov: Provider + Send + Sync + 'static,
+{
+    let alerts = ctx.alerts.as_ref()?;
+
+    let notifier =
+        match TelegramNotifier::new(&alerts.bot_token, alerts.chat_id, alerts.message_thread_id) {
+            Ok(notifier) => notifier,
+            Err(error) => {
+                error!(
+                    target: "gas",
+                    ?error,
+                    "Failed to build Telegram notifier; gas monitor will not be started"
+                );
+                return None;
+            }
+        };
+
+    Some(GasMonitor {
+        balance_reader: Arc::new(ProviderBalanceReader::new(provider)),
+        notifier: Arc::new(notifier),
+        wallet: ctx.order_owner(),
+        chain: "base",
+        threshold_wei: alerts.low_balance_threshold_wei,
+        poll_interval: alerts.poll_interval,
+        realert_interval: alerts.realert_interval,
+    })
 }
 
 fn log_optional_task_status(task_name: &str, is_configured: bool) {

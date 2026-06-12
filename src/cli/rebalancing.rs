@@ -1067,6 +1067,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs: 3600,
             broker: BrokerCtx::DryRun,
             telemetry: None,
+            alerts: None,
             trading_mode: TradingMode::Standalone,
             order_owner: Address::ZERO,
             wallet: None,
@@ -1127,6 +1128,7 @@ mod tests {
             apalis_finished_job_cleanup_interval_secs: 3600,
             broker: BrokerCtx::AlpacaBrokerApi(alpaca_broker_auth),
             telemetry: None,
+            alerts: None,
             trading_mode: TradingMode::Rebalancing(Box::new(
                 RebalancingCtx::stub()
                     .equity(ImbalanceThreshold {

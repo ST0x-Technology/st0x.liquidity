@@ -64,6 +64,20 @@ deviation = 0.1
 [rest_api]
 url = "https://api.st0x.io"
 
+# Low-gas balance alerting for the bot wallet. Telegram bot_token lives in the
+# encrypted secrets file under [alerts]. Every field is required (no defaults).
+[alerts]
+# Telegram chat alerts are delivered to (St0x Product Operations supergroup).
+chat_id = -1003850406522
+# Forum topic alerts post into (the "DEX Liquidity" topic).
+message_thread_id = 50
+# Native-ETH balance below which a low-gas alert fires (decimal ETH).
+low_balance_threshold = "0.05"
+# Seconds between native-balance polls.
+poll_interval = 300
+# Minimum seconds between repeated alerts while the balance stays below threshold.
+realert_interval = 3600
+
 # USDC vault and rebalancing settings.
 [assets.cash]
 # Raindex vault ID for USDC deposits/withdrawals.
