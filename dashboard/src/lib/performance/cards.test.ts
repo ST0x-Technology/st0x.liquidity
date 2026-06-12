@@ -1,11 +1,18 @@
 import { describe, expect, it } from 'vitest'
 
 import type { HedgeLatencies } from '$lib/api/HedgeLatencies'
+import type { InfraReport } from '$lib/api/InfraReport'
 import type { JobQueueHealth } from '$lib/api/JobQueueHealth'
 import type { LatencyStats } from '$lib/api/LatencyStats'
 import type { ReliabilityReport } from '$lib/api/ReliabilityReport'
 
-import { detectionCard, errorsCard, exposureCard, openExposureCard } from './cards'
+import {
+  blockLagCard,
+  detectionCard,
+  errorsCard,
+  exposureCard,
+  openExposureCard,
+} from './cards'
 
 const makeStats = (overrides: Partial<LatencyStats> = {}): LatencyStats => ({
   p50Ms: 5_000,
@@ -175,6 +182,112 @@ describe('errorsCard', () => {
 
     expect(card.status).toBe('good')
     expect(card.secondary).not.toContain('queue')
+  })
+})
+
+const infra = (overrides: Partial<InfraReport['monitor']>): InfraReport => ({
+  monitor: {
+    currentLagBlocks: 5,
+    currentLagSampledAt: '2026-06-01T00:00:00Z',
+    blockLag: [],
+    poll: {
+      cycles: 100,
+      errors: 0,
+      skippedTicks: 0,
+      duration: null,
+    },
+    ...overrides,
+  },
+})
+
+describe('blockLagCard', () => {
+  // One minute after the helper's currentLagSampledAt: fresh.
+  const freshNow = new Date('2026-06-01T00:01:00Z')
+
+  it('reports unknown while the report has not loaded', () => {
+    const card = blockLagCard(null, freshNow)
+
+    expect(card.status).toBe('unknown')
+    expect(card.primary).toBe('—')
+  })
+
+  it('reports unknown before the first refresh sets a clock', () => {
+    // The guard is `!report || !now`; this exercises the null-`now` branch
+    // independently of the null-report case above.
+    const card = blockLagCard(infra({}), null)
+
+    expect(card.status).toBe('unknown')
+    expect(card.primary).toBe('—')
+  })
+
+  it('reports unknown when no checkpointed sample exists yet', () => {
+    const card = blockLagCard(
+      infra({
+        currentLagBlocks: null,
+        currentLagSampledAt: null,
+      }),
+      freshNow,
+    )
+
+    expect(card.status).toBe('unknown')
+    expect(card.secondary).toBe('no checkpointed samples yet')
+  })
+
+  it('classifies the current lag against the block-lag thresholds', () => {
+    const card = blockLagCard(infra({}), freshNow)
+
+    expect(card.status).toBe('good')
+    expect(card.primary).toBe('5 blocks')
+    expect(card.secondary).toContain('sampled 1m 00s ago')
+  })
+
+  it('degrades to critical on a large lag and surfaces skipped ticks', () => {
+    const card = blockLagCard(
+      infra({
+        currentLagBlocks: 2_000,
+        poll: {
+          cycles: 100,
+          errors: 1,
+          skippedTicks: 7,
+          duration: null,
+        },
+      }),
+      freshNow,
+    )
+
+    expect(card.status).toBe('critical')
+    expect(card.primary).toBe('2000 blocks')
+    expect(card.secondary).toContain('7 skipped ticks')
+  })
+
+  it('classifies a mid-range lag as warning', () => {
+    // Between the good (30) and warning (300) thresholds.
+    const card = blockLagCard(infra({ currentLagBlocks: 100 }), freshNow)
+
+    expect(card.status).toBe('warning')
+    expect(card.primary).toBe('100 blocks')
+  })
+
+  it('degrades a healthy-looking lag to warning when the sample is stale', () => {
+    // A wedged monitor stops sampling: the frozen lag value must not keep
+    // rendering green.
+    const card = blockLagCard(infra({}), new Date('2026-06-01T03:00:00Z'))
+
+    expect(card.status).toBe('warning')
+    expect(card.secondary).toContain('STALE')
+    expect(card.secondary).toContain('3h 00m ago')
+  })
+
+  it('keeps a stale sample critical when the frozen lag was already critical', () => {
+    // Staleness floors the card at warning but must never downgrade a
+    // reading that was already worse.
+    const card = blockLagCard(
+      infra({ currentLagBlocks: 2_000 }),
+      new Date('2026-06-01T03:00:00Z'),
+    )
+
+    expect(card.status).toBe('critical')
+    expect(card.secondary).toContain('STALE')
   })
 })
 
