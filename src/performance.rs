@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use chrono::{DateTime, Duration, Utc};
+use itertools::Itertools;
 use sqlx::SqlitePool;
 use thiserror::Error;
 use tracing::warn;
@@ -22,6 +23,7 @@ use st0x_execution::Symbol;
 use crate::offchain::order::{OffchainOrderEvent, OffchainOrderId};
 use crate::position::PositionEvent;
 
+pub(crate) mod cache;
 pub(crate) mod rebalance;
 pub(crate) mod reliability;
 
@@ -130,20 +132,35 @@ pub(crate) enum PerformanceError {
     Database(#[from] sqlx::Error),
 }
 
-/// Load hedge performance for every symbol with a `Position` aggregate.
+/// Aggregate types the hedge report folds; its cache stamp is scoped to
+/// exactly these (see [`events_version`]).
 ///
-/// Both event streams are read inside one transaction so the report folds a
-/// consistent snapshot: without it, the bot could commit a hedge's events
-/// between the two reads and the report would misclassify it as pending.
+/// MUST stay in lockstep with the streams the fold actually reads (the
+/// `aggregate_type` literals in [`load_hedge_performance`] and
+/// `load_order_timelines`): a stream read here but missing from this list
+/// would never bump the stamp, silently serving stale reports. The cache
+/// tests insert an event of each listed type and assert eviction.
+pub(super) const HEDGE_AGGREGATE_TYPES: &[&str] = &["Position", "OffchainOrder"];
+
+/// Load hedge performance for every symbol with a `Position` aggregate,
+/// together with the events-table version the fold observed (see
+/// [`events_version`]).
+///
+/// Both event streams and the version stamp are read inside one transaction
+/// so the report folds a consistent snapshot: without it, the bot could
+/// commit a hedge's events between the reads and the report would
+/// misclassify it as pending (or the cache would stamp the fold newer than
+/// its contents).
 ///
 /// Undeserializable events and aggregates with malformed ids are skipped with
 /// a warning rather than failing the whole report: one bad historical row
 /// must not take down the dashboard's view of every other symbol.
 pub(crate) async fn load_hedge_performance(
     pool: &SqlitePool,
-) -> Result<Vec<SymbolPerformance>, PerformanceError> {
+) -> Result<(Vec<SymbolPerformance>, EventsVersion), PerformanceError> {
     let mut transaction = pool.begin().await?;
 
+    let events_version = events_version(&mut *transaction, HEDGE_AGGREGATE_TYPES).await?;
     let order_timelines = load_order_timelines(&mut transaction).await?;
 
     let rows: Vec<(String, String)> = sqlx::query_as(
@@ -173,10 +190,49 @@ pub(crate) async fn load_hedge_performance(
         }
     }
 
-    Ok(streams
+    let performances = streams
         .into_iter()
         .map(|(symbol, events)| fold_position_stream(symbol, events, &order_timelines))
-        .collect())
+        .collect();
+    Ok((performances, events_version))
+}
+
+/// Equality-only stamp of a report's event streams. Deliberately derives
+/// neither `PartialOrd` nor `Ord`: rowids are not a monotonic cursor, so
+/// "newer" comparisons would be meaningless -- callers may only ask "did
+/// anything change".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EventsVersion(i64);
+
+/// `MAX(rowid)` over the events rows of the given aggregate types: a cheap
+/// stamp for "has a relevant event been appended since this fold".
+///
+/// The stamp is scoped per report rather than global because other
+/// aggregates' rows ARE deleted at runtime (`InventorySnapshot` compaction)
+/// -- deleting the global max row lets SQLite reuse its rowid, so a global
+/// stamp could read equal across a delete+insert and serve a stale cache.
+/// Rows of the folded aggregate types are never deleted while the process
+/// serves requests, and SQLite assigns fresh rowids above the global max,
+/// so this scoped stamp changes exactly when a relevant event is appended.
+/// Scoping also keeps high-frequency snapshot writes from evicting the
+/// cache.
+pub(super) async fn events_version(
+    executor: impl sqlx::SqliteExecutor<'_>,
+    aggregate_types: &[&str],
+) -> Result<EventsVersion, PerformanceError> {
+    let placeholders = (1..=aggregate_types.len())
+        .map(|position| format!("${position}"))
+        .join(", ");
+    let sql = format!(
+        "SELECT COALESCE(MAX(rowid), 0) FROM events \
+         WHERE aggregate_type IN ({placeholders})"
+    );
+
+    let mut query = sqlx::query_scalar(&sql);
+    for aggregate_type in aggregate_types {
+        query = query.bind(*aggregate_type);
+    }
+    Ok(EventsVersion(query.fetch_one(executor).await?))
 }
 
 /// Broker-side timestamps of one hedge order, folded from its
@@ -1043,6 +1099,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn events_version_tracks_only_scoped_aggregate_types() {
+        let pool = setup_test_db().await;
+
+        let empty = events_version(&pool, HEDGE_AGGREGATE_TYPES).await.unwrap();
+        assert_eq!(empty, EventsVersion(0));
+
+        insert_event(
+            &pool,
+            "Position",
+            "AAPL",
+            1,
+            "PositionEvent::OnChainOrderFilled",
+            "{}",
+        )
+        .await;
+        let after_watched = events_version(&pool, HEDGE_AGGREGATE_TYPES).await.unwrap();
+        assert_ne!(
+            after_watched, empty,
+            "a scoped insert must change the stamp"
+        );
+
+        insert_event(
+            &pool,
+            "InventorySnapshot",
+            "inventory",
+            1,
+            "InventorySnapshotEvent::Recorded",
+            "{}",
+        )
+        .await;
+        let after_unwatched = events_version(&pool, HEDGE_AGGREGATE_TYPES).await.unwrap();
+        assert_eq!(
+            after_unwatched, after_watched,
+            "an unscoped insert must not change the stamp"
+        );
+    }
+
+    #[tokio::test]
     async fn load_hedge_performance_joins_position_and_order_streams() {
         let pool = setup_test_db().await;
         let order_id = OffchainOrderId::new();
@@ -1110,7 +1204,7 @@ mod tests {
         )
         .await;
 
-        let report = load_hedge_performance(&pool).await.unwrap();
+        let (report, _events_version) = load_hedge_performance(&pool).await.unwrap();
 
         assert_eq!(report.len(), 1);
         assert_eq!(report[0].symbol, symbol());
@@ -1162,7 +1256,7 @@ mod tests {
         )
         .await;
 
-        let report = load_hedge_performance(&pool).await.unwrap();
+        let (report, _events_version) = load_hedge_performance(&pool).await.unwrap();
 
         let cycle = &report[0].cycles[0];
         assert_eq!(cycle.outcome, HedgeOutcome::Pending);
@@ -1220,7 +1314,7 @@ mod tests {
         )
         .await;
 
-        let report = load_hedge_performance(&pool).await.unwrap();
+        let (report, _events_version) = load_hedge_performance(&pool).await.unwrap();
 
         assert_eq!(report.len(), 1);
         let cycle = &report[0].cycles[0];
@@ -1253,7 +1347,7 @@ mod tests {
         )
         .await;
 
-        let report = load_hedge_performance(&pool).await.unwrap();
+        let (report, _events_version) = load_hedge_performance(&pool).await.unwrap();
 
         assert_eq!(report.len(), 2);
         assert_eq!(report[0].symbol, Symbol::new("AAPL").unwrap());
@@ -1288,7 +1382,7 @@ mod tests {
         )
         .await;
 
-        let report = load_hedge_performance(&pool).await.unwrap();
+        let (report, _events_version) = load_hedge_performance(&pool).await.unwrap();
 
         assert_eq!(report.len(), 1);
         assert_eq!(report[0].symbol, symbol());
@@ -1346,7 +1440,7 @@ mod tests {
             .await;
         }
 
-        let report = load_hedge_performance(&pool).await.unwrap();
+        let (report, _events_version) = load_hedge_performance(&pool).await.unwrap();
 
         let cycle = &report[0].cycles[0];
         assert_eq!(cycle.submitted_at, Some(timestamp(2)));
@@ -1414,7 +1508,7 @@ mod tests {
             .await;
         }
 
-        let report = load_hedge_performance(&pool).await.unwrap();
+        let (report, _events_version) = load_hedge_performance(&pool).await.unwrap();
 
         let cycle = &report[0].cycles[0];
         assert_eq!(cycle.submitted_at, Some(timestamp(12)));
@@ -1664,7 +1758,7 @@ mod tests {
         )
         .await;
 
-        let report = load_hedge_performance(&pool).await.unwrap();
+        let (report, _events_version) = load_hedge_performance(&pool).await.unwrap();
 
         assert_eq!(report.len(), 1);
         assert_eq!(report[0].fills.len(), 1);
