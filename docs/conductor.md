@@ -265,6 +265,14 @@ registry. The same `SeedVaultRegistry` job is also registered as an apalis
 worker so the queue can retry on failure if seeding is re-triggered later (e.g.
 from a recovery flow).
 
+Seeding is additive for vault discovery history but authoritative for the
+configured primary vault. Each startup registers every configured vault ID and
+then marks the first entry in the configured vault list (config file order) for
+each asset as primary. A config change from an old vault ID to a new one
+therefore moves deposit/withdraw/rebalancing paths to the new vault after
+restart, while the old vault remains registered so inventory polling can surface
+any stranded balance.
+
 Ingestion is checkpoint-driven `eth_getLogs` polling, not a live subscription,
 so no events are missed across downtime. Deriving the cutoff
 (`tip - required_confirmations`) is not a startup phase -- the

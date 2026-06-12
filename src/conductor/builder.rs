@@ -4,7 +4,7 @@ use alloy::providers::Provider;
 use apalis::prelude::Monitor;
 use apalis_core::worker::ext::circuit_breaker::config::CircuitBreakerConfig;
 use sqlx::SqlitePool;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use task_supervisor::SupervisorBuilder;
 use tokio::task::JoinHandle;
@@ -164,6 +164,21 @@ where
         .cloned()
         .collect();
 
+    let mut configured_equity_vaults: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+    for equity_config in context.ctx.assets.equities.symbols.values() {
+        configured_equity_vaults
+            .entry(equity_config.tokenized_equity_derivative)
+            .or_default()
+            .extend(equity_config.vault_ids.iter().copied());
+    }
+
+    let configured_usdc_vaults = context
+        .ctx
+        .assets
+        .cash
+        .as_ref()
+        .map(|cash| cash.vault_ids.iter().copied().collect());
+
     let wallet_polling = context.wallet_polling;
     let tokenizer = context.tokenizer;
 
@@ -177,7 +192,8 @@ where
         tokenizer,
         reserved_cash,
     )
-    .with_configured_equity_symbols(configured_equity_symbols);
+    .with_configured_equity_symbols(configured_equity_symbols)
+    .with_configured_vaults(configured_equity_vaults, configured_usdc_vaults);
 
     if let Some(rebalancing_service) = &rebalancing_service {
         polling_service =
