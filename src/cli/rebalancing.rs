@@ -27,6 +27,8 @@ use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, Redemp
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
 use crate::rebalancing::to_wrapped_equities;
 use crate::rebalancing::usdc::{CrossVenueCashTransfer, UsdcSettlementParams, UsdcTransferError};
+use crate::telemetry::TelemetrySender;
+use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus, Tokenizer,
 };
@@ -413,7 +415,13 @@ async fn run_usdc_transfer<Writer: Write>(
         counter_trade_slippage_bps: alpaca_auth.counter_trade_slippage_bps,
     };
 
-    let alpaca_broker = Arc::new(AlpacaBrokerApi::try_from_ctx(broker_auth.clone()).await?);
+    // The CLI has no telemetry writer, so broker dependency samples have nowhere
+    // to go; wrap with a disabled sender purely to satisfy the shared
+    // `CrossVenueCashTransfer` constructor.
+    let alpaca_broker = InstrumentedAlpacaBroker::new(
+        AlpacaBrokerApi::try_from_ctx(broker_auth.clone()).await?,
+        TelemetrySender::disabled(),
+    );
 
     let alpaca_wallet = Arc::new(AlpacaWalletService::new(
         broker_auth.base_url().to_string(),

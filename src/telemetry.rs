@@ -28,6 +28,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
+pub(crate) mod broker;
 pub(crate) mod executor;
 pub(crate) mod rpc;
 

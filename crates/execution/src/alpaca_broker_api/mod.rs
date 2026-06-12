@@ -60,6 +60,20 @@ pub use order::{
     CryptoOrderResponse, ParseAlpacaLimitPriceError,
 };
 
+impl fmt::Display for CryptoOrderFailureReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Canceled => formatter.write_str("Canceled"),
+            Self::Expired => formatter.write_str("Expired"),
+            Self::Rejected => formatter.write_str("Rejected"),
+            Self::DoneForDay => formatter.write_str("DoneForDay"),
+            Self::Replaced => formatter.write_str("Replaced"),
+            Self::Suspended => formatter.write_str("Suspended"),
+            Self::Calculated => formatter.write_str("Calculated"),
+        }
+    }
+}
+
 impl fmt::Display for TimeInForce {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -147,7 +161,7 @@ pub enum AlpacaBrokerApiError {
         status: AccountStatus,
     },
 
-    #[error("Crypto order {order_id} failed: {reason:?}")]
+    #[error("Crypto order {order_id} failed: {reason}")]
     CryptoOrderFailed {
         order_id: Uuid,
         reason: CryptoOrderFailureReason,

@@ -38,9 +38,9 @@ use st0x_event_sorcery::{
 };
 use st0x_evm::{USDC_BASE, Wallet};
 use st0x_execution::{
-    AlpacaWalletService, ClientOrderId, CounterTradePreflight, CounterTradeReservation,
-    CounterTradeSkipReason, ExecutionError, Executor, FractionalShares, MarketOrder, Symbol,
-    TryIntoExecutor,
+    AlpacaBrokerApi, AlpacaWalletService, ClientOrderId, CounterTradePreflight,
+    CounterTradeReservation, CounterTradeSkipReason, ExecutionError, Executor, FractionalShares,
+    MarketOrder, Symbol, TryIntoExecutor,
 };
 use st0x_raindex::{RaindexService, RaindexVaultId};
 use st0x_wrapper::WrapperService;
@@ -84,6 +84,7 @@ use crate::rebalancing::{
     to_wrapped_equities,
 };
 use crate::symbol::cache::SymbolCache;
+use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::telemetry::executor::InstrumentedExecutor;
 use crate::telemetry::rpc::RpcTelemetryLayer;
 use crate::telemetry::{TelemetrySender, spawn_dependency_call_writer};
@@ -371,15 +372,16 @@ where
 /// Wires the telemetry channel, instrumented executor, and RPC provider together
 /// and spawns the background writer that drains samples into SQLite.
 ///
-/// Returns the instrumented executor, provider (ready for use), and the writer
-/// task handle. Probes the RPC endpoint once to fail fast on misconfiguration
-/// before the rest of startup proceeds: basic reachability plus a usable
-/// `finalized` block tag, which order-fill ingestion depends on for reorg
-/// protection. An endpoint that errors on `finalized`, or aliases it to the
-/// chain tip (disabling reorg protection), is rejected here rather than running
-/// silently degraded; a fresh chain with no finalized block yet is allowed
-/// through. The telemetry sender is held by the executor and RPC layer clones;
-/// when all are dropped the writer exits cleanly.
+/// Returns the instrumented executor, provider (ready for use), the writer task
+/// handle, and the original telemetry sender. Probes the RPC endpoint once to
+/// fail fast on misconfiguration before the rest of startup proceeds: basic
+/// reachability plus a usable `finalized` block tag, which order-fill ingestion
+/// depends on for reorg protection. An endpoint that errors on `finalized`, or
+/// aliases it to the chain tip (disabling reorg protection), is rejected here
+/// rather than running silently degraded; a fresh chain with no finalized block
+/// yet is allowed through. The executor, RPC layer, and the returned sender each
+/// hold a clone of the telemetry channel; the writer exits only when all three
+/// are dropped.
 /// Provider type returned by `ProviderBuilder::new().connect_client(...)` over
 /// an HTTP transport. Named here to make `setup_instrumentation`'s return type
 /// concrete without coupling callers to `alloy` internals.
@@ -395,7 +397,12 @@ async fn setup_instrumentation<E>(
     executor_ctx: impl TryIntoExecutor<Executor = E>,
     rpc_url: &Url,
     pool: SqlitePool,
-) -> anyhow::Result<(InstrumentedExecutor<E>, HttpProvider, JoinHandle<()>)>
+) -> anyhow::Result<(
+    InstrumentedExecutor<E>,
+    HttpProvider,
+    JoinHandle<()>,
+    TelemetrySender,
+)>
 where
     E: Executor,
 {
@@ -443,11 +450,12 @@ where
         FinalityProbe::Supported | FinalityProbe::NotYetAvailable => {}
     }
 
-    // Drop the original sender here; the executor and RPC layer each hold
-    // a clone. When all clones are eventually dropped, the writer exits.
+    // Spawn the writer before returning the sender: the executor, RPC layer,
+    // and the returned sender each hold a clone. When all three are dropped,
+    // the channel closes and the writer task exits cleanly.
     let telemetry_writer = spawn_dependency_call_writer(pool, telemetry_receiver);
 
-    Ok((executor, provider, telemetry_writer))
+    Ok((executor, provider, telemetry_writer, telemetry))
 }
 
 impl Conductor {
@@ -472,7 +480,7 @@ impl Conductor {
             apalis: apalis_pool,
         } = pools;
 
-        let (executor, provider, telemetry_writer) =
+        let (executor, provider, telemetry_writer, telemetry) =
             setup_instrumentation(executor_ctx, &ctx.evm.rpc_url, pool.clone()).await?;
         let cache = SymbolCache::default();
 
@@ -535,16 +543,17 @@ impl Conductor {
             resume_tokenization_queue,
         } = PositionAndRebalancing::setup(
             rebalancing,
-            &ctx,
-            &DatabasePools {
-                cqrs: pool.clone(),
-                apalis: apalis_pool.clone(),
+            RebalancingDeps {
+                pool: pool.clone(),
+                apalis_pool: apalis_pool.clone(),
+                ctx: ctx.clone(),
+                inventory: inventory.clone(),
+                event_sender,
+                vault_registry: vault_registry.clone(),
+                vault_registry_projection,
+                schedulers: schedulers.clone(),
+                telemetry: telemetry.clone(),
             },
-            inventory.clone(),
-            event_sender,
-            vault_registry.clone(),
-            vault_registry_projection,
-            schedulers.clone(),
         )
         .await?;
 
@@ -1076,6 +1085,7 @@ struct RebalancingDeps {
     vault_registry: Arc<Store<VaultRegistry>>,
     vault_registry_projection: Arc<Projection<VaultRegistry>>,
     schedulers: RebalancingSchedulers,
+    telemetry: TelemetrySender,
 }
 
 /// Position + rebalancing-adjacent infrastructure produced during conductor
@@ -1104,45 +1114,35 @@ struct PositionAndRebalancing {
 impl PositionAndRebalancing {
     async fn setup(
         rebalancing: Option<RebalancingCtx>,
-        ctx: &Ctx,
-        pools: &DatabasePools,
-        inventory: Arc<BroadcastingInventory>,
-        event_sender: broadcast::Sender<Statement>,
-        vault_registry: Arc<Store<VaultRegistry>>,
-        vault_registry_projection: Arc<Projection<VaultRegistry>>,
-        schedulers: RebalancingSchedulers,
+        deps: RebalancingDeps,
     ) -> anyhow::Result<Self> {
-        let pool = &pools.cqrs;
-        let apalis_pool = &pools.apalis;
-
         if let Some(rebalancing_ctx) = rebalancing {
-            let wallet_ctx = ctx.wallet()?;
+            let wallet_ctx = deps.ctx.wallet()?;
             let ethereum_wallet = wallet_ctx.ethereum_wallet().clone();
             let base_wallet = wallet_ctx.base_wallet().clone();
+            let redemption_wallet = deps.ctx.redemption_wallet()?;
+
+            // Computed before `deps` is moved into the spawn call, since
+            // `WalletPollingCtx` below also needs the config behind `deps.ctx`.
+            let unwrapped_equity_token_addresses =
+                base_wallet_unwrapped_equity_token_addresses(&deps.ctx);
+            let wrapped_equity_token_addresses =
+                base_wallet_wrapped_equity_token_addresses(&deps.ctx);
 
             let infra = spawn_rebalancing_infrastructure(
                 rebalancing_ctx,
-                ctx.redemption_wallet()?,
+                redemption_wallet,
                 ethereum_wallet.clone(),
                 base_wallet.clone(),
-                RebalancingDeps {
-                    pool: pool.clone(),
-                    apalis_pool: apalis_pool.clone(),
-                    ctx: ctx.clone(),
-                    inventory: inventory.clone(),
-                    event_sender,
-                    vault_registry,
-                    vault_registry_projection,
-                    schedulers,
-                },
+                deps,
             )
             .await?;
 
             let wallet_polling = crate::inventory::WalletPollingCtx {
                 ethereum: Arc::new(ethereum_wallet),
                 base: Arc::new(base_wallet),
-                unwrapped_equity_token_addresses: base_wallet_unwrapped_equity_token_addresses(ctx),
-                wrapped_equity_token_addresses: base_wallet_wrapped_equity_token_addresses(ctx),
+                unwrapped_equity_token_addresses,
+                wrapped_equity_token_addresses,
             };
 
             Ok(Self {
@@ -1166,8 +1166,15 @@ impl PositionAndRebalancing {
                 resume_tokenization_queue: Some(infra.resume_tokenization_queue),
             })
         } else {
+            let RebalancingDeps {
+                pool,
+                inventory,
+                event_sender,
+                ..
+            } = deps;
+
             let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
-            let (position, position_projection) = build_position_cqrs(pool, broadcaster).await?;
+            let (position, position_projection) = build_position_cqrs(&pool, broadcaster).await?;
 
             // Without the service, the projection is the only subscriber
             // keeping the dashboard view in sync.
@@ -1355,8 +1362,18 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             alpaca_auth.api_secret.clone(),
         ));
 
+        // Build the broker here (not inside `RebalancerServices::new`) so it can
+        // be wrapped in the telemetry decorator before being threaded down. This
+        // mirrors how the hedge executor is wrapped in `Conductor::run` before
+        // use, so the rebalancer's Alpaca conversion calls emit broker dependency
+        // samples alongside the hedge path.
+        let broker = InstrumentedAlpacaBroker::new(
+            AlpacaBrokerApi::try_from_ctx(alpaca_auth.clone()).await?,
+            deps.telemetry.clone(),
+        );
+
         let services = RebalancerServices::new(
-            alpaca_auth.clone(),
+            broker,
             Arc::clone(&alpaca_wallet),
             ethereum_wallet,
             base_wallet,
@@ -1371,8 +1388,7 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
                 #[cfg(feature = "test-support")]
                 message_transmitter: rebalancing_ctx.message_transmitter,
             },
-        )
-        .await?;
+        )?;
 
         let usdc_vault_id = deps
             .ctx
@@ -6520,16 +6536,17 @@ mod tests {
 
         let position_and_rebalancing = PositionAndRebalancing::setup(
             None,
-            &ctx,
-            &DatabasePools {
-                cqrs: pool.clone(),
-                apalis: apalis_pool.clone(),
+            RebalancingDeps {
+                pool: pool.clone(),
+                apalis_pool: apalis_pool.clone(),
+                ctx: ctx.clone(),
+                inventory,
+                event_sender,
+                vault_registry,
+                vault_registry_projection,
+                schedulers: RebalancingSchedulers::new(&apalis_pool),
+                telemetry: TelemetrySender::disabled(),
             },
-            inventory,
-            event_sender,
-            vault_registry,
-            vault_registry_projection,
-            RebalancingSchedulers::new(&apalis_pool),
         )
         .await
         .unwrap();
