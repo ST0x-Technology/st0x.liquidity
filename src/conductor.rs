@@ -231,12 +231,14 @@ async fn requeue_startup_orphans(
     usdc_to_hedging_ctx: Option<&Arc<TransferUsdcToHedgingCtx>>,
     usdc_to_market_making_ctx: Option<&Arc<TransferUsdcToMarketMakingCtx>>,
     equity_to_market_making_ctx: Option<&Arc<TransferEquityToMarketMakingCtx>>,
+    equity_to_hedging_ctx: Option<&Arc<TransferEquityToHedgingCtx>>,
 ) -> anyhow::Result<()> {
     requeue_wired_transfer_orphans(
         schedulers,
         usdc_to_hedging_ctx,
         usdc_to_market_making_ctx,
         equity_to_market_making_ctx,
+        equity_to_hedging_ctx,
     )
     .await?;
     requeue_backfill_orphans(backfill_queue).await
@@ -1209,26 +1211,16 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         // Built outside `QueryManifest` because the recovery aggregate's
         // services include `recovery_transfer`, which depends on the
         // mint/redemption stores produced by the manifest above.
-        let wrapped_equity_recovery_store =
-            StoreBuilder::<WrappedEquityRecovery>::new(deps.pool.clone())
-                .build(WrappedEquityRecoveryServices {
-                    raindex: raindex_service.clone(),
-                    vault_lookup: vault_lookup.clone(),
-                    wrapper: wrapper.clone(),
-                    transfer: recovery_transfer.clone(),
-                })
-                .await?;
-
-        let unwrapped_equity_recovery_store =
-            StoreBuilder::<UnwrappedEquityRecovery>::new(deps.pool.clone())
-                .build(UnwrappedEquityRecoveryServices {
-                    raindex: raindex_service.clone(),
-                    vault_lookup: vault_lookup.clone(),
-                    wrapper: wrapper.clone(),
-                    transfer: recovery_transfer.clone(),
-                    wallet: base_wallet.address(),
-                })
-                .await?;
+        let (wrapped_equity_recovery_store, unwrapped_equity_recovery_store) =
+            build_equity_recovery_stores(
+                &deps.pool,
+                raindex_service.clone(),
+                vault_lookup.clone(),
+                wrapper.clone(),
+                recovery_transfer.clone(),
+                base_wallet.address(),
+            )
+            .await?;
 
         recover_interrupted_tokenization_aggregates(
             &deps.pool,
@@ -1336,6 +1328,45 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             transfer_equity_to_hedging_ctx,
         })
     })
+}
+
+/// Builds the wrapped and unwrapped equity-recovery aggregate stores.
+///
+/// Both share the recovery `transfer` and the raindex/vault/wrapper
+/// dependencies; the unwrapped store additionally needs the base `wallet`
+/// address to settle unwraps. Kept together because they are the recovery
+/// counterpart built from the same `recovery_transfer`.
+async fn build_equity_recovery_stores<Chain: Wallet + Clone>(
+    pool: &SqlitePool,
+    raindex: Arc<RaindexService<Chain>>,
+    vault_lookup: Arc<dyn VaultLookup>,
+    wrapper: Arc<WrapperService<Chain>>,
+    transfer: Arc<CrossVenueEquityTransfer>,
+    wallet: Address,
+) -> anyhow::Result<(
+    Arc<Store<WrappedEquityRecovery>>,
+    Arc<Store<UnwrappedEquityRecovery>>,
+)> {
+    let wrapped_store = StoreBuilder::<WrappedEquityRecovery>::new(pool.clone())
+        .build(WrappedEquityRecoveryServices {
+            raindex: raindex.clone(),
+            vault_lookup: vault_lookup.clone(),
+            wrapper: wrapper.clone(),
+            transfer: transfer.clone(),
+        })
+        .await?;
+
+    let unwrapped_store = StoreBuilder::<UnwrappedEquityRecovery>::new(pool.clone())
+        .build(UnwrappedEquityRecoveryServices {
+            raindex,
+            vault_lookup,
+            wrapper,
+            transfer,
+            wallet,
+        })
+        .await?;
+
+    Ok((wrapped_store, unwrapped_store))
 }
 
 /// Recovers inflight state from event history at startup.

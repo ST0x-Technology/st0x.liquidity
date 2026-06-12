@@ -346,9 +346,15 @@ convention -- new generated paths should not extend that list.
   you want to understand CLI commands or configuration options, read the code.
   If you want to test functionality, write proper tests. There is never a reason
   to run the application speculatively.
-- When handling clippy errors about function lengths or cognitive complexity,
-  don't split up the functions more than necessary to get below the limit.
-  Instead ask the user if we can add a clippy allow for that error.
+- When clippy flags function length (`too_many_lines`) or cognitive complexity,
+  treat suppression as the LAST resort and work the options in order first: (1)
+  extract a genuine logical chunk -- a cohesive multi-step unit, never a
+  one-liner helper; (2) if a repeated pattern is driving the blowout, factor the
+  repetition out; (3) if it is irreducible boilerplate, consider a custom macro.
+  Only when none of these can bring the function under the threshold without
+  making the code worse may an allow be considered -- and adding any
+  `#[allow(...)]` requires EXPLICIT user permission first (per the Quality
+  Control Policy). Precedent elsewhere in the codebase is NOT permission.
 
 ### Push policy
 
