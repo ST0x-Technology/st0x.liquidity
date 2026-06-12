@@ -16,9 +16,7 @@ use st0x_bridge::cctp::{AttestationResponse, CctpBridge, CctpError};
 use st0x_bridge::{Attestation, Bridge, BridgeDirection, BurnReceipt, MintReceipt};
 use st0x_event_sorcery::Store;
 use st0x_evm::Wallet;
-use st0x_execution::{
-    AlpacaBrokerApi, ClientOrderId, ConversionDirection, CryptoOrderOutcome, Positive,
-};
+use st0x_execution::{ClientOrderId, ConversionDirection, CryptoOrderOutcome, Positive};
 use st0x_finance::Usdc;
 use st0x_raindex::{Raindex, RaindexService, RaindexVaultId, USDC_BASE};
 
@@ -26,6 +24,7 @@ use super::UsdcTransferError;
 use crate::alpaca_wallet::{
     AlpacaTransferId, AlpacaWalletService, Network, TokenSymbol, Transfer, TransferStatus,
 };
+use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::usdc_rebalance::{
     RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
 };
@@ -36,7 +35,7 @@ use crate::usdc_rebalance::{
 ///
 /// * `Chain` - Wallet type used for both Ethereum and Base chains
 pub(crate) struct CrossVenueCashTransfer<Chain: Wallet> {
-    alpaca_broker: Arc<AlpacaBrokerApi>,
+    alpaca_broker: InstrumentedAlpacaBroker,
     alpaca_wallet: Arc<AlpacaWalletService>,
     cctp_bridge: Arc<CctpBridge<Chain, Chain>>,
     raindex: Arc<RaindexService<Chain>>,
@@ -53,7 +52,7 @@ enum AttestationPollOutcome {
 
 impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
     pub(crate) fn new(
-        alpaca_broker: Arc<AlpacaBrokerApi>,
+        alpaca_broker: InstrumentedAlpacaBroker,
         alpaca_wallet: Arc<AlpacaWalletService>,
         cctp_bridge: Arc<CctpBridge<Chain, Chain>>,
         raindex: Arc<RaindexService<Chain>>,
@@ -2474,8 +2473,8 @@ mod tests {
 
     use st0x_execution::alpaca_broker_api::CryptoOrderFailureReason;
     use st0x_execution::{
-        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiError, AlpacaBrokerApiMode, Executor,
-        TimeInForce,
+        AlpacaAccountId, AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiError,
+        AlpacaBrokerApiMode, Executor, TimeInForce,
     };
 
     use st0x_bridge::Bridge;
@@ -2493,6 +2492,7 @@ mod tests {
         AlpacaTransferId, AlpacaWalletClient, AlpacaWalletError, PollingConfig,
     };
     use crate::bindings::IERC20;
+    use crate::telemetry::TelemetrySender;
     use crate::usdc_rebalance::{RebalanceDirection, TransferRef, UsdcRebalanceError};
     use st0x_finance::UsdcConversionError;
 
@@ -3060,7 +3060,10 @@ mod tests {
         let server = MockServer::start();
         let (_anvil, endpoint, private_key) = setup_anvil();
 
-        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let wallet = create_test_wallet(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
@@ -3116,7 +3119,10 @@ mod tests {
         let server = MockServer::start();
         let (_anvil, endpoint, private_key) = setup_anvil();
 
-        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let wallet = create_test_wallet(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
@@ -3179,7 +3185,10 @@ mod tests {
         let server = MockServer::start();
         let (_anvil, endpoint, private_key) = setup_anvil();
 
-        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let wallet = create_test_wallet(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
@@ -3236,7 +3245,10 @@ mod tests {
         let server = MockServer::start();
         let (_anvil, endpoint, private_key) = setup_anvil();
 
-        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let wallet = create_test_wallet(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
@@ -3276,7 +3288,10 @@ mod tests {
         let server = MockServer::start();
         let (_anvil, endpoint, private_key) = setup_anvil();
 
-        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let wallet = create_test_wallet(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
@@ -3315,7 +3330,10 @@ mod tests {
         let (_anvil, endpoint, private_key) = setup_anvil();
 
         let _account_mock = create_broker_account_mock(&server);
-        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let wallet = create_test_wallet(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
@@ -3361,7 +3379,10 @@ mod tests {
         let (_anvil, endpoint, private_key) = setup_anvil();
 
         let _account_mock = create_broker_account_mock(&server);
-        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let wallet = create_test_wallet(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
@@ -3415,7 +3436,10 @@ mod tests {
         let (_anvil, endpoint, private_key) = setup_anvil();
 
         let _account_mock = create_broker_account_mock(&server);
-        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let wallet = create_test_wallet(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
@@ -3460,7 +3484,10 @@ mod tests {
         let (_anvil, endpoint, private_key) = setup_anvil();
 
         let _account_mock = create_broker_account_mock(&server);
-        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let wallet = create_test_wallet(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
@@ -3513,7 +3540,10 @@ mod tests {
         let (_anvil, endpoint, private_key) = setup_anvil();
 
         let _account_mock = create_broker_account_mock(&server);
-        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let wallet = create_test_wallet(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
@@ -3629,7 +3659,10 @@ mod tests {
         let (_anvil, endpoint, private_key) = setup_anvil();
 
         let _account_mock = create_broker_account_mock(&server);
-        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let wallet = create_test_wallet(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
@@ -3697,7 +3730,10 @@ mod tests {
         let server = MockServer::start();
         let (_anvil, endpoint, private_key) = setup_anvil();
 
-        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let wallet = create_test_wallet(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
@@ -3769,7 +3805,10 @@ mod tests {
         let server = MockServer::start();
         let (_anvil, endpoint, private_key) = setup_anvil();
 
-        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let wallet = create_test_wallet(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
@@ -3837,7 +3876,10 @@ mod tests {
         let (_anvil, endpoint, private_key) = setup_anvil();
 
         let _account_mock = create_broker_account_mock(&server);
-        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let wallet = create_test_wallet(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
@@ -3898,7 +3940,10 @@ mod tests {
         let (_anvil, endpoint, private_key) = setup_anvil();
 
         let _account_mock = create_broker_account_mock(&server);
-        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let wallet = create_test_wallet(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
@@ -3975,7 +4020,10 @@ mod tests {
         let (_anvil, endpoint, private_key) = setup_anvil();
 
         let _account_mock = create_broker_account_mock(&server);
-        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let wallet = create_test_wallet(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
@@ -4039,7 +4087,10 @@ mod tests {
         let (_anvil, endpoint, private_key) = setup_anvil();
 
         let _account_mock = create_broker_account_mock(&server);
-        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let wallet = create_test_wallet(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
@@ -4095,7 +4146,10 @@ mod tests {
         let (_anvil, endpoint, private_key) = setup_anvil();
 
         let _account_mock = create_broker_account_mock(&server);
-        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let wallet = create_test_wallet(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
@@ -4152,7 +4206,10 @@ mod tests {
         alloy::node_bindings::AnvilInstance,
     ) {
         let (anvil, endpoint, private_key) = setup_anvil();
-        let alpaca_broker = Arc::new(create_test_broker_service(server).await);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(server).await,
+            TelemetrySender::disabled(),
+        );
         let alpaca_wallet = Arc::new(create_test_wallet_service(server));
         let wallet = create_test_wallet(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
@@ -4187,7 +4244,10 @@ mod tests {
         alloy::node_bindings::AnvilInstance,
     ) {
         let (anvil, endpoint, private_key) = setup_anvil();
-        let alpaca_broker = Arc::new(create_test_broker_service(server).await);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(server).await,
+            TelemetrySender::disabled(),
+        );
         let alpaca_wallet = Arc::new(create_test_wallet_service(server));
         let wallet = create_test_wallet(&endpoint, &private_key);
         let (cctp_bridge, vault_service) =
@@ -5693,7 +5753,10 @@ mod tests {
 
         // Build the manager on the same bridge with Alpaca mocked.
         let server = MockServer::start();
-        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let vault_service = RaindexService::new(
             create_test_wallet(&chains.base_endpoint, &chains.bot_key),
@@ -5866,7 +5929,10 @@ mod tests {
             .unwrap();
 
         let server = MockServer::start();
-        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let vault_service = RaindexService::new(
             create_test_wallet(&chains.base_endpoint, &chains.bot_key),
@@ -6121,7 +6187,10 @@ mod tests {
         let server = MockServer::start();
         let (_anvil, endpoint, private_key) = setup_anvil();
 
-        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let wallet = create_test_wallet(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
@@ -6176,7 +6245,10 @@ mod tests {
         let server = MockServer::start();
         let (_anvil, endpoint, private_key) = setup_anvil();
 
-        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(&server).await,
+            TelemetrySender::disabled(),
+        );
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let wallet = create_test_wallet(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(wallet);
@@ -6459,7 +6531,10 @@ mod tests {
         cqrs: Arc<Store<UsdcRebalance>>,
     ) -> CrossVenueCashTransfer<RawPrivateKeyWallet<impl alloy::providers::Provider + Clone + use<>>>
     {
-        let alpaca_broker = Arc::new(create_test_broker_service(server).await);
+        let alpaca_broker = InstrumentedAlpacaBroker::new(
+            create_test_broker_service(server).await,
+            TelemetrySender::disabled(),
+        );
         let bridge_wallet = create_test_wallet(&chain.endpoint, &chain.bot_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(bridge_wallet);
 
