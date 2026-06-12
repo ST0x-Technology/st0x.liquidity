@@ -90,10 +90,11 @@ rsa = { version = "0.9.10", features = ["pem"] }
 serde = { version = "1.0.197", features = ["derive"] }
 serde_json = "1.0.140"
 serial_test = "3.2.0"
-sqlx = { version = "0.8.6", features = [
+sqlx = { version = "0.9.0", features = [
   "sqlite",
   "chrono",
-  "runtime-tokio-rustls",
+  "runtime-tokio",
+  "tls-rustls",
 ] }
 st0x-bridge = { path = "crates/bridge" }
 st0x-config = { path = "crates/config" }
@@ -138,12 +139,12 @@ wasm-bindgen = "=0.2.122"
 
 [workspace.dependencies.sqlite-es]
 git = "https://github.com/ST0x-Technology/event-sorcery.git"
-rev = "1557172049c8a43add209a86c7d809e89a5fbc82"
+tag = "0.1.1"
 package = "sqlite-es"
 
 [workspace.dependencies.st0x-event-sorcery]
 git = "https://github.com/ST0x-Technology/event-sorcery.git"
-rev = "1557172049c8a43add209a86c7d809e89a5fbc82"
+tag = "0.1.1"
 package = "event-sorcery"
 
 [package]
@@ -233,6 +234,11 @@ apalis-workflow.workspace = true
 axum.workspace = true
 apalis-board.workspace = true
 st0x-wrapper = { workspace = true, features = ["erc4626"] }
+sqlx-apalis = { version = "0.8.6", package = "sqlx", features = [
+  "sqlite",
+  "chrono",
+  "runtime-tokio-rustls",
+] }
 
 [dev-dependencies]
 approx.workspace = true

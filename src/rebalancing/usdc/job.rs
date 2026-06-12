@@ -276,13 +276,12 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use sqlx::SqlitePool;
     use uuid::Uuid;
 
     use st0x_float_macro::float;
 
     use super::*;
-    use crate::conductor::setup_apalis_tables;
+    use crate::test_utils::setup_test_apalis_pool;
 
     struct TimeoutBaseToAlpaca;
 
@@ -374,14 +373,12 @@ mod tests {
         }
     }
 
-    async fn setup_queue_pool() -> SqlitePool {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        setup_apalis_tables(&pool).await.unwrap();
-        pool
+    async fn setup_queue_pool() -> apalis_sqlite::SqlitePool {
+        setup_test_apalis_pool().await
     }
 
-    async fn pending_job_count<Task>(pool: &SqlitePool) -> i64 {
-        sqlx::query_scalar(
+    async fn pending_job_count<Task>(pool: &apalis_sqlite::SqlitePool) -> i64 {
+        sqlx_apalis::query_scalar(
             "SELECT COUNT(*) FROM Jobs \
              WHERE job_type = ? AND status = 'Pending'",
         )
@@ -394,8 +391,8 @@ mod tests {
     /// Returns the serialized payload (apalis stores it as a `serde_json` BLOB
     /// via `JsonCodec`) and the `run_at` unix-second timestamp of the single
     /// pending row of the given task type.
-    async fn pending_job_row<Task>(pool: &SqlitePool) -> (Vec<u8>, i64) {
-        sqlx::query_as(
+    async fn pending_job_row<Task>(pool: &apalis_sqlite::SqlitePool) -> (Vec<u8>, i64) {
+        sqlx_apalis::query_as(
             "SELECT job, run_at FROM Jobs \
              WHERE job_type = ? AND status = 'Pending'",
         )

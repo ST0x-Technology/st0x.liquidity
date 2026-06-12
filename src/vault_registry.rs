@@ -740,7 +740,7 @@ mod tests {
     use st0x_event_sorcery::{EntityList, Reactor, StoreBuilder, TestHarness, deps, replay};
 
     use super::*;
-    use crate::test_utils::setup_test_db;
+    use crate::test_utils::{setup_test_db, setup_test_pools};
 
     const TEST_ORDERBOOK: Address = address!("0x1234567890123456789012345678901234567890");
     const TEST_OWNER: Address = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
@@ -1722,12 +1722,12 @@ mod tests {
         );
     }
 
-    async fn job_attempts_for_seed(pool: &sqlx::SqlitePool) -> i64 {
-        use sqlx::Row;
+    async fn job_attempts_for_seed(apalis_pool: &apalis_sqlite::SqlitePool) -> i64 {
+        use sqlx_apalis::Row;
         let queue_name = std::any::type_name::<SeedVaultRegistry>();
-        sqlx::query("SELECT attempts FROM Jobs WHERE job_type = ?")
+        sqlx_apalis::query("SELECT attempts FROM Jobs WHERE job_type = ?")
             .bind(queue_name)
-            .fetch_one(pool)
+            .fetch_one(apalis_pool)
             .await
             .unwrap()
             .get::<i64, _>("attempts")
@@ -1752,15 +1752,13 @@ mod tests {
         use std::time::Duration;
 
         use crate::conductor::job::{FAIL_STOP_RECOVERY_TIMEOUT, FailureInjector, JobQueue, work};
-        use crate::conductor::setup_apalis_tables;
 
-        let pool = setup_test_db().await;
-        setup_apalis_tables(&pool).await.unwrap();
+        let (pool, apalis_pool) = setup_test_pools().await;
 
         let ctx = ctx_with_seeded_assets();
         let seed_ctx = seed_ctx_from(pool.clone(), &ctx).await;
 
-        let mut queue: JobQueue<SeedVaultRegistry> = JobQueue::new(&pool);
+        let mut queue: JobQueue<SeedVaultRegistry> = JobQueue::new(&apalis_pool);
         queue.push(SeedVaultRegistry).await.unwrap();
 
         let injector = FailureInjector::new();
@@ -1802,7 +1800,7 @@ mod tests {
             .expect("Monitor task should not panic")
             .ok();
 
-        let attempts = job_attempts_for_seed(&pool).await;
+        let attempts = job_attempts_for_seed(&apalis_pool).await;
         assert!(
             attempts > 1,
             "Job should have been retried at least once; attempts={attempts}",

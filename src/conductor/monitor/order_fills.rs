@@ -117,7 +117,7 @@ enum OrderFillMonitorError {
     #[error(transparent)]
     Enqueue(#[from] QueuePushError),
     #[error("failed to query backfill job status: {0}")]
-    JobStatus(#[from] sqlx::Error),
+    JobStatus(#[from] apalis_sqlite::SqlxError),
 }
 
 impl<P: Provider + Clone> OrderFillMonitor<P> {
@@ -195,8 +195,7 @@ mod tests {
     use sqlx::SqlitePool;
 
     use super::*;
-    use crate::conductor::setup_apalis_tables;
-    use crate::test_utils::setup_test_db;
+    use crate::test_utils::setup_test_pools;
 
     /// Builds a mock provider whose `eth_blockNumber` resolves the tip to
     /// `block`, so `latest_confirmed_block` returns `block - confs`.
@@ -206,11 +205,11 @@ mod tests {
         ProviderBuilder::new().connect_mocked_client(asserter)
     }
 
-    async fn backfill_job_count(pool: &SqlitePool) -> i64 {
-        sqlx::query_scalar::<_, i64>(
+    async fn backfill_job_count(apalis_pool: &apalis_sqlite::SqlitePool) -> i64 {
+        sqlx_apalis::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM Jobs WHERE job_type LIKE '%BackfillRange%'",
         )
-        .fetch_one(pool)
+        .fetch_one(apalis_pool)
         .await
         .unwrap()
     }
@@ -218,10 +217,14 @@ mod tests {
     async fn setup<P>(
         provider: P,
         required_confirmations: u64,
-    ) -> (OrderFillMonitor<P>, SqlitePool, EvmCtx) {
-        let pool = setup_test_db().await;
-        setup_apalis_tables(&pool).await.unwrap();
-        let backfill_queue = BackfillJobQueue::new(&pool);
+    ) -> (
+        OrderFillMonitor<P>,
+        SqlitePool,
+        apalis_sqlite::SqlitePool,
+        EvmCtx,
+    ) {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let backfill_queue = BackfillJobQueue::new(&apalis_pool);
 
         let evm_ctx = EvmCtx {
             rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
@@ -238,14 +241,14 @@ mod tests {
             Duration::from_secs(5),
         );
 
-        (monitor, pool, evm_ctx)
+        (monitor, pool, apalis_pool, evm_ctx)
     }
 
-    async fn loaded_backfill(pool: &SqlitePool) -> BackfillRange {
-        let job_payload = sqlx::query_scalar::<_, Vec<u8>>(
+    async fn loaded_backfill(apalis_pool: &apalis_sqlite::SqlitePool) -> BackfillRange {
+        let job_payload = sqlx_apalis::query_scalar::<_, Vec<u8>>(
             "SELECT job FROM Jobs WHERE job_type LIKE '%BackfillRange%'",
         )
-        .fetch_one(pool)
+        .fetch_one(apalis_pool)
         .await
         .unwrap();
         serde_json::from_slice(&job_payload).unwrap()
@@ -254,15 +257,15 @@ mod tests {
     #[tokio::test]
     async fn poll_once_enqueues_range_capped_at_confirmation_boundary() {
         // checkpoint=99, tip=105, confs=3 -> cutoff=102, from=100.
-        let (mut monitor, pool, evm_ctx) = setup(provider_at_tip(105), 3).await;
+        let (mut monitor, pool, apalis_pool, evm_ctx) = setup(provider_at_tip(105), 3).await;
         crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 99)
             .await
             .unwrap();
 
         monitor.poll_once().await.unwrap();
 
-        assert_eq!(backfill_job_count(&pool).await, 1);
-        let job = loaded_backfill(&pool).await;
+        assert_eq!(backfill_job_count(&apalis_pool).await, 1);
+        let job = loaded_backfill(&apalis_pool).await;
         assert_eq!(job.from_block, 100, "backfill must resume after checkpoint");
         assert_eq!(
             job.to_block, 102,
@@ -273,11 +276,11 @@ mod tests {
     #[tokio::test]
     async fn poll_once_uses_deployment_block_without_checkpoint() {
         // No checkpoint: from_block falls back to deployment_block (1).
-        let (mut monitor, pool, _evm_ctx) = setup(provider_at_tip(50), 0).await;
+        let (mut monitor, _pool, apalis_pool, _evm_ctx) = setup(provider_at_tip(50), 0).await;
 
         monitor.poll_once().await.unwrap();
 
-        let job = loaded_backfill(&pool).await;
+        let job = loaded_backfill(&apalis_pool).await;
         assert_eq!(job.from_block, 1, "first run resumes from deployment_block");
         assert_eq!(job.to_block, 50);
     }
@@ -285,7 +288,7 @@ mod tests {
     #[tokio::test]
     async fn poll_once_skips_when_caught_up() {
         // checkpoint=105, tip=105, confs=3 -> cutoff=102, from=106 > cutoff.
-        let (mut monitor, pool, evm_ctx) = setup(provider_at_tip(105), 3).await;
+        let (mut monitor, pool, apalis_pool, evm_ctx) = setup(provider_at_tip(105), 3).await;
         crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 105)
             .await
             .unwrap();
@@ -293,7 +296,7 @@ mod tests {
         monitor.poll_once().await.unwrap();
 
         assert_eq!(
-            backfill_job_count(&pool).await,
+            backfill_job_count(&apalis_pool).await,
             0,
             "nothing to enqueue when checkpoint is past the confirmation boundary"
         );
@@ -303,12 +306,12 @@ mod tests {
     async fn poll_once_does_not_enqueue_when_no_block_is_safe_yet() {
         // Chain shallower than confs: latest_confirmed_block -> None -> 0.
         // checkpoint absent so from_block = deployment_block = 1 > 0: skip.
-        let (mut monitor, pool, _evm_ctx) = setup(provider_at_tip(2), 5).await;
+        let (mut monitor, _pool, apalis_pool, _evm_ctx) = setup(provider_at_tip(2), 5).await;
 
         monitor.poll_once().await.unwrap();
 
         assert_eq!(
-            backfill_job_count(&pool).await,
+            backfill_job_count(&apalis_pool).await,
             0,
             "no safe block to ingest yet -> no enqueue"
         );
@@ -321,12 +324,12 @@ mod tests {
         // so the empty asserter is never polled).
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let (mut monitor, pool, evm_ctx) = setup(provider, 0).await;
+        let (mut monitor, pool, apalis_pool, evm_ctx) = setup(provider, 0).await;
 
         crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 10)
             .await
             .unwrap();
-        let mut other_handle = BackfillJobQueue::new(&pool);
+        let mut other_handle = BackfillJobQueue::new(&apalis_pool);
         other_handle
             .push(BackfillRange {
                 from_block: 11,
@@ -334,12 +337,12 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(backfill_job_count(&pool).await, 1);
+        assert_eq!(backfill_job_count(&apalis_pool).await, 1);
 
         monitor.poll_once().await.unwrap();
 
         assert_eq!(
-            backfill_job_count(&pool).await,
+            backfill_job_count(&apalis_pool).await,
             1,
             "overlap guard must prevent a second enqueue while one is in flight"
         );
@@ -352,13 +355,13 @@ mod tests {
         // indefinitely -- the deterministic worker name means apalis never
         // ages the orphan out. `requeue_orphaned`, wired at conductor startup,
         // is what unwedges it.
-        let (mut monitor, pool, evm_ctx) = setup(provider_at_tip(105), 3).await;
+        let (mut monitor, pool, apalis_pool, evm_ctx) = setup(provider_at_tip(105), 3).await;
         crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 10)
             .await
             .unwrap();
 
-        let queue = BackfillJobQueue::new(&pool);
-        BackfillJobQueue::new(&pool)
+        let queue = BackfillJobQueue::new(&apalis_pool);
+        BackfillJobQueue::new(&apalis_pool)
             .push(BackfillRange {
                 from_block: 11,
                 to_block: 20,
@@ -367,15 +370,17 @@ mod tests {
             .unwrap();
         // Simulate a crash mid-process: the row is stuck `Running` with no
         // live worker owning it.
-        sqlx::query("UPDATE Jobs SET status = 'Running' WHERE job_type LIKE '%BackfillRange%'")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Running' WHERE job_type LIKE '%BackfillRange%'",
+        )
+        .execute(&apalis_pool)
+        .await
+        .unwrap();
 
         // The wedge: the poller skips while the orphan counts as in flight.
         monitor.poll_once().await.unwrap();
         assert_eq!(
-            backfill_job_count(&pool).await,
+            backfill_job_count(&apalis_pool).await,
             1,
             "orphaned Running range still blocks the overlap guard"
         );
@@ -384,10 +389,10 @@ mod tests {
         let reset = queue.requeue_orphaned().await.unwrap();
         assert_eq!(reset, 1, "the orphaned backfill range is requeued");
 
-        let status = sqlx::query_scalar::<_, String>(
+        let status = sqlx_apalis::query_scalar::<_, String>(
             "SELECT status FROM Jobs WHERE job_type LIKE '%BackfillRange%'",
         )
-        .fetch_one(&pool)
+        .fetch_one(&apalis_pool)
         .await
         .unwrap();
         assert_eq!(status, "Pending", "requeue makes the orphan re-drivable");

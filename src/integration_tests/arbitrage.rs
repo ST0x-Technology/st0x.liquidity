@@ -51,7 +51,7 @@ use crate::onchain::pyth::PythFeedIds;
 use crate::onchain::trade::RaindexTradeEvent;
 use crate::position::{Position, PositionCommand};
 use crate::symbol::cache::SymbolCache;
-use crate::test_utils::{deploy_tofu_singleton, setup_test_db};
+use crate::test_utils::{deploy_tofu_singleton, setup_test_pools};
 use crate::tokenization::alpaca::tests::setup_anvil;
 use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::trade_accountant::TradeAccountingError;
@@ -662,6 +662,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> AnvilOrderBook<P> {
 /// dispatches, while the same projection is returned for type-safe loading.
 async fn create_test_cqrs(
     pool: &SqlitePool,
+    apalis_pool: &apalis_sqlite::SqlitePool,
 ) -> (
     TradeProcessingCqrs,
     Arc<Store<Position>>,
@@ -671,6 +672,7 @@ async fn create_test_cqrs(
 ) {
     create_test_cqrs_with_assets(
         pool,
+        apalis_pool,
         AssetsConfig {
             equities: EquitiesConfig {
                 operational_limit: None,
@@ -684,6 +686,7 @@ async fn create_test_cqrs(
 
 async fn create_test_cqrs_with_assets(
     pool: &SqlitePool,
+    apalis_pool: &apalis_sqlite::SqlitePool,
     assets: AssetsConfig,
 ) -> (
     TradeProcessingCqrs,
@@ -708,7 +711,6 @@ async fn create_test_cqrs_with_assets(
             .await
             .unwrap();
 
-    crate::conductor::setup_apalis_tables(pool).await.unwrap();
     let cqrs = TradeProcessingCqrs {
         onchain_trade,
         position: position.clone(),
@@ -717,7 +719,7 @@ async fn create_test_cqrs_with_assets(
         execution_threshold: ExecutionThreshold::whole_share(),
         assets,
         counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
-        poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(pool),
+        poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(apalis_pool),
     };
 
     (
@@ -733,9 +735,9 @@ async fn create_test_cqrs_with_assets(
 async fn onchain_trades_accumulate_and_trigger_offchain_fill()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut orderbook = setup_anvil_orderbook().await;
-    let pool = setup_test_db().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
     let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
-        create_test_cqrs(&pool).await;
+        create_test_cqrs(&pool, &apalis_pool).await;
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // Checkpoint 1: before any trades -- no Position aggregate exists
@@ -885,9 +887,9 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
 #[tokio::test]
 async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std::error::Error>> {
     let mut orderbook = setup_anvil_orderbook().await;
-    let pool = setup_test_db().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
     let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
-        create_test_cqrs(&pool).await;
+        create_test_cqrs(&pool, &apalis_pool).await;
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // Two trades: 0.5 + 0.7 = 1.2 shares, crosses threshold
@@ -1027,9 +1029,9 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
 #[allow(clippy::too_many_lines)]
 async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     let mut orderbook = setup_anvil_orderbook().await;
-    let pool = setup_test_db().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
     let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
-        create_test_cqrs(&pool).await;
+        create_test_cqrs(&pool, &apalis_pool).await;
     let aapl = Symbol::new(TEST_AAPL).unwrap();
     let msft = Symbol::new(TEST_MSFT).unwrap();
 
@@ -1293,9 +1295,9 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Error>> {
     let mut orderbook = setup_anvil_orderbook().await;
-    let pool = setup_test_db().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
     let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
-        create_test_cqrs(&pool).await;
+        create_test_cqrs(&pool, &apalis_pool).await;
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // Trade 1: Buy 0.5 shares, below threshold
@@ -1420,8 +1422,9 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
 #[tokio::test]
 async fn exact_threshold_triggers_execution() -> Result<(), Box<dyn std::error::Error>> {
     let mut orderbook = setup_anvil_orderbook().await;
-    let pool = setup_test_db().await;
-    let (cqrs, _position, position_query, _offchain_order, _) = create_test_cqrs(&pool).await;
+    let (pool, apalis_pool) = setup_test_pools().await;
+    let (cqrs, _position, position_query, _offchain_order, _) =
+        create_test_cqrs(&pool, &apalis_pool).await;
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     let trade1 = orderbook
@@ -1489,9 +1492,9 @@ async fn exact_threshold_triggers_execution() -> Result<(), Box<dyn std::error::
 #[tokio::test]
 async fn position_checker_noop_when_hedged() -> Result<(), Box<dyn std::error::Error>> {
     let mut orderbook = setup_anvil_orderbook().await;
-    let pool = setup_test_db().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
     let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
-        create_test_cqrs(&pool).await;
+        create_test_cqrs(&pool, &apalis_pool).await;
 
     // Complete a full hedge cycle so position net=0
     let trade1 = orderbook
@@ -1546,9 +1549,9 @@ async fn position_checker_noop_when_hedged() -> Result<(), Box<dyn std::error::E
 #[tokio::test]
 async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
     let mut orderbook = setup_anvil_orderbook().await;
-    let pool = setup_test_db().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
     let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
-        create_test_cqrs(&pool).await;
+        create_test_cqrs(&pool, &apalis_pool).await;
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // First cycle: 1.0 share sell -> hedge -> fill
@@ -1668,8 +1671,8 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
 #[tokio::test]
 async fn take_order_discovers_equity_vault() -> Result<(), Box<dyn std::error::Error>> {
     let mut orderbook = setup_anvil_orderbook().await;
-    let pool = setup_test_db().await;
-    let (cqrs, _, _, _, _) = create_test_cqrs(&pool).await;
+    let (pool, apalis_pool) = setup_test_pools().await;
+    let (cqrs, _, _, _, _) = create_test_cqrs(&pool, &apalis_pool).await;
 
     let trade1 = orderbook
         .take_order()
@@ -1758,8 +1761,9 @@ async fn take_order_discovers_equity_vault() -> Result<(), Box<dyn std::error::E
 #[tokio::test]
 async fn tiny_fractional_trade_tracks_precisely() -> Result<(), Box<dyn std::error::Error>> {
     let mut orderbook = setup_anvil_orderbook().await;
-    let pool = setup_test_db().await;
-    let (cqrs, _position, position_query, _offchain_order, _) = create_test_cqrs(&pool).await;
+    let (pool, apalis_pool) = setup_test_pools().await;
+    let (cqrs, _position, position_query, _offchain_order, _) =
+        create_test_cqrs(&pool, &apalis_pool).await;
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     let trade1 = orderbook
@@ -1803,8 +1807,9 @@ async fn tiny_fractional_trade_tracks_precisely() -> Result<(), Box<dyn std::err
 #[tokio::test]
 async fn large_trade_triggers_immediate_execution() -> Result<(), Box<dyn std::error::Error>> {
     let mut orderbook = setup_anvil_orderbook().await;
-    let pool = setup_test_db().await;
-    let (cqrs, _position, position_query, _offchain_order, _) = create_test_cqrs(&pool).await;
+    let (pool, apalis_pool) = setup_test_pools().await;
+    let (cqrs, _position, position_query, _offchain_order, _) =
+        create_test_cqrs(&pool, &apalis_pool).await;
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     let trade1 = orderbook
@@ -1859,9 +1864,9 @@ async fn large_trade_triggers_immediate_execution() -> Result<(), Box<dyn std::e
 #[tokio::test]
 async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::error::Error>> {
     let mut orderbook = setup_anvil_orderbook().await;
-    let pool = setup_test_db().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
     let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
-        create_test_cqrs(&pool).await;
+        create_test_cqrs(&pool, &apalis_pool).await;
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // Trade 1: Buy 0.8 AAPL -> net=+0.8, below threshold
@@ -2017,8 +2022,9 @@ async fn mixed_direction_trades_partially_cancel() -> Result<(), Box<dyn std::er
 #[tokio::test]
 async fn pending_order_blocks_new_execution() -> Result<(), Box<dyn std::error::Error>> {
     let mut orderbook = setup_anvil_orderbook().await;
-    let pool = setup_test_db().await;
-    let (cqrs, _position, position_query, _offchain_order, _) = create_test_cqrs(&pool).await;
+    let (pool, apalis_pool) = setup_test_pools().await;
+    let (cqrs, _position, position_query, _offchain_order, _) =
+        create_test_cqrs(&pool, &apalis_pool).await;
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // Trade 1: Sell 1.5 AAPL -> crosses threshold, offchain order placed
@@ -2105,8 +2111,9 @@ async fn pending_order_blocks_new_execution() -> Result<(), Box<dyn std::error::
 #[tokio::test]
 async fn duplicate_onchain_event_is_idempotent() -> Result<(), Box<dyn std::error::Error>> {
     let mut orderbook = setup_anvil_orderbook().await;
-    let pool = setup_test_db().await;
-    let (cqrs, _position, position_query, _offchain_order, _) = create_test_cqrs(&pool).await;
+    let (pool, apalis_pool) = setup_test_pools().await;
+    let (cqrs, _position, position_query, _offchain_order, _) =
+        create_test_cqrs(&pool, &apalis_pool).await;
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     let trade1 = orderbook
@@ -2158,7 +2165,7 @@ async fn duplicate_onchain_event_is_idempotent() -> Result<(), Box<dyn std::erro
 async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut orderbook = setup_anvil_orderbook().await;
-    let pool = setup_test_db().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
 
     // Per-asset limit = 1 share. A 3-share onchain sell requires
     // 3 cycles of 1-share hedges to fully close.
@@ -2184,7 +2191,7 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
         cash: None,
     };
     let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
-        create_test_cqrs_with_assets(&pool, assets.clone()).await;
+        create_test_cqrs_with_assets(&pool, &apalis_pool, assets.clone()).await;
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // 3-share sell -> net = -3
@@ -2365,7 +2372,7 @@ async fn operational_limits_dollar_cap_constrains_counter_trades_across_cycles()
 async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_and_retry()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut orderbook = setup_anvil_orderbook().await;
-    let pool = setup_test_db().await;
+    let (pool, apalis_pool) = setup_test_pools().await;
 
     // Per-asset shares limit = 2. A 5-share onchain sell hedges 2 shares,
     // fails, retries (also capped to 2), and the pending order blocks
@@ -2392,7 +2399,7 @@ async fn operational_limits_shares_cap_constrains_counter_trades_with_failure_an
         cash: None,
     };
     let (cqrs, position, position_query, offchain_order, offchain_order_projection) =
-        create_test_cqrs_with_assets(&pool, assets.clone()).await;
+        create_test_cqrs_with_assets(&pool, &apalis_pool, assets.clone()).await;
     let symbol = Symbol::new(TEST_AAPL).unwrap();
 
     // 5-share sell -> net = -5, capped to 2 shares by max_shares

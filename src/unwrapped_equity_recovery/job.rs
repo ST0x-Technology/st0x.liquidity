@@ -677,7 +677,6 @@ mod tests {
     use st0x_raindex::{Raindex, RaindexVaultId};
     use st0x_wrapper::{MockWrapper, Wrapper};
 
-    use crate::conductor::setup_apalis_tables;
     use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand};
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
@@ -712,9 +711,7 @@ mod tests {
         equity_in_progress: HashSet<Symbol>,
         tokenizer: Arc<dyn Tokenizer>,
     ) -> UnwrappedEquityRecoveryCtx {
-        let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
-        setup_apalis_tables(&pool).await.unwrap();
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
@@ -736,7 +733,7 @@ mod tests {
             redemption_store.clone(),
         ));
         let store = Arc::new(test_store(
-            pool.clone(),
+            pool,
             UnwrappedEquityRecoveryServices {
                 raindex,
                 vault_lookup: Arc::new(mock_vault_lookup()),
@@ -754,7 +751,7 @@ mod tests {
             mint_store,
             redemption_store,
             equity_in_progress: Arc::new(RwLock::new(equity_in_progress)),
-            queue: UnwrappedEquityRecoveryJobQueue::new(&pool),
+            queue: UnwrappedEquityRecoveryJobQueue::new(&apalis_pool),
             reschedule_interval: Duration::from_secs(1),
         }
     }
@@ -784,9 +781,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let equity_in_progress = Arc::new(RwLock::new(HashSet::from([symbol.clone()])));
 
-        let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
-        setup_apalis_tables(&pool).await.unwrap();
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
@@ -827,7 +822,7 @@ mod tests {
             mint_store,
             redemption_store,
             equity_in_progress,
-            queue: UnwrappedEquityRecoveryJobQueue::new(&pool),
+            queue: UnwrappedEquityRecoveryJobQueue::new(&apalis_pool),
             reschedule_interval: Duration::from_secs(1),
         };
 
@@ -850,11 +845,12 @@ mod tests {
 
         // ...but it MUST have rescheduled itself, or the unchanged orphan balance
         // would be stranded (the snapshot only re-emits on a balance change).
-        let (rescheduled,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
-            .bind(std::any::type_name::<UnwrappedEquityRecoveryJob>())
-            .fetch_one(ctx.queue.pool())
-            .await
-            .unwrap();
+        let (rescheduled,): (i64,) =
+            sqlx_apalis::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+                .bind(std::any::type_name::<UnwrappedEquityRecoveryJob>())
+                .fetch_one(ctx.queue.pool())
+                .await
+                .unwrap();
         assert_eq!(
             rescheduled, 1,
             "guard contention must reschedule the recovery job (push_with_delay), not silently skip",
@@ -866,8 +862,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let mint_id = IssuerRequestId::new("missing-mint");
 
-        let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
         let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
@@ -926,7 +921,7 @@ mod tests {
             mint_store,
             redemption_store,
             equity_in_progress: Arc::new(RwLock::new(HashSet::new())),
-            queue: UnwrappedEquityRecoveryJobQueue::new(&pool),
+            queue: UnwrappedEquityRecoveryJobQueue::new(&apalis_pool),
             reschedule_interval: Duration::from_secs(1),
         };
 
@@ -970,10 +965,9 @@ mod tests {
 
     #[tokio::test]
     async fn enqueue_dedup_matches_symbol_exactly_not_as_substring() {
-        let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
-        crate::conductor::setup_apalis_tables(&pool).await.unwrap();
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
 
-        let mut queue = UnwrappedEquityRecoveryJobQueue::new(&pool);
+        let mut queue = UnwrappedEquityRecoveryJobQueue::new(&apalis_pool);
         queue
             .push(UnwrappedEquityRecoveryJob {
                 symbol: Symbol::new("GOOGL").unwrap(),
@@ -989,18 +983,18 @@ mod tests {
              AND json_extract(job, '$.symbol') = ?";
         let job_type = std::any::type_name::<UnwrappedEquityRecoveryJob>();
 
-        let (exact,): (i64,) = sqlx::query_as(DEDUP_QUERY)
+        let (exact,): (i64,) = sqlx_apalis::query_as(DEDUP_QUERY)
             .bind(job_type)
             .bind("GOOGL")
-            .fetch_one(&pool)
+            .fetch_one(&apalis_pool)
             .await
             .unwrap();
         assert_eq!(exact, 1, "exact symbol must match the queued GOOGL job");
 
-        let (substring,): (i64,) = sqlx::query_as(DEDUP_QUERY)
+        let (substring,): (i64,) = sqlx_apalis::query_as(DEDUP_QUERY)
             .bind(job_type)
             .bind("GOOG")
-            .fetch_one(&pool)
+            .fetch_one(&apalis_pool)
             .await
             .unwrap();
         assert_eq!(

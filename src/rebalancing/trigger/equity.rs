@@ -241,7 +241,7 @@ pub(crate) struct EquityRebalancingCheckScheduler {
 }
 
 impl EquityRebalancingCheckScheduler {
-    pub(crate) fn new(pool: &sqlx::SqlitePool) -> Self {
+    pub(crate) fn new(pool: &apalis_sqlite::SqlitePool) -> Self {
         Self {
             queue: EquityRebalancingCheckJobQueue::new(pool),
         }
@@ -279,7 +279,7 @@ pub(crate) async fn drain_pending_equity_jobs(
     let job_type = std::any::type_name::<EquityRebalancingCheck>();
 
     loop {
-        let row: Option<(String, Vec<u8>)> = sqlx::query_as(
+        let row: Option<(String, Vec<u8>)> = sqlx_apalis::query_as(
             "SELECT id, job FROM Jobs \
              WHERE status = 'Pending' AND job_type = ? \
              ORDER BY run_at LIMIT 1",
@@ -297,7 +297,7 @@ pub(crate) async fn drain_pending_equity_jobs(
             serde_json::from_slice(&payload).expect("deserialize EquityRebalancingCheck payload");
         job.perform(service).await?;
 
-        sqlx::query("UPDATE Jobs SET status = 'Done' WHERE id = ?")
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Done' WHERE id = ?")
             .bind(&id)
             .execute(&pool)
             .await
@@ -853,41 +853,41 @@ mod tests {
         assert_eq!(job.label().as_str(), "EquityRebalancingCheck(RKLB)");
     }
 
-    async fn count_pending_equity_check_jobs(pool: &sqlx::SqlitePool) -> i64 {
+    async fn count_pending_equity_check_jobs(apalis_pool: &apalis_sqlite::SqlitePool) -> i64 {
         let job_type = std::any::type_name::<EquityRebalancingCheck>();
-        sqlx::query_scalar::<_, i64>(
+        sqlx_apalis::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
         )
         .bind(job_type)
-        .fetch_one(pool)
+        .fetch_one(apalis_pool)
         .await
         .expect("count pending equity-check jobs")
     }
 
     #[tokio::test]
     async fn equity_scheduler_enqueue_check_inserts_pending_row() {
-        let pool = crate::test_utils::setup_test_db().await;
-        let scheduler = EquityRebalancingCheckScheduler::new(&pool);
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let scheduler = EquityRebalancingCheckScheduler::new(&apalis_pool);
         let symbol = Symbol::new("AAPL").unwrap();
 
         scheduler.enqueue_check(symbol).await;
 
-        assert_eq!(count_pending_equity_check_jobs(&pool).await, 1);
+        assert_eq!(count_pending_equity_check_jobs(&apalis_pool).await, 1);
     }
 
     #[tokio::test]
     async fn equity_scheduler_cancel_pending_marks_pending_rows_done() {
-        let pool = crate::test_utils::setup_test_db().await;
-        let scheduler = EquityRebalancingCheckScheduler::new(&pool);
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let scheduler = EquityRebalancingCheckScheduler::new(&apalis_pool);
 
         scheduler.enqueue_check(Symbol::new("AAPL").unwrap()).await;
         scheduler.enqueue_check(Symbol::new("MSFT").unwrap()).await;
-        assert_eq!(count_pending_equity_check_jobs(&pool).await, 2);
+        assert_eq!(count_pending_equity_check_jobs(&apalis_pool).await, 2);
 
         scheduler.cancel_pending().await;
 
         assert_eq!(
-            count_pending_equity_check_jobs(&pool).await,
+            count_pending_equity_check_jobs(&apalis_pool).await,
             0,
             "cancel_pending must drain all pending rows"
         );
@@ -895,15 +895,15 @@ mod tests {
 
     #[tokio::test]
     async fn equity_scheduler_enqueue_after_cancel_creates_fresh_row() {
-        let pool = crate::test_utils::setup_test_db().await;
-        let scheduler = EquityRebalancingCheckScheduler::new(&pool);
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let scheduler = EquityRebalancingCheckScheduler::new(&apalis_pool);
         let symbol = Symbol::new("AAPL").unwrap();
 
         scheduler.enqueue_check(symbol.clone()).await;
         scheduler.cancel_pending().await;
         scheduler.enqueue_check(symbol).await;
 
-        assert_eq!(count_pending_equity_check_jobs(&pool).await, 1);
+        assert_eq!(count_pending_equity_check_jobs(&apalis_pool).await, 1);
     }
 
     #[tokio::test]
