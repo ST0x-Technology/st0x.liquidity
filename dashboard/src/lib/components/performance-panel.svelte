@@ -3,6 +3,7 @@
   import * as Card from '$lib/components/ui/card'
   import type { HedgeLatencies } from '$lib/api/HedgeLatencies'
   import type { ReliabilityReport } from '$lib/api/ReliabilityReport'
+  import type { StageLatencies } from '$lib/api/StageLatencies'
   import { reactive } from '$lib/frp.svelte'
   import { fetchHedgeLatencies, fetchReliabilityReport } from '$lib/performance/api'
   import {
@@ -11,7 +12,13 @@
     exposureCard,
     openExposureCard,
   } from '$lib/performance/cards'
-  import { type SloStatus } from '$lib/performance/slo'
+  import {
+    type WaterfallSegmentName,
+    type WaterfallSort,
+    layoutPercentileSeries,
+    layoutWaterfall,
+  } from '$lib/performance/charts'
+  import { type SloStatus, formatDurationMs } from '$lib/performance/slo'
 
   const POLL_INTERVAL_MS = 30_000
   const CARD_WINDOW_HOURS = 24
@@ -41,10 +48,65 @@
     }
   }
 
+  type RangePreset = '1W' | '1M' | 'YTD' | '1Y' | 'ALL'
+
+  const RANGE_PRESETS: RangePreset[] = ['1W', '1M', 'YTD', '1Y', 'ALL']
+
+  /** Pre-dates the system's first deployment, so ALL covers everything. */
+  const ALL_TIME_START = new Date('2025-01-01T00:00:00Z')
+
+  const rangeStart = (preset: RangePreset, now: Date): Date => {
+    if (preset === '1W') {
+      return new Date(now.getTime() - 7 * 86_400_000)
+    }
+
+    if (preset === '1M') {
+      return new Date(now.getTime() - 31 * 86_400_000)
+    }
+
+    if (preset === 'YTD') {
+      return new Date(Date.UTC(now.getUTCFullYear(), 0, 1))
+    }
+
+    if (preset === '1Y') {
+      return new Date(now.getTime() - 365 * 86_400_000)
+    }
+
+    return ALL_TIME_START
+  }
+
+  const chartRange = reactive<RangePreset>('1W')
+  const chartLatencies = reactive<HedgeLatencies | null>(null)
+  const chartError = reactive<string | null>(null)
+
+  const refreshCharts = async () => {
+    const to = new Date()
+
+    try {
+      const report = await fetchHedgeLatencies({
+        from: rangeStart(chartRange.current, to),
+        to,
+      })
+      chartLatencies.update(() => report)
+      chartError.update(() => null)
+    } catch (fetchError) {
+      chartError.update(() =>
+        fetchError instanceof Error ? fetchError.message : 'Unknown error',
+      )
+    }
+  }
+
+  const selectRange = (preset: RangePreset) => {
+    chartRange.update(() => preset)
+    void refreshCharts()
+  }
+
   onMount(() => {
     void refresh()
+    void refreshCharts()
     const interval = setInterval(() => {
       void refresh()
+      void refreshCharts()
     }, POLL_INTERVAL_MS)
 
     return () => {
@@ -90,6 +152,68 @@
 
     return 'bg-red-500'
   }
+
+  const WATERFALL_PLOT_WIDTH = 600
+  const WATERFALL_MAX_ROWS = 20
+
+  const waterfallSort = reactive<WaterfallSort>('slowest')
+
+  const SEGMENT_COLORS: Record<WaterfallSegmentName, string> = {
+    unhedged: '#64748b',
+    submission: '#38bdf8',
+    execution: '#34d399',
+  }
+
+  const SEGMENT_LABELS: Record<WaterfallSegmentName, string> = {
+    unhedged: 'unhedged (fill -> placed)',
+    submission: 'submission (placed -> accepted)',
+    execution: 'execution (accepted -> filled)',
+  }
+
+  const segmentColor = (
+    name: WaterfallSegmentName,
+    status: string,
+  ): string => (name === 'execution' && status === 'failed' ? '#f87171' : SEGMENT_COLORS[name])
+
+  const waterfallRows = $derived(
+    layoutWaterfall(chartLatencies.current?.cycles ?? [], {
+      plotWidth: WATERFALL_PLOT_WIDTH,
+      sort: waterfallSort.current,
+      maxRows: WATERFALL_MAX_ROWS,
+    }),
+  )
+
+  type StageKey = keyof StageLatencies
+
+  const STAGE_OPTIONS: { key: StageKey; label: string }[] = [
+    { key: 'exposureWindow', label: 'Exposure window' },
+    { key: 'detection', label: 'Detection' },
+    { key: 'decision', label: 'Decision' },
+    { key: 'submission', label: 'Submission' },
+    { key: 'execution', label: 'Execution' },
+  ]
+
+  const SERIES_PLOT_WIDTH = 600
+  const SERIES_PLOT_HEIGHT = 160
+
+  const PERCENTILE_COLORS = {
+    p50Ms: '#34d399',
+    p90Ms: '#fbbf24',
+    p99Ms: '#f87171',
+  } as const
+
+  const selectedStage = reactive<StageKey>('exposureWindow')
+
+  const seriesLayout = $derived(
+    layoutPercentileSeries(chartLatencies.current?.buckets ?? [], selectedStage.current, {
+      plotWidth: SERIES_PLOT_WIDTH,
+      plotHeight: SERIES_PLOT_HEIGHT,
+      maxXLabels: 8,
+    }),
+  )
+
+  const rangeButtonClass = (active: boolean): string =>
+    `rounded px-2 py-1 text-xs font-medium transition-colors ${active ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground hover:text-foreground'}`
 </script>
 
 <div class="flex h-full flex-col gap-4 overflow-y-auto">
@@ -131,4 +255,184 @@
       {/if}
     </p>
   </section>
+
+  <section class="flex items-center gap-1">
+    {#each RANGE_PRESETS as preset (preset)}
+      <button
+        class={rangeButtonClass(chartRange.current === preset)}
+        onclick={() => {
+          selectRange(preset)
+        }}
+      >
+        {preset}
+      </button>
+    {/each}
+    {#if chartError.current}
+      <span class="ml-2 text-xs text-destructive">
+        Failed to load charts: {chartError.current}
+      </span>
+    {/if}
+  </section>
+
+  <Card.Root>
+    <Card.Header class="pb-2">
+      <div class="flex items-center justify-between">
+        <Card.Title class="text-sm font-medium">Hedge cycle waterfall</Card.Title>
+        <div class="flex gap-1">
+          <button
+            class={rangeButtonClass(waterfallSort.current === 'slowest')}
+            onclick={() => {
+              waterfallSort.update(() => 'slowest')
+            }}
+          >
+            Slowest
+          </button>
+          <button
+            class={rangeButtonClass(waterfallSort.current === 'newest')}
+            onclick={() => {
+              waterfallSort.update(() => 'newest')
+            }}
+          >
+            Newest
+          </button>
+        </div>
+      </div>
+      <div class="flex flex-wrap gap-3 text-xs text-muted-foreground">
+        {#each Object.entries(SEGMENT_LABELS) as [name, label] (name)}
+          <span class="flex items-center gap-1">
+            <span
+              class="inline-block h-2 w-2 rounded-sm"
+              style:background={SEGMENT_COLORS[name as WaterfallSegmentName]}
+            ></span>
+            {label}
+          </span>
+        {/each}
+      </div>
+    </Card.Header>
+    <Card.Content>
+      {#if waterfallRows.length === 0}
+        <p class="py-6 text-center text-sm text-muted-foreground">
+          No hedge cycles in the selected range.
+        </p>
+      {:else}
+        <div class="flex flex-col gap-1">
+          {#each waterfallRows as row (row.id)}
+            <div class="flex items-center gap-2 text-xs">
+              <span class="w-14 shrink-0 font-medium">{row.symbol}</span>
+              <svg
+                viewBox={`0 0 ${String(WATERFALL_PLOT_WIDTH)} 14`}
+                class="h-3.5 min-w-0 flex-1"
+                preserveAspectRatio="none"
+              >
+                {#each row.segments as segment (segment.name)}
+                  <rect
+                    x={segment.x}
+                    y="2"
+                    width={Math.max(segment.width, segment.ms > 0 ? 1 : 0)}
+                    height="10"
+                    rx="1"
+                    fill={segmentColor(segment.name, row.status)}
+                  >
+                    <title>
+                      {SEGMENT_LABELS[segment.name]}: {formatDurationMs(segment.ms)}
+                    </title>
+                  </rect>
+                {/each}
+              </svg>
+              <span class="w-16 shrink-0 text-right tabular-nums text-muted-foreground">
+                {formatDurationMs(row.totalMs)}
+              </span>
+            </div>
+          {/each}
+        </div>
+        {#if (chartLatencies.current?.totalCycles ?? 0) > waterfallRows.length}
+          <p class="mt-2 text-xs text-muted-foreground">
+            Showing {waterfallRows.length} of {chartLatencies.current?.totalCycles} cycles
+            in range.
+          </p>
+        {/if}
+      {/if}
+    </Card.Content>
+  </Card.Root>
+
+  <Card.Root>
+    <Card.Header class="pb-2">
+      <div class="flex items-center justify-between">
+        <Card.Title class="text-sm font-medium">Latency percentiles over time</Card.Title>
+        <div class="flex gap-1">
+          {#each STAGE_OPTIONS as option (option.key)}
+            <button
+              class={rangeButtonClass(selectedStage.current === option.key)}
+              onclick={() => {
+                selectedStage.update(() => option.key)
+              }}
+            >
+              {option.label}
+            </button>
+          {/each}
+        </div>
+      </div>
+      <div class="flex gap-3 text-xs text-muted-foreground">
+        {#each Object.entries(PERCENTILE_COLORS) as [percentile, color] (percentile)}
+          <span class="flex items-center gap-1">
+            <span class="inline-block h-0.5 w-3" style:background={color}></span>
+            {percentile.replace('Ms', '')}
+          </span>
+        {/each}
+      </div>
+    </Card.Header>
+    <Card.Content>
+      {#if (seriesLayout.lines[0]?.points.length ?? 0) === 0}
+        <p class="py-6 text-center text-sm text-muted-foreground">
+          No samples for this stage in the selected range.
+        </p>
+      {:else}
+        <div class="flex items-start gap-2">
+          <span class="shrink-0 text-xs tabular-nums text-muted-foreground">
+            {formatDurationMs(seriesLayout.maxMs)}
+          </span>
+          <svg
+            viewBox={`0 0 ${String(SERIES_PLOT_WIDTH)} ${String(SERIES_PLOT_HEIGHT + 18)}`}
+            class="min-w-0 flex-1"
+          >
+            <line
+              x1="0"
+              y1={SERIES_PLOT_HEIGHT}
+              x2={SERIES_PLOT_WIDTH}
+              y2={SERIES_PLOT_HEIGHT}
+              stroke="currentColor"
+              stroke-opacity="0.15"
+            />
+            {#each seriesLayout.lines as line (line.percentile)}
+              <polyline
+                points={line.path}
+                fill="none"
+                stroke={PERCENTILE_COLORS[line.percentile]}
+                stroke-width="1.5"
+              />
+              {#each line.points as point, pointIndex (pointIndex)}
+                <circle
+                  cx={point.x}
+                  cy={point.y}
+                  r="2"
+                  fill={PERCENTILE_COLORS[line.percentile]}
+                />
+              {/each}
+            {/each}
+            {#each seriesLayout.xLabels as xLabel (xLabel.x)}
+              <text
+                x={xLabel.x}
+                y={SERIES_PLOT_HEIGHT + 14}
+                text-anchor="middle"
+                class="fill-muted-foreground"
+                font-size="10"
+              >
+                {xLabel.label}
+              </text>
+            {/each}
+          </svg>
+        </div>
+      {/if}
+    </Card.Content>
+  </Card.Root>
 </div>
