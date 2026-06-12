@@ -265,8 +265,6 @@ async fn handle_http(
             .into_response();
     };
 
-    let delay = matched_delay(&state, &parts.method, parts.uri.path()).await;
-
     let mut upstream_url = state.upstream.clone();
     upstream_url.set_path(parts.uri.path());
     upstream_url.set_query(parts.uri.query());
@@ -296,7 +294,19 @@ async fn handle_http(
 
     let status = upstream_response.status();
     let headers = upstream_response.headers().clone();
-    let bytes = upstream_response.bytes().await.unwrap_or_default();
+    let bytes = match upstream_response.bytes().await {
+        Ok(response_bytes) => response_bytes,
+        Err(error) => {
+            warn!(?error, "latency proxy failed to read response body");
+            return (
+                axum::http::StatusCode::BAD_GATEWAY,
+                "latency proxy response body error",
+            )
+                .into_response();
+        }
+    };
+
+    let delay = matched_delay(&state, &parts.method, parts.uri.path()).await;
 
     if let Some(duration) = delay {
         tokio::time::sleep(duration).await;
@@ -316,7 +326,8 @@ async fn handle_http(
 }
 
 /// Consumes one unit of the armed latency budget if this request matches
-/// the active [`LatencyConfig`], returning the delay to apply.
+/// the active [`LatencyConfig`], returning the delay to apply. Call only
+/// after the upstream response has been received successfully.
 async fn matched_delay(
     state: &LatencyProxyState,
     method: &reqwest::Method,

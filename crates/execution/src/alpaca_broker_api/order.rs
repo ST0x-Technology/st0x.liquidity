@@ -652,6 +652,8 @@ pub(crate) async fn poll_crypto_order_until_filled(
 #[cfg(test)]
 mod tests {
     use httpmock::prelude::*;
+    use proptest::prelude::*;
+    use reqwest::StatusCode;
     use serde_json::json;
     use uuid::uuid;
 
@@ -1629,5 +1631,46 @@ mod tests {
             make_order(BrokerOrderStatus::Canceled).status_display(),
             "canceled"
         );
+    }
+
+    fn api_error(status: StatusCode, message: impl Into<String>) -> AlpacaBrokerApiError {
+        AlpacaBrokerApiError::ApiError {
+            status,
+            alpaca_code: None,
+            message: message.into(),
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn duplicate_client_order_id_detected_for_422_unique_violation(
+            prefix in "\\PC*",
+            suffix in "\\PC*",
+        ) {
+            let message = format!("{prefix}client_order_id must be unique{suffix}");
+            let error = api_error(StatusCode::UNPROCESSABLE_ENTITY, message);
+            prop_assert!(is_duplicate_client_order_id(&error));
+        }
+
+        #[test]
+        fn duplicate_client_order_id_rejects_non_422_status(
+            status_code in 100u16..600u16,
+            message in "\\PC*",
+        ) {
+            prop_assume!(status_code != StatusCode::UNPROCESSABLE_ENTITY.as_u16());
+            let status = StatusCode::from_u16(status_code)
+                .expect("status codes in 100..600 are valid HTTP codes");
+            let error = api_error(status, message);
+            prop_assert!(!is_duplicate_client_order_id(&error));
+        }
+
+        #[test]
+        fn duplicate_client_order_id_rejects_422_without_unique_message(
+            message in prop::string::string_regex("([^\n]|\\n)*").unwrap(),
+        ) {
+            prop_assume!(!message.contains("client_order_id must be unique"));
+            let error = api_error(StatusCode::UNPROCESSABLE_ENTITY, message);
+            prop_assert!(!is_duplicate_client_order_id(&error));
+        }
     }
 }
