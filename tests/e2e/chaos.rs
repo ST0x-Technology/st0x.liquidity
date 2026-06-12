@@ -210,7 +210,10 @@ impl LatencyProxy {
         let state = LatencyProxyState {
             config: config.clone(),
             upstream,
-            client: Client::new(),
+            // Bound the forward leg so an unresponsive upstream cannot hang the
+            // proxy task indefinitely; the injected latency is a separate sleep,
+            // not this request, so 10s is ample headroom for the real forward.
+            client: Client::builder().timeout(Duration::from_secs(10)).build()?,
         };
 
         let app = Router::new().fallback(handle_http).with_state(state);
@@ -265,8 +268,6 @@ async fn handle_http(
             .into_response();
     };
 
-    let delay = matched_delay(&state, &parts.method, parts.uri.path()).await;
-
     let mut upstream_url = state.upstream.clone();
     upstream_url.set_path(parts.uri.path());
     upstream_url.set_query(parts.uri.query());
@@ -296,7 +297,19 @@ async fn handle_http(
 
     let status = upstream_response.status();
     let headers = upstream_response.headers().clone();
-    let bytes = upstream_response.bytes().await.unwrap_or_default();
+    let bytes = match upstream_response.bytes().await {
+        Ok(response_bytes) => response_bytes,
+        Err(error) => {
+            warn!(?error, "latency proxy failed to read response body");
+            return (
+                axum::http::StatusCode::BAD_GATEWAY,
+                "latency proxy response body error",
+            )
+                .into_response();
+        }
+    };
+
+    let delay = matched_delay(&state, &parts.method, parts.uri.path()).await;
 
     if let Some(duration) = delay {
         tokio::time::sleep(duration).await;
@@ -304,9 +317,14 @@ async fn handle_http(
 
     let mut response = (status, bytes).into_response();
     for (name, value) in &headers {
-        // reqwest already decoded the body, so framing headers no longer
-        // describe the bytes being relayed; axum sets its own.
-        if name == reqwest::header::TRANSFER_ENCODING || name == reqwest::header::CONTENT_LENGTH {
+        // reqwest already decoded the body, so framing and content-encoding
+        // headers no longer describe the bytes being relayed -- forwarding
+        // Content-Encoding would make the downstream client re-decode plain
+        // bytes. Drop them; axum sets the correct framing for the new body.
+        if name == reqwest::header::TRANSFER_ENCODING
+            || name == reqwest::header::CONTENT_LENGTH
+            || name == reqwest::header::CONTENT_ENCODING
+        {
             continue;
         }
         response.headers_mut().insert(name.clone(), value.clone());
@@ -316,7 +334,8 @@ async fn handle_http(
 }
 
 /// Consumes one unit of the armed latency budget if this request matches
-/// the active [`LatencyConfig`], returning the delay to apply.
+/// the active [`LatencyConfig`], returning the delay to apply. Call only
+/// after the upstream response has been received successfully.
 async fn matched_delay(
     state: &LatencyProxyState,
     method: &reqwest::Method,

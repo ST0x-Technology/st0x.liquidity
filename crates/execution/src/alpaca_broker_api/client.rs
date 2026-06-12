@@ -17,6 +17,13 @@ use super::order::{
 };
 use crate::{ClientOrderId, FractionalShares, Positive, Symbol};
 
+/// Request timeout applied to every Alpaca Broker API HTTP call.
+///
+/// Exposed so timing-sensitive tests can derive their boundary delays from
+/// this single source of truth instead of duplicating the literal -- a
+/// change here then cannot silently invalidate those tests.
+pub const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Alpaca Broker API HTTP client with Basic authentication
 pub(crate) struct AlpacaBrokerApiClient {
     http_client: reqwest::Client,
@@ -51,7 +58,7 @@ impl AlpacaBrokerApiClient {
         let http_client = reqwest::Client::builder()
             .default_headers(headers)
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
+            .timeout(HTTP_REQUEST_TIMEOUT)
             .build()?;
         let api_key_header = HeaderName::from_static("apca-api-key-id");
         let api_secret_header = HeaderName::from_static("apca-api-secret-key");
@@ -63,7 +70,7 @@ impl AlpacaBrokerApiClient {
         let market_data_http_client = reqwest::Client::builder()
             .default_headers(market_data_headers)
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
+            .timeout(HTTP_REQUEST_TIMEOUT)
             .build()?;
 
         Ok(Self {

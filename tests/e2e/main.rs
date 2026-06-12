@@ -14,6 +14,7 @@ mod base_chain;
 mod cctp;
 mod chaos;
 mod chaos_alpaca;
+mod chaos_combined;
 mod chaos_rpc;
 mod full_system;
 mod hedging;
