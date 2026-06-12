@@ -23,21 +23,32 @@ use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceEvent};
 /// still reported via `total_operations`.
 const MAX_OPERATION_REPORTS: usize = 100;
 
-/// Load rebalance stage timings for operations started within `range`.
+/// Aggregate types the rebalance report folds; its cache stamp is scoped to
+/// exactly these (see `super::events_version`).
+pub(super) const REBALANCE_AGGREGATE_TYPES: &[&str] = &["UsdcRebalance"];
+
+/// Fold every `UsdcRebalance` aggregate into an operation timing row,
+/// together with the events-table version the fold observed (see
+/// `super::events_version`). Range filtering happens per request in
+/// [`rebalance_timing_report`] so the fold itself is cacheable.
 ///
 /// Undeserializable events are skipped with a warning rather than failing
 /// the whole report.
-pub(crate) async fn load_rebalance_timings(
+pub(crate) async fn load_rebalance_operations(
     pool: &SqlitePool,
-    range: &ReportRange,
-) -> Result<RebalanceTimings, PerformanceError> {
+) -> Result<(Vec<RebalanceOperationTiming>, super::EventsVersion), PerformanceError> {
+    let mut transaction = pool.begin().await?;
+
+    let events_version =
+        super::events_version(&mut *transaction, REBALANCE_AGGREGATE_TYPES).await?;
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT aggregate_id, payload FROM events \
          WHERE aggregate_type = 'UsdcRebalance' \
          ORDER BY aggregate_id, sequence",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *transaction)
     .await?;
+    transaction.commit().await?;
 
     let mut streams: BTreeMap<String, Vec<UsdcRebalanceEvent>> = BTreeMap::new();
     for (aggregate_id, payload) in rows {
@@ -54,22 +65,23 @@ pub(crate) async fn load_rebalance_timings(
         .filter_map(|(operation_id, events)| fold_operation(operation_id, &events))
         .collect();
 
-    Ok(rebalance_timing_report(operations, range))
+    Ok((operations, events_version))
 }
 
-/// Assemble the dashboard report from folded operations.
+/// Assemble the dashboard report for `range` from folded operations.
 pub(crate) fn rebalance_timing_report(
-    operations: Vec<RebalanceOperationTiming>,
+    operations: &[RebalanceOperationTiming],
     range: &ReportRange,
 ) -> RebalanceTimings {
-    let mut operations: Vec<RebalanceOperationTiming> = operations
-        .into_iter()
+    let mut in_range: Vec<RebalanceOperationTiming> = operations
+        .iter()
         .filter(|operation| range.contains(operation.started_at))
+        .cloned()
         .collect();
 
-    let stage_summary = stage_summary(&operations);
+    let stage_summary = stage_summary(&in_range);
 
-    let mut attestation_trend: Vec<AttestationSample> = operations
+    let mut attestation_trend: Vec<AttestationSample> = in_range
         .iter()
         .flat_map(|operation| &operation.stages)
         .filter(|stage| stage.stage == RebalanceStageName::Attestation && !stage.failed)
@@ -82,12 +94,12 @@ pub(crate) fn rebalance_timing_report(
         .collect();
     attestation_trend.sort_by_key(|sample| sample.burned_at);
 
-    operations.sort_unstable_by_key(|operation| std::cmp::Reverse(operation.started_at));
-    let total_operations = operations.len();
-    operations.truncate(MAX_OPERATION_REPORTS);
+    in_range.sort_unstable_by_key(|operation| std::cmp::Reverse(operation.started_at));
+    let total_operations = in_range.len();
+    in_range.truncate(MAX_OPERATION_REPORTS);
 
     RebalanceTimings {
-        operations,
+        operations: in_range,
         total_operations,
         stage_summary,
         attestation_trend,
@@ -752,7 +764,7 @@ mod tests {
             })
             .collect();
 
-        let report = rebalance_timing_report(operations, &range());
+        let report = rebalance_timing_report(&operations, &range());
 
         assert_eq!(report.total_operations, MAX_OPERATION_REPORTS + 1);
         assert_eq!(report.operations.len(), MAX_OPERATION_REPORTS);
@@ -762,7 +774,7 @@ mod tests {
     fn report_summarizes_stages_and_attestation_trend() {
         let first = fold_operation("op-1".to_string(), &alpaca_to_base_happy_path()).unwrap();
 
-        let report = rebalance_timing_report(vec![first], &range());
+        let report = rebalance_timing_report(&[first], &range());
 
         assert_eq!(report.total_operations, 1);
         assert_eq!(report.operations.len(), 1);
@@ -787,7 +799,7 @@ mod tests {
             to: timestamp(200_000),
         };
 
-        let report = rebalance_timing_report(vec![operation], &narrow);
+        let report = rebalance_timing_report(&[operation], &narrow);
 
         assert_eq!(report.total_operations, 0);
         assert!(report.operations.is_empty());
@@ -796,7 +808,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_rebalance_timings_reads_event_store() {
+    async fn load_rebalance_operations_reads_event_store() {
         let pool = setup_test_db().await;
         let operation_id = Uuid::new_v4().to_string();
 
@@ -817,7 +829,8 @@ mod tests {
             .unwrap();
         }
 
-        let report = load_rebalance_timings(&pool, &range()).await.unwrap();
+        let (operations, _events_version) = load_rebalance_operations(&pool).await.unwrap();
+        let report = rebalance_timing_report(&operations, &range());
 
         assert_eq!(report.total_operations, 1);
         let operation = &report.operations[0];
