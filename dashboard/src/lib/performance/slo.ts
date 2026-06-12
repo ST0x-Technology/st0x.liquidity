@@ -39,6 +39,17 @@ export const OPEN_EXPOSURE_AGE_THRESHOLDS: SloThresholds = {
   warning: 1_800_000,
 }
 
+/**
+ * Confirmed blocks not yet processed by fill detection. Base produces a
+ * block every ~2s (https://docs.base.org/chain/network-information —
+ * re-derive these if Base ships faster blocks), so 30 blocks ≈ the 60s
+ * detection budget and 300 blocks ≈ 10 minutes of invisible fills.
+ */
+export const BLOCK_LAG_THRESHOLDS: SloThresholds = {
+  good: 30,
+  warning: 300,
+}
+
 const STATUS_RANK: Record<SloStatus, number> = {
   unknown: 0,
   good: 1,

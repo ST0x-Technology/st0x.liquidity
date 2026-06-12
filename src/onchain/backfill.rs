@@ -196,15 +196,25 @@ where
     }
 }
 
+/// Loads the checkpoint and derives the resume block. Like
+/// [`backfill_events`], only tests exercise this composition; production
+/// code loads the checkpoint itself (the monitor also feeds it to block-lag
+/// telemetry) and calls [`start_block_after`].
+#[cfg(test)]
 pub(crate) async fn backfill_start_block(
     pool: &SqlitePool,
     evm_ctx: &EvmCtx,
 ) -> Result<u64, OnChainError> {
-    load_backfill_checkpoint(pool, evm_ctx)
-        .await?
-        .map_or(Ok(evm_ctx.deployment_block), |last_processed_block| {
-            Ok((last_processed_block + 1).max(evm_ctx.deployment_block))
-        })
+    let checkpoint = load_backfill_checkpoint(pool, evm_ctx).await?;
+    Ok(start_block_after(checkpoint, evm_ctx))
+}
+
+/// First block to backfill given the persisted checkpoint: the block after
+/// the checkpoint, floored at the orderbook's deployment block.
+pub(crate) fn start_block_after(checkpoint: Option<u64>, evm_ctx: &EvmCtx) -> u64 {
+    checkpoint.map_or(evm_ctx.deployment_block, |last_processed_block| {
+        (last_processed_block + 1).max(evm_ctx.deployment_block)
+    })
 }
 
 pub(crate) async fn load_backfill_checkpoint(

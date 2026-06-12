@@ -2,14 +2,16 @@
 //! polling over a persisted checkpoint.
 //!
 //! Every `order_fill_poll_interval` seconds the monitor:
-//! 1. Skips the tick if a `BackfillRange` job is still in flight -- the
+//! 1. Reads the chain tip and derives a cutoff at `tip -
+//!    required_confirmations`. The cutoff never exceeds the confirmation
+//!    boundary, so ingestion never persists logs from blocks that could
+//!    still reorg (under the assumed reorg depth). A block-lag telemetry
+//!    sample is recorded here, before any skip, so lag stays observable
+//!    during long catch-ups.
+//! 2. Skips the tick if a `BackfillRange` job is still in flight -- the
 //!    checkpoint has not advanced yet, so re-enqueuing would re-scan the
 //!    same blocks (and during a long catch-up would stack unbounded
 //!    overlapping ranges).
-//! 2. Reads the chain tip and derives a cutoff at `tip -
-//!    required_confirmations`. The cutoff never exceeds the confirmation
-//!    boundary, so ingestion never persists logs from blocks that could
-//!    still reorg (under the assumed reorg depth).
 //! 3. Enqueues a `BackfillRange` job covering `(checkpoint+1, cutoff)`.
 //!    The `backfill-worker` fetches the logs via HTTP `eth_getLogs`,
 //!    pushes an accounting job per fill, and advances the checkpoint only
@@ -33,9 +35,10 @@
 //! will still corrupt state; `backfill_range` surfaces a `removed: true`
 //! log past the confirmation boundary loudly rather than masking it.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alloy::providers::Provider;
+use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use task_supervisor::{SupervisedTask, TaskResult};
 use tokio::time::MissedTickBehavior;
@@ -45,7 +48,12 @@ use st0x_config::EvmCtx;
 
 use crate::conductor::job::QueuePushError;
 use crate::onchain::OnChainError;
-use crate::onchain::backfill::{BackfillJobQueue, BackfillRange, backfill_start_block};
+use crate::onchain::backfill::{
+    BackfillJobQueue, BackfillRange, load_backfill_checkpoint, start_block_after,
+};
+use crate::telemetry::{
+    BlockLagSample, Monitor, prune_expired, record_block_lag, record_poll_cycle,
+};
 
 /// Polls the orderbook chain for `ClearV3` / `TakeOrderV3` fills on a
 /// fixed interval and enqueues durable [`BackfillRange`] jobs that the
@@ -93,11 +101,41 @@ impl<P: Provider + Clone + Send + Sync + 'static> SupervisedTask for OrderFillMo
 
         let mut interval = tokio::time::interval(self.poll_interval);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut previous_tick: Option<Instant> = None;
+        let mut last_prune = Instant::now();
 
         loop {
             interval.tick().await;
+            let tick = Instant::now();
+            let elapsed = previous_tick.map(|previous| tick.duration_since(previous));
+            let skipped = skipped_ticks(elapsed, self.poll_interval);
+            previous_tick = Some(tick);
 
-            if let Err(error) = self.poll_once().await {
+            let sampled_at = Utc::now();
+            let result = self.poll_once(sampled_at).await;
+
+            if let Err(error) = record_poll_cycle(
+                &self.pool,
+                Monitor::OrderFill,
+                self.evm_ctx.orderbook,
+                sampled_at,
+                tick.elapsed(),
+                skipped,
+                result.as_ref().copied(),
+            )
+            .await
+            {
+                warn!(target: "orderbook", ?error, "Failed to record poll-cycle telemetry");
+            }
+
+            if last_prune.elapsed() >= PRUNE_INTERVAL {
+                last_prune = Instant::now();
+                if let Err(error) = prune_expired(&self.pool, Utc::now()).await {
+                    warn!(target: "orderbook", ?error, "Failed to prune expired telemetry");
+                }
+            }
+
+            if let Err(error) = result {
                 warn!(
                     target: "orderbook",
                     ?error,
@@ -106,6 +144,32 @@ impl<P: Provider + Clone + Send + Sync + 'static> SupervisedTask for OrderFillMo
             }
         }
     }
+}
+
+/// How often expired telemetry rows are pruned.
+const PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Ticks silently dropped by [`MissedTickBehavior::Skip`] since the previous
+/// tick: under Skip a slow poll fires nothing for the missed slots, so the
+/// only evidence is the wall-clock gap between consecutive ticks.
+///
+/// The accounting deliberately resets on a supervised restart
+/// (`previous_tick` starts `None`): downtime across restarts shows up as a
+/// gap in the `sampled_at` series rather than a skipped-tick count.
+fn skipped_ticks(elapsed_since_previous_tick: Option<Duration>, poll_interval: Duration) -> u64 {
+    let Some(elapsed) = elapsed_since_previous_tick else {
+        return 0;
+    };
+    let interval_ms = poll_interval.as_millis().max(1);
+    // Round to the nearest interval count to absorb timer jitter; intervals
+    // beyond the first are skips.
+    let elapsed_intervals = (elapsed.as_millis() + interval_ms / 2) / interval_ms;
+    // Clamp at i64::MAX (not u64::MAX) so the value always survives the
+    // storage layer's i64 conversion instead of failing the sample write.
+    let capped = elapsed_intervals
+        .saturating_sub(1)
+        .min(u128::from(i64::MAX.unsigned_abs()));
+    u64::try_from(capped).unwrap_or(i64::MAX.unsigned_abs())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -124,7 +188,31 @@ impl<P: Provider + Clone> OrderFillMonitor<P> {
     /// One poll iteration: enqueue a backfill range for the unprocessed
     /// blocks behind the confirmation boundary, unless a previous range
     /// is still in flight or there is nothing new to fetch.
-    async fn poll_once(&mut self) -> Result<(), OrderFillMonitorError> {
+    async fn poll_once(&mut self, sampled_at: DateTime<Utc>) -> Result<(), OrderFillMonitorError> {
+        // Cutoff is the latest block past the confirmation depth. Backfill
+        // is guaranteed not to ingest logs above this boundary, preserving
+        // reorg protection.
+        let (chain_tip, confirmed_tip) =
+            chain_tip_and_confirmed(&self.provider, self.evm_ctx.required_confirmations).await?;
+        let cutoff_block = confirmed_tip.unwrap_or(0);
+        let checkpoint = load_backfill_checkpoint(&self.pool, &self.evm_ctx).await?;
+
+        // The lag sample is recorded BEFORE the overlap guard: the periods
+        // where a previous range is still in flight (long catch-ups, stuck
+        // backfills) are exactly when the growing lag must stay observable.
+        // Telemetry is best-effort: a failed sample must never fail the
+        // poll.
+        let sample = BlockLagSample {
+            sampled_at,
+            orderbook: self.evm_ctx.orderbook,
+            chain_tip,
+            confirmed_tip: cutoff_block,
+            last_processed_block: checkpoint,
+        };
+        if let Err(error) = record_block_lag(&self.pool, &sample).await {
+            warn!(target: "orderbook", ?error, "Failed to record block-lag telemetry");
+        }
+
         // Overlap guard: while a previous range is still being processed
         // the checkpoint has not advanced, so a fresh enqueue would
         // re-scan the same blocks. During a long catch-up this would
@@ -137,14 +225,12 @@ impl<P: Provider + Clone> OrderFillMonitor<P> {
             return Ok(());
         }
 
-        // Cutoff is the latest block past the confirmation depth. Backfill
-        // is guaranteed not to ingest logs above this boundary, preserving
-        // reorg protection.
-        let cutoff_block =
-            latest_confirmed_block(&self.provider, self.evm_ctx.required_confirmations)
-                .await?
-                .unwrap_or(0);
-        let from_block = backfill_start_block(&self.pool, &self.evm_ctx).await?;
+        // Re-read the checkpoint now that the guard has passed: an in-flight
+        // job may have completed (advancing the checkpoint) between the
+        // telemetry read above and the guard, and deriving the range from
+        // the stale value would re-scan blocks that job just processed.
+        let checkpoint = load_backfill_checkpoint(&self.pool, &self.evm_ctx).await?;
+        let from_block = start_block_after(checkpoint, &self.evm_ctx);
 
         if from_block <= cutoff_block {
             info!(
@@ -174,17 +260,19 @@ impl<P: Provider + Clone> OrderFillMonitor<P> {
     }
 }
 
-/// Latest block past the configured confirmation depth:
-/// `latest_tip - required_confirmations`. Returns `None` when the chain has
-/// fewer blocks than the requested confirmation depth (no block is
-/// safe to ingest yet). This is a naive reorg-protection heuristic,
-/// not real chain finality.
-pub(crate) async fn latest_confirmed_block<P: Provider>(
+/// Chain tip and the latest block past the configured confirmation depth:
+/// `(tip, tip - required_confirmations)`. The confirmed block is `None`
+/// when the chain has fewer blocks than the requested confirmation depth
+/// (no block is safe to ingest yet). This is a naive reorg-protection
+/// heuristic, not real chain finality. The raw tip is returned alongside so
+/// block-lag telemetry can record how far behind the chain detection runs.
+pub(crate) async fn chain_tip_and_confirmed<P: Provider>(
     provider: &P,
     required_confirmations: u64,
-) -> Result<Option<u64>, alloy::transports::RpcError<alloy::transports::TransportErrorKind>> {
+) -> Result<(u64, Option<u64>), alloy::transports::RpcError<alloy::transports::TransportErrorKind>>
+{
     let tip = provider.get_block_number().await?;
-    Ok(tip.checked_sub(required_confirmations))
+    Ok((tip, tip.checked_sub(required_confirmations)))
 }
 
 #[cfg(test)]
@@ -259,7 +347,7 @@ mod tests {
             .await
             .unwrap();
 
-        monitor.poll_once().await.unwrap();
+        monitor.poll_once(Utc::now()).await.unwrap();
 
         assert_eq!(backfill_job_count(&pool).await, 1);
         let job = loaded_backfill(&pool).await;
@@ -275,7 +363,7 @@ mod tests {
         // No checkpoint: from_block falls back to deployment_block (1).
         let (mut monitor, pool, _evm_ctx) = setup(provider_at_tip(50), 0).await;
 
-        monitor.poll_once().await.unwrap();
+        monitor.poll_once(Utc::now()).await.unwrap();
 
         let job = loaded_backfill(&pool).await;
         assert_eq!(job.from_block, 1, "first run resumes from deployment_block");
@@ -290,7 +378,7 @@ mod tests {
             .await
             .unwrap();
 
-        monitor.poll_once().await.unwrap();
+        monitor.poll_once(Utc::now()).await.unwrap();
 
         assert_eq!(
             backfill_job_count(&pool).await,
@@ -305,7 +393,7 @@ mod tests {
         // checkpoint absent so from_block = deployment_block = 1 > 0: skip.
         let (mut monitor, pool, _evm_ctx) = setup(provider_at_tip(2), 5).await;
 
-        monitor.poll_once().await.unwrap();
+        monitor.poll_once(Utc::now()).await.unwrap();
 
         assert_eq!(
             backfill_job_count(&pool).await,
@@ -317,11 +405,9 @@ mod tests {
     #[tokio::test]
     async fn poll_once_skips_while_backfill_in_flight() {
         // A pending BackfillRange already exists: the overlap guard must
-        // short-circuit before enqueuing (and before touching the provider,
-        // so the empty asserter is never polled).
-        let asserter = Asserter::new();
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let (mut monitor, pool, evm_ctx) = setup(provider, 0).await;
+        // short-circuit before enqueuing. The lag sample IS still recorded
+        // (long catch-ups are exactly when lag must stay observable).
+        let (mut monitor, pool, evm_ctx) = setup(provider_at_tip(50), 0).await;
 
         crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 10)
             .await
@@ -336,12 +422,22 @@ mod tests {
             .unwrap();
         assert_eq!(backfill_job_count(&pool).await, 1);
 
-        monitor.poll_once().await.unwrap();
+        monitor.poll_once(Utc::now()).await.unwrap();
 
         assert_eq!(
             backfill_job_count(&pool).await,
             1,
             "overlap guard must prevent a second enqueue while one is in flight"
+        );
+        let lag_blocks: Option<i64> =
+            sqlx::query_scalar("SELECT lag_blocks FROM block_lag_samples")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            lag_blocks,
+            Some(40),
+            "lag must be sampled even while a backfill is in flight"
         );
     }
 
@@ -373,7 +469,7 @@ mod tests {
             .unwrap();
 
         // The wedge: the poller skips while the orphan counts as in flight.
-        monitor.poll_once().await.unwrap();
+        monitor.poll_once(Utc::now()).await.unwrap();
         assert_eq!(
             backfill_job_count(&pool).await,
             1,
@@ -394,18 +490,126 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn latest_confirmed_block_subtracts_confirmations() {
-        let confirmed = latest_confirmed_block(&provider_at_tip(105), 3)
+    async fn chain_tip_and_confirmed_subtracts_confirmations() {
+        let (tip, confirmed) = chain_tip_and_confirmed(&provider_at_tip(105), 3)
             .await
             .unwrap();
+        assert_eq!(tip, 105);
         assert_eq!(confirmed, Some(102));
     }
 
     #[tokio::test]
-    async fn latest_confirmed_block_returns_none_when_chain_too_shallow() {
-        let confirmed = latest_confirmed_block(&provider_at_tip(2), 3)
+    async fn chain_tip_and_confirmed_returns_none_when_chain_too_shallow() {
+        let (tip, confirmed) = chain_tip_and_confirmed(&provider_at_tip(2), 3)
             .await
             .unwrap();
+        assert_eq!(tip, 2);
         assert_eq!(confirmed, None);
+    }
+
+    #[tokio::test]
+    async fn poll_once_records_block_lag_sample() {
+        // tip=105, confs=3 -> confirmed_tip=102; checkpoint=99 ->
+        // lag = confirmed_tip - checkpoint = 3 (caught up would read 0).
+        let (mut monitor, pool, evm_ctx) = setup(provider_at_tip(105), 3).await;
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 99)
+            .await
+            .unwrap();
+
+        monitor.poll_once(Utc::now()).await.unwrap();
+
+        let (chain_tip, confirmed_tip, last_processed_block, lag_blocks): (
+            i64,
+            i64,
+            Option<i64>,
+            Option<i64>,
+        ) = sqlx::query_as(
+            "SELECT chain_tip, confirmed_tip, last_processed_block, lag_blocks \
+             FROM block_lag_samples",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(chain_tip, 105);
+        assert_eq!(confirmed_tip, 102);
+        assert_eq!(last_processed_block, Some(99));
+        assert_eq!(lag_blocks, Some(3));
+    }
+
+    #[tokio::test]
+    async fn poll_once_reads_zero_lag_when_caught_up() {
+        // checkpoint == confirmed_tip: a healthy system must read 0, not a
+        // permanent floor of required_confirmations.
+        let (mut monitor, pool, evm_ctx) = setup(provider_at_tip(105), 3).await;
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 102)
+            .await
+            .unwrap();
+
+        monitor.poll_once(Utc::now()).await.unwrap();
+
+        let lag_blocks: Option<i64> =
+            sqlx::query_scalar("SELECT lag_blocks FROM block_lag_samples")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(lag_blocks, Some(0));
+    }
+
+    #[tokio::test]
+    async fn poll_once_records_null_lag_without_checkpoint() {
+        let (mut monitor, pool, _evm_ctx) = setup(provider_at_tip(50), 0).await;
+
+        monitor.poll_once(Utc::now()).await.unwrap();
+
+        let lag_blocks: Option<i64> =
+            sqlx::query_scalar("SELECT lag_blocks FROM block_lag_samples")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(lag_blocks, None);
+    }
+
+    #[test]
+    fn skipped_ticks_is_zero_for_first_and_on_time_ticks() {
+        let interval = Duration::from_secs(5);
+
+        assert_eq!(skipped_ticks(None, interval), 0);
+        assert_eq!(skipped_ticks(Some(Duration::from_secs(5)), interval), 0);
+        // Jitter well under half an interval still counts as on time.
+        assert_eq!(
+            skipped_ticks(Some(Duration::from_millis(5_400)), interval),
+            0
+        );
+    }
+
+    #[test]
+    fn skipped_ticks_counts_missed_intervals() {
+        let interval = Duration::from_secs(5);
+
+        assert_eq!(skipped_ticks(Some(Duration::from_secs(10)), interval), 1);
+        assert_eq!(skipped_ticks(Some(Duration::from_secs(31)), interval), 5);
+        // The rounding boundary: half an interval past the first tick tips
+        // the count from "on time" to one skip.
+        assert_eq!(
+            skipped_ticks(Some(Duration::from_millis(7_499)), interval),
+            0
+        );
+        assert_eq!(
+            skipped_ticks(Some(Duration::from_millis(7_500)), interval),
+            1
+        );
+    }
+
+    #[test]
+    fn skipped_ticks_clamps_at_i64_max_for_storage() {
+        // A pathological gap must clamp at i64::MAX (the storage layer's
+        // integer width), not fail the eventual sample write.
+        assert_eq!(
+            skipped_ticks(
+                Some(Duration::from_millis(u64::MAX)),
+                Duration::from_millis(1)
+            ),
+            i64::MAX.unsigned_abs()
+        );
     }
 }

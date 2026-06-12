@@ -1,6 +1,7 @@
 /** Pure SVG layout math for the Performance tab's latency charts. */
 
 import type { AttestationSample } from '$lib/api/AttestationSample'
+import type { BlockLagPoint } from '$lib/api/BlockLagPoint'
 import type { HedgeCycleReport } from '$lib/api/HedgeCycleReport'
 import type { LatencyBucket } from '$lib/api/LatencyBucket'
 import type { RebalanceOperationTiming } from '$lib/api/RebalanceOperationTiming'
@@ -259,6 +260,43 @@ export const layoutAttestationTrend = (
       .map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`)
       .join(' '),
     maxMs,
+  }
+}
+
+export type BlockLagLayout = {
+  points: SeriesPoint[]
+  path: string
+  maxLagBlocks: number
+}
+
+/** Lays out per-bucket worst block lag over time as a single polyline. */
+export const layoutBlockLagTrend = (
+  buckets: BlockLagPoint[],
+  options: {
+    plotWidth: number
+    plotHeight: number
+  },
+): BlockLagLayout => {
+  const maxLagBlocks = Math.max(0, ...buckets.map((bucket) => bucket.maxLagBlocks))
+  // The y-scale denominator is floored at 1 so an all-zero series divides
+  // safely; the reported maximum stays the true value (0 for a healthy
+  // series), never the scale floor.
+  const scaleMax = Math.max(1, maxLagBlocks)
+  const xDenominator = Math.max(1, buckets.length - 1)
+  const points = buckets.map((bucket, index) => ({
+    x:
+      buckets.length <= 1
+        ? options.plotWidth / 2
+        : (index / xDenominator) * options.plotWidth,
+    y: options.plotHeight - (bucket.maxLagBlocks / scaleMax) * options.plotHeight,
+  }))
+
+  return {
+    points,
+    path: points
+      .map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`)
+      .join(' '),
+    maxLagBlocks,
   }
 }
 
