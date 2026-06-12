@@ -2,6 +2,9 @@
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use std::str::FromStr;
+use strum::VariantArray;
+use thiserror::Error;
 use ts_rs::TS;
 use uuid::Uuid;
 
@@ -226,12 +229,21 @@ pub struct LogVolumeBucket {
     pub warnings: usize,
 }
 
+/// Log level counted by the reliability report. Only errors and warnings are
+/// aggregated; other levels never reach the report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, TS)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum CountedLogLevel {
+    Error,
+    Warn,
+}
+
 /// How often one log target emitted at one level.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct LogTargetCount {
     pub target: String,
-    pub level: String,
+    pub level: CountedLogLevel,
     #[ts(type = "number")]
     pub count: usize,
     /// Per-bucket counts aligned with the report's `log_buckets`.
@@ -239,11 +251,94 @@ pub struct LogTargetCount {
     pub sparkline: Vec<usize>,
 }
 
+/// Money-at-risk lifecycle failure event types surfaced by the reliability
+/// report.
+///
+/// Serialized exactly as the event store's `event_type` discriminator
+/// (`AggregateEvent::Variant`), so the wire format matches what operators
+/// see in the database and logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, TS, VariantArray)]
+pub enum FailureEventType {
+    #[serde(rename = "OffchainOrderEvent::Failed")]
+    OffchainOrderFailed,
+    #[serde(rename = "UsdcRebalanceEvent::ConversionFailed")]
+    ConversionFailed,
+    #[serde(rename = "UsdcRebalanceEvent::WithdrawalFailed")]
+    WithdrawalFailed,
+    #[serde(rename = "UsdcRebalanceEvent::BridgingFailed")]
+    BridgingFailed,
+    #[serde(rename = "UsdcRebalanceEvent::DepositFailed")]
+    DepositFailed,
+    #[serde(rename = "UsdcRebalanceEvent::AttestationTimedOut")]
+    AttestationTimedOut,
+    #[serde(rename = "EquityRedemptionEvent::TransferFailed")]
+    RedemptionTransferFailed,
+    #[serde(rename = "EquityRedemptionEvent::DetectionFailed")]
+    RedemptionDetectionFailed,
+    #[serde(rename = "EquityRedemptionEvent::RedemptionRejected")]
+    RedemptionRejected,
+    #[serde(rename = "TokenizedEquityMintEvent::MintRejected")]
+    MintRejected,
+    #[serde(rename = "TokenizedEquityMintEvent::MintAcceptanceFailed")]
+    MintAcceptanceFailed,
+    #[serde(rename = "TokenizedEquityMintEvent::WrappingFailed")]
+    WrappingFailed,
+    #[serde(rename = "TokenizedEquityMintEvent::RaindexDepositFailed")]
+    RaindexDepositFailed,
+}
+
+impl FailureEventType {
+    /// Every failure event type, derived by macro so the list itself cannot
+    /// drift from the enum. The reliability query derives its SQL filter
+    /// from this list.
+    pub const ALL: &'static [Self] = <Self as VariantArray>::VARIANTS;
+
+    /// The event store's `event_type` discriminator for this failure. Must
+    /// match the `#[serde(rename)]` strings; a unit test pins the two
+    /// together.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OffchainOrderFailed => "OffchainOrderEvent::Failed",
+            Self::ConversionFailed => "UsdcRebalanceEvent::ConversionFailed",
+            Self::WithdrawalFailed => "UsdcRebalanceEvent::WithdrawalFailed",
+            Self::BridgingFailed => "UsdcRebalanceEvent::BridgingFailed",
+            Self::DepositFailed => "UsdcRebalanceEvent::DepositFailed",
+            Self::AttestationTimedOut => "UsdcRebalanceEvent::AttestationTimedOut",
+            Self::RedemptionTransferFailed => "EquityRedemptionEvent::TransferFailed",
+            Self::RedemptionDetectionFailed => "EquityRedemptionEvent::DetectionFailed",
+            Self::RedemptionRejected => "EquityRedemptionEvent::RedemptionRejected",
+            Self::MintRejected => "TokenizedEquityMintEvent::MintRejected",
+            Self::MintAcceptanceFailed => "TokenizedEquityMintEvent::MintAcceptanceFailed",
+            Self::WrappingFailed => "TokenizedEquityMintEvent::WrappingFailed",
+            Self::RaindexDepositFailed => "TokenizedEquityMintEvent::RaindexDepositFailed",
+        }
+    }
+}
+
+/// An `event_type` string that does not name a known failure event type.
+/// Carries no payload (per the no-opaque-String-errors rule); callers
+/// already hold the offending input and log it themselves.
+#[derive(Debug, Error)]
+#[error("unknown failure event type")]
+pub struct UnknownFailureEventType;
+
+impl FromStr for FailureEventType {
+    type Err = UnknownFailureEventType;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|event_type| event_type.as_str() == input)
+            .ok_or(UnknownFailureEventType)
+    }
+}
+
 /// Occurrences of one lifecycle failure event type.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct FailureEventCount {
-    pub event_type: String,
+    pub event_type: FailureEventType,
     #[ts(type = "number")]
     pub count: usize,
     pub last_at: DateTime<Utc>,
@@ -385,6 +480,82 @@ mod tests {
         assert_eq!(json["completedAt"], json!(null));
         assert_eq!(json["totalMs"], json!(null));
         assert_eq!(json["status"], json!("in_progress"));
+    }
+
+    #[test]
+    // Scope note: this only pins the serde renames against as_str within
+    // the DTO crate. The binding against the live event store discriminators
+    // is failure_event_types_match_domain_event_names in
+    // src/performance/reliability.rs, which samples every variant.
+    fn failure_event_type_serde_matches_as_str() {
+        for event_type in FailureEventType::ALL.iter().copied() {
+            let serialized = serde_json::to_value(event_type).unwrap();
+            assert_eq!(
+                serialized,
+                json!(event_type.as_str()),
+                "serde rename and as_str drifted for {event_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_event_type_round_trips_through_from_str() {
+        for event_type in FailureEventType::ALL.iter().copied() {
+            assert_eq!(
+                FailureEventType::from_str(event_type.as_str()).unwrap(),
+                event_type
+            );
+        }
+    }
+
+    #[test]
+    fn failure_event_type_rejects_unknown_strings() {
+        assert!(matches!(
+            FailureEventType::from_str("PositionEvent::Opened"),
+            Err(UnknownFailureEventType)
+        ));
+    }
+
+    #[test]
+    fn counted_log_level_serializes_uppercase() {
+        assert_eq!(
+            serde_json::to_value(CountedLogLevel::Error).unwrap(),
+            json!("ERROR")
+        );
+        assert_eq!(
+            serde_json::to_value(CountedLogLevel::Warn).unwrap(),
+            json!("WARN")
+        );
+    }
+
+    #[test]
+    fn log_target_count_serializes_camel_case() {
+        let row = LogTargetCount {
+            target: "hedge".to_string(),
+            level: CountedLogLevel::Warn,
+            count: 2,
+            sparkline: vec![1, 1],
+        };
+
+        let json = serde_json::to_value(&row).expect("serialization should succeed");
+        assert_eq!(json["target"], json!("hedge"));
+        assert_eq!(json["level"], json!("WARN"));
+        assert_eq!(json["count"], json!(2));
+        assert_eq!(json["sparkline"], json!([1, 1]));
+    }
+
+    #[test]
+    fn failure_event_count_serializes_event_type_discriminator() {
+        let row = FailureEventCount {
+            event_type: FailureEventType::OffchainOrderFailed,
+            count: 3,
+            last_at: DateTime::from_timestamp(1_750_000_000, 0).unwrap(),
+        };
+
+        let json = serde_json::to_value(&row).expect("serialization should succeed");
+        assert_eq!(json["eventType"], json!("OffchainOrderEvent::Failed"));
+        assert_eq!(json["count"], json!(3));
+        assert_eq!(json["lastAt"], json!("2025-06-15T15:06:40Z"));
     }
 
     #[test]
