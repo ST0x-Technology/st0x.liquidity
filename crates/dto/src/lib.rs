@@ -78,6 +78,13 @@ pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
     HedgeCycleReport::export_all_to(out_dir)?;
     HedgeCycleStatus::export_all_to(out_dir)?;
     OpenExposureReport::export_all_to(out_dir)?;
+    RebalanceTimings::export_all_to(out_dir)?;
+    RebalanceOperationTiming::export_all_to(out_dir)?;
+    RebalanceTimingStatus::export_all_to(out_dir)?;
+    RebalanceStageTiming::export_all_to(out_dir)?;
+    RebalanceStageName::export_all_to(out_dir)?;
+    RebalanceStageStats::export_all_to(out_dir)?;
+    AttestationSample::export_all_to(out_dir)?;
     std::fs::write(out_dir.join("StatementGuard.ts"), Statement::guard_ts())
         .map_err(ts_rs::ExportError::Io)?;
 
