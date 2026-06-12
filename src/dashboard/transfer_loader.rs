@@ -356,7 +356,9 @@ mod tests {
     use st0x_float_macro::float;
 
     use super::*;
-    use crate::equity_redemption::EquityRedemptionEvent;
+    use crate::equity_redemption::{
+        EquityRedemptionEvent, RedemptionAggregateId, redemption_aggregate_id,
+    };
     use crate::tokenized_equity_mint::{
         IssuerRequestId, TokenizedEquityMintEvent, issuer_request_id,
     };
@@ -456,6 +458,7 @@ mod tests {
     struct SeededTransferIds {
         active_mint: IssuerRequestId,
         failed_mint: IssuerRequestId,
+        active_redemption: RedemptionAggregateId,
         usdc: Uuid,
     }
 
@@ -517,11 +520,14 @@ mod tests {
         )
         .await;
 
+        let old_redemption_id = redemption_aggregate_id("old-redemption-1");
+        let active_redemption_id = redemption_aggregate_id("active-redemption-1");
+
         // 3. Old failed redemption (terminal, >24h ago -- should NOT appear)
         insert_event(
             pool,
             "EquityRedemption",
-            "old-redemption-1",
+            &old_redemption_id.to_string(),
             1,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             serde_json::to_value(EquityRedemptionEvent::WithdrawnFromRaindex {
@@ -540,7 +546,7 @@ mod tests {
         insert_event(
             pool,
             "EquityRedemption",
-            "old-redemption-1",
+            &old_redemption_id.to_string(),
             2,
             "EquityRedemptionEvent::TransferFailed",
             serde_json::to_value(EquityRedemptionEvent::TransferFailed {
@@ -556,7 +562,7 @@ mod tests {
         insert_event(
             pool,
             "EquityRedemption",
-            "active-redemption-1",
+            &active_redemption_id.to_string(),
             1,
             "EquityRedemptionEvent::WithdrawnFromRaindex",
             serde_json::to_value(EquityRedemptionEvent::WithdrawnFromRaindex {
@@ -608,6 +614,7 @@ mod tests {
         SeededTransferIds {
             active_mint: active_mint_id,
             failed_mint: failed_mint_id,
+            active_redemption: active_redemption_id,
             usdc: usdc_id,
         }
     }
@@ -673,7 +680,7 @@ mod tests {
         if let TransferOperation::EquityRedemption(op) = active_redemption {
             assert_eq!(
                 op.id,
-                Id::<EquityRedemptionTag>::new("active-redemption-1".to_string())
+                Id::<EquityRedemptionTag>::new(seeded.active_redemption.to_string())
             );
         }
 

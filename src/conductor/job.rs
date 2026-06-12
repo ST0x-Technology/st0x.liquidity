@@ -367,6 +367,7 @@ pub enum JobKind {
     TransferUsdcToHedging,
     TransferUsdcToMarketMaking,
     TransferEquityToMarketMaking,
+    TransferEquityToHedging,
 }
 
 /// Job execution error. Wraps the concrete `Job::Error` type at
@@ -406,6 +407,7 @@ pub struct FailureInjector {
     transfer_usdc_to_hedging: Arc<Mutex<InjectionState>>,
     transfer_usdc_to_market_making: Arc<Mutex<InjectionState>>,
     transfer_equity_to_market_making: Arc<Mutex<InjectionState>>,
+    transfer_equity_to_hedging: Arc<Mutex<InjectionState>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -443,6 +445,7 @@ impl FailureInjector {
             transfer_usdc_to_hedging: Arc::new(Mutex::new(InjectionState::Idle)),
             transfer_usdc_to_market_making: Arc::new(Mutex::new(InjectionState::Idle)),
             transfer_equity_to_market_making: Arc::new(Mutex::new(InjectionState::Idle)),
+            transfer_equity_to_hedging: Arc::new(Mutex::new(InjectionState::Idle)),
         }
     }
 
@@ -492,6 +495,7 @@ impl FailureInjector {
             JobKind::TransferUsdcToHedging => &self.transfer_usdc_to_hedging,
             JobKind::TransferUsdcToMarketMaking => &self.transfer_usdc_to_market_making,
             JobKind::TransferEquityToMarketMaking => &self.transfer_equity_to_market_making,
+            JobKind::TransferEquityToHedging => &self.transfer_equity_to_hedging,
         };
 
         match mutex.lock() {
