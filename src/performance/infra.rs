@@ -5,12 +5,16 @@
 //! report: current block lag, worst lag per time bucket, and poll-cycle
 //! duration/error/skipped-tick aggregates. Strictly read-only.
 
+use std::collections::BTreeMap;
+
 use alloy::primitives::Address;
 use chrono::{DateTime, Duration, SubsecRound, Utc};
 use sqlx::SqlitePool;
 use tracing::warn;
 
-use st0x_dto::{BlockLagPoint, MonitorTelemetry, PollHealth};
+use st0x_dto::{
+    BlockLagPoint, DependencyBucket, DependencyName, DependencyStats, MonitorTelemetry, PollHealth,
+};
 
 use super::{PerformanceError, ReportRange, latency_stats};
 use crate::telemetry::{Monitor, sqlite_timestamp};
@@ -135,6 +139,109 @@ struct PollCycleRow {
     duration_ms: i64,
     skipped_ticks: i64,
     outcome: String,
+}
+
+/// Per-(dependency, operation) accumulator of `(bucket_index, duration_ms,
+/// is_error)` call samples, grouped before aggregation into `DependencyStats`.
+type DependencyGroups = BTreeMap<(DependencyName, String), Vec<(i64, i64, bool)>>;
+
+/// Load per-(dependency, operation) call aggregates for `range`.
+///
+/// The time-bucket index and the error flag are computed in SQL (mirroring
+/// `block_lag_buckets`) so each row arrives as compact scalars rather than
+/// four heap strings plus a parsed timestamp. Raw durations still come back
+/// per row -- SQLite has no percentile function, so the p50/p90/p99 stats are
+/// computed in Rust -- but the per-row footprint is bounded to a single small
+/// `operation` string.
+pub(crate) async fn load_dependency_stats(
+    pool: &SqlitePool,
+    range: &ReportRange,
+) -> Result<Vec<DependencyStats>, PerformanceError> {
+    let width = range.bucket_width();
+    // strftime('%s', ...) truncates to whole seconds, so anchor the bucket
+    // origin the same way (see `block_lag_buckets`).
+    let origin = range.from.trunc_subsecs(0);
+    let rows: Vec<(i64, String, String, i64, bool)> = sqlx::query_as(
+        "SELECT (CAST(strftime('%s', recorded_at) AS INTEGER) - $3) / $4 AS bucket_index, \
+                dependency, operation, duration_ms, outcome = 'error' AS is_error \
+         FROM dependency_call_samples \
+         WHERE recorded_at BETWEEN $1 AND $2 \
+         ORDER BY dependency, operation, bucket_index",
+    )
+    .bind(sqlite_timestamp(range.from))
+    .bind(sqlite_timestamp(range.to))
+    .bind(origin.timestamp())
+    .bind(width.num_seconds())
+    .fetch_all(pool)
+    .await?;
+
+    let mut groups: DependencyGroups = BTreeMap::new();
+    for (bucket_index, raw_dependency, operation, duration_ms, is_error) in rows {
+        let dependency = match raw_dependency.as_str() {
+            "rpc" => DependencyName::Rpc,
+            "broker" => DependencyName::Broker,
+            other => {
+                warn!(
+                    dependency = other,
+                    "Skipping sample with unknown dependency"
+                );
+                continue;
+            }
+        };
+
+        groups.entry((dependency, operation)).or_default().push((
+            bucket_index,
+            duration_ms,
+            is_error,
+        ));
+    }
+
+    Ok(groups
+        .into_iter()
+        .map(|((dependency, operation), samples)| {
+            dependency_stats(dependency, operation, &samples, origin, width)
+        })
+        .collect())
+}
+
+fn dependency_stats(
+    dependency: DependencyName,
+    operation: String,
+    samples: &[(i64, i64, bool)],
+    origin: DateTime<Utc>,
+    width: Duration,
+) -> DependencyStats {
+    let mut buckets: BTreeMap<i64, (Vec<i64>, usize)> = BTreeMap::new();
+    for &(bucket, duration_ms, is_error) in samples {
+        let (durations, errors) = buckets.entry(bucket).or_default();
+        durations.push(duration_ms);
+        if is_error {
+            *errors += 1;
+        }
+    }
+
+    let errors = samples.iter().filter(|&&(_, _, is_error)| is_error).count();
+    let durations: Vec<i64> = samples
+        .iter()
+        .map(|&(_, duration_ms, _)| duration_ms)
+        .collect();
+
+    DependencyStats {
+        dependency,
+        operation,
+        calls: samples.len(),
+        errors,
+        latency: latency_stats(durations),
+        buckets: buckets
+            .into_iter()
+            .map(|(index, (durations, errors))| DependencyBucket {
+                start: origin + Duration::seconds(width.num_seconds() * index),
+                calls: durations.len(),
+                errors,
+                p50_ms: latency_stats(durations).map(|stats| stats.p50_ms),
+            })
+            .collect(),
+    }
 }
 
 /// Stored counts are non-negative by schema CHECK; a negative value means a
@@ -363,6 +470,72 @@ mod tests {
         let duration = telemetry.poll.duration.unwrap();
         assert_eq!(duration.sample_count, 2);
         assert_eq!(duration.max_ms, 300);
+    }
+
+    async fn insert_call(
+        pool: &SqlitePool,
+        seconds: i64,
+        dependency: &str,
+        operation: &str,
+        duration_ms: i64,
+        error: Option<&str>,
+    ) {
+        let outcome = if error.is_some() { "error" } else { "ok" };
+        sqlx::query(
+            "INSERT INTO dependency_call_samples \
+             (recorded_at, dependency, operation, duration_ms, outcome, error) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(sqlite_timestamp(timestamp(seconds)))
+        .bind(dependency)
+        .bind(operation)
+        .bind(duration_ms)
+        .bind(outcome)
+        .bind(error)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn groups_dependency_calls_by_operation_with_buckets() {
+        let pool = setup_test_db().await;
+        insert_call(&pool, 10, "rpc", "eth_blockNumber", 50, None).await;
+        insert_call(&pool, 20, "rpc", "eth_blockNumber", 150, Some("timeout")).await;
+        insert_call(&pool, 4_000, "rpc", "eth_blockNumber", 70, None).await;
+        insert_call(&pool, 30, "broker", "place_market_order", 400, None).await;
+        // Outside the range: must not be counted.
+        insert_call(&pool, -100, "rpc", "eth_blockNumber", 999, None).await;
+
+        let stats = load_dependency_stats(&pool, &range()).await.unwrap();
+
+        assert_eq!(stats.len(), 2);
+        let broker = &stats[1];
+        assert_eq!(broker.dependency, DependencyName::Broker);
+        assert_eq!(broker.operation, "place_market_order");
+        assert_eq!(broker.calls, 1);
+        assert_eq!(broker.errors, 0);
+
+        let rpc = &stats[0];
+        assert_eq!(rpc.dependency, DependencyName::Rpc);
+        assert_eq!(rpc.operation, "eth_blockNumber");
+        assert_eq!(rpc.calls, 3);
+        assert_eq!(rpc.errors, 1);
+        assert_eq!(rpc.latency.as_ref().unwrap().max_ms, 150);
+        assert_eq!(rpc.latency.as_ref().unwrap().sample_count, 3);
+
+        assert_eq!(rpc.buckets.len(), 2);
+        assert_eq!(rpc.buckets[0].start, timestamp(0));
+        assert_eq!(rpc.buckets[0].calls, 2);
+        assert_eq!(rpc.buckets[0].errors, 1);
+        assert_eq!(rpc.buckets[0].p50_ms, Some(50));
+        assert_eq!(rpc.buckets[1].start, timestamp(3_600));
+        assert_eq!(rpc.buckets[1].calls, 1);
+        assert_eq!(
+            rpc.buckets[1].errors, 0,
+            "errors must not leak across buckets"
+        );
+        assert_eq!(rpc.buckets[1].p50_ms, Some(70));
     }
 
     #[tokio::test]

@@ -1,20 +1,35 @@
 //! Lightweight operational telemetry store.
 //!
-//! Persists high-frequency ingestion-health samples (chain-tip block lag,
-//! poll-cycle duration and skipped ticks) to plain SQLite tables, outside
-//! the CQRS event store: these are operational observations, not domain
-//! events. Writes are best-effort from the caller's perspective -- a failed
-//! sample must never fail the monitored operation -- and rows older than
-//! [`RETENTION`] are pruned opportunistically.
+//! Persists high-frequency operational samples -- chain-tip block lag,
+//! poll-cycle duration and skipped ticks, external dependency call
+//! latency/errors -- to plain SQLite tables, outside the CQRS event store:
+//! these are operational observations, not domain events. Writes are
+//! best-effort from the caller's perspective -- a failed sample must never
+//! fail the monitored operation -- and rows older than [`RETENTION`] are
+//! pruned opportunistically.
+//!
+//! Monitor samples are written inline (one row per poll interval).
+//! Dependency-call samples come from hot paths (every RPC and broker call),
+//! so they flow through a bounded mpsc channel ([`TelemetrySender`]) into a
+//! background writer task that batches inserts and never blocks the caller.
 
+use std::borrow::Cow;
 use std::fmt::Display;
 use std::num::TryFromIntError;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use alloy::primitives::Address;
 use chrono::{DateTime, SecondsFormat, Utc};
 use sqlx::SqlitePool;
 use thiserror::Error;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tracing::{info, warn};
+
+pub(crate) mod executor;
+pub(crate) mod rpc;
 
 /// How long telemetry samples are retained. Telemetry is an operational
 /// debugging aid, not an audit trail; two weeks comfortably covers "what
@@ -155,6 +170,246 @@ pub(crate) async fn prune_expired(
         .await?;
     sqlx::query("DELETE FROM poll_cycle_samples WHERE sampled_at < $1")
         .bind(&cutoff)
+        .execute(pool)
+        .await?;
+
+    Ok(())
+}
+
+/// External dependency a call sample belongs to. `Broker` covers whatever
+/// `Executor` implementation is configured, not just Alpaca.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Dependency {
+    Rpc,
+    Broker,
+}
+
+impl Dependency {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rpc => "rpc",
+            Self::Broker => "broker",
+        }
+    }
+}
+
+/// One observed call to an external dependency.
+#[derive(Debug, Clone)]
+pub(crate) struct DependencyCallSample {
+    pub(crate) recorded_at: DateTime<Utc>,
+    pub(crate) dependency: Dependency,
+    pub(crate) operation: Cow<'static, str>,
+    pub(crate) duration: Duration,
+    /// `Some` when the call failed, rendered for operators.
+    pub(crate) error: Option<String>,
+}
+
+/// Capacity of the sample channel. At one slow batch insert per
+/// `recv_many`, thousands of in-flight samples means the writer is wedged,
+/// not busy -- dropping is the correct behavior on hot paths.
+const DEPENDENCY_CHANNEL_CAPACITY: usize = 4_096;
+
+/// Log every Nth dropped sample so a wedged writer is visible without
+/// turning the hot path into a log storm.
+const DROP_LOG_EVERY: u64 = 1_000;
+
+/// Non-blocking handle hot paths use to emit [`DependencyCallSample`]s.
+///
+/// `record` never blocks and never fails the caller: when the channel is
+/// full or closed the sample is counted and dropped. A disabled sender
+/// (no channel) swallows samples outright -- used where a handle is
+/// structurally required but no writer exists.
+#[derive(Debug, Clone)]
+pub(crate) struct TelemetrySender {
+    /// `Some` for a connected sender; `None` swallows every sample. The drop
+    /// counter is `Some` exactly when the channel is, since a disabled sender
+    /// has nothing to drop.
+    channel: Option<mpsc::Sender<DependencyCallSample>>,
+    dropped: Option<Arc<AtomicU64>>,
+}
+
+impl TelemetrySender {
+    /// A connected sender plus the receiver to hand to
+    /// [`spawn_dependency_call_writer`].
+    pub(crate) fn channel() -> (Self, mpsc::Receiver<DependencyCallSample>) {
+        let (sender, receiver) = mpsc::channel(DEPENDENCY_CHANNEL_CAPACITY);
+        (
+            Self {
+                channel: Some(sender),
+                dropped: Some(Arc::new(AtomicU64::new(0))),
+            },
+            receiver,
+        )
+    }
+
+    /// A sender that swallows every sample.
+    pub(crate) fn disabled() -> Self {
+        Self {
+            channel: None,
+            dropped: None,
+        }
+    }
+
+    /// Emit one sample, never blocking the caller.
+    pub(crate) fn record(&self, sample: DependencyCallSample) {
+        let Some(channel) = &self.channel else {
+            return;
+        };
+
+        if channel.try_send(sample).is_err()
+            && let Some(dropped) = &self.dropped
+        {
+            let count = dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if count == 1 || count.is_multiple_of(DROP_LOG_EVERY) {
+                warn!(
+                    dropped = count,
+                    "Telemetry channel full or closed; dropping dependency call samples"
+                );
+            }
+        }
+    }
+
+    /// Total samples dropped so far (channel full or closed). Test-only.
+    #[cfg(test)]
+    pub(crate) fn dropped_count(&self) -> u64 {
+        self.dropped
+            .as_ref()
+            .map_or(0, |dropped| dropped.load(Ordering::Relaxed))
+    }
+}
+
+/// Redact credential-bearing parts of any URL embedded in a dependency error
+/// before it is persisted. Production RPC URLs carry the API key in the path
+/// or query string (e.g. dRPC `?dkey=...`, Alchemy `/v2/<key>`), and a
+/// transport failure surfaces the full URL through the error's `Display`.
+/// Keeping only `scheme://host` preserves the operator-useful "which provider
+/// failed" signal while dropping the secret-bearing remainder.
+pub(crate) fn scrub_secrets(message: &str) -> String {
+    message
+        .split(' ')
+        .map(|token| {
+            let Some(scheme_end) = token.find("://") else {
+                return Cow::Borrowed(token);
+            };
+            let rest = &token[scheme_end + 3..];
+            let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+            let authority = &rest[..authority_end];
+            // Drop userinfo (`user:pass@`); keep only the host.
+            let host = authority
+                .rfind('@')
+                .map_or(authority, |at| &authority[at + 1..]);
+            if authority_end == rest.len() && host.len() == authority.len() {
+                return Cow::Borrowed(token);
+            }
+            let suffix = if authority_end == rest.len() {
+                ""
+            } else {
+                "/<redacted>"
+            };
+            Cow::Owned(format!("{}{host}{suffix}", &token[..scheme_end + 3]))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Samples drained per write batch.
+const WRITE_BATCH: usize = 256;
+
+/// How often the writer prunes expired dependency-call rows.
+const DEPENDENCY_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Spawn the background task that drains the sample channel into
+/// `dependency_call_samples` in batched transactions and prunes expired
+/// rows hourly. Exits when every [`TelemetrySender`] clone is dropped.
+pub(crate) fn spawn_dependency_call_writer(
+    pool: SqlitePool,
+    mut receiver: mpsc::Receiver<DependencyCallSample>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        // `interval_at` (not `interval`) so the first prune fires one full
+        // interval in, not immediately at startup before any rows exist.
+        let mut prune_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + DEPENDENCY_PRUNE_INTERVAL,
+            DEPENDENCY_PRUNE_INTERVAL,
+        );
+        let mut batch = Vec::with_capacity(WRITE_BATCH);
+
+        loop {
+            tokio::select! {
+                received_count = receiver.recv_many(&mut batch, WRITE_BATCH) => {
+                    if received_count == 0 {
+                        info!("Telemetry channel closed; dependency call writer stopping");
+                        return;
+                    }
+                    if let Err(error) = write_dependency_calls(&pool, &batch).await {
+                        // Telemetry is best-effort, but report the magnitude so
+                        // a persistent write failure (disk full, lock) is not an
+                        // invisible blackhole.
+                        warn!(?error, lost = batch.len(), "Failed to write dependency call samples");
+                    }
+                    batch.clear();
+                }
+                _ = prune_timer.tick() => {
+                    if let Err(error) = prune_expired_dependency_calls(&pool, Utc::now()).await {
+                        warn!(?error, "Failed to prune expired dependency call samples");
+                    }
+                }
+            }
+        }
+    })
+}
+
+async fn write_dependency_calls(
+    pool: &SqlitePool,
+    samples: &[DependencyCallSample],
+) -> Result<(), TelemetryError> {
+    let mut transaction = pool.begin().await?;
+
+    for sample in samples {
+        // One unrepresentable duration (>292 million years) must not poison
+        // the whole batch: skip the sample, keep the rest.
+        let duration_ms = match i64::try_from(sample.duration.as_millis()) {
+            Ok(duration_ms) => duration_ms,
+            Err(error) => {
+                warn!(
+                    ?error,
+                    operation = %sample.operation,
+                    "Skipping dependency sample with unrepresentable duration"
+                );
+                continue;
+            }
+        };
+
+        let (outcome, error) = sample
+            .error
+            .as_ref()
+            .map_or(("ok", None), |message| ("error", Some(message.as_str())));
+
+        sqlx::query(
+            "INSERT INTO dependency_call_samples \
+             (recorded_at, dependency, operation, duration_ms, outcome, error) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(sqlite_timestamp(sample.recorded_at))
+        .bind(sample.dependency.as_str())
+        .bind(sample.operation.as_ref())
+        .bind(duration_ms)
+        .bind(outcome)
+        .bind(error)
+        .execute(&mut *transaction)
+        .await?;
+    }
+
+    transaction.commit().await?;
+    Ok(())
+}
+
+async fn prune_expired_dependency_calls(
+    pool: &SqlitePool,
+    now: DateTime<Utc>,
+) -> Result<(), TelemetryError> {
+    sqlx::query("DELETE FROM dependency_call_samples WHERE recorded_at < $1")
+        .bind(sqlite_timestamp(now - RETENTION))
         .execute(pool)
         .await?;
 
@@ -337,5 +592,148 @@ mod tests {
     fn sqlite_timestamp_matches_sqlite_strftime_format() {
         let formatted = sqlite_timestamp(Utc.timestamp_opt(1_750_000_000, 123_000_000).unwrap());
         assert_eq!(formatted, "2025-06-15T15:06:40.123Z");
+    }
+
+    /// Samples are stamped relative to now: the writer task prunes expired
+    /// rows on its first timer tick, so historic timestamps would be
+    /// deleted right after insertion.
+    fn call_sample(
+        seconds: i64,
+        dependency: Dependency,
+        error: Option<&str>,
+    ) -> DependencyCallSample {
+        DependencyCallSample {
+            recorded_at: Utc::now() + chrono::Duration::seconds(seconds),
+            dependency,
+            operation: Cow::Borrowed("eth_blockNumber"),
+            duration: Duration::from_millis(42),
+            error: error.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_persists_batched_samples_and_exits_on_close() {
+        let pool = setup_test_db().await;
+        let (sender, receiver) = TelemetrySender::channel();
+        let writer = spawn_dependency_call_writer(pool.clone(), receiver);
+
+        sender.record(call_sample(0, Dependency::Rpc, None));
+        sender.record(call_sample(1, Dependency::Broker, Some("rejected")));
+        drop(sender);
+        writer.await.unwrap();
+
+        let rows: Vec<(String, String, i64, String, Option<String>)> = sqlx::query_as(
+            "SELECT dependency, operation, duration_ms, outcome, error \
+             FROM dependency_call_samples ORDER BY recorded_at",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "rpc");
+        assert_eq!(rows[0].1, "eth_blockNumber");
+        assert_eq!(rows[0].2, 42);
+        assert_eq!(rows[0].3, "ok");
+        assert_eq!(rows[0].4, None);
+        assert_eq!(rows[1].0, "broker");
+        assert_eq!(rows[1].3, "error");
+        assert_eq!(rows[1].4, Some("rejected".to_string()));
+    }
+
+    #[test]
+    fn scrub_secrets_redacts_url_credentials() {
+        // dRPC-style key in the query string.
+        assert_eq!(
+            scrub_secrets("error sending request for url (https://lb.drpc.org/ogrpc?dkey=SECRET)"),
+            "error sending request for url (https://lb.drpc.org/<redacted>"
+        );
+        // Alchemy-style key in the path.
+        assert_eq!(
+            scrub_secrets("connect error: https://base-mainnet.g.alchemy.com/v2/SECRET_KEY"),
+            "connect error: https://base-mainnet.g.alchemy.com/<redacted>"
+        );
+        // userinfo credentials.
+        assert_eq!(
+            scrub_secrets("https://user:pass@node.example.com"),
+            "https://node.example.com"
+        );
+        // A plain message with no URL is untouched.
+        assert_eq!(
+            scrub_secrets("broker rejected order: insufficient funds"),
+            "broker rejected order: insufficient funds"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_never_panics_on_closed_or_disabled_channels() {
+        let (sender, receiver) = TelemetrySender::channel();
+        drop(receiver);
+        sender.record(call_sample(0, Dependency::Rpc, None));
+
+        TelemetrySender::disabled().record(call_sample(0, Dependency::Broker, None));
+    }
+
+    #[tokio::test]
+    async fn prune_expired_dependency_calls_respects_retention() {
+        let pool = setup_test_db().await;
+        let now = timestamp(0);
+        let expired = call_sample(0, Dependency::Rpc, None);
+        let expired = DependencyCallSample {
+            recorded_at: now - RETENTION - chrono::Duration::hours(1),
+            ..expired
+        };
+        let retained = DependencyCallSample {
+            recorded_at: now - RETENTION + chrono::Duration::hours(1),
+            ..call_sample(0, Dependency::Rpc, None)
+        };
+        write_dependency_calls(&pool, &[expired, retained])
+            .await
+            .unwrap();
+
+        prune_expired_dependency_calls(&pool, now).await.unwrap();
+
+        // Assert the surviving row is the retained one, not merely that one
+        // row remains: a reversed predicate would keep the expired row and
+        // still leave a count of 1.
+        let survivors: Vec<String> =
+            sqlx::query_scalar("SELECT recorded_at FROM dependency_call_samples")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            survivors,
+            vec![sqlite_timestamp(
+                now - RETENTION + chrono::Duration::hours(1)
+            )],
+            "only the in-retention dependency sample survives"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_drops_and_counts_samples_when_the_channel_is_full() {
+        // No writer drains the channel, so it fills at capacity. record() must
+        // never block: the test completing is itself the non-blocking proof.
+        let (sender, mut receiver) = TelemetrySender::channel();
+        let overflow = 10;
+        for index in 0..DEPENDENCY_CHANNEL_CAPACITY + overflow {
+            sender.record(call_sample(
+                i64::try_from(index).unwrap(),
+                Dependency::Rpc,
+                None,
+            ));
+        }
+
+        assert_eq!(
+            sender.dropped_count(),
+            u64::try_from(overflow).unwrap(),
+            "every sample past capacity is dropped and counted"
+        );
+
+        let mut drained = Vec::new();
+        let drained_count = receiver.recv_many(&mut drained, usize::MAX).await;
+        assert_eq!(
+            drained_count, DEPENDENCY_CHANNEL_CAPACITY,
+            "exactly the channel capacity is buffered; the overflow was dropped"
+        );
     }
 }

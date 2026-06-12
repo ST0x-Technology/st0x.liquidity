@@ -233,6 +233,7 @@ apalis-workflow.workspace = true
 axum.workspace = true
 apalis-board.workspace = true
 st0x-wrapper = { workspace = true, features = ["erc4626"] }
+tower = { version = "0.5.3", features = ["util"] }
 
 [dev-dependencies]
 approx.workspace = true

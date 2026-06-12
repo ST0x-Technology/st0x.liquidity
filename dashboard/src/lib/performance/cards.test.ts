@@ -112,6 +112,7 @@ const infra = (overrides: Partial<InfraReport['monitor']>): InfraReport => ({
     },
     ...overrides,
   },
+  dependencies: [],
 })
 
 describe('blockLagCard', () => {

@@ -27,6 +27,7 @@
     type WaterfallSort,
     layoutAttestationTrend,
     layoutBlockLagTrend,
+    layoutDependencySparkline,
     layoutPercentileSeries,
     layoutRebalanceBars,
     layoutWaterfall,
@@ -722,6 +723,68 @@
               {formatDurationMs(poll.duration.maxMs)}
             </span>
           {/if}
+        </div>
+      {/if}
+    </Card.Content>
+  </Card.Root>
+
+  <Card.Root>
+    <Card.Header class="pb-2">
+      <Card.Title class="text-sm font-medium">Dependency health</Card.Title>
+      <p class="text-xs text-muted-foreground">
+        Per-operation latency and errors for the RPC provider and broker API.
+        Sparkline bars are per-bucket median latency; red bars contain errors.
+      </p>
+    </Card.Header>
+    <Card.Content>
+      {#if (chartInfra.current?.dependencies.length ?? 0) === 0}
+        <p class="py-6 text-center text-sm text-muted-foreground">
+          No dependency calls in the selected range.
+        </p>
+      {:else}
+        <div class="flex flex-col gap-1">
+          {#each chartInfra.current?.dependencies ?? [] as row (`${row.dependency}:${row.operation}`)}
+            {@const bars = layoutDependencySparkline(row.buckets, { plotHeight: 12 })}
+            <div class="flex items-center gap-2 text-xs">
+              <span class="w-14 shrink-0 font-semibold uppercase text-muted-foreground">
+                {row.dependency}
+              </span>
+              <span class="w-44 shrink-0 truncate font-mono">{row.operation}</span>
+              <svg
+                viewBox={`0 0 ${String(bars.length * 6)} 14`}
+                class="h-3.5 w-28 shrink-0"
+                preserveAspectRatio="none"
+              >
+                {#each bars as bar, barIndex (barIndex)}
+                  <rect
+                    x={barIndex * 6}
+                    y={14 - bar.height - 1}
+                    width="4"
+                    height={bar.height + 1}
+                    fill={bar.hasErrors ? '#f87171' : '#38bdf8'}
+                    opacity="0.9"
+                  />
+                {/each}
+              </svg>
+              <span class="w-20 shrink-0 text-right tabular-nums text-muted-foreground">
+                {row.calls} calls
+              </span>
+              <span
+                class={`w-16 shrink-0 text-right tabular-nums ${row.errors > 0 ? 'text-red-400' : 'text-muted-foreground'}`}
+              >
+                {row.errors} err
+              </span>
+              <span class="min-w-0 flex-1 truncate text-right tabular-nums text-muted-foreground">
+                {#if row.latency}
+                  p50 {formatDurationMs(row.latency.p50Ms)} · p95
+                  {formatDurationMs(row.latency.p95Ms)} · max
+                  {formatDurationMs(row.latency.maxMs)}
+                {:else}
+                  —
+                {/if}
+              </span>
+            </div>
+          {/each}
         </div>
       {/if}
     </Card.Content>
