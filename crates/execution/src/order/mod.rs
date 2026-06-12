@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use st0x_float_serde::DebugOptionFloat;
 
-use crate::{Direction, FractionalShares, Positive, Symbol};
+use crate::{Direction, FractionalShares, Positive, Symbol, Usd};
 
 pub mod state;
 pub mod status;
@@ -95,6 +95,17 @@ pub struct OrderPlacement<OrderId> {
     pub shares: Positive<FractionalShares>,
     pub direction: Direction,
     pub placed_at: DateTime<Utc>,
+    /// Whether the broker holds this as an extended-hours order. For a fresh
+    /// placement this echoes the request; when a duplicate `client_order_id`
+    /// placement adopts an order from a prior attempt, it is the ADOPTED
+    /// order's flag, which can differ from the request (e.g. a regular-hours
+    /// market retry adopting a still-live extended-hours limit order after a
+    /// lost placement response). Callers must record this value -- not the
+    /// request's -- so session-convergence logic sees broker reality.
+    pub extended_hours: bool,
+    /// The broker-held limit price, if the order is a limit order. Same
+    /// adoption semantics as `extended_hours`.
+    pub limit_price: Option<Positive<Usd>>,
 }
 
 pub struct OrderUpdate<OrderId> {
@@ -105,6 +116,14 @@ pub struct OrderUpdate<OrderId> {
     pub status: OrderStatus,
     pub updated_at: DateTime<Utc>,
     pub price: Option<Float>,
+    /// Cumulative quantity filled at the broker so far. `None` when the
+    /// broker response omitted the field; brokers that always report it
+    /// (Alpaca sends `filled_qty: "0"`) yield `Some(0)` for unfilled orders,
+    /// so consumers MUST treat `Some(0)` and `None` alike as "no fill" --
+    /// never branch on `is_some()` to detect a fill. Required for
+    /// `OrderStatus::PartiallyFilled` so the caller can reconcile the local
+    /// aggregate via `UpdatePartialFill`.
+    pub shares_filled: Option<FractionalShares>,
 }
 
 impl<OrderId: Debug> Debug for OrderUpdate<OrderId> {
@@ -117,8 +136,27 @@ impl<OrderId: Debug> Debug for OrderUpdate<OrderId> {
             .field("status", &self.status)
             .field("updated_at", &self.updated_at)
             .field("price", &DebugOptionFloat(&self.price))
+            .field("shares_filled", &self.shares_filled)
             .finish()
     }
+}
+
+/// Outcome of a broker cancel request.
+///
+/// Distinguishes "the broker accepted the cancel request" from "the broker
+/// no longer recognises the order id". The latter must not be reported as
+/// plain success (the caller would wait forever for a cancellation
+/// confirmation the broker will never produce) nor as a retryable error
+/// (re-sending the cancel can never succeed). Callers resolve `OrderNotFound`
+/// by treating the order as already terminal at the broker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancellationOutcome {
+    /// The broker accepted the cancel request; the order will reach a
+    /// terminal state observable via `get_order_status`.
+    Requested,
+    /// The broker does not recognise the order id (e.g. HTTP 404). No live
+    /// order exists under this id, so no further fills can occur.
+    OrderNotFound,
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +168,23 @@ pub struct MarketOrder {
     /// placement (e.g. apalis re-running a job after a transient 5xx whose
     /// response was lost in flight) are deduped by the broker rather than
     /// submitting a second order.
+    pub client_order_id: ClientOrderId,
+}
+
+/// Broker-agnostic limit order for automated counter-trading during extended
+/// hours. The executor implementation converts this to its broker-specific
+/// limit order type (e.g. `AlpacaLimitOrder`).
+#[derive(Debug, Clone)]
+pub struct LimitOrder {
+    pub symbol: Symbol,
+    pub shares: Positive<FractionalShares>,
+    pub direction: Direction,
+    pub limit_price: Positive<Usd>,
+    pub extended_hours: bool,
+    /// Forwarded to the broker so that retries of a logically identical
+    /// extended-hours placement (e.g. apalis re-running a job after a lost
+    /// placement response) are deduped by the broker rather than submitting a
+    /// second live limit order. Mirrors [`MarketOrder::client_order_id`].
     pub client_order_id: ClientOrderId,
 }
 

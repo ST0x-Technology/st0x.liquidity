@@ -3,7 +3,9 @@
 pub enum OrderStatus {
     Pending,
     Submitted,
+    PartiallyFilled,
     Filled,
+    Cancelled,
     Failed,
 }
 
@@ -12,7 +14,9 @@ impl OrderStatus {
         match self {
             Self::Pending => "PENDING",
             Self::Submitted => "SUBMITTED",
+            Self::PartiallyFilled => "PARTIALLY_FILLED",
             Self::Filled => "FILLED",
+            Self::Cancelled => "CANCELLED",
             Self::Failed => "FAILED",
         }
     }
@@ -28,7 +32,7 @@ impl std::fmt::Display for OrderStatus {
 pub enum ParseOrderStatusError {
     #[error(
         "invalid order status: '{status_provided}'. Expected one of: \
-         PENDING, SUBMITTED, FILLED, FAILED"
+         PENDING, SUBMITTED, PARTIALLY_FILLED, FILLED, CANCELLED, FAILED"
     )]
     InvalidStatus { status_provided: String },
 }
@@ -40,7 +44,9 @@ impl std::str::FromStr for OrderStatus {
         match s {
             "PENDING" => Ok(Self::Pending),
             "SUBMITTED" => Ok(Self::Submitted),
+            "PARTIALLY_FILLED" => Ok(Self::PartiallyFilled),
             "FILLED" => Ok(Self::Filled),
+            "CANCELLED" => Ok(Self::Cancelled),
             "FAILED" => Ok(Self::Failed),
             _ => Err(ParseOrderStatusError::InvalidStatus {
                 status_provided: s.to_string(),

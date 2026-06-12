@@ -1776,7 +1776,10 @@ impl Reactor for RebalancingService {
                             .insert(symbol);
                         return Ok(());
                     }
-                    OffChainOrderFailed { .. } => {
+                    OffChainOrderFailed { .. } | OffChainOrderCancelled { .. } => {
+                        // A failure or an intentional cancellation both release
+                        // the symbol's pending-offchain-order gate; nudge an
+                        // immediate equity check rather than waiting a poll cycle.
                         self.pending_offchain_order_symbols
                             .write()
                             .await
@@ -3746,6 +3749,7 @@ mod tests {
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Enabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );

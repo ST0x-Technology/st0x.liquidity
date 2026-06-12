@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use st0x_config::ExecutionThreshold;
 use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
@@ -21,7 +21,7 @@ use st0x_finance::{Usd, Usdc};
 use st0x_float_macro::float;
 use st0x_float_serde::{DebugFloat, DebugOptionFloat};
 
-use crate::offchain::order::OffchainOrderId;
+use crate::offchain::order::{CancellationReason, OffchainOrderId};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Position {
@@ -206,6 +206,27 @@ impl EventSourced for Position {
                     .last_failed_offchain_order_id
                     .or(Some(*offchain_order_id)),
                 last_updated: Some(*failed_at),
+                ..entity.clone()
+            })),
+
+            OffChainOrderCancelled {
+                offchain_order_id, ..
+            } if entity.pending_offchain_order_id != Some(*offchain_order_id) => Ok(None),
+
+            OffChainOrderCancelled { cancelled_at, .. } => Ok(Some(Self {
+                // Intentional cancellation: release the pending slot so the
+                // symbol can re-hedge. Deliberately does NOT set the
+                // failure/idempotency anchor -- the replacement is a fresh
+                // order, not a retry of the cancelled one.
+                pending_offchain_order_id: None,
+                // Clear any pre-existing failure anchor too: if a prior attempt
+                // failed and stashed its OID, the cancelled order may have been
+                // placed under that key. The market-order replacement must be a
+                // FRESH order, so it must not reuse the cancelled order's
+                // `client_order_id` and be deduped by the broker against an
+                // order that no longer exists.
+                last_failed_offchain_order_id: None,
+                last_updated: Some(*cancelled_at),
                 ..entity.clone()
             })),
 
@@ -414,6 +435,26 @@ impl EventSourced for Position {
                     offchain_order_id,
                     error,
                     failed_at: Utc::now(),
+                }])
+            }
+
+            CancelOffChainOrder {
+                offchain_order_id,
+                reason,
+                cancelled_at,
+            } => {
+                self.validate_pending_execution(offchain_order_id)?;
+
+                info!(
+                    target: "hedge",
+                    %offchain_order_id, symbol = %self.symbol, ?reason,
+                    "Offchain order cancelled; clearing pending"
+                );
+
+                Ok(vec![PositionEvent::OffChainOrderCancelled {
+                    offchain_order_id,
+                    reason,
+                    cancelled_at,
                 }])
             }
 
@@ -736,6 +777,19 @@ pub enum PositionCommand {
         offchain_order_id: OffchainOrderId,
         error: String,
     },
+    /// Clear a pending offchain order that was intentionally cancelled (e.g.
+    /// the extended-hours -> regular cancel-and-replace), distinct from a broker
+    /// failure. Does not set the failure/idempotency anchor: the replacement is
+    /// a fresh order, not a retry under the cancelled key.
+    CancelOffChainOrder {
+        offchain_order_id: OffchainOrderId,
+        reason: CancellationReason,
+        /// The broker's cancellation time (from the terminal order), not the
+        /// wall-clock time the finalization sweep happens to run -- it flows
+        /// into `Position.last_updated`, mirroring `CompleteOffChainOrder`'s
+        /// `broker_timestamp`.
+        cancelled_at: DateTime<Utc>,
+    },
     UpdateThreshold {
         threshold: ExecutionThreshold,
     },
@@ -793,6 +847,14 @@ pub enum PositionEvent {
         error: String,
         failed_at: DateTime<Utc>,
     },
+    /// A pending offchain order was intentionally cancelled (not a failure), so
+    /// failure-rate analytics can tell the two apart. Clears the pending
+    /// reference without setting the failure/idempotency anchor.
+    OffChainOrderCancelled {
+        offchain_order_id: OffchainOrderId,
+        reason: CancellationReason,
+        cancelled_at: DateTime<Utc>,
+    },
     ThresholdUpdated {
         old_threshold: ExecutionThreshold,
         new_threshold: ExecutionThreshold,
@@ -823,6 +885,7 @@ impl PositionEvent {
                 broker_timestamp, ..
             } => *broker_timestamp,
             OffChainOrderFailed { failed_at, .. } => *failed_at,
+            OffChainOrderCancelled { cancelled_at, .. } => *cancelled_at,
             ThresholdUpdated { updated_at, .. } => *updated_at,
             ManualPositionAdjusted { adjusted_at, .. } => *adjusted_at,
         }
@@ -838,6 +901,7 @@ impl DomainEvent for PositionEvent {
             OffChainOrderPlaced { .. } => "PositionEvent::OffChainOrderPlaced".to_string(),
             OffChainOrderFilled { .. } => "PositionEvent::OffChainOrderFilled".to_string(),
             OffChainOrderFailed { .. } => "PositionEvent::OffChainOrderFailed".to_string(),
+            OffChainOrderCancelled { .. } => "PositionEvent::OffChainOrderCancelled".to_string(),
             ThresholdUpdated { .. } => "PositionEvent::ThresholdUpdated".to_string(),
             ManualPositionAdjusted { .. } => "PositionEvent::ManualPositionAdjusted".to_string(),
         }
@@ -947,6 +1011,18 @@ impl PartialEq for PositionEvent {
                     failed_at: f2,
                 },
             ) => o1 == o2 && e1 == e2 && f1 == f2,
+            (
+                Self::OffChainOrderCancelled {
+                    offchain_order_id: o1,
+                    reason: r1,
+                    cancelled_at: c1,
+                },
+                Self::OffChainOrderCancelled {
+                    offchain_order_id: o2,
+                    reason: r2,
+                    cancelled_at: c2,
+                },
+            ) => o1 == o2 && r1 == r2 && c1 == c2,
             (
                 Self::ThresholdUpdated {
                     old_threshold: ot1,
@@ -1131,6 +1207,16 @@ impl std::fmt::Debug for PositionCommand {
                 .field("offchain_order_id", offchain_order_id)
                 .field("error", error)
                 .finish(),
+            Self::CancelOffChainOrder {
+                offchain_order_id,
+                reason,
+                cancelled_at,
+            } => f
+                .debug_struct("CancelOffChainOrder")
+                .field("offchain_order_id", offchain_order_id)
+                .field("reason", reason)
+                .field("cancelled_at", cancelled_at)
+                .finish(),
             Self::UpdateThreshold { threshold } => f
                 .debug_struct("UpdateThreshold")
                 .field("threshold", threshold)
@@ -1227,6 +1313,16 @@ impl std::fmt::Debug for PositionEvent {
                 .field("offchain_order_id", offchain_order_id)
                 .field("error", error)
                 .field("failed_at", failed_at)
+                .finish(),
+            Self::OffChainOrderCancelled {
+                offchain_order_id,
+                reason,
+                cancelled_at,
+            } => f
+                .debug_struct("OffChainOrderCancelled")
+                .field("offchain_order_id", offchain_order_id)
+                .field("reason", reason)
+                .field("cancelled_at", cancelled_at)
                 .finish(),
             Self::ThresholdUpdated {
                 old_threshold,
@@ -1579,6 +1675,133 @@ mod tests {
             .events();
 
         assert_eq!(events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_offchain_order_emits_cancelled_not_failed() {
+        let threshold = one_share_threshold();
+        let offchain_order_id = OffchainOrderId::new();
+        let broker_cancelled_at = Utc::now();
+
+        let events = TestHarness::<Position>::with(())
+            .given(vec![
+                PositionEvent::Initialized {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    threshold,
+                    initialized_at: Utc::now(),
+                },
+                PositionEvent::OnChainOrderFilled {
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(float!(1.5)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                    seen_at: Utc::now(),
+                },
+                PositionEvent::OffChainOrderPlaced {
+                    offchain_order_id,
+                    shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    trigger_reason: TriggerReason::SharesThreshold {
+                        net_position_shares: float!(1.5),
+                        threshold_shares: float!(1),
+                    },
+                    placed_at: Utc::now(),
+                },
+            ])
+            .when(PositionCommand::CancelOffChainOrder {
+                offchain_order_id,
+                reason: CancellationReason::MarketOpenReplacement,
+                cancelled_at: broker_cancelled_at,
+            })
+            .await
+            .events();
+
+        // An intentional cancellation must emit OffChainOrderCancelled, NOT
+        // OffChainOrderFailed -- otherwise it pollutes failure-rate analytics.
+        // The event must carry the broker's cancellation time, not the
+        // wall-clock time the command handler ran.
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(
+                events.first(),
+                Some(PositionEvent::OffChainOrderCancelled {
+                    reason: CancellationReason::MarketOpenReplacement,
+                    cancelled_at,
+                    ..
+                }) if *cancelled_at == broker_cancelled_at
+            ),
+            "expected OffChainOrderCancelled carrying the broker timestamp, got: {:?}",
+            events.first()
+        );
+    }
+
+    #[test]
+    fn cancelling_an_order_clears_a_pre_existing_failure_anchor() {
+        // A prior attempt failed and stashed its OID as the idempotency anchor.
+        // The next attempt is placed (and reuses that anchor as its
+        // client_order_id), then cancelled at the Extended->Regular transition.
+        // The cancel must clear the anchor so the market-order REPLACEMENT is a
+        // fresh order, not a retry deduped by the broker against the cancelled
+        // order's key.
+        let failed_order_id = OffchainOrderId::new();
+        let cancelled_order_id = OffchainOrderId::new();
+
+        let placed = |offchain_order_id| PositionEvent::OffChainOrderPlaced {
+            offchain_order_id,
+            shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            direction: Direction::Sell,
+            executor: SupportedExecutor::DryRun,
+            trigger_reason: TriggerReason::SharesThreshold {
+                net_position_shares: float!(1.5),
+                threshold_shares: float!(1),
+            },
+            placed_at: Utc::now(),
+        };
+
+        let position = replay::<Position>(vec![
+            PositionEvent::Initialized {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold: one_share_threshold(),
+                initialized_at: Utc::now(),
+            },
+            PositionEvent::OnChainOrderFilled {
+                trade_id: TradeId {
+                    tx_hash: TxHash::random(),
+                    log_index: 1,
+                },
+                amount: FractionalShares::new(float!(1.5)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp: Utc::now(),
+                seen_at: Utc::now(),
+            },
+            placed(failed_order_id),
+            PositionEvent::OffChainOrderFailed {
+                offchain_order_id: failed_order_id,
+                error: "broker rejected".to_string(),
+                failed_at: Utc::now(),
+            },
+            placed(cancelled_order_id),
+            PositionEvent::OffChainOrderCancelled {
+                offchain_order_id: cancelled_order_id,
+                reason: CancellationReason::MarketOpenReplacement,
+                cancelled_at: Utc::now(),
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            position.last_failed_offchain_order_id, None,
+            "cancellation must clear the failure/idempotency anchor so the \
+             replacement is a fresh order"
+        );
+        assert_eq!(position.pending_offchain_order_id, None);
     }
 
     #[tokio::test]

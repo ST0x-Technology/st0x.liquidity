@@ -1,3 +1,4 @@
+use chrono::NaiveDate;
 use rain_math_float::Float;
 use rain_math_float::FloatError;
 use serde::Deserialize;
@@ -8,7 +9,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::alpaca_market_data::AlpacaMarketDataError;
-use crate::{ClientOrderId, CounterTradeCostError, FractionalShares, Positive, Symbol, Usd};
+use crate::{
+    ClientOrderId, CounterTradeCostError, ExecutorOrderId, FractionalShares, Positive, Symbol, Usd,
+};
 
 /// Time-in-force specifies how long an order remains active before it expires.
 ///
@@ -112,6 +115,19 @@ pub enum CryptoOrderFailureReason {
     Calculated,
 }
 
+/// A field absent from a broker order response that the reported order
+/// status requires.
+///
+/// A closed enum (not a string) so call sites and tests cannot drift on
+/// spelling and new fields force exhaustive handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingOrderField {
+    FilledQty,
+    Price,
+    FilledAt,
+    CanceledAt,
+}
+
 #[derive(Debug, Error)]
 pub enum AlpacaBrokerApiError {
     #[error("HTTP client error: {0}")]
@@ -135,8 +151,11 @@ pub enum AlpacaBrokerApiError {
     #[error("Invalid order ID: {0}")]
     InvalidOrderId(#[from] uuid::Error),
 
-    #[error("Filled order {order_id} is missing required field: {field}")]
-    IncompleteFilledOrder { order_id: String, field: String },
+    #[error("Order {order_id} is missing required field {field:?} for its reported state")]
+    IncompleteOrder {
+        order_id: ExecutorOrderId,
+        field: MissingOrderField,
+    },
 
     #[error("Account {account_id} is not active (status: {status:?})")]
     AccountNotActive {
@@ -159,6 +178,15 @@ pub enum AlpacaBrokerApiError {
 
     #[error("Internal error: calendar was non-empty but iteration returned None")]
     CalendarIterationInvariantViolation,
+
+    #[error(
+        "Calendar endpoint returned an entry for {returned} when {queried} was \
+         requested; refusing to classify the market session from another day's hours"
+    )]
+    CalendarDateMismatch {
+        queried: NaiveDate,
+        returned: NaiveDate,
+    },
 
     #[error("Asset {symbol} is not active (status: {status:?})")]
     AssetNotActive { symbol: Symbol, status: AssetStatus },
@@ -212,6 +240,9 @@ pub enum AlpacaBrokerApiError {
 
     #[error(transparent)]
     NotPositive(#[from] st0x_finance::NotPositive<FractionalShares>),
+
+    #[error(transparent)]
+    NotPositiveLimitPrice(#[from] st0x_finance::NotPositive<Usd>),
 
     #[error("Float conversion error: {0}")]
     FloatConversion(#[from] FloatError),

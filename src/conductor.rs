@@ -31,7 +31,8 @@ use st0x_event_sorcery::{
 use st0x_evm::Wallet;
 use st0x_execution::{
     ClientOrderId, CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason,
-    ExecutionError, Executor, FractionalShares, MarketOrder, Symbol, TryIntoExecutor,
+    ExecutionError, Executor, FractionalShares, MarketOrder, MarketSession, Symbol,
+    TryIntoExecutor,
 };
 use st0x_raindex::{RaindexService, RaindexVaultId};
 use st0x_wrapper::WrapperService;
@@ -48,7 +49,8 @@ use crate::inventory::{
 use crate::offchain::order::{
     ExecutorOrderPlacer, HandleOrderRejectionJobQueue, OffchainOrder, OffchainOrderCommand,
     OffchainOrderId, OrderPlacer, PollOrderStatus, PollOrderStatusJobQueue,
-    ReconcileOrderFillJobQueue, recover_submitted_offchain_orders,
+    ReconcileOrderFillJobQueue, TerminalPositionFinalization, position_command_for_finalization,
+    recover_submitted_offchain_orders, terminal_position_finalization,
 };
 use crate::onchain::OnchainTrade;
 use crate::onchain::USDC_BASE;
@@ -115,6 +117,10 @@ pub(crate) struct TradeProcessingCqrs {
     /// hook the order stays `Submitted` forever -- the system has no other
     /// trigger to ask the broker about an in-flight order.
     pub(crate) poll_status_queue: PollOrderStatusJobQueue,
+    /// Used to enqueue an immediate `PlaceHedge` for extended-hours fills, which
+    /// the inline path cannot place itself (it has no `OrderPlacer` for the
+    /// limit-order price lookup). `CheckPositions` is the backstop.
+    pub(crate) hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue,
 }
 
 /// Orchestrates the bot's runtime by composing long-running supervised tasks
@@ -1344,7 +1350,6 @@ async fn recover_orphaned_pending_offchain_orders(
     Ok(())
 }
 
-#[allow(clippy::cognitive_complexity)]
 async fn recover_single_orphaned_order(
     position: &Arc<Store<Position>>,
     offchain_order: &Arc<Store<OffchainOrder>>,
@@ -1366,47 +1371,69 @@ async fn recover_single_orphaned_order(
         return Ok(());
     };
 
-    let command = match order {
-        OffchainOrder::Filled {
-            ref executor_order_id,
-            price,
-            filled_at,
-            ..
-        } => {
-            info!(%symbol, %order_id, "Orphaned order already Filled -- recovering");
-            PositionCommand::CompleteOffChainOrder {
-                offchain_order_id: order_id,
-                shares_filled: order.shares(),
-                direction: order.direction(),
-                executor_order_id: executor_order_id.clone(),
-                price,
-                broker_timestamp: filled_at,
-            }
-        }
-
-        OffchainOrder::Failed { .. } => {
-            info!(%symbol, %order_id, "Orphaned order already Failed -- recovering");
-            PositionCommand::FailOffChainOrder {
-                offchain_order_id: order_id,
-                error: "recovered from orphaned state on startup".to_string(),
-            }
-        }
-
-        OffchainOrder::Submitted { .. } | OffchainOrder::PartiallyFilled { .. } => {
-            debug!(%symbol, %order_id, "Pending offchain order still in progress");
-            return Ok(());
-        }
-
-        OffchainOrder::Pending { .. } => {
-            warn!(%symbol, %order_id, "Offchain order still Pending -- may not have been submitted");
-            return Ok(());
-        }
+    let Some(command) = orphaned_order_position_command(&order, symbol, order_id) else {
+        return Ok(());
     };
 
     position.send(symbol, command).await?;
     info!(%symbol, %order_id, "Orphaned pending order recovered");
 
     Ok(())
+}
+
+/// Maps an orphaned offchain order to the position command that finalizes
+/// its owning position, or `None` when the position must be left pending.
+/// Every `None` path logs its reason, so the caller's early return is never
+/// silent.
+#[allow(clippy::cognitive_complexity)]
+fn orphaned_order_position_command(
+    order: &OffchainOrder,
+    symbol: &Symbol,
+    order_id: OffchainOrderId,
+) -> Option<PositionCommand> {
+    match terminal_position_finalization(order) {
+        // Mirrors `CheckPositionsCtx::finalize_position_for_terminal_order`:
+        // the fill cannot be recorded without a price, so leave the position
+        // pending instead of aborting the whole startup recovery sweep. The
+        // order is terminal, so its data never changes -- NO automated path
+        // resolves this; the every-tick finalize sweep only re-logs it, and
+        // operator intervention is required to record or discard the fill.
+        // Aborting here would instead crash-loop the bot and block hedging of
+        // every other symbol.
+        Some(TerminalPositionFinalization::UnpricedFill { shares_filled }) => {
+            error!(
+                %symbol, %order_id, %shares_filled,
+                "Orphaned terminal order has a partial fill without avg price; \
+                 leaving position pending"
+            );
+            None
+        }
+
+        // Non-terminal: the order is still in progress (Submitted /
+        // PartiallyFilled / Cancelling / Pending) -- nothing to finalize yet.
+        None => {
+            // A `Pending` order at startup was claimed by the position but never
+            // submitted to the broker, and this recovery sweep has no path to
+            // re-drive it -- surface it at warn so the anomaly is visible. The
+            // other in-flight states (Submitted/PartiallyFilled/Cancelling) are
+            // owned by the poll loop and are expected here.
+            if matches!(order, OffchainOrder::Pending { .. }) {
+                warn!(%symbol, %order_id, "Orphaned offchain order still Pending at startup -- may never have been submitted to the broker");
+            } else {
+                debug!(%symbol, %order_id, "Pending offchain order still in progress");
+            }
+            None
+        }
+
+        // Complete and both NoFill outcomes map through the shared helper so
+        // the terminal-state -> position-command mapping cannot drift from
+        // the cancel-and-replace sweep and rejection paths.
+        Some(finalization) => {
+            let command = position_command_for_finalization(finalization, order_id);
+            info!(%symbol, %order_id, ?command, "Orphaned order terminal -- recovering");
+            command
+        }
+    }
 }
 
 /// Constructs the position CQRS framework with its view query
@@ -1694,6 +1721,57 @@ where
         return Ok(None);
     };
 
+    // Extended-hours counter-trades cannot be placed inline (this path has no
+    // OrderPlacer for the limit-order price lookup). Instead of waiting for the
+    // next CheckPositions scan (~1 min), enqueue an immediate PlaceHedge job,
+    // which has the OrderPlacer and submits the limit order. CheckPositions
+    // remains the backstop. Preflight + clamp here, mirroring the scan path, so
+    // we never enqueue a hedge that would exceed buying power.
+    if execution.market_session == MarketSession::Extended {
+        let _counter_trade_submission_guard = cqrs.counter_trade_submission_lock.lock().await;
+
+        match preflight_counter_trade_submission(executor, &execution, None).await? {
+            CounterTradeSubmissionCheck::Skipped => return Ok(None),
+            CounterTradeSubmissionCheck::Allowed { reservation } => {
+                clamp_shares_to_reservation(&mut execution, reservation.as_ref());
+            }
+        }
+
+        let offchain_order_id = OffchainOrderId::new();
+        info!(
+            target: "hedge",
+            symbol = %execution.symbol,
+            shares = %execution.shares,
+            direction = ?execution.direction,
+            "Extended hours: enqueueing immediate PlaceHedge (limit order via the job's OrderPlacer)"
+        );
+
+        let job = crate::trading::offchain::hedge::PlaceHedge {
+            symbol: execution.symbol.clone(),
+            direction: execution.direction,
+            shares: execution.shares,
+            executor: execution.executor,
+            threshold: cqrs.execution_threshold,
+            offchain_order_id,
+            market_session: execution.market_session,
+        };
+
+        if let Err(error) = cqrs.hedge_queue.clone().push(job).await {
+            error!(
+                target: "hedge",
+                symbol = %execution.symbol,
+                %error,
+                "Failed to enqueue extended-hours hedge; CheckPositions will retry"
+            );
+        }
+
+        // No inline offchain order was placed: the durable PlaceHedge job claims
+        // the position (via PlaceOffChainOrder) when it runs. Returning the job's
+        // not-yet-recorded id would be a synthetic handle the aggregates know
+        // nothing about, so signal "no inline placement" with None.
+        return Ok(None);
+    }
+
     let _counter_trade_submission_guard = cqrs.counter_trade_submission_lock.lock().await;
 
     match preflight_counter_trade_submission(executor, &execution, None).await? {
@@ -1964,7 +2042,9 @@ async fn dispatch_post_place_state(
     cqrs: &TradeProcessingCqrs,
     offchain_order_id: OffchainOrderId,
 ) -> Result<Option<OffchainOrderId>, TradeAccountingError> {
-    use OffchainOrder::{Failed, Filled, PartiallyFilled, Pending, Submitted};
+    use OffchainOrder::{
+        Cancelled, Cancelling, Failed, Filled, PartiallyFilled, Pending, Submitted,
+    };
     match loaded {
         Some(Failed { error, .. }) => {
             cqrs.position
@@ -1980,7 +2060,7 @@ async fn dispatch_post_place_state(
             Ok(Some(offchain_order_id))
         }
 
-        Some(Submitted { .. } | PartiallyFilled { .. }) => {
+        Some(Submitted { .. } | PartiallyFilled { .. } | Cancelling { .. }) => {
             let mut queue = cqrs.poll_status_queue.clone();
 
             queue
@@ -2014,6 +2094,30 @@ async fn dispatch_post_place_state(
                     },
                 )
                 .await?;
+
+            Ok(None)
+        }
+
+        // Cancelled directly after Place is unexpected but is a genuine
+        // broker-confirmed cancellation: route through the shared terminal
+        // finalization instead of recording a failure, which would anchor the
+        // next attempt's client_order_id to the cancelled key and drop any
+        // retained fill. Mirrors the matching arm in `PlaceHedge::perform`.
+        Some(cancelled @ Cancelled { .. }) => {
+            let command = terminal_position_finalization(&cancelled).and_then(|finalization| {
+                position_command_for_finalization(finalization, offchain_order_id)
+            });
+            if let Some(command) = command {
+                cqrs.position.send(&execution.symbol, command).await?;
+            } else {
+                error!(
+                    symbol = %execution.symbol,
+                    %offchain_order_id,
+                    "Cancelled order after Place retains an unpriced fill; \
+                     position left pending -- no automated path can finalize \
+                     this, operator intervention required"
+                );
+            }
 
             Ok(None)
         }
@@ -2100,6 +2204,7 @@ async fn execute_create_offchain_order(
         direction: execution.direction,
         executor: execution.executor,
         client_order_id: ClientOrderId::from_uuid(client_order_id_source.as_uuid()),
+        kind: crate::offchain::order::CounterTradeOrderKind::Market,
     };
 
     match cqrs.offchain_order.send(&offchain_order_id, command).await {
@@ -2228,6 +2333,7 @@ where
             direction: execution.direction,
             executor: execution.executor,
             client_order_id: ClientOrderId::from_uuid(client_order_id_source.as_uuid()),
+            kind: crate::offchain::order::CounterTradeOrderKind::Market,
         };
 
         let place_result = offchain_order.send(&offchain_order_id, command).await;
@@ -2308,7 +2414,7 @@ mod tests {
     use crate::conductor::builder::CqrsFrameworks;
     use crate::inventory::view::Operator;
     use crate::inventory::{ImbalanceThreshold, Inventory, InventoryView, Venue};
-    use crate::offchain::order::OrderPlacementResult;
+    use crate::offchain::order::{CancellationReason, OrderPlacementResult};
     use crate::onchain::trade::OnchainTrade;
     use crate::rebalancing::{RebalancingSchedulers, RebalancingService, TriggeredOperation};
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
@@ -2486,6 +2592,7 @@ mod tests {
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -2499,6 +2606,7 @@ mod tests {
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -2512,6 +2620,7 @@ mod tests {
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -2564,6 +2673,7 @@ mod tests {
                 trading: OperationMode::Enabled,
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -2577,6 +2687,7 @@ mod tests {
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -2590,6 +2701,7 @@ mod tests {
                 trading: OperationMode::Disabled,
                 rebalancing: OperationMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
+                extended_hours_counter_trading: OperationMode::Disabled,
                 operational_limit: None,
             },
         );
@@ -2958,7 +3070,30 @@ mod tests {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("TEST_BROKER_ORD"),
                     placed_shares: order.shares,
+                    is_extended_hours: false,
+                    limit_price: None,
                 })
+            }
+
+            async fn place_limit_order(
+                &self,
+                order: st0x_execution::LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("TEST_BROKER_LIMIT_ORD"),
+                    placed_shares: order.shares,
+                    is_extended_hours: order.extended_hours,
+                    limit_price: Some(order.limit_price),
+                })
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &st0x_execution::ExecutorOrderId,
+            ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(st0x_execution::CancellationOutcome::Requested)
             }
         }
 
@@ -3029,6 +3164,7 @@ mod tests {
             },
             counter_trade_submission_lock: Arc::new(Mutex::new(())),
             poll_status_queue: PollOrderStatusJobQueue::new(pool),
+            hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(pool),
         }
     }
 
@@ -3194,6 +3330,125 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "Skipped counter trades must not create offchain orders"
+        );
+    }
+
+    #[tokio::test]
+    async fn extended_hours_trade_enqueues_immediate_hedge_job() {
+        // With extended-hours counter-trading enabled and the broker in an
+        // Extended session, an onchain fill must enqueue an immediate PlaceHedge
+        // job (which has the OrderPlacer for the limit order) rather than place
+        // inline or wait for the next CheckPositions scan.
+        let pool = setup_test_db().await;
+        setup_apalis_tables(&pool).await.unwrap();
+        let (frameworks, offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs = TradeProcessingCqrs {
+            onchain_trade: frameworks.onchain_trade.clone(),
+            position: frameworks.position.clone(),
+            position_projection: frameworks.position_projection.clone(),
+            offchain_order: frameworks.offchain_order.clone(),
+            execution_threshold: ExecutionThreshold::whole_share(),
+            assets: AssetsConfig {
+                equities: EquitiesConfig {
+                    operational_limit: None,
+                    symbols: HashMap::from([(
+                        Symbol::new("AAPL").unwrap(),
+                        EquityAssetConfig {
+                            tokenized_equity: Address::ZERO,
+                            tokenized_equity_derivative: Address::ZERO,
+                            pyth_feed_id: None,
+                            vault_ids: Vec::new(),
+                            trading: OperationMode::Enabled,
+                            rebalancing: OperationMode::Disabled,
+                            wrapped_equity_recovery: OperationMode::Disabled,
+                            extended_hours_counter_trading: OperationMode::Enabled,
+                            operational_limit: None,
+                        },
+                    )]),
+                },
+                cash: None,
+            },
+            counter_trade_submission_lock: Arc::new(Mutex::new(())),
+            poll_status_queue: PollOrderStatusJobQueue::new(&pool),
+            hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(&pool),
+        };
+
+        let trade_event = make_trade_event(77);
+        let trade = test_trade_with_amount_and_direction(float!(5.0), 77, Direction::Buy);
+
+        let executor = MockExecutor::new()
+            .with_market_session(MarketSession::Extended)
+            .with_inventory(ExecutionInventory {
+                positions: vec![EquityPosition {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: FractionalShares::new(float!(10.0)),
+                    market_value: None,
+                }],
+                usd_balance_cents: 1_000_000,
+                cash_buying_power_cents: Some(1_000_000),
+                alpaca_usdc: None,
+                cash_withdrawable_cents: None,
+            });
+
+        let result = process_queued_trade(&executor, &trade_event, trade, &cqrs, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result, None,
+            "no inline offchain order is placed for extended hours; the PlaceHedge \
+             job claims the position when it runs"
+        );
+
+        assert!(
+            offchain_order_projection
+                .load_all()
+                .await
+                .unwrap()
+                .is_empty(),
+            "extended-hours hedge must be deferred to a PlaceHedge job, not placed inline"
+        );
+
+        let hedge_jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+            .bind(std::any::type_name::<
+                crate::trading::offchain::hedge::PlaceHedge,
+            >())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            hedge_jobs, 1,
+            "exactly one immediate PlaceHedge job should be enqueued for the extended-hours fill"
+        );
+
+        let job_bytes: Vec<u8> = sqlx::query_scalar("SELECT job FROM Jobs WHERE job_type = ?")
+            .bind(std::any::type_name::<
+                crate::trading::offchain::hedge::PlaceHedge,
+            >())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let job: crate::trading::offchain::hedge::PlaceHedge =
+            serde_json::from_slice(&job_bytes).unwrap();
+
+        assert_eq!(job.symbol, Symbol::new("AAPL").unwrap());
+        assert_eq!(
+            job.direction,
+            Direction::Sell,
+            "an onchain buy must be hedged by an offchain sell"
+        );
+        assert_eq!(
+            job.shares,
+            Positive::new(FractionalShares::new(float!(5.0))).unwrap()
+        );
+        assert_eq!(job.executor, st0x_execution::SupportedExecutor::DryRun);
+        assert_eq!(job.threshold, ExecutionThreshold::whole_share());
+        assert_eq!(
+            job.market_session,
+            MarketSession::Extended,
+            "the enqueue path must carry the observed Extended session into the job \
+             payload so the job can detect a stale session at execution time"
         );
     }
 
@@ -3725,7 +3980,34 @@ mod tests {
                 Ok(OrderPlacementResult {
                     executor_order_id: ExecutorOrderId::new("TEST_BROKER_ORD"),
                     placed_shares: order.shares,
+                    is_extended_hours: false,
+                    limit_price: None,
                 })
+            }
+
+            async fn place_limit_order(
+                &self,
+                order: st0x_execution::LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err("Broker rejected first order".into());
+                }
+
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("TEST_BROKER_LIMIT_ORD"),
+                    placed_shares: order.shares,
+                    is_extended_hours: order.extended_hours,
+                    limit_price: Some(order.limit_price),
+                })
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &st0x_execution::ExecutorOrderId,
+            ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(st0x_execution::CancellationOutcome::Requested)
             }
         }
 
@@ -4571,6 +4853,24 @@ mod tests {
                 {
                     Err("API error (403 Forbidden): trade denied due to pattern day trading protection".into())
                 }
+
+                async fn place_limit_order(
+                    &self,
+                    _order: st0x_execution::LimitOrder,
+                ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+                {
+                    Err("API error (403 Forbidden): trade denied due to pattern day trading protection".into())
+                }
+
+                async fn cancel_order(
+                    &self,
+                    _executor_order_id: &st0x_execution::ExecutorOrderId,
+                ) -> Result<
+                    st0x_execution::CancellationOutcome,
+                    Box<dyn std::error::Error + Send + Sync>,
+                > {
+                    Ok(st0x_execution::CancellationOutcome::Requested)
+                }
             }
 
             Arc::new(RejectingOrderPlacer)
@@ -4665,6 +4965,24 @@ mod tests {
                 ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
                 {
                     Err("Broker rejected: insufficient buying power".into())
+                }
+
+                async fn place_limit_order(
+                    &self,
+                    _order: st0x_execution::LimitOrder,
+                ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+                {
+                    Err("Broker rejected: insufficient buying power".into())
+                }
+
+                async fn cancel_order(
+                    &self,
+                    _executor_order_id: &st0x_execution::ExecutorOrderId,
+                ) -> Result<
+                    st0x_execution::CancellationOutcome,
+                    Box<dyn std::error::Error + Send + Sync>,
+                > {
+                    Ok(st0x_execution::CancellationOutcome::Requested)
                 }
             }
 
@@ -4905,6 +5223,7 @@ mod tests {
                     direction: Direction::Sell,
                     executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
                     client_order_id: ClientOrderId::from_uuid(offchain_order_id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
                 },
             )
             .await
@@ -4915,6 +5234,7 @@ mod tests {
                 &offchain_order_id,
                 OffchainOrderCommand::CompleteFill {
                     price: Usd::new(float!(78)),
+                    filled_at: Utc::now(),
                 },
             )
             .await
@@ -5026,7 +5346,33 @@ mod tests {
                         0.5
                     )))
                     .unwrap(),
+                    is_extended_hours: false,
+                    limit_price: None,
                 })
+            }
+
+            async fn place_limit_order(
+                &self,
+                order: st0x_execution::LimitOrder,
+            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(OrderPlacementResult {
+                    executor_order_id: ExecutorOrderId::new("test-submitted-limit"),
+                    placed_shares: Positive::new(st0x_execution::FractionalShares::new(float!(
+                        0.5
+                    )))
+                    .unwrap(),
+                    is_extended_hours: order.extended_hours,
+                    limit_price: Some(order.limit_price),
+                })
+            }
+
+            async fn cancel_order(
+                &self,
+                _executor_order_id: &st0x_execution::ExecutorOrderId,
+            ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Ok(st0x_execution::CancellationOutcome::Requested)
             }
         }
 
@@ -5095,6 +5441,7 @@ mod tests {
                     direction: Direction::Sell,
                     executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
                     client_order_id: ClientOrderId::from_uuid(offchain_order_id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
                 },
             )
             .await
@@ -5190,6 +5537,7 @@ mod tests {
                     direction: Direction::Sell,
                     executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
                     client_order_id: ClientOrderId::from_uuid(offchain_order_id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
                 },
             )
             .await
@@ -5200,6 +5548,7 @@ mod tests {
                 &offchain_order_id,
                 OffchainOrderCommand::MarkFailed {
                     error: "insufficient qty".to_string(),
+                    failed_at: Utc::now(),
                 },
             )
             .await
@@ -5219,6 +5568,327 @@ mod tests {
         assert_eq!(
             pos.pending_offchain_order_id, None,
             "Recovery should clear pending_offchain_order_id for failed orders"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_orphaned_pending_clears_cancelled_order() {
+        let pool = setup_test_db().await;
+        let order_placer = crate::offchain::order::noop_order_placer();
+
+        let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let (offchain_order, _offchain_order_projection) =
+            StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(order_placer)
+                .await
+                .unwrap();
+
+        let symbol = Symbol::new("NVDA").unwrap();
+        let threshold = ExecutionThreshold::whole_share();
+        let offchain_order_id = OffchainOrderId::new();
+        let shares = Positive::new(st0x_execution::FractionalShares::new(float!(0.5))).unwrap();
+
+        position
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold,
+                    trade_id: TradeId {
+                        tx_hash: fixed_bytes!(
+                            "0000000000000000000000000000000000000000000000000000000000000005"
+                        ),
+                        log_index: 0,
+                    },
+                    amount: st0x_execution::FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(120),
+                    block_timestamp: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id,
+                    shares,
+                    direction: Direction::Sell,
+                    executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                    threshold,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Drive the offchain order to terminal Cancelled with no fill:
+        // Place -> Submitted -> Cancelling -> Cancelled.
+        offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::Place {
+                    symbol: symbol.clone(),
+                    shares,
+                    direction: Direction::Sell,
+                    executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: ClientOrderId::from_uuid(offchain_order_id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+
+        offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::CancelOrder {
+                    reason: CancellationReason::MarketOpenReplacement,
+                },
+            )
+            .await
+            .unwrap();
+
+        offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::ConfirmCancellation {
+                    cancelled_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let order = offchain_order
+            .load(&offchain_order_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(order, OffchainOrder::Cancelled { .. }));
+
+        let pos = position_projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(pos.pending_offchain_order_id, Some(offchain_order_id));
+
+        recover_orphaned_pending_offchain_orders(&position, &position_projection, &offchain_order)
+            .await
+            .unwrap();
+
+        let pos = position_projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(
+            pos.pending_offchain_order_id, None,
+            "Recovery should clear pending_offchain_order_id for cancelled orders"
+        );
+        // CancelOffChainOrder (unlike FailOffChainOrder) must NOT stash the
+        // cancelled order's id as the failure/idempotency anchor: the
+        // replacement is a fresh order, not a retry under the cancelled key.
+        assert_eq!(
+            pos.last_failed_offchain_order_id, None,
+            "An orphaned cancellation must not set the failure anchor; a \
+             replacement order reusing the cancelled client_order_id would be \
+             deduped by the broker against a dead order"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_orphaned_pending_completes_cancelled_order_with_partial_fill() {
+        let pool = setup_test_db().await;
+        let order_placer = crate::offchain::order::noop_order_placer();
+
+        let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let (offchain_order, _offchain_order_projection) =
+            StoreBuilder::<OffchainOrder>::new(pool.clone())
+                .build(order_placer)
+                .await
+                .unwrap();
+
+        let symbol = Symbol::new("AMD").unwrap();
+        let threshold = ExecutionThreshold::whole_share();
+        let offchain_order_id = OffchainOrderId::new();
+        let shares = Positive::new(st0x_execution::FractionalShares::new(float!(0.5))).unwrap();
+
+        position
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold,
+                    trade_id: TradeId {
+                        tx_hash: fixed_bytes!(
+                            "0000000000000000000000000000000000000000000000000000000000000006"
+                        ),
+                        log_index: 0,
+                    },
+                    amount: st0x_execution::FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(95),
+                    block_timestamp: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        position
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id,
+                    shares,
+                    direction: Direction::Sell,
+                    executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                    threshold,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Drive the offchain order to terminal Cancelled carrying a priced
+        // partial fill: Place -> Submitted -> PartiallyFilled -> Cancelling
+        // -> Cancelled.
+        offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::Place {
+                    symbol: symbol.clone(),
+                    shares,
+                    direction: Direction::Sell,
+                    executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+                    client_order_id: ClientOrderId::from_uuid(offchain_order_id.as_uuid()),
+                    kind: crate::offchain::order::CounterTradeOrderKind::Market,
+                },
+            )
+            .await
+            .unwrap();
+
+        offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled: st0x_execution::FractionalShares::new(float!(0.3)),
+                    avg_price: Usd::new(float!(95)),
+                    partially_filled_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::CancelOrder {
+                    reason: CancellationReason::MarketOpenReplacement,
+                },
+            )
+            .await
+            .unwrap();
+
+        offchain_order
+            .send(
+                &offchain_order_id,
+                OffchainOrderCommand::ConfirmCancellation {
+                    cancelled_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let pos = position_projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(pos.pending_offchain_order_id, Some(offchain_order_id));
+
+        recover_orphaned_pending_offchain_orders(&position, &position_projection, &offchain_order)
+            .await
+            .unwrap();
+
+        // The partial fill must be applied to the position (Sell debits net:
+        // 1 - 0.3 = 0.7), otherwise the broker keeps those shares but the
+        // position never records them and the next scan re-hedges them.
+        let pos = position_projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(
+            pos.pending_offchain_order_id, None,
+            "Recovery should clear pending_offchain_order_id for cancelled \
+             orders with a recorded fill"
+        );
+        assert_eq!(
+            pos.net,
+            st0x_execution::FractionalShares::new(float!(0.7)),
+            "The cancelled order's priced partial fill must debit the position"
+        );
+    }
+
+    #[test]
+    fn orphaned_unpriced_fill_leaves_position_pending() {
+        // A terminal Cancelled order carrying a positive fill without an
+        // average price cannot be finalized correctly. The recovery sweep
+        // must leave the position pending (returning no command) rather
+        // than abort startup -- the order is terminal, so its data never
+        // changes and an abort would crash-loop the bot on every restart.
+        let symbol = Symbol::new("AAPL").unwrap();
+        let order_id = OffchainOrderId::new();
+        let order = OffchainOrder::Cancelled {
+            symbol: symbol.clone(),
+            shares: Positive::new(st0x_execution::FractionalShares::new(float!(0.5))).unwrap(),
+            shares_filled: st0x_execution::FractionalShares::new(float!(0.3)),
+            avg_price: None,
+            partially_filled_at: Some(Utc::now()),
+            direction: Direction::Sell,
+            executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+            executor_order_id: ExecutorOrderId::new("unpriced-fill"),
+            reason: CancellationReason::MarketOpenReplacement,
+            placed_at: Utc::now(),
+            cancelled_at: Utc::now(),
+        };
+
+        let command = orphaned_order_position_command(&order, &symbol, order_id);
+
+        assert!(
+            command.is_none(),
+            "an unpriced terminal fill must leave the position pending for \
+             operator intervention (no automated path can price it)"
+        );
+    }
+
+    #[test]
+    fn orphaned_cancelled_order_maps_to_cancel_command() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let order_id = OffchainOrderId::new();
+        let broker_cancelled_at = Utc::now();
+        let order = OffchainOrder::Cancelled {
+            symbol: symbol.clone(),
+            shares: Positive::new(st0x_execution::FractionalShares::new(float!(0.5))).unwrap(),
+            shares_filled: st0x_execution::FractionalShares::ZERO,
+            avg_price: None,
+            partially_filled_at: None,
+            direction: Direction::Sell,
+            executor: st0x_execution::SupportedExecutor::AlpacaBrokerApi,
+            executor_order_id: ExecutorOrderId::new("cancelled-no-fill"),
+            reason: CancellationReason::MarketOpenReplacement,
+            placed_at: Utc::now(),
+            cancelled_at: broker_cancelled_at,
+        };
+
+        let command = orphaned_order_position_command(&order, &symbol, order_id);
+
+        let Some(PositionCommand::CancelOffChainOrder {
+            offchain_order_id,
+            reason,
+            cancelled_at,
+        }) = command
+        else {
+            panic!("expected CancelOffChainOrder for an orphaned cancelled order with no fill");
+        };
+        assert_eq!(offchain_order_id, order_id);
+        assert_eq!(reason, CancellationReason::MarketOpenReplacement);
+        assert_eq!(
+            cancelled_at, broker_cancelled_at,
+            "the position command must carry the broker's cancellation time"
         );
     }
 
@@ -5282,6 +5952,7 @@ mod tests {
             direction: Direction::Sell,
             shares,
             executor: st0x_execution::SupportedExecutor::DryRun,
+            market_session: st0x_execution::MarketSession::Regular,
         }
     }
 
@@ -5333,6 +6004,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_post_place_state_cancelled_routes_to_cancel_not_failure() {
+        // A Cancelled order directly after Place must release the position
+        // via cancel semantics: the pending slot clears AND the
+        // failure/idempotency anchor stays unset, so the replacement is a
+        // fresh order instead of a broker-deduped retry against a dead key.
+        let pool = setup_test_db().await;
+        let (frameworks, _projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            ExecutionThreshold::whole_share(),
+            &pool,
+        )
+        .await;
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
+        let offchain_order_id = drive_position_to_pending(&frameworks, &symbol, shares).await;
+
+        let cancelled = OffchainOrder::Cancelled {
+            symbol: symbol.clone(),
+            shares,
+            shares_filled: st0x_execution::FractionalShares::ZERO,
+            avg_price: None,
+            partially_filled_at: None,
+            direction: Direction::Sell,
+            executor: st0x_execution::SupportedExecutor::DryRun,
+            executor_order_id: ExecutorOrderId::new("cancelled-after-place"),
+            reason: CancellationReason::MarketOpenReplacement,
+            placed_at: Utc::now(),
+            cancelled_at: Utc::now(),
+        };
+
+        let execution = execution_ctx_for(&symbol, shares);
+        let result =
+            dispatch_post_place_state(Some(cancelled), &execution, &cqrs, offchain_order_id)
+                .await
+                .unwrap();
+        assert_eq!(result, None, "a cancelled order is not a live placement");
+
+        let position = frameworks
+            .position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            position.pending_offchain_order_id, None,
+            "cancellation must release the position's pending slot"
+        );
+        assert_eq!(
+            position.last_failed_offchain_order_id, None,
+            "cancellation must NOT set the failure/idempotency anchor"
+        );
+    }
+
+    #[tokio::test]
     async fn dispatch_post_place_state_pending_clears_position_pending() {
         let pool = setup_test_db().await;
         let (frameworks, _projection) =
@@ -5354,6 +6082,7 @@ mod tests {
             direction: Direction::Sell,
             executor: st0x_execution::SupportedExecutor::DryRun,
             placed_at: Utc::now(),
+            is_extended_hours: false,
         };
 
         let execution = execution_ctx_for(&symbol, shares);
@@ -5537,6 +6266,10 @@ mod tests {
             shares,
             direction: Direction::Sell,
             executor: st0x_execution::SupportedExecutor::DryRun,
+            shares_filled: None,
+            avg_price: None,
+            partially_filled_at: None,
+            executor_order_id: None,
             error: "broker rejected".to_string(),
             placed_at: Utc::now(),
             failed_at: Utc::now(),
