@@ -2722,8 +2722,12 @@ balances and emitting them as events the system can react to:
 
 - **VaultRegistry** (CQRS aggregate): Auto-discovers Raindex vaults from
   ClearV3/TakeOrderV3 trade events. Tracks multiple equity vaults per token
-  address and multiple USDC vaults per orderbook/owner pair. Inventory polling
-  sums balances across all vaults for each asset.
+  address and multiple USDC vaults per orderbook/owner pair. Startup config
+  seeding registers every configured vault, then explicitly marks the first
+  entry in the configured vault list (config file order) for each asset as the
+  operational primary used by deposit/withdraw/rebalancing paths. Re-running the
+  bot after a vault ID config change must move the primary to the new configured
+  vault while retaining the retired vault in the registry for balance polling.
 - **InventorySnapshot** (CQRS aggregate): Records point-in-time snapshots of
   actual balances fetched from onchain vaults and the offchain broker.
 - **InventoryPollingService**: Periodically polls actual balances from both
@@ -2731,7 +2735,10 @@ balances and emitting them as events the system can react to:
   events to update tracked inventory. Offchain equity polling normalizes active
   configured equities omitted by the broker positions response to explicit zero
   balances, and ignores broker-only symbols that are not configured as active
-  assets.
+  assets. Onchain polling sums all registered vaults for each asset and warns
+  when a registered vault that is no longer present in current config still has
+  a positive balance, so stranded funds are visible without sending new
+  rebalancing transfers to the retired vault.
 - **Polling runs on a 60-second interval** during market hours as a background
   conductor task. Onchain polling uses the `vaultBalance2` contract call;
   offchain polling uses the `Executor::get_inventory()` trait method.

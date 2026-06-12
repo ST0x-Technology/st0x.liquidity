@@ -84,6 +84,42 @@ stox sell -s COIN -q 10
 stox order-status --order-id <order-id>
 ```
 
+### Moving Stranded Raindex Equity Vault Funds
+
+Use this when an equity vault ID was removed from config but inventory polling
+warns that the retired vault still has a positive balance. After the bot has
+restarted with the new config, new deposits and rebalancing paths use the first
+entry in the configured vault list (config file order), but the old vault
+remains registered for balance visibility.
+
+Use the token address stored in
+`assets.equities.symbols.<SYMBOL>.tokenized_equity_derivative`, not the
+unwrapped token address table above. For the symbol you are moving, confirm the
+configured destination vault ID in the current config before moving funds.
+
+**Step 1: Withdraw from the retired vault**
+
+```bash
+stox vault-withdraw \
+  --amount <shares> \
+  --token <tokenized-equity-derivative-address> \
+  --vault-id <retired-vault-id>
+```
+
+**Step 2: Deposit the same tokens into the configured vault**
+
+```bash
+stox vault-deposit \
+  --amount <shares> \
+  --token <tokenized-equity-derivative-address> \
+  --vault-id <configured-vault-id>
+```
+
+The commands print the amount, token, wallet, orderbook, vault ID, decimals, and
+smallest-unit amount before submitting the transaction. Verify those values
+match the retired source vault and configured destination vault before relying
+on the printed transaction hash.
+
 ## Alpaca Crypto Wallet Management
 
 ### USDC Deposits and Withdrawals

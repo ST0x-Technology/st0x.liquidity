@@ -126,6 +126,20 @@ impl EventSourced for VaultRegistry {
                 }
             }
 
+            VaultRegistryCommand::SetPrimaryEquityVaultFromConfig {
+                token, vault_id, ..
+            } => {
+                if self.primary_equity_vault.get(token) == Some(vault_id) {
+                    return Ok(vec![]);
+                }
+            }
+
+            VaultRegistryCommand::SetPrimaryUsdcVaultFromConfig { vault_id } => {
+                if self.primary_usdc_vault == Some(*vault_id) {
+                    return Ok(vec![]);
+                }
+            }
+
             VaultRegistryCommand::DiscoverEquityVault { .. }
             | VaultRegistryCommand::DiscoverUsdcVault { .. } => {}
         }
@@ -140,20 +154,20 @@ impl EventSourced for VaultRegistry {
 /// address, with each token mapping to a set of vaults keyed by vault ID.
 /// Multiple USDC vaults are supported, keyed by vault ID.
 ///
-/// Each asset also tracks a **primary** vault ID — the first vault seeded
-/// from config (or the first discovered, if none was configured). The
-/// primary vault is used for single-vault operations like deposits and
-/// withdrawals, preserving operator intent from config ordering.
+/// Each asset also tracks a **primary** vault ID. Config seeding reasserts
+/// the first vault currently configured for the asset; otherwise the first
+/// discovered vault remains primary. The primary vault is used for
+/// single-vault operations like deposits and withdrawals, preserving
+/// operator intent from current config ordering.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct VaultRegistry {
     /// Equity vaults, grouped by token address then keyed by vault ID.
     pub(crate) equity_vaults: BTreeMap<Address, BTreeMap<B256, EquityVault>>,
     /// USDC vaults, keyed by vault ID.
     pub(crate) usdc_vaults: BTreeMap<B256, UsdcVault>,
-    /// Primary equity vault per token — the first config-seeded or discovered
-    /// vault ID for each token. Used by deposit/withdraw operations.
+    /// Primary equity vault per token, used by deposit/withdraw operations.
     primary_equity_vault: BTreeMap<Address, B256>,
-    /// Primary USDC vault — the first config-seeded or discovered vault ID.
+    /// Primary USDC vault, used by deposit/withdraw operations.
     primary_usdc_vault: Option<B256>,
     pub(crate) last_updated: DateTime<Utc>,
 }
@@ -196,8 +210,7 @@ impl VaultRegistry {
             .map(|(token, _)| *token)
     }
 
-    /// Returns the primary vault ID for a token — the first config-seeded
-    /// or discovered vault, preserving operator intent from config ordering.
+    /// Returns the primary vault ID for a token.
     pub(crate) fn primary_vault_id_by_token(&self, token: Address) -> Option<B256> {
         self.primary_equity_vault.get(&token).copied()
     }
@@ -319,6 +332,16 @@ impl VaultRegistry {
                     },
                 );
             }
+
+            VaultRegistryEvent::PrimaryEquityVaultSetFromConfig {
+                token, vault_id, ..
+            } => {
+                self.primary_equity_vault.insert(*token, *vault_id);
+            }
+
+            VaultRegistryEvent::PrimaryUsdcVaultSetFromConfig { vault_id, .. } => {
+                self.primary_usdc_vault = Some(*vault_id);
+            }
         }
     }
 
@@ -363,6 +386,24 @@ impl VaultRegistry {
                     seeded_at: now,
                 }
             }
+
+            VaultRegistryCommand::SetPrimaryEquityVaultFromConfig {
+                token,
+                vault_id,
+                symbol,
+            } => VaultRegistryEvent::PrimaryEquityVaultSetFromConfig {
+                token,
+                vault_id,
+                configured_at: now,
+                symbol,
+            },
+
+            VaultRegistryCommand::SetPrimaryUsdcVaultFromConfig { vault_id } => {
+                VaultRegistryEvent::PrimaryUsdcVaultSetFromConfig {
+                    vault_id,
+                    configured_at: now,
+                }
+            }
         }
     }
 }
@@ -387,6 +428,14 @@ pub(crate) enum VaultRegistryCommand {
     },
     /// Pre-seed the USDC vault from config (no onchain discovery).
     SeedUsdcVaultFromConfig { vault_id: B256 },
+    /// Mark the currently configured primary equity vault.
+    SetPrimaryEquityVaultFromConfig {
+        token: Address,
+        vault_id: B256,
+        symbol: Symbol,
+    },
+    /// Mark the currently configured primary USDC vault.
+    SetPrimaryUsdcVaultFromConfig { vault_id: B256 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -415,6 +464,18 @@ pub(crate) enum VaultRegistryEvent {
         vault_id: B256,
         seeded_at: DateTime<Utc>,
     },
+    /// Primary equity vault selected from current config ordering.
+    PrimaryEquityVaultSetFromConfig {
+        token: Address,
+        vault_id: B256,
+        configured_at: DateTime<Utc>,
+        symbol: Symbol,
+    },
+    /// Primary USDC vault selected from current config ordering.
+    PrimaryUsdcVaultSetFromConfig {
+        vault_id: B256,
+        configured_at: DateTime<Utc>,
+    },
 }
 
 impl VaultRegistryEvent {
@@ -424,6 +485,8 @@ impl VaultRegistryEvent {
             | Self::UsdcVaultDiscovered { discovered_at, .. } => *discovered_at,
             Self::EquityVaultSeededFromConfig { seeded_at, .. }
             | Self::UsdcVaultSeededFromConfig { seeded_at, .. } => *seeded_at,
+            Self::PrimaryEquityVaultSetFromConfig { configured_at, .. }
+            | Self::PrimaryUsdcVaultSetFromConfig { configured_at, .. } => *configured_at,
         }
     }
 }
@@ -442,6 +505,12 @@ impl DomainEvent for VaultRegistryEvent {
             }
             Self::UsdcVaultSeededFromConfig { .. } => {
                 "VaultRegistryEvent::UsdcVaultSeededFromConfig".to_string()
+            }
+            Self::PrimaryEquityVaultSetFromConfig { .. } => {
+                "VaultRegistryEvent::PrimaryEquityVaultSetFromConfig".to_string()
+            }
+            Self::PrimaryUsdcVaultSetFromConfig { .. } => {
+                "VaultRegistryEvent::PrimaryUsdcVaultSetFromConfig".to_string()
             }
         }
     }
@@ -484,7 +553,9 @@ pub(crate) struct SeedVaultRegistryCtx {
     vault_registry: Arc<Store<VaultRegistry>>,
     id: VaultRegistryId,
     equity_seeds: Vec<EquityVaultSeed>,
+    equity_primary_seeds: Vec<EquityVaultSeed>,
     usdc_vault_ids: Vec<B256>,
+    usdc_primary_vault_id: Option<B256>,
 }
 
 impl SeedVaultRegistryCtx {
@@ -528,6 +599,24 @@ impl SeedVaultRegistryCtx {
             })
             .collect();
 
+        let equity_primary_seeds = ctx
+            .assets
+            .equities
+            .symbols
+            .iter()
+            .filter_map(|(symbol, equity_config)| {
+                equity_config
+                    .vault_ids
+                    .first()
+                    .copied()
+                    .map(|vault_id| EquityVaultSeed {
+                        token: equity_config.tokenized_equity_derivative,
+                        vault_id,
+                        symbol: symbol.clone(),
+                    })
+            })
+            .collect();
+
         let usdc_vault_ids = ctx
             .assets
             .cash
@@ -535,11 +624,19 @@ impl SeedVaultRegistryCtx {
             .map(|cash| cash.vault_ids.clone())
             .unwrap_or_default();
 
+        let usdc_primary_vault_id = ctx
+            .assets
+            .cash
+            .as_ref()
+            .and_then(|cash| cash.vault_ids.first().copied());
+
         Ok(Self {
             vault_registry,
             id,
             equity_seeds,
+            equity_primary_seeds,
             usdc_vault_ids,
+            usdc_primary_vault_id,
         })
     }
 }
@@ -585,6 +682,26 @@ impl Job<SeedVaultRegistryCtx> for SeedVaultRegistry {
                 .await?;
         }
 
+        for seed in &ctx.equity_primary_seeds {
+            info!(
+                symbol = %seed.symbol,
+                vault_id = %seed.vault_id,
+                token = %seed.token,
+                "Setting configured primary equity vault",
+            );
+
+            ctx.vault_registry
+                .send(
+                    &ctx.id,
+                    VaultRegistryCommand::SetPrimaryEquityVaultFromConfig {
+                        token: seed.token,
+                        vault_id: seed.vault_id,
+                        symbol: seed.symbol.clone(),
+                    },
+                )
+                .await?;
+        }
+
         for vault_id in &ctx.usdc_vault_ids {
             info!(%vault_id, "Seeding USDC vault from config");
 
@@ -594,6 +711,17 @@ impl Job<SeedVaultRegistryCtx> for SeedVaultRegistry {
                     VaultRegistryCommand::SeedUsdcVaultFromConfig {
                         vault_id: *vault_id,
                     },
+                )
+                .await?;
+        }
+
+        if let Some(vault_id) = ctx.usdc_primary_vault_id {
+            info!(%vault_id, "Setting configured primary USDC vault");
+
+            ctx.vault_registry
+                .send(
+                    &ctx.id,
+                    VaultRegistryCommand::SetPrimaryUsdcVaultFromConfig { vault_id },
                 )
                 .await?;
         }
@@ -838,6 +966,52 @@ mod tests {
             registry.primary_vault_id_by_token(TEST_TOKEN),
             Some(large_vault_id),
             "Primary vault must preserve config order, not BTreeMap key order"
+        );
+    }
+
+    #[test]
+    fn configured_primary_equity_vault_can_replace_previous_primary() {
+        let new_vault_id =
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000099");
+
+        let registry = replay::<VaultRegistry>(vec![
+            VaultRegistryEvent::EquityVaultSeededFromConfig {
+                token: TEST_TOKEN,
+                vault_id: TEST_VAULT_ID,
+                seeded_at: Utc::now(),
+                symbol: test_symbol(),
+            },
+            VaultRegistryEvent::PrimaryEquityVaultSetFromConfig {
+                token: TEST_TOKEN,
+                vault_id: TEST_VAULT_ID,
+                configured_at: Utc::now(),
+                symbol: test_symbol(),
+            },
+            VaultRegistryEvent::EquityVaultSeededFromConfig {
+                token: TEST_TOKEN,
+                vault_id: new_vault_id,
+                seeded_at: Utc::now(),
+                symbol: test_symbol(),
+            },
+            VaultRegistryEvent::PrimaryEquityVaultSetFromConfig {
+                token: TEST_TOKEN,
+                vault_id: new_vault_id,
+                configured_at: Utc::now(),
+                symbol: test_symbol(),
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            registry.primary_vault_id_by_token(TEST_TOKEN),
+            Some(new_vault_id),
+            "current config must be able to replace the previous primary vault",
+        );
+        assert_eq!(
+            registry.all_vault_ids_by_token(TEST_TOKEN),
+            vec![TEST_VAULT_ID, new_vault_id],
+            "retired vault remains registered for inventory polling",
         );
     }
 
@@ -1110,6 +1284,148 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn set_primary_equity_vault_deduplicates_when_config_unchanged() {
+        let events = TestHarness::<VaultRegistry>::with(())
+            .given(vec![
+                VaultRegistryEvent::EquityVaultSeededFromConfig {
+                    token: TEST_TOKEN,
+                    vault_id: TEST_VAULT_ID,
+                    seeded_at: Utc::now(),
+                    symbol: test_symbol(),
+                },
+                VaultRegistryEvent::PrimaryEquityVaultSetFromConfig {
+                    token: TEST_TOKEN,
+                    vault_id: TEST_VAULT_ID,
+                    configured_at: Utc::now(),
+                    symbol: test_symbol(),
+                },
+            ])
+            .when(VaultRegistryCommand::SetPrimaryEquityVaultFromConfig {
+                token: TEST_TOKEN,
+                vault_id: TEST_VAULT_ID,
+                symbol: test_symbol(),
+            })
+            .await
+            .events();
+
+        assert_eq!(
+            events.len(),
+            0,
+            "Should not emit event when configured primary equity vault is unchanged",
+        );
+    }
+
+    #[tokio::test]
+    async fn set_primary_equity_vault_emits_when_config_changes() {
+        let new_vault_id =
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000099");
+
+        let events = TestHarness::<VaultRegistry>::with(())
+            .given(vec![
+                VaultRegistryEvent::EquityVaultSeededFromConfig {
+                    token: TEST_TOKEN,
+                    vault_id: TEST_VAULT_ID,
+                    seeded_at: Utc::now(),
+                    symbol: test_symbol(),
+                },
+                VaultRegistryEvent::PrimaryEquityVaultSetFromConfig {
+                    token: TEST_TOKEN,
+                    vault_id: TEST_VAULT_ID,
+                    configured_at: Utc::now(),
+                    symbol: test_symbol(),
+                },
+                VaultRegistryEvent::EquityVaultSeededFromConfig {
+                    token: TEST_TOKEN,
+                    vault_id: new_vault_id,
+                    seeded_at: Utc::now(),
+                    symbol: test_symbol(),
+                },
+            ])
+            .when(VaultRegistryCommand::SetPrimaryEquityVaultFromConfig {
+                token: TEST_TOKEN,
+                vault_id: new_vault_id,
+                symbol: test_symbol(),
+            })
+            .await
+            .events();
+
+        assert_eq!(
+            events.len(),
+            1,
+            "Should emit event when configured primary equity vault changes",
+        );
+        assert!(matches!(
+            &events[0],
+            VaultRegistryEvent::PrimaryEquityVaultSetFromConfig { vault_id, .. }
+            if *vault_id == new_vault_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn set_primary_usdc_vault_deduplicates_when_config_unchanged() {
+        let events = TestHarness::<VaultRegistry>::with(())
+            .given(vec![
+                VaultRegistryEvent::UsdcVaultSeededFromConfig {
+                    vault_id: TEST_VAULT_ID,
+                    seeded_at: Utc::now(),
+                },
+                VaultRegistryEvent::PrimaryUsdcVaultSetFromConfig {
+                    vault_id: TEST_VAULT_ID,
+                    configured_at: Utc::now(),
+                },
+            ])
+            .when(VaultRegistryCommand::SetPrimaryUsdcVaultFromConfig {
+                vault_id: TEST_VAULT_ID,
+            })
+            .await
+            .events();
+
+        assert_eq!(
+            events.len(),
+            0,
+            "Should not emit event when configured primary USDC vault is unchanged",
+        );
+    }
+
+    #[tokio::test]
+    async fn set_primary_usdc_vault_emits_when_config_changes() {
+        let new_vault_id =
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000099");
+
+        let events = TestHarness::<VaultRegistry>::with(())
+            .given(vec![
+                VaultRegistryEvent::UsdcVaultSeededFromConfig {
+                    vault_id: TEST_VAULT_ID,
+                    seeded_at: Utc::now(),
+                },
+                VaultRegistryEvent::PrimaryUsdcVaultSetFromConfig {
+                    vault_id: TEST_VAULT_ID,
+                    configured_at: Utc::now(),
+                },
+                VaultRegistryEvent::UsdcVaultSeededFromConfig {
+                    vault_id: new_vault_id,
+                    seeded_at: Utc::now(),
+                },
+            ])
+            .when(VaultRegistryCommand::SetPrimaryUsdcVaultFromConfig {
+                vault_id: new_vault_id,
+            })
+            .await
+            .events();
+
+        assert_eq!(
+            events.len(),
+            1,
+            "Should emit event when configured primary USDC vault changes",
+        );
+        assert!(matches!(
+            &events[0],
+            VaultRegistryEvent::PrimaryUsdcVaultSetFromConfig { vault_id, .. }
+            if *vault_id == new_vault_id
+        ));
+    }
+
     /// Proves that reactors only receive events from commands
     /// executed AFTER the framework is constructed -- existing events
     /// in the store are NOT replayed on construction.
@@ -1319,6 +1635,71 @@ mod tests {
             registry.primary_usdc_vault_id(),
             Some(test_usdc_vault_id()),
             "usdc vault should be seeded as primary",
+        );
+    }
+
+    #[tokio::test]
+    async fn perform_reasserts_configured_equity_primary_after_vault_id_change() {
+        let pool = setup_test_db().await;
+        let initial_ctx = ctx_with_seeded_assets();
+        let initial_seed_ctx = seed_ctx_from(pool.clone(), &initial_ctx).await;
+        SeedVaultRegistry.perform(&initial_seed_ctx).await.unwrap();
+
+        let new_vault_id =
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000099");
+        let mut updated_ctx = ctx_with_seeded_assets();
+        updated_ctx
+            .assets
+            .equities
+            .symbols
+            .get_mut(&test_symbol())
+            .unwrap()
+            .vault_ids = vec![new_vault_id];
+
+        let updated_seed_ctx = seed_ctx_from(pool, &updated_ctx).await;
+        SeedVaultRegistry.perform(&updated_seed_ctx).await.unwrap();
+
+        let registry =
+            loaded_registry(&updated_seed_ctx.vault_registry, &updated_seed_ctx.id).await;
+
+        assert_eq!(
+            registry.primary_vault_id_by_token(TEST_TOKEN),
+            Some(new_vault_id),
+            "configured equity vault change must update the primary used by rebalancing",
+        );
+        assert_eq!(
+            registry.all_vault_ids_by_token(TEST_TOKEN),
+            vec![TEST_VAULT_ID, new_vault_id],
+            "old equity vault remains registered so inventory polling can surface stranded funds",
+        );
+    }
+
+    #[tokio::test]
+    async fn perform_reasserts_configured_usdc_primary_after_vault_id_change() {
+        let pool = setup_test_db().await;
+        let initial_ctx = ctx_with_seeded_assets();
+        let initial_seed_ctx = seed_ctx_from(pool.clone(), &initial_ctx).await;
+        SeedVaultRegistry.perform(&initial_seed_ctx).await.unwrap();
+
+        let new_vault_id =
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000099");
+        let mut updated_ctx = ctx_with_seeded_assets();
+        updated_ctx.assets.cash.as_mut().unwrap().vault_ids = vec![new_vault_id];
+
+        let updated_seed_ctx = seed_ctx_from(pool, &updated_ctx).await;
+        SeedVaultRegistry.perform(&updated_seed_ctx).await.unwrap();
+
+        let registry =
+            loaded_registry(&updated_seed_ctx.vault_registry, &updated_seed_ctx.id).await;
+
+        assert_eq!(
+            registry.primary_usdc_vault_id(),
+            Some(new_vault_id),
+            "configured USDC vault change must update the primary",
+        );
+        assert!(
+            registry.usdc_vaults.contains_key(&test_usdc_vault_id()),
+            "old USDC vault remains registered so inventory polling can surface stranded funds",
         );
     }
 

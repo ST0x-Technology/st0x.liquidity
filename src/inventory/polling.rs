@@ -6,20 +6,20 @@
 //! the fetched values. The InventoryView reacts to these events to reconcile
 //! tracked inventory.
 
-use alloy::primitives::{Address, TxHash};
+use alloy::primitives::{Address, B256, TxHash};
 use alloy::providers::RootProvider;
 use async_trait::async_trait;
 use chrono::Utc;
 use futures_util::future::try_join_all;
 use rain_math_float::FloatError;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tracing::{debug, warn};
 
 use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::{Evm, EvmError, OpenChainErrorRegistry, Wallet};
 use st0x_execution::{Executor, FractionalShares, InventoryResult, SharesConversionError, Symbol};
-use st0x_finance::{HasZero, Usd, UsdToCentsError};
+use st0x_finance::{HasZero, Usd, UsdToCentsError, Usdc};
 use st0x_raindex::{RaindexError, RaindexService, RaindexVaultId};
 
 use crate::bindings::IERC20;
@@ -118,7 +118,11 @@ where
     pending_request_ownership: Option<Arc<dyn PendingRequestOwnership>>,
     external_pending_warnings: Mutex<HashSet<TokenizationRequestId>>,
     unconfigured_symbol_warnings: Mutex<HashSet<Symbol>>,
+    retired_equity_vault_warnings: Mutex<HashSet<(Address, B256)>>,
+    retired_usdc_vault_warnings: Mutex<HashSet<B256>>,
     configured_equity_symbols: Option<HashSet<Symbol>>,
+    configured_equity_vaults: Option<BTreeMap<Address, BTreeSet<B256>>>,
+    configured_usdc_vaults: Option<BTreeSet<B256>>,
     reserved_cash: Usd,
 }
 
@@ -149,7 +153,11 @@ where
             pending_request_ownership: None,
             external_pending_warnings: Mutex::new(HashSet::new()),
             unconfigured_symbol_warnings: Mutex::new(HashSet::new()),
+            retired_equity_vault_warnings: Mutex::new(HashSet::new()),
+            retired_usdc_vault_warnings: Mutex::new(HashSet::new()),
             configured_equity_symbols: None,
+            configured_equity_vaults: None,
+            configured_usdc_vaults: None,
             reserved_cash,
         }
     }
@@ -159,6 +167,16 @@ where
         configured_equity_symbols: HashSet<Symbol>,
     ) -> Self {
         self.configured_equity_symbols = Some(configured_equity_symbols);
+        self
+    }
+
+    pub(crate) fn with_configured_vaults(
+        mut self,
+        configured_equity_vaults: BTreeMap<Address, BTreeSet<B256>>,
+        configured_usdc_vaults: Option<BTreeSet<B256>>,
+    ) -> Self {
+        self.configured_equity_vaults = Some(configured_equity_vaults);
+        self.configured_usdc_vaults = configured_usdc_vaults;
         self
     }
 
@@ -275,6 +293,15 @@ where
 
                 let vault_balances = try_join_all(vault_futures).await?;
 
+                for (vault, balance) in vaults_for_token.values().zip(vault_balances.iter()) {
+                    self.warn_if_retired_equity_vault_has_balance(
+                        &symbol,
+                        token,
+                        vault.vault_id,
+                        *balance,
+                    )?;
+                }
+
                 let total = vault_balances[1..]
                     .iter()
                     .copied()
@@ -328,6 +355,10 @@ where
         });
 
         let vault_balances = try_join_all(balance_futures).await?;
+
+        for (vault, balance) in registry.usdc_vaults.values().zip(vault_balances.iter()) {
+            self.warn_if_retired_usdc_vault_has_balance(vault.vault_id, *balance)?;
+        }
 
         let usdc_balance = vault_balances[1..]
             .iter()
@@ -590,6 +621,91 @@ where
                 warn!(
                     target: "inventory",
                     "Unconfigured symbol warning tracker was poisoned; recovering state"
+                );
+                poisoned.into_inner()
+            })
+    }
+
+    fn warn_if_retired_equity_vault_has_balance(
+        &self,
+        symbol: &Symbol,
+        token: Address,
+        vault_id: B256,
+        balance: FractionalShares,
+    ) -> Result<(), FloatError> {
+        let Some(configured_equity_vaults) = &self.configured_equity_vaults else {
+            return Ok(());
+        };
+
+        if configured_equity_vaults
+            .get(&token)
+            .is_some_and(|configured_vaults| configured_vaults.contains(&vault_id))
+            || balance.is_zero()?
+        {
+            return Ok(());
+        }
+
+        if self
+            .lock_retired_equity_vault_warnings()
+            .insert((token, vault_id))
+        {
+            warn!(
+                target: "inventory",
+                %symbol,
+                %token,
+                %vault_id,
+                ?balance,
+                "Registered equity vault has a positive balance but is no longer configured"
+            );
+        }
+
+        Ok(())
+    }
+
+    fn lock_retired_equity_vault_warnings(&self) -> MutexGuard<'_, HashSet<(Address, B256)>> {
+        self.retired_equity_vault_warnings
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                warn!(
+                    target: "inventory",
+                    "Retired equity vault warning tracker was poisoned; recovering state"
+                );
+                poisoned.into_inner()
+            })
+    }
+
+    fn warn_if_retired_usdc_vault_has_balance(
+        &self,
+        vault_id: B256,
+        balance: Usdc,
+    ) -> Result<(), FloatError> {
+        let Some(configured_usdc_vaults) = &self.configured_usdc_vaults else {
+            return Ok(());
+        };
+
+        if configured_usdc_vaults.contains(&vault_id) || balance.is_zero()? {
+            return Ok(());
+        }
+
+        if self.lock_retired_usdc_vault_warnings().insert(vault_id) {
+            warn!(
+                target: "inventory",
+                %vault_id,
+                ?balance,
+                "Registered USDC vault has a positive balance but is no longer configured"
+            );
+        }
+
+        Ok(())
+    }
+
+    fn lock_retired_usdc_vault_warnings(&self) -> MutexGuard<'_, HashSet<B256>> {
+        self.retired_usdc_vault_warnings
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                warn!(
+                    target: "inventory",
+                    "Retired USDC vault warning tracker was poisoned; recovering state"
                 );
                 poisoned.into_inner()
             })
@@ -1056,6 +1172,19 @@ mod tests {
 
     fn configured_symbols(symbols: &[&str]) -> HashSet<Symbol> {
         symbols.iter().map(|symbol| test_symbol(symbol)).collect()
+    }
+
+    fn configured_equity_vaults(
+        token: Address,
+        vault_ids: impl IntoIterator<Item = B256>,
+    ) -> BTreeMap<Address, BTreeSet<B256>> {
+        let mut configured = BTreeMap::new();
+        configured.insert(token, vault_ids.into_iter().collect());
+        configured
+    }
+
+    fn vault_balance_hex(balance: rain_math_float::Float) -> String {
+        alloy::hex::encode_prefixed(balance.get_inner())
     }
 
     fn create_test_raindex_service(
@@ -2021,6 +2150,121 @@ mod tests {
         assert!(
             matches!(error, InventoryPollingError::Raindex(_)),
             "Expected Vault error when RPC fails, got {error:?}"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn poll_onchain_warns_when_retired_equity_vault_has_positive_balance() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+        let retired_vault_id = TEST_VAULT_ID;
+        let configured_vault_id =
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000002");
+
+        discover_equity_vault(
+            &pool,
+            orderbook,
+            order_owner,
+            TEST_TOKEN,
+            retired_vault_id,
+            test_symbol("SGOV"),
+        )
+        .await;
+        discover_equity_vault(
+            &pool,
+            orderbook,
+            order_owner,
+            TEST_TOKEN,
+            configured_vault_id,
+            test_symbol("SGOV"),
+        )
+        .await;
+
+        let retired_balance = vault_balance_hex(float!(5));
+        let asserter = Asserter::new();
+        asserter.push_success(&retired_balance);
+        asserter.push_success(&ZERO_FLOAT_HEX);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let raindex_service = create_test_raindex_service(provider);
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            MockExecutor::new(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            None,
+            Usd::ZERO,
+        )
+        .with_configured_vaults(
+            configured_equity_vaults(TEST_TOKEN, [configured_vault_id]),
+            None,
+        );
+
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+        service.poll_onchain(&snapshot_id).await.unwrap();
+
+        assert!(
+            logs_contain(
+                "Registered equity vault has a positive balance but is no longer configured"
+            ),
+            "Should warn when a retired equity vault still holds funds"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn poll_onchain_warns_when_retired_usdc_vault_has_positive_balance() {
+        let pool = setup_test_db().await;
+        let (orderbook, order_owner) = test_addresses();
+        let retired_vault_id = TEST_VAULT_ID;
+        let configured_vault_id =
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000002");
+
+        discover_usdc_vault(&pool, orderbook, order_owner, retired_vault_id).await;
+        discover_usdc_vault(&pool, orderbook, order_owner, configured_vault_id).await;
+
+        let retired_balance = vault_balance_hex(float!(125));
+        let asserter = Asserter::new();
+        asserter.push_success(&retired_balance);
+        asserter.push_success(&ZERO_FLOAT_HEX);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let raindex_service = create_test_raindex_service(provider);
+
+        let service = InventoryPollingService::new(
+            raindex_service,
+            MockExecutor::new(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            None,
+            Usd::ZERO,
+        )
+        .with_configured_vaults(BTreeMap::new(), Some(BTreeSet::from([configured_vault_id])));
+
+        let snapshot_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        };
+        service.poll_onchain(&snapshot_id).await.unwrap();
+
+        assert!(
+            logs_contain(
+                "Registered USDC vault has a positive balance but is no longer configured"
+            ),
+            "Should warn when a retired USDC vault still holds funds"
         );
     }
 
