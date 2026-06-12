@@ -6,36 +6,22 @@
 //! apalis queue backlogs and retry pressure. Strictly read-only.
 
 use std::collections::BTreeMap;
+use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use tracing::warn;
 
-use st0x_dto::{FailureEventCount, JobQueueHealth, LogTargetCount, LogVolumeBucket};
+use st0x_dto::{
+    CountedLogLevel, FailureEventCount, FailureEventType, JobQueueHealth, LogTargetCount,
+    LogVolumeBucket,
+};
 
-use super::rebalance::event_timestamp;
 use super::{PerformanceError, ReportRange};
 use crate::equity_redemption::EquityRedemptionEvent;
 use crate::offchain::order::OffchainOrderEvent;
 use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
 use crate::usdc_rebalance::UsdcRebalanceEvent;
-
-/// Lifecycle failure event types treated as money-at-risk signals.
-const FAILURE_EVENT_TYPES: [&str; 13] = [
-    "OffchainOrderEvent::Failed",
-    "UsdcRebalanceEvent::ConversionFailed",
-    "UsdcRebalanceEvent::WithdrawalFailed",
-    "UsdcRebalanceEvent::BridgingFailed",
-    "UsdcRebalanceEvent::DepositFailed",
-    "UsdcRebalanceEvent::AttestationTimedOut",
-    "EquityRedemptionEvent::TransferFailed",
-    "EquityRedemptionEvent::DetectionFailed",
-    "EquityRedemptionEvent::RedemptionRejected",
-    "TokenizedEquityMintEvent::MintRejected",
-    "TokenizedEquityMintEvent::MintAcceptanceFailed",
-    "TokenizedEquityMintEvent::WrappingFailed",
-    "TokenizedEquityMintEvent::RaindexDepositFailed",
-];
 
 /// Most recent failure rows scanned per report. Failure events are rare in a
 /// healthy system; the cap bounds the endpoint's cost when they are not.
@@ -46,7 +32,7 @@ pub(crate) async fn load_failure_events(
     pool: &SqlitePool,
     range: &ReportRange,
 ) -> Result<Vec<FailureEventCount>, PerformanceError> {
-    let placeholders = (1..=FAILURE_EVENT_TYPES.len())
+    let placeholders = (1..=FailureEventType::ALL.len())
         .map(|position| format!("${position}"))
         .collect::<Vec<_>>()
         .join(", ");
@@ -57,15 +43,22 @@ pub(crate) async fn load_failure_events(
     );
 
     let mut query = sqlx::query_as::<_, (String, String)>(&sql);
-    for event_type in FAILURE_EVENT_TYPES {
-        query = query.bind(event_type);
+    for event_type in FailureEventType::ALL {
+        query = query.bind(event_type.as_str());
     }
     let rows = query.fetch_all(pool).await?;
 
-    let mut counts: BTreeMap<String, FailureEventCount> = BTreeMap::new();
-    for (event_type, payload) in rows {
-        let Some(occurred_at) = failure_timestamp(&event_type, &payload) else {
-            warn!(%event_type, "Skipping failure event with undeserializable payload");
+    let mut counts: BTreeMap<FailureEventType, FailureEventCount> = BTreeMap::new();
+    for (raw_event_type, payload) in rows {
+        let Ok(event_type) = FailureEventType::from_str(&raw_event_type) else {
+            warn!(%raw_event_type, "Skipping unrecognized failure event type");
+            continue;
+        };
+        let Some(occurred_at) = failure_timestamp(event_type, &payload) else {
+            warn!(
+                event_type = event_type.as_str(),
+                "Skipping failure event with undeserializable payload"
+            );
             continue;
         };
         if !range.contains(occurred_at) {
@@ -73,7 +66,7 @@ pub(crate) async fn load_failure_events(
         }
 
         counts
-            .entry(event_type.clone())
+            .entry(event_type)
             .and_modify(|entry| {
                 entry.count += 1;
                 entry.last_at = entry.last_at.max(occurred_at);
@@ -86,40 +79,102 @@ pub(crate) async fn load_failure_events(
     }
 
     let mut failure_events: Vec<FailureEventCount> = counts.into_values().collect();
-    failure_events.sort_by(|left, right| right.last_at.cmp(&left.last_at));
+    // Tie-break equal timestamps by discriminator string so the order
+    // matches the pre-enum (string-keyed) implementation byte for byte.
+    failure_events.sort_by(|left, right| {
+        right
+            .last_at
+            .cmp(&left.last_at)
+            .then_with(|| left.event_type.as_str().cmp(right.event_type.as_str()))
+    });
     Ok(failure_events)
 }
 
-fn failure_timestamp(event_type: &str, payload: &str) -> Option<DateTime<Utc>> {
-    if event_type == "OffchainOrderEvent::Failed" {
-        let OffchainOrderEvent::Failed { failed_at, .. } = serde_json::from_str(payload).ok()?
-        else {
-            return None;
-        };
-        return Some(failed_at);
-    }
+fn failure_timestamp(event_type: FailureEventType, payload: &str) -> Option<DateTime<Utc>> {
+    use FailureEventType::{
+        AttestationTimedOut, BridgingFailed, ConversionFailed, DepositFailed, MintAcceptanceFailed,
+        MintRejected, OffchainOrderFailed, RaindexDepositFailed, RedemptionDetectionFailed,
+        RedemptionRejected, RedemptionTransferFailed, WithdrawalFailed, WrappingFailed,
+    };
 
-    if event_type.starts_with("EquityRedemptionEvent::") {
-        return match serde_json::from_str(payload).ok()? {
-            EquityRedemptionEvent::TransferFailed { failed_at, .. }
-            | EquityRedemptionEvent::DetectionFailed { failed_at, .. } => Some(failed_at),
-            EquityRedemptionEvent::RedemptionRejected { rejected_at, .. } => Some(rejected_at),
-            _ => None,
-        };
+    match event_type {
+        OffchainOrderFailed => {
+            match serde_json::from_str(payload).ok()? {
+                OffchainOrderEvent::Failed { failed_at, .. } => Some(failed_at),
+                // Non-failure variants cannot appear under this failure
+                // discriminator; listed explicitly (not `_`) so the
+                // compiler flags new domain variants for triage here.
+                OffchainOrderEvent::Placed { .. }
+                | OffchainOrderEvent::Submitted { .. }
+                | OffchainOrderEvent::PartiallyFilled { .. }
+                | OffchainOrderEvent::Filled { .. } => None,
+            }
+        }
+        ConversionFailed | WithdrawalFailed | BridgingFailed | DepositFailed
+        | AttestationTimedOut => {
+            match serde_json::from_str(payload).ok()? {
+                UsdcRebalanceEvent::ConversionFailed { failed_at, .. }
+                | UsdcRebalanceEvent::WithdrawalFailed { failed_at, .. }
+                | UsdcRebalanceEvent::BridgingFailed { failed_at, .. }
+                | UsdcRebalanceEvent::DepositFailed { failed_at, .. } => Some(failed_at),
+                UsdcRebalanceEvent::AttestationTimedOut { timed_out_at, .. } => Some(timed_out_at),
+                // Same compile-time triage guard as below.
+                UsdcRebalanceEvent::ConversionInitiated { .. }
+                | UsdcRebalanceEvent::ConversionConfirmed { .. }
+                | UsdcRebalanceEvent::Initiated { .. }
+                | UsdcRebalanceEvent::WithdrawalSubmitting { .. }
+                | UsdcRebalanceEvent::WithdrawalConfirmed { .. }
+                | UsdcRebalanceEvent::BridgingSubmitting { .. }
+                | UsdcRebalanceEvent::BridgingInitiated { .. }
+                | UsdcRebalanceEvent::BridgeAttestationReceived { .. }
+                | UsdcRebalanceEvent::Bridged { .. }
+                | UsdcRebalanceEvent::BridgingCompletionRecovered { .. }
+                | UsdcRebalanceEvent::DepositInitiated { .. }
+                | UsdcRebalanceEvent::DepositConfirmed { .. }
+                | UsdcRebalanceEvent::OperatorReconciled { .. } => None,
+            }
+        }
+        RedemptionTransferFailed | RedemptionDetectionFailed | RedemptionRejected => {
+            match serde_json::from_str(payload).ok()? {
+                EquityRedemptionEvent::TransferFailed { failed_at, .. }
+                | EquityRedemptionEvent::DetectionFailed { failed_at, .. } => Some(failed_at),
+                EquityRedemptionEvent::RedemptionRejected { rejected_at, .. } => Some(rejected_at),
+                // Non-failure variants cannot appear under these failure
+                // discriminators; listed explicitly (not `_`) so the
+                // compiler flags new domain variants for triage here.
+                EquityRedemptionEvent::VaultWithdrawPending { .. }
+                | EquityRedemptionEvent::VaultWithdrawSubmitted { .. }
+                | EquityRedemptionEvent::WithdrawnFromRaindex { .. }
+                | EquityRedemptionEvent::TokensUnwrapped { .. }
+                | EquityRedemptionEvent::UnwrapPending { .. }
+                | EquityRedemptionEvent::UnwrapSubmitted { .. }
+                | EquityRedemptionEvent::SendPending { .. }
+                | EquityRedemptionEvent::TokensSent { .. }
+                | EquityRedemptionEvent::Detected { .. }
+                | EquityRedemptionEvent::Completed { .. }
+                | EquityRedemptionEvent::ProviderCompletionRecovered { .. } => None,
+            }
+        }
+        MintRejected | MintAcceptanceFailed | WrappingFailed | RaindexDepositFailed => {
+            match serde_json::from_str(payload).ok()? {
+                TokenizedEquityMintEvent::MintRejected { rejected_at, .. } => Some(rejected_at),
+                TokenizedEquityMintEvent::MintAcceptanceFailed { failed_at, .. }
+                | TokenizedEquityMintEvent::WrappingFailed { failed_at, .. }
+                | TokenizedEquityMintEvent::RaindexDepositFailed { failed_at, .. } => {
+                    Some(failed_at)
+                }
+                // Same compile-time triage guard as above.
+                TokenizedEquityMintEvent::MintRequested { .. }
+                | TokenizedEquityMintEvent::MintAccepted { .. }
+                | TokenizedEquityMintEvent::TokensReceived { .. }
+                | TokenizedEquityMintEvent::WrapSubmitted { .. }
+                | TokenizedEquityMintEvent::TokensWrapped { .. }
+                | TokenizedEquityMintEvent::VaultDepositSubmitted { .. }
+                | TokenizedEquityMintEvent::DepositedIntoRaindex { .. }
+                | TokenizedEquityMintEvent::ProviderCompletionRecovered { .. } => None,
+            }
+        }
     }
-
-    if event_type.starts_with("TokenizedEquityMintEvent::") {
-        return match serde_json::from_str(payload).ok()? {
-            TokenizedEquityMintEvent::MintRejected { rejected_at, .. } => Some(rejected_at),
-            TokenizedEquityMintEvent::MintAcceptanceFailed { failed_at, .. }
-            | TokenizedEquityMintEvent::WrappingFailed { failed_at, .. }
-            | TokenizedEquityMintEvent::RaindexDepositFailed { failed_at, .. } => Some(failed_at),
-            _ => None,
-        };
-    }
-
-    let event: UsdcRebalanceEvent = serde_json::from_str(payload).ok()?;
-    Some(event_timestamp(&event))
 }
 
 /// Aggregate already-filtered ERROR/WARN log entries into time buckets and
@@ -134,7 +189,7 @@ pub(crate) fn aggregate_log_entries(
 ) -> (Vec<LogVolumeBucket>, Vec<LogTargetCount>) {
     let width = range.bucket_width();
     let mut buckets: BTreeMap<i64, (usize, usize)> = BTreeMap::new();
-    let mut targets: BTreeMap<(String, String), BTreeMap<i64, usize>> = BTreeMap::new();
+    let mut targets: BTreeMap<(String, CountedLogLevel), BTreeMap<i64, usize>> = BTreeMap::new();
 
     for entry in entries {
         let Some(timestamp) = entry["timestamp"]
@@ -148,14 +203,17 @@ pub(crate) fn aggregate_log_entries(
             continue;
         }
 
-        let level = entry["level"].as_str().unwrap_or("UNKNOWN").to_uppercase();
+        let level = match entry["level"].as_str() {
+            Some(raw_level) if raw_level.eq_ignore_ascii_case("ERROR") => CountedLogLevel::Error,
+            Some(raw_level) if raw_level.eq_ignore_ascii_case("WARN") => CountedLogLevel::Warn,
+            _ => continue,
+        };
         let target = entry["target"].as_str().unwrap_or("unknown").to_string();
 
         let index = (timestamp - range.from).num_seconds() / width.num_seconds();
-        match level.as_str() {
-            "ERROR" => buckets.entry(index).or_default().0 += 1,
-            "WARN" => buckets.entry(index).or_default().1 += 1,
-            _ => continue,
+        match level {
+            CountedLogLevel::Error => buckets.entry(index).or_default().0 += 1,
+            CountedLogLevel::Warn => buckets.entry(index).or_default().1 += 1,
         }
 
         *targets
@@ -274,6 +332,8 @@ fn count(value: i64) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use chrono::TimeZone;
     use serde_json::json;
 
@@ -322,7 +382,7 @@ mod tests {
             targets[0],
             LogTargetCount {
                 target: "hedge".to_string(),
-                level: "ERROR".to_string(),
+                level: CountedLogLevel::Error,
                 count: 2,
                 sparkline: vec![2],
             }
@@ -435,14 +495,84 @@ mod tests {
         let failures = load_failure_events(&pool, &range()).await.unwrap();
 
         assert_eq!(failures.len(), 2);
-        assert_eq!(
-            failures[0].event_type,
-            "UsdcRebalanceEvent::WithdrawalFailed"
-        );
+        assert_eq!(failures[0].event_type, FailureEventType::WithdrawalFailed);
         assert_eq!(failures[0].count, 1);
         assert_eq!(failures[0].last_at, timestamp(200));
-        assert_eq!(failures[1].event_type, "OffchainOrderEvent::Failed");
+        assert_eq!(
+            failures[1].event_type,
+            FailureEventType::OffchainOrderFailed
+        );
         assert_eq!(failures[1].count, 1);
+    }
+
+    #[tokio::test]
+    async fn load_failure_events_accumulates_counts_and_latest_timestamp() {
+        let pool = setup_test_db().await;
+
+        for (sequence, offset) in [(1_i64, 300_i64), (2, 100)] {
+            insert_event(
+                &pool,
+                "OffchainOrder",
+                &format!("order-{sequence}"),
+                "OffchainOrderEvent::Failed",
+                json!({"Failed": {
+                    "error": "rejected",
+                    "failed_at": timestamp(offset).to_rfc3339(),
+                }}),
+            )
+            .await;
+        }
+
+        let failures = load_failure_events(&pool, &range()).await.unwrap();
+
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].count, 2);
+        // last_at must be the most recent occurrence, regardless of the
+        // order the rows were scanned in.
+        assert_eq!(failures[0].last_at, timestamp(300));
+    }
+
+    #[tokio::test]
+    async fn load_failure_events_extracts_rebalance_timestamps_per_variant() {
+        let pool = setup_test_db().await;
+
+        insert_event(
+            &pool,
+            "UsdcRebalance",
+            "op-1",
+            "UsdcRebalanceEvent::ConversionFailed",
+            json!({"ConversionFailed": {
+                "reason": "rejected",
+                "failed_at": timestamp(100).to_rfc3339(),
+            }}),
+        )
+        .await;
+        // AttestationTimedOut carries timed_out_at, not failed_at: the
+        // riskiest extraction path in the grouped rebalance arm.
+        insert_event(
+            &pool,
+            "UsdcRebalance",
+            "op-2",
+            "UsdcRebalanceEvent::AttestationTimedOut",
+            json!({"AttestationTimedOut": {
+                "burn_tx_hash":
+                    "0x1111111111111111111111111111111111111111111111111111111111111111",
+                "retry_deadline_at": timestamp(50).to_rfc3339(),
+                "timed_out_at": timestamp(200).to_rfc3339(),
+            }}),
+        )
+        .await;
+
+        let failures = load_failure_events(&pool, &range()).await.unwrap();
+
+        assert_eq!(failures.len(), 2);
+        assert_eq!(
+            failures[0].event_type,
+            FailureEventType::AttestationTimedOut
+        );
+        assert_eq!(failures[0].last_at, timestamp(200));
+        assert_eq!(failures[1].event_type, FailureEventType::ConversionFailed);
+        assert_eq!(failures[1].last_at, timestamp(100));
     }
 
     #[tokio::test]
@@ -524,6 +654,33 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_log_entries_accepts_case_variant_levels() {
+        let entries = vec![
+            log_entry(10, "error", "hedge"),
+            log_entry(20, "Warn", "hedge"),
+        ];
+
+        let (buckets, targets) = aggregate_log_entries(&entries, &range());
+
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].errors, 1);
+        assert_eq!(buckets[0].warnings, 1);
+        assert_eq!(targets.len(), 2);
+        // Pin the classification itself, not just the totals: a swapped
+        // mapping would keep the counts at 1/1.
+        let error_target = targets
+            .iter()
+            .find(|target| target.level == CountedLogLevel::Error)
+            .unwrap();
+        assert_eq!(error_target.count, 1);
+        let warn_target = targets
+            .iter()
+            .find(|target| target.level == CountedLogLevel::Warn)
+            .unwrap();
+        assert_eq!(warn_target.count, 1);
+    }
+
+    #[test]
     fn aggregate_log_entries_ignores_unexpected_levels() {
         let entries = vec![
             log_entry(10, "INFO", "hedge"),
@@ -541,11 +698,19 @@ mod tests {
 
     #[test]
     fn failure_event_types_match_domain_event_names() {
+        use alloy::primitives::TxHash;
         use st0x_event_sorcery::DomainEvent;
+        use st0x_execution::Symbol;
+        use st0x_float_macro::float;
 
-        let samples: Vec<(&str, String)> = vec![
+        use crate::equity_redemption::DetectionFailure;
+
+        // One constructed domain event per FailureEventType variant: this is
+        // the authoritative binding between the DTO enum and the event
+        // store's discriminator strings.
+        let samples: Vec<(FailureEventType, String)> = vec![
             (
-                "OffchainOrderEvent::Failed",
+                FailureEventType::OffchainOrderFailed,
                 OffchainOrderEvent::Failed {
                     error: "rejected".to_string(),
                     failed_at: timestamp(0),
@@ -553,7 +718,15 @@ mod tests {
                 .event_type(),
             ),
             (
-                "UsdcRebalanceEvent::WithdrawalFailed",
+                FailureEventType::ConversionFailed,
+                UsdcRebalanceEvent::ConversionFailed {
+                    reason: "rejected".to_string(),
+                    failed_at: timestamp(0),
+                }
+                .event_type(),
+            ),
+            (
+                FailureEventType::WithdrawalFailed,
                 UsdcRebalanceEvent::WithdrawalFailed {
                     reason: "revert".to_string(),
                     failed_at: timestamp(0),
@@ -561,7 +734,52 @@ mod tests {
                 .event_type(),
             ),
             (
-                "EquityRedemptionEvent::RedemptionRejected",
+                FailureEventType::BridgingFailed,
+                UsdcRebalanceEvent::BridgingFailed {
+                    burn_tx_hash: None,
+                    cctp_nonce: None,
+                    reason: "revert".to_string(),
+                    failed_at: timestamp(0),
+                }
+                .event_type(),
+            ),
+            (
+                FailureEventType::DepositFailed,
+                UsdcRebalanceEvent::DepositFailed {
+                    deposit_ref: None,
+                    reason: "revert".to_string(),
+                    failed_at: timestamp(0),
+                }
+                .event_type(),
+            ),
+            (
+                FailureEventType::AttestationTimedOut,
+                UsdcRebalanceEvent::AttestationTimedOut {
+                    burn_tx_hash: TxHash::random(),
+                    retry_deadline_at: timestamp(0),
+                    timed_out_at: timestamp(0),
+                }
+                .event_type(),
+            ),
+            (
+                FailureEventType::RedemptionTransferFailed,
+                EquityRedemptionEvent::TransferFailed {
+                    tx_hash: None,
+                    reason: None,
+                    failed_at: timestamp(0),
+                }
+                .event_type(),
+            ),
+            (
+                FailureEventType::RedemptionDetectionFailed,
+                EquityRedemptionEvent::DetectionFailed {
+                    failure: DetectionFailure::Timeout,
+                    failed_at: timestamp(0),
+                }
+                .event_type(),
+            ),
+            (
+                FailureEventType::RedemptionRejected,
                 EquityRedemptionEvent::RedemptionRejected {
                     reason: "rejected".to_string(),
                     rejected_at: timestamp(0),
@@ -569,20 +787,60 @@ mod tests {
                 .event_type(),
             ),
             (
-                "TokenizedEquityMintEvent::MintRejected",
+                FailureEventType::MintRejected,
                 TokenizedEquityMintEvent::MintRejected {
                     reason: "rejected".to_string(),
                     rejected_at: timestamp(0),
                 }
                 .event_type(),
             ),
+            (
+                FailureEventType::MintAcceptanceFailed,
+                TokenizedEquityMintEvent::MintAcceptanceFailed {
+                    reason: "rejected".to_string(),
+                    failed_at: timestamp(0),
+                }
+                .event_type(),
+            ),
+            (
+                FailureEventType::WrappingFailed,
+                TokenizedEquityMintEvent::WrappingFailed {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(1),
+                    reason: None,
+                    failed_at: timestamp(0),
+                }
+                .event_type(),
+            ),
+            (
+                FailureEventType::RaindexDepositFailed,
+                TokenizedEquityMintEvent::RaindexDepositFailed {
+                    reason: "revert".to_string(),
+                    failed_at: timestamp(0),
+                }
+                .event_type(),
+            ),
         ];
 
-        for (expected, actual) in samples {
-            assert_eq!(actual, expected);
-            assert!(
-                FAILURE_EVENT_TYPES.contains(&expected),
-                "{expected} missing from FAILURE_EVENT_TYPES"
+        let sampled_types: BTreeSet<FailureEventType> = samples
+            .iter()
+            .map(|(failure_type, _)| *failure_type)
+            .collect();
+        let all: BTreeSet<FailureEventType> = FailureEventType::ALL.iter().copied().collect();
+        assert_eq!(
+            sampled_types, all,
+            "every failure event type needs exactly one domain sample here"
+        );
+
+        for (failure_type, domain_name) in samples {
+            assert_eq!(
+                failure_type.as_str(),
+                domain_name,
+                "{failure_type:?} drifted from the domain event's event_type()"
+            );
+            assert_eq!(
+                FailureEventType::from_str(&domain_name).unwrap(),
+                failure_type
             );
         }
     }
