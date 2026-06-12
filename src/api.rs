@@ -22,11 +22,11 @@ use st0x_execution::FractionalShares;
 use crate::AppState;
 use crate::dashboard::transfer_loader::{InvalidTransferKind, TransferKind};
 use crate::equity_redemption::{EquityRedemptionEvent, RedemptionAggregateId};
-use crate::performance::rebalance::load_rebalance_timings;
+use crate::performance::rebalance::rebalance_timing_report;
 use crate::performance::reliability::{
     aggregate_log_entries, load_failure_events, load_job_queue_health,
 };
-use crate::performance::{ReportRange, hedge_latency_report, load_hedge_performance};
+use crate::performance::{ReportRange, hedge_latency_report};
 use crate::rebalancing::RebalancingService;
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, RecheckError, RecheckOutcome};
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMintEvent};
@@ -1490,7 +1490,9 @@ async fn performance_latencies(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let performances = load_hedge_performance(&state.pool)
+    let performances = state
+        .performance
+        .hedge_performances(&state.pool)
         .await
         .inspect_err(|error| error!(%error, "Failed to load hedge performance"))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -1511,12 +1513,17 @@ async fn performance_rebalances(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let timings = load_rebalance_timings(&state.pool, &ReportRange { from, to })
+    let operations = state
+        .performance
+        .rebalance_operations(&state.pool)
         .await
         .inspect_err(|error| error!(%error, "Failed to load rebalance timings"))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    Ok(Json(timings))
+    Ok(Json(rebalance_timing_report(
+        &operations,
+        &ReportRange { from, to },
+    )))
 }
 
 async fn performance_reliability(
@@ -1616,6 +1623,7 @@ mod tests {
     use super::*;
     use crate::dashboard;
     use crate::inventory::{self, BroadcastingInventory};
+    use crate::performance::cache::PerformanceCache;
 
     async fn empty_app_state(ctx: Ctx) -> AppState {
         let (sender, _) = broadcast::channel(16);
@@ -1633,6 +1641,7 @@ mod tests {
             )),
             recovery: Arc::new(tokio::sync::OnceCell::new()),
             resume_lock: Arc::new(ResumeLock(Mutex::new(()))),
+            performance: Arc::new(PerformanceCache::default()),
         }
     }
 

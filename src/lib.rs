@@ -137,6 +137,7 @@ pub(crate) struct AppState {
     pub(crate) settings: st0x_dto::Settings,
     pub(crate) recovery: Arc<tokio::sync::OnceCell<api::RecoveryHandle>>,
     pub(crate) resume_lock: Arc<api::ResumeLock>,
+    pub(crate) performance: Arc<performance::cache::PerformanceCache>,
 }
 
 #[tracing::instrument(skip_all, target = "startup", level = tracing::Level::INFO)]
@@ -292,6 +293,7 @@ fn spawn_server_supervisor(
         settings: dashboard::settings_from_ctx(ctx),
         recovery,
         resume_lock,
+        performance: Arc::new(performance::cache::PerformanceCache::default()),
     };
 
     let main_router = Router::new()
