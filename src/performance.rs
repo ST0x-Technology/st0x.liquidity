@@ -413,11 +413,14 @@ impl ReportRange {
         self.from <= timestamp && timestamp <= self.to
     }
 
-    /// Bucket width mirroring the P&L tab's cadence: daily up to a month,
-    /// weekly up to half a year, otherwise ~monthly.
+    /// Bucket width mirroring the P&L tab's cadence (daily up to a month,
+    /// weekly up to half a year, otherwise ~monthly), with hourly buckets
+    /// for short windows so a 24h report still shows a trend.
     fn bucket_width(&self) -> Duration {
         let span = self.to - self.from;
-        if span <= Duration::days(31) {
+        if span <= Duration::days(2) {
+            Duration::hours(1)
+        } else if span <= Duration::days(31) {
             Duration::days(1)
         } else if span <= Duration::days(183) {
             Duration::days(7)

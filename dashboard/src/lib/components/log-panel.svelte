@@ -4,6 +4,7 @@
   import MultiSelect from '$lib/components/multi-select.svelte'
   import { reactive } from '$lib/frp.svelte'
   import { getApiBaseUrl } from '$lib/env'
+  import { resolveLogFilter, takeRequestedLogTarget } from '$lib/log-filter-request.svelte'
   import { formatUtcMs, toDatetimeLocal, TIME_PRESETS, toRfc3339 } from '$lib/time'
 
   /** Log queries scan files on disk and can be slow at trace level. */
@@ -202,7 +203,36 @@
     !setsEqual(selectedCrates.current, OUR_CRATES)
   )
 
-  onMount(() => { void fetchLogs('replace') })
+  /**
+   * Seed filters from a Performance-tab click-through before the first
+   * fetch: known categories/crates narrow their checkbox filters, anything
+   * else lands in the free-text search so the click never silently no-ops.
+   */
+  const applyRequestedTarget = () => {
+    const requested = takeRequestedLogTarget()
+    if (requested === null) return
+
+    const resolution = resolveLogFilter(requested, ALL_CATEGORIES, ALL_CRATES)
+
+    if (resolution.kind === 'category') {
+      selectedCategories.update(() => new Set([resolution.target]))
+      selectedCrates.update(() => new Set<string>())
+      return
+    }
+
+    if (resolution.kind === 'crate') {
+      selectedCategories.update(() => new Set<string>())
+      selectedCrates.update(() => new Set([resolution.target]))
+      return
+    }
+
+    search.update(() => resolution.target)
+  }
+
+  onMount(() => {
+    applyRequestedTarget()
+    void fetchLogs('replace')
+  })
 
   // Debounced search
   let debounceTimer: ReturnType<typeof setTimeout> | undefined
