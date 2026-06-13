@@ -524,7 +524,7 @@ The system provides two top-level capabilities:
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
 │  st0x-hedge                            st0x-rebalance                   │
-│  ├─ Trade accounting                   ├─ Rebalancer                    │
+│  ├─ Trade accounting                   ├─ Transfer jobs                 │
 │  ├─ Position tracking                  ├─ Trigger logic                 │
 │  └─ CQRS aggregates                    ├─ Mint/Redeem managers          │
 │                                         └─ CQRS aggregates              │
@@ -1250,78 +1250,53 @@ move assets from one venue to the other.
 based on inventory imbalances. Tracks in-flight transfers. Does not know _how_
 transfers work.
 
-**Middle layer -- Cross-venue transfer trait**: Abstracts the _how_. Each
-implementation is a complete directional transfer that accepts an amount and
-succeeds or fails. The transfer steps (minting, bridging, vault operations) are
-encapsulated behind this trait.
+**Middle layer -- Transfer jobs**: Abstracts the _how_. Each of the four
+directional transfers is a persisted apalis job whose payload carries the
+lifecycle aggregate id (generated at enqueue time), so apalis retries and bot
+restarts re-enter the same aggregate. The job's worker calls a resume entry
+point on the transfer struct, which loads the aggregate and dispatches on its
+current state: an absent aggregate starts a fresh transfer, an in-flight one
+resumes from its persisted step, and a terminal one is a no-op. New transfers
+and mid-flight resumes share the same entry point -- that uniformity is what
+makes recovery dispatch fall out of the standard transfer lifecycle.
 
-```rust
-/// Marker types for the two trading venues.
-struct MarketMakingVenue;
-struct HedgingVenue;
+Four transfer jobs exist:
 
-/// Abstraction for transferring assets between venues.
-///
-/// Implementations encapsulate the full multi-step lifecycle (e.g. mint +
-/// deposit, or withdraw + redeem). The inventory layer calls this without
-/// knowing the steps involved.
-#[async_trait]
-trait CrossVenueTransfer<Source, Destination>: Send + Sync {
-    /// The asset being transferred (e.g. equity shares, USDC).
-    type Asset;
-    type Error;
+| Job                          | Asset  | Steps                                                          |
+| ---------------------------- | ------ | -------------------------------------------------------------- |
+| TransferEquityToMarketMaking | Equity | Mint via Alpaca ITN, wrap, deposit to Raindex vault            |
+| TransferEquityToHedging      | Equity | Withdraw from Raindex vault, unwrap, redeem via Alpaca ITN     |
+| TransferUsdcToMarketMaking   | USDC   | Convert USD->USDC, withdraw, bridge via CCTP, deposit to vault |
+| TransferUsdcToHedging        | USDC   | Withdraw from vault, bridge via CCTP, deposit USDC to Alpaca   |
 
-    async fn transfer(
-        &self,
-        asset: Self::Asset,
-    ) -> Result<(), Self::Error>;
-}
-```
-
-Four transfer directions exist:
-
-| Source            | Destination       | Asset  | Implementation                                                 |
-| ----------------- | ----------------- | ------ | -------------------------------------------------------------- |
-| HedgingVenue      | MarketMakingVenue | Equity | Mint via Alpaca ITN, deposit to Raindex vault                  |
-| MarketMakingVenue | HedgingVenue      | Equity | Withdraw from Raindex vault, redeem via Alpaca ITN             |
-| HedgingVenue      | MarketMakingVenue | USDC   | Convert USD->USDC, withdraw, bridge via CCTP, deposit to vault |
-| MarketMakingVenue | HedgingVenue      | USDC   | Withdraw from vault, bridge via CCTP, deposit USDC to Alpaca   |
+The trigger enqueues at most one transfer per scope at a time, guarded both by
+an in-memory in-progress set and by a Jobs-table dedupe (the in-memory guard
+resets on restart; a non-terminal job row suppresses a duplicate enqueue). The
+equity dedupe is per-symbol and direction-independent; the USDC dedupe is global
+and direction-independent.
 
 **Bottom layer -- Lifecycle aggregates**: Event-sourced entities that track
 multi-step transfer progress. These are implementation details of their
-respective `CrossVenueTransfer` impls, not top-level domain concepts. The
-transfer impl sends commands to its lifecycle aggregate, which handles crash
-recovery by persisting state transitions as events.
+respective transfer structs, not top-level domain concepts. The transfer struct
+sends commands to its lifecycle aggregate, which handles crash recovery by
+persisting state transitions as events.
 
 ##### Transfer Implementations
 
 Two structs implement all four transfer directions:
 
-- **`CrossVenueEquityTransfer`**: Implements
-  `CrossVenueTransfer<HedgingVenue, MarketMakingVenue>` (mint direction) and
-  `CrossVenueTransfer<MarketMakingVenue, HedgingVenue>` (redemption direction).
-  Holds stores for both equity lifecycle aggregates plus `Raindex` and
-  `Tokenizer` service traits.
+- **`CrossVenueEquityTransfer`**: Exposes `resume_equity_to_market_making` (mint
+  direction) and `resume_equity_to_hedging` (redemption direction). Holds stores
+  for both equity lifecycle aggregates plus `Raindex` and `Tokenizer` service
+  traits.
 
-- **`CrossVenueCashTransfer`**: Implements both USDC directions. Holds a store
-  for the `UsdcRebalance` lifecycle aggregate plus `Bridge`, `AlpacaFunding`,
-  and onchain provider dependencies.
-
-Each transfer:
-
-1. Creates a lifecycle aggregate instance (UUID) for crash recovery
-2. Sends commands that invoke domain service methods as side effects
-3. Returns when the lifecycle reaches a terminal state
+- **`CrossVenueCashTransfer`**: Exposes `resume_alpaca_to_base` and
+  `resume_base_to_alpaca`. Holds a store for the `UsdcRebalance` lifecycle
+  aggregate plus `Bridge`, `AlpacaFunding`, and onchain provider dependencies.
 
 The lifecycle aggregates (TokenizedEquityMint, EquityRedemption, UsdcRebalance)
 are implementation details of their respective transfer structs. External code
-interacts only through `CrossVenueTransfer::transfer()`.
-
-##### Rebalancer
-
-The `Rebalancer` receives `TriggeredOperation`s and dispatches to the
-appropriate `CrossVenueTransfer` impl. It holds `Arc<dyn CrossVenueTransfer>`
-for each of the four directions and calls `transfer()` on the right one.
+drives transfers only through the apalis jobs and their resume entry points.
 
 Three lifecycle aggregates handle the transfer workflows.
 
@@ -2583,8 +2558,10 @@ When thresholds crossed AND minimum amounts met, InventoryView emits:
   estimated_value_usd }`
 - `UsdcImbalanceDetected { direction: AlpacaToBase/BaseToAlpaca, amount }`
 
-**Rebalancer** (stateless) listens to these events and executes appropriate
-commands on TokenizedEquityMint, EquityRedemption, or UsdcRebalance aggregates.
+The trigger reacts to these events by enqueueing the matching transfer job
+(`TransferEquityToMarketMaking`, `TransferEquityToHedging`,
+`TransferUsdcToMarketMaking`, or `TransferUsdcToHedging`), whose worker drives
+the TokenizedEquityMint, EquityRedemption, or UsdcRebalance aggregate.
 
 ##### Example Scenarios
 
@@ -2772,8 +2749,8 @@ assets in transit (minting, redeeming, bridging) are accounted for.
 
 Imbalance detection compares each asset's onchain ratio against a configurable
 `ImbalanceThreshold` (target ratio + deviation). Rebalancing is only triggered
-when no inflight operations exist for the asset. Trigger events are emitted to
-`Rebalancer` for execution.
+when no inflight operations exist for the asset. The trigger enqueues the
+matching transfer job for execution.
 
 #### Failure Handling and Reconciliation
 
