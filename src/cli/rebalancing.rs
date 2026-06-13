@@ -11,7 +11,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
-use st0x_event_sorcery::StoreBuilder;
+use st0x_event_sorcery::{AggregateError, StoreBuilder};
 use st0x_evm::{Evm, OpenChainErrorRegistry, ReadOnlyEvm};
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Executor, FractionalShares, Symbol,
@@ -24,7 +24,9 @@ use st0x_wrapper::{Wrapper, WrapperService};
 use super::{TransferDirection, TransferType};
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::bindings::IERC20;
-use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId};
+use crate::equity_redemption::{
+    DetectionFailure, EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId,
+};
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, Equity, EquityTransferServices};
 use crate::rebalancing::to_wrapped_equities;
@@ -814,6 +816,29 @@ fn format_tokenization_request<Writer: Write>(
     Ok(())
 }
 
+/// Adds operator guidance to a rejected recovery command: between the CLI's
+/// state read and the command dispatch, the running bot may have advanced the
+/// aggregate, so on a typed rejection the operator should re-run to see the
+/// current state. Infrastructure failures pass through without the hint.
+fn stale_state_context<Failure: std::error::Error + Send + Sync + 'static>(
+    kind: &str,
+    id: &str,
+    error: AggregateError<Failure>,
+) -> anyhow::Error {
+    match error {
+        rejection @ (AggregateError::UserError(_) | AggregateError::AggregateConflict) => {
+            anyhow::Error::new(rejection).context(format!(
+                "{kind} {id} rejected the failure command. The state may have \
+                 advanced since it was read (is the bot driving this aggregate \
+                 concurrently?) -- re-run to see the current state."
+            ))
+        }
+        infrastructure @ (AggregateError::DatabaseConnectionError(_)
+        | AggregateError::DeserializationError(_)
+        | AggregateError::UnexpectedError(_)) => anyhow::Error::new(infrastructure),
+    }
+}
+
 /// Manually fail a stuck mint or redemption transfer aggregate.
 ///
 /// Loads the aggregate from the event store, determines its current state,
@@ -862,7 +887,8 @@ pub(crate) async fn fail_transfer_command<W: Write>(
             st0x_event_sorcery::send_command::<TokenizedEquityMint>(
                 pool, &mint_id, command, services,
             )
-            .await?;
+            .await
+            .map_err(|error| stale_state_context("Mint", id, error))?;
 
             writeln!(stdout, "Mint {id} marked as failed")?;
         }
@@ -877,39 +903,51 @@ pub(crate) async fn fail_transfer_command<W: Write>(
                 .ok_or_else(|| anyhow::anyhow!("Redemption aggregate not found: {id}"))?;
 
             use EquityRedemption::*;
-            match entity {
+            use EquityRedemptionCommand::*;
+            let command = match entity {
                 VaultWithdrawPending { .. }
                 | VaultWithdrawSubmitted { .. }
                 | WithdrawnFromRaindex { .. }
                 | UnwrapPending { .. }
                 | UnwrapSubmitted { .. }
                 | TokensUnwrapped { .. }
-                | SendPending { .. } => {}
-                TokensSent { .. } | Pending { .. } => {
-                    anyhow::bail!(
-                        "Redemption {id} is past the transfer stage -- \
-                         use FailDetection or RejectRedemption instead"
-                    );
-                }
+                | SendPending { .. } => FailTransfer {
+                    reason: reason.to_string(),
+                },
+                // Tokens reached Alpaca's redemption wallet but detection never
+                // fired: force the detection-failure terminal (DetectionFailed
+                // -> Failed), persisting the operator's reason on the event.
+                TokensSent { .. } => FailDetection {
+                    failure: DetectionFailure::Operator {
+                        reason: reason.to_string(),
+                    },
+                },
+                // Alpaca detected the transfer but never completed it: reject
+                // the redemption (RedemptionRejected -> Failed).
+                Pending { .. } => RejectRedemption {
+                    reason: reason.to_string(),
+                },
                 Completed { .. } => {
                     anyhow::bail!("Redemption {id} already completed");
                 }
                 Failed { .. } => {
                     anyhow::bail!("Redemption {id} already failed");
                 }
-            }
+            };
 
             st0x_event_sorcery::send_command::<EquityRedemption>(
                 pool,
                 &redemption_id,
-                EquityRedemptionCommand::FailTransfer {
-                    reason: reason.to_string(),
-                },
+                command,
                 services,
             )
-            .await?;
+            .await
+            .map_err(|error| stale_state_context("Redemption", id, error))?;
 
-            writeln!(stdout, "Redemption {id} marked as failed")?;
+            writeln!(
+                stdout,
+                "Redemption {id} marked as failed (reason: {reason})"
+            )?;
         }
     }
 
@@ -969,25 +1007,32 @@ pub(crate) async fn recheck_transfer_command<W: Write>(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, address, b256};
+    use alloy::primitives::{Address, B256, address, b256};
     use rain_math_float::Float;
     use url::Url;
     use uuid::uuid;
 
-    use st0x_execution::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
+    use st0x_config::{
+        AssetsConfig, CashAssetConfig, EquitiesConfig, EvmCtx, ExecutionThreshold, LogLevel,
+        OperationMode, RebalancingCtx, TradingMode,
+    };
+    use st0x_event_sorcery::LifecycleError;
+    use st0x_execution::{
+        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Symbol, TimeInForce,
+    };
     use st0x_finance::Usdc;
     use st0x_float_macro::float;
+    use st0x_wrapper::MockWrapper;
 
     use super::*;
+    use crate::equity_redemption::EquityRedemptionError;
     use crate::inventory::ImbalanceThreshold;
+    use crate::onchain::mock::MockRaindex;
     use crate::test_utils::setup_test_db;
+    use crate::tokenization::mock::MockTokenizer;
+    use crate::tokenized_equity_mint::TokenizationRequestId;
     use crate::usdc_rebalance::{ReconcileReason, TransferRef, UsdcRebalanceCommand};
-    use st0x_config::EvmCtx;
-    use st0x_config::ExecutionThreshold;
-    use st0x_config::RebalancingCtx;
-    use st0x_config::{
-        AssetsConfig, CashAssetConfig, EquitiesConfig, LogLevel, OperationMode, TradingMode,
-    };
+    use crate::vault_lookup::MockVaultLookup;
 
     /// RAI-835: the manual redrive loop must re-invoke `resume` on the same id
     /// after an attestation timeout and drive through to success -- so a single
@@ -1645,6 +1690,320 @@ mod tests {
         assert!(
             err_msg.contains("requires [tokenization]"),
             "Expected tokenization config error, got: {err_msg}"
+        );
+    }
+
+    fn redemption_services() -> EquityTransferServices {
+        EquityTransferServices {
+            raindex: Arc::new(MockRaindex::new()),
+            vault_lookup: Arc::new(
+                MockVaultLookup::new().with_default_vault(RaindexVaultId(B256::ZERO)),
+            ),
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::new()),
+        }
+    }
+
+    /// Drives a redemption through the real CQRS command flow until the vault
+    /// withdrawal is confirmed (`WithdrawnFromRaindex`) -- stuck before the
+    /// tokens leave the bot's custody.
+    async fn seed_redemption_to_withdrawn(pool: &SqlitePool, id: &RedemptionAggregateId) {
+        use EquityRedemptionCommand::*;
+
+        let store = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .build(redemption_services())
+            .await
+            .unwrap();
+
+        store
+            .send(
+                id,
+                Redeem {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(50.25),
+                    token: Address::random(),
+                    amount: U256::from(50_250_000_000_000_000_000_u128),
+                },
+            )
+            .await
+            .unwrap();
+        store.send(id, SubmitWithdraw).await.unwrap();
+        store.send(id, ConfirmWithdraw).await.unwrap();
+    }
+
+    /// Continues the real CQRS command flow until the redemption is stuck in
+    /// `TokensSent`: tokens reached Alpaca's redemption wallet but detection
+    /// never fired.
+    async fn seed_redemption_to_tokens_sent(pool: &SqlitePool, id: &RedemptionAggregateId) {
+        use EquityRedemptionCommand::*;
+
+        seed_redemption_to_withdrawn(pool, id).await;
+
+        let store = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .build(redemption_services())
+            .await
+            .unwrap();
+        for command in [
+            UnwrapTokens,
+            SubmitUnwrap,
+            ConfirmUnwrap,
+            PrepareSend,
+            SendTokens,
+        ] {
+            store.send(id, command).await.unwrap();
+        }
+    }
+
+    async fn send_redemption_command(
+        pool: &SqlitePool,
+        id: &RedemptionAggregateId,
+        command: EquityRedemptionCommand,
+    ) {
+        let store = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .build(redemption_services())
+            .await
+            .unwrap();
+        store.send(id, command).await.unwrap();
+    }
+
+    /// `fail-transfer --type redemption` on a redemption stuck in `TokensSent`
+    /// must dispatch `FailDetection { Operator }` and persist the operator's
+    /// `--reason`, recoverable from the replayed `Failed` state.
+    #[tokio::test]
+    async fn fail_transfer_redemption_tokens_sent_persists_operator_reason() {
+        let pool = setup_test_db().await;
+        let id = RedemptionAggregateId("cli-stuck-tokens-sent".to_string());
+        seed_redemption_to_tokens_sent(&pool, &id).await;
+
+        let mut stdout = Vec::new();
+        fail_transfer_command(
+            &mut stdout,
+            &pool,
+            TransferType::Redemption,
+            "cli-stuck-tokens-sent",
+            "tokens stranded at Alpaca, ticket 42",
+        )
+        .await
+        .unwrap();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert_eq!(
+            output,
+            "Redemption cli-stuck-tokens-sent marked as failed \
+             (reason: tokens stranded at Alpaca, ticket 42)\n",
+        );
+
+        let entity = st0x_event_sorcery::load_entity::<EquityRedemption>(&pool, &id)
+            .await
+            .unwrap()
+            .expect("force-failed redemption must still materialize");
+        let EquityRedemption::Failed { reason, .. } = entity else {
+            panic!("force-failed redemption must replay to Failed, got {entity:?}");
+        };
+        assert_eq!(
+            reason.as_deref(),
+            Some("tokens stranded at Alpaca, ticket 42"),
+            "operator reason must survive into the replayed Failed state",
+        );
+    }
+
+    /// `fail-transfer --type redemption` on a redemption stuck in `Pending`
+    /// (Alpaca detected the transfer but never completed it) must dispatch
+    /// `RejectRedemption` and persist the operator's `--reason`.
+    #[tokio::test]
+    async fn fail_transfer_redemption_pending_rejects_with_reason() {
+        let pool = setup_test_db().await;
+        let id = RedemptionAggregateId("cli-stuck-pending".to_string());
+
+        seed_redemption_to_tokens_sent(&pool, &id).await;
+        send_redemption_command(
+            &pool,
+            &id,
+            EquityRedemptionCommand::Detect {
+                tokenization_request_id: TokenizationRequestId("tok-cli-test".to_string()),
+            },
+        )
+        .await;
+
+        let mut stdout = Vec::new();
+        fail_transfer_command(
+            &mut stdout,
+            &pool,
+            TransferType::Redemption,
+            "cli-stuck-pending",
+            "alpaca never completed, ticket 43",
+        )
+        .await
+        .unwrap();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert_eq!(
+            output,
+            "Redemption cli-stuck-pending marked as failed \
+             (reason: alpaca never completed, ticket 43)\n",
+        );
+
+        let entity = st0x_event_sorcery::load_entity::<EquityRedemption>(&pool, &id)
+            .await
+            .unwrap()
+            .expect("rejected redemption must still materialize");
+        let EquityRedemption::Failed { reason, .. } = entity else {
+            panic!("rejected redemption must replay to Failed, got {entity:?}");
+        };
+        assert_eq!(
+            reason.as_deref(),
+            Some("alpaca never completed, ticket 43"),
+            "rejection reason must survive into the replayed Failed state",
+        );
+    }
+
+    /// A redemption stuck before the tokens leave the bot's custody takes the
+    /// `FailTransfer` arm of the dispatch.
+    #[tokio::test]
+    async fn fail_transfer_redemption_early_state_fails_with_reason() {
+        let pool = setup_test_db().await;
+        let id = RedemptionAggregateId("cli-stuck-early".to_string());
+        seed_redemption_to_withdrawn(&pool, &id).await;
+
+        let mut stdout = Vec::new();
+        fail_transfer_command(
+            &mut stdout,
+            &pool,
+            TransferType::Redemption,
+            "cli-stuck-early",
+            "withdraw orphaned, ticket 44",
+        )
+        .await
+        .unwrap();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert_eq!(
+            output,
+            "Redemption cli-stuck-early marked as failed \
+             (reason: withdraw orphaned, ticket 44)\n",
+        );
+
+        let entity = st0x_event_sorcery::load_entity::<EquityRedemption>(&pool, &id)
+            .await
+            .unwrap()
+            .expect("transfer-failed redemption must still materialize");
+        let EquityRedemption::Failed { reason, .. } = entity else {
+            panic!("transfer-failed redemption must replay to Failed, got {entity:?}");
+        };
+        assert_eq!(
+            reason.as_deref(),
+            Some("withdraw orphaned, ticket 44"),
+            "transfer-fail reason must survive into the replayed Failed state",
+        );
+    }
+
+    /// A completed redemption must be refused, not force-failed.
+    #[tokio::test]
+    async fn fail_transfer_redemption_refuses_already_completed() {
+        let pool = setup_test_db().await;
+        let id = RedemptionAggregateId("cli-already-completed".to_string());
+
+        seed_redemption_to_tokens_sent(&pool, &id).await;
+        send_redemption_command(
+            &pool,
+            &id,
+            EquityRedemptionCommand::Detect {
+                tokenization_request_id: TokenizationRequestId("tok-done".to_string()),
+            },
+        )
+        .await;
+        send_redemption_command(&pool, &id, EquityRedemptionCommand::Complete).await;
+
+        let mut stdout = Vec::new();
+        let result = fail_transfer_command(
+            &mut stdout,
+            &pool,
+            TransferType::Redemption,
+            "cli-already-completed",
+            "should be refused",
+        )
+        .await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("already completed"),
+            "failing a completed redemption must refuse; got: {err_msg}"
+        );
+    }
+
+    /// A typed command rejection (the TOCTOU case: the bot advanced the
+    /// aggregate between the CLI's read and its write) gets the operator
+    /// re-run hint, with the original error preserved in the chain.
+    #[test]
+    fn stale_state_context_adds_rerun_hint_for_command_rejections() {
+        let error: AggregateError<LifecycleError<EquityRedemption>> =
+            AggregateError::UserError(LifecycleError::Apply(EquityRedemptionError::AlreadyFailed));
+
+        let wrapped = stale_state_context("Redemption", "some-id", error);
+
+        let message = format!("{wrapped:#}");
+        assert!(
+            message.contains("Redemption some-id rejected the failure command"),
+            "got: {message}"
+        );
+        assert!(
+            message.contains("re-run to see the current state"),
+            "got: {message}"
+        );
+        assert!(
+            wrapped.source().is_some(),
+            "the original aggregate error must be preserved as the source"
+        );
+    }
+
+    /// Infrastructure failures must pass through untouched -- the stale-state
+    /// hint would misattribute a database problem to a concurrency race.
+    #[test]
+    fn stale_state_context_passes_infrastructure_errors_through() {
+        let error: AggregateError<LifecycleError<EquityRedemption>> =
+            AggregateError::UnexpectedError(Box::new(std::io::Error::other("db on fire")));
+
+        let wrapped = stale_state_context("Redemption", "some-id", error);
+
+        let message = format!("{wrapped:#}");
+        assert!(
+            !message.contains("re-run"),
+            "infrastructure errors must not get the stale-state hint; got: {message}"
+        );
+        assert!(message.contains("db on fire"), "got: {message}");
+    }
+
+    /// A redemption already in a terminal state must be refused, not
+    /// double-failed.
+    #[tokio::test]
+    async fn fail_transfer_redemption_refuses_already_failed() {
+        let pool = setup_test_db().await;
+        let id = RedemptionAggregateId("cli-already-failed".to_string());
+
+        seed_redemption_to_tokens_sent(&pool, &id).await;
+        send_redemption_command(
+            &pool,
+            &id,
+            EquityRedemptionCommand::FailDetection {
+                failure: DetectionFailure::Timeout,
+            },
+        )
+        .await;
+
+        let mut stdout = Vec::new();
+        let result = fail_transfer_command(
+            &mut stdout,
+            &pool,
+            TransferType::Redemption,
+            "cli-already-failed",
+            "should be refused",
+        )
+        .await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("already failed"),
+            "failing an already-failed redemption must refuse; got: {err_msg}"
         );
     }
 }

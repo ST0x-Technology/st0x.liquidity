@@ -258,11 +258,19 @@ pub(crate) enum EquityRedemptionCommand {
     PrepareSend,
 }
 
-/// Reason for detection failure when polling Alpaca for redemption detection.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// Why redemption detection failed.
+///
+/// `Timeout` and `ApiError` are emitted automatically by the detection-polling
+/// reactor. `Operator` marks an operator-initiated force-fail of a redemption
+/// stuck in `TokensSent` (the tokens reached Alpaca but detection never fired),
+/// distinguishing a manual intervention from an automated polling failure in
+/// the event log; it carries the operator's `--reason` so the audit trail
+/// records why the redemption was force-failed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum DetectionFailure {
     Timeout,
     ApiError { status_code: Option<u16> },
+    Operator { reason: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1013,7 +1021,11 @@ impl EventSourced for EquityRedemption {
     const PROJECTION: Nil = Nil;
     // v3: added the `ProviderCompletionRecovered` event for in-process
     // failed-transfer recovery.
-    const SCHEMA_VERSION: u64 = 3;
+    // v4: `Failed.reason` is now materialized from `DetectionFailed`
+    // (`Operator` failures) and `RedemptionRejected` events instead of always
+    // `None`. Bumped to clear stale snapshots so historical rejections rebuild
+    // from events under the corrected evolve logic.
+    const SCHEMA_VERSION: u64 = 4;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use EquityRedemptionEvent::*;
@@ -1398,10 +1410,7 @@ impl EventSourced for EquityRedemption {
                 })
             }
 
-            DetectionFailed {
-                failure: _,
-                failed_at,
-            } => {
+            DetectionFailed { failure, failed_at } => {
                 let Self::TokensSent {
                     symbol,
                     quantity,
@@ -1414,13 +1423,18 @@ impl EventSourced for EquityRedemption {
                     return Ok(None);
                 };
 
+                let reason = match failure {
+                    DetectionFailure::Operator { reason } => Some(reason.clone()),
+                    DetectionFailure::Timeout | DetectionFailure::ApiError { .. } => None,
+                };
+
                 Some(Self::Failed {
                     symbol: symbol.clone(),
                     quantity: *quantity,
                     raindex_withdraw_tx: Some(*raindex_withdraw_tx),
                     redemption_tx: Some(*redemption_tx),
                     tokenization_request_id: None,
-                    reason: None,
+                    reason,
                     started_at: *sent_at,
                     failed_at: *failed_at,
                 })
@@ -1449,7 +1463,10 @@ impl EventSourced for EquityRedemption {
                 })
             }
 
-            RedemptionRejected { rejected_at, .. } => {
+            RedemptionRejected {
+                reason,
+                rejected_at,
+            } => {
                 let Self::Pending {
                     symbol,
                     quantity,
@@ -1468,7 +1485,7 @@ impl EventSourced for EquityRedemption {
                     raindex_withdraw_tx: None,
                     redemption_tx: Some(*redemption_tx),
                     tokenization_request_id: Some(tokenization_request_id.clone()),
-                    reason: None,
+                    reason: Some(reason.clone()),
                     started_at: *sent_at,
                     failed_at: *rejected_at,
                 })
@@ -1808,10 +1825,17 @@ impl EventSourced for EquityRedemption {
             },
 
             FailDetection { failure } => match self {
-                Self::TokensSent { .. } => Ok(vec![DetectionFailed {
-                    failure,
-                    failed_at: Utc::now(),
-                }]),
+                Self::TokensSent { symbol, .. } => {
+                    warn!(
+                        target: "rebalance",
+                        %symbol, ?failure,
+                        "Marking redemption as detection-failed"
+                    );
+                    Ok(vec![DetectionFailed {
+                        failure,
+                        failed_at: Utc::now(),
+                    }])
+                }
                 Self::VaultWithdrawPending { .. }
                 | Self::VaultWithdrawSubmitted { .. }
                 | Self::WithdrawnFromRaindex { .. }
@@ -1849,10 +1873,17 @@ impl EventSourced for EquityRedemption {
                 | Self::TokensUnwrapped { .. }
                 | Self::SendPending { .. }
                 | Self::TokensSent { .. } => Err(EquityRedemptionError::NotPendingForRejection),
-                Self::Pending { .. } => Ok(vec![RedemptionRejected {
-                    reason,
-                    rejected_at: Utc::now(),
-                }]),
+                Self::Pending { symbol, .. } => {
+                    warn!(
+                        target: "rebalance",
+                        %symbol, %reason,
+                        "Rejecting detected redemption"
+                    );
+                    Ok(vec![RedemptionRejected {
+                        reason,
+                        rejected_at: Utc::now(),
+                    }])
+                }
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
             },
@@ -2769,8 +2800,10 @@ mod tests {
 
     #[tokio::test]
     async fn fail_detection_from_tokens_sent_state() {
+        let history = vec![withdrawn_from_raindex_event(), tokens_sent_event()];
+
         let events = TestHarness::<EquityRedemption>::with(mock_services())
-            .given(vec![withdrawn_from_raindex_event(), tokens_sent_event()])
+            .given(history.clone())
             .when(EquityRedemptionCommand::FailDetection {
                 failure: DetectionFailure::Timeout,
             })
@@ -2785,16 +2818,100 @@ mod tests {
                 ..
             }
         ));
+
+        let state = replay::<EquityRedemption>([history, events].concat())
+            .expect("event stream should replay")
+            .expect("event stream should materialize a state");
+        let EquityRedemption::Failed { reason, .. } = state else {
+            panic!("timeout detection failure must terminate in Failed, got {state:?}");
+        };
+        assert_eq!(
+            reason, None,
+            "automated timeout failures carry no operator reason",
+        );
+    }
+
+    #[test]
+    fn detection_failure_operator_serde_roundtrip() {
+        let failure = DetectionFailure::Operator {
+            reason: "ticket 42".to_string(),
+        };
+
+        let json = serde_json::to_string(&failure).unwrap();
+        assert_eq!(json, r#"{"Operator":{"reason":"ticket 42"}}"#);
+
+        let back: DetectionFailure = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, failure);
+    }
+
+    #[test]
+    fn detection_failed_operator_event_deserializes_from_raw_json() {
+        let raw = r#"{"DetectionFailed":{"failure":{"Operator":{"reason":"ticket 42"}},"failed_at":"2026-01-01T00:00:00Z"}}"#;
+
+        let event: EquityRedemptionEvent = serde_json::from_str(raw).unwrap();
+        let EquityRedemptionEvent::DetectionFailed { failure, .. } = event else {
+            panic!("expected DetectionFailed, got {event:?}");
+        };
+        assert_eq!(
+            failure,
+            DetectionFailure::Operator {
+                reason: "ticket 42".to_string(),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_detection_operator_from_tokens_sent_reaches_failed() {
+        // Operator force-fail of a redemption stuck in TokensSent: unlike an
+        // automated `Timeout`, the `Operator` failure carries the operator's
+        // reason, which must be persisted on the event and recoverable from
+        // the replayed `Failed` state.
+        let history = vec![withdrawn_from_raindex_event(), tokens_sent_event()];
+
+        let events = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(history.clone())
+            .when(EquityRedemptionCommand::FailDetection {
+                failure: DetectionFailure::Operator {
+                    reason: "tokens stuck at Alpaca, support ticket 42".to_string(),
+                },
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let EquityRedemptionEvent::DetectionFailed { failure, .. } = &events[0] else {
+            panic!("expected DetectionFailed, got {:?}", events[0]);
+        };
+        assert_eq!(
+            *failure,
+            DetectionFailure::Operator {
+                reason: "tokens stuck at Alpaca, support ticket 42".to_string(),
+            },
+        );
+
+        let state = replay::<EquityRedemption>([history, events].concat())
+            .expect("event stream should replay")
+            .expect("event stream should materialize a state");
+        let EquityRedemption::Failed { reason, .. } = state else {
+            panic!("operator detection failure must terminate in Failed, got {state:?}");
+        };
+        assert_eq!(
+            reason.as_deref(),
+            Some("tokens stuck at Alpaca, support ticket 42"),
+            "operator reason must be recoverable from the replayed Failed state",
+        );
     }
 
     #[tokio::test]
     async fn reject_redemption_from_pending_state() {
+        let history = vec![
+            withdrawn_from_raindex_event(),
+            tokens_sent_event(),
+            detected_event(),
+        ];
+
         let events = TestHarness::<EquityRedemption>::with(mock_services())
-            .given(vec![
-                withdrawn_from_raindex_event(),
-                tokens_sent_event(),
-                detected_event(),
-            ])
+            .given(history.clone())
             .when(EquityRedemptionCommand::RejectRedemption {
                 reason: "test rejection".to_string(),
             })
@@ -2802,10 +2919,22 @@ mod tests {
             .events();
 
         assert_eq!(events.len(), 1);
-        assert!(matches!(
-            events[0],
-            EquityRedemptionEvent::RedemptionRejected { .. }
-        ));
+        let EquityRedemptionEvent::RedemptionRejected { reason, .. } = &events[0] else {
+            panic!("expected RedemptionRejected, got {:?}", events[0]);
+        };
+        assert_eq!(reason, "test rejection");
+
+        let state = replay::<EquityRedemption>([history, events].concat())
+            .expect("event stream should replay")
+            .expect("event stream should materialize a state");
+        let EquityRedemption::Failed { reason, .. } = state else {
+            panic!("rejected redemption must terminate in Failed, got {state:?}");
+        };
+        assert_eq!(
+            reason.as_deref(),
+            Some("test rejection"),
+            "rejection reason must be recoverable from the replayed Failed state",
+        );
     }
 
     #[tokio::test]
