@@ -23,6 +23,7 @@ use st0x_wrapper::{Wrapper, WrapperService};
 
 use super::{TransferDirection, TransferType};
 use crate::alpaca_wallet::AlpacaWalletService;
+use crate::api::ResumeResponse;
 use crate::bindings::IERC20;
 use crate::equity_redemption::{
     DetectionFailure, EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId,
@@ -253,7 +254,7 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
     writeln!(
         stdout,
         "USDC transfer id: {id}\n   If this is interrupted after the burn, resume with:\n   \
-         transfer resume --id {id} --direction {dir_flag}"
+         transfer resume --kind usdc --id {id} --direction {dir_flag}"
     )?;
     // Flush the recovery id to durable output BEFORE the burn: the resume safety
     // story depends on the operator still having this id if the process is killed
@@ -962,6 +963,17 @@ pub(crate) async fn fail_transfer_command<W: Write>(
     Ok(())
 }
 
+/// Wraps a reqwest send error: a connection failure gets actionable operator
+/// guidance (the bot is probably not running), anything else passes through.
+fn connect_error(url: &str, error: reqwest::Error) -> anyhow::Error {
+    if error.is_connect() {
+        anyhow::Error::new(error)
+            .context(format!("could not reach the bot at {url}; is it running?"))
+    } else {
+        anyhow::Error::new(error)
+    }
+}
+
 /// Re-checks a stuck transfer by calling the running bot's
 /// `/transfers/recheck` endpoint. Recovery must run in the bot process so the
 /// recovery event dispatches through the reactor-wired store (correcting the
@@ -989,7 +1001,11 @@ pub(crate) async fn recheck_transfer_command<W: Write>(
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
-    let response = client.post(&url).send().await?;
+    let response = client
+        .post(url.as_str())
+        .send()
+        .await
+        .map_err(|error| connect_error(&url, error))?;
     let status = response.status();
     let body = response.text().await?;
 
@@ -1010,6 +1026,67 @@ pub(crate) async fn recheck_transfer_command<W: Write>(
         })
         .unwrap_or(body);
     writeln!(stdout, "transfer recheck outcome: {outcome}")?;
+    Ok(())
+}
+
+/// Resumes ALL interrupted equity transfers (mints and redemptions) by calling
+/// the running bot's `/transfers/resume` endpoint. The endpoint always resumes
+/// ALL interrupted transfers (each independently; failures reported as counts)
+/// (no per-id/per-kind filter) and must run in the bot process so recovery
+/// dispatches through the reactor-wired store and shares the bot's resume lock.
+/// Requires the bot to be running and serving its REST API on `server_port`.
+pub(crate) async fn resume_interrupted_transfers_command<W: Write>(
+    stdout: &mut W,
+    ctx: &Ctx,
+) -> anyhow::Result<()> {
+    let url = format!("http://127.0.0.1:{}/transfers/resume", ctx.server_port);
+    writeln!(
+        stdout,
+        "Resuming all interrupted equity transfers via {url}"
+    )?;
+
+    // Bound only the CONNECT phase: the bot drives every interrupted
+    // transfer's on-chain recovery inline before responding (confirmations,
+    // vault deposits), so a total request timeout would cancel the in-flight
+    // handler mid-recovery and report a false failure. Once connected, wait as
+    // long as the recovery takes. Deliberate tradeoff: if the bot stalls after
+    // accepting the connection, this invocation hangs until the operator kills
+    // it -- preferable to silently cancelling real on-chain recovery work,
+    // whose duration has no known upper bound (N transfers x confirmations).
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()?;
+    let response = client
+        .post(url.as_str())
+        .send()
+        .await
+        .map_err(|error| connect_error(&url, error))?;
+    let status = response.status();
+    let body = response.text().await?;
+
+    if !status.is_success() {
+        anyhow::bail!("transfer resume failed ({status}): {body}");
+    }
+
+    let resumed: ResumeResponse = serde_json::from_str(&body).map_err(|error| {
+        anyhow::Error::new(error).context(format!("could not parse resume response '{body}'"))
+    })?;
+    writeln!(
+        stdout,
+        "Resumed {} mint(s) ({} failed), {} redemption(s) ({} failed)",
+        resumed.mints_attempted,
+        resumed.mints_failed,
+        resumed.redemptions_attempted,
+        resumed.redemptions_failed
+    )?;
+
+    let failed = resumed.mints_failed + resumed.redemptions_failed;
+    if failed > 0 {
+        anyhow::bail!(
+            "{failed} transfer(s) failed to resume; check the bot logs for per-id errors"
+        );
+    }
+
     Ok(())
 }
 
@@ -1097,6 +1174,177 @@ mod tests {
             "a deadline-elapsed outcome must surface, not be retried; got {error:?}",
         );
         assert_eq!(calls.get(), 1, "a terminal error must not be retried");
+    }
+
+    /// `transfer resume --kind equity` against a mocked bot endpoint: the
+    /// summary line renders the counts from a literal response body.
+    #[tokio::test]
+    async fn resume_interrupted_transfers_reports_counts() {
+        let server = httpmock::MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/transfers/resume");
+                then.status(200).body(
+                    r#"{"mintsAttempted":2,"mintsFailed":0,"redemptionsAttempted":1,"redemptionsFailed":0}"#,
+                );
+            })
+            .await;
+        let mut ctx = create_ctx_without_rebalancing();
+        ctx.server_port = server.port();
+
+        let mut stdout = Vec::new();
+        resume_interrupted_transfers_command(&mut stdout, &ctx)
+            .await
+            .unwrap();
+
+        mock.assert_async().await;
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("Resumed 2 mint(s) (0 failed), 1 redemption(s) (0 failed)"),
+            "unexpected output: {output}"
+        );
+    }
+
+    /// Per-transfer failures must surface as a non-zero exit, not a clean one:
+    /// scripts and operators must not mistake a partial recovery for success.
+    #[tokio::test]
+    async fn resume_interrupted_transfers_fails_on_partial_failures() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/transfers/resume");
+                then.status(200).body(
+                    r#"{"mintsAttempted":2,"mintsFailed":1,"redemptionsAttempted":1,"redemptionsFailed":1}"#,
+                );
+            })
+            .await;
+        let mut ctx = create_ctx_without_rebalancing();
+        ctx.server_port = server.port();
+
+        let mut stdout = Vec::new();
+        let error = resume_interrupted_transfers_command(&mut stdout, &ctx)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("2 transfer(s) failed to resume"),
+            "expected the failure-count bail; got: {error}"
+        );
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("Resumed 2 mint(s) (1 failed), 1 redemption(s) (1 failed)"),
+            "the counts must still be printed before bailing; got: {output}"
+        );
+    }
+
+    /// A failure on only one side (mints) must still be a non-zero exit.
+    #[tokio::test]
+    async fn resume_interrupted_transfers_fails_when_only_mints_fail() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/transfers/resume");
+                then.status(200).body(
+                    r#"{"mintsAttempted":1,"mintsFailed":1,"redemptionsAttempted":0,"redemptionsFailed":0}"#,
+                );
+            })
+            .await;
+        let mut ctx = create_ctx_without_rebalancing();
+        ctx.server_port = server.port();
+
+        let mut stdout = Vec::new();
+        let error = resume_interrupted_transfers_command(&mut stdout, &ctx)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("1 transfer(s) failed to resume"),
+            "a mint-only failure must be non-zero exit; got: {error}"
+        );
+    }
+
+    /// A 200 with an unparseable body must fail loudly with the raw body.
+    #[tokio::test]
+    async fn resume_interrupted_transfers_rejects_malformed_response() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/transfers/resume");
+                then.status(200).body(r#"{"unexpected":1}"#);
+            })
+            .await;
+        let mut ctx = create_ctx_without_rebalancing();
+        ctx.server_port = server.port();
+
+        let mut stdout = Vec::new();
+        let error = resume_interrupted_transfers_command(&mut stdout, &ctx)
+            .await
+            .unwrap_err();
+
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("could not parse resume response"),
+            "expected the parse-failure context; got: {chain}"
+        );
+        assert!(
+            chain.contains(r#"{"unexpected":1}"#),
+            "the raw body must be surfaced; got: {chain}"
+        );
+    }
+
+    /// The bot's real lock-held response (409 + ErrorResponse JSON) must reach
+    /// the operator verbatim.
+    #[tokio::test]
+    async fn resume_interrupted_transfers_surfaces_lock_conflict() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/transfers/resume");
+                then.status(409)
+                    .body(r#"{"error":"A resume operation is already in progress"}"#);
+            })
+            .await;
+        let mut ctx = create_ctx_without_rebalancing();
+        ctx.server_port = server.port();
+
+        let mut stdout = Vec::new();
+        let error = resume_interrupted_transfers_command(&mut stdout, &ctx)
+            .await
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("transfer resume failed"), "got: {message}");
+        assert!(message.contains("409"), "got: {message}");
+        assert!(
+            message.contains("A resume operation is already in progress"),
+            "got: {message}"
+        );
+    }
+
+    /// A connection refusal (bot not running) must carry the actionable hint.
+    #[tokio::test]
+    async fn resume_interrupted_transfers_hints_when_bot_unreachable() {
+        // Bind and immediately drop a listener to get a port with nothing
+        // listening on it.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let mut ctx = create_ctx_without_rebalancing();
+        ctx.server_port = port;
+
+        let mut stdout = Vec::new();
+        let error = resume_interrupted_transfers_command(&mut stdout, &ctx)
+            .await
+            .unwrap_err();
+
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("is it running?"),
+            "a refused connection must carry the bot hint; got: {chain}"
+        );
     }
 
     fn create_ctx_without_rebalancing() -> Ctx {

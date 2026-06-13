@@ -79,6 +79,17 @@ impl From<ReconcileReasonArg> for crate::usdc_rebalance::ReconcileReason {
     }
 }
 
+/// What kind of transfer to resume.
+///
+/// `usdc` resumes a single USDC rebalance by id, directly against the local CQRS
+/// state. `equity` resumes ALL interrupted mints and redemptions via the running
+/// bot's REST endpoint (always ALL interrupted transfers; no per-id filter).
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum TransferResumeKind {
+    Usdc,
+    Equity,
+}
+
 /// Aggregate types that have materialized views.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum AggregateView {
@@ -664,22 +675,34 @@ pub enum Commands {
 /// Recover stuck asset transfers between trading venues.
 #[derive(Debug, Subcommand)]
 pub enum TransferCommand {
-    /// Resume an interrupted USDC transfer by its id (Raindex <-> Alpaca).
+    /// Resume interrupted transfers.
     ///
-    /// Re-drives a transfer whose CLI invocation was interrupted after the burn.
-    /// The id is printed by `transfer-usdc` at start. An unknown id is rejected
-    /// (never starts a fresh burn) and `--direction` must match the original.
-    /// The resume uses the aggregate's persisted amount, so no amount is taken.
-    /// Operates on the local CQRS state plus a live RPC provider (re-drives the
-    /// on-chain burn/mint/deposit flow itself). Does not require the running
-    /// bot, but the bot must not be concurrently driving the same id.
+    /// `--kind usdc` re-drives a single USDC transfer whose CLI invocation was
+    /// interrupted after the burn: pass `--id` (printed by `transfer-usdc`) and
+    /// the original `--direction`. An unknown id is rejected (never starts a
+    /// fresh burn); the resume uses the persisted amount, so no amount is
+    /// taken. Operates on the local CQRS state plus a live RPC provider
+    /// (re-drives the on-chain burn/mint/deposit flow itself); the bot must not
+    /// be concurrently driving the same id.
+    ///
+    /// `--kind equity` resumes ALL interrupted mints and redemptions via the
+    /// running bot's REST API: there is no per-id filter (`--id`/`--direction`
+    /// are rejected), each transfer succeeds or fails independently, and
+    /// failures are reported as counts (non-zero exit). Requires the bot to be
+    /// running and serving its API on the configured `server_port`.
     Resume {
-        /// Id of the transfer to resume (printed by `transfer-usdc`)
-        #[arg(long = "id")]
-        id: Uuid,
-        /// Direction of the original transfer (must match the persisted transfer)
-        #[arg(short = 'd', long = "direction")]
-        direction: TransferDirection,
+        /// What to resume: a single USDC transfer (`usdc`) or all equity transfers
+        /// (`equity`). Required -- clap `required_if_eq` only enforces the
+        /// `--id`/`--direction` dependency against an explicit value, not a
+        /// default, so `--kind` is not defaulted.
+        #[arg(short = 'k', long = "kind", value_enum)]
+        kind: TransferResumeKind,
+        /// Id of the USDC transfer to resume (required for `--kind usdc`)
+        #[arg(long = "id", required_if_eq("kind", "usdc"))]
+        id: Option<Uuid>,
+        /// Direction of the original USDC transfer (required for `--kind usdc`)
+        #[arg(short = 'd', long = "direction", required_if_eq("kind", "usdc"))]
+        direction: Option<TransferDirection>,
     },
 
     /// Reconcile a USDC transfer stranded in a post-burn terminal failure.
@@ -929,6 +952,7 @@ enum SimpleCommand {
         transfer_type: TransferType,
         id: String,
     },
+    ResumeInterruptedTransfers,
     ReconcileUsdcTransfer {
         id: Uuid,
         reason: ReconcileReasonArg,
@@ -1079,12 +1103,48 @@ enum ProviderCommand {
     AlpacaTokenizationRequests,
 }
 
+/// Rejects argument combinations clap cannot express conditionally: the
+/// equity bulk-resume takes no per-id filter, so a supplied `--id` or
+/// `--direction` signals the operator probably meant `--kind usdc` and must
+/// not be silently discarded.
+fn validate_command(command: &Commands) -> anyhow::Result<()> {
+    let Commands::Transfer {
+        command:
+            TransferCommand::Resume {
+                kind,
+                id,
+                direction,
+            },
+    } = command
+    else {
+        return Ok(());
+    };
+
+    match kind {
+        TransferResumeKind::Equity if id.is_some() || direction.is_some() => {
+            anyhow::bail!(
+                "transfer resume --kind equity resumes ALL interrupted equity transfers and \
+                 takes no --id/--direction. To resume a single USDC transfer, re-run with \
+                 --kind usdc."
+            );
+        }
+        TransferResumeKind::Usdc if id.is_none() || direction.is_none() => {
+            anyhow::bail!(
+                "transfer resume --kind usdc requires --id and --direction (clap should \
+                 have rejected this invocation; please report it)"
+            );
+        }
+        TransferResumeKind::Equity | TransferResumeKind::Usdc => Ok(()),
+    }
+}
+
 async fn run_command_with_writers<W: Write>(
     ctx: Ctx,
     command: Commands,
     pool: &SqlitePool,
     stdout: &mut W,
 ) -> anyhow::Result<()> {
+    validate_command(&command)?;
     match classify_command(command) {
         Ok(simple) => run_simple_command(simple, &ctx, pool, stdout).await?,
         Err(provider_cmd) => {
@@ -1097,6 +1157,11 @@ async fn run_command_with_writers<W: Write>(
     Ok(())
 }
 
+// One flat match mapping every CLI command to its internal Simple/Provider
+// dispatch. Kept as a single match (per the repo's "don't split simple-but-long
+// matches" rule) rather than fragmented into per-group helpers; the grouped
+// subcommands added in the recovery-CLI rename pushed it just over the limit.
+#[allow(clippy::too_many_lines)]
 fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand> {
     match command {
         Commands::Buy {
@@ -1252,8 +1317,28 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             Ok(SimpleCommand::ReconcileUsdcTransfer { id, reason })
         }
         Commands::Transfer { command } => match command {
-            TransferCommand::Resume { id, direction } => {
-                Err(ProviderCommand::ResumeUsdcTransfer { id, direction })
+            // `--kind equity` resumes all interrupted equity transfers via the bot
+            // REST API. `--kind usdc` re-drives a single USDC transfer; `id` and
+            // `direction` are guaranteed present by `required_if_eq("kind","usdc")`.
+            TransferCommand::Resume {
+                kind: TransferResumeKind::Equity,
+                ..
+            } => Ok(SimpleCommand::ResumeInterruptedTransfers),
+            TransferCommand::Resume {
+                kind: TransferResumeKind::Usdc,
+                id: Some(id),
+                direction: Some(direction),
+            } => Err(ProviderCommand::ResumeUsdcTransfer { id, direction }),
+            TransferCommand::Resume {
+                kind: TransferResumeKind::Usdc,
+                ..
+            } => {
+                // Doubly guarded: clap's `required_if_eq("kind","usdc")`
+                // rejects the missing args at parse time, and
+                // `validate_command` (which also checks this combination)
+                // runs before classify in the production dispatch. Callers
+                // invoking classify directly must pass clap-parsed input.
+                unreachable!("clap `required_if_eq(\"kind\",\"usdc\")` guarantees id and direction")
             }
             TransferCommand::Reconcile { id, reason } => {
                 Ok(SimpleCommand::ReconcileUsdcTransfer { id, reason })
@@ -1444,6 +1529,9 @@ async fn run_simple_command<W: Write>(
         } => rebalancing::fail_transfer_command(stdout, pool, transfer_type, &id, &reason).await,
         SimpleCommand::RecheckTransfer { transfer_type, id } => {
             rebalancing::recheck_transfer_command(stdout, transfer_type, &id, ctx).await
+        }
+        SimpleCommand::ResumeInterruptedTransfers => {
+            rebalancing::resume_interrupted_transfers_command(stdout, ctx).await
         }
         SimpleCommand::ReconcileUsdcTransfer { id, reason } => {
             rebalancing::reconcile_usdc_transfer_command(stdout, id, reason.into(), pool).await
@@ -1983,6 +2071,42 @@ mod tests {
     }
 
     #[test]
+    fn transfer_resume_equity_classifies_as_simple() {
+        // `transfer resume --kind equity` resumes all interrupted equity transfers
+        // via the bot REST API, so it must route as a simple (no-RPC) command and
+        // requires neither --id nor --direction.
+        let cli =
+            Cli::try_parse_from(["st0x-cli", "transfer", "resume", "--kind", "equity"]).unwrap();
+
+        match classify_command(cli.command) {
+            Ok(SimpleCommand::ResumeInterruptedTransfers) => {}
+            Ok(_) => panic!("expected ResumeInterruptedTransfers simple command"),
+            Err(
+                ProviderCommand::ProcessTx { .. }
+                | ProviderCommand::TransferUsdc { .. }
+                | ProviderCommand::ResumeUsdcTransfer { .. }
+                | ProviderCommand::CctpBridge { .. }
+                | ProviderCommand::CctpRecover { .. }
+                | ProviderCommand::ResetAllowance { .. }
+                | ProviderCommand::AlpacaTokenize { .. }
+                | ProviderCommand::AlpacaRedeem { .. }
+                | ProviderCommand::AlpacaTokenizationRequests,
+            ) => panic!("expected simple command classification, got provider command"),
+        }
+    }
+
+    #[test]
+    fn transfer_resume_requires_kind() {
+        // `--kind` is intentionally not defaulted (so required_if_eq can enforce
+        // the usdc dependency), so a bare `transfer resume` must error.
+        let error = Cli::try_parse_from(["st0x-cli", "transfer", "resume"]).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
     fn repair_fail_pending_offchain_order_parses() {
         let order_id = OffchainOrderId::new();
         let cli = Cli::try_parse_from([
@@ -2257,6 +2381,8 @@ mod tests {
             "st0x-cli",
             "transfer",
             "resume",
+            "--kind",
+            "usdc",
             "--id",
             &id.to_string(),
             "--direction",
@@ -2458,6 +2584,143 @@ mod tests {
             }
             _ => panic!("expected position release-hedge to classify as a simple position command"),
         }
+    }
+
+    /// A supplied `--id`/`--direction` with `--kind equity` signals the
+    /// operator probably meant `--kind usdc`; it must be rejected, never
+    /// silently discarded.
+    #[test]
+    fn validate_rejects_equity_resume_with_id() {
+        let with_id = Cli::try_parse_from([
+            "st0x-cli",
+            "transfer",
+            "resume",
+            "--kind",
+            "equity",
+            "--id",
+            &Uuid::from_u128(7).to_string(),
+        ])
+        .unwrap();
+
+        let error = validate_command(&with_id.command).unwrap_err();
+        assert!(
+            error.to_string().contains("--kind usdc"),
+            "the rejection must point at --kind usdc; got: {error}"
+        );
+    }
+
+    /// Both flags at once must also be rejected.
+    #[test]
+    fn validate_rejects_equity_resume_with_both_flags() {
+        let with_both = Cli::try_parse_from([
+            "st0x-cli",
+            "transfer",
+            "resume",
+            "--kind",
+            "equity",
+            "--id",
+            &Uuid::from_u128(7).to_string(),
+            "--direction",
+            "to-raindex",
+        ])
+        .unwrap();
+
+        let error = validate_command(&with_both.command).unwrap_err();
+        assert!(
+            error.to_string().contains("takes no --id/--direction"),
+            "got: {error}"
+        );
+    }
+
+    /// Same for a supplied `--direction`.
+    #[test]
+    fn validate_rejects_equity_resume_with_direction() {
+        let with_direction = Cli::try_parse_from([
+            "st0x-cli",
+            "transfer",
+            "resume",
+            "--kind",
+            "equity",
+            "--direction",
+            "to-raindex",
+        ])
+        .unwrap();
+
+        let error = validate_command(&with_direction.command).unwrap_err();
+        assert!(
+            error.to_string().contains("takes no --id/--direction"),
+            "got: {error}"
+        );
+    }
+
+    /// A bare `--kind equity` passes validation and routes to the bulk
+    /// equity resume.
+    #[test]
+    fn validate_accepts_bare_equity_resume() {
+        let clean =
+            Cli::try_parse_from(["st0x-cli", "transfer", "resume", "--kind", "equity"]).unwrap();
+        validate_command(&clean.command).unwrap();
+        assert!(matches!(
+            classify_command(clean.command),
+            Ok(SimpleCommand::ResumeInterruptedTransfers)
+        ));
+    }
+
+    /// The defensive Usdc guard exists for callers that bypass clap (the only
+    /// path where it can fire); construct the bad shape directly.
+    #[test]
+    fn validate_rejects_directly_constructed_usdc_resume_without_args() {
+        let command = Commands::Transfer {
+            command: TransferCommand::Resume {
+                kind: TransferResumeKind::Usdc,
+                id: None,
+                direction: None,
+            },
+        };
+
+        let error = validate_command(&command).unwrap_err();
+        assert!(
+            error.to_string().contains("requires --id and --direction"),
+            "got: {error}"
+        );
+    }
+
+    /// The two `required_if_eq("kind","usdc")` annotations are independent:
+    /// each missing arg must be rejected at parse time on its own, or the
+    /// classify `unreachable!` guarantee silently rots.
+    #[test]
+    fn usdc_resume_requires_each_arg_independently() {
+        let missing_direction = Cli::try_parse_from([
+            "st0x-cli",
+            "transfer",
+            "resume",
+            "--kind",
+            "usdc",
+            "--id",
+            &Uuid::from_u128(7).to_string(),
+        ])
+        .unwrap_err();
+        assert_eq!(
+            missing_direction.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "--kind usdc without --direction must be rejected at parse time",
+        );
+
+        let missing_id = Cli::try_parse_from([
+            "st0x-cli",
+            "transfer",
+            "resume",
+            "--kind",
+            "usdc",
+            "--direction",
+            "to-raindex",
+        ])
+        .unwrap_err();
+        assert_eq!(
+            missing_id.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "--kind usdc without --id must be rejected at parse time",
+        );
     }
 
     #[test]
