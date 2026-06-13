@@ -317,6 +317,40 @@ mod tests {
         );
     }
 
+    /// A severed RPC must surface as a typed error -- the run loop's
+    /// warn-and-retry contract depends on it -- and must neither enqueue
+    /// a bogus range nor move the checkpoint, so the post-outage tick
+    /// re-scans exactly the blocks the outage hid.
+    #[tokio::test]
+    async fn poll_once_propagates_rpc_error_without_enqueuing() {
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("connection refused");
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let (mut monitor, pool, apalis_pool, evm_ctx) = setup(provider, 0).await;
+
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 99)
+            .await
+            .unwrap();
+
+        let result = monitor.poll_once().await;
+        assert!(
+            matches!(result, Err(OrderFillMonitorError::Rpc(_))),
+            "A severed RPC must surface as a typed RPC error; got: {result:?}",
+        );
+        assert_eq!(
+            backfill_job_count(&apalis_pool).await,
+            0,
+            "No backfill range may be enqueued off a failed tip read"
+        );
+        assert_eq!(
+            crate::onchain::backfill::load_backfill_checkpoint(&pool, &evm_ctx)
+                .await
+                .unwrap(),
+            Some(99),
+            "The checkpoint must not move during the outage"
+        );
+    }
+
     /// A write-locked database during the backfill enqueue must surface
     /// as a typed error (the run loop logs it and retries next tick),
     /// leave nothing enqueued, and enqueue cleanly once the lock clears.
