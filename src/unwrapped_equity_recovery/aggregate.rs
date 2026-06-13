@@ -817,7 +817,7 @@ mod tests {
     use st0x_wrapper::MockWrapper;
 
     use crate::equity_redemption::redemption_aggregate_id;
-    use crate::onchain::mock::MockRaindex;
+    use crate::onchain::mock::{ConfirmTxBehavior, DepositBehavior, DepositCall, MockRaindex};
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::tokenization::mock::MockTokenizer;
     use crate::tokenized_equity_mint::issuer_request_id;
@@ -1315,12 +1315,12 @@ mod tests {
         );
         assert_eq!(
             raindex.last_deposit_call(),
-            Some((
-                wrapped_token,
-                RaindexVaultId(B256::ZERO),
-                U256::from(123u64),
-                TOKENIZED_EQUITY_DECIMALS,
-            )),
+            Some(DepositCall {
+                token: wrapped_token,
+                vault_id: RaindexVaultId(B256::ZERO),
+                amount: U256::from(123u64),
+                decimals: TOKENIZED_EQUITY_DECIMALS,
+            }),
             "SubmitOrphanDeposit must deposit the confirmed wrapped amount into the \
              wrapped token vault at tokenized-equity precision",
         );
@@ -1329,7 +1329,9 @@ mod tests {
     #[tokio::test]
     async fn submit_orphan_deposit_records_failure_when_raindex_reverts() {
         let services = services_with(
-            Arc::new(MockRaindex::reverting_deposit()),
+            Arc::new(
+                MockRaindex::new().with_deposit_behavior(DepositBehavior::FailExecutionReverted),
+            ),
             Arc::new(MockWrapper::new()),
         )
         .await;
@@ -1422,7 +1424,7 @@ mod tests {
     #[tokio::test]
     async fn confirm_orphan_deposit_records_failure_when_confirm_tx_fails() {
         let services = services_with(
-            Arc::new(MockRaindex::failing_confirm_tx()),
+            Arc::new(MockRaindex::new().with_confirm_behavior(ConfirmTxBehavior::Fail)),
             Arc::new(MockWrapper::new()),
         )
         .await;
@@ -1455,7 +1457,7 @@ mod tests {
     #[tokio::test]
     async fn confirm_orphan_deposit_retryable_error_keeps_submitted_state_live() {
         let services = services_with(
-            Arc::new(MockRaindex::retryable_confirm_tx()),
+            Arc::new(MockRaindex::new().with_confirm_behavior(ConfirmTxBehavior::Retryable)),
             Arc::new(MockWrapper::new()),
         )
         .await;
