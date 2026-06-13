@@ -50,6 +50,9 @@ pub enum AssetStatus {
 }
 
 pub use auth::{AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+// Exposed as the single source of truth for the broker HTTP request timeout so
+// timing-sensitive integration tests derive their boundaries from it.
+pub use client::HTTP_REQUEST_TIMEOUT;
 pub use executor::AlpacaBrokerApi;
 pub use journal::{JournalResponse, JournalStatus};
 pub use order::{

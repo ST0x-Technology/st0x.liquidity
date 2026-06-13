@@ -163,8 +163,7 @@ impl Job<HedgeCtx> for PlaceHedge {
             .load(&self.symbol)
             .await?
             .and_then(|position| position.last_failed_offchain_order_id);
-        let client_order_id_source = anchor.unwrap_or(self.offchain_order_id);
-        let client_order_id = ClientOrderId::from_uuid(client_order_id_source.as_uuid());
+        let client_order_id = client_order_id_for_placement(self.offchain_order_id, anchor);
 
         ctx.offchain_order
             .send(
@@ -210,15 +209,32 @@ impl Job<HedgeCtx> for PlaceHedge {
     }
 }
 
+/// Derives the broker-side [`ClientOrderId`] for a placement attempt.
+///
+/// When a prior attempt failed after the broker accepted the order, the
+/// position aggregate stashes that attempt's [`OffchainOrderId`] as the
+/// idempotency anchor. Retries must reuse its UUID as `client_order_id` so
+/// the broker dedupes rather than double-submitting.
+fn client_order_id_for_placement(
+    offchain_order_id: OffchainOrderId,
+    last_failed_offchain_order_id: Option<OffchainOrderId>,
+) -> ClientOrderId {
+    let idempotency_source = last_failed_offchain_order_id.unwrap_or(offchain_order_id);
+    ClientOrderId::from_uuid(idempotency_source.as_uuid())
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::primitives::TxHash;
+    use proptest::prelude::*;
     use std::any::type_name;
     use std::sync::Arc;
+    use uuid::Uuid;
 
     use st0x_event_sorcery::StoreBuilder;
     use st0x_execution::{
-        Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor, Symbol,
+        ClientOrderId, Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor,
+        Symbol,
     };
     use st0x_float_macro::float;
 
@@ -532,5 +548,57 @@ mod tests {
             poll_jobs_after_retry, 2,
             "Retry must re-enqueue PollOrderStatus when the order is still Submitted"
         );
+    }
+
+    fn offchain_order_id_from(uuid: Uuid) -> OffchainOrderId {
+        uuid.to_string().parse().unwrap()
+    }
+
+    fn arb_uuid() -> impl Strategy<Value = Uuid> {
+        prop::array::uniform16(any::<u8>()).prop_map(Uuid::from_bytes)
+    }
+
+    proptest! {
+        #[test]
+        fn client_order_id_for_placement_reuses_anchor_uuid(
+            attempt_uuid in arb_uuid(),
+            anchor_uuid in arb_uuid(),
+        ) {
+            let attempt_id = offchain_order_id_from(attempt_uuid);
+            let anchor_id = offchain_order_id_from(anchor_uuid);
+
+            let derived = client_order_id_for_placement(attempt_id, Some(anchor_id));
+            prop_assert_eq!(derived, ClientOrderId::from_uuid(anchor_uuid));
+        }
+
+        #[test]
+        fn client_order_id_for_placement_falls_back_to_attempt_without_anchor(
+            attempt_uuid in arb_uuid(),
+        ) {
+            let attempt_id = offchain_order_id_from(attempt_uuid);
+
+            let derived = client_order_id_for_placement(attempt_id, None);
+            prop_assert_eq!(derived, ClientOrderId::from_uuid(attempt_uuid));
+        }
+
+        #[test]
+        fn retries_with_same_anchor_share_broker_client_order_id(
+            first_attempt in arb_uuid(),
+            second_attempt in arb_uuid(),
+            anchor in arb_uuid(),
+        ) {
+            prop_assume!(first_attempt != second_attempt);
+
+            let first = client_order_id_for_placement(
+                offchain_order_id_from(first_attempt),
+                Some(offchain_order_id_from(anchor)),
+            );
+            let second = client_order_id_for_placement(
+                offchain_order_id_from(second_attempt),
+                Some(offchain_order_id_from(anchor)),
+            );
+
+            prop_assert_eq!(first, second);
+        }
     }
 }

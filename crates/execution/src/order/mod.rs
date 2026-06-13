@@ -135,6 +135,7 @@ pub struct MarketOrder {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
     use serde_json::json;
     use uuid::{Uuid, uuid};
 
@@ -194,5 +195,25 @@ mod tests {
 
         let cli: ClientOrderId = serde_json::from_value(json!(PREFIXED)).unwrap();
         assert_eq!(cli, ClientOrderId::Cli(ID));
+    }
+
+    proptest! {
+        #[test]
+        fn display_parse_roundtrip(uuid in prop::array::uniform16(any::<u8>()).prop_map(Uuid::from_bytes)) {
+            for id in [ClientOrderId::from_uuid(uuid), ClientOrderId::cli(uuid)] {
+                let rendered = id.to_string();
+                let parsed: ClientOrderId = rendered.parse().unwrap();
+                prop_assert_eq!(parsed, id);
+            }
+        }
+
+        #[test]
+        fn serde_roundtrip(uuid in prop::array::uniform16(any::<u8>()).prop_map(Uuid::from_bytes)) {
+            for id in [ClientOrderId::from_uuid(uuid), ClientOrderId::cli(uuid)] {
+                let json = serde_json::to_value(&id).unwrap();
+                let parsed: ClientOrderId = serde_json::from_value(json).unwrap();
+                prop_assert_eq!(parsed, id);
+            }
+        }
     }
 }
