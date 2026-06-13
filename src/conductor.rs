@@ -701,12 +701,18 @@ fn build_unwrapped_equity_recovery_ctx(
     }))
 }
 
+fn base_wallet_equity_recovery_enabled(ctx: &Ctx, symbol: &Symbol) -> bool {
+    ctx.is_trading_enabled(symbol)
+        || ctx.is_rebalancing_enabled(symbol)
+        || ctx.is_wrapped_equity_recovery_enabled(symbol)
+}
+
 fn base_wallet_unwrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Address> {
     ctx.assets
         .equities
         .symbols
         .iter()
-        .filter(|(symbol, _)| ctx.is_trading_enabled(symbol) || ctx.is_rebalancing_enabled(symbol))
+        .filter(|(symbol, _)| base_wallet_equity_recovery_enabled(ctx, symbol))
         .map(|(symbol, config)| (symbol.clone(), config.tokenized_equity))
         .collect()
 }
@@ -716,7 +722,7 @@ fn base_wallet_wrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Addr
         .equities
         .symbols
         .iter()
-        .filter(|(symbol, _)| ctx.is_trading_enabled(symbol) || ctx.is_rebalancing_enabled(symbol))
+        .filter(|(symbol, _)| base_wallet_equity_recovery_enabled(ctx, symbol))
         .map(|(symbol, config)| (symbol.clone(), config.tokenized_equity_derivative))
         .collect()
 }
@@ -1096,16 +1102,6 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             wrapper: wrapper.clone(),
         };
 
-        let disabled_assets = deps
-            .ctx
-            .assets
-            .equities
-            .symbols
-            .keys()
-            .filter(|symbol| !deps.ctx.is_rebalancing_enabled(symbol))
-            .cloned()
-            .collect();
-
         let transfer_usdc_to_hedging_queue = deps.schedulers.transfer_usdc_to_hedging.clone();
         let transfer_usdc_to_market_making_queue =
             deps.schedulers.transfer_usdc_to_market_making.clone();
@@ -1116,7 +1112,6 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
                 usdc: rebalancing_ctx.usdc,
                 transfer_timeout: rebalancing_ctx.transfer_timeout,
                 assets: deps.ctx.assets.clone(),
-                disabled_assets,
             },
             deps.vault_registry,
             deps.ctx.evm.orderbook,
@@ -2354,7 +2349,6 @@ mod tests {
     use apalis::prelude::Status;
     use rain_math_float::Float;
     use sqlx::SqlitePool;
-    use std::collections::HashSet;
     use std::future::pending;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2387,7 +2381,8 @@ mod tests {
     use crate::rebalancing::equity::{TransferEquityToHedging, TransferEquityToMarketMaking};
     use crate::rebalancing::{RebalancingSchedulers, RebalancingService};
     use crate::test_utils::{
-        OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db, setup_test_pools,
+        OnchainTradeBuilder, get_test_log, get_test_order, rebalancing_enabled_equities,
+        setup_test_db, setup_test_pools,
     };
     use crate::trading::onchain::inclusion::EmittedOnChain;
     use crate::unwrapped_equity_recovery::UnwrappedEquityRecoveryJob;
@@ -2555,9 +2550,11 @@ mod tests {
         let aapl = Symbol::new("AAPL").unwrap();
         let tsla = Symbol::new("TSLA").unwrap();
         let spym = Symbol::new("SPYM").unwrap();
+        let coin = Symbol::new("COIN").unwrap();
         let aapl_token = Address::random();
         let tsla_token = Address::random();
         let spym_token = Address::random();
+        let coin_token = Address::random();
 
         let mut symbols = HashMap::new();
         symbols.insert(
@@ -2599,6 +2596,19 @@ mod tests {
                 operational_limit: None,
             },
         );
+        symbols.insert(
+            coin.clone(),
+            EquityAssetConfig {
+                tokenized_equity: coin_token,
+                tokenized_equity_derivative: Address::random(),
+                pyth_feed_id: None,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Disabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Enabled,
+                operational_limit: None,
+            },
+        );
 
         let ctx = Ctx {
             assets: AssetsConfig {
@@ -2617,11 +2627,12 @@ mod tests {
 
         assert_eq!(
             actual.len(),
-            2,
-            "Only trading-enabled or rebalancing-enabled assets should be polled"
+            3,
+            "Trading-enabled, rebalancing-enabled, and recovery-enabled assets should be polled"
         );
         assert_eq!(actual.get(&aapl), Some(&aapl_token));
         assert_eq!(actual.get(&tsla), Some(&tsla_token));
+        assert_eq!(actual.get(&coin), Some(&coin_token));
         assert!(
             !actual.contains_key(&spym),
             "Disabled assets should be excluded from Base-wallet unwrapped equity polling"
@@ -2633,9 +2644,11 @@ mod tests {
         let aapl = Symbol::new("AAPL").unwrap();
         let tsla = Symbol::new("TSLA").unwrap();
         let spym = Symbol::new("SPYM").unwrap();
+        let coin = Symbol::new("COIN").unwrap();
         let aapl_wrapped_token = Address::random();
         let tsla_wrapped_token = Address::random();
         let spym_wrapped_token = Address::random();
+        let coin_wrapped_token = Address::random();
 
         let mut symbols = HashMap::new();
         symbols.insert(
@@ -2677,6 +2690,19 @@ mod tests {
                 operational_limit: None,
             },
         );
+        symbols.insert(
+            coin.clone(),
+            EquityAssetConfig {
+                tokenized_equity: Address::random(),
+                tokenized_equity_derivative: coin_wrapped_token,
+                pyth_feed_id: None,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Disabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Enabled,
+                operational_limit: None,
+            },
+        );
 
         let ctx = Ctx {
             assets: AssetsConfig {
@@ -2695,11 +2721,12 @@ mod tests {
 
         assert_eq!(
             actual.len(),
-            2,
-            "Only trading-enabled or rebalancing-enabled assets should be polled"
+            3,
+            "Trading-enabled, rebalancing-enabled, and recovery-enabled assets should be polled"
         );
         assert_eq!(actual.get(&aapl), Some(&aapl_wrapped_token));
         assert_eq!(actual.get(&tsla), Some(&tsla_wrapped_token));
+        assert_eq!(actual.get(&coin), Some(&coin_wrapped_token));
         assert!(
             !actual.contains_key(&spym),
             "Disabled assets should be excluded from Base-wallet wrapped equity polling"
@@ -3944,10 +3971,9 @@ mod tests {
                 }),
                 transfer_timeout: Duration::from_secs(30 * 60),
                 assets: AssetsConfig {
-                    equities: EquitiesConfig::default(),
+                    equities: rebalancing_enabled_equities(&["AAPL"]),
                     cash: None,
                 },
-                disabled_assets: HashSet::new(),
             },
             vault_registry,
             orderbook,
@@ -4053,10 +4079,9 @@ mod tests {
                 usdc: Some(threshold),
                 transfer_timeout: Duration::from_secs(30 * 60),
                 assets: AssetsConfig {
-                    equities: EquitiesConfig::default(),
+                    equities: rebalancing_enabled_equities(&["AAPL"]),
                     cash: None,
                 },
-                disabled_assets: HashSet::new(),
             },
             vault_registry,
             orderbook,
@@ -4172,10 +4197,9 @@ mod tests {
                 }),
                 transfer_timeout: Duration::from_secs(30 * 60),
                 assets: AssetsConfig {
-                    equities: EquitiesConfig::default(),
+                    equities: rebalancing_enabled_equities(&["AAPL"]),
                     cash: None,
                 },
-                disabled_assets: HashSet::new(),
             },
             vault_registry,
             orderbook,
@@ -4309,10 +4333,9 @@ mod tests {
                 }),
                 transfer_timeout: Duration::from_secs(30 * 60),
                 assets: AssetsConfig {
-                    equities: EquitiesConfig::default(),
+                    equities: rebalancing_enabled_equities(&["AAPL"]),
                     cash: None,
                 },
-                disabled_assets: HashSet::new(),
             },
             vault_registry,
             orderbook,

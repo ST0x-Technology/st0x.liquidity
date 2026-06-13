@@ -1000,6 +1000,20 @@ impl Ctx {
             .get(symbol)
             .is_some_and(|config| config.rebalancing == OperationMode::Enabled)
     }
+
+    /// Returns whether wrapped/unwrapped wallet equity recovery is enabled
+    /// for the given equity.
+    ///
+    /// Independent of `rebalancing`: a symbol may opt into recovery while
+    /// keeping automatic rebalancing disabled. Assets not present in the
+    /// config are treated as recovery-disabled by default.
+    pub fn is_wrapped_equity_recovery_enabled(&self, symbol: &Symbol) -> bool {
+        self.assets
+            .equities
+            .symbols
+            .get(symbol)
+            .is_some_and(|config| config.wrapped_equity_recovery == OperationMode::Enabled)
+    }
 }
 
 /// Test-only constructor for `Ctx` that internalizes fields e2e tests
@@ -3705,6 +3719,51 @@ mod tests {
         assert!(
             !ctx.is_rebalancing_enabled(&Symbol::new("UNKNOWN").unwrap()),
             "Unknown assets should default to rebalancing disabled"
+        );
+    }
+
+    #[test]
+    fn is_wrapped_equity_recovery_enabled_is_independent_of_rebalancing() {
+        let mut symbols = HashMap::new();
+        symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            EquityAssetConfig {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: Address::ZERO,
+                pyth_feed_id: None,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Disabled,
+                rebalancing: OperationMode::Disabled,
+                wrapped_equity_recovery: OperationMode::Enabled,
+                operational_limit: None,
+            },
+        );
+
+        let ctx = Ctx {
+            assets: AssetsConfig {
+                equities: EquitiesConfig {
+                    operational_limit: None,
+                    symbols,
+                },
+                cash: None,
+            },
+            ..create_test_ctx_with_order_owner(address!(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ))
+        };
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        assert!(
+            ctx.is_wrapped_equity_recovery_enabled(&aapl),
+            "Recovery should follow wrapped_equity_recovery config"
+        );
+        assert!(
+            !ctx.is_rebalancing_enabled(&aapl),
+            "Recovery-enabled symbol must not imply rebalancing is enabled"
+        );
+        assert!(
+            !ctx.is_wrapped_equity_recovery_enabled(&Symbol::new("UNKNOWN").unwrap()),
+            "Unknown assets should default to recovery disabled"
         );
     }
 

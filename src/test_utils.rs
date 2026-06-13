@@ -12,11 +12,40 @@ use rain_math_float::Float;
 use sqlx::SqlitePool;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use st0x_execution::{Direction, FractionalShares, Positive};
+use st0x_config::{EquitiesConfig, EquityAssetConfig, OperationMode};
+use st0x_execution::{Direction, FractionalShares, Positive, Symbol};
 
 use crate::bindings::IRaindexV6::{EvaluableV4, IOV2, OrderV4};
 use crate::onchain::OnchainTrade;
 use crate::onchain::io::{TokenizedSymbol, Usdc, WrappedTokenizedShares};
+
+/// Builds an equity assets config with the given symbols whitelisted for
+/// rebalancing. The trigger only dispatches transfers for symbols configured
+/// with `rebalancing = "enabled"`, so trigger tests must whitelist the
+/// symbols they exercise.
+pub(crate) fn rebalancing_enabled_equities(symbols: &[&str]) -> EquitiesConfig {
+    EquitiesConfig {
+        operational_limit: None,
+        symbols: symbols
+            .iter()
+            .map(|symbol| {
+                (
+                    Symbol::new(*symbol).unwrap(),
+                    EquityAssetConfig {
+                        tokenized_equity: Address::ZERO,
+                        tokenized_equity_derivative: Address::ZERO,
+                        pyth_feed_id: None,
+                        vault_ids: Vec::new(),
+                        trading: OperationMode::Disabled,
+                        rebalancing: OperationMode::Enabled,
+                        wrapped_equity_recovery: OperationMode::Disabled,
+                        operational_limit: None,
+                    },
+                )
+            })
+            .collect(),
+    }
+}
 
 /// Deterministic singleton address of the TOFUTokenDecimals contract. The
 /// orderbook's `LibTOFUTokenDecimals.ensureDeployed` hardcodes this address and
