@@ -191,9 +191,10 @@ impl EquityTransferServices {
     /// Constructs a services instance whose methods all panic.
     ///
     /// Safe for sending commands that never invoke services (e.g., the
-    /// `FailWrapping`, `FailAcceptance`, `FailRaindexDeposit`, and
-    /// `FailTransfer` commands). Used by the CLI `transfer fail`
-    /// subcommand where no real broker/RPC connection exists.
+    /// `FailWrapping`, `FailAcceptance`, `FailRaindexDeposit`, `FailTransfer`,
+    /// and `Reconcile` commands). Used by the CLI `transfer fail` and
+    /// `transfer reconcile` subcommands where no real broker/RPC connection
+    /// exists.
     pub(crate) fn panicking() -> Self {
         Self {
             raindex: Arc::new(PanickingRaindex),
@@ -862,7 +863,8 @@ impl CrossVenueEquityTransfer {
                     return Ok(());
                 }
                 TokenizedEquityMint::DepositedIntoRaindex { .. }
-                | TokenizedEquityMint::Failed { .. } => return Ok(()),
+                | TokenizedEquityMint::Failed { .. }
+                | TokenizedEquityMint::Reconciled { .. } => return Ok(()),
                 entity @ TokenizedEquityMint::MintRequested { .. } => {
                     return Err(MintError::UnexpectedState {
                         issuer_request_id: issuer_request_id.clone(),
@@ -1116,7 +1118,9 @@ impl CrossVenueEquityTransfer {
                         .resume_pending_redemption(aggregate_id, &tokenization_request_id)
                         .await;
                 }
-                EquityRedemption::Completed { .. } | EquityRedemption::Failed { .. } => {
+                EquityRedemption::Completed { .. }
+                | EquityRedemption::Failed { .. }
+                | EquityRedemption::Reconciled { .. } => {
                     return Ok(());
                 }
             }
@@ -1196,7 +1200,9 @@ impl CrossVenueEquityTransfer {
     ) -> Result<bool, RedemptionError> {
         Ok(matches!(
             self.load_redemption_entity(aggregate_id).await?,
-            EquityRedemption::Completed { .. } | EquityRedemption::Failed { .. }
+            EquityRedemption::Completed { .. }
+                | EquityRedemption::Failed { .. }
+                | EquityRedemption::Reconciled { .. }
         ))
     }
 
@@ -1216,7 +1222,9 @@ impl CrossVenueEquityTransfer {
         let entity = self.load_mint_entity(issuer_request_id).await?;
 
         let (symbol, quantity) = match &entity {
-            TokenizedEquityMint::DepositedIntoRaindex { .. } => {
+            // Both terminals are already settled: nothing to recheck.
+            TokenizedEquityMint::DepositedIntoRaindex { .. }
+            | TokenizedEquityMint::Reconciled { .. } => {
                 return Ok(RecheckOutcome::AlreadyCompleted);
             }
             TokenizedEquityMint::Failed {
@@ -1367,7 +1375,10 @@ impl CrossVenueEquityTransfer {
         let entity = self.load_redemption_entity(aggregate_id).await?;
 
         let (symbol, tokenization_request_id, redemption_tx) = match &entity {
-            EquityRedemption::Completed { .. } => return Ok(RecheckOutcome::AlreadyCompleted),
+            // Both terminals are already settled: nothing to recheck.
+            EquityRedemption::Completed { .. } | EquityRedemption::Reconciled { .. } => {
+                return Ok(RecheckOutcome::AlreadyCompleted);
+            }
             EquityRedemption::Failed {
                 symbol,
                 redemption_tx: Some(redemption_tx),
