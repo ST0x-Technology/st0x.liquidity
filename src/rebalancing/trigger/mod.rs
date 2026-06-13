@@ -2041,6 +2041,7 @@ impl RebalancingService {
     fn mint_inventory_update(
         event: &TokenizedEquityMintEvent,
         quantity: FractionalShares,
+        stage: MintTrackingStage,
     ) -> Option<EquityInventoryUpdate> {
         use TokenizedEquityMintEvent::*;
 
@@ -2048,10 +2049,28 @@ impl RebalancingService {
             MintAccepted { .. } => {
                 Some(Self::start_equity_transfer_update(Venue::Hedging, quantity))
             }
-            MintAcceptanceFailed { .. } => Some(Self::cancel_equity_transfer_update(
-                Venue::Hedging,
-                quantity,
-            )),
+            // Cancel the Hedging inflight that `MintAccepted` started -- but ONLY
+            // if acceptance actually happened. The operator force-fail from
+            // `MintRequested` (RAI-999) emits this same event PRE-acceptance,
+            // where no inflight was ever started; cancelling there would be an
+            // unmatched Cancel. Gating on the tracking stage makes this honour
+            // SPEC's "no balance change for a pre-acceptance force-fail" rule by
+            // construction -- independent of process topology (the CLI's
+            // separate-process write also keeps it off this reactor today, but
+            // this guard is what keeps it correct if `transfer fail` is ever
+            // routed through the running bot). `track_mint_progress` does not
+            // advance the stage on `MintAcceptanceFailed`, so the stage here is
+            // `Requested` for a pre-acceptance fail and `Accepted` otherwise.
+            MintAcceptanceFailed { .. } => match stage {
+                MintTrackingStage::Requested => None,
+                MintTrackingStage::Accepted
+                | MintTrackingStage::TokensReceived
+                | MintTrackingStage::WrapSubmitted
+                | MintTrackingStage::TokensWrapped
+                | MintTrackingStage::VaultDepositSubmitted => Some(
+                    Self::cancel_equity_transfer_update(Venue::Hedging, quantity),
+                ),
+            },
             // TokensReceived completes the normal mint; ProviderCompletionRecovered
             // completes a recovered one. rebuild_mint_tracking_for_recovery restores
             // the canonical in-flight shape (Hedging in-flight = quantity, available
@@ -3378,7 +3397,8 @@ impl RebalancingService {
         };
         let symbol = tracking.symbol;
 
-        if let Some(update) = Self::mint_inventory_update(&event, tracking.quantity) {
+        if let Some(update) = Self::mint_inventory_update(&event, tracking.quantity, tracking.stage)
+        {
             self.apply_equity_update(&symbol, update).await?;
         }
 
@@ -3679,6 +3699,29 @@ mod tests {
         TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
     };
     use crate::vault_registry::VaultRegistryCommand;
+
+    #[test]
+    fn mint_inventory_update_skips_cancel_for_pre_acceptance_fail() {
+        // RAI-999: a pre-acceptance force-fail (tracking stage still Requested)
+        // started no Hedging inflight, so it must produce NO inventory update --
+        // a Cancel there would be unmatched. (The post-acceptance Cancel path is
+        // covered end-to-end by `recover_mint_clears_hedging_inflight`.)
+        let event = TokenizedEquityMintEvent::MintAcceptanceFailed {
+            reason: "operator force-fail".to_string(),
+            failed_at: Utc::now(),
+        };
+        let quantity = FractionalShares::new(float!(10));
+
+        let update = RebalancingService::mint_inventory_update(
+            &event,
+            quantity,
+            MintTrackingStage::Requested,
+        );
+        assert!(
+            update.is_none(),
+            "pre-acceptance MintAcceptanceFailed must not produce an inventory update"
+        );
+    }
 
     fn test_config() -> RebalancingServiceConfig {
         RebalancingServiceConfig {
