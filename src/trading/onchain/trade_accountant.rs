@@ -6,7 +6,7 @@
 //!
 //! [`perform`]: Job::perform
 
-use alloy::primitives::{Address, IntoLogData};
+use alloy::primitives::{Address, IntoLogData, TxHash};
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use serde::{Deserialize, Serialize};
@@ -233,6 +233,8 @@ pub(crate) enum TradeAccountingError {
     AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
     #[error("Failed to enqueue PollOrderStatus job: {0}")]
     EnqueuePollJob(#[from] crate::conductor::job::QueuePushError),
+    #[error("Missing block_timestamp for fill {tx_hash:#x}:{log_index}; cannot account for it")]
+    MissingBlockTimestamp { tx_hash: TxHash, log_index: u64 },
 }
 
 #[cfg(test)]

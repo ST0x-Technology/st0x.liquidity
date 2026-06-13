@@ -11,7 +11,7 @@ use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder};
 use anyhow::Context;
 use apalis::prelude::Status;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use sqlx_apalis::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode};
 use std::collections::HashMap;
@@ -61,7 +61,7 @@ use crate::onchain::approvals::{build_approval_targets, grant_startup_approvals}
 use crate::onchain::backfill::BackfillJobQueue;
 use crate::onchain::trade::{RaindexTradeEvent, extract_owned_vaults, extract_vaults_from_clear};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeError, OnChainTradeId};
-use crate::position::{Position, PositionCommand, TradeId};
+use crate::position::{Position, PositionCommand, PositionError, TradeId};
 use crate::position_check::{CheckPositionsJobQueue, bootstrap_check_positions};
 use crate::rebalancing::equity::{
     CrossVenueEquityTransfer, EquityTransferServices, TransferEquityToHedgingCtx,
@@ -1622,6 +1622,7 @@ async fn execute_witness_trade(
     onchain_trade: &Store<OnChainTrade>,
     trade: &OnchainTrade,
     block_number: u64,
+    block_timestamp: DateTime<Utc>,
 ) -> Result<bool, SendError<OnChainTrade>> {
     let trade_id = OnChainTradeId {
         tx_hash: trade.tx_hash,
@@ -1630,16 +1631,6 @@ async fn execute_witness_trade(
 
     let amount = trade.amount.inner();
     let price_usdc = trade.price.value();
-
-    let Some(block_timestamp) = trade.block_timestamp else {
-        warn!(
-            tx_hash = ?trade.tx_hash,
-            log_index = trade.log_index,
-            symbol = %trade.symbol,
-            "Missing block_timestamp for OnChainTrade::Witness"
-        );
-        return Ok(false);
-    };
 
     let command = OnChainTradeCommand::Witness {
         symbol: trade.symbol.base().clone(),
@@ -1720,25 +1711,24 @@ async fn execute_enrich_trade(onchain_trade: &Store<OnChainTrade>, trade: &Oncha
     }
 }
 
+/// Drives `Position::AcknowledgeOnChainFill`, treating the idempotent
+/// re-drive as success rather than an error.
+///
+/// Returns `Ok(())` when the position reflects the fill -- either this call
+/// applied it or a previous attempt already did (`DuplicateTrade`, the
+/// resume path's crash window between the position write and the
+/// acknowledgement marker). Every other error propagates so the apalis job
+/// retries instead of silently dropping the fill.
 async fn execute_acknowledge_fill(
     position: &Store<Position>,
     trade: &OnchainTrade,
     threshold: ExecutionThreshold,
-) {
+    block_timestamp: DateTime<Utc>,
+) -> Result<(), SendError<Position>> {
     let base_symbol = trade.symbol.base();
 
     let amount = trade.amount.inner();
     let price_usdc = trade.price.value();
-
-    let Some(block_timestamp) = trade.block_timestamp else {
-        warn!(
-            tx_hash = ?trade.tx_hash,
-            log_index = trade.log_index,
-            symbol = %trade.symbol,
-            "Missing block_timestamp for Position::AcknowledgeOnChainFill"
-        );
-        return;
-    };
 
     let command = PositionCommand::AcknowledgeOnChainFill {
         symbol: base_symbol.clone(),
@@ -1754,18 +1744,49 @@ async fn execute_acknowledge_fill(
     };
 
     match position.send(base_symbol, command).await {
-        Ok(()) => debug!(
-            tx_hash = ?trade.tx_hash,
-            log_index = trade.log_index,
-            symbol = %trade.symbol,
-            "Successfully executed Position::AcknowledgeOnChainFill command"
-        ),
-        Err(error) => error!(
-            tx_hash = ?trade.tx_hash,
-            log_index = trade.log_index,
-            symbol = %trade.symbol,
-            "Failed to execute Position::AcknowledgeOnChainFill command: {error}"
-        ),
+        Ok(()) => {
+            debug!(
+                tx_hash = ?trade.tx_hash,
+                log_index = trade.log_index,
+                symbol = %trade.symbol,
+                "Successfully executed Position::AcknowledgeOnChainFill command"
+            );
+            Ok(())
+        }
+        Err(AggregateError::UserError(LifecycleError::Apply(PositionError::DuplicateTrade {
+            ref trade_id,
+        }))) => {
+            info!(
+                tx_hash = ?trade.tx_hash,
+                log_index = trade.log_index,
+                symbol = %trade.symbol,
+                %trade_id,
+                "Position already applied this fill; resuming without re-counting"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Marks the trade acknowledged on the `OnChainTrade` aggregate after the
+/// position write succeeded, completing the exactly-once pair (ADR 0005).
+/// A re-driven marker (`AlreadyAcknowledged`) is idempotent;
+/// infrastructure errors propagate so the apalis retry re-drives the
+/// idempotent acknowledge pair.
+async fn execute_mark_acknowledged(
+    onchain_trade: &Store<OnChainTrade>,
+    trade_id: &OnChainTradeId,
+) -> Result<(), SendError<OnChainTrade>> {
+    match onchain_trade
+        .send(trade_id, OnChainTradeCommand::Acknowledge)
+        .await
+    {
+        Ok(())
+        | Err(AggregateError::UserError(LifecycleError::Apply(
+            OnChainTradeError::AlreadyAcknowledged,
+        ))) => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -1785,8 +1806,28 @@ where
         log_index: trade.log_index,
     };
 
+    // A fill we cannot timestamp can be neither witnessed nor acknowledged.
+    // Fail loudly so the apalis retry surfaces it as an operator-visible
+    // failure instead of completing the job and dropping the fill silently.
+    let Some(block_timestamp) = trade.block_timestamp else {
+        error!(
+            ?trade_id,
+            symbol = %trade.symbol,
+            "Missing block_timestamp; cannot account for fill"
+        );
+        return Err(TradeAccountingError::MissingBlockTimestamp {
+            tx_hash: trade.tx_hash,
+            log_index: trade.log_index,
+        });
+    };
+
+    // The dedupe is step-grained (ADR 0005): only a trade the position
+    // has acknowledged is fully processed. A trade that exists but is
+    // not acknowledged means a previous delivery died between the
+    // witness and acknowledge writes -- resume the acknowledge pair
+    // instead of skipping the fill into permanent loss.
     match cqrs.onchain_trade.load(&trade_id).await {
-        Ok(Some(_)) => {
+        Ok(Some(state)) if state.is_acknowledged() => {
             debug!(
                 ?trade_id,
                 symbol = %trade.symbol,
@@ -1794,23 +1835,42 @@ where
             );
             return Ok(None);
         }
-        Ok(None) => {}
+        Ok(Some(_)) => {
+            info!(
+                ?trade_id,
+                symbol = %trade.symbol,
+                "Trade witnessed but not acknowledged; resuming fill accounting"
+            );
+        }
+        Ok(None) => {
+            let witnessed = execute_witness_trade(
+                &cqrs.onchain_trade,
+                &trade,
+                trade_event.block_number,
+                block_timestamp,
+            )
+            .await?;
+
+            if !witnessed {
+                return Ok(None);
+            }
+
+            execute_enrich_trade(&cqrs.onchain_trade, &trade).await;
+        }
         // A failed read must not masquerade as "not a duplicate": the
         // witness write would also fail on a healthy dedupe path, but
         // propagating here keeps the retry contract explicit.
         Err(error) => return Err(error.into()),
     }
 
-    let witnessed =
-        execute_witness_trade(&cqrs.onchain_trade, &trade, trade_event.block_number).await?;
-
-    if !witnessed {
-        return Ok(None);
-    }
-
-    execute_enrich_trade(&cqrs.onchain_trade, &trade).await;
-
-    execute_acknowledge_fill(&cqrs.position, &trade, cqrs.execution_threshold).await;
+    execute_acknowledge_fill(
+        &cqrs.position,
+        &trade,
+        cqrs.execution_threshold,
+        block_timestamp,
+    )
+    .await?;
+    execute_mark_acknowledged(&cqrs.onchain_trade, &trade_id).await?;
 
     let base_symbol = trade.symbol.base();
 
@@ -3454,13 +3514,18 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
 
         let trade_event = make_trade_event(60);
+        let witnessing_trade = test_trade_with_amount(float!(1.5), 60);
+        let block_timestamp = witnessing_trade
+            .block_timestamp
+            .expect("test trade carries a block timestamp");
 
         // The exact first write process_queued_trade makes -- and then
         // nothing: models the kill between the two aggregate writes.
         let witnessed = execute_witness_trade(
             &cqrs.onchain_trade,
-            &test_trade_with_amount(float!(1.5), 60),
+            &witnessing_trade,
             trade_event.block_number,
+            block_timestamp,
         )
         .await
         .unwrap();
@@ -3520,6 +3585,120 @@ mod tests {
         assert_eq!(
             position_fills, 1,
             "Exactly one position fill event after recovery"
+        );
+
+        // The crash window this fix closes is the gap between the position
+        // write and the acknowledgement marker. Proving the fill reached
+        // the position is not enough: without the marker, every later
+        // re-delivery re-enters the resume path and re-drives the fill,
+        // which the position then rejects as a duplicate. Assert the marker
+        // was actually written -- both as a persisted event and as
+        // acknowledged state on the replayed aggregate.
+        let (acknowledged_markers,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
+                .bind("OnChainTradeEvent::Acknowledged")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            acknowledged_markers, 1,
+            "The resume path must write exactly one Acknowledged marker"
+        );
+
+        let witnessed_trade = test_trade_with_amount(float!(1.5), 60);
+        let trade_id = OnChainTradeId {
+            tx_hash: witnessed_trade.tx_hash,
+            log_index: witnessed_trade.log_index,
+        };
+        let recovered_trade = cqrs
+            .onchain_trade
+            .load(&trade_id)
+            .await
+            .unwrap()
+            .expect("the witnessed trade aggregate must exist after recovery");
+        assert!(
+            recovered_trade.is_acknowledged(),
+            "The OnChainTrade must be marked acknowledged so the dedupe \
+             treats the fill as fully processed on subsequent deliveries"
+        );
+    }
+
+    /// The resume path's idempotency contract in isolation: re-driving a
+    /// fill the position already applied (the crash window between the
+    /// position write and the acknowledgement marker) must succeed without
+    /// counting the fill twice. `execute_acknowledge_fill` maps the
+    /// position's `DuplicateTrade` rejection to `Ok(())`.
+    #[tokio::test]
+    async fn execute_acknowledge_fill_redrive_is_idempotent() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trade = test_trade_with_amount(float!(1.5), 60);
+        let block_timestamp = trade
+            .block_timestamp
+            .expect("test trade carries a block timestamp");
+
+        execute_acknowledge_fill(
+            &cqrs.position,
+            &trade,
+            cqrs.execution_threshold,
+            block_timestamp,
+        )
+        .await
+        .expect("the first acknowledge must apply the fill");
+
+        execute_acknowledge_fill(
+            &cqrs.position,
+            &trade,
+            cqrs.execution_threshold,
+            block_timestamp,
+        )
+        .await
+        .expect("re-driving the same fill must succeed, not propagate an error");
+
+        let position = cqrs
+            .position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .expect("the position must exist after acknowledge");
+        assert!(
+            position.net.inner().eq(float!(1.5)).unwrap(),
+            "the re-drive must not double-count the fill"
+        );
+    }
+
+    /// A fill missing its block timestamp can be neither witnessed nor
+    /// acknowledged, so `process_queued_trade` must fail loudly with a
+    /// retryable error rather than completing the job and dropping the fill
+    /// silently.
+    #[tokio::test]
+    async fn process_queued_trade_rejects_missing_block_timestamp() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+
+        let trade_event = make_trade_event(60);
+        let mut trade = test_trade_with_amount(float!(1.5), 60);
+        trade.block_timestamp = None;
+
+        let error = process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, TradeAccountingError::MissingBlockTimestamp { .. }),
+            "a fill without a block timestamp must fail loudly, not drop silently; got {error:?}"
         );
     }
 
