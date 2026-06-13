@@ -1041,6 +1041,35 @@ impl UsdcRebalance {
             | Self::Reconciled { direction, .. } => direction.clone(),
         }
     }
+
+    /// The persisted effective amount of the transfer (post-conversion /
+    /// post-fee where applicable), as opposed to whatever an operator typed
+    /// on a CLI resume.
+    pub(crate) fn amount(&self) -> Usdc {
+        match self {
+            // Post-conversion / post-bridge, the actually received amount is
+            // the effective one; `amount` is the originally requested figure.
+            Self::ConversionComplete { filled_amount, .. } => *filled_amount,
+            Self::Bridged {
+                amount_received, ..
+            } => *amount_received,
+            Self::Converting { amount, .. }
+            | Self::ConversionFailed { amount, .. }
+            | Self::WithdrawalSubmitting { amount, .. }
+            | Self::Withdrawing { amount, .. }
+            | Self::WithdrawalComplete { amount, .. }
+            | Self::WithdrawalFailed { amount, .. }
+            | Self::BridgingSubmitting { amount, .. }
+            | Self::Bridging { amount, .. }
+            | Self::AwaitingAttestation { amount, .. }
+            | Self::Attested { amount, .. }
+            | Self::BridgingFailed { amount, .. }
+            | Self::DepositInitiated { amount, .. }
+            | Self::DepositConfirmed { amount, .. }
+            | Self::DepositFailed { amount, .. }
+            | Self::Reconciled { amount, .. } => *amount,
+        }
+    }
 }
 
 /// Candidate `UsdcRebalance` aggregates whose latest event leaves them
@@ -3625,6 +3654,71 @@ mod tests {
             failed_at: now,
         };
         assert_eq!(deposit_failed.direction(), RebalanceDirection::AlpacaToBase);
+    }
+
+    /// `amount()` must return the persisted EFFECTIVE amount: the conversion
+    /// fill once a conversion completed, the requested amount otherwise.
+    #[test]
+    fn amount_reads_persisted_effective_amount() {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000002");
+        let now = Utc::now();
+        let requested = Usdc::new(float!(321));
+
+        let bridged = UsdcRebalance::Bridged {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: requested,
+            amount_received: Usdc::new(float!(320)),
+            fee_collected: Usdc::new(float!(1)),
+            burn_tx_hash: burn_tx,
+            mint_tx_hash: burn_tx,
+            initiated_at: now,
+            minted_at: now,
+        };
+        assert_eq!(
+            bridged.amount(),
+            Usdc::new(float!(320)),
+            "post-bridge the received amount is the effective amount",
+        );
+
+        let conversion_failed = UsdcRebalance::ConversionFailed {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: requested,
+            order_id: ClientOrderId::from_uuid(Uuid::from_u128(11)),
+            reason: "broker rejected".to_string(),
+            initiated_at: now,
+            failed_at: now,
+        };
+        assert_eq!(conversion_failed.amount(), requested);
+
+        let conversion_complete = UsdcRebalance::ConversionComplete {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: requested,
+            filled_amount: Usdc::new(float!(319)),
+            initiated_at: now,
+            converted_at: now,
+        };
+        assert_eq!(
+            conversion_complete.amount(),
+            Usdc::new(float!(319)),
+            "post-conversion the filled amount is the effective amount",
+        );
+
+        let deposit_failed = UsdcRebalance::DepositFailed {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: requested,
+            burn_tx_hash: burn_tx,
+            mint_tx_hash: burn_tx,
+            deposit_ref: None,
+            reason: "deposit reverted".to_string(),
+            initiated_at: now,
+            failed_at: now,
+        };
+        assert_eq!(
+            deposit_failed.amount(),
+            requested,
+            "the common reconcile target state reports the requested amount",
+        );
     }
 
     #[tokio::test]

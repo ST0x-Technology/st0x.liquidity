@@ -126,10 +126,10 @@ stox alpaca-tokenization-requests
 
 ### Rechecking Failed Equity Transfers
 
-Use `recheck-transfer` when the bot marked an equity mint or redemption as
+Use `transfer recheck` when the bot marked an equity mint or redemption as
 failed, but Alpaca later shows the same provider request as completed.
 
-**The bot must be running.** `recheck-transfer` delegates to the bot's REST API
+**The bot must be running.** `transfer recheck` delegates to the bot's REST API
 (`POST /transfers/recheck/<kind>/<id>` on the configured `server_port`) rather
 than mutating the database directly. Recovery has to run inside the bot process
 so the recovery event dispatches through the in-process inventory reactor (which
@@ -146,22 +146,22 @@ Recoverable cases:
 
 - Mint failed at acceptance (accepted by Alpaca, but tokens never received),
   then Alpaca later reports the mint completed.
-  `stox recheck-transfer --type mint --id <issuer-request-id>` records provider
+  `stox transfer recheck --kind mint --id <issuer-request-id>` records provider
   completion and resumes wrapping/depositing to Raindex. A mint that already
   received tokens and then failed while wrapping or depositing is **not**
   recoverable this way (recovery would re-wrap tokens that already moved); the
   command reports it as not recoverable.
 - Redemption failed after tokens were sent, with a redemption tx in the
   aggregate.
-  `stox recheck-transfer --type redemption --id <redemption-aggregate-id>`
+  `stox transfer recheck --kind redemption --id <redemption-aggregate-id>`
   completes it if Alpaca now reports completed.
-- Non-failed active mints/redemptions can also be passed to `recheck-transfer`;
+- Non-failed active mints/redemptions can also be passed to `transfer recheck`;
   the command resumes the normal workflow instead of forcing recovery.
 
 The command prints the recovery outcome: `recovered`, `resumed`,
 `already_completed`, `left_unchanged`, `not_detected_yet`, or `not_recoverable`.
 
-Not covered by `recheck-transfer` yet:
+Not covered by `transfer recheck` yet:
 
 - Mint requests rejected before Alpaca acceptance. There is no provider
   completion to discover.
@@ -175,14 +175,12 @@ Not covered by `recheck-transfer` yet:
 - USDC rebalancing failures. Those use the USDC/CCTP state machine and have
   their own recovery command. A manual `transfer-usdc` prints its transfer id
   and, if interrupted after the burn, is resumed with
-  `stox resume-usdc-transfer --id <id> --direction <to-raindex|to-alpaca>
-  --amount <amount>`.
-  The `--direction` must match the original (a mismatch is rejected to avoid
+  `stox transfer resume --id <id> --direction <to-raindex|to-alpaca>`. The
+  `--direction` must match the original (a mismatch is rejected to avoid
   mis-driving) and an unknown id is rejected rather than starting a fresh burn;
-  the `--amount` is required for symmetry with `transfer-usdc` but a resume uses
-  the aggregate's persisted amount. Run it only when the bot is not concurrently
-  driving that same id, since it drives the aggregate directly rather than
-  through the bot's resume lock.
+  a resume uses the aggregate's persisted amount, so no amount is taken. Run it
+  only when the bot is not concurrently driving that same id, since it drives
+  the aggregate directly rather than through the bot's resume lock.
 
 For local dashboard testing, run:
 
@@ -191,5 +189,6 @@ nix run .#simulate-failures
 ```
 
 The backend creates failed mint and redemption transfers whose mock Alpaca
-provider later completes, then prints the exact `recheck-transfer` commands for
-that run's generated config, secrets, database, and mock API port.
+provider later completes, then prints the exact (legacy-named)
+`recheck-transfer` commands for that run's generated config, secrets, database,
+and mock API port.

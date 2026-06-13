@@ -309,7 +309,7 @@ pub(super) async fn set_position_command<W: Write>(
     {
         bail!(
             "position {symbol} has pending offchain order {pending}; \
-             run repair fail-pending-offchain-order before setting position"
+             run position release-hedge before setting position"
         );
     }
 

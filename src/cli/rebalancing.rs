@@ -222,7 +222,7 @@ where
 }
 
 /// Starts a fresh manual USDC transfer. Surfaces the generated id up front so an
-/// operator can resume it (via `resume-usdc-transfer`) if the process is
+/// operator can resume it (via `transfer resume`) if the process is
 /// interrupted, then drives it to terminal with attestation-timeout redrive.
 /// Whether a USDC transfer command may start a fresh transfer or must resume an
 /// existing one. Drives the `None`-state policy in [`run_usdc_transfer`]: a
@@ -231,7 +231,10 @@ where
 /// must be rejected -- never burned into a brand-new transfer.
 #[derive(Clone, Copy)]
 enum UsdcTransferStartMode {
-    Fresh,
+    /// First run of a brand-new transfer; the operator supplies the amount.
+    Fresh { amount: Usdc },
+    /// Re-entry on an existing id; the amount always comes from the persisted
+    /// aggregate, never from the CLI.
     Resume,
 }
 
@@ -250,7 +253,7 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
     writeln!(
         stdout,
         "USDC transfer id: {id}\n   If this is interrupted after the burn, resume with:\n   \
-         resume-usdc-transfer --id {id} --direction {dir_flag} --amount {amount}"
+         transfer resume --id {id} --direction {dir_flag}"
     )?;
     // Flush the recovery id to durable output BEFORE the burn: the resume safety
     // story depends on the operator still having this id if the process is killed
@@ -259,9 +262,8 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
     run_usdc_transfer(
         stdout,
         direction,
-        amount,
         id,
-        UsdcTransferStartMode::Fresh,
+        UsdcTransferStartMode::Fresh { amount },
         ctx,
         pool,
     )
@@ -271,23 +273,19 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
 /// Resumes an interrupted manual USDC transfer by its id, driving it to terminal
 /// with the same attestation-timeout redrive as a fresh transfer. Refuses to run
 /// if the id has no persisted transfer (a wrong/typoed id would otherwise start a
-/// brand-new burn) or if `--direction` disagrees with the persisted transfer. The
-/// `--amount` is required for symmetry with the `transfer-usdc` recovery hint but
-/// is not validated -- a resume uses the aggregate's persisted amount.
+/// brand-new burn) or if `--direction` disagrees with the persisted transfer.
+/// The amount always comes from the persisted aggregate, never from the CLI.
 pub(super) async fn resume_usdc_transfer_command<Writer: Write>(
     stdout: &mut Writer,
     id: Uuid,
     direction: TransferDirection,
-    amount: Usdc,
     ctx: &Ctx,
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
     let id = UsdcRebalanceId(id);
-    writeln!(stdout, "Resuming USDC transfer id: {id}")?;
     run_usdc_transfer(
         stdout,
         direction,
-        amount,
         id,
         UsdcTransferStartMode::Resume,
         ctx,
@@ -299,7 +297,6 @@ pub(super) async fn resume_usdc_transfer_command<Writer: Write>(
 async fn run_usdc_transfer<Writer: Write>(
     stdout: &mut Writer,
     direction: TransferDirection,
-    amount: Usdc,
     id: UsdcRebalanceId,
     mode: UsdcTransferStartMode,
     ctx: &Ctx,
@@ -309,7 +306,6 @@ async fn run_usdc_transfer<Writer: Write>(
         TransferDirection::ToRaindex => "Alpaca -> Raindex",
         TransferDirection::ToAlpaca => "Raindex -> Alpaca",
     };
-    writeln!(stdout, "Transferring USDC: {dir}, Amount: {amount} USDC")?;
 
     let usdc_store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
         .build(())
@@ -322,31 +318,43 @@ async fn run_usdc_transfer<Writer: Write>(
     // operator-supplied resume id that is mistyped or points at the wrong
     // database. Reject `None`, and reject a `--direction` that disagrees with the
     // persisted transfer (driving the opposite-direction resume path would
-    // mis-drive the aggregate). The `--amount` is NOT validated: it stays in the
-    // recovery command for symmetry with `transfer-usdc`, but a resume uses the
-    // aggregate's persisted amount, and the persisted state amount is the
-    // post-conversion/post-fee effective amount, not the original requested one.
-    if matches!(mode, UsdcTransferStartMode::Resume) {
-        let Some(state) = usdc_store.load(&id).await? else {
-            anyhow::bail!(
-                "resume-usdc-transfer: no transfer found for id {id}. Refusing to start a new \
-                 burn -- check the id and that you are pointed at the right database."
-            );
-        };
-
-        let expected_direction = match direction {
-            TransferDirection::ToRaindex => RebalanceDirection::AlpacaToBase,
-            TransferDirection::ToAlpaca => RebalanceDirection::BaseToAlpaca,
-        };
-
-        if state.direction() != expected_direction {
-            anyhow::bail!(
-                "resume-usdc-transfer: --direction does not match the persisted transfer for id \
-                 {id} (persisted {:?}). Refusing to mis-drive the transfer.",
-                state.direction()
-            );
+    // mis-drive the aggregate). A resume uses the aggregate's persisted amount --
+    // the post-conversion/post-fee effective amount, not the original requested
+    // one -- so the CLI never fabricates a financial value for it.
+    let amount = match mode {
+        UsdcTransferStartMode::Fresh { amount } => {
+            writeln!(stdout, "Transferring USDC: {dir}, Amount: {amount} USDC")?;
+            amount
         }
-    }
+        UsdcTransferStartMode::Resume => {
+            let Some(state) = usdc_store.load(&id).await? else {
+                anyhow::bail!(
+                    "transfer resume: no transfer found for id {id}. Refusing to start a new \
+                     burn -- check the id and that you are pointed at the right database."
+                );
+            };
+
+            let expected_direction = match direction {
+                TransferDirection::ToRaindex => RebalanceDirection::AlpacaToBase,
+                TransferDirection::ToAlpaca => RebalanceDirection::BaseToAlpaca,
+            };
+
+            if state.direction() != expected_direction {
+                anyhow::bail!(
+                    "transfer resume: --direction does not match the persisted transfer for \
+                     id {id} (persisted {:?}). Refusing to mis-drive the transfer.",
+                    state.direction()
+                );
+            }
+
+            let amount = state.amount();
+            writeln!(
+                stdout,
+                "Resuming USDC transfer {id}: {dir}, persisted amount: {amount} USDC"
+            )?;
+            amount
+        }
+    };
 
     let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
         anyhow::bail!("transfer-usdc requires Alpaca Broker API configuration");
@@ -487,7 +495,7 @@ pub(super) async fn reconcile_usdc_transfer_command<Writer: Write>(
 
     let Some(state) = usdc_store.load(&id).await? else {
         anyhow::bail!(
-            "reconcile-usdc-transfer: no transfer found for id {id}. Refusing to act -- check \
+            "transfer reconcile: no transfer found for id {id}. Refusing to act -- check \
              the id and that you are pointed at the right database."
         );
     };
@@ -514,7 +522,7 @@ pub(super) async fn reconcile_usdc_transfer_command<Writer: Write>(
 
     if !is_post_burn_failure {
         anyhow::bail!(
-            "reconcile-usdc-transfer: transfer {id} is in state {state:?}, not a post-burn \
+            "transfer reconcile: transfer {id} is in state {state:?}, not a post-burn \
              terminal failure that strands the in-progress guard (DepositFailed, post-burn \
              BridgingFailed, or a BaseToAlpaca ConversionFailed). Refusing to act."
         );
@@ -986,7 +994,7 @@ pub(crate) async fn recheck_transfer_command<W: Write>(
     let body = response.text().await?;
 
     if !status.is_success() {
-        anyhow::bail!("recheck-transfer failed ({status}): {body}");
+        anyhow::bail!("transfer recheck failed ({status}): {body}");
     }
 
     // The endpoint returns `{"outcome":"<snake_case>"}`; surface the outcome
@@ -1001,7 +1009,7 @@ pub(crate) async fn recheck_transfer_command<W: Write>(
                 .map(str::to_owned)
         })
         .unwrap_or(body);
-    writeln!(stdout, "recheck-transfer outcome: {outcome}")?;
+    writeln!(stdout, "transfer recheck outcome: {outcome}")?;
     Ok(())
 }
 
@@ -1277,14 +1285,13 @@ mod tests {
 
     #[tokio::test]
     async fn resume_usdc_transfer_rejects_unknown_id_without_burning() {
-        // The core safety contract of `resume-usdc-transfer`: an id that has no
+        // The core safety contract of `transfer resume`: an id that has no
         // persisted transfer (a typo, or the wrong database) MUST be rejected up
         // front rather than falling through to the manager's `None` -> fresh-burn
         // path. The existence check runs before any broker/bridge setup, so a bare
         // ctx and an empty pool reach it directly.
         let ctx = create_ctx_without_rebalancing();
         let pool = setup_test_db().await;
-        let amount = Usdc::new(Float::parse("100".to_string()).unwrap());
         let unknown_id = Uuid::from_u128(0xDEAD_BEEF);
 
         let mut stdout = Vec::new();
@@ -1292,7 +1299,6 @@ mod tests {
             &mut stdout,
             unknown_id,
             TransferDirection::ToRaindex,
-            amount,
             &ctx,
             &pool,
         )
@@ -1398,15 +1404,9 @@ mod tests {
             .unwrap();
 
         let mut stdout = Vec::new();
-        let result = resume_usdc_transfer_command(
-            &mut stdout,
-            id,
-            TransferDirection::ToAlpaca,
-            amount,
-            &ctx,
-            &pool,
-        )
-        .await;
+        let result =
+            resume_usdc_transfer_command(&mut stdout, id, TransferDirection::ToAlpaca, &ctx, &pool)
+                .await;
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -1416,18 +1416,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_usdc_transfer_accepts_amount_differing_from_persisted() {
-        // Regression guard: a resume with the CORRECT direction but a `--amount`
-        // different from the persisted state amount must NOT be rejected. The
-        // persisted amount is the post-slippage/post-fee effective amount, not the
-        // original requested one the operator types, so validating against it
-        // would wrongly reject legitimate resumes (the iter2 bug). The preflight
-        // guard must let it through -- here it then fails at broker setup, proving
-        // the guard accepted it.
+    async fn resume_usdc_transfer_reports_persisted_amount() {
+        // A resume takes no amount: it loads the persisted state amount (the
+        // post-slippage/post-fee effective amount) and reports it to the
+        // operator. The preflight guard must accept the correct direction --
+        // here it then fails at broker setup, proving the guard accepted it.
         let ctx = create_ctx_without_rebalancing();
         let pool = setup_test_db().await;
         let seeded_amount = Usdc::new(Float::parse("100".to_string()).unwrap());
-        let different_amount = Usdc::new(Float::parse("250".to_string()).unwrap());
         let id = Uuid::from_u128(123);
 
         let store = StoreBuilder::<UsdcRebalance>::new(pool.clone())
@@ -1454,7 +1450,6 @@ mod tests {
             &mut stdout,
             id,
             TransferDirection::ToRaindex,
-            different_amount,
             &ctx,
             &pool,
         )
@@ -1463,11 +1458,17 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(
             !err_msg.contains("does not match"),
-            "a differing --amount must pass the guard (resume uses persisted amount); got: {err_msg}"
+            "the correct direction must pass the guard; got: {err_msg}"
         );
         assert!(
             err_msg.contains("requires Alpaca Broker API configuration"),
             "past the guard, the bare ctx must fail at broker setup; got: {err_msg}"
+        );
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("persisted amount: 100 USDC"),
+            "the resume must report the persisted effective amount; got: {output}"
         );
     }
 

@@ -108,17 +108,17 @@ cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.to
 Manual repair of local position tracking after an operator trade or rebalance:
 
 ```bash
-cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml repair set-position --symbol SPYM --zero --reason "manual rebalance completed"
-cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml repair set-position --symbol SPYM --long 100 --price 200 --reason "manual buy not observed by bot"
-cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml repair set-position --symbol SPYM --short 12.5 --price 200 --reason "manual sell not observed by bot"
+cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml position set --symbol SPYM --zero --reason "manual rebalance completed"
+cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml position set --symbol SPYM --long 100 --price 200 --reason "manual buy not observed by bot"
+cargo run --bin cli -- --config path/to/config.toml --secrets path/to/secrets.toml position set --symbol SPYM --short 12.5 --price 200 --reason "manual sell not observed by bot"
 ```
 
 `--price` (USDC per share) is required for a nonzero target when the symbol uses
 a dollar-value execution threshold and no price is already known; without it the
 repaired exposure could never be valued and would never hedge.
 
-`set-position` is rejected while the symbol still has a pending offchain hedge
-order; resolve it first with `repair fail-pending-offchain-order`, then retry.
+`position set` is rejected while the symbol still has a pending offchain hedge
+order; resolve it first with `position release-hedge`, then retry.
 
 ### Brokerage Setup
 
@@ -276,7 +276,9 @@ nix develop .#ci-backend -c cargo clippy --workspace --all-targets --all-feature
 system using [mprocs](https://github.com/pvolok/mprocs) to run the dashboard and
 the bot side-by-side. `nix run .#simulate-failures` starts the same stack, then
 creates failed mint and redemption rebalances whose mock Alpaca provider later
-completes and prints the `recheck-transfer` commands that recover them.
+completes and prints the (legacy-named) `recheck-transfer` commands that recover
+them; the printed hints move to the new names when the legacy aliases are
+deprecated.
 
 What it does:
 
