@@ -4,14 +4,20 @@
   import * as Card from '$lib/components/ui/card'
   import * as Table from '$lib/components/ui/table'
   import HoverTooltip from '$lib/components/hover-tooltip.svelte'
+  import CliCommandBlock from '$lib/components/cli-command-block.svelte'
   import type { Position } from '$lib/api/Position'
   import MultiSelect from '$lib/components/multi-select.svelte'
   import { reactive } from '$lib/frp.svelte'
-  import { getApiBaseUrl } from '$lib/env'
+  import {
+    getApiBaseUrl,
+    getExplorerTxUrl,
+    getSimulateBackendPort,
+    getSimulateSourceId
+  } from '$lib/env'
   import { formatUtc, toDatetimeLocal, TIME_PRESETS, FETCH_TIMEOUT_MS, toRfc3339 } from '$lib/time'
   import { formatDecimal } from '$lib/decimal'
-  import { getExplorerTxUrl } from '$lib/env'
   import { equityUsdTooltip } from '$lib/inventory-value'
+  import { tradeRecoveryCommands } from '$lib/transfer'
 
   type TradeEvent = {
     step: string
@@ -676,6 +682,29 @@
             </div>
           {/each}
         </div>
+
+        {@const txHash =
+          trade.venue === 'raindex' && trade.id.includes(':')
+            ? trade.id.slice(0, trade.id.lastIndexOf(':'))
+            : null}
+        {@const recoveryCommands = tradeRecoveryCommands({
+          deployment: {
+            simulateSourceId: getSimulateSourceId(),
+            backendPort: getSimulateBackendPort()
+          },
+          symbol: trade.symbol,
+          txHash
+        })}
+        {#if recoveryCommands.length > 0}
+          <div class="mt-5 border-t pt-4">
+            <div class="mb-2 text-xs font-semibold text-foreground">CLI commands</div>
+            <div class="space-y-2">
+              {#each recoveryCommands as entry (entry.command)}
+                <CliCommandBlock {entry} />
+              {/each}
+            </div>
+          </div>
+        {/if}
       {/if}
     </div>
   {/if}

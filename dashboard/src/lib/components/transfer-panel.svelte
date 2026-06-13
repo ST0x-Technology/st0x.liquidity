@@ -4,14 +4,17 @@
   import * as Card from '$lib/components/ui/card'
   import * as Table from '$lib/components/ui/table'
   import HoverTooltip from '$lib/components/hover-tooltip.svelte'
+  import CliCommandBlock from '$lib/components/cli-command-block.svelte'
   import type { Position } from '$lib/api/Position'
+  import type { TransferCategory } from '$lib/transfer'
+  import type { UsdcBridgeDirection } from '$lib/api/UsdcBridgeDirection'
   import MultiSelect from '$lib/components/multi-select.svelte'
   import { reactive } from '$lib/frp.svelte'
   import {
     getApiBaseUrl,
     getExplorerTxUrl,
     getSimulateBackendPort,
-    getSimulateSourceId,
+    getSimulateSourceId
   } from '$lib/env'
   import { formatUtc, toDatetimeLocal, TIME_PRESETS, FETCH_TIMEOUT_MS, toRfc3339 } from '$lib/time'
   import { formatDecimal } from '$lib/decimal'
@@ -30,7 +33,7 @@
     apiErrorStatus,
     stuckLocationLabel,
     stuckReasonLabel,
-    recoveryCommand
+    transferRecoveryCommands
   } from '$lib/transfer'
 
   const isNumeric = (value: unknown): boolean =>
@@ -48,13 +51,13 @@
   }
 
   type TransferEntry = {
-    kind: string
+    kind: TransferCategory
     id: string
     symbol?: string
     quantity?: string
     amount?: string
-    direction?: string
-    status: { status: string }
+    direction?: UsdcBridgeDirection
+    status: { status: string; postBurn?: boolean }
     startedAt: string
     updatedAt: string
   }
@@ -285,7 +288,6 @@
       }
     }
   }
-
 </script>
 
 <Card.Root class="flex h-full flex-col overflow-hidden border-l-4 border-l-purple-500/50">
@@ -582,162 +584,177 @@
           Failed to load events: {detailError.current}
         </div>
       {:else}
-        <svelte:boundary onerror={(error) => console.error('Failed to render transfer detail', error)}>
-        {#if detailStuck.current}
-          {@const recovery = recoveryCommand({
-            simulateSourceId: getSimulateSourceId(),
-            backendPort: getSimulateBackendPort(),
-            kind: transfer.kind,
-            id: transfer.id
-          })}
-          <div class="mb-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs">
-            <div class="font-medium text-destructive">Stranded equity</div>
-            <div class="mt-1 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 font-mono">
-              <span class="text-muted-foreground">Amount</span>
-              <span>{formatDecimal(detailStuck.current.stuckAmount, 3)}</span>
-              <span class="text-muted-foreground">Location</span>
-              <span>{stuckLocationLabel(detailStuck.current.stuckLocation)}</span>
-              <span class="text-muted-foreground">Reason</span>
-              <span>{stuckReasonLabel(detailStuck.current.stuckReason)}</span>
+        <svelte:boundary
+          onerror={(error) => console.error('Failed to render transfer detail', error)}
+        >
+          {#if detailStuck.current}
+            <div
+              class="mb-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs"
+            >
+              <div class="font-medium text-destructive">Stranded equity</div>
+              <div class="mt-1 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 font-mono">
+                <span class="text-muted-foreground">Amount</span>
+                <span>{formatDecimal(detailStuck.current.stuckAmount, 3)}</span>
+                <span class="text-muted-foreground">Location</span>
+                <span>{stuckLocationLabel(detailStuck.current.stuckLocation)}</span>
+                <span class="text-muted-foreground">Reason</span>
+                <span>{stuckReasonLabel(detailStuck.current.stuckReason)}</span>
+              </div>
             </div>
-            {#if recovery}
-              <div class="mt-2 border-t border-destructive/20 pt-2">
-                <div class="font-medium text-destructive">Recovery command</div>
-                {#if recovery.mode === 'production'}
-                  <div class="mt-1 text-muted-foreground">Run on the server (ssh via Tailscale):</div>
-                {/if}
-                <pre class="mt-1 whitespace-pre-wrap break-all rounded bg-background/80 p-2 font-mono text-[11px] text-foreground">{recovery.command}</pre>
-              </div>
-            {/if}
-          </div>
-        {/if}
+          {/if}
 
-        <div class="relative space-y-0 border-l-2 border-muted pl-4">
-          {#each detailEvents.current as event (event.sequence)}
-            <svelte:boundary onerror={(error) => console.error('Failed to render transfer event', error)}>
-            {@const stepStyle = statusStyle(event.step)}
-            {@const timestamp = extractTimestamp(event.payload)}
-            {@const fields = detailFields(event.payload)}
-            <div class="relative pb-4">
-              <!-- Timeline dot -->
-              <div
-                class="absolute -left-[calc(0.25rem+1px+1rem)] top-0.5 h-2 w-2 rounded-full {stepStyle.dot}"
-              ></div>
+          <div class="relative space-y-0 border-l-2 border-muted pl-4">
+            {#each detailEvents.current as event (event.sequence)}
+              <svelte:boundary
+                onerror={(error) => console.error('Failed to render transfer event', error)}
+              >
+                {@const stepStyle = statusStyle(event.step)}
+                {@const timestamp = extractTimestamp(event.payload)}
+                {@const fields = detailFields(event.payload)}
+                <div class="relative pb-4">
+                  <!-- Timeline dot -->
+                  <div
+                    class="absolute -left-[calc(0.25rem+1px+1rem)] top-0.5 h-2 w-2 rounded-full {stepStyle.dot}"
+                  ></div>
 
-              <div class="text-xs font-medium {stepStyle.text}">
-                {humanizeStep(event.step)}
-              </div>
+                  <div class="text-xs font-medium {stepStyle.text}">
+                    {humanizeStep(event.step)}
+                  </div>
 
-              {#if timestamp}
-                <div class="mt-0.5 font-mono text-xs text-muted-foreground">
-                  {formatUtc(timestamp)}
-                </div>
-              {/if}
+                  {#if timestamp}
+                    <div class="mt-0.5 font-mono text-xs text-muted-foreground">
+                      {formatUtc(timestamp)}
+                    </div>
+                  {/if}
 
-              {#if fields.length > 0}
-                <div class="mt-1.5 space-y-1">
-                  {#each fields as [key, value] (key)}
-                    <div class="flex items-start gap-2 font-mono text-xs">
-                      <span class="shrink-0 text-muted-foreground">{formatFieldName(key)}</span>
-                      <span class="min-w-0 break-all">
-                        {#if key === 'reason'}
-                          <span class="text-destructive">{value}</span>
-                        {:else if key === 'failure'}
-                          <span class="text-destructive">
-                            {#if typeof value === 'object' && value !== null}
-                              {#if 'ApiError' in value}
-                                API error{@const status = apiErrorStatus(value)}{#if status}
-                                  (status {status}){/if}
-                              {:else if 'Timeout' in value}
-                                Timeout
+                  {#if fields.length > 0}
+                    <div class="mt-1.5 space-y-1">
+                      {#each fields as [key, value] (key)}
+                        <div class="flex items-start gap-2 font-mono text-xs">
+                          <span class="shrink-0 text-muted-foreground">{formatFieldName(key)}</span>
+                          <span class="min-w-0 break-all">
+                            {#if key === 'reason'}
+                              <span class="text-destructive">{value}</span>
+                            {:else if key === 'failure'}
+                              <span class="text-destructive">
+                                {#if typeof value === 'object' && value !== null}
+                                  {#if 'ApiError' in value}
+                                    API error{@const status = apiErrorStatus(value)}{#if status}
+                                      (status {status}){/if}
+                                  {:else if 'Timeout' in value}
+                                    Timeout
+                                  {:else}
+                                    {JSON.stringify(value)}
+                                  {/if}
+                                {:else if isNumeric(value)}
+                                  {formatNumericDetailValue(key, String(value))}
+                                {:else}
+                                  {String(value)}
+                                {/if}
+                              </span>
+                            {:else if isTxHash(value)}
+                              <a
+                                href={getExplorerTxUrl(value)}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                class="inline-flex items-center gap-1 text-blue-400 hover:text-blue-300"
+                              >
+                                {value.slice(0, 10)}...{value.slice(-8)}
+                                <svg
+                                  xmlns="http://www.w3.org/2000/svg"
+                                  viewBox="0 0 16 16"
+                                  fill="currentColor"
+                                  class="h-3 w-3"
+                                >
+                                  <path
+                                    d="M6.22 8.72a.75.75 0 0 0 1.06 1.06l5.22-5.22v1.69a.75.75 0 0 0 1.5 0v-3.5a.75.75 0 0 0-.75-.75h-3.5a.75.75 0 0 0 0 1.5h1.69L6.22 8.72Z"
+                                  />
+                                  <path
+                                    d="M3.5 6.75c0-.69.56-1.25 1.25-1.25H7A.75.75 0 0 0 7 4H4.75A2.75 2.75 0 0 0 2 6.75v4.5A2.75 2.75 0 0 0 4.75 14h4.5A2.75 2.75 0 0 0 12 11.25V9a.75.75 0 0 0-1.5 0v2.25c0 .69-.56 1.25-1.25 1.25h-4.5c-.69 0-1.25-.56-1.25-1.25v-4.5Z"
+                                  />
+                                </svg>
+                              </a>
+                            {:else if isTransferRef(value)}
+                              {#if 'OnchainTx' in value}
+                                {@const txHash = value['OnchainTx']}
+                                <a
+                                  href={getExplorerTxUrl(txHash)}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  class="inline-flex items-center gap-1 text-blue-400 hover:text-blue-300"
+                                >
+                                  {txHash.slice(0, 10)}...{txHash.slice(-8)}
+                                  <svg
+                                    xmlns="http://www.w3.org/2000/svg"
+                                    viewBox="0 0 16 16"
+                                    fill="currentColor"
+                                    class="h-3 w-3"
+                                  >
+                                    <path
+                                      d="M6.22 8.72a.75.75 0 0 0 1.06 1.06l5.22-5.22v1.69a.75.75 0 0 0 1.5 0v-3.5a.75.75 0 0 0-.75-.75h-3.5a.75.75 0 0 0 0 1.5h1.69L6.22 8.72Z"
+                                    />
+                                    <path
+                                      d="M3.5 6.75c0-.69.56-1.25 1.25-1.25H7A.75.75 0 0 0 7 4H4.75A2.75 2.75 0 0 0 2 6.75v4.5A2.75 2.75 0 0 0 4.75 14h4.5A2.75 2.75 0 0 0 12 11.25V9a.75.75 0 0 0-1.5 0v2.25c0 .69-.56 1.25-1.25 1.25h-4.5c-.69 0-1.25-.56-1.25-1.25v-4.5Z"
+                                    />
+                                  </svg>
+                                </a>
+                              {:else if 'AlpacaId' in value}
+                                <span class="text-muted-foreground"
+                                  >Alpaca: {value['AlpacaId']}</span
+                                >
                               {:else}
                                 {JSON.stringify(value)}
                               {/if}
+                            {:else if typeof value === 'object' && value !== null}
+                              {JSON.stringify(value)}
                             {:else if isNumeric(value)}
                               {formatNumericDetailValue(key, String(value))}
                             {:else}
                               {String(value)}
                             {/if}
                           </span>
-                        {:else if isTxHash(value)}
-                          <a
-                            href={getExplorerTxUrl(value)}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            class="inline-flex items-center gap-1 text-blue-400 hover:text-blue-300"
-                          >
-                            {value.slice(0, 10)}...{value.slice(-8)}
-                            <svg
-                              xmlns="http://www.w3.org/2000/svg"
-                              viewBox="0 0 16 16"
-                              fill="currentColor"
-                              class="h-3 w-3"
-                            >
-                              <path
-                                d="M6.22 8.72a.75.75 0 0 0 1.06 1.06l5.22-5.22v1.69a.75.75 0 0 0 1.5 0v-3.5a.75.75 0 0 0-.75-.75h-3.5a.75.75 0 0 0 0 1.5h1.69L6.22 8.72Z"
-                              />
-                              <path
-                                d="M3.5 6.75c0-.69.56-1.25 1.25-1.25H7A.75.75 0 0 0 7 4H4.75A2.75 2.75 0 0 0 2 6.75v4.5A2.75 2.75 0 0 0 4.75 14h4.5A2.75 2.75 0 0 0 12 11.25V9a.75.75 0 0 0-1.5 0v2.25c0 .69-.56 1.25-1.25 1.25h-4.5c-.69 0-1.25-.56-1.25-1.25v-4.5Z"
-                              />
-                            </svg>
-                          </a>
-                        {:else if isTransferRef(value)}
-                          {#if 'OnchainTx' in value}
-                            {@const txHash = value['OnchainTx']}
-                            <a
-                              href={getExplorerTxUrl(txHash)}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              class="inline-flex items-center gap-1 text-blue-400 hover:text-blue-300"
-                            >
-                              {txHash.slice(0, 10)}...{txHash.slice(-8)}
-                              <svg
-                                xmlns="http://www.w3.org/2000/svg"
-                                viewBox="0 0 16 16"
-                                fill="currentColor"
-                                class="h-3 w-3"
-                              >
-                                <path
-                                  d="M6.22 8.72a.75.75 0 0 0 1.06 1.06l5.22-5.22v1.69a.75.75 0 0 0 1.5 0v-3.5a.75.75 0 0 0-.75-.75h-3.5a.75.75 0 0 0 0 1.5h1.69L6.22 8.72Z"
-                                />
-                                <path
-                                  d="M3.5 6.75c0-.69.56-1.25 1.25-1.25H7A.75.75 0 0 0 7 4H4.75A2.75 2.75 0 0 0 2 6.75v4.5A2.75 2.75 0 0 0 4.75 14h4.5A2.75 2.75 0 0 0 12 11.25V9a.75.75 0 0 0-1.5 0v2.25c0 .69-.56 1.25-1.25 1.25h-4.5c-.69 0-1.25-.56-1.25-1.25v-4.5Z"
-                                />
-                              </svg>
-                            </a>
-                          {:else if 'AlpacaId' in value}
-                            <span class="text-muted-foreground">Alpaca: {value['AlpacaId']}</span>
-                          {:else}
-                            {JSON.stringify(value)}
-                          {/if}
-                        {:else if typeof value === 'object' && value !== null}
-                          {JSON.stringify(value)}
-                        {:else if isNumeric(value)}
-                          {formatNumericDetailValue(key, String(value))}
-                        {:else}
-                          {String(value)}
-                        {/if}
-                      </span>
+                        </div>
+                      {/each}
                     </div>
-                  {/each}
+                  {/if}
                 </div>
-              {/if}
-            </div>
 
-            {#snippet failed()}
-              <div class="relative pb-4 text-xs text-destructive">
-                Something went wrong rendering this event — check the browser console.
-              </div>
-            {/snippet}
-            </svelte:boundary>
-          {/each}
-        </div>
-
-        {#snippet failed()}
-          <div class="flex items-center justify-center py-8 text-sm text-destructive">
-            Something went wrong — check the browser console.
+                {#snippet failed()}
+                  <div class="relative pb-4 text-xs text-destructive">
+                    Something went wrong rendering this event — check the browser console.
+                  </div>
+                {/snippet}
+              </svelte:boundary>
+            {/each}
           </div>
-        {/snippet}
+
+          {@const recoveryCommands = transferRecoveryCommands({
+            deployment: {
+              simulateSourceId: getSimulateSourceId(),
+              backendPort: getSimulateBackendPort()
+            },
+            kind: transfer.kind,
+            id: transfer.id,
+            status: transfer.status.status,
+            direction: transfer.direction ?? null,
+            postBurn: transfer.status.postBurn ?? null
+          })}
+          {#if recoveryCommands.length > 0}
+            <div class="mt-5 border-t pt-4">
+              <div class="mb-2 text-xs font-semibold text-foreground">CLI commands</div>
+              <div class="space-y-2">
+                {#each recoveryCommands as entry (entry.command)}
+                  <CliCommandBlock {entry} />
+                {/each}
+              </div>
+            </div>
+          {/if}
+
+          {#snippet failed()}
+            <div class="flex items-center justify-center py-8 text-sm text-destructive">
+              Something went wrong — check the browser console.
+            </div>
+          {/snippet}
         </svelte:boundary>
       {/if}
     </div>
