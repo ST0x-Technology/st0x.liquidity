@@ -31,8 +31,9 @@ use st0x_event_sorcery::{
 };
 use st0x_evm::Wallet;
 use st0x_execution::{
-    ClientOrderId, CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason,
-    ExecutionError, Executor, FractionalShares, MarketOrder, Symbol, TryIntoExecutor,
+    AlpacaBrokerApi, ClientOrderId, CounterTradePreflight, CounterTradeReservation,
+    CounterTradeSkipReason, ExecutionError, Executor, FractionalShares, MarketOrder, Symbol,
+    TryIntoExecutor,
 };
 use st0x_raindex::{RaindexService, RaindexVaultId};
 use st0x_wrapper::WrapperService;
@@ -69,6 +70,7 @@ use crate::rebalancing::{
     RebalancingServiceConfig, to_wrapped_equities,
 };
 use crate::symbol::cache::SymbolCache;
+use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::telemetry::executor::InstrumentedExecutor;
 use crate::telemetry::rpc::RpcTelemetryLayer;
 use crate::telemetry::{TelemetrySender, spawn_dependency_call_writer};
@@ -223,6 +225,10 @@ async fn requeue_backfill_orphans(backfill_queue: &BackfillJobQueue) -> anyhow::
 }
 
 impl Conductor {
+    // Startup orchestration sequences every subsystem in one place; threading the
+    // rebalancer telemetry sender through `setup` tipped an already-200-line
+    // function over the limit. Splitting it would scatter the startup ordering.
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn run<E>(
         executor_ctx: impl TryIntoExecutor<Executor = E>,
         ctx: Ctx,
@@ -325,13 +331,16 @@ impl Conductor {
             transfer_usdc_to_market_making_ctx,
         } = PositionAndRebalancing::setup(
             rebalancing,
-            &ctx,
-            &pool,
-            inventory.clone(),
-            event_sender,
-            vault_registry.clone(),
-            vault_registry_projection,
-            schedulers.clone(),
+            RebalancingDeps {
+                pool: pool.clone(),
+                ctx: ctx.clone(),
+                inventory: inventory.clone(),
+                event_sender,
+                vault_registry: vault_registry.clone(),
+                vault_registry_projection,
+                schedulers: schedulers.clone(),
+                telemetry: telemetry.clone(),
+            },
         )
         .await?;
 
@@ -865,6 +874,7 @@ struct RebalancingDeps {
     vault_registry: Arc<Store<VaultRegistry>>,
     vault_registry_projection: Arc<Projection<VaultRegistry>>,
     schedulers: RebalancingSchedulers,
+    telemetry: TelemetrySender,
 }
 
 /// Position + rebalancing-adjacent infrastructure produced during conductor
@@ -893,41 +903,35 @@ struct PositionAndRebalancing {
 impl PositionAndRebalancing {
     async fn setup(
         rebalancing: Option<RebalancingCtx>,
-        ctx: &Ctx,
-        pool: &SqlitePool,
-        inventory: Arc<BroadcastingInventory>,
-        event_sender: broadcast::Sender<Statement>,
-        vault_registry: Arc<Store<VaultRegistry>>,
-        vault_registry_projection: Arc<Projection<VaultRegistry>>,
-        schedulers: RebalancingSchedulers,
+        deps: RebalancingDeps,
     ) -> anyhow::Result<Self> {
         if let Some(rebalancing_ctx) = rebalancing {
-            let wallet_ctx = ctx.wallet()?;
+            let wallet_ctx = deps.ctx.wallet()?;
             let ethereum_wallet = wallet_ctx.ethereum_wallet().clone();
             let base_wallet = wallet_ctx.base_wallet().clone();
+            let redemption_wallet = deps.ctx.redemption_wallet()?;
+
+            // Computed before `deps` is moved into the spawn call, since
+            // `WalletPollingCtx` below also needs the config behind `deps.ctx`.
+            let unwrapped_equity_token_addresses =
+                base_wallet_unwrapped_equity_token_addresses(&deps.ctx);
+            let wrapped_equity_token_addresses =
+                base_wallet_wrapped_equity_token_addresses(&deps.ctx);
 
             let infra = spawn_rebalancing_infrastructure(
                 rebalancing_ctx,
-                ctx.redemption_wallet()?,
+                redemption_wallet,
                 ethereum_wallet.clone(),
                 base_wallet.clone(),
-                RebalancingDeps {
-                    pool: pool.clone(),
-                    ctx: ctx.clone(),
-                    inventory: inventory.clone(),
-                    event_sender,
-                    vault_registry,
-                    vault_registry_projection,
-                    schedulers,
-                },
+                deps,
             )
             .await?;
 
             let wallet_polling = crate::inventory::WalletPollingCtx {
                 ethereum: Arc::new(ethereum_wallet),
                 base: Arc::new(base_wallet),
-                unwrapped_equity_token_addresses: base_wallet_unwrapped_equity_token_addresses(ctx),
-                wrapped_equity_token_addresses: base_wallet_wrapped_equity_token_addresses(ctx),
+                unwrapped_equity_token_addresses,
+                wrapped_equity_token_addresses,
             };
 
             Ok(Self {
@@ -948,8 +952,15 @@ impl PositionAndRebalancing {
                 transfer_usdc_to_market_making_ctx: Some(infra.transfer_usdc_to_market_making_ctx),
             })
         } else {
+            let RebalancingDeps {
+                pool,
+                inventory,
+                event_sender,
+                ..
+            } = deps;
+
             let broadcaster = Arc::new(Broadcaster::new(event_sender, pool.clone()));
-            let (position, position_projection) = build_position_cqrs(pool, broadcaster).await?;
+            let (position, position_projection) = build_position_cqrs(&pool, broadcaster).await?;
 
             // Without the service, the projection is the only subscriber
             // keeping the dashboard view in sync.
@@ -1145,17 +1156,26 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             alpaca_auth.api_secret.clone(),
         ));
 
+        // Build the broker here (not inside `RebalancerServices::new`) so it can
+        // be wrapped in the telemetry decorator before being threaded down. This
+        // mirrors how the hedge executor is wrapped in `Conductor::run` before
+        // use, so the rebalancer's Alpaca conversion calls emit broker dependency
+        // samples alongside the hedge path.
+        let broker = InstrumentedAlpacaBroker::new(
+            AlpacaBrokerApi::try_from_ctx(alpaca_auth.clone()).await?,
+            deps.telemetry.clone(),
+        );
+
         let services = RebalancerServices::new(
-            rebalancing_ctx.clone(),
-            alpaca_auth.clone(),
+            &rebalancing_ctx,
+            broker,
             Arc::clone(&alpaca_wallet),
-            deps.ctx.assets.equities.symbols.clone(),
+            &deps.ctx.assets.equities.symbols,
             ethereum_wallet,
             base_wallet,
             raindex_service,
             Arc::clone(&tokenizer),
-        )
-        .await?;
+        )?;
 
         let usdc_vault_id = deps
             .ctx
@@ -4519,13 +4539,16 @@ mod tests {
 
         let position_and_rebalancing = PositionAndRebalancing::setup(
             None,
-            &ctx,
-            &pool,
-            inventory,
-            event_sender,
-            vault_registry,
-            vault_registry_projection,
-            RebalancingSchedulers::new(&pool),
+            RebalancingDeps {
+                pool: pool.clone(),
+                ctx: ctx.clone(),
+                inventory,
+                event_sender,
+                vault_registry,
+                vault_registry_projection,
+                schedulers: RebalancingSchedulers::new(&pool),
+                telemetry: TelemetrySender::disabled(),
+            },
         )
         .await
         .unwrap();

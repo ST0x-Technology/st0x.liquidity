@@ -3,9 +3,10 @@
 //! Wraps the hedge broker executor once at conductor startup, so every hedge
 //! consumer cloning it (order placement, status polling, inventory polling,
 //! maintenance) emits dependency-call telemetry without knowing about it. The
-//! rebalancer builds its own broker handle and is not covered here. Lives in
-//! the main crate: the execution crate stays independent of the telemetry
-//! store.
+//! rebalancer's USDC conversion calls are timed by `InstrumentedAlpacaBroker`
+//! in `crate::telemetry::broker`; this decorator covers the generic `Executor`
+//! methods used on the hedge path. Lives in the main crate: the execution crate
+//! stays independent of the telemetry store.
 
 use std::time::{Duration, Instant};
 

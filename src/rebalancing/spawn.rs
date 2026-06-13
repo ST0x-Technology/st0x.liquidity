@@ -13,9 +13,7 @@ use st0x_bridge::cctp::{CctpBridge, CctpCtx, CctpError};
 use st0x_config::{EquityAssetConfig, RebalancingCtx};
 use st0x_event_sorcery::Store;
 use st0x_evm::Wallet;
-use st0x_execution::{
-    AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiError, EmptySymbolError, Executor, Symbol,
-};
+use st0x_execution::{EmptySymbolError, Symbol};
 use st0x_raindex::{RaindexService, RaindexVaultId};
 use st0x_wrapper::{WrappedEquity, WrapperService};
 
@@ -25,6 +23,7 @@ use super::{Rebalancer, TriggeredOperation};
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::equity_redemption::EquityRedemption;
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
+use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::tokenization::Tokenizer;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
@@ -33,8 +32,6 @@ use crate::vault_lookup::VaultLookup;
 /// Errors that can occur when spawning the rebalancer.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SpawnRebalancerError {
-    #[error("failed to create Alpaca broker API: {0}")]
-    AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
     #[error("failed to create CCTP bridge: {0}")]
     Cctp(#[from] Box<CctpError>),
     #[error("failed to create wrapper service: {0}")]
@@ -82,7 +79,7 @@ pub(crate) struct SpawnedRebalancer {
 /// Holds connections to Alpaca APIs, CCTP bridge, and vault services.
 /// Providers for both chains are obtained from the wallets on `RebalancingCtx`.
 pub(crate) struct RebalancerServices<Chain: Wallet> {
-    broker: Arc<AlpacaBrokerApi>,
+    broker: InstrumentedAlpacaBroker,
     wallet: Arc<AlpacaWalletService>,
     cctp: Arc<CctpBridge<Chain, Chain>>,
     raindex: Arc<RaindexService<Chain>>,
@@ -97,17 +94,16 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
     /// RaindexService is passed in rather than created here because it is
     /// needed for CQRS framework initialization in the conductor, which
     /// must happen before this constructor is called.
-    pub(crate) async fn new(
-        ctx: RebalancingCtx,
-        broker_auth: AlpacaBrokerApiCtx,
+    pub(crate) fn new(
+        ctx: &RebalancingCtx,
+        broker: InstrumentedAlpacaBroker,
         wallet: Arc<AlpacaWalletService>,
-        equities: HashMap<Symbol, EquityAssetConfig>,
+        equities: &HashMap<Symbol, EquityAssetConfig>,
         ethereum_wallet: Chain,
         base_wallet: Chain,
         raindex: Arc<RaindexService<Chain>>,
         tokenizer: Arc<dyn Tokenizer>,
     ) -> Result<Self, SpawnRebalancerError> {
-        let broker = Arc::new(AlpacaBrokerApi::try_from_ctx(broker_auth).await?);
         let attestation_retry_deadline = ctx.attestation_retry_deadline;
 
         let cctp = Arc::new(
@@ -128,7 +124,7 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
 
         let wrapper = Arc::new(WrapperService::new(
             base_wallet,
-            to_wrapped_equities(&equities),
+            to_wrapped_equities(equities),
         ));
 
         Ok(Self {
@@ -223,8 +219,8 @@ mod tests {
     use st0x_event_sorcery::test_store;
     use st0x_evm::local::RawPrivateKeyWallet;
     use st0x_execution::{
-        AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Symbol,
-        TimeInForce,
+        AlpacaAccountId, AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Executor,
+        FractionalShares, Symbol, TimeInForce,
     };
 
     use super::*;
@@ -233,6 +229,7 @@ mod tests {
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::RebalancingServiceConfig;
     use crate::rebalancing::equity::EquityTransferServices;
+    use crate::telemetry::TelemetrySender;
     use crate::tokenization::alpaca::AlpacaTokenizationService;
     use crate::tokenization::mock::MockTokenizer;
     use crate::vault_lookup::MockVaultLookup;
@@ -383,10 +380,11 @@ mod tests {
             time_in_force: TimeInForce::default(),
             counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
         };
-        let broker = Arc::new(
+        let broker = InstrumentedAlpacaBroker::new(
             AlpacaBrokerApi::try_from_ctx(broker_auth)
                 .await
                 .expect("Failed to create test broker API"),
+            TelemetrySender::disabled(),
         );
 
         let wallet = Arc::new(AlpacaWalletService::new(
@@ -428,37 +426,6 @@ mod tests {
         };
 
         (services, rebalancing_ctx)
-    }
-
-    #[tokio::test]
-    async fn broker_auth_failure_returns_spawn_error() {
-        let server = MockServer::start();
-
-        let _account_mock = server.mock(|when, then| {
-            when.method(GET).path_includes("/trading/accounts/");
-            then.status(401)
-                .header("content-type", "application/json")
-                .json_body(json!({"message": "Invalid API credentials"}));
-        });
-
-        let broker_auth = AlpacaBrokerApiCtx {
-            api_key: "invalid_key".to_string(),
-            api_secret: "invalid_secret".to_string(),
-            account_id: AlpacaAccountId::new(Uuid::nil()),
-            mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
-            asset_cache_ttl: std::time::Duration::from_secs(3600),
-            time_in_force: TimeInForce::default(),
-            counter_trade_slippage_bps: st0x_execution::DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS,
-        };
-
-        let spawn_error: SpawnRebalancerError = AlpacaBrokerApi::try_from_ctx(broker_auth)
-            .await
-            .unwrap_err()
-            .into();
-        assert!(
-            matches!(spawn_error, SpawnRebalancerError::AlpacaBrokerApi(_)),
-            "Expected AlpacaBrokerApi error variant, got: {spawn_error:?}"
-        );
     }
 
     #[tokio::test]
