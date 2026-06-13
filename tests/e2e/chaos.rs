@@ -27,6 +27,7 @@
 //! production code paths. Additional behaviours (drop, error, stall)
 //! land alongside the chaos sub-issues that need them.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,6 +53,12 @@ pub(crate) enum ChaosBehaviour {
     /// for `duration` before relaying it. Models a slow upstream node:
     /// the request is processed on time, only the answer is late.
     Delay { duration: Duration },
+    /// Merge the last non-empty result previously served for the same
+    /// event signature into the response. Models a load-balanced or
+    /// caching RPC node serving stale results that ignore the requested
+    /// block range -- the same logs are delivered again in a later poll
+    /// round, after the consumer's checkpoint has already advanced.
+    ReplayLogs,
 }
 
 /// Knob describing which method to perturb and for how many calls.
@@ -71,11 +78,17 @@ pub(crate) struct ChaosConfig {
 
 type SharedConfig = Arc<Mutex<Option<ChaosConfig>>>;
 
+/// Last non-empty `eth_getLogs` result served per event signature
+/// (`topics[0]` of the request filter), used by
+/// [`ChaosBehaviour::ReplayLogs`] to re-deliver stale logs.
+type LogsCache = Arc<Mutex<HashMap<String, Vec<Value>>>>;
+
 /// Axum handler state: the mutable chaos config plus what's needed to
 /// forward un-perturbed requests to the real Anvil node.
 #[derive(Clone)]
 struct ProxyState {
     config: SharedConfig,
+    logs_cache: LogsCache,
     upstream: Url,
     client: Client,
 }
@@ -106,6 +119,7 @@ impl ChaosProxy {
         let config: SharedConfig = Arc::new(Mutex::new(None));
         let state = ProxyState {
             config: config.clone(),
+            logs_cache: Arc::new(Mutex::new(HashMap::new())),
             upstream,
             client: Client::new(),
         };
@@ -160,6 +174,19 @@ impl ChaosProxy {
         *self.config.lock().await = Some(ChaosConfig {
             method: "eth_getTransactionReceipt".to_owned(),
             behaviour: ChaosBehaviour::Delay { duration },
+            remaining: count,
+            pending_stale_tips: 0,
+        });
+    }
+
+    /// Convenience: merge the last non-empty `eth_getLogs` result for
+    /// the same event signature into the next `count` `eth_getLogs`
+    /// responses, modelling a stale node re-serving logs the consumer
+    /// already ingested in an earlier poll round.
+    pub(crate) async fn replay_get_logs(&self, count: usize) {
+        *self.config.lock().await = Some(ChaosConfig {
+            method: "eth_getLogs".to_owned(),
+            behaviour: ChaosBehaviour::ReplayLogs,
             remaining: count,
             pending_stale_tips: 0,
         });
@@ -392,17 +419,26 @@ enum Perturbation {
     Synthesize(Value),
     /// Forward upstream, then hold the response for this long.
     DelayResponse(Duration),
+    /// Forward upstream, then merge previously-cached logs for the same
+    /// event signature into the response.
+    ReplayResponse,
 }
 
-/// Decide a single JSON-RPC request: synthesize or delay a perturbed
-/// response when the active chaos config matches, otherwise forward it
-/// upstream untouched.
+/// Decide a single JSON-RPC request: synthesize, delay, or replay a
+/// perturbed response when the active chaos config matches, otherwise
+/// forward it upstream untouched.
+///
+/// Every forwarded `eth_getLogs` response refreshes the per-signature
+/// logs cache so a later [`ChaosBehaviour::ReplayLogs`] arm has stale
+/// logs to re-serve.
 async fn process_one(state: &ProxyState, request: Value) -> Value {
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     let method = request
         .get("method")
         .and_then(Value::as_str)
         .map(str::to_owned);
+
+    let is_get_logs = method.as_deref() == Some("eth_getLogs");
 
     let perturbation = match method {
         Some(method) => perturb(state, &method, &id).await,
@@ -416,8 +452,98 @@ async fn process_one(state: &ProxyState, request: Value) -> Value {
             tokio::time::sleep(duration).await;
             response
         }
-        None => forward_or_rpc_error(state, &request, id).await,
+        Some(Perturbation::ReplayResponse) => {
+            let response = forward_or_rpc_error(state, &request, id).await;
+            replay_cached_logs(state, &request, response).await
+        }
+        None => {
+            let response = forward_or_rpc_error(state, &request, id).await;
+            if is_get_logs {
+                cache_get_logs_result(state, &request, &response).await;
+            }
+            response
+        }
     }
+}
+
+/// Extracts the request filter's event signature (`topics[0]`), the key
+/// under which `eth_getLogs` results are cached and replayed.
+fn filter_event_signature(request: &Value) -> Option<String> {
+    request["params"][0]["topics"][0]
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Refreshes the logs cache with this response's result when non-empty,
+/// keyed by the request filter's event signature.
+async fn cache_get_logs_result(state: &ProxyState, request: &Value, response: &Value) {
+    let Some(signature) = filter_event_signature(request) else {
+        return;
+    };
+
+    let Some(logs) = response["result"].as_array() else {
+        return;
+    };
+
+    if logs.is_empty() {
+        return;
+    }
+
+    state
+        .logs_cache
+        .lock()
+        .await
+        .insert(signature, logs.clone());
+}
+
+/// Merges the cached logs for the request's event signature into the
+/// response, skipping logs already present (matched by transaction hash
+/// and log index), then refreshes the cache with the original result.
+/// The merged response models a stale node re-serving logs from outside
+/// the requested block range.
+async fn replay_cached_logs(state: &ProxyState, request: &Value, mut response: Value) -> Value {
+    let Some(signature) = filter_event_signature(request) else {
+        return response;
+    };
+
+    let cached_logs = state.logs_cache.lock().await.get(&signature).cloned();
+
+    cache_get_logs_result(state, request, &response).await;
+
+    let Some(cached_logs) = cached_logs else {
+        warn!(
+            signature,
+            "ReplayLogs armed but no cached logs for this event signature; \
+             forwarding unmodified"
+        );
+        return response;
+    };
+
+    let Some(result) = response["result"].as_array_mut() else {
+        return response;
+    };
+
+    let log_key = |log: &Value| {
+        (
+            log["transactionHash"].as_str().map(str::to_owned),
+            log["logIndex"].as_str().map(str::to_owned),
+        )
+    };
+    let present: Vec<_> = result.iter().map(log_key).collect();
+
+    let replayed: Vec<Value> = cached_logs
+        .into_iter()
+        .filter(|log| !present.contains(&log_key(log)))
+        .collect();
+
+    warn!(
+        signature,
+        replayed = replayed.len(),
+        "ReplayLogs: re-serving stale logs alongside the live response"
+    );
+    result.extend(replayed);
+
+    response
 }
 
 /// Forwards one request upstream, shaping any transport failure into a
@@ -468,6 +594,10 @@ async fn perturb(state: &ProxyState, method: &str, id: &Value) -> Option<Perturb
                     ChaosBehaviour::Delay { duration } => {
                         cfg.remaining -= 1;
                         Some(Perturbation::DelayResponse(duration))
+                    }
+                    ChaosBehaviour::ReplayLogs => {
+                        cfg.remaining -= 1;
+                        Some(Perturbation::ReplayResponse)
                     }
                 }
             } else {
