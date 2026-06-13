@@ -14,7 +14,7 @@
 //!
 //! - [`simulate_failures`]: Same live simulation, but first creates stuck
 //!   mint and redemption rebalances where the local aggregate failed while
-//!   the mock provider later completed, so `recheck-transfer` can recover them.
+//!   the mock provider later completed, so `transfer recheck` can recover them.
 //!   Run via `nix run .#simulate-failures`.
 
 use std::collections::HashMap;
@@ -454,7 +454,7 @@ fn log_recheck_command(
     };
     let command = format!(
         "nix develop --command cargo run --features mock --bin cli -- \
-         --config {} --secrets {} recheck-transfer --type {} --id {}",
+         --config {} --secrets {} transfer recheck --kind {} --id {}",
         config_path.display(),
         secrets_path.display(),
         transfer_type_arg,
@@ -961,7 +961,7 @@ async fn simulate() -> anyhow::Result<()> {
 /// Failure-injection simulation: starts the full system, performs normal trades
 /// to create recoverable AAPL mint and TSLA redemption failures, then advances
 /// the mock issuer/provider to Completed. The dashboard should show the failed
-/// transfers until `recheck-transfer` recovers them.
+/// transfers until `transfer recheck` recovers them.
 ///
 /// Run via `nix run .#simulate-failures`. Set
 /// `SIMULATE_EXIT_AFTER_SELF_HEAL=1` when running under automated verification
@@ -1245,7 +1245,7 @@ async fn simulate_failures() -> anyhow::Result<()> {
         // `ProviderCompletionRecovered` is the terminal recovery event: the
         // redemption aggregate evolves straight to the `Completed` state from
         // it (no separate `Completed` event is ever written), so its presence
-        // is the end-to-end proof that recheck-transfer completed the redemption.
+        // is the end-to-end proof that transfer recheck completed the redemption.
         poll_for_events_with_timeout(
             &mut bot,
             &infra.db_path,
@@ -1255,7 +1255,7 @@ async fn simulate_failures() -> anyhow::Result<()> {
         )
         .await;
         info!(
-            "Recovery verified: recheck-transfer completed stuck mint and redemption rebalances."
+            "Recovery verified: transfer recheck completed stuck mint and redemption rebalances."
         );
         bot.abort();
         return Ok(());

@@ -229,7 +229,7 @@ describe('recoveryCommand', () => {
     expect(command).toEqual({
       mode: 'simulation',
       command:
-        'nix develop --command cargo run --features mock --bin cli -- --config /tmp/st0x-simulate-failures-8123.config.toml --secrets /tmp/st0x-simulate-failures-8123.secrets.toml recheck-transfer --type mint --id ISS001',
+        'nix develop --command cargo run --features mock --bin cli -- --config /tmp/st0x-simulate-failures-8123.config.toml --secrets /tmp/st0x-simulate-failures-8123.secrets.toml transfer recheck --kind mint --id ISS001',
     })
   })
 
@@ -240,7 +240,7 @@ describe('recoveryCommand', () => {
       kind: 'equity_redemption',
       id: 'RED001',
     })
-    expect(command?.command).toContain('recheck-transfer --type redemption --id RED001')
+    expect(command?.command).toContain('transfer recheck --kind redemption --id RED001')
   })
 
   it('builds the stox command for an equity mint on a live deployment', () => {
@@ -252,7 +252,7 @@ describe('recoveryCommand', () => {
     })
     expect(command).toEqual({
       mode: 'production',
-      command: 'stox recheck-transfer --type mint --id ISS001',
+      command: 'stox transfer recheck --kind mint --id ISS001',
     })
   })
 
@@ -265,7 +265,7 @@ describe('recoveryCommand', () => {
     })
     expect(command).toEqual({
       mode: 'production',
-      command: 'stox recheck-transfer --type redemption --id RED001',
+      command: 'stox transfer recheck --kind redemption --id RED001',
     })
   })
 

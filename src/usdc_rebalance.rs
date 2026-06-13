@@ -1010,8 +1010,8 @@ impl UsdcRebalance {
     }
 
     /// The rebalance direction, present in every non-initial state and invariant
-    /// across the whole lifecycle. Used by the CLI `resume-usdc-transfer` command
-    /// to validate the operator-supplied `--direction` against the persisted
+    /// across the whole lifecycle. Used by the CLI `transfer resume --kind usdc`
+    /// command to validate the operator-supplied `--direction` against the persisted
     /// transfer, so a wrong flag is rejected rather than mis-driving the aggregate
     /// through the opposite-direction resume path.
     ///

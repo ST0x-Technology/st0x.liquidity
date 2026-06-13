@@ -194,6 +194,5 @@ nix run .#simulate-failures
 ```
 
 The backend creates failed mint and redemption transfers whose mock Alpaca
-provider later completes, then prints the exact (legacy-named)
-`recheck-transfer` commands for that run's generated config, secrets, database,
-and mock API port.
+provider later completes, then prints the exact `transfer recheck` commands for
+that run's generated config, secrets, database, and mock API port.

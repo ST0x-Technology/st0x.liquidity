@@ -276,9 +276,7 @@ nix develop .#ci-backend -c cargo clippy --workspace --all-targets --all-feature
 system using [mprocs](https://github.com/pvolok/mprocs) to run the dashboard and
 the bot side-by-side. `nix run .#simulate-failures` starts the same stack, then
 creates failed mint and redemption rebalances whose mock Alpaca provider later
-completes and prints the (legacy-named) `recheck-transfer` commands that recover
-them; the printed hints move to the new names when the legacy aliases are
-deprecated.
+completes and prints the `transfer recheck` commands that recover them.
 
 What it does:
 
