@@ -189,6 +189,55 @@ pub(crate) async fn setup_test_db() -> SqlitePool {
     setup_test_pools().await.0
 }
 
+/// File-backed variant of [`setup_test_db`] with production-shaped pool
+/// options (WAL journal mode, explicit busy timeout). Needed by tests
+/// that inject SQLite lock contention: an in-memory database cannot be
+/// locked from a second connection, a file can. The `busy_timeout` is
+/// injectable so lock tests wait milliseconds instead of production's
+/// 10 seconds -- the code path under test (`SQLITE_BUSY` surfacing
+/// through the store) is identical, only the wait differs. The apalis
+/// worker pool (sqlx 0.8) is opened over the same file with the same
+/// scaled-down timeout so enqueue contention surfaces just as fast.
+///
+/// Returns the CQRS pool, the apalis worker pool, the database file path
+/// (for opening contending connections), and the tempdir guard keeping
+/// the file alive.
+pub(crate) async fn setup_file_backed_test_db(
+    busy_timeout: std::time::Duration,
+) -> (
+    SqlitePool,
+    apalis_sqlite::SqlitePool,
+    std::path::PathBuf,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.sqlite");
+
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&db_path)
+        .create_if_missing(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .busy_timeout(busy_timeout);
+    let pool = SqlitePool::connect_with(options).await.unwrap();
+
+    sqlx::migrate!().run(&pool).await.unwrap();
+
+    let apalis_options = sqlx_apalis::sqlite::SqliteConnectOptions::new()
+        .filename(&db_path)
+        .create_if_missing(true)
+        .journal_mode(sqlx_apalis::sqlite::SqliteJournalMode::Wal)
+        .busy_timeout(busy_timeout);
+    let apalis_pool = apalis_sqlite::SqlitePool::connect_with(apalis_options)
+        .await
+        .unwrap();
+
+    crate::conductor::setup_apalis_tables(&apalis_pool)
+        .await
+        .unwrap();
+
+    (pool, apalis_pool, db_path, dir)
+}
+
 /// Shared constructor for positive share quantities in tests.
 pub(crate) fn positive_shares(value: &str) -> Positive<FractionalShares> {
     Positive::new(FractionalShares::new(
