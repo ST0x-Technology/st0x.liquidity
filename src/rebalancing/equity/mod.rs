@@ -2331,7 +2331,7 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             transfer.resume_equity_to_hedging(
-                &RedemptionAggregateId::new("redeem-workflow"),
+                &redemption_aggregate_id("redeem-workflow"),
                 &Symbol::new("TEST").unwrap(),
                 FractionalShares::new(float!(50)),
             ),
@@ -2352,7 +2352,7 @@ mod tests {
 
         let error = transfer
             .resume_equity_to_hedging(
-                &RedemptionAggregateId::new("redeem-detection-timeout"),
+                &redemption_aggregate_id("redeem-detection-timeout"),
                 &Symbol::new("TEST").unwrap(),
                 FractionalShares::new(float!(50)),
             )
@@ -2376,7 +2376,7 @@ mod tests {
 
         let error = transfer
             .resume_equity_to_hedging(
-                &RedemptionAggregateId::new("redeem-detection-api-error"),
+                &redemption_aggregate_id("redeem-detection-api-error"),
                 &Symbol::new("TEST").unwrap(),
                 FractionalShares::new(float!(50)),
             )
@@ -2403,7 +2403,7 @@ mod tests {
 
         let error = transfer
             .resume_equity_to_hedging(
-                &RedemptionAggregateId::new("redeem-completion-rejected"),
+                &redemption_aggregate_id("redeem-completion-rejected"),
                 &Symbol::new("TEST").unwrap(),
                 FractionalShares::new(float!(50)),
             )
@@ -2430,7 +2430,7 @@ mod tests {
 
         let error = transfer
             .resume_equity_to_hedging(
-                &RedemptionAggregateId::new("redeem-pending-status"),
+                &redemption_aggregate_id("redeem-pending-status"),
                 &Symbol::new("TEST").unwrap(),
                 FractionalShares::new(float!(50)),
             )

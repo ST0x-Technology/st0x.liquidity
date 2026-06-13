@@ -177,7 +177,7 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
         TransferDirection::ToAlpaca => {
             writeln!(stdout, "   Sending tokens for redemption...")?;
 
-            let aggregate_id = RedemptionAggregateId::new(Uuid::new_v4().to_string());
+            let aggregate_id = RedemptionAggregateId::generate();
             equity_transfer
                 .resume_equity_to_hedging(&aggregate_id, symbol, quantity)
                 .await?;

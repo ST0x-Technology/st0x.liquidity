@@ -2744,7 +2744,7 @@ impl RebalancingService {
             }
         }
 
-        let aggregate_id = RedemptionAggregateId::new(Uuid::new_v4().to_string());
+        let aggregate_id = RedemptionAggregateId::generate();
 
         let push = queue
             .push(TransferEquityToHedging {
