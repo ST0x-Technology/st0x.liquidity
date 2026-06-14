@@ -304,11 +304,14 @@ Workspace crates:
 
 - **`st0x-hedge`** (root) - Main arbitrage bot: event loop, CQRS/ES aggregates,
   conductor, dashboard backend, and CLI
+- **`st0x-config`** (`crates/config/`) - TOML/secrets loading,
+  `Ctx`/`BrokerCtx`/`Env` assembly, and `setup_tracing`. Restricted: only
+  `st0x-server` and `st0x-cli` may depend on it
 - **`st0x-dto`** (`crates/dto/`) - Dashboard DTOs and TypeScript binding
   generation
-- **`st0x-event-sorcery`** (`crates/event-sorcery/`) - CQRS/event-sourcing
-  helpers, snapshot-backed loading, compactable observational event streams, and
-  testing utilities
+- **`st0x-event-sorcery`** (external git dep) - CQRS/event-sourcing helpers,
+  snapshot-backed loading, compactable observational event streams, and testing
+  utilities
 - **`st0x-execution`** (`crates/execution/`) - Standalone `Executor` trait
   abstraction with Alpaca Broker API and mock implementations
 - **`st0x-bridge`** (`crates/bridge/`) - Cross-chain bridge abstractions and
@@ -320,6 +323,10 @@ Workspace crates:
   and serde helpers for workspace wire formats
 - **`st0x-float-macro`** (`crates/float-macro/`) - Proc-macro for compile-time
   `Float` literals (`float!(1.5)`)
+- **`st0x-raindex`** (`crates/raindex/`) - Raindex orderbook vault
+  deposit/withdraw operations and vault registry seeding
+- **`st0x-wrapper`** (`crates/wrapper/`) - ERC-4626 wrap/unwrap operations and
+  ratio math
 
 ### Infrastructure
 
