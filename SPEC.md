@@ -2797,19 +2797,25 @@ that fails after the CCTP burn holds the rebalancing guard, blocking further
 USDC rebalancing. Because the burned/minted USDC was handled out-of-band, this
 is reconciled rather than re-driven: the `reconcile-usdc-transfer` CLI command
 sends `ReconcileStuckRebalance`, which emits `OperatorReconciled` and drives the
-aggregate to a new clearing terminal state, `Reconciled`. The reactor then
-clears the in-progress guard, removes tracking, and reconciles source-venue
-inflight with **post-burn semantics** -- it zeroes the source-venue inflight
-WITHOUT crediting `available`, because the funds already left the source venue
-(it is NOT a cancel, which would wrongly credit available). The command is valid
-ONLY from a post-burn terminal failure that strands the guard: `DepositFailed`
-(the CCTP mint landed but the destination deposit failed), a post-burn
-`BridgingFailed` (a `burn_tx_hash` or `cctp_nonce` is recorded), or a
-`BaseToAlpaca` `ConversionFailed` (the post-deposit USDC->USD leg). Every other
-state is rejected -- an in-progress transfer must be resumed, and a pre-burn
-failure already reconciles to source on its own. Because `Reconciled` is a
-clearable terminal, a restart does not re-latch the guard, and automatic USDC
-rebalancing resumes.
+aggregate to a new clearing terminal state, `Reconciled`. The in-progress guard
+then clears via one of two paths: (1) the live reactor processes
+`OperatorReconciled` directly (if the server itself ran the store command) and
+clears the guard, tracking, and source-venue inflight immediately; or (2) the
+CLI ran in a separate process, so the live reactor never sees the event -- in
+that case the periodic timeout sweep re-derives the durable state on its next
+tick (within `transfer_timeout`), finds `Reconciled`, applies the source-venue
+inflight reconciliation with **post-burn semantics** (zeroing source-venue
+inflight WITHOUT crediting `available`, because the funds already left the
+source venue -- it is NOT a cancel, which would wrongly credit available), and
+clears the guard. No restart is required. The command is valid ONLY from a
+post-burn terminal failure that strands the guard: `DepositFailed` (the CCTP
+mint landed but the destination deposit failed), a post-burn `BridgingFailed` (a
+`burn_tx_hash` or `cctp_nonce` is recorded), or a `BaseToAlpaca`
+`ConversionFailed` (the post-deposit USDC->USD leg). Every other state is
+rejected -- an in-progress transfer must be resumed, and a pre-burn failure
+already reconciles to source on its own. Because `Reconciled` is a clearable
+terminal, a restart does not re-latch the guard, and automatic USDC rebalancing
+resumes.
 
 ##### Manual Reconciliation Required
 

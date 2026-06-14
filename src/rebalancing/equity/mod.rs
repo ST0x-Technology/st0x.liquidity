@@ -1567,6 +1567,7 @@ mod tests {
     use crate::tokenization::mock::{
         MockCompletionOutcome, MockDetectionOutcome, MockTokenizer, MockVerificationOutcome,
     };
+    use crate::usdc_rebalance::UsdcRebalance;
     use crate::vault_lookup::MockVaultLookup;
     use crate::vault_registry::VaultRegistry;
 
@@ -1738,7 +1739,11 @@ mod tests {
             .await
             .unwrap();
         service
-            .set_stores(mint_store.clone(), redemption_store.clone())
+            .set_stores(
+                mint_store.clone(),
+                redemption_store.clone(),
+                Arc::new(test_store::<UsdcRebalance>(pool.clone(), ())),
+            )
             .await;
 
         // The provider reports the request settled: get_request must find a
@@ -1880,7 +1885,11 @@ mod tests {
             .await
             .unwrap();
         service
-            .set_stores(mint_store.clone(), redemption_store.clone())
+            .set_stores(
+                mint_store.clone(),
+                redemption_store.clone(),
+                Arc::new(test_store::<UsdcRebalance>(pool.clone(), ())),
+            )
             .await;
 
         let mut completed_request = TokenizationRequest::mock_completed();

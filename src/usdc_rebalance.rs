@@ -1041,6 +1041,107 @@ impl UsdcRebalance {
             | Self::Reconciled { direction, .. } => direction.clone(),
         }
     }
+
+    /// Returns the data needed to reconstruct an in-memory tracking entry
+    /// during startup guard recovery.
+    ///
+    /// Returns `Some((direction, amount, last_progress_at))` for the three
+    /// manually-reconcilable guard-holding terminal states that cannot
+    /// self-recover via the reactor/apalis:
+    ///
+    /// - `DepositFailed` (any direction): post-burn/post-mint; no recovery
+    ///   path.
+    /// - `ConversionFailed { direction: BaseToAlpaca }`: the post-deposit
+    ///   USDC->USD conversion leg; post-mint, no apalis re-arm.
+    /// - `BridgingFailed { direction: AlpacaToBase, burn_tx_hash: Some }`:
+    ///   post-burn, no recovery job (only `BaseToAlpaca` is re-armed on
+    ///   startup via `resumable_post_burn_transfer`).
+    ///
+    /// All three are accepted by `transition_reconcile_stuck_rebalance` (the
+    /// CLI `reconcile-usdc-transfer` target), hold the guard on restart
+    /// (`holds_rebalance_guard` returns `true`), and are NOT auto-re-armed:
+    /// without a tracking seed the sweep has no entry to iterate and the guard
+    /// stays latched forever after a CLI reconcile.
+    ///
+    /// All other states return `None`:
+    /// - Guard-holding in-progress states self-recover via the reactor/apalis
+    ///   once resumed; seeding tracking would wedge their `DepositConfirmed`
+    ///   path (which requires `bridged_amount_received`) and corrupt inflight
+    ///   accounting.
+    /// - `BridgingFailed { direction: BaseToAlpaca, burn_tx_hash: Some }` is
+    ///   resumable and re-armed by `recover_usdc_guard` via
+    ///   `resumable_post_burn_transfer`; seeding it would wedge the re-armed
+    ///   job's `DepositConfirmed` path.
+    /// - Non-guard-holding terminal states are skipped entirely by the caller.
+    ///
+    /// `recover_usdc_guard` still re-latches the guard for all guard-holding
+    /// states; only the tracking seed is narrowed here.
+    pub(crate) fn guard_recovery_tracking_data(
+        &self,
+    ) -> Option<(RebalanceDirection, Usdc, DateTime<Utc>)> {
+        match self {
+            // The three manually-reconcilable guard-holding terminal states
+            // that cannot self-recover via the reactor/apalis:
+            //  - DepositFailed (any direction): post-burn/post-mint.
+            //  - ConversionFailed(BaseToAlpaca): post-deposit USDC->USD leg,
+            //    post-mint, no apalis re-arm.
+            //  - BridgingFailed(AlpacaToBase, burn_tx=Some): post-burn; only
+            //    BaseToAlpaca BridgingFailed is re-armed on startup by
+            //    `resumable_post_burn_transfer`; AlpacaToBase has no recovery
+            //    path and requires CLI reconciliation.
+            Self::DepositFailed {
+                direction,
+                amount,
+                failed_at,
+                ..
+            }
+            | Self::ConversionFailed {
+                direction: direction @ RebalanceDirection::BaseToAlpaca,
+                amount,
+                failed_at,
+                ..
+            }
+            | Self::BridgingFailed {
+                direction: direction @ RebalanceDirection::AlpacaToBase,
+                amount,
+                burn_tx_hash: Some(_),
+                failed_at,
+                ..
+            } => Some((direction.clone(), *amount, *failed_at)),
+            // Guard-holding in-progress states: self-recover via
+            // reactor/apalis once resumed; seeding would wedge
+            // `DepositConfirmed`.
+            Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::WithdrawalSubmitting { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalComplete { .. }
+            | Self::BridgingSubmitting { .. }
+            | Self::Bridging { .. }
+            | Self::AwaitingAttestation { .. }
+            | Self::Attested { .. }
+            | Self::Bridged { .. }
+            | Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            // ConversionFailed(AlpacaToBase) is pre-withdrawal (pre-burn),
+            // not guard-holding; caller skips it.
+            | Self::ConversionFailed { direction: RebalanceDirection::AlpacaToBase, .. }
+            // BridgingFailed(BaseToAlpaca, burn_tx=Some): resumable, re-armed
+            // by recover_usdc_guard; seeding would wedge its DepositConfirmed
+            // path.
+            | Self::BridgingFailed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                burn_tx_hash: Some(_),
+                ..
+            }
+            // BridgingFailed(burn_tx=None): pre-burn, not guard-holding;
+            // caller skips it. cctp_nonce-only case also not guard-holding.
+            | Self::BridgingFailed { burn_tx_hash: None, .. }
+            // Non-guard-holding terminals: no seeding needed.
+            | Self::WithdrawalFailed { .. }
+            | Self::Reconciled { .. } => None,
+        }
+    }
 }
 
 /// Candidate `UsdcRebalance` aggregates whose latest event leaves them
@@ -7062,6 +7163,349 @@ mod tests {
                 failed_at: now,
             }
             .holds_rebalance_guard()
+        );
+    }
+
+    /// The three manually-reconcilable guard-holding terminal states return
+    /// `Some((direction, amount, failed_at))`: `DepositFailed` (any
+    /// direction), `ConversionFailed(BaseToAlpaca)`, and
+    /// `BridgingFailed(AlpacaToBase, burn_tx=Some)`.
+    #[test]
+    fn guard_recovery_tracking_data_returns_some_for_manually_reconcilable_states() {
+        use RebalanceDirection::{AlpacaToBase, BaseToAlpaca};
+        use UsdcRebalance::*;
+
+        let now = Utc::now();
+        let amount = Usdc::new(float!(400.0));
+        let withdrawal_ref = TransferRef::OnchainTx(BURN_TX);
+
+        let deposit_failed_bta = DepositFailed {
+            direction: BaseToAlpaca,
+            amount,
+            burn_tx_hash: BURN_TX,
+            mint_tx_hash: MINT_TX,
+            deposit_ref: Some(withdrawal_ref.clone()),
+            reason: "deposit rejected".to_string(),
+            initiated_at: now,
+            failed_at: now,
+        };
+        let Some((direction, tracked_amount, last_progress_at)) =
+            deposit_failed_bta.guard_recovery_tracking_data()
+        else {
+            panic!("expected Some for DepositFailed(BaseToAlpaca)");
+        };
+        assert_eq!(direction, BaseToAlpaca, "DepositFailed(BtA): direction");
+        assert_eq!(tracked_amount, amount, "DepositFailed(BtA): amount");
+        assert_eq!(last_progress_at, now, "DepositFailed(BtA): timestamp");
+
+        let deposit_failed_atb = DepositFailed {
+            direction: AlpacaToBase,
+            amount,
+            burn_tx_hash: BURN_TX,
+            mint_tx_hash: MINT_TX,
+            deposit_ref: Some(withdrawal_ref),
+            reason: "deposit rejected".to_string(),
+            initiated_at: now,
+            failed_at: now,
+        };
+        let Some((direction, tracked_amount, last_progress_at)) =
+            deposit_failed_atb.guard_recovery_tracking_data()
+        else {
+            panic!("expected Some for DepositFailed(AlpacaToBase)");
+        };
+        assert_eq!(direction, AlpacaToBase, "DepositFailed(AtB): direction");
+        assert_eq!(tracked_amount, amount, "DepositFailed(AtB): amount");
+        assert_eq!(last_progress_at, now, "DepositFailed(AtB): timestamp");
+
+        let conversion_failed_bta = ConversionFailed {
+            direction: BaseToAlpaca,
+            amount,
+            order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            reason: "order rejected".to_string(),
+            initiated_at: now,
+            failed_at: now,
+        };
+        let Some((direction, tracked_amount, last_progress_at)) =
+            conversion_failed_bta.guard_recovery_tracking_data()
+        else {
+            panic!("expected Some for ConversionFailed(BaseToAlpaca)");
+        };
+        assert_eq!(direction, BaseToAlpaca, "ConversionFailed(BtA): direction");
+        assert_eq!(tracked_amount, amount, "ConversionFailed(BtA): amount");
+        assert_eq!(last_progress_at, now, "ConversionFailed(BtA): timestamp");
+
+        let bridging_failed_atb = BridgingFailed {
+            direction: AlpacaToBase,
+            amount,
+            burn_tx_hash: Some(BURN_TX),
+            cctp_nonce: None,
+            reason: "unrecoverable".to_string(),
+            initiated_at: now,
+            failed_at: now,
+        };
+        let Some((direction, tracked_amount, last_progress_at)) =
+            bridging_failed_atb.guard_recovery_tracking_data()
+        else {
+            panic!("expected Some for BridgingFailed(AlpacaToBase, burn_tx=Some)");
+        };
+        assert_eq!(direction, AlpacaToBase, "BridgingFailed(AtB): direction");
+        assert_eq!(tracked_amount, amount, "BridgingFailed(AtB): amount");
+        assert_eq!(last_progress_at, now, "BridgingFailed(AtB): timestamp");
+    }
+
+    /// All other states return `None`: guard-holding in-progress states
+    /// (self-recover via reactor/apalis), the resumable
+    /// `BridgingFailed(BaseToAlpaca, burn_tx=Some)` (re-armed on startup),
+    /// pre-burn failures, and non-guard-holding terminals.
+    // Each assert is a single trivial `None` check for a distinct enum variant.
+    // Splitting into sub-functions would just move the line count elsewhere
+    // without improving readability; the exhaustive flat sequence is the point.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn guard_recovery_tracking_data_returns_none_for_self_recovering_and_terminal_states() {
+        use RebalanceDirection::{AlpacaToBase, BaseToAlpaca};
+        use UsdcRebalance::*;
+
+        let now = Utc::now();
+        let amount = Usdc::new(float!(400.0));
+        let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
+        let withdrawal_ref = TransferRef::OnchainTx(BURN_TX);
+
+        // Guard-holding in-progress states: self-recover via reactor/apalis.
+        assert_eq!(
+            Converting {
+                direction: AlpacaToBase,
+                amount,
+                order_id: order_id.clone(),
+                initiated_at: now,
+            }
+            .guard_recovery_tracking_data(),
+            None,
+            "Converting(AlpacaToBase) must return None"
+        );
+        assert_eq!(
+            Converting {
+                direction: BaseToAlpaca,
+                amount,
+                order_id: order_id.clone(),
+                initiated_at: now,
+            }
+            .guard_recovery_tracking_data(),
+            None,
+            "Converting(BaseToAlpaca) must return None"
+        );
+        assert_eq!(
+            Withdrawing {
+                direction: BaseToAlpaca,
+                amount,
+                withdrawal_ref: withdrawal_ref.clone(),
+                initiated_at: now,
+            }
+            .guard_recovery_tracking_data(),
+            None,
+            "Withdrawing must return None"
+        );
+        assert_eq!(
+            Bridging {
+                direction: BaseToAlpaca,
+                amount,
+                burn_tx_hash: BURN_TX,
+                initiated_at: now,
+                burned_at: now,
+            }
+            .guard_recovery_tracking_data(),
+            None,
+            "Bridging must return None"
+        );
+        assert_eq!(
+            Bridged {
+                direction: BaseToAlpaca,
+                amount,
+                amount_received: amount,
+                fee_collected: Usdc::new(float!(0.0)),
+                burn_tx_hash: BURN_TX,
+                mint_tx_hash: MINT_TX,
+                initiated_at: now,
+                minted_at: now,
+            }
+            .guard_recovery_tracking_data(),
+            None,
+            "Bridged must return None"
+        );
+        assert_eq!(
+            DepositInitiated {
+                direction: AlpacaToBase,
+                amount,
+                burn_tx_hash: BURN_TX,
+                mint_tx_hash: MINT_TX,
+                deposit_ref: withdrawal_ref.clone(),
+                initiated_at: now,
+                deposit_initiated_at: now,
+            }
+            .guard_recovery_tracking_data(),
+            None,
+            "DepositInitiated must return None"
+        );
+        assert_eq!(
+            DepositConfirmed {
+                direction: BaseToAlpaca,
+                amount,
+                burn_tx_hash: BURN_TX,
+                mint_tx_hash: MINT_TX,
+                initiated_at: now,
+                deposit_confirmed_at: now,
+            }
+            .guard_recovery_tracking_data(),
+            None,
+            "DepositConfirmed(BaseToAlpaca) must return None"
+        );
+        // ConversionFailed(AlpacaToBase): pre-withdrawal leg, not guard-holding.
+        assert_eq!(
+            ConversionFailed {
+                direction: AlpacaToBase,
+                amount,
+                order_id,
+                reason: "x".to_string(),
+                initiated_at: now,
+                failed_at: now,
+            }
+            .guard_recovery_tracking_data(),
+            None,
+            "ConversionFailed(AlpacaToBase) must return None (pre-burn)"
+        );
+        // BridgingFailed(BaseToAlpaca, burn_tx=Some): resumable, re-armed on
+        // startup; seeding would wedge its DepositConfirmed path.
+        assert_eq!(
+            BridgingFailed {
+                direction: BaseToAlpaca,
+                amount,
+                burn_tx_hash: Some(BURN_TX),
+                cctp_nonce: None,
+                reason: "transient".to_string(),
+                initiated_at: now,
+                failed_at: now,
+            }
+            .guard_recovery_tracking_data(),
+            None,
+            "BridgingFailed(BaseToAlpaca, burn_tx=Some) must return None (resumable)"
+        );
+        // BridgingFailed(burn_tx=None): pre-burn, not guard-holding.
+        assert_eq!(
+            BridgingFailed {
+                direction: BaseToAlpaca,
+                amount,
+                burn_tx_hash: None,
+                cctp_nonce: None,
+                reason: "pre-burn fail".to_string(),
+                initiated_at: now,
+                failed_at: now,
+            }
+            .guard_recovery_tracking_data(),
+            None,
+            "BridgingFailed(burn_tx=None) must return None (pre-burn)"
+        );
+        // Guard-holding in-progress states not yet tested: these must all
+        // return None because they self-recover via apalis; seeding them would
+        // wedge their DepositConfirmed path.
+        assert_eq!(
+            ConversionComplete {
+                direction: BaseToAlpaca,
+                amount,
+                filled_amount: amount,
+                initiated_at: now,
+                converted_at: now,
+            }
+            .guard_recovery_tracking_data(),
+            None,
+            "ConversionComplete must return None (self-recovering)"
+        );
+        assert_eq!(
+            WithdrawalSubmitting {
+                direction: BaseToAlpaca,
+                amount,
+                from_block: 1,
+                initiated_at: now,
+            }
+            .guard_recovery_tracking_data(),
+            None,
+            "WithdrawalSubmitting must return None (self-recovering)"
+        );
+        assert_eq!(
+            WithdrawalComplete {
+                direction: BaseToAlpaca,
+                amount,
+                initiated_at: now,
+                confirmed_at: now,
+            }
+            .guard_recovery_tracking_data(),
+            None,
+            "WithdrawalComplete must return None (self-recovering)"
+        );
+        assert_eq!(
+            BridgingSubmitting {
+                direction: BaseToAlpaca,
+                amount,
+                from_block: 1,
+                initiated_at: now,
+            }
+            .guard_recovery_tracking_data(),
+            None,
+            "BridgingSubmitting must return None (self-recovering)"
+        );
+        assert_eq!(
+            AwaitingAttestation {
+                direction: BaseToAlpaca,
+                amount,
+                burn_tx_hash: BURN_TX,
+                initiated_at: now,
+                timed_out_at: now,
+                retry_deadline_at: now,
+            }
+            .guard_recovery_tracking_data(),
+            None,
+            "AwaitingAttestation must return None (self-recovering)"
+        );
+        assert_eq!(
+            Attested {
+                direction: BaseToAlpaca,
+                amount,
+                burn_tx_hash: BURN_TX,
+                cctp_nonce: alloy::primitives::B256::ZERO,
+                attestation: vec![],
+                message: None,
+                mint_scan_from_block: None,
+                initiated_at: now,
+                attested_at: now,
+            }
+            .guard_recovery_tracking_data(),
+            None,
+            "Attested must return None (self-recovering)"
+        );
+        // Non-guard-holding terminal states.
+        assert_eq!(
+            Reconciled {
+                direction: BaseToAlpaca,
+                amount,
+                reason: ReconcileReason::FundsMovedManually,
+                initiated_at: now,
+                reconciled_at: now,
+            }
+            .guard_recovery_tracking_data(),
+            None,
+            "Reconciled must return None"
+        );
+        assert_eq!(
+            WithdrawalFailed {
+                direction: BaseToAlpaca,
+                amount,
+                withdrawal_ref,
+                reason: "x".to_string(),
+                initiated_at: now,
+                failed_at: now,
+            }
+            .guard_recovery_tracking_data(),
+            None,
+            "WithdrawalFailed must return None"
         );
     }
 

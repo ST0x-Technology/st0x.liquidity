@@ -757,7 +757,14 @@ impl RebalancingService {
     /// `available` unchanged, because the funds physically left the source.
     /// Derives the source venue from `direction` via the shared `source_venue`
     /// mapping so it does not depend on in-memory tracking, which may be absent
-    /// after a restart.
+    /// after a restart. Called by the `OperatorReconciled` reactor arm in this
+    /// file to apply the inflight side-effect when the live reactor processes
+    /// the event.
+    ///
+    /// The timeout sweep in `mod.rs` does NOT call this function: it inlines
+    /// `clear_usdc_inflight + clear_active_usdc_rebalance` in a single lock
+    /// acquisition to avoid a transient state where inflight is zeroed but the
+    /// active rebalance is still set.
     async fn reconcile_operator_resolved(
         &self,
         direction: &RebalanceDirection,
