@@ -802,18 +802,39 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
                 direction: BaseToAlpaca,
             }),
 
-            // `WithdrawalSubmitting`/`BridgingSubmitting` are crash-safe
-            // submission states produced only by the Base->Alpaca flow (on-chain
-            // vault withdrawal and burn-on-Base). The Alpaca->Base flow withdraws
-            // off-chain and burns via `InitiateBridging` straight to `Bridging`,
-            // so it never enters these states -- reaching one here means the
-            // aggregate belongs to the other direction.
-            Some(WithdrawalSubmitting { direction, .. } | BridgingSubmitting { direction, .. }) => {
-                Err(UsdcTransferError::ResumeDirectionMismatch {
-                    id: id.clone(),
-                    direction,
-                })
+            // `BridgingSubmitting` for AlpacaToBase: a crash occurred after
+            // `BeginBridging` (durable intent) but before `InitiateBridging`
+            // (burn recorded). Scan Ethereum for an already-submitted burn to
+            // avoid a double-burn, then continue the bridge.
+            Some(BridgingSubmitting {
+                direction: AlpacaToBase,
+                amount,
+                from_block,
+                ..
+            }) => {
+                let amount_u256 = usdc_to_u256(amount)?;
+                let burn_receipt = self
+                    .resume_bridging_submitting_ethereum(id, amount_u256, from_block)
+                    .await?;
+                self.continue_alpaca_to_base_from_bridging(id, amount, burn_receipt.tx)
+                    .await
             }
+
+            // `WithdrawalSubmitting` is produced only by the BaseToAlpaca flow
+            // (on-chain vault withdrawal). `BridgingSubmitting { direction:
+            // BaseToAlpaca }` is produced only by the BaseToAlpaca burn-on-Base
+            // path. Reaching either here means the aggregate belongs to the
+            // other direction.
+            Some(
+                WithdrawalSubmitting { direction, .. }
+                | BridgingSubmitting {
+                    direction: direction @ BaseToAlpaca,
+                    ..
+                },
+            ) => Err(UsdcTransferError::ResumeDirectionMismatch {
+                id: id.clone(),
+                direction,
+            }),
 
             Some(
                 WithdrawalFailed { .. }
@@ -922,7 +943,31 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
         // is a cheap additional sanity check.
         self.check_ethereum_usdc_balance(id, burn_amount).await?;
 
-        let burn_receipt = self.execute_cctp_burn(id, burn_amount).await?;
+        // Derive the burn-scan lower bound from this rebalance's confirmed
+        // withdrawal tx block when available: the burn lands in a strictly later
+        // block than the deposit (find_recent_burn uses block > from_block), so
+        // the withdrawal block is a valid exclusive lower bound that excludes
+        // any identical burn from a prior rebalance. When no tx hash was
+        // returned by Alpaca, fall back to the raw chain head (residual
+        // risk: a stale RPC head could include a prior burn; operators must
+        // reconcile if two rebalances produce the same scan fingerprint).
+        let burn_from_block = if let Some(tx) = withdrawal_tx {
+            Some(
+                self.cctp_bridge
+                    .ethereum_tx_block(tx)
+                    .await
+                    .map_err(|error| UsdcTransferError::SettlementCheckTransient {
+                        id: id.clone(),
+                        source: Box::new(error),
+                    })?,
+            )
+        } else {
+            None
+        };
+
+        let burn_receipt = self
+            .execute_cctp_burn_on_ethereum(id, burn_amount, burn_from_block)
+            .await?;
 
         self.continue_alpaca_to_base_from_bridging(id, amount, burn_receipt.tx)
             .await
@@ -2509,46 +2554,114 @@ impl<Chain: Wallet> CrossVenueCashTransfer<Chain> {
         Ok(burn_receipt)
     }
 
-    async fn execute_cctp_burn(
+    /// Emits `BeginBridging` (durable intent), burns on Ethereum, then records
+    /// the burn. A crash after `BeginBridging` but before `InitiateBridging`
+    /// lands the aggregate at `BridgingSubmitting`, from which
+    /// `resume_bridging_submitting_ethereum` scans for the burn instead of
+    /// re-burning.
+    ///
+    /// `burn_from_block`: when `Some`, uses the caller-supplied block as the
+    /// scan lower bound (derived from this rebalance's confirmed withdrawal tx
+    /// block, which strictly precedes any burn for this rebalance). When
+    /// `None`, falls back to `source_block(EthereumToBase)` (residual risk:
+    /// a stale RPC head could include a prior identical burn; reconcile
+    /// manually if two rebalances share the same scan fingerprint).
+    async fn execute_cctp_burn_on_ethereum(
         &self,
         id: &UsdcRebalanceId,
         amount: U256,
+        burn_from_block: Option<u64>,
+    ) -> Result<BurnReceipt, UsdcTransferError> {
+        let from_block = match burn_from_block {
+            Some(block) => block,
+            None => self
+                .cctp_bridge
+                .source_block(BridgeDirection::EthereumToBase)
+                .await
+                .map_err(|error| UsdcTransferError::SettlementCheckTransient {
+                    id: id.clone(),
+                    source: Box::new(error),
+                })?,
+        };
+        self.cqrs
+            .send(id, UsdcRebalanceCommand::BeginBridging { from_block })
+            .await?;
+
+        let burn_receipt = self.burn_on_ethereum(amount).await?;
+        self.record_cctp_burn(id, burn_receipt).await
+    }
+
+    /// Resumes a transfer stalled at `BridgingSubmitting` (AlpacaToBase direction):
+    /// scans Ethereum for an already-submitted burn (adopting it to avoid a
+    /// double-burn) and otherwise issues the burn, then records it.
+    async fn resume_bridging_submitting_ethereum(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: U256,
+        from_block: u64,
     ) -> Result<BurnReceipt, UsdcTransferError> {
         let burn_receipt = match self
             .cctp_bridge
+            .find_recent_burn(
+                BridgeDirection::EthereumToBase,
+                amount,
+                self.market_maker_wallet,
+                from_block,
+            )
+            .await
+        {
+            Ok(Some(existing_tx)) => {
+                info!(
+                    target: "rebalance",
+                    %existing_tx,
+                    "Adopting already-submitted CCTP burn on Ethereum resume"
+                );
+                BurnReceipt {
+                    tx: existing_tx,
+                    amount,
+                }
+            }
+            Ok(None) => self.burn_on_ethereum(amount).await?,
+            // ScanInconclusive: the chain head hasn't advanced far enough past
+            // `from_block` to trust an empty scan result. The aggregate is at
+            // `BridgingSubmitting` (a durable state), so return
+            // `SettlementCheckTransient` so the job delayed-redrives instead of
+            // consuming the apalis retry budget.
+            Err(error @ CctpError::ScanInconclusive { .. }) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    "CCTP burn scan on Ethereum inconclusive; will retry after delay"
+                );
+                return Err(UsdcTransferError::SettlementCheckTransient {
+                    id: id.clone(),
+                    source: Box::new(error),
+                });
+            }
+            Err(error) => {
+                warn!(target: "rebalance", "CCTP burn scan on Ethereum failed: {error}");
+                return Err(UsdcTransferError::Cctp(Box::new(error)));
+            }
+        };
+
+        self.record_cctp_burn(id, burn_receipt).await
+    }
+
+    /// Burns USDC on Ethereum (EthereumToBase direction). On failure the
+    /// aggregate stays at `BridgingSubmitting` (no terminal event is emitted)
+    /// so an apalis retry re-enters the scan path rather than re-burning.
+    async fn burn_on_ethereum(&self, amount: U256) -> Result<BurnReceipt, UsdcTransferError> {
+        self.cctp_bridge
             .burn(
                 BridgeDirection::EthereumToBase,
                 amount,
                 self.market_maker_wallet,
             )
             .await
-        {
-            Ok(receipt) => receipt,
-            Err(error) => {
-                warn!(target: "rebalance", "CCTP burn failed: {error}");
-                self.cqrs
-                    .send(
-                        id,
-                        UsdcRebalanceCommand::FailBridging {
-                            reason: format!("Burn failed: {error}"),
-                        },
-                    )
-                    .await?;
-                return Err(UsdcTransferError::Cctp(Box::new(error)));
-            }
-        };
-
-        self.cqrs
-            .send(
-                id,
-                UsdcRebalanceCommand::InitiateBridging {
-                    burn_tx: burn_receipt.tx,
-                },
-            )
-            .await?;
-
-        info!(target: "rebalance", burn_tx = %burn_receipt.tx, "CCTP burn executed");
-        Ok(burn_receipt)
+            .map_err(|error| {
+                warn!(target: "rebalance", "CCTP burn on Ethereum failed: {error}");
+                UsdcTransferError::Cctp(Box::new(error))
+            })
     }
 
     #[instrument(target = "rebalance", skip(self, attestation_response), fields(%id), level = tracing::Level::DEBUG)]
@@ -7422,6 +7535,76 @@ mod tests {
         );
     }
 
+    /// Hypothesis: a pre-commit burn failure (burn tx REVERTS on-chain) does NOT
+    /// emit FailBridging; the crash-safe `execute_cctp_burn_on_ethereum` emits
+    /// `BeginBridging` BEFORE the burn call, landing the aggregate at
+    /// `BridgingSubmitting`. The burn revert leaves it there (no terminal event),
+    /// so apalis retries enter `resume_bridging_submitting_ethereum` which scans
+    /// for the burn before re-attempting -- avoiding any double-burn.
+    ///
+    /// A REVERT-only contract at the TokenMessenger address ensures any tx
+    /// that reaches the contract level also reverts. Calling an address with
+    /// no deployed bytecode would succeed (no-code = success with no events)
+    /// and trigger the post-commit MessageSentEventNotFound path instead.
+    #[tokio::test]
+    async fn pre_commit_burn_failure_does_not_produce_bridging_failed() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+
+        // Sufficient USDC balance to pass the balance gate.
+        let required = U256::from(1_000_000u64);
+        let chain = deploy_ethereum_usdc_chain_with_balance(required, market_maker_wallet).await;
+
+        let server = MockServer::start();
+        let (manager, cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+
+        // Deploy a REVERT-only contract at TOKEN_MESSENGER_V2 (0xFD = REVERT opcode)
+        // to ensure any call that reaches the contract level also reverts.
+        let revert_bytecode = alloy::primitives::Bytes::from(vec![0xFDu8]);
+        let provider = ProviderBuilder::new()
+            .connect(&chain.endpoint)
+            .await
+            .unwrap();
+        provider
+            .anvil_set_code(st0x_bridge::cctp::TOKEN_MESSENGER_V2, revert_bytecode)
+            .await
+            .unwrap();
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+
+        advance_to_withdrawal_complete_alpaca_to_base(&cqrs, &id, amount).await;
+
+        // execute_cctp_burn_on_ethereum is called indirectly through
+        // continue_alpaca_to_base_from_withdrawal_complete. BeginBridging is
+        // emitted before the burn attempt; the REVERT leaves the aggregate at
+        // BridgingSubmitting with no FailBridging.
+        let error = manager
+            .continue_alpaca_to_base_from_withdrawal_complete(&id, amount, None)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::Cctp(_)),
+            "Expected Cctp error from pre-commit burn failure, got: {error:?}"
+        );
+
+        // Aggregate must be in BridgingSubmitting (BeginBridging was emitted before
+        // the burn). No FailBridging -- the burn was never committed; retries are safe.
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::BridgingSubmitting {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    ..
+                }
+            ),
+            "Aggregate must be at BridgingSubmitting after pre-commit burn failure \
+             (BeginBridging persisted, burn failed before InitiateBridging); got: {state:?}"
+        );
+    }
+
     /// Helper: creates an HTTP mock that serves a single COMPLETE transfer with
     /// the given `tx_hash` for the transfer polling endpoint.
     fn mock_complete_withdrawal_with_tx(
@@ -7980,6 +8163,70 @@ mod tests {
         );
     }
 
+    /// Hypothesis: when the burn confirms a receipt but the receipt contains no
+    /// MessageSent event (CctpError::MessageSentEventNotFound),
+    /// `execute_cctp_burn_on_ethereum` leaves the aggregate at `BridgingSubmitting`
+    /// (BeginBridging was persisted before the burn). On apalis redrive
+    /// `resume_bridging_submitting_ethereum` scans Ethereum for the
+    /// confirmed-but-event-missing burn tx (via `find_recent_burn`) and adopts it.
+    #[tokio::test]
+    async fn post_commit_burn_message_sent_not_found_lands_at_bridging_submitting() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+
+        // Mint enough USDC to pass the balance gate (1 USDC = 1_000_000 units).
+        let required = U256::from(1_000_000u64);
+        let chain = deploy_ethereum_usdc_chain_with_balance(required, market_maker_wallet).await;
+
+        let server = MockServer::start();
+        let (manager, cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+
+        // Place a STOP-only contract at TOKEN_MESSENGER_V2: the call succeeds
+        // (receipt.status = 1) with empty return data and no logs, triggering
+        // CctpError::MessageSentEventNotFound after the receipt is confirmed.
+        let stop_bytecode = alloy::primitives::Bytes::from(vec![0x00u8]);
+        let provider = ProviderBuilder::new()
+            .connect(&chain.endpoint)
+            .await
+            .unwrap();
+        provider
+            .anvil_set_code(st0x_bridge::cctp::TOKEN_MESSENGER_V2, stop_bytecode)
+            .await
+            .unwrap();
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+
+        advance_to_withdrawal_complete_alpaca_to_base(&cqrs, &id, amount).await;
+
+        let error = manager
+            .continue_alpaca_to_base_from_withdrawal_complete(&id, amount, None)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::Cctp(_)),
+            "Expected Cctp error from post-commit MessageSentEventNotFound; got: {error:?}"
+        );
+
+        // Aggregate must be in BridgingSubmitting: BeginBridging was persisted
+        // before the burn, so on redrive the scan path handles the
+        // confirmed-but-event-missing burn. The in-progress guard is latched
+        // and the transfer is recoverable via the crash-safe scan.
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::BridgingSubmitting {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    ..
+                }
+            ),
+            "Aggregate must be at BridgingSubmitting after post-commit burn \
+             MessageSentEventNotFound (crash-safe scan handles recovery); got: {state:?}"
+        );
+    }
+
     /// Hypothesis: resuming resume_alpaca_to_base from WithdrawalComplete with
     /// insufficient USDC balance returns a retryable WalletUsdcInsufficient error,
     /// the aggregate stays in WithdrawalComplete, and the guard stays latched.
@@ -8024,7 +8271,258 @@ mod tests {
         );
     }
 
-    /// T10: `continue_alpaca_to_base_from_withdrawal_complete` with an
+    // -------------------------------------------------------------------------
+    // Crash-safe AlpacaToBase burn via BridgingSubmitting
+    // -------------------------------------------------------------------------
+
+    /// Advances the aggregate to `BridgingSubmitting` (AlpacaToBase) with the
+    /// given `from_block`. Pre-stages the BridgingSubmitting state for tests.
+    async fn advance_to_bridging_submitting_alpaca_to_base(
+        cqrs: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        from_block: u64,
+    ) {
+        advance_to_withdrawal_complete_alpaca_to_base(cqrs, id, amount).await;
+        cqrs.send(id, UsdcRebalanceCommand::BeginBridging { from_block })
+            .await
+            .unwrap();
+    }
+
+    /// Advances the aggregate to `BridgingSubmitting { direction: BaseToAlpaca }`.
+    /// Used by the resume direction-mismatch test.
+    async fn advance_to_bridging_submitting_base_to_alpaca(
+        cqrs: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        from_block: u64,
+    ) {
+        let burn_tx =
+            fixed_bytes!("0xbbbb000000000000000000000000000000000000000000000000000000000001");
+        cqrs.send(
+            id,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount,
+                withdrawal: TransferRef::OnchainTx(burn_tx),
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(
+            id,
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+        )
+        .await
+        .unwrap();
+        cqrs.send(id, UsdcRebalanceCommand::BeginBridging { from_block })
+            .await
+            .unwrap();
+    }
+
+    /// `resume_alpaca_to_base` from `BridgingSubmitting { direction: BaseToAlpaca }`
+    /// must return `ResumeDirectionMismatch` (not enter the Ethereum scan path).
+    #[tokio::test]
+    async fn resume_alpaca_to_base_from_bridging_submitting_base_to_alpaca_returns_direction_mismatch()
+     {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+
+        advance_to_bridging_submitting_base_to_alpaca(&cqrs, &id, amount, 0).await;
+
+        // Verify the pre-condition: aggregate is at BridgingSubmitting{BaseToAlpaca}.
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::BridgingSubmitting {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    ..
+                }
+            ),
+            "Pre-condition: aggregate must be at BridgingSubmitting{{BaseToAlpaca}}; got: {state:?}"
+        );
+
+        // ResumeDirectionMismatch fires before any chain access, so no live chain is
+        // needed -- the mismatch is detected purely from the aggregate state.
+        let error = manager
+            .resume_alpaca_to_base(&id, amount)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                UsdcTransferError::ResumeDirectionMismatch {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    ..
+                }
+            ),
+            "BridgingSubmitting{{BaseToAlpaca}} must yield ResumeDirectionMismatch, \
+             got: {error:?}"
+        );
+    }
+
+    /// `execute_cctp_burn_on_ethereum` emits `BeginBridging`
+    /// BEFORE the burn and leaves the aggregate at `BridgingSubmitting` when the
+    /// burn fails (STOP-bytecode path: tx mines but MessageSent event is absent).
+    ///
+    /// Covers two invariants in one test:
+    ///   - BeginBridging is persisted before the burn is attempted (durable
+    ///     ordering that makes the crash-safe scan possible).
+    ///   - The aggregate ends at BridgingSubmitting (not WithdrawalComplete),
+    ///     so a subsequent apalis redrive enters resume_bridging_submitting_ethereum
+    ///     (scan path) rather than re-burning.
+    #[tokio::test]
+    async fn execute_cctp_burn_on_ethereum_records_begin_bridging_before_burn_and_leaves_bridging_submitting()
+     {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+
+        let required = U256::from(1_000_000u64);
+        let chain = deploy_ethereum_usdc_chain_with_balance(required, market_maker_wallet).await;
+
+        let server = MockServer::start();
+        let (manager, cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+
+        // STOP-only contract: burn tx mines and gets a receipt (status = 1) but
+        // no MessageSent event -- simulates the post-commit error window.
+        let stop_bytecode = alloy::primitives::Bytes::from(vec![0x00u8]);
+        let provider = ProviderBuilder::new()
+            .connect(&chain.endpoint)
+            .await
+            .unwrap();
+        provider
+            .anvil_set_code(st0x_bridge::cctp::TOKEN_MESSENGER_V2, stop_bytecode)
+            .await
+            .unwrap();
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+
+        advance_to_withdrawal_complete_alpaca_to_base(&cqrs, &id, amount).await;
+
+        let error = manager
+            .execute_cctp_burn_on_ethereum(&id, amount_u256, None)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::Cctp(_)),
+            "Expected Cctp error (post-commit burn), got: {error:?}"
+        );
+
+        // Key invariant: aggregate is at BridgingSubmitting (BeginBridging persisted
+        // before the burn), so redrive enters the scan path not the re-burn path.
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::BridgingSubmitting {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    ..
+                }
+            ),
+            "Aggregate must be at BridgingSubmitting so redrive scans instead of re-burning; \
+             got: {state:?}"
+        );
+    }
+
+    /// `resume_bridging_submitting_ethereum` with a scan error (chain
+    /// unreachable) returns `UsdcTransferError::Cctp` and does NOT burn.
+    /// The aggregate stays at `BridgingSubmitting`.
+    #[tokio::test]
+    async fn resume_bridging_submitting_ethereum_scan_error_returns_cctp_no_burn() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+
+        let chain =
+            deploy_ethereum_usdc_chain_with_balance(U256::from(1_000_000u64), market_maker_wallet)
+                .await;
+
+        let server = MockServer::start();
+        let (manager, cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+
+        advance_to_bridging_submitting_alpaca_to_base(&cqrs, &id, amount, 0).await;
+
+        // Drop the chain so the scan RPC call fails.
+        drop(chain);
+
+        let error = manager
+            .resume_bridging_submitting_ethereum(&id, amount_u256, 0)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::Cctp(_)),
+            "Scan error must surface as Cctp (retryable), got: {error:?}"
+        );
+
+        // Aggregate must remain at BridgingSubmitting -- no burn, no InitiateBridging.
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::BridgingSubmitting {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    ..
+                }
+            ),
+            "Aggregate must stay at BridgingSubmitting after scan error; got: {state:?}"
+        );
+    }
+
+    /// `resume_alpaca_to_base` routes a `BridgingSubmitting { direction:
+    /// AlpacaToBase }` aggregate to `resume_bridging_submitting_ethereum`
+    /// rather than `ResumeDirectionMismatch`.
+    ///
+    /// Drops the chain immediately after staging so any burn/scan attempt
+    /// fails with a Cctp error. The test asserts we get Cctp (entered the
+    /// resume path) rather than ResumeDirectionMismatch (wrong path).
+    #[tokio::test]
+    async fn resume_alpaca_to_base_from_bridging_submitting_routes_to_ethereum_scan() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+
+        let chain =
+            deploy_ethereum_usdc_chain_with_balance(U256::from(1_000_000u64), market_maker_wallet)
+                .await;
+
+        let server = MockServer::start();
+        let (manager, cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+
+        advance_to_bridging_submitting_alpaca_to_base(&cqrs, &id, amount, 0).await;
+
+        // Drop the chain so the scan fails with Cctp (proves entry into the scan
+        // path, not ResumeDirectionMismatch which would not touch the chain).
+        drop(chain);
+
+        let error = manager
+            .resume_alpaca_to_base(&id, amount)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::Cctp(_)),
+            "BridgingSubmitting AlpacaToBase must route to scan path (Cctp error on \
+             chain drop), not ResumeDirectionMismatch; got: {error:?}"
+        );
+    }
+
+    /// `continue_alpaca_to_base_from_withdrawal_complete` with an
     /// under-confirmed `withdrawal_tx` returns `WithdrawalTxUnderconfirmed`
     /// (retryable) and does NOT attempt any burn. The aggregate stays at
     /// `WithdrawalComplete`.
@@ -8081,7 +8579,7 @@ mod tests {
         );
     }
 
-    /// T11: `continue_alpaca_to_base_from_withdrawal_complete` with
+    /// `continue_alpaca_to_base_from_withdrawal_complete` with
     /// `withdrawal_tx: None` skips the confirmation gate and proceeds to the
     /// balance gate (returns WalletUsdcInsufficient if balance is zero).
     #[tokio::test]
@@ -8115,7 +8613,7 @@ mod tests {
         );
     }
 
-    /// T14: `resume_alpaca_to_base` from `WithdrawalComplete { withdrawal_tx:
+    /// `resume_alpaca_to_base` from `WithdrawalComplete { withdrawal_tx:
     /// Some(tx), .. }` with an under-confirmed tx returns
     /// `WithdrawalTxUnderconfirmed` without attempting any burn. The durable
     /// re-check fires even on the redrive path (aggregate already at
@@ -8211,6 +8709,321 @@ mod tests {
             ),
             "Aggregate must stay at WithdrawalComplete on under-confirmed redrive; \
              got: {state:?}"
+        );
+    }
+
+    /// When `withdrawal_tx` is `Some`, `continue_alpaca_to_base_from_withdrawal_complete`
+    /// derives `from_block` from that tx's block (not the raw chain head) and threads
+    /// it into `BeginBridging`. The aggregate at `BridgingSubmitting` carries that
+    /// `from_block`, so `resume_bridging_submitting_ethereum` scans from the
+    /// withdrawal-tx block rather than a potentially stale head.
+    #[tokio::test]
+    async fn withdrawal_complete_with_tx_uses_tx_block_as_burn_scan_lower_bound() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+
+        // Mint USDC so the balance gate passes.
+        let required = U256::from(1_000_000u64);
+        let chain = deploy_ethereum_usdc_chain_with_balance(required, market_maker_wallet).await;
+
+        // The mint_tx is our stand-in for the Alpaca withdrawal tx. Mine enough
+        // extra blocks so `ethereum_tx_confirmations` returns >= required_confirmations
+        // (the test_settlement_params uses 3 required).
+        let provider = ProviderBuilder::new()
+            .connect(&chain.endpoint)
+            .await
+            .unwrap();
+        provider.anvil_mine(Some(5), None).await.unwrap();
+
+        // Record the chain head AFTER mining extra blocks. The burn-scan lower bound
+        // must equal the withdrawal-tx block (which is BEFORE the current head), not
+        // the current head.
+        let chain_head_after_mining: u64 = provider.get_block_number().await.unwrap();
+
+        // Look up the block the withdrawal-tx was mined in.
+        let withdrawal_tx = chain.mint_tx;
+
+        let server = MockServer::start();
+        let (manager, cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+
+        // STOP-only contract: the burn tx mines (status = 1) but no MessageSent
+        // event, triggering a Cctp error. This lets us observe the from_block in
+        // BridgingSubmitting without completing the burn successfully.
+        let stop_bytecode = alloy::primitives::Bytes::from(vec![0x00u8]);
+        provider
+            .anvil_set_code(st0x_bridge::cctp::TOKEN_MESSENGER_V2, stop_bytecode)
+            .await
+            .unwrap();
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+
+        advance_to_withdrawal_complete_alpaca_to_base(&cqrs, &id, amount).await;
+
+        let error = manager
+            .continue_alpaca_to_base_from_withdrawal_complete(&id, amount, Some(withdrawal_tx))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::Cctp(_)),
+            "Expected Cctp error from STOP-bytecode burn; got: {error:?}"
+        );
+
+        // The aggregate must be at BridgingSubmitting with from_block derived from
+        // the withdrawal tx, not from the raw chain head.
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        let UsdcRebalance::BridgingSubmitting { from_block, .. } = state else {
+            panic!("Expected BridgingSubmitting, got: {state:?}");
+        };
+
+        // from_block must equal the withdrawal tx block exactly, proving the scan
+        // bound is derived from the tx rather than the raw chain head.
+        let expected_from_block = manager
+            .cctp_bridge
+            .ethereum_tx_block(withdrawal_tx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            from_block, expected_from_block,
+            "from_block must equal the withdrawal tx block, not a stale chain head"
+        );
+        assert!(
+            from_block < chain_head_after_mining,
+            "the fixture must keep the withdrawal tx block before the current head"
+        );
+    }
+
+    /// `resume_bridging_submitting_ethereum` adopts an already-submitted burn
+    /// (scan returns Some) without re-burning, then advances to `Bridging`. The
+    /// nonce-increment check proves no second burn was submitted.
+    ///
+    /// Full dual-chain CCTP is needed to call `find_recent_burn` for real.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn resume_bridging_submitting_ethereum_adopts_existing_burn() {
+        let chains = deploy_dual_chain_cctp().await;
+        let amount = usdc("100");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+
+        let cctp_bridge = Arc::new(
+            CctpBridge::try_from_ctx(CctpCtx {
+                usdc_ethereum: USDC_ADDRESS,
+                usdc_base: USDC_ADDRESS,
+                ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
+                base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                token_messenger: chains.token_messenger,
+                message_transmitter: chains.message_transmitter,
+            })
+            .unwrap(),
+        );
+
+        // Burn on Ethereum BEFORE calling resume, so the scan can find it.
+        // Fund the Ethereum bot wallet with USDC first (deploy_dual_chain_cctp
+        // funds Base, not Ethereum).
+        let deployer_key = B256::from_slice(chains.bot_key.as_slice());
+        mint_usdc(
+            &chains.ethereum_endpoint,
+            &deployer_key,
+            USDC_ADDRESS,
+            chains.bot_address,
+            amount_u256 * U256::from(10u64),
+        )
+        .await
+        .unwrap();
+
+        let from_block = cctp_bridge
+            .source_block(BridgeDirection::EthereumToBase)
+            .await
+            .unwrap();
+
+        let existing_burn = cctp_bridge
+            .burn(
+                BridgeDirection::EthereumToBase,
+                amount_u256,
+                chains.bot_address,
+            )
+            .await
+            .unwrap();
+
+        // Build the manager.
+        let server = MockServer::start();
+        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let vault_service = RaindexService::new(
+            create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+            ORDERBOOK_ADDRESS,
+            chains.bot_address,
+        );
+        let cqrs = create_test_store_instance().await;
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::clone(&cctp_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            chains.bot_address,
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        advance_to_bridging_submitting_alpaca_to_base(&cqrs, &id, amount, from_block).await;
+
+        // Capture the nonce before calling resume -- adopt must not add a tx.
+        let ethereum_provider = ProviderBuilder::new()
+            .connect(&chains.ethereum_endpoint)
+            .await
+            .unwrap();
+        let nonce_before = ethereum_provider
+            .get_transaction_count(chains.bot_address)
+            .await
+            .unwrap();
+
+        let burn_receipt = manager
+            .resume_bridging_submitting_ethereum(&id, amount_u256, from_block)
+            .await
+            .unwrap();
+
+        // Adopted burn: same tx, no new transaction.
+        assert_eq!(
+            burn_receipt.tx, existing_burn.tx,
+            "Adopted burn must return the existing burn tx hash"
+        );
+        assert_eq!(
+            ethereum_provider
+                .get_transaction_count(chains.bot_address)
+                .await
+                .unwrap(),
+            nonce_before,
+            "Adopting the existing burn must NOT submit a second burn (nonce unchanged)"
+        );
+
+        // Aggregate must be at Bridging (InitiateBridging emitted by record_cctp_burn).
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::Bridging {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    burn_tx_hash,
+                    ..
+                } if burn_tx_hash == existing_burn.tx
+            ),
+            "Aggregate must reach Bridging with the adopted burn tx; got: {state:?}"
+        );
+    }
+
+    /// When `find_recent_burn` returns None (no prior burn),
+    /// `resume_bridging_submitting_ethereum` issues a fresh burn and records it.
+    /// Uses a `from_block` ABOVE the current head so no prior burn can be found.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn resume_bridging_submitting_ethereum_burns_when_no_existing_burn_found() {
+        let chains = deploy_dual_chain_cctp().await;
+        let amount = usdc("100");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+
+        let cctp_bridge = Arc::new(
+            CctpBridge::try_from_ctx(CctpCtx {
+                usdc_ethereum: USDC_ADDRESS,
+                usdc_base: USDC_ADDRESS,
+                ethereum_wallet: create_test_wallet(&chains.ethereum_endpoint, &chains.bot_key),
+                base_wallet: create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                token_messenger: chains.token_messenger,
+                message_transmitter: chains.message_transmitter,
+            })
+            .unwrap(),
+        );
+
+        // Fund the Ethereum bot wallet.
+        let deployer_key = B256::from_slice(chains.bot_key.as_slice());
+        mint_usdc(
+            &chains.ethereum_endpoint,
+            &deployer_key,
+            USDC_ADDRESS,
+            chains.bot_address,
+            amount_u256 * U256::from(10u64),
+        )
+        .await
+        .unwrap();
+
+        let server = MockServer::start();
+        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let vault_service = RaindexService::new(
+            create_test_wallet(&chains.base_endpoint, &chains.bot_key),
+            ORDERBOOK_ADDRESS,
+            chains.bot_address,
+        );
+        let cqrs = create_test_store_instance().await;
+        let manager = CrossVenueCashTransfer::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::clone(&cctp_bridge),
+            Arc::new(vault_service),
+            cqrs.clone(),
+            chains.bot_address,
+            TEST_VAULT_ID,
+            &test_settlement_params(),
+        );
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        // Capture the current block BEFORE any burn so the scan window opens here.
+        // No burn has been submitted yet, so find_recent_burn returns None.
+        let ethereum_provider = ProviderBuilder::new()
+            .connect(&chains.ethereum_endpoint)
+            .await
+            .unwrap();
+        let from_block = ethereum_provider.get_block_number().await.unwrap();
+
+        // Mine 2+ extra blocks so find_recent_burn's finality margin (SCAN_FINALITY_MARGIN=2)
+        // is satisfied; otherwise the scan returns ScanInconclusive instead of None.
+        ethereum_provider.anvil_mine(Some(3), None).await.unwrap();
+
+        advance_to_bridging_submitting_alpaca_to_base(&cqrs, &id, usdc("100"), from_block).await;
+
+        let nonce_before = ethereum_provider
+            .get_transaction_count(chains.bot_address)
+            .await
+            .unwrap();
+
+        let burn_receipt = manager
+            .resume_bridging_submitting_ethereum(&id, amount_u256, from_block)
+            .await
+            .unwrap();
+
+        // A new burn was issued (nonce increased by at least one transaction).
+        let nonce_after = ethereum_provider
+            .get_transaction_count(chains.bot_address)
+            .await
+            .unwrap();
+        assert!(
+            nonce_after > nonce_before,
+            "resume with no existing burn must issue a new burn (nonce must increase); \
+             nonce_before={nonce_before} nonce_after={nonce_after}"
+        );
+        assert_ne!(
+            burn_receipt.tx,
+            TxHash::ZERO,
+            "burn receipt must carry a real tx hash"
+        );
+
+        // Aggregate must be at Bridging.
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::Bridging {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    ..
+                }
+            ),
+            "Aggregate must reach Bridging after a fresh burn on resume; got: {state:?}"
         );
     }
 

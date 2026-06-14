@@ -1034,6 +1034,7 @@ fn usdc_rebalance_expectations(
                 "UsdcRebalanceEvent::ConversionConfirmed",
                 "UsdcRebalanceEvent::Initiated",
                 "UsdcRebalanceEvent::WithdrawalConfirmed",
+                "UsdcRebalanceEvent::BridgingSubmitting",
                 "UsdcRebalanceEvent::BridgingInitiated",
                 "UsdcRebalanceEvent::BridgeAttestationReceived",
                 "UsdcRebalanceEvent::Bridged",
