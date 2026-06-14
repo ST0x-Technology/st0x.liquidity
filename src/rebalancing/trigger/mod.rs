@@ -8424,7 +8424,12 @@ mod tests {
             .await
             .unwrap();
         store
-            .send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
             .await
             .unwrap();
         store
@@ -8948,6 +8953,7 @@ mod tests {
     fn make_usdc_withdrawal_confirmed() -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::WithdrawalConfirmed {
             confirmed_at: Utc::now(),
+            withdrawal_tx: None,
         }
     }
 
@@ -9892,7 +9898,12 @@ mod tests {
             .await
             .unwrap();
         store
-            .send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
             .await
             .unwrap();
         store
@@ -9948,7 +9959,12 @@ mod tests {
             .await
             .unwrap();
         store
-            .send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
             .await
             .unwrap();
         store
@@ -9987,7 +10003,12 @@ mod tests {
             .await
             .unwrap();
         store
-            .send(id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .send(
+                id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
             .await
             .unwrap();
         store
@@ -10024,7 +10045,12 @@ mod tests {
             .await
             .unwrap();
         store
-            .send(id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .send(
+                id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
             .await
             .unwrap();
         store
@@ -10482,7 +10508,12 @@ mod tests {
             .await
             .unwrap();
         store
-            .send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
             .await
             .unwrap();
         store
@@ -11042,7 +11073,12 @@ mod tests {
             .unwrap();
 
         store
-            .send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -11130,7 +11166,12 @@ mod tests {
             .unwrap();
 
         store
-            .send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -11257,7 +11298,12 @@ mod tests {
             .unwrap();
 
         store
-            .send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -11429,7 +11475,12 @@ mod tests {
             .unwrap();
 
         store
-            .send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
             .await
             .unwrap();
 

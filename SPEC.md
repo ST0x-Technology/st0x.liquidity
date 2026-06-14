@@ -2066,6 +2066,15 @@ Alpaca to Base:
 2. Poll Alpaca until conversion order is filled
 3. Initiate USDC withdrawal from Alpaca (get transfer_id)
 4. Poll Alpaca API until withdrawal status is COMPLETE
+   - **Settlement gate (before proceeding):** verify that the withdrawn USDC is
+     confirmed present in the market-maker Ethereum wallet. Wait for the
+     withdrawal tx to reach the required confirmations on Ethereum (primary
+     gate), then re-check the balance at the entry of the burn step (fallback
+     gate). Alpaca marks a withdrawal "Complete" before the on-chain tx is
+     settled network-wide on load-balanced RPC nodes; burning against an
+     unconfirmed balance causes an ERC20 transfer-exceeds-balance revert. Both
+     gates are retryable: a transient "not yet settled" returns a retriable
+     error without advancing the aggregate.
 5. Query Circle's `/v2/burn/USDC/fees` API for current fast transfer fee
 6. Submit depositForBurn() tx on Ethereum TokenMessenger (domain 0 -> domain 6)
    with minFinalityThreshold=1000 and calculated maxFee for fast transfer

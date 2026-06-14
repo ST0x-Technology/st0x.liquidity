@@ -142,7 +142,9 @@ impl<W: Wallet> CctpEndpoint<W> {
             .iter()
             .any(|log| MessageTransmitterV2::MessageSent::decode_log(log.as_ref()).is_ok())
         {
-            return Err(CctpError::MessageSentEventNotFound);
+            return Err(CctpError::MessageSentEventNotFound {
+                tx_hash: receipt.transaction_hash,
+            });
         }
 
         Ok(crate::BurnReceipt {
@@ -289,6 +291,34 @@ impl<W: Wallet> CctpEndpoint<W> {
         receipt
             .block_number
             .ok_or(CctpError::TxReceiptMissingBlock { tx_hash })
+    }
+
+    /// Returns the number of confirmations `tx_hash` has on this endpoint's
+    /// chain, or `None` if the transaction is not yet mined.
+    ///
+    /// Confirmations = (current head block) - (block the tx landed in) + 1.
+    /// A tx in the current head has 1 confirmation (the inclusion block counts),
+    /// matching the `required_confirmations` contract used across the codebase
+    /// (alloy's `with_required_confirmations`, the e2e settlement helper). Used to
+    /// gate operations on on-chain settlement without blocking -- the caller
+    /// decides whether to retry if confirmations are insufficient.
+    pub(super) async fn tx_confirmations(&self, tx_hash: TxHash) -> Result<Option<u64>, CctpError> {
+        let Some(receipt) = self
+            .wallet
+            .provider()
+            .get_transaction_receipt(tx_hash)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let Some(tx_block) = receipt.block_number else {
+            return Ok(None);
+        };
+
+        let head = self.wallet.provider().get_block_number().await?;
+
+        Ok(Some(head.saturating_sub(tx_block).saturating_add(1)))
     }
 
     /// Sends `amount` of this endpoint's USDC from the wallet to `to`, waiting

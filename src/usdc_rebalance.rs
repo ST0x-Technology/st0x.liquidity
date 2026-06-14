@@ -241,7 +241,9 @@ pub(crate) enum UsdcRebalanceCommand {
         withdrawal: TransferRef,
     },
     /// Confirm successful withdrawal from source. Valid only from `Withdrawing` state.
-    ConfirmWithdrawal,
+    /// `withdrawal_tx` carries the on-chain tx hash when the source provides one
+    /// (AlpacaToBase), so the confirmation-depth gate can re-run on apalis redrive.
+    ConfirmWithdrawal { withdrawal_tx: Option<TxHash> },
     /// Record the intent to burn for CCTP bridging BEFORE the on-chain call.
     /// Captures the chain head (`from_block`) for crash recovery, mirroring
     /// [`BeginWithdrawal`]. Valid only from `WithdrawalComplete` state.
@@ -350,7 +352,15 @@ pub(crate) enum UsdcRebalanceEvent {
         initiated_at: DateTime<Utc>,
     },
     /// Withdrawal from source completed successfully.
-    WithdrawalConfirmed { confirmed_at: DateTime<Utc> },
+    WithdrawalConfirmed {
+        confirmed_at: DateTime<Utc>,
+        /// On-chain tx hash that delivered USDC to the market-maker wallet.
+        /// `None` if the withdrawal source did not return a tx hash (e.g. onchain
+        /// vault withdrawal in BaseToAlpaca). `#[serde(default)]` ensures
+        /// backward-compatibility with events persisted before this field existed.
+        #[serde(default)]
+        withdrawal_tx: Option<TxHash>,
+    },
     /// Withdrawal from source failed.
     WithdrawalFailed {
         reason: String,
@@ -539,6 +549,11 @@ pub(crate) enum UsdcRebalance {
         amount: Usdc,
         initiated_at: DateTime<Utc>,
         confirmed_at: DateTime<Utc>,
+        /// Persisted so the confirmation-depth gate can re-run on apalis redrive.
+        /// `#[serde(default)]` ensures backward-compat with snapshots persisted
+        /// before this field was added.
+        #[serde(default)]
+        withdrawal_tx: Option<TxHash>,
     },
     /// Withdrawal from source has failed (terminal state)
     WithdrawalFailed {
@@ -934,10 +949,11 @@ impl UsdcRebalance {
                 RebalanceDirection::BaseToAlpaca => false,
             },
             // Post-burn failure (burn already broadcast) keeps the guard so a
-            // re-burn cannot fire against funds CCTP already burned. The
-            // `FailBridging` command only emits `burn_tx_hash: Some` from the
-            // post-burn `Bridging`/`Attested` states; a pre-burn failure (from
-            // `WithdrawalComplete`) carries `None` and reconciles to source.
+            // re-burn cannot fire against funds CCTP already burned. `FailBridging`
+            // from post-burn `Bridging`/`Attested` states emits `burn_tx_hash: Some`
+            // and holds the guard. A plain pre-burn `FailBridging` from
+            // `WithdrawalComplete` carries `burn_tx_hash: None` and reconciles to
+            // source.
             //
             // For a BaseToAlpaca post-burn failure this is not a permanent latch:
             // it is now recoverable and auto-re-armed on startup, and recovery
@@ -1307,7 +1323,10 @@ impl EventSourced for UsdcRebalance {
             },
 
             (
-                WithdrawalConfirmed { confirmed_at },
+                WithdrawalConfirmed {
+                    confirmed_at,
+                    withdrawal_tx,
+                },
                 Self::Withdrawing {
                     direction,
                     amount,
@@ -1319,6 +1338,7 @@ impl EventSourced for UsdcRebalance {
                 amount: *amount,
                 initiated_at: *initiated_at,
                 confirmed_at: *confirmed_at,
+                withdrawal_tx: *withdrawal_tx,
             },
 
             (
@@ -1705,7 +1725,7 @@ impl EventSourced for UsdcRebalance {
 
             InitiatePostDepositConversion { .. } => Err(UsdcRebalanceError::DepositNotConfirmed),
 
-            ConfirmWithdrawal | FailWithdrawal { .. } => {
+            ConfirmWithdrawal { .. } | FailWithdrawal { .. } => {
                 Err(UsdcRebalanceError::WithdrawalNotInitiated)
             }
 
@@ -1713,13 +1733,12 @@ impl EventSourced for UsdcRebalance {
                 Err(UsdcRebalanceError::WithdrawalNotConfirmed)
             }
 
-            ReceiveAttestation { .. } | TimeoutAttestation { .. } | FailBridging { .. } => {
-                Err(UsdcRebalanceError::BridgingNotInitiated)
-            }
+            ReceiveAttestation { .. }
+            | TimeoutAttestation { .. }
+            | FailBridging { .. }
+            | RecoverBridging { .. } => Err(UsdcRebalanceError::BridgingNotInitiated),
 
             ConfirmBridging { .. } => Err(UsdcRebalanceError::AttestationNotReceived),
-
-            RecoverBridging { .. } => Err(UsdcRebalanceError::BridgingNotInitiated),
 
             InitiateDeposit { .. } => Err(UsdcRebalanceError::BridgingNotCompleted),
 
@@ -1757,7 +1776,9 @@ impl EventSourced for UsdcRebalance {
                 amount,
                 withdrawal,
             } => self.transition_initiate_withdrawal(direction, amount, withdrawal),
-            ConfirmWithdrawal => self.transition_confirm_withdrawal(),
+            ConfirmWithdrawal { withdrawal_tx } => {
+                self.transition_confirm_withdrawal(withdrawal_tx)
+            }
             FailWithdrawal { reason } => self.transition_fail_withdrawal(reason),
             BeginBridging { from_block } => self.transition_begin_bridging(from_block),
             InitiateBridging { burn_tx } => self.transition_initiate_bridging(burn_tx),
@@ -1956,11 +1977,15 @@ impl UsdcRebalance {
         }])
     }
 
-    fn transition_confirm_withdrawal(&self) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+    fn transition_confirm_withdrawal(
+        &self,
+        withdrawal_tx: Option<TxHash>,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {
             Self::Withdrawing { .. } => Ok(vec![WithdrawalConfirmed {
                 confirmed_at: Utc::now(),
+                withdrawal_tx,
             }]),
             Self::WithdrawalComplete { .. }
             | Self::BridgingSubmitting { .. }
@@ -2521,6 +2546,7 @@ mod tests {
             },
             UsdcRebalanceEvent::WithdrawalConfirmed {
                 confirmed_at: Utc::now(),
+                withdrawal_tx: None,
             },
             UsdcRebalanceEvent::BridgingInitiated {
                 burn_tx_hash: burn_tx,
@@ -2678,6 +2704,7 @@ mod tests {
     fn non_init_event_on_uninitialized_produces_failed_state() {
         let error = replay::<UsdcRebalance>(vec![UsdcRebalanceEvent::WithdrawalConfirmed {
             confirmed_at: Utc::now(),
+            withdrawal_tx: None,
         }])
         .unwrap_err();
 
@@ -2819,6 +2846,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
             ])
             .when(UsdcRebalanceCommand::BeginBridging { from_block: 99 })
@@ -2849,6 +2877,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingSubmitting {
                     from_block: 99,
@@ -2885,6 +2914,7 @@ mod tests {
             },
             UsdcRebalanceEvent::WithdrawalConfirmed {
                 confirmed_at: Utc::now(),
+                withdrawal_tx: None,
             },
             UsdcRebalanceEvent::BridgingSubmitting {
                 from_block: 99,
@@ -2910,7 +2940,9 @@ mod tests {
                 withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                 initiated_at: Utc::now(),
             }])
-            .when(UsdcRebalanceCommand::ConfirmWithdrawal)
+            .when(UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            })
             .await
             .events();
 
@@ -2925,7 +2957,9 @@ mod tests {
     async fn test_cannot_confirm_withdrawal_before_initiating() {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given_no_previous_events()
-            .when(UsdcRebalanceCommand::ConfirmWithdrawal)
+            .when(UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            })
             .await
             .then_expect_error();
 
@@ -2949,9 +2983,12 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
             ])
-            .when(UsdcRebalanceCommand::ConfirmWithdrawal)
+            .when(UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            })
             .await
             .then_expect_error();
 
@@ -3015,6 +3052,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
             ])
             .when(UsdcRebalanceCommand::FailWithdrawal {
@@ -3074,6 +3112,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
             ])
             .when(UsdcRebalanceCommand::InitiateBridging {
@@ -3111,6 +3150,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash,
@@ -3149,6 +3189,7 @@ mod tests {
             },
             UsdcRebalanceEvent::WithdrawalConfirmed {
                 confirmed_at: initiated_at,
+                withdrawal_tx: None,
             },
             UsdcRebalanceEvent::BridgingInitiated {
                 burn_tx_hash: BURN_TX,
@@ -3192,6 +3233,7 @@ mod tests {
             },
             UsdcRebalanceEvent::WithdrawalConfirmed {
                 confirmed_at: initiated_at,
+                withdrawal_tx: None,
             },
             UsdcRebalanceEvent::BridgingInitiated {
                 burn_tx_hash: BURN_TX,
@@ -3318,6 +3360,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash,
@@ -3354,6 +3397,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash,
@@ -3686,6 +3730,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
             ])
             .when(UsdcRebalanceCommand::ReceiveAttestation {
@@ -3751,6 +3796,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash,
@@ -3797,6 +3843,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash,
@@ -3848,6 +3895,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash,
@@ -3882,6 +3930,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
             ])
             .when(UsdcRebalanceCommand::FailBridging {
@@ -3922,6 +3971,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash,
@@ -3971,6 +4021,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash,
@@ -4021,6 +4072,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash,
@@ -4072,6 +4124,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash,
@@ -4122,6 +4175,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash,
@@ -4175,6 +4229,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash,
@@ -4222,6 +4277,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash,
@@ -4267,6 +4323,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash,
@@ -4326,6 +4383,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash,
@@ -4380,6 +4438,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash,
@@ -4426,6 +4485,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash,
@@ -4479,6 +4539,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash,
@@ -4529,6 +4590,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash,
@@ -4594,6 +4656,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash,
@@ -4655,6 +4718,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash,
@@ -4709,6 +4773,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash,
@@ -4758,7 +4823,9 @@ mod tests {
                     failed_at: Utc::now(),
                 },
             ])
-            .when(UsdcRebalanceCommand::ConfirmWithdrawal)
+            .when(UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            })
             .await
             .then_expect_error();
 
@@ -4811,6 +4878,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash: burn_tx,
@@ -4855,6 +4923,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash: burn_tx,
@@ -4901,6 +4970,7 @@ mod tests {
             },
             UsdcRebalanceEvent::WithdrawalConfirmed {
                 confirmed_at: Utc::now(),
+                withdrawal_tx: None,
             },
             UsdcRebalanceEvent::BridgingInitiated {
                 burn_tx_hash: burn_tx,
@@ -4981,6 +5051,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingFailed {
                     burn_tx_hash: None,
@@ -5023,6 +5094,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash: fixed_bytes!(
@@ -5062,6 +5134,7 @@ mod tests {
             },
             UsdcRebalanceEvent::WithdrawalConfirmed {
                 confirmed_at: Utc::now(),
+                withdrawal_tx: None,
             },
             UsdcRebalanceEvent::BridgingInitiated {
                 burn_tx_hash: burn_tx,
@@ -5108,6 +5181,7 @@ mod tests {
             },
             UsdcRebalanceEvent::WithdrawalConfirmed {
                 confirmed_at: Utc::now(),
+                withdrawal_tx: None,
             },
             UsdcRebalanceEvent::BridgingInitiated {
                 burn_tx_hash: burn_tx,
@@ -5140,6 +5214,7 @@ mod tests {
             },
             UsdcRebalanceEvent::WithdrawalConfirmed {
                 confirmed_at: Utc::now(),
+                withdrawal_tx: None,
             },
             UsdcRebalanceEvent::BridgingInitiated {
                 burn_tx_hash: burn_tx,
@@ -5369,6 +5444,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash: burn_tx,
@@ -5417,6 +5493,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash: burn_tx,
@@ -5519,6 +5596,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingFailed {
                     burn_tx_hash: None,
@@ -5586,6 +5664,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash: burn_tx,
@@ -5641,6 +5720,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash: burn_tx,
@@ -5699,6 +5779,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash: burn_tx,
@@ -6018,6 +6099,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash: burn_tx,
@@ -6086,6 +6168,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash: burn_tx,
@@ -6160,6 +6243,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash: burn_tx,
@@ -6223,6 +6307,7 @@ mod tests {
                 },
                 UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
                 },
                 UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash: burn_tx,
@@ -6292,6 +6377,7 @@ mod tests {
             },
             UsdcRebalanceEvent::WithdrawalConfirmed {
                 confirmed_at: withdrawal_confirmed_at,
+                withdrawal_tx: None,
             },
             UsdcRebalanceEvent::BridgingInitiated {
                 burn_tx_hash: burn_tx,
@@ -6709,6 +6795,7 @@ mod tests {
             amount: Usdc::new(float!(800)),
             initiated_at,
             confirmed_at,
+            withdrawal_tx: None,
         };
 
         let dto = state.to_dto(&id);
@@ -6865,6 +6952,7 @@ mod tests {
                 amount,
                 initiated_at: now,
                 confirmed_at: now,
+                withdrawal_tx: None,
             }
             .holds_rebalance_guard()
         );
@@ -7108,7 +7196,12 @@ mod tests {
             .await
             .unwrap();
         store
-            .send(&bridge_failed, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .send(
+                &bridge_failed,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
             .await
             .unwrap();
         store
@@ -7144,7 +7237,9 @@ mod tests {
         store
             .send(
                 &awaiting_attestation,
-                UsdcRebalanceCommand::ConfirmWithdrawal,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
             )
             .await
             .unwrap();
@@ -7181,7 +7276,12 @@ mod tests {
             .await
             .unwrap();
         store
-            .send(&recovered, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .send(
+                &recovered,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
             .await
             .unwrap();
         store
@@ -7239,5 +7339,271 @@ mod tests {
             interrupted.unparseable.is_empty(),
             "well-formed UUID aggregate_ids must not be reported as unparseable"
         );
+    }
+
+    // --- T1-T5: crash-safe AlpacaToBase machinery ---
+
+    /// T1: ConfirmWithdrawal with Some(tx) emits WithdrawalConfirmed carrying
+    /// the tx hash, then transitions WithdrawalComplete to carry it too.
+    #[tokio::test]
+    async fn confirm_withdrawal_with_tx_hash_threads_it_through_to_withdrawal_complete() {
+        let tx_hash =
+            fixed_bytes!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc::new(float!(100.00)),
+                withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                initiated_at: Utc::now(),
+            }])
+            .when(UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: Some(tx_hash),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::WithdrawalConfirmed { withdrawal_tx, .. } = &events[0] else {
+            panic!("Expected WithdrawalConfirmed, got {:?}", events[0]);
+        };
+        assert_eq!(*withdrawal_tx, Some(tx_hash));
+
+        let state = replay::<UsdcRebalance>(vec![
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc::new(float!(100.00)),
+                withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                initiated_at: Utc::now(),
+            },
+            events[0].clone(),
+        ])
+        .unwrap();
+
+        let Some(UsdcRebalance::WithdrawalComplete { withdrawal_tx, .. }) = state else {
+            panic!("Expected WithdrawalComplete state, got: {state:?}");
+        };
+        assert_eq!(withdrawal_tx, Some(tx_hash));
+    }
+
+    /// T2: ConfirmWithdrawal with None works identically for the None case.
+    #[tokio::test]
+    async fn confirm_withdrawal_with_none_produces_withdrawal_complete_with_none_tx() {
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(100.00)),
+                withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                initiated_at: Utc::now(),
+            }])
+            .when(UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::WithdrawalConfirmed { withdrawal_tx, .. } = &events[0] else {
+            panic!("Expected WithdrawalConfirmed, got {:?}", events[0]);
+        };
+        assert_eq!(*withdrawal_tx, None);
+
+        let state = replay::<UsdcRebalance>(vec![
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(100.00)),
+                withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                initiated_at: Utc::now(),
+            },
+            events[0].clone(),
+        ])
+        .unwrap();
+
+        let Some(UsdcRebalance::WithdrawalComplete { withdrawal_tx, .. }) = state else {
+            panic!("Expected WithdrawalComplete state, got: {state:?}");
+        };
+        assert_eq!(withdrawal_tx, None);
+    }
+
+    /// T3: Backward compatibility -- replaying a persisted WithdrawalConfirmed
+    /// that lacks the `withdrawal_tx` field (simulated via JSON without the field)
+    /// deserializes via `#[serde(default)]` to `None`, producing WithdrawalComplete
+    /// with `withdrawal_tx: None`.
+    #[test]
+    fn withdrawal_confirmed_without_withdrawal_tx_field_deserializes_to_none() {
+        let old_event = json!({
+            "WithdrawalConfirmed": {
+                "confirmed_at": "2026-01-01T00:00:00Z"
+            }
+        });
+
+        let event: UsdcRebalanceEvent =
+            from_value(old_event).expect("old WithdrawalConfirmed must still deserialize");
+
+        let UsdcRebalanceEvent::WithdrawalConfirmed { withdrawal_tx, .. } = event else {
+            panic!("Expected WithdrawalConfirmed");
+        };
+        assert_eq!(withdrawal_tx, None, "missing field must default to None");
+    }
+
+    /// T3b: State-level mirror of T3 -- a `WithdrawalComplete` snapshot persisted
+    /// before `withdrawal_tx` existed must still load, defaulting the field to
+    /// `None` via `#[serde(default)]`. Guards the restart/resume path: dropping
+    /// the default or adding `deny_unknown_fields` would strand in-flight
+    /// transfers held in a pre-field `WithdrawalComplete` snapshot.
+    #[test]
+    fn withdrawal_complete_snapshot_without_withdrawal_tx_deserializes_to_none() {
+        let tx_hash =
+            fixed_bytes!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let mut snapshot = to_value(UsdcRebalance::WithdrawalComplete {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc::new(float!(100.00)),
+            initiated_at: Utc::now(),
+            confirmed_at: Utc::now(),
+            withdrawal_tx: Some(tx_hash),
+        })
+        .expect("WithdrawalComplete state serializes");
+
+        // Simulate a snapshot persisted before the `withdrawal_tx` field existed.
+        snapshot
+            .get_mut("WithdrawalComplete")
+            .and_then(|value| value.as_object_mut())
+            .expect("externally-tagged WithdrawalComplete object")
+            .remove("withdrawal_tx");
+
+        let state = from_value::<UsdcRebalance>(snapshot)
+            .expect("pre-field WithdrawalComplete snapshot must still load");
+
+        let UsdcRebalance::WithdrawalComplete { withdrawal_tx, .. } = state else {
+            panic!("expected WithdrawalComplete, got {state:?}");
+        };
+
+        assert_eq!(withdrawal_tx, None);
+    }
+
+    /// T4: BeginBridging from WithdrawalComplete (AlpacaToBase direction) emits
+    /// BridgingSubmitting and transitions to BridgingSubmitting state carrying
+    /// direction: AlpacaToBase.
+    #[tokio::test]
+    async fn begin_bridging_from_withdrawal_complete_alpaca_to_base_transitions_correctly() {
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc::new(float!(200.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
+                },
+            ])
+            .when(UsdcRebalanceCommand::BeginBridging { from_block: 42 })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::BridgingSubmitting { from_block, .. } = &events[0] else {
+            panic!("Expected BridgingSubmitting event, got {:?}", events[0]);
+        };
+        assert_eq!(*from_block, 42);
+
+        let state = replay::<UsdcRebalance>(vec![
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc::new(float!(200.00)),
+                withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::WithdrawalConfirmed {
+                confirmed_at: Utc::now(),
+                withdrawal_tx: None,
+            },
+            events[0].clone(),
+        ])
+        .unwrap();
+
+        let Some(UsdcRebalance::BridgingSubmitting {
+            direction,
+            from_block,
+            ..
+        }) = state
+        else {
+            panic!("Expected BridgingSubmitting state, got: {state:?}");
+        };
+        assert_eq!(direction, RebalanceDirection::AlpacaToBase);
+        assert_eq!(from_block, 42);
+    }
+
+    /// T5: BridgingSubmitting (AlpacaToBase direction): InitiateBridging transitions
+    /// to Bridging. Verifies InitiateBridging is direction-agnostic.
+    #[tokio::test]
+    async fn initiate_bridging_from_bridging_submitting_alpaca_to_base_transitions_to_bridging() {
+        let burn_tx =
+            fixed_bytes!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc::new(float!(200.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
+                },
+                UsdcRebalanceEvent::BridgingSubmitting {
+                    from_block: 42,
+                    submitting_at: Utc::now(),
+                },
+            ])
+            .when(UsdcRebalanceCommand::InitiateBridging { burn_tx })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::BridgingInitiated { burn_tx_hash, .. } = &events[0] else {
+            panic!("Expected BridgingInitiated event, got {:?}", events[0]);
+        };
+        assert_eq!(*burn_tx_hash, burn_tx);
+
+        let state = replay::<UsdcRebalance>(vec![
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc::new(float!(200.00)),
+                withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::WithdrawalConfirmed {
+                confirmed_at: Utc::now(),
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceEvent::BridgingSubmitting {
+                from_block: 42,
+                submitting_at: Utc::now(),
+            },
+            events[0].clone(),
+        ])
+        .unwrap();
+
+        let Some(UsdcRebalance::Bridging {
+            direction,
+            burn_tx_hash,
+            ..
+        }) = state
+        else {
+            panic!("Expected Bridging state, got: {state:?}");
+        };
+        assert_eq!(direction, RebalanceDirection::AlpacaToBase);
+        assert_eq!(burn_tx_hash, burn_tx);
     }
 }

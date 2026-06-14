@@ -34,6 +34,13 @@ use crate::usdc_rebalance::UsdcRebalanceId;
 
 const ATTESTATION_REDRIVE_DELAY: Duration = Duration::from_secs(60);
 
+/// Delay before re-enqueueing an Alpaca->Base job when on-chain settlement has
+/// not yet completed. Two to three Ethereum block times (~30 s total) is enough
+/// to give a lagging RPC node time to catch up after Alpaca marks the
+/// withdrawal "Complete", while keeping the redrive cadence tight enough to
+/// avoid materially delaying the transfer.
+const SETTLEMENT_REDRIVE_DELAY: Duration = Duration::from_secs(30);
+
 /// Apalis queue type for [`TransferUsdcToHedging`].
 pub(crate) type TransferUsdcToHedgingJobQueue = JobQueue<TransferUsdcToHedging>;
 
@@ -250,6 +257,48 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
                     .push_with_delay(self.clone(), ATTESTATION_REDRIVE_DELAY)
                     .await?;
             }
+            // Settlement-wait errors: the withdrawal tx has not yet reached the
+            // required on-chain confirmation depth, the Ethereum wallet has not yet
+            // received the withdrawn USDC, or an RPC call in the settlement phase
+            // (confirmation re-check, balance read, or burn scan) failed
+            // transiently. These are all safe to delayed-redrive because the
+            // aggregate is in a durable state (WithdrawalComplete or
+            // BridgingSubmitting) -- they must NOT consume apalis retry budget
+            // (only 3 retries, ~7 s total). Re-enqueue with
+            // SETTLEMENT_REDRIVE_DELAY and return Ok so this attempt completes
+            // cleanly; the delayed job resumes once settlement is likely complete.
+            Err(
+                ref settlement_err @ (UsdcTransferError::WithdrawalTxUnderconfirmed {
+                    ref id, ..
+                }
+                | UsdcTransferError::WalletUsdcInsufficient { ref id, .. }
+                | UsdcTransferError::SettlementCheckTransient { ref id, .. }),
+            ) => {
+                let reason = match settlement_err {
+                    UsdcTransferError::WithdrawalTxUnderconfirmed { .. } => {
+                        "withdrawal tx not yet sufficiently confirmed"
+                    }
+                    UsdcTransferError::WalletUsdcInsufficient { .. } => {
+                        "market-maker wallet has insufficient USDC (withdrawal not yet settled)"
+                    }
+                    UsdcTransferError::SettlementCheckTransient { .. } => {
+                        "settlement-phase RPC check failed transiently"
+                    }
+                    // The outer or-pattern matches only the three variants above.
+                    // This arm is unreachable; it exists only to satisfy exhaustiveness.
+                    _ => unreachable!("outer or-pattern limits to settlement variants"),
+                };
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    delay = ?SETTLEMENT_REDRIVE_DELAY,
+                    "Rescheduling Alpaca->Base USDC transfer: {reason}"
+                );
+                let mut job_queue = ctx.job_queue.clone();
+                job_queue
+                    .push_with_delay(self.clone(), SETTLEMENT_REDRIVE_DELAY)
+                    .await?;
+            }
             Err(UsdcTransferError::AttestationRetryDeadlineElapsed { id }) => {
                 warn!(
                     target: "rebalance",
@@ -275,6 +324,7 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::{TxHash, U256};
     use chrono::Utc;
     use sqlx::SqlitePool;
     use uuid::Uuid;
@@ -704,6 +754,200 @@ mod tests {
         assert!(
             matches!(error, TransferUsdcToMarketMakingJobError::Transfer(_)),
             "perform must propagate the resume failure as a Transfer error, got {error:?}",
+        );
+    }
+
+    /// Stubs that return settlement-wait errors (retryable, not consumer of
+    /// apalis retry budget).
+    struct UnderconfirmedWithdrawal;
+
+    #[async_trait]
+    impl ResumeAlpacaToBase for UnderconfirmedWithdrawal {
+        async fn resume_alpaca_to_base(
+            &self,
+            id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Err(UsdcTransferError::WithdrawalTxUnderconfirmed {
+                id: id.clone(),
+                tx: TxHash::ZERO,
+                required: 3,
+                actual: 1,
+            })
+        }
+    }
+
+    struct InsufficientUsdcBalance;
+
+    #[async_trait]
+    impl ResumeAlpacaToBase for InsufficientUsdcBalance {
+        async fn resume_alpaca_to_base(
+            &self,
+            id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            Err(UsdcTransferError::WalletUsdcInsufficient {
+                id: id.clone(),
+                required: U256::from(1_000_000u64),
+                actual: U256::ZERO,
+            })
+        }
+    }
+
+    /// Hypothesis: WithdrawalTxUnderconfirmed re-enqueues with
+    /// SETTLEMENT_REDRIVE_DELAY and returns Ok (job stays alive, no apalis
+    /// retry budget consumed).
+    #[tokio::test]
+    async fn market_making_job_reschedules_underconfirmed_withdrawal() {
+        let pool = setup_queue_pool().await;
+        let job_queue = TransferUsdcToMarketMakingJobQueue::new(&pool);
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(UnderconfirmedWithdrawal),
+            job_queue,
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+        };
+
+        let before = Utc::now().timestamp();
+        job.perform(&ctx).await.unwrap();
+        let after = Utc::now().timestamp();
+
+        assert_eq!(
+            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
+            1,
+            "WithdrawalTxUnderconfirmed must re-enqueue a delayed replacement job"
+        );
+
+        let (payload, run_at) = pending_job_row::<TransferUsdcToMarketMaking>(&pool).await;
+        let rescheduled: TransferUsdcToMarketMaking = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            rescheduled.id, job.id,
+            "the rescheduled job must resume the same aggregate id"
+        );
+        assert!(
+            rescheduled.amount.eq(&job.amount).unwrap(),
+            "the rescheduled job must carry the same amount, got {} vs {}",
+            rescheduled.amount,
+            job.amount
+        );
+        assert!(
+            run_at >= before + i64::try_from(SETTLEMENT_REDRIVE_DELAY.as_secs()).unwrap() - 5
+                && run_at <= after + i64::try_from(SETTLEMENT_REDRIVE_DELAY.as_secs()).unwrap() + 5,
+            "redrive must be delayed by ~{SETTLEMENT_REDRIVE_DELAY:?} -- \
+             run_at={run_at} before={before} after={after}"
+        );
+    }
+
+    /// Hypothesis: WalletUsdcInsufficient re-enqueues with
+    /// SETTLEMENT_REDRIVE_DELAY and returns Ok (job stays alive, no apalis
+    /// retry budget consumed).
+    #[tokio::test]
+    async fn market_making_job_reschedules_insufficient_usdc_balance() {
+        let pool = setup_queue_pool().await;
+        let job_queue = TransferUsdcToMarketMakingJobQueue::new(&pool);
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(InsufficientUsdcBalance),
+            job_queue,
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+        };
+
+        let before = Utc::now().timestamp();
+        job.perform(&ctx).await.unwrap();
+        let after = Utc::now().timestamp();
+
+        assert_eq!(
+            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
+            1,
+            "WalletUsdcInsufficient must re-enqueue a delayed replacement job"
+        );
+
+        let (payload, run_at) = pending_job_row::<TransferUsdcToMarketMaking>(&pool).await;
+        let rescheduled: TransferUsdcToMarketMaking = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            rescheduled.id, job.id,
+            "the rescheduled job must resume the same aggregate id"
+        );
+        assert!(
+            rescheduled.amount.eq(&job.amount).unwrap(),
+            "the rescheduled job must carry the same amount, got {} vs {}",
+            rescheduled.amount,
+            job.amount
+        );
+        assert!(
+            run_at >= before + i64::try_from(SETTLEMENT_REDRIVE_DELAY.as_secs()).unwrap() - 5
+                && run_at <= after + i64::try_from(SETTLEMENT_REDRIVE_DELAY.as_secs()).unwrap() + 5,
+            "redrive must be delayed by ~{SETTLEMENT_REDRIVE_DELAY:?} -- \
+             run_at={run_at} before={before} after={after}"
+        );
+    }
+
+    /// Stubs for `SettlementCheckTransient` -- models an RPC failure during the
+    /// settlement-phase confirmation re-check or the BridgingSubmitting scan.
+    struct SettlementRpcFailure;
+
+    #[async_trait]
+    impl ResumeAlpacaToBase for SettlementRpcFailure {
+        async fn resume_alpaca_to_base(
+            &self,
+            id: &UsdcRebalanceId,
+            _amount: Usdc,
+        ) -> Result<(), UsdcTransferError> {
+            use st0x_bridge::cctp::CctpError;
+            Err(UsdcTransferError::SettlementCheckTransient {
+                id: id.clone(),
+                source: Box::new(CctpError::ScanInconclusive { from_block: 42 }),
+            })
+        }
+    }
+
+    /// Hypothesis: SettlementCheckTransient (e.g. confirmation-check RPC failure)
+    /// re-enqueues with SETTLEMENT_REDRIVE_DELAY and returns Ok -- the job stays
+    /// alive without consuming the apalis retry budget.
+    #[tokio::test]
+    async fn market_making_job_reschedules_settlement_check_transient() {
+        let pool = setup_queue_pool().await;
+        let job_queue = TransferUsdcToMarketMakingJobQueue::new(&pool);
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(SettlementRpcFailure),
+            job_queue,
+        };
+        let job = TransferUsdcToMarketMaking {
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+        };
+
+        let before = Utc::now().timestamp();
+        job.perform(&ctx).await.unwrap();
+        let after = Utc::now().timestamp();
+
+        assert_eq!(
+            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
+            1,
+            "SettlementCheckTransient must re-enqueue a delayed replacement job"
+        );
+
+        let (payload, run_at) = pending_job_row::<TransferUsdcToMarketMaking>(&pool).await;
+        let rescheduled: TransferUsdcToMarketMaking = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            rescheduled.id, job.id,
+            "the rescheduled job must resume the same aggregate id"
+        );
+        assert!(
+            rescheduled.amount.eq(&job.amount).unwrap(),
+            "the rescheduled job must carry the same amount, got {} vs {}",
+            rescheduled.amount,
+            job.amount
+        );
+        assert!(
+            run_at >= before + i64::try_from(SETTLEMENT_REDRIVE_DELAY.as_secs()).unwrap() - 5
+                && run_at <= after + i64::try_from(SETTLEMENT_REDRIVE_DELAY.as_secs()).unwrap() + 5,
+            "redrive must be delayed by ~{SETTLEMENT_REDRIVE_DELAY:?} -- \
+             run_at={run_at} before={before} after={after}"
         );
     }
 }

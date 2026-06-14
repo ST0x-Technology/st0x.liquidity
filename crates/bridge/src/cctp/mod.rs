@@ -384,8 +384,8 @@ pub enum CctpError {
     /// bridge failure rather than retried to the deadline.
     #[error("malformed complete attestation: {source}")]
     MalformedAttestation { source: AttestationError },
-    #[error("MessageSent event not found in transaction receipt")]
-    MessageSentEventNotFound,
+    #[error("MessageSent event not found in burn receipt {tx_hash}")]
+    MessageSentEventNotFound { tx_hash: TxHash },
     #[error("MintAndWithdraw event not found in transaction receipt")]
     MintAndWithdrawEventNotFound,
     #[error("transaction {tx_hash} receipt has no block number")]
@@ -831,6 +831,36 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
             .await
     }
 
+    /// Returns `holder`'s USDC balance on Ethereum, the source chain for
+    /// AlpacaToBase burns.
+    ///
+    /// Used as a fallback settlement gate before executing the CCTP burn:
+    /// verifies that withdrawn USDC is present in the market-maker wallet
+    /// before attempting to burn it. Delegates to the Ethereum endpoint,
+    /// not Base.
+    pub async fn ethereum_usdc_balance(&self, holder: Address) -> Result<U256, CctpError> {
+        self.ethereum
+            .usdc_balance::<OpenChainErrorRegistry>(holder)
+            .await
+    }
+
+    /// Returns the number of confirmations `tx_hash` has on Ethereum, or `None`
+    /// if the transaction is not yet mined.
+    ///
+    /// Used to gate the AlpacaToBase CCTP burn on the Alpaca withdrawal tx
+    /// being settled on Ethereum: Alpaca reports "Complete" before the
+    /// on-chain tx is visible network-wide on load-balanced nodes, so waiting
+    /// for the required confirmations prevents burning against a balance
+    /// that only exists on a lagging node. The returned count follows the
+    /// repo-wide `required_confirmations` contract: the inclusion block counts
+    /// as confirmation 1 (so a mined-in-head tx returns 1, not 0).
+    pub async fn ethereum_tx_confirmations(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<Option<u64>, CctpError> {
+        self.ethereum.tx_confirmations(tx_hash).await
+    }
+
     /// Returns the block in which `tx_hash` was mined on Ethereum, the chain
     /// where BaseToEthereum mints land.
     ///
@@ -995,6 +1025,13 @@ where
             BridgeDirection::BaseToEthereum => self.ethereum.current_block().await,
         }
     }
+
+    async fn source_block(&self, direction: BridgeDirection) -> Result<u64, Self::Error> {
+        match direction {
+            BridgeDirection::EthereumToBase => self.ethereum.current_block().await,
+            BridgeDirection::BaseToEthereum => self.base.current_block().await,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1003,6 +1040,7 @@ mod tests {
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::address;
     use alloy::primitives::{B256, b256, keccak256};
+    use alloy::providers::ext::AnvilApi as _;
     use alloy::providers::{Provider, ProviderBuilder};
     use alloy::signers::Signer;
     use alloy::signers::local::PrivateKeySigner;
@@ -3625,6 +3663,208 @@ mod tests {
                 .unwrap(),
             None,
             "a burn from a different depositor must not be adopted",
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // ethereum_usdc_balance and ethereum_tx_confirmations delegation tests
+    // -------------------------------------------------------------------------
+
+    /// Hypothesis: ethereum_usdc_balance reads from the Ethereum endpoint, not
+    /// Base. Deploy USDC on one chain but not the other; the call must succeed
+    /// on the one that has the contract (Ethereum) and reflect the minted amount.
+    #[tokio::test]
+    async fn ethereum_usdc_balance_reads_from_ethereum_endpoint() {
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _) = setup_anvil();
+
+        // Deploy USDC only on the Ethereum endpoint.
+        let usdc_address = deploy_mock_usdc(&ethereum_endpoint, &private_key)
+            .await
+            .unwrap();
+
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            usdc_address,
+        )
+        .await
+        .unwrap();
+
+        let holder = PrivateKeySigner::from_bytes(&private_key)
+            .unwrap()
+            .address();
+
+        let balance = bridge.ethereum_usdc_balance(holder).await.unwrap();
+
+        // deploy_mock_usdc mints 1_000_000_000_000 to the deployer.
+        assert_eq!(
+            balance,
+            U256::from(1_000_000_000_000u64),
+            "ethereum_usdc_balance must return the Ethereum USDC balance, not Base"
+        );
+    }
+
+    /// Hypothesis: ethereum_tx_confirmations returns None for a tx hash that
+    /// does not exist on-chain (unmined).
+    #[tokio::test]
+    async fn ethereum_tx_confirmations_returns_none_for_unmined_tx() {
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _) = setup_anvil();
+
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            USDC_ETHEREUM,
+        )
+        .await
+        .unwrap();
+
+        let nonexistent_tx =
+            b256!("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+
+        let result = bridge
+            .ethereum_tx_confirmations(nonexistent_tx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result, None,
+            "ethereum_tx_confirmations must return None for an unmined tx"
+        );
+    }
+
+    /// Hypothesis: ethereum_tx_confirmations returns Some(N) where N >= 1 after
+    /// mining a tx and advancing the chain head.
+    #[tokio::test]
+    async fn ethereum_tx_confirmations_counts_confirmations_correctly() {
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _) = setup_anvil();
+
+        let usdc_address = deploy_mock_usdc(&ethereum_endpoint, &private_key)
+            .await
+            .unwrap();
+
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            usdc_address,
+        )
+        .await
+        .unwrap();
+
+        let signer = PrivateKeySigner::from_bytes(&private_key).unwrap();
+        let provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(signer.clone()))
+            .connect(&ethereum_endpoint)
+            .await
+            .unwrap();
+        let token = MockMintBurnToken::new(usdc_address, &provider);
+
+        // Mine a tx (mint to self) so we have a real tx hash.
+        let receipt = token
+            .mint(signer.address(), U256::from(1u64))
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+
+        let tx_hash = receipt.transaction_hash;
+
+        // Immediately after mining: 1 confirmation (the inclusion block counts).
+        let confs_immediate = bridge
+            .ethereum_tx_confirmations(tx_hash)
+            .await
+            .unwrap()
+            .expect("tx is mined");
+
+        assert_eq!(
+            confs_immediate, 1,
+            "tx in the current head has 1 confirmation (inclusion block counts)"
+        );
+
+        // After 2 more blocks: 3 confirmations (inclusion block + 2).
+        provider.anvil_mine(Some(2), None).await.unwrap();
+
+        let confs_after_2 = bridge
+            .ethereum_tx_confirmations(tx_hash)
+            .await
+            .unwrap()
+            .expect("tx is still mined");
+
+        assert_eq!(
+            confs_after_2, 3,
+            "tx has 3 confirmations after 2 blocks mined (inclusion block + 2)"
+        );
+    }
+
+    /// Hypothesis: deposit_for_burn (via burn()) returns
+    /// CctpError::MessageSentEventNotFound when the token messenger accepts the
+    /// call and mines a receipt (tx succeeds) but emits no MessageSent log.
+    ///
+    /// This is the post-commit error class: the burn tx IS on-chain. Callers
+    /// must NOT retry the burn on this error -- they must surface it for
+    /// operator reconciliation.
+    #[tokio::test]
+    async fn burn_returns_message_sent_event_not_found_when_receipt_has_no_event() {
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _) = setup_anvil();
+
+        // Deploy real USDC so ensure_usdc_approval succeeds.
+        let usdc_address = deploy_mock_usdc(&ethereum_endpoint, &private_key)
+            .await
+            .unwrap();
+
+        // Place a STOP-only contract at the TokenMessenger address: any call to
+        // it succeeds (receipt status = 1) with empty return data and no events,
+        // triggering MessageSentEventNotFound after the receipt is confirmed.
+        let stop_bytecode = alloy::primitives::Bytes::from(vec![0x00u8]);
+        let no_wallet_provider = ProviderBuilder::new()
+            .connect(&ethereum_endpoint)
+            .await
+            .unwrap();
+        no_wallet_provider
+            .anvil_set_code(TOKEN_MESSENGER_V2, stop_bytecode)
+            .await
+            .unwrap();
+
+        // Mock the Circle fee endpoint so burn() can proceed past query_fast_transfer_fee.
+        let fee_server = MockServer::start();
+        fee_server.mock(|when, then| {
+            when.method(GET).path_includes("/v2/burn/USDC/fees/");
+            then.status(200).json_body(serde_json::json!([
+                {"finalityThreshold": 1000, "minimumFee": 1},
+                {"finalityThreshold": 2000, "minimumFee": 0}
+            ]));
+        });
+
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            usdc_address,
+        )
+        .await
+        .unwrap()
+        .with_circle_api_base(fee_server.base_url());
+
+        let signer = PrivateKeySigner::from_bytes(&private_key).unwrap();
+        let recipient = signer.address();
+        let amount = U256::from(1_000u64);
+
+        let error = Bridge::burn(&bridge, BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CctpError::MessageSentEventNotFound { .. }),
+            "burn must return MessageSentEventNotFound when the receipt has no \
+             MessageSent event (post-commit error); got: {error:?}"
         );
     }
 }

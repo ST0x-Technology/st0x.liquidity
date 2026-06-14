@@ -272,7 +272,16 @@ impl AlpacaWithdrawalExecutor {
         )
         .await
         {
-            Ok(()) => MintAttempt::Done,
+            Ok(tx_hash) => {
+                // Record the real on-chain mint tx hash so the bot's
+                // withdrawal-confirmation check can verify it against the
+                // Ethereum chain. Without this, the mock returns the
+                // placeholder 0xcdcd... hash, which isn't on-chain and fails
+                // the confirmation gate.
+                self.broker
+                    .set_transfer_tx_hash(transfer_id, format!("{tx_hash:#x}"));
+                MintAttempt::Done
+            }
             Err(error) => {
                 warn!(
                     %transfer_id,
