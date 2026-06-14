@@ -483,12 +483,14 @@ pub(crate) struct RebalancingService {
     mint_event_sync: Arc<Mutex<()>>,
     redemption_event_sync: Arc<Mutex<()>>,
     usdc_event_sync: Arc<Mutex<()>>,
-    /// CQRS stores for emitting failure events on timeout.
+    /// CQRS stores for emitting failure events on timeout and for re-deriving
+    /// durable state in the USDC timeout sweep.
     /// Set after construction via `set_stores` because the stores
     /// are built after the trigger (the trigger is a Reactor dependency
     /// of the stores' query manifest).
     mint_store: RwLock<Option<Arc<Store<TokenizedEquityMint>>>>,
     redemption_store: RwLock<Option<Arc<Store<EquityRedemption>>>>,
+    usdc_store: RwLock<Option<Arc<Store<UsdcRebalance>>>>,
 }
 
 type EquityInventoryUpdate = Box<
@@ -574,10 +576,12 @@ impl RebalancingService {
             usdc_event_sync: Arc::new(Mutex::new(())),
             mint_store: RwLock::new(None),
             redemption_store: RwLock::new(None),
+            usdc_store: RwLock::new(None),
         }
     }
 
-    /// Attach CQRS stores so the trigger can emit failure events on timeout.
+    /// Attach CQRS stores so the trigger can emit failure events on timeout and
+    /// re-derive durable USDC state in the timeout sweep.
     ///
     /// Called after construction because the stores are built by the query
     /// manifest, which depends on the trigger as a reactor.
@@ -585,9 +589,11 @@ impl RebalancingService {
         &self,
         mint_store: Arc<Store<TokenizedEquityMint>>,
         redemption_store: Arc<Store<EquityRedemption>>,
+        usdc_store: Arc<Store<UsdcRebalance>>,
     ) {
         *self.mint_store.write().await = Some(mint_store);
         *self.redemption_store.write().await = Some(redemption_store);
+        *self.usdc_store.write().await = Some(usdc_store);
     }
 
     pub(crate) async fn recover_pending_offchain_order_symbols(
@@ -805,7 +811,19 @@ impl RebalancingService {
         &self,
         now: DateTime<Utc>,
     ) -> Result<(), RebalancingServiceError> {
-        let timed_out_ids = {
+        // Select ids to examine this tick. The selection is intentionally broad:
+        //
+        // - Post-burn entries are ALWAYS selected regardless of elapsed time.
+        //   The durable-Reconciled check is safe to run at any age: it only
+        //   fires when the store already shows Reconciled, and clearing the guard
+        //   at that point is always correct. This ensures that a CLI
+        //   `reconcile-usdc-transfer` issued before the failed transfer ages past
+        //   `transfer_timeout` still takes effect on the next sweep tick.
+        //
+        // - Pre-burn entries (not yet post-burn) are only selected after the
+        //   timeout elapses, as before: they cannot have an in-flight on-chain
+        //   burn so abandonment is safe to defer until then.
+        let candidate_ids = {
             let tracking = self.usdc_tracking.read().await;
             tracking
                 .iter()
@@ -813,7 +831,7 @@ impl RebalancingService {
                     let elapsed =
                         Self::elapsed_since_timeout_start(tracking.last_progress_at, now)?;
 
-                    if elapsed >= self.config.transfer_timeout {
+                    if tracking.is_post_burn() || elapsed >= self.config.transfer_timeout {
                         Some(id.clone())
                     } else {
                         None
@@ -822,7 +840,7 @@ impl RebalancingService {
                 .collect::<Vec<_>>()
         };
 
-        for id in timed_out_ids {
+        for id in candidate_ids {
             // A timed-out transfer whose apalis row is still in flight is NOT
             // abandoned: the job will resume and may have an irreversible on-chain
             // withdraw/burn already submitted. Skip the cleanup entirely so we
@@ -1181,15 +1199,123 @@ impl RebalancingService {
             return Ok(None);
         };
 
-        if elapsed < self.config.transfer_timeout {
-            return Ok(None);
-        }
-
         if tracking.is_post_burn() {
+            // Post-burn: check durable state FIRST, regardless of elapsed time.
+            // The Reconciled check is always safe: it only fires when the
+            // aggregate is actually Reconciled and clearing the guard at that
+            // point is always correct. Running it before the timeout gate means
+            // that a CLI `reconcile-usdc-transfer` issued before the failed
+            // transfer ages past `transfer_timeout` takes effect on the next
+            // sweep tick rather than waiting for the full timeout window.
+            let usdc_store_guard = self.usdc_store.read().await;
+            if let Some(store) = usdc_store_guard.as_ref() {
+                match store.load(id).await {
+                    Ok(Some(UsdcRebalance::Reconciled { .. })) => {
+                        // Durable state is Reconciled: the CLI's separate-process
+                        // store emitted OperatorReconciled but the live reactor
+                        // never saw it. Apply the side-effect here: zero the
+                        // source-venue inflight and clear the active rebalance.
+                        //
+                        // Drop the tracking lock BEFORE acquiring inventory.
+                        // `usdc_event_sync` (held by both this sweep path and the
+                        // reactor's `on_usdc_rebalance`) serialises the two paths,
+                        // so there is no deadlock risk from lock ordering between
+                        // them. We drop the tracking lock before acquiring inventory
+                        // to reduce unnecessary contention -- the relative ordering
+                        // of these two inner locks is not load-bearing for deadlock
+                        // safety; `usdc_event_sync` serialises sweep vs reactor
+                        // entirely.
+                        //
+                        // Both inventory mutations (inflight clear and active
+                        // rebalance clear) are chained in a single lock
+                        // acquisition so there is never a transient state where
+                        // inflight is zeroed but active_usdc_rebalance is still
+                        // set.
+                        tracking_guard.remove(id);
+                        drop(tracking_guard);
+                        drop(usdc_store_guard);
+
+                        let mut inventory = self.inventory.write().await;
+                        let result = inventory
+                            .clone()
+                            .clear_usdc_inflight(tracking.source_venue(), now)
+                            .map(InventoryView::clear_active_usdc_rebalance);
+
+                        match result {
+                            Ok(updated) => *inventory = updated,
+                            Err(error) => {
+                                drop(inventory);
+                                // In practice this branch cannot be triggered:
+                                // `clear_usdc_inflight` only fails when the
+                                // resulting inflight would be negative
+                                // (`Inventory::set_inflight` guards against
+                                // this), and zeroing inflight always produces a
+                                // non-negative result. The branch is retained as
+                                // a defensive layer: if a future inventory
+                                // operation can fail, re-inserting tracking
+                                // ensures the next sweep tick retries rather
+                                // than latching the guard forever with no entry
+                                // to re-select.
+                                self.usdc_tracking
+                                    .write()
+                                    .await
+                                    .insert(id.clone(), tracking);
+                                return Err(error.into());
+                            }
+                        }
+                        drop(inventory);
+
+                        self.timed_out_usdc_rebalances
+                            .write()
+                            .await
+                            .insert(id.clone(), now);
+                        return Ok(Some(UsdcTimeoutCleanup::Cleared { tracking, elapsed }));
+                    }
+                    Ok(Some(_) | None) => {
+                        // Guard-holding state or aggregate not yet in store:
+                        // fall through to the timeout gate below.
+                        drop(usdc_store_guard);
+                    }
+                    Err(load_error) => {
+                        // Store read failed (I/O error, deserialization error,
+                        // etc.). Fail safe: preserve the guard so a possibly-
+                        // post-burn rebalance cannot be re-burned. Log so
+                        // operators can diagnose a persistent DB issue rather
+                        // than seeing only "Skipped USDC trigger: already in
+                        // progress" with no cause.
+                        warn!(
+                            target: "rebalance",
+                            id = %id,
+                            ?load_error,
+                            "Failed to load UsdcRebalance from store during \
+                             post-burn sweep; preserving guard"
+                        );
+                        drop(usdc_store_guard);
+                        return Ok(Some(UsdcTimeoutCleanup::PreservedPostBurn {
+                            tracking,
+                            elapsed,
+                        }));
+                    }
+                }
+            }
+
+            // Not yet Reconciled (or store not wired): only transition to
+            // PreservedPostBurn after the timeout has elapsed so we do not log
+            // the "timed out after CCTP burn" error on every sweep tick for a
+            // transfer that is still within its normal window.
+            if elapsed < self.config.transfer_timeout {
+                return Ok(None);
+            }
+
             return Ok(Some(UsdcTimeoutCleanup::PreservedPostBurn {
                 tracking,
                 elapsed,
             }));
+        }
+
+        // Pre-burn path: only act after the timeout has elapsed.
+        if elapsed < self.config.transfer_timeout {
+            return Ok(None);
         }
 
         let mut inventory = self.inventory.write().await;
@@ -2622,6 +2748,7 @@ impl RebalancingService {
         } = interrupted_usdc_rebalance_ids(pool).await?;
 
         let mut held_ids = Vec::new();
+        let mut held_tracking = Vec::new();
         let mut unresolved_ids = Vec::new();
         let mut rearm_candidates = Vec::new();
         for id in candidate_ids {
@@ -2629,6 +2756,49 @@ impl RebalancingService {
                 Ok(Some(entity)) => {
                     if entity.holds_rebalance_guard() {
                         held_ids.push(id.clone());
+
+                        // Reconstruct an in-memory tracking entry for the
+                        // manually-reconcilable guard-holding terminal states
+                        // that cannot self-recover: `DepositFailed`,
+                        // `ConversionFailed { BaseToAlpaca }`, and
+                        // `BridgingFailed { AlpacaToBase, burn_tx=Some }`.
+                        // Seeding tracking for in-progress states or the
+                        // resumable `BridgingFailed { BaseToAlpaca }` would
+                        // wedge their `DepositConfirmed` path, which requires
+                        // `bridged_amount_received` that the seed cannot
+                        // supply. Those states self-recover; only these three
+                        // terminal states need the sweep's durable-state-check
+                        // path to clear the guard after a CLI reconcile.
+                        if let Some((direction, amount, last_progress_at)) =
+                            entity.guard_recovery_tracking_data()
+                        {
+                            held_tracking.push((
+                                id.clone(),
+                                usdc::UsdcRebalanceTracking {
+                                    direction,
+                                    initiated_amount: amount,
+                                    bridged_amount_received: None,
+                                    // All seeded states are post-burn
+                                    // (DepositFailed, ConversionFailed{BtA},
+                                    // BridgingFailed{AtB}), so the sweep takes
+                                    // the durable-state-check path
+                                    // (is_post_burn = true) on every tick.
+                                    stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                                    // Use the aggregate's `failed_at` rather
+                                    // than `Utc::now()` so that a failure which
+                                    // occurred hours before this restart is
+                                    // already past the `transfer_timeout` on the
+                                    // first sweep tick, enabling fast guard
+                                    // recovery without waiting for another full
+                                    // timeout window. The sweep's Reconciled
+                                    // check (which is timeout-independent) fires
+                                    // either way; `failed_at` only affects when
+                                    // the non-Reconciled PreservedPostBurn log
+                                    // is emitted.
+                                    last_progress_at,
+                                },
+                            ));
+                        }
                     }
 
                     if let Some((direction, amount)) = entity.resumable_post_burn_transfer() {
@@ -2686,6 +2856,14 @@ impl RebalancingService {
         }
 
         self.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        // Populate in-memory tracking for each held aggregate so the timeout
+        // sweep can re-derive durable state and clear the guard when the
+        // operator reconciles via the CLI without requiring a restart. Without
+        // these entries the sweep's `usdc_tracking` iteration finds nothing and
+        // `cleanup_timed_out_usdc_rebalance` is never called.
+        self.usdc_tracking.write().await.extend(held_tracking);
+
         error!(
             target: "rebalance",
             held = ?held_ids,
@@ -9816,6 +9994,1253 @@ mod tests {
         );
     }
 
+    /// The main RAI-1017 regression test: the operator runs
+    /// `reconcile-usdc-transfer` in a separate CLI process, which writes
+    /// `OperatorReconciled` to durable storage. The live server's
+    /// `usdc_in_progress` guard must clear on the next sweep tick without
+    /// requiring a restart.
+    #[tokio::test]
+    async fn sweep_clears_guard_after_cli_reconcile_without_restart() {
+        let now = Utc::now();
+        let pool = crate::test_utils::setup_test_db().await;
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        // Drive a BaseToAlpaca aggregate all the way to DepositFailed, then
+        // reconcile it (simulating what the CLI does in a separate process).
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        seed_deposit_failed(
+            &store,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            burn_tx,
+            mint_tx,
+            42,
+        )
+        .await;
+        // Simulate the CLI running in a separate process: write Reconciled to
+        // the durable store. The live reactor never processes this event.
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Build a trigger backed by the same pool and attach the usdc_store so
+        // the sweep can re-derive durable state.
+        // BaseToAlpaca: source venue is MarketMaking (onchain, USDC leaves the
+        // Base chain). Start with 500 available so a 400 inflight fits.
+        // Set active_usdc_rebalance to verify the sweep clears it (finding #9).
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(500), usdc(900))
+            .update_usdc(
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, usdc(400)),
+                now,
+            )
+            .unwrap()
+            .set_active_usdc_rebalance(id.clone());
+        let (trigger, _receiver) = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+
+        trigger
+            .set_stores(
+                Arc::new(test_store::<TokenizedEquityMint>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(store),
+            )
+            .await;
+
+        // Simulate the in-memory state the live server holds: guard is set and
+        // tracking shows a post-burn stage (BridgingInitiated), as it was when
+        // DepositFailed arrived. The CLI's OperatorReconciled event only advanced
+        // the durable store; in-memory state did not change.
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::BaseToAlpaca,
+                initiated_amount: usdc(400),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                last_progress_at: now - ChronoDuration::minutes(31),
+            },
+        );
+
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "sweep must clear the guard when durable state is Reconciled"
+        );
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "sweep must remove tracking when durable state is Reconciled"
+        );
+        assert!(
+            trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "sweep must tombstone the id so late events are ignored"
+        );
+
+        // Source-venue inflight for BaseToAlpaca is MarketMaking (USDC left the
+        // Base chain). The sweep zeroes it via clear_usdc_inflight (inlined in
+        // the Reconciled branch of cleanup_timed_out_usdc_rebalance).
+        // active_usdc_rebalance must also be cleared (invariant from the
+        // pre-burn timeout path; the Reconciled sweep path must match).
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_inflight(Venue::MarketMaking),
+            Some(Usdc::ZERO),
+            "sweep must zero source-venue (MarketMaking) inflight after CLI reconcile"
+        );
+        assert_eq!(
+            inventory.active_usdc_rebalance(),
+            None,
+            "sweep must clear active_usdc_rebalance after CLI reconcile"
+        );
+        drop(inventory);
+    }
+
+    /// Reconciled check fires even when `last_progress_at` is RECENT (within
+    /// `transfer_timeout`). This is the key correctness invariant: a CLI
+    /// `reconcile-usdc-transfer` run before the failure has aged past the
+    /// timeout must still clear the guard on the next sweep tick, not wait
+    /// for the full timeout window to elapse.
+    #[tokio::test]
+    async fn sweep_clears_guard_when_reconciled_before_timeout_expires() {
+        let now = Utc::now();
+        let pool = crate::test_utils::setup_test_db().await;
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000042");
+        let mint_tx =
+            fixed_bytes!("0x4242424242424242424242424242424242424242424242424242424242424242");
+
+        // Drive to DepositFailed then reconcile (simulating CLI in separate
+        // process).
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        seed_deposit_failed(
+            &store,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            burn_tx,
+            mint_tx,
+            0x42,
+        )
+        .await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+                },
+            )
+            .await
+            .unwrap();
+
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(500), usdc(900))
+            .update_usdc(
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, usdc(400)),
+                now,
+            )
+            .unwrap()
+            .set_active_usdc_rebalance(id.clone());
+        let (trigger, _receiver) = make_trigger_with_inventory_config(
+            inventory,
+            // Use a 30-minute timeout so that `last_progress_at = now` is
+            // well within the timeout window, proving the Reconciled check
+            // fires independently of elapsed time.
+            test_config_with_timeout(Duration::from_secs(1800)),
+        )
+        .await;
+
+        trigger
+            .set_stores(
+                Arc::new(test_store::<TokenizedEquityMint>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(store),
+            )
+            .await;
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        // last_progress_at = now: elapsed is ~0, well within the 30-minute
+        // transfer_timeout. The sweep must still detect Reconciled and clear.
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::BaseToAlpaca,
+                initiated_amount: usdc(400),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                last_progress_at: now,
+            },
+        );
+
+        trigger.expire_stuck_usdc_rebalances(now).await.unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "guard must clear even when last_progress_at is recent (within timeout)"
+        );
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "tracking must be removed when Reconciled is detected before timeout"
+        );
+        assert!(
+            trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "id must be tombstoned after Reconciled clear"
+        );
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_inflight(Venue::MarketMaking),
+            Some(Usdc::ZERO),
+            "sweep must zero MarketMaking inflight even when reconciled before timeout"
+        );
+        assert_eq!(
+            inventory.active_usdc_rebalance(),
+            None,
+            "sweep must clear active_usdc_rebalance even when reconciled before timeout"
+        );
+        drop(inventory);
+    }
+
+    /// Guard is preserved when the durable store still shows `DepositFailed`
+    /// (i.e. the CLI has NOT yet reconciled). The narrowed `Reconciled` match
+    /// must not accidentally clear other guard-holding states.
+    #[tokio::test]
+    async fn sweep_preserves_guard_when_store_still_deposit_failed() {
+        let now = Utc::now();
+        let pool = crate::test_utils::setup_test_db().await;
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        // Drive aggregate to DepositFailed but do NOT reconcile it.
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        seed_deposit_failed(
+            &store,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            burn_tx,
+            mint_tx,
+            42,
+        )
+        .await;
+
+        // BaseToAlpaca: source venue is MarketMaking (USDC leaves the Base chain).
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(500), usdc(900))
+            .update_usdc(
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, usdc(400)),
+                now,
+            )
+            .unwrap();
+        let (trigger, _receiver) = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+
+        trigger
+            .set_stores(
+                Arc::new(test_store::<TokenizedEquityMint>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(store),
+            )
+            .await;
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::BaseToAlpaca,
+                initiated_amount: usdc(400),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                last_progress_at: now - ChronoDuration::minutes(31),
+            },
+        );
+
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "guard must stay set when durable state is still DepositFailed"
+        );
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "tracking must be preserved when durable state is still DepositFailed"
+        );
+        assert!(
+            !trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "must not tombstone a genuinely stuck post-burn transfer"
+        );
+
+        // The guard-preserving path must leave source-venue inflight unchanged:
+        // zeroing it here would allow a concurrent transfer to start while the
+        // stuck rebalance is still unresolved.
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_inflight(Venue::MarketMaking),
+            Some(usdc(400)),
+            "guard-preserving path must leave source-venue (MarketMaking) inflight unchanged"
+        );
+        drop(inventory);
+    }
+
+    /// Fail-safe: when `usdc_store` is not attached (None), the sweep must
+    /// preserve the guard and leave inventory inflight untouched. Covers the
+    /// "store not yet wired" case (usdc_store is None).
+    #[tokio::test]
+    async fn sweep_preserves_guard_when_usdc_store_not_set() {
+        let now = Utc::now();
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(100), usdc(900))
+            .update_usdc(
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, usdc(400)),
+                now,
+            )
+            .unwrap();
+        let (trigger, _receiver) = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+        // Do NOT call set_stores -- usdc_store stays None.
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::AlpacaToBase,
+                initiated_amount: usdc(400),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                last_progress_at: now - ChronoDuration::minutes(31),
+            },
+        );
+
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "guard must stay set when usdc_store is not attached"
+        );
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "tracking must be preserved when usdc_store is not attached"
+        );
+
+        // The fail-safe path must not zero inflight: the source-venue USDC
+        // inflight (AlpacaToBase -> Hedging) must remain at its original value.
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_inflight(Venue::Hedging),
+            Some(usdc(400)),
+            "fail-safe path must leave source-venue inflight unchanged"
+        );
+        drop(inventory);
+    }
+
+    /// Idempotency: sweep clears the guard first, then the reactor processes
+    /// the late OperatorReconciled event. Final inventory inflight must still
+    /// be zero (zeroing zero is a no-op).
+    #[tokio::test]
+    async fn sweep_then_reactor_is_idempotent_on_inventory() {
+        let now = Utc::now();
+        let pool = crate::test_utils::setup_test_db().await;
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        // Drive to DepositFailed then Reconciled.
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        seed_deposit_failed(
+            &store,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            burn_tx,
+            mint_tx,
+            42,
+        )
+        .await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+                },
+            )
+            .await
+            .unwrap();
+
+        // BaseToAlpaca: source venue is MarketMaking (onchain, USDC leaves the
+        // Base chain). Start with 500 available so a 400 inflight fits.
+        // Set active_usdc_rebalance to verify the sweep's Reconciled branch
+        // clears it (via clear_active_usdc_rebalance, chained inline).
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(500), usdc(900))
+            .update_usdc(
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, usdc(400)),
+                now,
+            )
+            .unwrap()
+            .set_active_usdc_rebalance(id.clone());
+        let (trigger, _receiver) = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+
+        let store = Arc::new(store);
+        trigger
+            .set_stores(
+                Arc::new(test_store::<TokenizedEquityMint>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::clone(&store),
+            )
+            .await;
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::BaseToAlpaca,
+                initiated_amount: usdc(400),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                last_progress_at: now - ChronoDuration::minutes(31),
+            },
+        );
+
+        // Step 1: sweep clears the guard and zeroes MarketMaking inflight.
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "sweep must clear the guard"
+        );
+        let active_rebalance = trigger
+            .inventory
+            .read()
+            .await
+            .active_usdc_rebalance()
+            .cloned();
+        assert_eq!(
+            active_rebalance, None,
+            "sweep must clear active_usdc_rebalance"
+        );
+
+        // Step 2: the OperatorReconciled event arrives late via the reactor
+        // (simulating a race where the live reactor eventually processes it).
+        // The tombstone guard in on_usdc_rebalance must short-circuit and
+        // return without re-populating tracking or touching inventory.
+        trigger
+            .on_usdc_rebalance(
+                id.clone(),
+                make_usdc_operator_reconciled(RebalanceDirection::BaseToAlpaca),
+            )
+            .await
+            .unwrap();
+
+        // The tombstone causes an early return: tracking is still absent (was
+        // removed by the sweep), and the guard stays clear.
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "tombstone must prevent the late event from re-populating tracking"
+        );
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "tombstone must prevent the late event from re-latching the guard"
+        );
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_inflight(Venue::MarketMaking),
+            Some(Usdc::ZERO),
+            "inflight remains zero: tombstone short-circuit prevents double-clear"
+        );
+        drop(inventory);
+    }
+
+    /// Fail-safe: when `usdc_store` is attached but its `load` returns an
+    /// error (e.g. schema mismatch, I/O failure), the sweep must preserve the
+    /// guard and leave inventory inflight unchanged. A store created without
+    /// migrations will error on every query with "no such table: events".
+    #[tokio::test]
+    async fn sweep_preserves_guard_on_store_load_error() {
+        let now = Utc::now();
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(100), usdc(900))
+            .update_usdc(
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, usdc(400)),
+                now,
+            )
+            .unwrap();
+        let (trigger, _receiver) = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+
+        // Attach a store backed by an unmigrated pool so every `load` call
+        // returns Err("no such table: events"). This exercises the Err arm in
+        // cleanup_timed_out_usdc_rebalance that must preserve the guard.
+        let unmigrated_pool = SqlitePool::connect(":memory:").await.unwrap();
+        trigger
+            .set_stores(
+                Arc::new(test_store::<
+                    crate::tokenized_equity_mint::TokenizedEquityMint,
+                >(
+                    unmigrated_pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
+                    unmigrated_pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<UsdcRebalance>(unmigrated_pool.clone(), ())),
+            )
+            .await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::AlpacaToBase,
+                initiated_amount: usdc(400),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                last_progress_at: now - ChronoDuration::minutes(31),
+            },
+        );
+
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "guard must stay set when store load returns an error"
+        );
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "tracking must be preserved when store load returns an error"
+        );
+
+        // The fail-safe Err arm must not zero inflight: source-venue inflight
+        // (AlpacaToBase -> Hedging) must remain at the original value.
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_inflight(Venue::Hedging),
+            Some(usdc(400)),
+            "fail-safe Err path must leave source-venue inflight unchanged"
+        );
+        drop(inventory);
+    }
+
+    /// AlpacaToBase direction: sweep clears the Hedging-venue inflight when
+    /// durable state is Reconciled, mirroring
+    /// `sweep_clears_guard_after_cli_reconcile_without_restart` for the
+    /// reverse direction. Exercises the `source_venue(AlpacaToBase) = Hedging`
+    /// mapping through the full sweep code path.
+    #[tokio::test]
+    async fn sweep_clears_guard_after_cli_reconcile_alpaca_to_base() {
+        let now = Utc::now();
+        let pool = crate::test_utils::setup_test_db().await;
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000002");
+        let mint_tx =
+            fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
+
+        // Drive an AlpacaToBase aggregate to DepositFailed then Reconciled.
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        seed_deposit_failed(
+            &store,
+            &id,
+            RebalanceDirection::AlpacaToBase,
+            usdc(400),
+            burn_tx,
+            mint_tx,
+            99,
+        )
+        .await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+                },
+            )
+            .await
+            .unwrap();
+
+        // AlpacaToBase: source venue is Hedging (USDC leaves the Alpaca side).
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(100), usdc(900))
+            .update_usdc(
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, usdc(400)),
+                now,
+            )
+            .unwrap()
+            .set_active_usdc_rebalance(id.clone());
+        let (trigger, _receiver) = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+
+        trigger
+            .set_stores(
+                Arc::new(test_store::<
+                    crate::tokenized_equity_mint::TokenizedEquityMint,
+                >(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(store),
+            )
+            .await;
+
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                direction: RebalanceDirection::AlpacaToBase,
+                initiated_amount: usdc(400),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                last_progress_at: now - ChronoDuration::minutes(31),
+            },
+        );
+
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "sweep must clear the guard when durable state is Reconciled (AlpacaToBase)"
+        );
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "sweep must remove tracking when durable state is Reconciled (AlpacaToBase)"
+        );
+        assert!(
+            trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "sweep must tombstone the id so late events are ignored"
+        );
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_inflight(Venue::Hedging),
+            Some(Usdc::ZERO),
+            "sweep must zero Hedging inflight for AlpacaToBase direction"
+        );
+        assert_eq!(
+            inventory.active_usdc_rebalance(),
+            None,
+            "sweep must clear active_usdc_rebalance after reconcile"
+        );
+        drop(inventory);
+    }
+
+    /// Exercises the real restart-then-CLI-reconcile path end-to-end:
+    /// `recover_usdc_guard` seeds tracking for a stranded `DepositFailed`
+    /// aggregate (path 1), then the sweep detects the operator's CLI
+    /// `reconcile-usdc-transfer` via durable `Reconciled` state and clears
+    /// the guard (path 2). Calling `recover_usdc_guard` directly (rather than
+    /// manually planting tracking) ensures both paths are regression-tested
+    /// together: a break in path 1 is caught here, not silently missed.
+    #[tokio::test]
+    async fn sweep_clears_guard_after_restart_then_cli_reconcile() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000003");
+        let mint_tx =
+            fixed_bytes!("0x3333333333333333333333333333333333333333333333333333333333333333");
+
+        // Drive a BaseToAlpaca aggregate to DepositFailed (not yet reconciled).
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        seed_deposit_failed(
+            &store,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            burn_tx,
+            mint_tx,
+            77,
+        )
+        .await;
+
+        // Build a trigger backed by the same pool. BaseToAlpaca: source venue
+        // is MarketMaking (USDC leaves the Base chain).
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(500), usdc(900))
+            .update_usdc(
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, usdc(400)),
+                Utc::now(),
+            )
+            .unwrap()
+            .set_active_usdc_rebalance(id.clone());
+        let (trigger, _receiver) = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+
+        // Call recover_usdc_guard (the real startup path). The aggregate is in
+        // DepositFailed, which holds the guard and seeds tracking.
+        trigger.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        // Path 1: tracking was seeded by recover_usdc_guard for DepositFailed.
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "recover_usdc_guard must seed tracking for DepositFailed so the sweep can run"
+        );
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "recover_usdc_guard must latch the guard for DepositFailed"
+        );
+
+        // The seeded tracking's `last_progress_at` is sourced from
+        // `DepositFailed.failed_at`, which is stamped by the store when the
+        // FailDeposit command above was applied. Passing `Utc::now() + 5s` to
+        // the sweep is therefore sufficient: elapsed = (now + 5s) - failed_at
+        // which is well above the 1s test timeout, regardless of how fast the
+        // store.send calls completed.
+
+        // Simulate the operator running `reconcile-usdc-transfer` in a
+        // separate CLI process (the store emits OperatorReconciled).
+
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+                },
+            )
+            .await
+            .unwrap();
+
+        trigger
+            .set_stores(
+                Arc::new(test_store::<
+                    crate::tokenized_equity_mint::TokenizedEquityMint,
+                >(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::clone(&store),
+            )
+            .await;
+
+        // Path 2: the sweep detects Reconciled durable state and clears the
+        // guard -- no second restart required. Pass a `now` far enough in the
+        // future to exceed the 1-second test timeout (DepositFailed.failed_at
+        // is set to Utc::now() at store.send time, so elapsed = now - failed_at
+        // must be > 1s).
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now() + ChronoDuration::seconds(5))
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "sweep must clear the guard after restart + CLI reconcile, no second restart needed"
+        );
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "sweep must remove tracking after CLI reconcile detected via durable state"
+        );
+        assert!(
+            trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "sweep must tombstone the id so late events are ignored"
+        );
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_inflight(Venue::MarketMaking),
+            Some(Usdc::ZERO),
+            "sweep must zero MarketMaking inflight after CLI reconcile"
+        );
+        assert_eq!(
+            inventory.active_usdc_rebalance(),
+            None,
+            "sweep must clear active_usdc_rebalance after reconcile"
+        );
+        drop(inventory);
+    }
+
+    /// Restart + CLI reconcile for `ConversionFailed{BaseToAlpaca}`:
+    /// the post-deposit USDC->USD conversion failure that holds the guard,
+    /// cannot self-recover, and accepts `reconcile-usdc-transfer`.
+    /// After restart, `recover_usdc_guard` must seed tracking for it so the
+    /// sweep can detect the CLI-emitted `Reconciled` state and clear the guard
+    /// without a second restart.
+    #[tokio::test]
+    async fn sweep_clears_guard_after_restart_then_cli_reconcile_conversion_failed() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000010");
+        let mint_tx =
+            fixed_bytes!("0x1010101010101010101010101010101010101010101010101010101010101010");
+
+        // Drive a BaseToAlpaca aggregate to ConversionFailed.
+        // Path: Initiate -> ConfirmWithdrawal -> InitiateBridging ->
+        //   ReceiveAttestation -> ConfirmBridging -> InitiateDeposit ->
+        //   ConfirmDeposit -> InitiatePostDepositConversion -> FailConversion.
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: usdc(400),
+                    withdrawal: TransferRef::OnchainTx(burn_tx),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .await
+            .unwrap();
+        store
+            .send(&id, UsdcRebalanceCommand::InitiateBridging { burn_tx })
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ReceiveAttestation {
+                    attestation: vec![0x01],
+                    cctp_nonce: alloy::primitives::B256::left_padding_from(&42u64.to_be_bytes()),
+                    message: valid_cctp_message(),
+                    mint_scan_from_block: 100,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmBridging {
+                    mint_tx,
+                    amount_received: usdc(399),
+                    fee_collected: usdc(1),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::InitiateDeposit {
+                    deposit: TransferRef::OnchainTx(mint_tx),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(&id, UsdcRebalanceCommand::ConfirmDeposit)
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::InitiatePostDepositConversion {
+                    order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                    amount: usdc(399),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailConversion {
+                    reason: "conversion rejected".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Build a trigger backed by the same pool. BaseToAlpaca: source venue
+        // is MarketMaking.
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(500), usdc(900))
+            .update_usdc(
+                Inventory::transfer(Venue::MarketMaking, TransferOp::Start, usdc(400)),
+                Utc::now(),
+            )
+            .unwrap()
+            .set_active_usdc_rebalance(id.clone());
+        let (trigger, _receiver) = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+
+        // Simulate restart: recover_usdc_guard must seed tracking for
+        // ConversionFailed(BaseToAlpaca) so the sweep can later detect
+        // a CLI-emitted Reconciled state.
+        trigger.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "recover_usdc_guard must seed tracking for ConversionFailed(BtA)"
+        );
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "recover_usdc_guard must latch the guard for ConversionFailed(BtA)"
+        );
+
+        // Simulate the operator running `reconcile-usdc-transfer` in a
+        // separate CLI process.
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+                },
+            )
+            .await
+            .unwrap();
+
+        trigger
+            .set_stores(
+                Arc::new(test_store::<
+                    crate::tokenized_equity_mint::TokenizedEquityMint,
+                >(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::clone(&store),
+            )
+            .await;
+
+        // The sweep must detect Reconciled and clear the guard -- no second
+        // restart required.
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now() + ChronoDuration::seconds(5))
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "sweep must clear the guard after restart + CLI reconcile for ConversionFailed(BtA)"
+        );
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "sweep must remove tracking after CLI reconcile detected via durable state"
+        );
+        assert!(
+            trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "sweep must tombstone the id so late events are ignored"
+        );
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_inflight(Venue::MarketMaking),
+            Some(Usdc::ZERO),
+            "sweep must zero MarketMaking inflight after CLI reconcile"
+        );
+        assert_eq!(
+            inventory.active_usdc_rebalance(),
+            None,
+            "sweep must clear active_usdc_rebalance after reconcile"
+        );
+        drop(inventory);
+    }
+
+    /// Restart + CLI reconcile for `BridgingFailed{AlpacaToBase, burn_tx=Some}`:
+    /// a non-resumable post-burn failure (the BaseToAlpaca direction is the one
+    /// `resumable_post_burn_transfer` re-arms; AlpacaToBase has no recovery path).
+    /// After restart, `recover_usdc_guard` must seed tracking for it so the sweep
+    /// can detect the CLI-emitted `Reconciled` state and clear the guard without
+    /// a second restart.
+    #[tokio::test]
+    async fn sweep_clears_guard_after_restart_then_cli_reconcile_non_resumable_bridging_failed() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000020");
+
+        // Drive an AlpacaToBase aggregate to BridgingFailed with burn_tx set
+        // (post-burn). Path: Initiate{AtB} -> ConfirmWithdrawal ->
+        // InitiateBridging -> FailBridging.
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: usdc(400),
+                    withdrawal: TransferRef::OnchainTx(burn_tx),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(&id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .await
+            .unwrap();
+        store
+            .send(&id, UsdcRebalanceCommand::InitiateBridging { burn_tx })
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "attestation timed out, AlpacaToBase has no recovery path".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // AlpacaToBase: source venue is Hedging.
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(900), usdc(500))
+            .update_usdc(
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, usdc(400)),
+                Utc::now(),
+            )
+            .unwrap()
+            .set_active_usdc_rebalance(id.clone());
+        let (trigger, _receiver) = make_trigger_with_inventory_config(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(1)),
+        )
+        .await;
+
+        // Simulate restart: recover_usdc_guard must seed tracking for this
+        // non-resumable BridgingFailed and must NOT enqueue a recovery job
+        // (that would be the BaseToAlpaca resumable path).
+        trigger.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "recover_usdc_guard must seed tracking for BridgingFailed(AlpacaToBase, burn_tx=Some)"
+        );
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "recover_usdc_guard must latch the guard for BridgingFailed(AlpacaToBase)"
+        );
+        // No recovery job must be enqueued: AlpacaToBase is not in
+        // resumable_post_burn_transfer.
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0,
+            "non-resumable AlpacaToBase BridgingFailed must not be re-armed"
+        );
+
+        // Simulate the operator running `reconcile-usdc-transfer` in a
+        // separate CLI process.
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+                },
+            )
+            .await
+            .unwrap();
+
+        trigger
+            .set_stores(
+                Arc::new(test_store::<
+                    crate::tokenized_equity_mint::TokenizedEquityMint,
+                >(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<crate::equity_redemption::EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::clone(&store),
+            )
+            .await;
+
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now() + ChronoDuration::seconds(5))
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "sweep must clear the guard after restart + CLI reconcile for \
+             BridgingFailed(AlpacaToBase)"
+        );
+        assert!(
+            !trigger.usdc_tracking.read().await.contains_key(&id),
+            "sweep must remove tracking after CLI reconcile detected via durable state"
+        );
+        assert!(
+            trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "sweep must tombstone the id so late events are ignored"
+        );
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_inflight(Venue::Hedging),
+            Some(Usdc::ZERO),
+            "sweep must zero Hedging inflight after CLI reconcile for AlpacaToBase"
+        );
+        assert_eq!(
+            inventory.active_usdc_rebalance(),
+            None,
+            "sweep must clear active_usdc_rebalance after reconcile"
+        );
+        drop(inventory);
+    }
+
+    /// `BridgingFailed{BaseToAlpaca, burn_tx=Some}` is resumable and must NOT
+    /// be seeded with tracking on restart: `recover_usdc_guard` re-arms it via
+    /// `resumable_post_burn_transfer`, and seeding it would wedge the re-armed
+    /// job's `DepositConfirmed` path (which requires `bridged_amount_received`).
+    #[tokio::test]
+    async fn resumable_post_burn_bridging_failed_is_not_seeded_with_tracking() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000030");
+
+        // Drive a BaseToAlpaca aggregate to BridgingFailed with burn_tx set.
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        seed_post_burn_bridging_failed(
+            &store,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            usdc(400),
+            burn_tx,
+        )
+        .await;
+
+        let (service, _receiver) = make_trigger_with_inventory(InventoryView::default()).await;
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        // The resumable BridgingFailed must NOT produce a tracking entry -- it
+        // self-recovers via the re-armed job.
+        assert!(
+            !service.usdc_tracking.read().await.contains_key(&id),
+            "resumable BridgingFailed(BaseToAlpaca) must not be seeded with tracking"
+        );
+        // It MUST produce a recovery job (re-armed via resumable_post_burn_transfer).
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&service).await,
+            1,
+            "resumable BridgingFailed(BaseToAlpaca) must be re-armed as a hedging job"
+        );
+    }
+
     #[tokio::test]
     async fn post_burn_usdc_timeout_logs_once_across_sweeps() {
         let now = Utc::now();
@@ -9999,6 +11424,85 @@ mod tests {
                 id,
                 UsdcRebalanceCommand::TimeoutAttestation {
                     retry_deadline_at: Utc::now() + chrono::Duration::hours(1),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Drives a `UsdcRebalance` aggregate from `Uninitialized` all the way to
+    /// `DepositFailed` via the standard 7-step post-burn path. Used by sweep
+    /// tests that need a stranded post-deposit failure in the durable store.
+    ///
+    /// `cctp_nonce_seed` must be unique per test to avoid aggregate conflicts
+    /// on the shared SQLite pool.
+    async fn seed_deposit_failed(
+        store: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        direction: RebalanceDirection,
+        amount: Usdc,
+        burn_tx: TxHash,
+        mint_tx: TxHash,
+        cctp_nonce_seed: u64,
+    ) {
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::Initiate {
+                    direction,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(burn_tx),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .await
+            .unwrap();
+        store
+            .send(id, UsdcRebalanceCommand::InitiateBridging { burn_tx })
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::ReceiveAttestation {
+                    attestation: vec![0x01],
+                    cctp_nonce: alloy::primitives::B256::left_padding_from(
+                        &cctp_nonce_seed.to_be_bytes(),
+                    ),
+                    message: valid_cctp_message(),
+                    mint_scan_from_block: 100,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::ConfirmBridging {
+                    mint_tx,
+                    amount_received: usdc(399),
+                    fee_collected: usdc(1),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::InitiateDeposit {
+                    deposit: TransferRef::OnchainTx(mint_tx),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                UsdcRebalanceCommand::FailDeposit {
+                    reason: "deposit rejected".to_string(),
                 },
             )
             .await

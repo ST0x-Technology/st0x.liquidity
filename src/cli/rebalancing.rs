@@ -528,7 +528,8 @@ pub(super) async fn reconcile_usdc_transfer_command<Writer: Write>(
     writeln!(
         stdout,
         "Reconciled USDC transfer {id} (reason: {reason:?}); the in-progress guard will clear \
-         and USDC rebalancing resumes."
+         on the next sweep tick (within transfer_timeout) and USDC rebalancing will resume \
+         without a restart."
     )?;
 
     Ok(())

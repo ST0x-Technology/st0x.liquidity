@@ -1061,7 +1061,11 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             .await?;
 
         rebalancing_service
-            .set_stores(built.mint.clone(), built.redemption.clone())
+            .set_stores(
+                built.mint.clone(),
+                built.redemption.clone(),
+                built.usdc.clone(),
+            )
             .await;
 
         let recovery_transfer = Arc::new(CrossVenueEquityTransfer::new(
