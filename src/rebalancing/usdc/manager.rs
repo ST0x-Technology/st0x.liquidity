@@ -1,5 +1,7 @@
 //! [`CrossVenueCashTransfer`] orchestrates USDC cross-venue transfers.
 //!
+// WIP: RAI-1018 gate AlpacaToBase CCTP burn on on-chain USDC settlement
+//!
 //! Coordinates between `AlpacaBrokerApi`, `AlpacaWalletService`,
 //! `CctpBridge`, `RaindexService`, and the `UsdcRebalance` aggregate to
 //! execute USDC transfers between Alpaca and Base.
