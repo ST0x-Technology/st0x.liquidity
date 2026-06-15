@@ -69,6 +69,18 @@ pub struct Position {
     /// re-accumulating every historical trade id.
     #[serde(default)]
     pub pending_acknowledged_trade_ids: BTreeSet<TradeId>,
+    /// Reorg reversals applied to the position but whose `OnChainTrade`
+    /// reorg-acknowledgement marker is not yet settle-pruned (ADR 0012). The
+    /// reorg twin of `pending_acknowledged_trade_ids`: the single slot
+    /// `last_reorged_trade_id` only remembers the LAST reversed trade, so a
+    /// crash-resumed re-drive of an older reorg -- after a newer reorg of the
+    /// same symbol advanced the slot -- slips past the slot and double-reverses
+    /// `net`. This set, fed by the `Reorged` evolve and pruned by `SettleReorg`
+    /// once the reorg-ack marker is durable, rejects such a re-drive regardless
+    /// of how many reorgs intervened. Bounded: empty at rest, one entry per
+    /// in-flight reversal, and reorgs are rare.
+    #[serde(default)]
+    pub pending_reorged_trade_ids: BTreeSet<TradeId>,
     pub threshold: ExecutionThreshold,
     #[serde(
         serialize_with = "st0x_float_serde::serialize_option_float",
@@ -83,6 +95,16 @@ pub struct Position {
     /// field existed, which is the never-reorged default.
     #[serde(default)]
     pub last_reorged_at: Option<DateTime<Utc>>,
+    /// The most recently reversed fill (single slot). Retained as the
+    /// zero-migration cross-upgrade bridge alongside `pending_reorged_trade_ids`
+    /// (ADR 0012, mirroring ADR 0010 for fills): a reorg reversed under
+    /// pre-`pending_reorged_trade_ids` code but left unsettled at the deploy
+    /// restart has no set entry to guard it, so this slot -- still written by the
+    /// `Reorged` evolve -- equals that trade and rejects its re-drive. The set
+    /// closes the out-of-order re-drive the slot alone cannot, once a newer reorg
+    /// of the same symbol advances the slot past the older trade.
+    #[serde(default)]
+    pub last_reorged_trade_id: Option<TradeId>,
 }
 
 impl std::fmt::Debug for Position {
@@ -105,10 +127,12 @@ impl std::fmt::Debug for Position {
                 "pending_acknowledged_trade_ids",
                 &self.pending_acknowledged_trade_ids,
             )
+            .field("pending_reorged_trade_ids", &self.pending_reorged_trade_ids)
             .field("threshold", &self.threshold)
             .field("last_price_usdc", &DebugOptionFloat(&self.last_price_usdc))
             .field("last_updated", &self.last_updated)
             .field("last_reorged_at", &self.last_reorged_at)
+            .field("last_reorged_trade_id", &self.last_reorged_trade_id)
             .finish()
     }
 }
@@ -160,7 +184,7 @@ impl EventSourced for Position {
 
     const AGGREGATE_TYPE: &'static str = "Position";
     const PROJECTION: Table = Table("position_view");
-    const SCHEMA_VERSION: u64 = 4;
+    const SCHEMA_VERSION: u64 = 5;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use PositionEvent::*;
@@ -178,10 +202,12 @@ impl EventSourced for Position {
                 last_failed_offchain_order_id: None,
                 last_acknowledged_trade_id: None,
                 pending_acknowledged_trade_ids: BTreeSet::new(),
+                pending_reorged_trade_ids: BTreeSet::new(),
                 threshold: *threshold,
                 last_price_usdc: None,
                 last_updated: Some(*initialized_at),
                 last_reorged_at: None,
+                last_reorged_trade_id: None,
             }),
 
             _ => None,
@@ -274,7 +300,11 @@ impl EventSourced for Position {
             // the anchor would leave the trade_id in the set and keep rejecting the
             // re-confirmation. Clearing the anchor unconditionally would instead
             // drop a more recent fill's anchor when an older fill is reorged,
-            // reopening that newer fill's crash-window replay.
+            // reopening that newer fill's crash-window replay. Set
+            // `last_reorged_trade_id` and insert into `pending_reorged_trade_ids`
+            // so a re-driven reorg of the same trade is rejected -- the slot
+            // covers the most-recent re-drive, the bounded set covers an
+            // out-of-order one after a newer reorg advanced the slot (ADR 0012).
             Reorged {
                 trade_id,
                 direction: Buy,
@@ -285,6 +315,8 @@ impl EventSourced for Position {
                 let mut pending_acknowledged_trade_ids =
                     entity.pending_acknowledged_trade_ids.clone();
                 pending_acknowledged_trade_ids.remove(trade_id);
+                let mut pending_reorged_trade_ids = entity.pending_reorged_trade_ids.clone();
+                pending_reorged_trade_ids.insert(trade_id.clone());
                 Ok(Some(Self {
                     net: (entity.net - *amount)?,
                     accumulated_long: (entity.accumulated_long - *amount)?,
@@ -293,7 +325,9 @@ impl EventSourced for Position {
                         .last_acknowledged_trade_id
                         .clone()
                         .filter(|id| id != trade_id),
+                    last_reorged_trade_id: Some(trade_id.clone()),
                     pending_acknowledged_trade_ids,
+                    pending_reorged_trade_ids,
                     last_updated: Some(*reorged_at),
                     ..entity.clone()
                 }))
@@ -309,6 +343,8 @@ impl EventSourced for Position {
                 let mut pending_acknowledged_trade_ids =
                     entity.pending_acknowledged_trade_ids.clone();
                 pending_acknowledged_trade_ids.remove(trade_id);
+                let mut pending_reorged_trade_ids = entity.pending_reorged_trade_ids.clone();
+                pending_reorged_trade_ids.insert(trade_id.clone());
                 Ok(Some(Self {
                     net: (entity.net + *amount)?,
                     accumulated_short: (entity.accumulated_short - *amount)?,
@@ -317,8 +353,22 @@ impl EventSourced for Position {
                         .last_acknowledged_trade_id
                         .clone()
                         .filter(|id| id != trade_id),
+                    last_reorged_trade_id: Some(trade_id.clone()),
                     pending_acknowledged_trade_ids,
+                    pending_reorged_trade_ids,
                     last_updated: Some(*reorged_at),
+                    ..entity.clone()
+                }))
+            }
+
+            // Bookkeeping only (ADR 0012): prune the settled reversal from the
+            // pending-reorg set without touching net -- the reversal already
+            // happened in the `Reorged` event. Mirrors `OnChainFillSettled`.
+            ReorgSettled { trade_id, .. } => {
+                let mut pending_reorged_trade_ids = entity.pending_reorged_trade_ids.clone();
+                pending_reorged_trade_ids.remove(trade_id);
+                Ok(Some(Self {
+                    pending_reorged_trade_ids,
                     ..entity.clone()
                 }))
             }
@@ -501,9 +551,10 @@ impl EventSourced for Position {
                 seen_at,
             )),
 
-            // Pruning a fill the position never applied is a no-op; never
-            // initialize the aggregate just to settle an absent trade.
-            SettleOnChainFill { .. } => Ok(vec![]),
+            // Pruning a fill or reorg the position never applied/reversed is a
+            // no-op (ADR 0010 fills, ADR 0012 reorgs); never initialize the
+            // aggregate just to settle an absent trade.
+            SettleOnChainFill { .. } | SettleReorg { .. } => Ok(vec![]),
 
             ManuallyAdjustPosition {
                 symbol,
@@ -606,6 +657,7 @@ impl EventSourced for Position {
                 trade_id,
                 amount,
                 direction,
+                price_usdc,
                 reorg_depth,
             } => {
                 // A reversal must undo a real (strictly positive) fill amount.
@@ -614,10 +666,26 @@ impl EventSourced for Position {
                 Positive::new(amount)
                     .map_err(|_| PositionError::NonPositiveReorgAmount { amount })?;
 
+                // Dual guard (ADR 0012, mirroring ADR 0010 for fills): the
+                // retained slot bridges a reorg reversed under pre-set code and
+                // left unsettled at the deploy restart; the set rejects an
+                // out-of-order re-drive the single slot cannot, because a newer
+                // reorg advances the slot but never the set entry.
+                if self.last_reorged_trade_id.as_ref() == Some(&trade_id)
+                    || self.pending_reorged_trade_ids.contains(&trade_id)
+                {
+                    warn!(
+                        target: "hedge",
+                        symbol = %self.symbol, %trade_id,
+                        "Rejecting re-driven reorg: fill already reversed on this position"
+                    );
+                    return Err(PositionError::DuplicateReorg { trade_id });
+                }
+
                 warn!(
                     target: "hedge",
                     symbol = %self.symbol,
-                    ?trade_id,
+                    %trade_id,
                     ?direction,
                     %amount,
                     reorg_depth,
@@ -628,9 +696,21 @@ impl EventSourced for Position {
                     trade_id,
                     amount,
                     direction,
+                    price_usdc: Some(price_usdc),
                     reorg_depth,
                     reorged_at: Utc::now(),
                 }])
+            }
+
+            SettleReorg { trade_id } => {
+                if self.pending_reorged_trade_ids.contains(&trade_id) {
+                    Ok(vec![PositionEvent::ReorgSettled {
+                        trade_id,
+                        settled_at: Utc::now(),
+                    }])
+                } else {
+                    Ok(vec![])
+                }
             }
 
             PlaceOffChainOrder {
@@ -1072,6 +1152,11 @@ pub enum PositionError {
     )]
     DuplicateTrade { trade_id: TradeId },
     #[error(
+        "Cannot record reorg: trade {trade_id} \
+         was already reversed on this position"
+    )]
+    DuplicateReorg { trade_id: TradeId },
+    #[error(
         "Cannot manually adjust position: already have \
          pending execution {offchain_order_id:?}"
     )]
@@ -1157,13 +1242,22 @@ pub enum PositionCommand {
         trade_id: TradeId,
     },
     /// Reverses an onchain fill that a reorg invalidated. Carries the original
-    /// fill's `amount` and `direction` so the reversal undoes exactly its
-    /// position impact; `reorg_depth` is retained for the audit trail.
+    /// fill's `amount`, `direction`, and `price_usdc` so the reversal undoes
+    /// exactly its position impact and the reactor can reverse the inventory's
+    /// equity and USDC legs; `reorg_depth` is retained for the audit trail.
     RecordReorg {
         trade_id: TradeId,
         amount: FractionalShares,
         direction: Direction,
+        price_usdc: Float,
         reorg_depth: u64,
+    },
+    /// Prunes `trade_id` from `pending_reorged_trade_ids` after its
+    /// `OnChainTrade` reorg-ack marker is durable (ADR 0012). A no-op (emits no
+    /// events) when the trade is not in the set, so a re-driven prune is
+    /// idempotent and optimistic-concurrency-safe.
+    SettleReorg {
+        trade_id: TradeId,
     },
     PlaceOffChainOrder {
         offchain_order_id: OffchainOrderId,
@@ -1264,8 +1358,26 @@ pub enum PositionEvent {
         trade_id: TradeId,
         amount: FractionalShares,
         direction: Direction,
+        /// `Option` for replay safety: a `Reorged` event persisted before the
+        /// reactor carried the price has no `price_usdc`, and
+        /// deserializes to `None`. The reactor falls back to nudging an equity
+        /// check for those rather than reversing the inventory's USDC leg with a
+        /// fabricated price.
+        #[serde(
+            default,
+            serialize_with = "st0x_float_serde::serialize_option_float",
+            deserialize_with = "st0x_float_serde::deserialize_option_float_from_number_or_string"
+        )]
+        price_usdc: Option<Float>,
         reorg_depth: u64,
         reorged_at: DateTime<Utc>,
+    },
+    /// Prunes `trade_id` from `pending_reorged_trade_ids` once its `OnChainTrade`
+    /// reorg-ack marker is durable (ADR 0012). The reorg twin of
+    /// `OnChainFillSettled`.
+    ReorgSettled {
+        trade_id: TradeId,
+        settled_at: DateTime<Utc>,
     },
     OffChainOrderPlaced {
         offchain_order_id: OffchainOrderId,
@@ -1322,7 +1434,7 @@ impl PositionEvent {
             Initialized { initialized_at, .. } => *initialized_at,
             OnChainOrderFilled { seen_at, .. } => *seen_at,
             OnChainFillApplied { applied_at, .. } => *applied_at,
-            OnChainFillSettled { settled_at, .. } => *settled_at,
+            OnChainFillSettled { settled_at, .. } | ReorgSettled { settled_at, .. } => *settled_at,
             Reorged { reorged_at, .. } => *reorged_at,
             OffChainOrderPlaced { placed_at, .. } => *placed_at,
             OffChainOrderFilled {
@@ -1345,6 +1457,7 @@ impl DomainEvent for PositionEvent {
             OnChainFillApplied { .. } => "PositionEvent::OnChainFillApplied".to_string(),
             OnChainFillSettled { .. } => "PositionEvent::OnChainFillSettled".to_string(),
             Reorged { .. } => "PositionEvent::Reorged".to_string(),
+            ReorgSettled { .. } => "PositionEvent::ReorgSettled".to_string(),
             OffChainOrderPlaced { .. } => "PositionEvent::OffChainOrderPlaced".to_string(),
             OffChainOrderFilled { .. } => "PositionEvent::OffChainOrderFilled".to_string(),
             OffChainOrderFailed { .. } => "PositionEvent::OffChainOrderFailed".to_string(),
@@ -1440,6 +1553,7 @@ impl PartialEq for PositionEvent {
                     trade_id: left_trade_id,
                     amount: left_amount,
                     direction: left_direction,
+                    price_usdc: left_price_usdc,
                     reorg_depth: left_reorg_depth,
                     reorged_at: left_reorged_at,
                 },
@@ -1447,6 +1561,7 @@ impl PartialEq for PositionEvent {
                     trade_id: right_trade_id,
                     amount: right_amount,
                     direction: right_direction,
+                    price_usdc: right_price_usdc,
                     reorg_depth: right_reorg_depth,
                     reorged_at: right_reorged_at,
                 },
@@ -1454,9 +1569,20 @@ impl PartialEq for PositionEvent {
                 left_trade_id == right_trade_id
                     && left_amount == right_amount
                     && left_direction == right_direction
+                    && option_float_eq(*left_price_usdc, *right_price_usdc)
                     && left_reorg_depth == right_reorg_depth
                     && left_reorged_at == right_reorged_at
             }
+            (
+                Self::ReorgSettled {
+                    trade_id: left_trade_id,
+                    settled_at: left_settled_at,
+                },
+                Self::ReorgSettled {
+                    trade_id: right_trade_id,
+                    settled_at: right_settled_at,
+                },
+            ) => left_trade_id == right_trade_id && left_settled_at == right_settled_at,
             (
                 Self::OffChainOrderPlaced {
                     offchain_order_id: o1,
@@ -1692,13 +1818,19 @@ impl std::fmt::Debug for PositionCommand {
                 trade_id,
                 amount,
                 direction,
+                price_usdc,
                 reorg_depth,
             } => f
                 .debug_struct("RecordReorg")
                 .field("trade_id", trade_id)
                 .field("amount", amount)
                 .field("direction", direction)
+                .field("price_usdc", &DebugFloat(price_usdc))
                 .field("reorg_depth", reorg_depth)
+                .finish(),
+            Self::SettleReorg { trade_id } => f
+                .debug_struct("SettleReorg")
+                .field("trade_id", trade_id)
                 .finish(),
             Self::PlaceOffChainOrder {
                 offchain_order_id,
@@ -1840,6 +1972,7 @@ impl std::fmt::Debug for PositionEvent {
                 trade_id,
                 amount,
                 direction,
+                price_usdc,
                 reorg_depth,
                 reorged_at,
             } => f
@@ -1847,8 +1980,17 @@ impl std::fmt::Debug for PositionEvent {
                 .field("trade_id", trade_id)
                 .field("amount", amount)
                 .field("direction", direction)
+                .field("price_usdc", &DebugOptionFloat(price_usdc))
                 .field("reorg_depth", reorg_depth)
                 .field("reorged_at", reorged_at)
+                .finish(),
+            Self::ReorgSettled {
+                trade_id,
+                settled_at,
+            } => f
+                .debug_struct("ReorgSettled")
+                .field("trade_id", trade_id)
+                .field("settled_at", settled_at)
                 .finish(),
             Self::OffChainOrderPlaced {
                 offchain_order_id,
@@ -2115,6 +2257,7 @@ mod tests {
                 trade_id: trade_id.clone(),
                 amount: FractionalShares::new(float!(5)),
                 direction: Direction::Buy,
+                price_usdc: float!(150),
                 reorg_depth: 2,
             })
             .await
@@ -2125,6 +2268,7 @@ mod tests {
                 trade_id: reorged_trade_id,
                 amount,
                 direction,
+                price_usdc,
                 reorg_depth,
                 ..
             },
@@ -2148,6 +2292,10 @@ mod tests {
             "direction drives the reversal sign"
         );
         assert_eq!(*reorg_depth, 2);
+        assert!(
+            option_float_eq(*price_usdc, Some(float!(150))),
+            "the reorged event must carry the fill price for the USDC reversal"
+        );
     }
 
     #[tokio::test]
@@ -2179,6 +2327,7 @@ mod tests {
                 trade_id,
                 amount: FractionalShares::ZERO,
                 direction: Direction::Buy,
+                price_usdc: float!(150),
                 reorg_depth: 2,
             })
             .await
@@ -2222,6 +2371,7 @@ mod tests {
                 trade_id,
                 amount: FractionalShares::new(float!(5)),
                 direction: Direction::Buy,
+                price_usdc: Some(float!(150)),
                 reorg_depth: 2,
                 reorged_at: now,
             },
@@ -2264,6 +2414,7 @@ mod tests {
                 trade_id,
                 amount: FractionalShares::new(float!(5)),
                 direction: Direction::Sell,
+                price_usdc: Some(float!(150)),
                 reorg_depth: 1,
                 reorged_at: now,
             },
@@ -2320,6 +2471,7 @@ mod tests {
                 trade_id: reorged_trade,
                 amount: FractionalShares::new(float!(5)),
                 direction: Direction::Buy,
+                price_usdc: Some(float!(150)),
                 reorg_depth: 1,
                 reorged_at: now,
             },
@@ -2375,6 +2527,7 @@ mod tests {
                     trade_id: trade_id.clone(),
                     amount,
                     direction: Direction::Buy,
+                    price_usdc: Some(float!(150)),
                     reorg_depth: 1,
                     reorged_at: now,
                 },
@@ -2450,6 +2603,7 @@ mod tests {
                     trade_id: older.clone(),
                     amount,
                     direction: Direction::Buy,
+                    price_usdc: Some(float!(150)),
                     reorg_depth: 1,
                     reorged_at: now,
                 },
@@ -2490,6 +2644,7 @@ mod tests {
                 },
                 amount: FractionalShares::new(float!(5)),
                 direction: Direction::Buy,
+                price_usdc: float!(150),
                 reorg_depth: 1,
             })
             .await
@@ -2499,6 +2654,175 @@ mod tests {
             error,
             LifecycleError::Apply(PositionError::Uninitialized)
         ));
+    }
+
+    /// Defense in depth (ADR 0012): a reorg re-driven for a `trade_id` the
+    /// position already reversed must be rejected, not double-reverse `net`.
+    #[tokio::test]
+    async fn cannot_reorg_same_trade_twice() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let trade_id = TradeId {
+            tx_hash: TxHash::random(),
+            log_index: 1,
+        };
+
+        let error = TestHarness::<Position>::with(())
+            .given(vec![
+                PositionEvent::Initialized {
+                    symbol,
+                    threshold: one_share_threshold(),
+                    initialized_at: now,
+                },
+                PositionEvent::OnChainOrderFilled {
+                    trade_id: trade_id.clone(),
+                    amount: FractionalShares::new(float!(5)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: now,
+                    seen_at: now,
+                },
+                PositionEvent::Reorged {
+                    trade_id: trade_id.clone(),
+                    amount: FractionalShares::new(float!(5)),
+                    direction: Direction::Buy,
+                    price_usdc: Some(float!(150)),
+                    reorg_depth: 1,
+                    reorged_at: now,
+                },
+            ])
+            .when(PositionCommand::RecordReorg {
+                trade_id,
+                amount: FractionalShares::new(float!(5)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                reorg_depth: 1,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(PositionError::DuplicateReorg { .. })
+        ));
+    }
+
+    /// The pending-reorg set rejects an out-of-order re-drive the single slot
+    /// cannot (ADR 0012): reorg B is reversed, then a newer reorg C of the same
+    /// symbol completes and advances the slot to C, but the set still holds B. A
+    /// re-driven reorg of B is then caught by the SET, not the slot. Remove the
+    /// set check from the RecordReorg guard and this fails.
+    #[tokio::test]
+    async fn out_of_order_reorg_redrive_rejected_by_pending_set() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let trade_b = TradeId {
+            tx_hash: TxHash::random(),
+            log_index: 1,
+        };
+        let trade_c = TradeId {
+            tx_hash: TxHash::random(),
+            log_index: 2,
+        };
+        let amount = FractionalShares::new(float!(5));
+
+        let error = TestHarness::<Position>::with(())
+            .given(vec![
+                PositionEvent::Initialized {
+                    symbol: symbol.clone(),
+                    threshold: one_share_threshold(),
+                    initialized_at: now,
+                },
+                PositionEvent::OnChainOrderFilled {
+                    trade_id: trade_b.clone(),
+                    amount,
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: now,
+                    seen_at: now,
+                },
+                PositionEvent::OnChainOrderFilled {
+                    trade_id: trade_c.clone(),
+                    amount,
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: now,
+                    seen_at: now,
+                },
+                PositionEvent::Reorged {
+                    trade_id: trade_b.clone(),
+                    amount,
+                    direction: Direction::Buy,
+                    price_usdc: Some(float!(150)),
+                    reorg_depth: 1,
+                    reorged_at: now,
+                },
+                PositionEvent::Reorged {
+                    trade_id: trade_c.clone(),
+                    amount,
+                    direction: Direction::Buy,
+                    price_usdc: Some(float!(150)),
+                    reorg_depth: 1,
+                    reorged_at: now,
+                },
+            ])
+            .when(PositionCommand::RecordReorg {
+                trade_id: trade_b.clone(),
+                amount,
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                reorg_depth: 1,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(PositionError::DuplicateReorg {
+                    trade_id: ref rejected
+                }) if *rejected == trade_b
+            ),
+            "an older reorged trade must be rejected by the pending-reorg set even \
+             after a newer reorg advanced the slot; got: {error:?}",
+        );
+    }
+
+    /// Replay safety (ADR 0012): a `Reorged` event persisted before `price_usdc`
+    /// was added (by the basic detect-and-reverse slice) must deserialize with
+    /// `price_usdc: None`, not fail replay. The reactor then nudges instead of
+    /// reversing the inventory's USDC leg with a fabricated price.
+    #[test]
+    fn reorged_event_without_price_usdc_deserializes_to_none() {
+        let now = Utc::now();
+        let event = PositionEvent::Reorged {
+            trade_id: TradeId {
+                tx_hash: TxHash::ZERO,
+                log_index: 1,
+            },
+            amount: FractionalShares::new(float!(5)),
+            direction: Direction::Buy,
+            price_usdc: Some(float!(150)),
+            reorg_depth: 1,
+            reorged_at: now,
+        };
+
+        let mut json = serde_json::to_value(&event).unwrap();
+        json["Reorged"]
+            .as_object_mut()
+            .unwrap()
+            .remove("price_usdc")
+            .expect("premise: a current Reorged event carries price_usdc");
+
+        let restored: PositionEvent = serde_json::from_value(json).unwrap();
+        let PositionEvent::Reorged { price_usdc, .. } = restored else {
+            panic!("expected Reorged, got {restored:?}");
+        };
+
+        assert!(
+            price_usdc.is_none(),
+            "a legacy Reorged event without price_usdc must replay as None",
+        );
     }
 
     /// The `position_view.last_reorged_at` column is `json_extract(payload,
@@ -2538,6 +2862,7 @@ mod tests {
                 trade_id,
                 amount: FractionalShares::new(float!(5)),
                 direction: Direction::Buy,
+                price_usdc: Some(float!(150)),
                 reorg_depth: 1,
                 reorged_at,
             },
@@ -2860,6 +3185,138 @@ mod tests {
         assert!(
             events.is_empty(),
             "Settling an absent trade must emit no events"
+        );
+    }
+
+    /// SettleReorg emits ReorgSettled when the trade is in the pending-reorg set
+    /// (ADR 0012, the reorg twin of `settle_emits_settled_when_member`).
+    #[tokio::test]
+    async fn settle_reorg_emits_reorg_settled_when_member() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let trade_id = TradeId {
+            tx_hash: TxHash::random(),
+            log_index: 1,
+        };
+        let amount = FractionalShares::new(float!(5));
+
+        let events = TestHarness::<Position>::with(())
+            .given(vec![
+                PositionEvent::Initialized {
+                    symbol: symbol.clone(),
+                    threshold: one_share_threshold(),
+                    initialized_at: now,
+                },
+                PositionEvent::OnChainOrderFilled {
+                    trade_id: trade_id.clone(),
+                    amount,
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: now,
+                    seen_at: now,
+                },
+                PositionEvent::Reorged {
+                    trade_id: trade_id.clone(),
+                    amount,
+                    direction: Direction::Buy,
+                    price_usdc: Some(float!(150)),
+                    reorg_depth: 1,
+                    reorged_at: now,
+                },
+            ])
+            .when(PositionCommand::SettleReorg {
+                trade_id: trade_id.clone(),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            PositionEvent::ReorgSettled { trade_id: settled, .. }
+                if *settled == trade_id
+        ));
+    }
+
+    /// The ReorgSettled evolve prunes the trade from the bounded pending-reorg
+    /// set (ADR 0012); the retained slot still guards the most-recent reversal.
+    #[test]
+    fn reorg_settled_prunes_pending_reorged_set() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let trade_id = TradeId {
+            tx_hash: TxHash::random(),
+            log_index: 1,
+        };
+        let amount = FractionalShares::new(float!(5));
+
+        let position = replay::<Position>(vec![
+            PositionEvent::Initialized {
+                symbol,
+                threshold: one_share_threshold(),
+                initialized_at: now,
+            },
+            PositionEvent::OnChainOrderFilled {
+                trade_id: trade_id.clone(),
+                amount,
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp: now,
+                seen_at: now,
+            },
+            PositionEvent::Reorged {
+                trade_id: trade_id.clone(),
+                amount,
+                direction: Direction::Buy,
+                price_usdc: Some(float!(150)),
+                reorg_depth: 1,
+                reorged_at: now,
+            },
+            PositionEvent::ReorgSettled {
+                trade_id: trade_id.clone(),
+                settled_at: now,
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert!(
+            position.pending_reorged_trade_ids.is_empty(),
+            "ReorgSettled must prune the reversed trade from the pending-reorg \
+             set; got: {:?}",
+            position.pending_reorged_trade_ids,
+        );
+        assert_eq!(
+            position.last_reorged_trade_id,
+            Some(trade_id),
+            "the retained slot still guards the most-recent reversal after settle",
+        );
+    }
+
+    /// SettleReorg for a trade not in the pending-reorg set is a no-op: zero
+    /// events, so a re-driven prune is idempotent and optimistic-concurrency-safe.
+    #[tokio::test]
+    async fn settle_reorg_is_noop_when_not_member() {
+        let threshold = one_share_threshold();
+
+        let events = TestHarness::<Position>::with(())
+            .given(vec![PositionEvent::Initialized {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold,
+                initialized_at: Utc::now(),
+            }])
+            .when(PositionCommand::SettleReorg {
+                trade_id: TradeId {
+                    tx_hash: TxHash::random(),
+                    log_index: 99,
+                },
+            })
+            .await
+            .events();
+
+        assert!(
+            events.is_empty(),
+            "Settling an absent reorg must emit no events"
         );
     }
 
@@ -4224,6 +4681,7 @@ mod tests {
             },
             amount: FractionalShares::new(float!(5)),
             direction: Direction::Buy,
+            price_usdc: Some(float!(150)),
             reorg_depth: 1,
             reorged_at,
         };
@@ -4315,10 +4773,12 @@ mod tests {
             last_failed_offchain_order_id: None,
             last_acknowledged_trade_id: None,
             pending_acknowledged_trade_ids: BTreeSet::new(),
+            pending_reorged_trade_ids: BTreeSet::new(),
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
             last_reorged_at: None,
+            last_reorged_trade_id: None,
         };
 
         let (direction, shares) = position
@@ -4345,10 +4805,12 @@ mod tests {
             last_failed_offchain_order_id: None,
             last_acknowledged_trade_id: None,
             pending_acknowledged_trade_ids: BTreeSet::new(),
+            pending_reorged_trade_ids: BTreeSet::new(),
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
             last_reorged_at: None,
+            last_reorged_trade_id: None,
         };
 
         let (direction, shares) = position
@@ -4375,10 +4837,12 @@ mod tests {
             last_failed_offchain_order_id: None,
             last_acknowledged_trade_id: None,
             pending_acknowledged_trade_ids: BTreeSet::new(),
+            pending_reorged_trade_ids: BTreeSet::new(),
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
             last_reorged_at: None,
+            last_reorged_trade_id: None,
         };
 
         let shares_limit = Positive::new(FractionalShares::new(float!(50))).unwrap();
@@ -4408,10 +4872,12 @@ mod tests {
             last_failed_offchain_order_id: None,
             last_acknowledged_trade_id: None,
             pending_acknowledged_trade_ids: BTreeSet::new(),
+            pending_reorged_trade_ids: BTreeSet::new(),
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
             last_reorged_at: None,
+            last_reorged_trade_id: None,
         };
 
         let shares_limit = Positive::new(FractionalShares::new(float!(50))).unwrap();
@@ -4441,10 +4907,12 @@ mod tests {
             last_failed_offchain_order_id: None,
             last_acknowledged_trade_id: None,
             pending_acknowledged_trade_ids: BTreeSet::new(),
+            pending_reorged_trade_ids: BTreeSet::new(),
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
             last_reorged_at: None,
+            last_reorged_trade_id: None,
         };
 
         let shares_limit = Positive::new(FractionalShares::new(float!(50.7))).unwrap();
@@ -4473,10 +4941,12 @@ mod tests {
             last_failed_offchain_order_id: None,
             last_acknowledged_trade_id: None,
             pending_acknowledged_trade_ids: BTreeSet::new(),
+            pending_reorged_trade_ids: BTreeSet::new(),
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
             last_reorged_at: None,
+            last_reorged_trade_id: None,
         };
 
         let shares_limit = Positive::new(FractionalShares::new(float!(7.5))).unwrap();
@@ -4506,10 +4976,12 @@ mod tests {
             last_failed_offchain_order_id: None,
             last_acknowledged_trade_id: None,
             pending_acknowledged_trade_ids: BTreeSet::new(),
+            pending_reorged_trade_ids: BTreeSet::new(),
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
             last_reorged_at: None,
+            last_reorged_trade_id: None,
         };
 
         let shares_limit = Positive::new(FractionalShares::new(float!(5))).unwrap();
@@ -4539,10 +5011,12 @@ mod tests {
             last_failed_offchain_order_id: None,
             last_acknowledged_trade_id: None,
             pending_acknowledged_trade_ids: BTreeSet::new(),
+            pending_reorged_trade_ids: BTreeSet::new(),
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: None,
             last_updated: Some(Utc::now()),
             last_reorged_at: None,
+            last_reorged_trade_id: None,
         };
 
         let shares_limit = Positive::new(FractionalShares::new(float!(50))).unwrap();
@@ -4622,10 +5096,12 @@ mod tests {
             last_failed_offchain_order_id: None,
             last_acknowledged_trade_id: None,
             pending_acknowledged_trade_ids: BTreeSet::new(),
+            pending_reorged_trade_ids: BTreeSet::new(),
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
             last_reorged_at: None,
+            last_reorged_trade_id: None,
         };
 
         let (_, first_shares) = position
