@@ -16,10 +16,11 @@ use std::time::Duration;
 
 use st0x_float_macro::float;
 
-use crate::chaos::LatencyProxy;
+use crate::chaos::{ChaosProxy, LatencyProxy};
 use crate::hedging::assertions::*;
 use crate::poll::{
-    connect_db, count_events, fetch_events_by_type, poll_for_events_with_timeout, spawn_bot,
+    connect_db, count_events, fetch_events_by_type, poll_for_backfill_checkpoint,
+    poll_for_events_with_timeout, poll_for_running_job, spawn_bot,
 };
 
 /// Top-level hypothesis: a crash while a broker placement is in flight
@@ -370,6 +371,158 @@ async fn crash_while_order_submitted_resumes_polling_and_fills() -> anyhow::Resu
 
     bot2.abort();
     let _ = bot2.await;
+    Ok(())
+}
+
+/// Top-level hypothesis: a crash in the middle of the trade-accounting
+/// job -- fill observed, job enqueued, backfill checkpoint already
+/// advanced past the fill's block, but no CQRS event persisted yet --
+/// must not lose the fill. The job row is the only remaining record of
+/// the trade at that point.
+///
+/// Mechanism under test: the [`ChaosProxy`] holds the
+/// `eth_getTransactionReceipt` response, which is the first RPC call
+/// `AccountForDexTrade::perform` makes, pinning the job in `Running`
+/// with zero events persisted. The bot is killed there. apalis cannot
+/// rescue the orphaned `Running` row on its own: the deterministic
+/// worker name keeps the row's heartbeat fresh after restart, so it
+/// never ages out, and the advanced checkpoint means no rescan will
+/// ever surface the fill again. Startup must reset the orphaned row to
+/// `Pending` (`requeue_trading_orphans`) so the re-spawned worker
+/// re-runs the job and the fill flows through Witness -> Position ->
+/// hedge exactly once.
+#[test_log::test(tokio::test)]
+async fn crash_mid_accounting_job_recovers_the_fill_after_restart() -> anyhow::Result<()> {
+    let equity_symbol = "AAPL";
+    let onchain_price = float!(155.00);
+    let broker_fill_price = float!(150.25);
+    let sell_amount = float!(10.75);
+
+    let infra = TestInfra::start(vec![(equity_symbol, broker_fill_price)], vec![]).await?;
+    let chaos = ChaosProxy::start(infra.base_chain.endpoint().parse()?).await?;
+
+    let current_block = infra.base_chain.provider.get_block_number().await?;
+    let ctx = build_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .assets(infra.assets_config())
+        .rpc_url_override(chaos.endpoint.clone())
+        .call()?;
+    let mut bot = spawn_bot(ctx);
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Pin the accounting job mid-perform: the receipt fetch is its first
+    // RPC call, so holding the response keeps the job Running with zero
+    // CQRS events persisted. The hold must outlast the worst-case time to
+    // reach the abort below -- the Running-job poll and the checkpoint poll
+    // can each take their full 60s timeout (120s combined) -- or a slow run
+    // would deliver the receipt before the crash and let the job complete,
+    // defeating the test. The receipt is never actually awaited (the crash
+    // lands first), so the larger hold does not slow the test.
+    chaos
+        .delay_transaction_receipts(Duration::from_secs(150), 4)
+        .await;
+
+    let take_result = infra
+        .base_chain
+        .take_order()
+        .symbol(equity_symbol)
+        .amount(sell_amount)
+        .price(onchain_price)
+        .direction(TakeDirection::SellEquity)
+        .call()
+        .await?;
+
+    let take_block = infra.base_chain.provider.get_block_number().await?;
+
+    poll_for_running_job(
+        &mut bot,
+        &infra.db_path,
+        std::any::type_name::<st0x_hedge::AccountForDexTrade>(),
+        Duration::from_secs(60),
+    )
+    .await;
+
+    // The checkpoint must be past the fill before the crash: that is
+    // what makes the wedged job row the only remaining record of the
+    // trade, so nothing short of rescuing the row can recover the fill.
+    poll_for_backfill_checkpoint(
+        &mut bot,
+        &infra.db_path,
+        take_block,
+        Duration::from_secs(60),
+    )
+    .await;
+
+    bot.abort();
+    let _ = bot.await;
+
+    // Pin the crash point: job observed and enqueued, no event persisted. This
+    // is the pre-witness window, where the existence dedup does not short-circuit
+    // the requeued re-run, so requeue alone recovers the fill. The post-witness
+    // window (witnessed but not acknowledged) is recovered by the exactly-once
+    // acknowledgement marker and is covered by that work, not this test.
+    let pool = connect_db(&infra.db_path).await?;
+    let onchain_events_at_crash = count_events(&pool, "OnChainTrade").await?;
+    pool.close().await;
+    assert_eq!(
+        onchain_events_at_crash, 0,
+        "Expected the crash to land before the trade was witnessed; \
+         found {onchain_events_at_crash} OnChainTrade events",
+    );
+
+    let ctx2 = build_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .assets(infra.assets_config())
+        .call()?;
+    let mut bot2 = spawn_bot(ctx2);
+
+    poll_for_events_with_timeout(
+        &mut bot2,
+        &infra.db_path,
+        "OffchainOrderEvent::Filled",
+        1,
+        Duration::from_secs(120),
+    )
+    .await;
+
+    let orders = infra.broker_service.orders();
+    let order_count = orders.len();
+    assert_eq!(
+        order_count, 1,
+        "Expected exactly one hedge on the broker for the recovered \
+         fill; got {order_count}",
+    );
+
+    let expected_position = ExpectedPosition::builder()
+        .symbol(equity_symbol)
+        .amount(sell_amount)
+        .direction(TakeDirection::SellEquity)
+        .onchain_price(onchain_price)
+        .broker_fill_price(broker_fill_price)
+        .expected_accumulated_long(float!(0))
+        .expected_accumulated_short(sell_amount)
+        .expected_net(float!(0))
+        .build();
+
+    assert_full_hedging_flow(
+        &[expected_position],
+        &[take_result],
+        &infra.base_chain.provider,
+        infra.base_chain.orderbook,
+        infra.base_chain.owner,
+        &infra.broker_service,
+        &infra.db_path.display().to_string(),
+    )
+    .await?;
+
+    bot2.abort();
     Ok(())
 }
 
