@@ -800,10 +800,15 @@ async fn account_fill_exactly_once(
         );
     };
 
+    // process-tx reconstructs the fill from the transaction and does not carry
+    // the originating block hash (OnchainTrade stores only block number and
+    // timestamp), so a manually recovered fill is witnessed without a reorg
+    // hash. Such a fill is past reorg risk by the time an operator accounts it.
     execute_witness_trade(
         onchain_trade_store,
         onchain_trade,
         block_number,
+        None,
         block_timestamp,
     )
     .await
@@ -1449,6 +1454,7 @@ mod tests {
                     direction,
                     price_usdc,
                     block_number: 1,
+                    block_hash: None,
                     block_timestamp,
                 },
             )
@@ -1521,6 +1527,7 @@ mod tests {
                     direction,
                     price_usdc,
                     block_number: 1,
+                    block_hash: None,
                     block_timestamp,
                 },
             )
@@ -1683,6 +1690,7 @@ mod tests {
             &onchain_trade_store,
             &onchain_trade,
             block_number,
+            None,
             block_timestamp,
         )
         .await
@@ -1838,6 +1846,7 @@ mod tests {
                     direction: fill_a.direction,
                     price_usdc: fill_a.price.value(),
                     block_number: 1,
+                    block_hash: None,
                     block_timestamp: fill_a.block_timestamp.unwrap(),
                 },
             )
