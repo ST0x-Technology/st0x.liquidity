@@ -1,7 +1,8 @@
 //! Cross-venue equity transfer.
 //!
-//! [`CrossVenueEquityTransfer`] implements [`CrossVenueTransfer`] in both
-//! directions:
+//! [`CrossVenueEquityTransfer`] drives equity transfers in both directions
+//! through `resume_equity_to_market_making` / `resume_equity_to_hedging`
+//! entry points, each backed by an apalis job:
 //!
 //! - **Hedging -> Market-Making** (mint): requests tokenized equity from
 //!   Alpaca and deposits it into a Raindex vault.
@@ -9,8 +10,6 @@
 //!   from a Raindex vault and sends it to Alpaca for redemption.
 
 mod job;
-#[cfg(test)]
-pub(crate) mod mock;
 
 #[cfg(test)]
 pub(crate) use job::TransferEquityToMarketMakingJobError;
@@ -25,7 +24,6 @@ use alloy::primitives::{Address, TxHash, U256};
 use alloy::rpc::types::TransactionReceipt;
 use async_trait::async_trait;
 use sqlx::SqlitePool;
-use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, error, info, instrument, warn};
@@ -37,7 +35,6 @@ use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
 use st0x_wrapper::{UnderlyingPerWrapped, Wrapper, WrapperError};
 
 use super::RebalancingService;
-use super::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
 use super::trigger::RecoveryClaim;
 use crate::equity_redemption::{
     DetectionFailure, EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId,
@@ -51,19 +48,6 @@ use crate::tokenized_equity_mint::{
     TokenizedEquityMintCommand,
 };
 use crate::vault_lookup::{VaultLookup, VaultLookupError};
-
-/// A quantity of equity in a specific symbol.
-#[derive(Debug)]
-pub(crate) struct Equity {
-    pub(crate) symbol: Symbol,
-    pub(crate) quantity: FractionalShares,
-}
-
-impl fmt::Display for Equity {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "Equity({}, {})", self.symbol, self.quantity)
-    }
-}
 
 /// Data extracted from the TokensReceived aggregate state for
 /// onchain verification and subsequent wrapping.
@@ -533,8 +517,9 @@ pub(crate) enum RedemptionError {
 /// Orchestrates equity transfers between Raindex and Alpaca.
 ///
 /// Holds CQRS stores for both directions and domain service traits for
-/// vault operations and tokenization. External code interacts with
-/// transfers only through [`CrossVenueTransfer::transfer()`].
+/// vault operations and tokenization. External code drives transfers only
+/// through [`Self::resume_equity_to_market_making`] and
+/// [`Self::resume_equity_to_hedging`].
 pub(crate) struct CrossVenueEquityTransfer {
     raindex: Arc<dyn Raindex>,
     vault_lookup: Arc<dyn VaultLookup>,
@@ -1624,25 +1609,6 @@ impl CrossVenueEquityTransfer {
     }
 }
 
-/// Market-Making -> Hedging: withdraw tokenized equity from Raindex vault
-/// and send to Alpaca for redemption. Thin delegation kept while the
-/// `Rebalancer` mpsc channel still routes redemptions; the channel and this
-/// impl go away once the trigger enqueues [`TransferEquityToHedging`]
-/// directly.
-#[async_trait]
-impl CrossVenueTransfer<MarketMakingVenue, HedgingVenue> for CrossVenueEquityTransfer {
-    type Asset = Equity;
-    type Error = RedemptionError;
-
-    async fn transfer(&self, asset: Self::Asset) -> Result<(), Self::Error> {
-        let Equity { symbol, quantity } = asset;
-        let aggregate_id = RedemptionAggregateId::generate();
-
-        self.start_redemption(&aggregate_id, &symbol, quantity)
-            .await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, B256, address};
@@ -1651,7 +1617,7 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio::sync::{broadcast, mpsc};
+    use tokio::sync::broadcast;
 
     use st0x_dto::Statement;
     use st0x_event_sorcery::{StoreBuilder, test_store};
@@ -1809,7 +1775,6 @@ mod tests {
         )
         .await;
 
-        let (operation_sender, _operation_receiver) = mpsc::channel(10);
         let (event_sender, _event_receiver) = broadcast::channel::<Statement>(16);
         let inventory = Arc::new(BroadcastingInventory::new(
             InventoryView::default().with_equity(
@@ -1838,7 +1803,6 @@ mod tests {
             address!("0x0000000000000000000000000000000000000001"),
             address!("0x0000000000000000000000000000000000000002"),
             inventory.clone(),
-            operation_sender,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
         ));
@@ -1948,7 +1912,6 @@ mod tests {
         )
         .await;
 
-        let (operation_sender, _operation_receiver) = mpsc::channel(10);
         let (event_sender, _event_receiver) = broadcast::channel::<Statement>(16);
 
         // MintAccepted's `start` already moved the quantity into Hedging
@@ -1986,7 +1949,6 @@ mod tests {
             address!("0x0000000000000000000000000000000000000001"),
             address!("0x0000000000000000000000000000000000000002"),
             inventory.clone(),
-            operation_sender,
             Arc::new(MockWrapper::new()),
             RebalancingSchedulers::new(&apalis_pool),
         ));
@@ -2377,12 +2339,10 @@ mod tests {
 
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
-                &transfer,
-                Equity {
-                    symbol: Symbol::new("TEST").unwrap(),
-                    quantity: FractionalShares::new(float!(50)),
-                },
+            transfer.resume_equity_to_hedging(
+                &redemption_aggregate_id("redeem-workflow"),
+                &Symbol::new("TEST").unwrap(),
+                FractionalShares::new(float!(50)),
             ),
         )
         .await
@@ -2399,15 +2359,14 @@ mod tests {
         let transfer =
             create_equity_transfer(tokenizer, raindex, Arc::new(MockWrapper::new())).await;
 
-        let error = CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
-            &transfer,
-            Equity {
-                symbol: Symbol::new("TEST").unwrap(),
-                quantity: FractionalShares::new(float!(50)),
-            },
-        )
-        .await
-        .unwrap_err();
+        let error = transfer
+            .resume_equity_to_hedging(
+                &redemption_aggregate_id("redeem-detection-timeout"),
+                &Symbol::new("TEST").unwrap(),
+                FractionalShares::new(float!(50)),
+            )
+            .await
+            .unwrap_err();
 
         assert!(
             matches!(error, RedemptionError::Tokenizer(_)),
@@ -2424,15 +2383,14 @@ mod tests {
         let transfer =
             create_equity_transfer(tokenizer, raindex, Arc::new(MockWrapper::new())).await;
 
-        let error = CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
-            &transfer,
-            Equity {
-                symbol: Symbol::new("TEST").unwrap(),
-                quantity: FractionalShares::new(float!(50)),
-            },
-        )
-        .await
-        .unwrap_err();
+        let error = transfer
+            .resume_equity_to_hedging(
+                &redemption_aggregate_id("redeem-detection-api-error"),
+                &Symbol::new("TEST").unwrap(),
+                FractionalShares::new(float!(50)),
+            )
+            .await
+            .unwrap_err();
 
         assert!(
             matches!(error, RedemptionError::Tokenizer(_)),
@@ -2452,15 +2410,14 @@ mod tests {
         let transfer =
             create_equity_transfer(tokenizer, raindex, Arc::new(MockWrapper::new())).await;
 
-        let error = CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
-            &transfer,
-            Equity {
-                symbol: Symbol::new("TEST").unwrap(),
-                quantity: FractionalShares::new(float!(50)),
-            },
-        )
-        .await
-        .unwrap_err();
+        let error = transfer
+            .resume_equity_to_hedging(
+                &redemption_aggregate_id("redeem-completion-rejected"),
+                &Symbol::new("TEST").unwrap(),
+                FractionalShares::new(float!(50)),
+            )
+            .await
+            .unwrap_err();
 
         assert!(
             matches!(error, RedemptionError::Rejected),
@@ -2480,15 +2437,14 @@ mod tests {
         let transfer =
             create_equity_transfer(tokenizer, raindex, Arc::new(MockWrapper::new())).await;
 
-        let error = CrossVenueTransfer::<MarketMakingVenue, HedgingVenue>::transfer(
-            &transfer,
-            Equity {
-                symbol: Symbol::new("TEST").unwrap(),
-                quantity: FractionalShares::new(float!(50)),
-            },
-        )
-        .await
-        .unwrap_err();
+        let error = transfer
+            .resume_equity_to_hedging(
+                &redemption_aggregate_id("redeem-pending-status"),
+                &Symbol::new("TEST").unwrap(),
+                FractionalShares::new(float!(50)),
+            )
+            .await
+            .unwrap_err();
 
         assert!(
             matches!(error, RedemptionError::UnexpectedPendingStatus),
