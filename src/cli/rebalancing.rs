@@ -29,8 +29,7 @@ use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, Equity, EquityTransferServices};
 use crate::rebalancing::to_wrapped_equities;
 use crate::rebalancing::transfer::{CrossVenueTransfer, HedgingVenue, MarketMakingVenue};
-use crate::rebalancing::usdc::CrossVenueCashTransfer;
-use crate::rebalancing::usdc::UsdcTransferError;
+use crate::rebalancing::usdc::{CrossVenueCashTransfer, UsdcSettlementParams, UsdcTransferError};
 use crate::tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus, Tokenizer,
 };
@@ -186,12 +185,18 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
 /// not yet ready. Mirrors the apalis job's redrive cadence.
 const CLI_ATTESTATION_REDRIVE_DELAY: Duration = Duration::from_secs(60);
 
-/// Drives a manual USDC transfer to a terminal outcome, redriving on attestation
-/// timeouts so a single CLI invocation cannot strand after the burn.
+/// Drives a manual USDC transfer to a terminal outcome, redriving on the same
+/// retryable waits the apalis worker delayed-redrives -- Circle attestation
+/// timeouts and the AlpacaToBase on-chain settlement gate -- so a single CLI
+/// invocation cannot strand after the burn (or before it, during settlement
+/// lag).
 ///
 /// `resume` is re-invoked with the same `UsdcRebalanceId` on every attempt, so a
-/// timeout resumes the already-burned transfer instead of starting a second
-/// fund-moving one. Any non-timeout error -- including
+/// retry resumes the existing transfer instead of starting a second
+/// fund-moving one. The retryable set mirrors the worker:
+/// `AttestationTimedOut` plus the settlement-wait errors
+/// (`WithdrawalTxUnderconfirmed`, `WalletUsdcInsufficient`,
+/// `SettlementCheckTransient`). Any other error -- including
 /// `AttestationRetryDeadlineElapsed` and a previously-failed aggregate -- is
 /// terminal and returned to the caller.
 async fn redrive_transfer_until_settled<Resume, Fut>(
@@ -211,6 +216,20 @@ where
                     %id,
                     ?redrive_delay,
                     "Circle attestation not ready for manual USDC transfer; retrying after delay"
+                );
+                tokio::time::sleep(redrive_delay).await;
+            }
+            Err(
+                UsdcTransferError::WithdrawalTxUnderconfirmed { id, .. }
+                | UsdcTransferError::WalletUsdcInsufficient { id, .. }
+                | UsdcTransferError::SettlementCheckTransient { id, .. },
+            ) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    ?redrive_delay,
+                    "USDC transfer settlement not yet durable for manual transfer; \
+                     retrying after delay"
                 );
                 tokio::time::sleep(redrive_delay).await;
             }
@@ -417,7 +436,7 @@ async fn run_usdc_transfer<Writer: Write>(
         owner,
     ));
 
-    let attestation_retry_deadline = ctx.rebalancing_ctx()?.attestation_retry_deadline;
+    let rebalancing_ctx = ctx.rebalancing_ctx()?;
 
     let rebalance_manager = CrossVenueCashTransfer::new(
         alpaca_broker,
@@ -427,7 +446,16 @@ async fn run_usdc_transfer<Writer: Write>(
         usdc_store,
         owner,
         RaindexVaultId(usdc_vault_id),
-        attestation_retry_deadline,
+        &UsdcSettlementParams {
+            attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
+            required_confirmations: ctx.evm.required_confirmations,
+            #[cfg(feature = "test-support")]
+            circle_api_base: rebalancing_ctx.circle_api_base.clone(),
+            #[cfg(feature = "test-support")]
+            token_messenger: rebalancing_ctx.token_messenger,
+            #[cfg(feature = "test-support")]
+            message_transmitter: rebalancing_ctx.message_transmitter,
+        },
     );
 
     writeln!(stdout, "   Transfer may take several minutes...")?;
@@ -1016,6 +1044,41 @@ mod tests {
             calls.get(),
             2,
             "the loop must retry exactly once after the timeout, then succeed",
+        );
+    }
+
+    /// The manual redrive loop must also retry the on-chain settlement-wait
+    /// errors the apalis worker delayed-redrives -- otherwise a manual transfer
+    /// would exit on normal settlement lag instead of continuing to completion.
+    #[tokio::test]
+    async fn redrive_loop_retries_settlement_wait_then_succeeds() {
+        let calls = std::cell::Cell::new(0u32);
+
+        let result = redrive_transfer_until_settled(Duration::from_millis(0), || {
+            let attempt = calls.get() + 1;
+            calls.set(attempt);
+            async move {
+                if attempt == 1 {
+                    Err(UsdcTransferError::WithdrawalTxUnderconfirmed {
+                        id: UsdcRebalanceId(Uuid::from_u128(9)),
+                        tx: b256!(
+                            "0x0000000000000000000000000000000000000000000000000000000000000001"
+                        ),
+                        required: 3,
+                        actual: 1,
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+
+        result.expect("redrive must succeed once the withdrawal tx settles");
+        assert_eq!(
+            calls.get(),
+            2,
+            "the loop must retry exactly once after the settlement wait, then succeed",
         );
     }
 

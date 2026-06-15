@@ -465,6 +465,18 @@ impl AlpacaBrokerMock {
             .collect()
     }
 
+    /// Records the on-chain tx hash for an outgoing wallet transfer by
+    /// transfer_id. Used by test infrastructure to inject the real Ethereum
+    /// mint tx hash so the bot's withdrawal-confirmation check can verify it.
+    pub fn set_transfer_tx_hash(&self, transfer_id: &str, tx_hash_hex: String) {
+        lock(&self.state)
+            .wallet_transfers
+            .iter_mut()
+            .find(|transfer| transfer.transfer_id == transfer_id)
+            .unwrap_or_else(|| panic!("set_transfer_tx_hash: no transfer with id {transfer_id}"))
+            .tx_hash = tx_hash_hex;
+    }
+
     /// Returns a snapshot of all current positions.
     pub fn positions(&self) -> Vec<MockPositionSnapshot> {
         let state = lock(&self.state);

@@ -194,7 +194,7 @@ impl UsdcRebalanceStage {
                 Some(*converted_at)
             }
             (Self::Initiated, Initiated { initiated_at, .. }) => Some(*initiated_at),
-            (Self::WithdrawalConfirmed, WithdrawalConfirmed { confirmed_at }) => {
+            (Self::WithdrawalConfirmed, WithdrawalConfirmed { confirmed_at, .. }) => {
                 Some(*confirmed_at)
             }
             (Self::BridgingInitiated, BridgingInitiated { burned_at, .. }) => Some(*burned_at),
@@ -1747,6 +1747,7 @@ mod tests {
     fn withdrawal_confirmed_event() -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::WithdrawalConfirmed {
             confirmed_at: ts(103),
+            withdrawal_tx: None,
         }
     }
 

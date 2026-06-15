@@ -5,7 +5,7 @@
 //! testing the full USDC bridge pipeline without forking mainnet.
 
 use alloy::network::EthereumWallet;
-use alloy::primitives::{Address, B256, Bytes, FixedBytes, U256};
+use alloy::primitives::{Address, B256, Bytes, FixedBytes, TxHash, U256};
 use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
@@ -319,7 +319,7 @@ pub async fn mint_usdc(
     usdc: Address,
     to: Address,
     amount: U256,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<TxHash> {
     let signer = PrivateKeySigner::from_bytes(deployer_key)?;
     let wallet = EthereumWallet::from(signer);
     let provider = ProviderBuilder::new()
@@ -328,7 +328,7 @@ pub async fn mint_usdc(
         .await?;
 
     let token = MockMintBurnToken::new(usdc, &provider);
-    token.mint(to, amount).send().await?.get_receipt().await?;
+    let receipt = token.mint(to, amount).send().await?.get_receipt().await?;
 
-    Ok(())
+    Ok(receipt.transaction_hash)
 }

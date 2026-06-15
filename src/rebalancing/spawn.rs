@@ -3,14 +3,13 @@
 use alloy::primitives::Address;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx, CctpError};
-use st0x_config::{EquityAssetConfig, RebalancingCtx};
+use st0x_config::EquityAssetConfig;
 use st0x_event_sorcery::Store;
 use st0x_evm::Wallet;
 use st0x_execution::{
@@ -20,7 +19,9 @@ use st0x_raindex::{RaindexService, RaindexVaultId};
 use st0x_wrapper::{WrappedEquity, WrapperService};
 
 use super::equity::CrossVenueEquityTransfer;
-use super::usdc::{CrossVenueCashTransfer, ResumeAlpacaToBase, ResumeBaseToAlpaca};
+use super::usdc::{
+    CrossVenueCashTransfer, ResumeAlpacaToBase, ResumeBaseToAlpaca, UsdcSettlementParams,
+};
 use super::{Rebalancer, TriggeredOperation};
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::equity_redemption::EquityRedemption;
@@ -88,7 +89,7 @@ pub(crate) struct RebalancerServices<Chain: Wallet> {
     raindex: Arc<RaindexService<Chain>>,
     tokenizer: Arc<dyn Tokenizer>,
     wrapper: Arc<WrapperService<Chain>>,
-    attestation_retry_deadline: Duration,
+    settlement: UsdcSettlementParams,
 }
 
 impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
@@ -98,7 +99,6 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
     /// needed for CQRS framework initialization in the conductor, which
     /// must happen before this constructor is called.
     pub(crate) async fn new(
-        ctx: RebalancingCtx,
         broker_auth: AlpacaBrokerApiCtx,
         wallet: Arc<AlpacaWalletService>,
         equities: HashMap<Symbol, EquityAssetConfig>,
@@ -106,9 +106,9 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
         base_wallet: Chain,
         raindex: Arc<RaindexService<Chain>>,
         tokenizer: Arc<dyn Tokenizer>,
+        settlement: UsdcSettlementParams,
     ) -> Result<Self, SpawnRebalancerError> {
         let broker = Arc::new(AlpacaBrokerApi::try_from_ctx(broker_auth).await?);
-        let attestation_retry_deadline = ctx.attestation_retry_deadline;
 
         let cctp = Arc::new(
             CctpBridge::try_from_ctx(CctpCtx {
@@ -117,11 +117,11 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
                 ethereum_wallet,
                 base_wallet: base_wallet.clone(),
                 #[cfg(feature = "test-support")]
-                circle_api_base: ctx.circle_api_base.clone(),
+                circle_api_base: settlement.circle_api_base.clone(),
                 #[cfg(feature = "test-support")]
-                token_messenger: ctx.token_messenger,
+                token_messenger: settlement.token_messenger,
                 #[cfg(feature = "test-support")]
-                message_transmitter: ctx.message_transmitter,
+                message_transmitter: settlement.message_transmitter,
             })
             .map_err(|error| SpawnRebalancerError::Cctp(Box::new(error)))?,
         );
@@ -138,7 +138,7 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
             raindex,
             tokenizer,
             wrapper,
-            attestation_retry_deadline,
+            settlement,
         })
     }
 
@@ -174,7 +174,7 @@ impl<Chain: Wallet + Clone> RebalancerServices<Chain> {
             frameworks.usdc,
             market_maker_wallet,
             usdc_vault_id,
-            self.attestation_retry_deadline,
+            &self.settlement,
         ));
 
         let resume_base_to_alpaca: Arc<dyn ResumeBaseToAlpaca> = usdc.clone();
@@ -220,12 +220,15 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use uuid::Uuid;
 
+    use st0x_config::{AssetsConfig, EquitiesConfig, OperationMode, RebalancingCtx};
     use st0x_event_sorcery::test_store;
     use st0x_evm::local::RawPrivateKeyWallet;
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Symbol,
         TimeInForce,
     };
+    use st0x_float_macro::float;
+    use st0x_wrapper::{MockWrapper, WrappedEquity};
 
     use super::*;
     use crate::alpaca_wallet::AlpacaWalletService;
@@ -233,12 +236,10 @@ mod tests {
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::RebalancingServiceConfig;
     use crate::rebalancing::equity::EquityTransferServices;
+    use crate::rebalancing::usdc::UsdcSettlementParams;
     use crate::tokenization::alpaca::AlpacaTokenizationService;
     use crate::tokenization::mock::MockTokenizer;
     use crate::vault_lookup::MockVaultLookup;
-    use st0x_config::{AssetsConfig, EquitiesConfig, OperationMode};
-    use st0x_float_macro::float;
-    use st0x_wrapper::{MockWrapper, WrappedEquity};
 
     #[test]
     fn to_wrapped_equities_maps_underlying_and_derivative() {
@@ -425,7 +426,16 @@ mod tests {
             raindex,
             tokenizer: tokenization,
             wrapper,
-            attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
+            settlement: UsdcSettlementParams {
+                attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
+                required_confirmations: 0,
+                #[cfg(feature = "test-support")]
+                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
+                #[cfg(feature = "test-support")]
+                token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
+                #[cfg(feature = "test-support")]
+                message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
+            },
         };
 
         (services, rebalancing_ctx)

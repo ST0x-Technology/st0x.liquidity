@@ -129,4 +129,10 @@ pub trait Bridge: Send + Sync + 'static {
     /// crash-safe resume scan in [`Bridge::find_recent_mint`] is bounded to
     /// blocks mined strictly after it.
     async fn destination_block(&self, direction: BridgeDirection) -> Result<u64, Self::Error>;
+
+    /// Returns the current head of the burn source chain for `direction`.
+    /// Captured before the burn call so crash-safe resume ([`Bridge::find_recent_burn`])
+    /// has a lower-bound block. For `BaseToEthereum` this is Base chain head;
+    /// for `EthereumToBase` this is Ethereum chain head.
+    async fn source_block(&self, direction: BridgeDirection) -> Result<u64, Self::Error>;
 }

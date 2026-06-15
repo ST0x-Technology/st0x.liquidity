@@ -63,7 +63,9 @@ use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::position_check::{CheckPositionsJobQueue, bootstrap_check_positions};
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
-use crate::rebalancing::usdc::{TransferUsdcToHedgingCtx, TransferUsdcToMarketMakingCtx};
+use crate::rebalancing::usdc::{
+    TransferUsdcToHedgingCtx, TransferUsdcToMarketMakingCtx, UsdcSettlementParams,
+};
 use crate::rebalancing::{
     RebalancerServices, RebalancingCqrsFrameworks, RebalancingSchedulers, RebalancingService,
     RebalancingServiceConfig, to_wrapped_equities,
@@ -1146,7 +1148,6 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
         ));
 
         let services = RebalancerServices::new(
-            rebalancing_ctx.clone(),
             alpaca_auth.clone(),
             Arc::clone(&alpaca_wallet),
             deps.ctx.assets.equities.symbols.clone(),
@@ -1154,6 +1155,16 @@ fn spawn_rebalancing_infrastructure<Chain: Wallet + Clone>(
             base_wallet,
             raindex_service,
             Arc::clone(&tokenizer),
+            UsdcSettlementParams {
+                attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
+                required_confirmations: deps.ctx.evm.required_confirmations,
+                #[cfg(feature = "test-support")]
+                circle_api_base: rebalancing_ctx.circle_api_base.clone(),
+                #[cfg(feature = "test-support")]
+                token_messenger: rebalancing_ctx.token_messenger,
+                #[cfg(feature = "test-support")]
+                message_transmitter: rebalancing_ctx.message_transmitter,
+            },
         )
         .await?;
 

@@ -13,7 +13,7 @@ pub(crate) use job::{
     TransferUsdcToHedgingJobQueue, TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
     TransferUsdcToMarketMakingJobQueue,
 };
-pub(crate) use manager::{CrossVenueCashTransfer, u256_to_usdc};
+pub(crate) use manager::{CrossVenueCashTransfer, UsdcSettlementParams, u256_to_usdc};
 
 use std::time::Duration;
 
@@ -129,6 +129,40 @@ pub(crate) enum UsdcTransferError {
     )]
     WithdrawalRefMustBeAlpacaId {
         id: crate::usdc_rebalance::UsdcRebalanceId,
+    },
+    #[error(
+        "USDC rebalance {id}: market-maker Ethereum wallet holds {actual} USDC \
+         but {required} is required for the CCTP burn; waiting for withdrawal \
+         to settle on-chain"
+    )]
+    WalletUsdcInsufficient {
+        id: UsdcRebalanceId,
+        required: alloy::primitives::U256,
+        actual: alloy::primitives::U256,
+    },
+    #[error(
+        "USDC rebalance {id}: withdrawal tx {tx} has only {actual} confirmations, \
+         need {required}; waiting for on-chain settlement"
+    )]
+    WithdrawalTxUnderconfirmed {
+        id: UsdcRebalanceId,
+        tx: alloy::primitives::TxHash,
+        required: u64,
+        actual: u64,
+    },
+    /// An RPC call in the settlement phase (confirmation re-check, balance read,
+    /// or burn scan) failed transiently. The aggregate is in
+    /// `WithdrawalComplete` or `BridgingSubmitting` -- a durable, resumable
+    /// state -- so this is safe to delayed-redrive exactly like
+    /// `WithdrawalTxUnderconfirmed`.
+    #[error(
+        "USDC rebalance {id}: settlement-phase RPC check failed transiently; \
+         will retry after delay"
+    )]
+    SettlementCheckTransient {
+        id: UsdcRebalanceId,
+        #[source]
+        source: Box<CctpError>,
     },
 }
 
