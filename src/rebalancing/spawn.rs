@@ -160,7 +160,7 @@ mod tests {
     use httpmock::Method::GET;
     use httpmock::MockServer;
     use serde_json::json;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use uuid::Uuid;
 
     use st0x_config::{AssetsConfig, EquitiesConfig, OperationMode, RebalancingCtx};
@@ -246,7 +246,6 @@ mod tests {
                 equities: EquitiesConfig::default(),
                 cash: None,
             },
-            disabled_assets: HashSet::new(),
         };
 
         assert!(trigger_config.equity.target.eq(float!(0.5)).unwrap());
@@ -265,7 +264,6 @@ mod tests {
                 equities: EquitiesConfig::default(),
                 cash: None,
             },
-            disabled_assets: HashSet::new(),
         };
 
         let usdc_threshold = trigger_config.usdc.expect("USDC threshold should be Some");
