@@ -15,23 +15,42 @@ use crate::bindings::IERC20;
 
 /// Whether `submit_deposit` should succeed, fail generically, or fail
 /// with an "execution reverted" RPC error (simulating a revert during
-/// gas estimation).
+/// gas estimation, e.g. `ERC20InsufficientBalance` when tokens are
+/// already in the vault from a previous session).
 #[derive(Default)]
-enum DepositBehavior {
+pub(crate) enum DepositBehavior {
     #[default]
     Succeed,
     FailGeneric,
     FailExecutionReverted,
 }
 
-/// Whether `confirm_tx_receipt` should succeed or fail, simulating a
-/// transaction that was submitted but whose receipt never materializes.
-#[derive(Default, PartialEq, Eq)]
-enum ConfirmTxBehavior {
+/// Whether `confirm_tx_receipt` should succeed, fail terminally
+/// (simulating a submitted transaction whose receipt never
+/// materializes), or fail with a retryable inconclusive scan
+/// (simulating RPC lag rather than a dropped transaction).
+#[derive(Default)]
+pub(crate) enum ConfirmTxBehavior {
     #[default]
     Succeed,
     Fail,
     Retryable,
+}
+
+/// Arguments captured from the last `submit_deposit` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DepositCall {
+    pub(crate) token: Address,
+    pub(crate) vault_id: RaindexVaultId,
+    pub(crate) amount: U256,
+    pub(crate) decimals: u8,
+}
+
+/// Arguments captured from the last `submit_withdraw` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WithdrawCall {
+    token: Address,
+    amount: U256,
 }
 
 pub(crate) struct MockRaindex {
@@ -40,9 +59,9 @@ pub(crate) struct MockRaindex {
     deposit_behavior: DepositBehavior,
     confirm_behavior: ConfirmTxBehavior,
     deposited_token: Mutex<Option<Address>>,
-    deposit_call: Mutex<Option<(Address, RaindexVaultId, U256, u8)>>,
+    deposit_call: Mutex<Option<DepositCall>>,
     confirmed_tx: Mutex<Option<TxHash>>,
-    withdraw_transfer: Mutex<Option<(Address, U256)>>,
+    withdraw_transfer: Mutex<Option<WithdrawCall>>,
     withdraw_actual_amount: Option<U256>,
 }
 
@@ -108,40 +127,19 @@ impl MockRaindex {
         }
     }
 
-    pub(crate) fn failing_deposit() -> Self {
-        Self {
-            deposit_behavior: DepositBehavior::FailGeneric,
-            ..Self::new()
-        }
+    /// Configures how `submit_deposit` behaves; combinable with the
+    /// confirm-behaviour knob, unlike the former one-knob-per-constructor
+    /// design.
+    pub(crate) fn with_deposit_behavior(mut self, behavior: DepositBehavior) -> Self {
+        self.deposit_behavior = behavior;
+        self
     }
 
-    /// Creates a mock that fails `submit_deposit` with an "execution
-    /// reverted" RPC error, simulating a revert during gas estimation
-    /// (e.g., `ERC20InsufficientBalance` when tokens are already in
-    /// the vault from a previous session).
-    pub(crate) fn reverting_deposit() -> Self {
-        Self {
-            deposit_behavior: DepositBehavior::FailExecutionReverted,
-            ..Self::new()
-        }
-    }
-
-    /// Creates a mock whose `confirm_tx_receipt` fails, simulating a
-    /// submitted transaction whose receipt never materializes.
-    pub(crate) fn failing_confirm_tx() -> Self {
-        Self {
-            confirm_behavior: ConfirmTxBehavior::Fail,
-            ..Self::new()
-        }
-    }
-
-    /// Creates a mock whose `confirm_tx_receipt` fails with a retryable
-    /// inconclusive scan, simulating RPC lag rather than a dropped transaction.
-    pub(crate) fn retryable_confirm_tx() -> Self {
-        Self {
-            confirm_behavior: ConfirmTxBehavior::Retryable,
-            ..Self::new()
-        }
+    /// Configures how `confirm_tx_receipt` behaves; combinable with the
+    /// deposit-behaviour knob.
+    pub(crate) fn with_confirm_behavior(mut self, behavior: ConfirmTxBehavior) -> Self {
+        self.confirm_behavior = behavior;
+        self
     }
 
     /// Returns the token address that was passed to the last `deposit()` call.
@@ -149,7 +147,7 @@ impl MockRaindex {
         *self.deposited_token.lock().unwrap()
     }
 
-    pub(crate) fn last_deposit_call(&self) -> Option<(Address, RaindexVaultId, U256, u8)> {
+    pub(crate) fn last_deposit_call(&self) -> Option<DepositCall> {
         *self.deposit_call.lock().unwrap()
     }
 
@@ -185,7 +183,12 @@ impl Raindex for MockRaindex {
         match self.deposit_behavior {
             DepositBehavior::Succeed => {
                 *self.deposited_token.lock().unwrap() = Some(token);
-                *self.deposit_call.lock().unwrap() = Some((token, vault_id, amount, decimals));
+                *self.deposit_call.lock().unwrap() = Some(DepositCall {
+                    token,
+                    vault_id,
+                    amount,
+                    decimals,
+                });
                 Ok(self.deposit_tx)
             }
             DepositBehavior::FailGeneric => Err(RaindexError::ZeroAmount),
@@ -220,7 +223,10 @@ impl Raindex for MockRaindex {
         target_amount: U256,
         _decimals: u8,
     ) -> Result<TxHash, RaindexError> {
-        *self.withdraw_transfer.lock().unwrap() = Some((token, target_amount));
+        *self.withdraw_transfer.lock().unwrap() = Some(WithdrawCall {
+            token,
+            amount: target_amount,
+        });
         Ok(self.withdraw_tx)
     }
 
@@ -230,22 +236,24 @@ impl Raindex for MockRaindex {
     ) -> Result<TransactionReceipt, RaindexError> {
         *self.confirmed_tx.lock().unwrap() = Some(tx_hash);
 
-        if self.confirm_behavior == ConfirmTxBehavior::Fail {
-            return Err(RaindexError::Evm(EvmError::TransactionDropped {
-                tx_hash,
-                elapsed_secs: 0,
-            }));
-        }
-
-        if self.confirm_behavior == ConfirmTxBehavior::Retryable {
-            return Err(RaindexError::ScanInconclusive { from_block: 0 });
+        match self.confirm_behavior {
+            ConfirmTxBehavior::Fail => {
+                return Err(RaindexError::Evm(EvmError::TransactionDropped {
+                    tx_hash,
+                    elapsed_secs: 0,
+                }));
+            }
+            ConfirmTxBehavior::Retryable => {
+                return Err(RaindexError::ScanInconclusive { from_block: 0 });
+            }
+            ConfirmTxBehavior::Succeed => {}
         }
 
         let logs = self
             .withdraw_transfer
             .lock()
             .unwrap()
-            .map(|(token, amount)| {
+            .map(|WithdrawCall { token, amount }| {
                 let amount = self.withdraw_actual_amount.unwrap_or(amount);
                 vec![transfer_log(token, Address::ZERO, amount)]
             })

@@ -584,7 +584,7 @@ mod tests {
     use st0x_wrapper::MockWrapper;
 
     use crate::equity_redemption::redemption_aggregate_id;
-    use crate::onchain::mock::MockRaindex;
+    use crate::onchain::mock::{DepositBehavior, MockRaindex};
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::tokenization::mock::MockTokenizer;
     use crate::tokenized_equity_mint::issuer_request_id;
@@ -813,7 +813,9 @@ mod tests {
     /// `RecoveryFailed` instead of advancing into `OrphanDepositSubmitted`.
     #[tokio::test]
     async fn submit_orphan_deposit_records_failure_when_raindex_reports_revert() {
-        let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::reverting_deposit());
+        let raindex: Arc<dyn Raindex> = Arc::new(
+            MockRaindex::new().with_deposit_behavior(DepositBehavior::FailExecutionReverted),
+        );
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
         let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
