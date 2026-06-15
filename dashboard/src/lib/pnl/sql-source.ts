@@ -120,6 +120,7 @@ type PositionReplayDelta = {
 const ATTRIBUTION_METHOD = 'direct_sql_position_fill_replay_fifo'
 const COUNTER_TRADE_THRESHOLD_SECONDS = 300
 const DATASSETTE_DEFAULT_MAX_RETURNED_ROWS = 1000
+const DATASSETTE_SQL_PAGE_SIZE = 900
 const SQL_FETCH_TIMEOUT_MS = 30000
 const SAFE_SQL_SYMBOL = /^[A-Za-z0-9._-]+$/u
 const ZERO = new Decimal(0)
@@ -192,9 +193,14 @@ const globalOrigin = (): string => {
   return 'http://localhost'
 }
 
-export const buildSqlApiUrl = (baseUrl: string, sql: string): string => {
+const stripSqlTerminator = (sql: string): string => sql.trim().replace(/;+\s*$/u, '')
+
+const pagedSql = (sql: string, offset: number): string =>
+  `SELECT * FROM (${stripSqlTerminator(sql)}) LIMIT ${String(DATASSETTE_SQL_PAGE_SIZE)} OFFSET ${String(offset)}`
+
+export const buildSqlApiUrl = (baseUrl: string, sql: string, offset = 0): string => {
   const url = new URL(baseUrl, globalOrigin())
-  url.searchParams.set('sql', sql)
+  url.searchParams.set('sql', pagedSql(sql, offset))
   url.searchParams.set('_shape', 'objects')
   url.searchParams.set('_size', 'max')
   return url.toString()
@@ -205,8 +211,8 @@ type DatasetteRowsResponse = {
   truncated?: boolean
 }
 
-const fetchSqlRows = async <Row>(baseUrl: string, sql: string): Promise<Row[]> => {
-  const response = await fetch(buildSqlApiUrl(baseUrl, sql), {
+const fetchSqlPage = async <Row>(baseUrl: string, sql: string, offset: number): Promise<Row[]> => {
+  const response = await fetch(buildSqlApiUrl(baseUrl, sql, offset), {
     signal: AbortSignal.timeout(SQL_FETCH_TIMEOUT_MS)
   })
 
@@ -220,7 +226,7 @@ const fetchSqlRows = async <Row>(baseUrl: string, sql: string): Promise<Row[]> =
   }
 
   if (body.truncated === true) {
-    throw new Error('SQL endpoint truncated the result set; refusing to render partial PnL')
+    throw new Error('SQL endpoint truncated a paged result set; refusing to render partial PnL')
   }
 
   if (body.truncated === undefined && body.rows.length >= DATASSETTE_DEFAULT_MAX_RETURNED_ROWS) {
@@ -228,6 +234,19 @@ const fetchSqlRows = async <Row>(baseUrl: string, sql: string): Promise<Row[]> =
   }
 
   return body.rows as Row[]
+}
+
+const fetchSqlRows = async <Row>(baseUrl: string, sql: string): Promise<Row[]> => {
+  const rows: Row[] = []
+  let offset = 0
+
+  for (;;) {
+    const page = await fetchSqlPage<Row>(baseUrl, sql, offset)
+    rows.push(...page)
+
+    if (page.length < DATASSETTE_SQL_PAGE_SIZE) return rows
+    offset += DATASSETTE_SQL_PAGE_SIZE
+  }
 }
 
 const positionEventsSql = (symbols: Set<string>): string => `
