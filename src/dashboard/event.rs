@@ -1184,7 +1184,8 @@ impl Reactor for Broadcaster {
                         self.broadcast_onchain_trade_revision(id).await?;
                     }
                     OnChainTradeEvent::Enriched { .. }
-                    | OnChainTradeEvent::Acknowledged { .. } => {}
+                    | OnChainTradeEvent::Acknowledged { .. }
+                    | OnChainTradeEvent::Reorged { .. } => {}
                 }
 
                 Ok(())
