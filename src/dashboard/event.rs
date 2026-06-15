@@ -94,6 +94,7 @@ impl Reactor for Broadcaster {
                     PositionEvent::OnChainOrderFilled { .. }
                         | PositionEvent::OffChainOrderFilled { .. }
                         | PositionEvent::ManualPositionAdjusted { .. }
+                        | PositionEvent::Reorged { .. }
                 ) {
                     return;
                 }
@@ -470,6 +471,111 @@ mod tests {
                 assert!(
                     position.net.eq(st0x_float_macro::float!(-3)).unwrap(),
                     "expected adjusted net -3, got {:?}",
+                    position.net
+                );
+            }
+            other => panic!("expected PositionUpdate message, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reorged_broadcasts_reversed_net() {
+        let pool = setup_test_db().await;
+        let (store, _projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let (broadcaster, mut receiver) = test_broadcaster(pool.clone());
+        let harness = ReactorHarness::new(broadcaster);
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = chrono::Utc::now();
+        let threshold = st0x_config::ExecutionThreshold::Shares(
+            st0x_execution::Positive::new(st0x_execution::FractionalShares::new(
+                st0x_float_macro::float!(1),
+            ))
+            .unwrap(),
+        );
+        let reorged_trade = TradeId {
+            tx_hash: alloy::primitives::TxHash::ZERO,
+            log_index: 0,
+        };
+        let surviving_trade = TradeId {
+            tx_hash: alloy::primitives::TxHash::ZERO,
+            log_index: 1,
+        };
+
+        // Two buys (net 8), then a reorg reverses the first (net 3). The
+        // broadcaster loads the persisted post-reorg position, so the broadcast
+        // net must reflect the reversal, not the pre-reorg total.
+        store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold,
+                    trade_id: reorged_trade.clone(),
+                    amount: st0x_execution::FractionalShares::new(st0x_float_macro::float!(5)),
+                    direction: st0x_execution::Direction::Buy,
+                    price_usdc: st0x_float_macro::float!(150),
+                    block_timestamp: now,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold,
+                    trade_id: surviving_trade.clone(),
+                    amount: st0x_execution::FractionalShares::new(st0x_float_macro::float!(3)),
+                    direction: st0x_execution::Direction::Buy,
+                    price_usdc: st0x_float_macro::float!(150),
+                    block_timestamp: now,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &symbol,
+                PositionCommand::RecordReorg {
+                    trade_id: reorged_trade.clone(),
+                    amount: st0x_execution::FractionalShares::new(st0x_float_macro::float!(5)),
+                    direction: st0x_execution::Direction::Buy,
+                    reorg_depth: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                PositionEvent::Reorged {
+                    trade_id: reorged_trade,
+                    amount: st0x_execution::FractionalShares::new(st0x_float_macro::float!(5)),
+                    direction: st0x_execution::Direction::Buy,
+                    reorg_depth: 1,
+                    reorged_at: now,
+                },
+            )
+            .await
+            .unwrap();
+
+        let msg = receiver
+            .recv()
+            .await
+            .expect("should receive position update");
+
+        match msg {
+            Statement::PositionUpdate(position) => {
+                assert_eq!(position.symbol, symbol);
+                assert!(
+                    position.net.eq(st0x_float_macro::float!(3)).unwrap(),
+                    "expected reversed net 3, got {:?}",
                     position.net
                 );
             }
