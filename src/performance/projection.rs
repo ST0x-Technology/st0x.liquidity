@@ -41,11 +41,17 @@ impl HedgeLatencyProjection {
         event: PositionEvent,
     ) -> Result<(), ProjectionError> {
         match event {
-            // Dedup bookkeeping only (ADR 0010): no performance signal.
+            // No hedge-latency impact: ADR 0010 dedup bookkeeping
+            // (OnChainFillApplied/OnChainFillSettled) and
+            // Initialized/ThresholdUpdated carry no fill timing, and a reorged
+            // fill's latency attribution is left as a follow-up -- the read model
+            // is observability-only, never gates hedging correctness, and reorgs
+            // are rare.
             PositionEvent::Initialized { .. }
             | PositionEvent::ThresholdUpdated { .. }
             | PositionEvent::OnChainFillApplied { .. }
-            | PositionEvent::OnChainFillSettled { .. } => Ok(()),
+            | PositionEvent::OnChainFillSettled { .. }
+            | PositionEvent::Reorged { .. } => Ok(()),
             PositionEvent::OnChainOrderFilled {
                 trade_id,
                 block_timestamp,
