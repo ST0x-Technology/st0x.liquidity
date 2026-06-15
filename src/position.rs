@@ -76,6 +76,13 @@ pub struct Position {
     )]
     pub last_price_usdc: Option<Float>,
     pub last_updated: Option<DateTime<Utc>>,
+    /// Set when a reorg reversal has been applied to this position. Append-only
+    /// marker -- the reversal is a new event, the original fill events are
+    /// preserved, and `position_view` surfaces that a reorg struck without
+    /// deleting history. Absent on positions persisted before the
+    /// field existed, which is the never-reorged default.
+    #[serde(default)]
+    pub last_reorged_at: Option<DateTime<Utc>>,
 }
 
 impl std::fmt::Debug for Position {
@@ -101,6 +108,7 @@ impl std::fmt::Debug for Position {
             .field("threshold", &self.threshold)
             .field("last_price_usdc", &DebugOptionFloat(&self.last_price_usdc))
             .field("last_updated", &self.last_updated)
+            .field("last_reorged_at", &self.last_reorged_at)
             .finish()
     }
 }
@@ -169,6 +177,7 @@ impl EventSourced for Position {
                 threshold: *threshold,
                 last_price_usdc: None,
                 last_updated: Some(*initialized_at),
+                last_reorged_at: None,
             }),
 
             _ => None,
@@ -242,6 +251,70 @@ impl EventSourced for Position {
                 pending_acknowledged_trade_ids.remove(trade_id);
                 Ok(Some(Self {
                     pending_acknowledged_trade_ids,
+                    ..entity.clone()
+                }))
+            }
+
+            // A reorg reverses the original fill's impact exactly: undo the net
+            // delta and the accumulator the fill grew. The fill events stay in
+            // history; this reversal is appended on top.
+            //
+            // Clear `last_acknowledged_trade_id` only when it points at the trade
+            // being reorged, and remove the reorged trade_id from
+            // `pending_acknowledged_trade_ids`. The fill-dedupe guard absorbs
+            // crash-window replay of the same event, not a permanent tombstone: if
+            // this exact `(tx_hash, log_index)` re-confirms on the canonical chain
+            // after the reorg resolves, `AcknowledgeOnChainFill` must accept it
+            // instead of rejecting it as a `DuplicateTrade`. That guard ORs both
+            // slots, so the bounded pending set must be pruned too -- clearing only
+            // the anchor would leave the trade_id in the set and keep rejecting the
+            // re-confirmation. Clearing the anchor unconditionally would instead
+            // drop a more recent fill's anchor when an older fill is reorged,
+            // reopening that newer fill's crash-window replay.
+            Reorged {
+                trade_id,
+                direction: Buy,
+                amount,
+                reorged_at,
+                ..
+            } => {
+                let mut pending_acknowledged_trade_ids =
+                    entity.pending_acknowledged_trade_ids.clone();
+                pending_acknowledged_trade_ids.remove(trade_id);
+                Ok(Some(Self {
+                    net: (entity.net - *amount)?,
+                    accumulated_long: (entity.accumulated_long - *amount)?,
+                    last_reorged_at: Some(*reorged_at),
+                    last_acknowledged_trade_id: entity
+                        .last_acknowledged_trade_id
+                        .clone()
+                        .filter(|id| id != trade_id),
+                    pending_acknowledged_trade_ids,
+                    last_updated: Some(*reorged_at),
+                    ..entity.clone()
+                }))
+            }
+
+            Reorged {
+                trade_id,
+                direction: Sell,
+                amount,
+                reorged_at,
+                ..
+            } => {
+                let mut pending_acknowledged_trade_ids =
+                    entity.pending_acknowledged_trade_ids.clone();
+                pending_acknowledged_trade_ids.remove(trade_id);
+                Ok(Some(Self {
+                    net: (entity.net + *amount)?,
+                    accumulated_short: (entity.accumulated_short - *amount)?,
+                    last_reorged_at: Some(*reorged_at),
+                    last_acknowledged_trade_id: entity
+                        .last_acknowledged_trade_id
+                        .clone()
+                        .filter(|id| id != trade_id),
+                    pending_acknowledged_trade_ids,
+                    last_updated: Some(*reorged_at),
                     ..entity.clone()
                 }))
             }
@@ -523,6 +596,37 @@ impl EventSourced for Position {
                 } else {
                     Ok(vec![])
                 }
+            }
+
+            RecordReorg {
+                trade_id,
+                amount,
+                direction,
+                reorg_depth,
+            } => {
+                // A reversal must undo a real (strictly positive) fill amount.
+                // Reject a zero or negative amount rather than appending a
+                // reversal that would corrupt the net position.
+                Positive::new(amount)
+                    .map_err(|_| PositionError::NonPositiveReorgAmount { amount })?;
+
+                warn!(
+                    target: "hedge",
+                    symbol = %self.symbol,
+                    ?trade_id,
+                    ?direction,
+                    %amount,
+                    reorg_depth,
+                    "Reversing position impact of a reorged fill"
+                );
+
+                Ok(vec![PositionEvent::Reorged {
+                    trade_id,
+                    amount,
+                    direction,
+                    reorg_depth,
+                    reorged_at: Utc::now(),
+                }])
             }
 
             PlaceOffChainOrder {
@@ -942,6 +1046,8 @@ impl Position {
 pub enum PositionError {
     #[error("Position has not been initialized")]
     Uninitialized,
+    #[error("Reorg reversal amount must be strictly positive, got {amount:?}")]
+    NonPositiveReorgAmount { amount: FractionalShares },
     #[error(
         "Cannot place offchain order: position \
          {net_position:?} does not meet threshold \
@@ -1046,6 +1152,15 @@ pub enum PositionCommand {
     SettleOnChainFill {
         trade_id: TradeId,
     },
+    /// Reverses an onchain fill that a reorg invalidated. Carries the original
+    /// fill's `amount` and `direction` so the reversal undoes exactly its
+    /// position impact; `reorg_depth` is retained for the audit trail.
+    RecordReorg {
+        trade_id: TradeId,
+        amount: FractionalShares,
+        direction: Direction,
+        reorg_depth: u64,
+    },
     PlaceOffChainOrder {
         offchain_order_id: OffchainOrderId,
         shares: Positive<FractionalShares>,
@@ -1141,6 +1256,13 @@ pub enum PositionEvent {
         trade_id: TradeId,
         settled_at: DateTime<Utc>,
     },
+    Reorged {
+        trade_id: TradeId,
+        amount: FractionalShares,
+        direction: Direction,
+        reorg_depth: u64,
+        reorged_at: DateTime<Utc>,
+    },
     OffChainOrderPlaced {
         offchain_order_id: OffchainOrderId,
         shares: Positive<FractionalShares>,
@@ -1197,6 +1319,7 @@ impl PositionEvent {
             OnChainOrderFilled { seen_at, .. } => *seen_at,
             OnChainFillApplied { applied_at, .. } => *applied_at,
             OnChainFillSettled { settled_at, .. } => *settled_at,
+            Reorged { reorged_at, .. } => *reorged_at,
             OffChainOrderPlaced { placed_at, .. } => *placed_at,
             OffChainOrderFilled {
                 broker_timestamp, ..
@@ -1217,6 +1340,7 @@ impl DomainEvent for PositionEvent {
             OnChainOrderFilled { .. } => Self::ON_CHAIN_ORDER_FILLED_EVENT_TYPE.to_string(),
             OnChainFillApplied { .. } => "PositionEvent::OnChainFillApplied".to_string(),
             OnChainFillSettled { .. } => "PositionEvent::OnChainFillSettled".to_string(),
+            Reorged { .. } => "PositionEvent::Reorged".to_string(),
             OffChainOrderPlaced { .. } => "PositionEvent::OffChainOrderPlaced".to_string(),
             OffChainOrderFilled { .. } => "PositionEvent::OffChainOrderFilled".to_string(),
             OffChainOrderFailed { .. } => "PositionEvent::OffChainOrderFailed".to_string(),
@@ -1307,6 +1431,28 @@ impl PartialEq for PositionEvent {
                     settled_at: c2,
                 },
             ) => t1 == t2 && c1 == c2,
+            (
+                Self::Reorged {
+                    trade_id: left_trade_id,
+                    amount: left_amount,
+                    direction: left_direction,
+                    reorg_depth: left_reorg_depth,
+                    reorged_at: left_reorged_at,
+                },
+                Self::Reorged {
+                    trade_id: right_trade_id,
+                    amount: right_amount,
+                    direction: right_direction,
+                    reorg_depth: right_reorg_depth,
+                    reorged_at: right_reorged_at,
+                },
+            ) => {
+                left_trade_id == right_trade_id
+                    && left_amount == right_amount
+                    && left_direction == right_direction
+                    && left_reorg_depth == right_reorg_depth
+                    && left_reorged_at == right_reorged_at
+            }
             (
                 Self::OffChainOrderPlaced {
                     offchain_order_id: o1,
@@ -1538,6 +1684,18 @@ impl std::fmt::Debug for PositionCommand {
                 .debug_struct("SettleOnChainFill")
                 .field("trade_id", trade_id)
                 .finish(),
+            Self::RecordReorg {
+                trade_id,
+                amount,
+                direction,
+                reorg_depth,
+            } => f
+                .debug_struct("RecordReorg")
+                .field("trade_id", trade_id)
+                .field("amount", amount)
+                .field("direction", direction)
+                .field("reorg_depth", reorg_depth)
+                .finish(),
             Self::PlaceOffChainOrder {
                 offchain_order_id,
                 shares,
@@ -1673,6 +1831,20 @@ impl std::fmt::Debug for PositionEvent {
                 .debug_struct("OnChainFillSettled")
                 .field("trade_id", trade_id)
                 .field("settled_at", settled_at)
+                .finish(),
+            Self::Reorged {
+                trade_id,
+                amount,
+                direction,
+                reorg_depth,
+                reorged_at,
+            } => f
+                .debug_struct("Reorged")
+                .field("trade_id", trade_id)
+                .field("amount", amount)
+                .field("direction", direction)
+                .field("reorg_depth", reorg_depth)
+                .field("reorged_at", reorged_at)
                 .finish(),
             Self::OffChainOrderPlaced {
                 offchain_order_id,
@@ -1908,6 +2080,475 @@ mod tests {
             panic!("Expected OnChainOrderFilled, got: {:?}", events[1]);
         };
         assert_eq!(*event_seen_at, seen_at);
+    }
+
+    #[tokio::test]
+    async fn record_reorg_on_filled_position_emits_reorged_event() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let trade_id = TradeId {
+            tx_hash: TxHash::random(),
+            log_index: 1,
+        };
+
+        let events = TestHarness::<Position>::with(())
+            .given(vec![
+                PositionEvent::Initialized {
+                    symbol,
+                    threshold: one_share_threshold(),
+                    initialized_at: now,
+                },
+                PositionEvent::OnChainOrderFilled {
+                    trade_id: trade_id.clone(),
+                    amount: FractionalShares::new(float!(5)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: now,
+                    seen_at: now,
+                },
+            ])
+            .when(PositionCommand::RecordReorg {
+                trade_id: trade_id.clone(),
+                amount: FractionalShares::new(float!(5)),
+                direction: Direction::Buy,
+                reorg_depth: 2,
+            })
+            .await
+            .events();
+
+        let [
+            PositionEvent::Reorged {
+                trade_id: reorged_trade_id,
+                amount,
+                direction,
+                reorg_depth,
+                ..
+            },
+        ] = events.as_slice()
+        else {
+            panic!("RecordReorg must emit exactly one Reorged event; got {events:?}");
+        };
+
+        assert_eq!(
+            *reorged_trade_id, trade_id,
+            "the reversal must target the reorged fill"
+        );
+        assert_eq!(
+            *amount,
+            FractionalShares::new(float!(5)),
+            "amount drives the reversal"
+        );
+        assert_eq!(
+            *direction,
+            Direction::Buy,
+            "direction drives the reversal sign"
+        );
+        assert_eq!(*reorg_depth, 2);
+    }
+
+    #[tokio::test]
+    async fn record_reorg_with_non_positive_amount_is_rejected() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let trade_id = TradeId {
+            tx_hash: TxHash::random(),
+            log_index: 1,
+        };
+
+        let error = TestHarness::<Position>::with(())
+            .given(vec![
+                PositionEvent::Initialized {
+                    symbol,
+                    threshold: one_share_threshold(),
+                    initialized_at: now,
+                },
+                PositionEvent::OnChainOrderFilled {
+                    trade_id: trade_id.clone(),
+                    amount: FractionalShares::new(float!(5)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: now,
+                    seen_at: now,
+                },
+            ])
+            .when(PositionCommand::RecordReorg {
+                trade_id,
+                amount: FractionalShares::ZERO,
+                direction: Direction::Buy,
+                reorg_depth: 2,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(PositionError::NonPositiveReorgAmount { .. })
+            ),
+            "a zero reorg amount must be rejected; got {error:?}",
+        );
+    }
+
+    /// A reorg of a buy fill must return `net` and `accumulated_long` to the
+    /// exact pre-fill state while preserving the original fill events.
+    #[test]
+    fn reorg_reverses_buy_fill_to_pre_fill_state() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let trade_id = TradeId {
+            tx_hash: TxHash::random(),
+            log_index: 1,
+        };
+
+        let position = replay::<Position>(vec![
+            PositionEvent::Initialized {
+                symbol,
+                threshold: one_share_threshold(),
+                initialized_at: now,
+            },
+            PositionEvent::OnChainOrderFilled {
+                trade_id: trade_id.clone(),
+                amount: FractionalShares::new(float!(5)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp: now,
+                seen_at: now,
+            },
+            PositionEvent::Reorged {
+                trade_id,
+                amount: FractionalShares::new(float!(5)),
+                direction: Direction::Buy,
+                reorg_depth: 2,
+                reorged_at: now,
+            },
+        ])
+        .unwrap()
+        .expect("replay must produce a live position");
+
+        assert_eq!(position.net, FractionalShares::ZERO);
+        assert_eq!(position.accumulated_long, FractionalShares::ZERO);
+        assert_eq!(position.accumulated_short, FractionalShares::ZERO);
+        assert_eq!(position.last_reorged_at, Some(now));
+    }
+
+    /// The sell-side mirror: reversing a sell returns `net` to zero and undoes
+    /// the `accumulated_short` the fill grew.
+    #[test]
+    fn reorg_reverses_sell_fill_to_pre_fill_state() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let trade_id = TradeId {
+            tx_hash: TxHash::random(),
+            log_index: 1,
+        };
+
+        let position = replay::<Position>(vec![
+            PositionEvent::Initialized {
+                symbol,
+                threshold: one_share_threshold(),
+                initialized_at: now,
+            },
+            PositionEvent::OnChainOrderFilled {
+                trade_id: trade_id.clone(),
+                amount: FractionalShares::new(float!(5)),
+                direction: Direction::Sell,
+                price_usdc: float!(150),
+                block_timestamp: now,
+                seen_at: now,
+            },
+            PositionEvent::Reorged {
+                trade_id,
+                amount: FractionalShares::new(float!(5)),
+                direction: Direction::Sell,
+                reorg_depth: 1,
+                reorged_at: now,
+            },
+        ])
+        .unwrap()
+        .expect("replay must produce a live position");
+
+        assert_eq!(position.net, FractionalShares::ZERO);
+        assert_eq!(position.accumulated_short, FractionalShares::ZERO);
+        assert_eq!(position.accumulated_long, FractionalShares::ZERO);
+        assert_eq!(position.last_reorged_at, Some(now));
+    }
+
+    /// `evolve` reverses a `Reorged` by its `amount`/`direction`, NOT by
+    /// `trade_id` (which is audit metadata the aggregate does not match on). A
+    /// 5-share buy reversed out of two buys (5 + 3) leaves the 3-share net --
+    /// the reversal matches the amount, not the named trade.
+    #[test]
+    fn reorg_reverses_by_amount_and_direction_not_trade_id() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let reorged_trade = TradeId {
+            tx_hash: TxHash::random(),
+            log_index: 1,
+        };
+        let surviving_trade = TradeId {
+            tx_hash: TxHash::random(),
+            log_index: 2,
+        };
+
+        let position = replay::<Position>(vec![
+            PositionEvent::Initialized {
+                symbol,
+                threshold: one_share_threshold(),
+                initialized_at: now,
+            },
+            PositionEvent::OnChainOrderFilled {
+                trade_id: reorged_trade.clone(),
+                amount: FractionalShares::new(float!(5)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp: now,
+                seen_at: now,
+            },
+            PositionEvent::OnChainOrderFilled {
+                trade_id: surviving_trade,
+                amount: FractionalShares::new(float!(3)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp: now,
+                seen_at: now,
+            },
+            PositionEvent::Reorged {
+                trade_id: reorged_trade,
+                amount: FractionalShares::new(float!(5)),
+                direction: Direction::Buy,
+                reorg_depth: 1,
+                reorged_at: now,
+            },
+        ])
+        .unwrap()
+        .expect("replay must produce a live position");
+
+        assert_eq!(position.net, FractionalShares::new(float!(3)));
+        assert_eq!(position.accumulated_long, FractionalShares::new(float!(3)));
+    }
+
+    #[tokio::test]
+    async fn reorged_fill_can_be_re_acknowledged_after_canonical_reconfirmation() {
+        // The fill-dedupe guard absorbs crash-window replay but must not
+        // permanently tombstone a fill: if the same (tx, log) re-confirms on the
+        // canonical chain after the reorg resolves, re-acknowledgement must
+        // succeed, not be rejected as a DuplicateTrade.
+        //
+        // The seeded history is the real post-ADR-0010 production state:
+        // `AcknowledgeOnChainFill` always emits `OnChainOrderFilled` +
+        // `OnChainFillApplied` as an atomic pair, so the applied trade_id sits
+        // in `pending_acknowledged_trade_ids`. The `Reorged` evolve must remove
+        // it from that set (mirroring `OnChainFillSettled`); otherwise the dedup
+        // guard's set check would keep rejecting the canonical re-confirmation.
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let trade_id = TradeId {
+            tx_hash: TxHash::random(),
+            log_index: 1,
+        };
+        let amount = FractionalShares::new(float!(5));
+
+        let events = TestHarness::<Position>::with(())
+            .given(vec![
+                PositionEvent::Initialized {
+                    symbol: symbol.clone(),
+                    threshold: one_share_threshold(),
+                    initialized_at: now,
+                },
+                PositionEvent::OnChainOrderFilled {
+                    trade_id: trade_id.clone(),
+                    amount,
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: now,
+                    seen_at: now,
+                },
+                PositionEvent::OnChainFillApplied {
+                    trade_id: trade_id.clone(),
+                    applied_at: now,
+                },
+                PositionEvent::Reorged {
+                    trade_id: trade_id.clone(),
+                    amount,
+                    direction: Direction::Buy,
+                    reorg_depth: 1,
+                    reorged_at: now,
+                },
+            ])
+            .when(PositionCommand::AcknowledgeOnChainFill {
+                symbol,
+                threshold: one_share_threshold(),
+                trade_id,
+                amount,
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp: now,
+            })
+            .await
+            .events();
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    PositionEvent::OnChainOrderFilled { .. },
+                    PositionEvent::OnChainFillApplied { .. }
+                ]
+            ),
+            "re-confirmation of a reorged fill must be accepted, not rejected as \
+             DuplicateTrade; got {events:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn reorging_an_older_fill_preserves_a_newer_fills_dedupe_anchor() {
+        // Reversing one fill must not reopen another fill's crash-window guard.
+        // After two fills are acknowledged, reorging the OLDER one must leave the
+        // NEWER fill's dedupe anchor intact, so a re-delivered acknowledge of the
+        // newer fill is still rejected as a duplicate rather than double-counted.
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let threshold = one_share_threshold();
+        let older = TradeId {
+            tx_hash: TxHash::random(),
+            log_index: 1,
+        };
+        let newer = TradeId {
+            tx_hash: TxHash::random(),
+            log_index: 2,
+        };
+        let amount = FractionalShares::new(float!(5));
+
+        let error = TestHarness::<Position>::with(())
+            .given(vec![
+                PositionEvent::Initialized {
+                    symbol: symbol.clone(),
+                    threshold,
+                    initialized_at: now,
+                },
+                PositionEvent::OnChainOrderFilled {
+                    trade_id: older.clone(),
+                    amount,
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: now,
+                    seen_at: now,
+                },
+                PositionEvent::OnChainOrderFilled {
+                    trade_id: newer.clone(),
+                    amount,
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: now,
+                    seen_at: now,
+                },
+                PositionEvent::Reorged {
+                    trade_id: older.clone(),
+                    amount,
+                    direction: Direction::Buy,
+                    reorg_depth: 1,
+                    reorged_at: now,
+                },
+            ])
+            .when(PositionCommand::AcknowledgeOnChainFill {
+                symbol,
+                threshold,
+                trade_id: newer.clone(),
+                amount,
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp: now,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(PositionError::DuplicateTrade {
+                    trade_id: ref rejected
+                }) if *rejected == newer
+            ),
+            "reorging an older fill must not clear a newer fill's dedupe anchor; \
+             re-acknowledging the newer fill must still be rejected as a \
+             duplicate; got: {error:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn cannot_reorg_uninitialized_position() {
+        let error = TestHarness::<Position>::with(())
+            .given_no_previous_events()
+            .when(PositionCommand::RecordReorg {
+                trade_id: TradeId {
+                    tx_hash: TxHash::random(),
+                    log_index: 1,
+                },
+                amount: FractionalShares::new(float!(5)),
+                direction: Direction::Buy,
+                reorg_depth: 1,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(PositionError::Uninitialized)
+        ));
+    }
+
+    /// The `position_view.last_reorged_at` column is `json_extract(payload,
+    /// '$.Live.last_reorged_at')`. `Position` serializes flat (the field at the
+    /// top level); the framework's `Lifecycle<Position>` wrapper nests that flat
+    /// object under the externally-tagged `Live` key, so the projection reads
+    /// `$.Live.last_reorged_at`. This pins the exact RFC3339 string the column
+    /// receives for a known `reorged_at`, independent of the serialization under
+    /// test.
+    #[test]
+    fn reorged_marker_serializes_for_view() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let reorged_at = DateTime::parse_from_rfc3339("2026-06-15T19:49:15Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let trade_id = TradeId {
+            tx_hash: TxHash::random(),
+            log_index: 1,
+        };
+
+        let position = replay::<Position>(vec![
+            PositionEvent::Initialized {
+                symbol,
+                threshold: one_share_threshold(),
+                initialized_at: now,
+            },
+            PositionEvent::OnChainOrderFilled {
+                trade_id: trade_id.clone(),
+                amount: FractionalShares::new(float!(5)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp: now,
+                seen_at: now,
+            },
+            PositionEvent::Reorged {
+                trade_id,
+                amount: FractionalShares::new(float!(5)),
+                direction: Direction::Buy,
+                reorg_depth: 1,
+                reorged_at,
+            },
+        ])
+        .unwrap()
+        .expect("replay must produce a live position");
+
+        let payload = serde_json::to_value(&position).unwrap();
+
+        assert_eq!(
+            payload["last_reorged_at"],
+            serde_json::json!("2026-06-15T19:49:15Z"),
+            "last_reorged_at must serialize to the exact RFC3339 string the \
+             position_view projection extracts via $.Live.last_reorged_at",
+        );
     }
 
     /// Reproduction for the double-count half of the Witness/Acknowledge
@@ -3570,6 +4211,23 @@ mod tests {
     }
 
     #[test]
+    fn timestamp_returns_reorged_at_for_reorged_event() {
+        let reorged_at = Utc::now();
+        let event = PositionEvent::Reorged {
+            trade_id: TradeId {
+                tx_hash: TxHash::random(),
+                log_index: 1,
+            },
+            amount: FractionalShares::new(float!(5)),
+            direction: Direction::Buy,
+            reorg_depth: 1,
+            reorged_at,
+        };
+
+        assert_eq!(event.timestamp(), reorged_at);
+    }
+
+    #[test]
     fn timestamp_returns_placed_at_for_offchain_order_placed_event() {
         let timestamp = Utc::now();
         let event = PositionEvent::OffChainOrderPlaced {
@@ -3656,6 +4314,7 @@ mod tests {
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
+            last_reorged_at: None,
         };
 
         let (direction, shares) = position
@@ -3685,6 +4344,7 @@ mod tests {
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
+            last_reorged_at: None,
         };
 
         let (direction, shares) = position
@@ -3714,6 +4374,7 @@ mod tests {
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
+            last_reorged_at: None,
         };
 
         let shares_limit = Positive::new(FractionalShares::new(float!(50))).unwrap();
@@ -3746,6 +4407,7 @@ mod tests {
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
+            last_reorged_at: None,
         };
 
         let shares_limit = Positive::new(FractionalShares::new(float!(50))).unwrap();
@@ -3778,6 +4440,7 @@ mod tests {
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
+            last_reorged_at: None,
         };
 
         let shares_limit = Positive::new(FractionalShares::new(float!(50.7))).unwrap();
@@ -3809,6 +4472,7 @@ mod tests {
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
+            last_reorged_at: None,
         };
 
         let shares_limit = Positive::new(FractionalShares::new(float!(7.5))).unwrap();
@@ -3841,6 +4505,7 @@ mod tests {
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
+            last_reorged_at: None,
         };
 
         let shares_limit = Positive::new(FractionalShares::new(float!(5))).unwrap();
@@ -3873,6 +4538,7 @@ mod tests {
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: None,
             last_updated: Some(Utc::now()),
+            last_reorged_at: None,
         };
 
         let shares_limit = Positive::new(FractionalShares::new(float!(50))).unwrap();
@@ -3955,6 +4621,7 @@ mod tests {
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(float!(150)),
             last_updated: Some(Utc::now()),
+            last_reorged_at: None,
         };
 
         let (_, first_shares) = position

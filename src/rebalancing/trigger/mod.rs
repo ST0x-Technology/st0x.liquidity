@@ -2326,6 +2326,15 @@ impl Reactor for RebalancingService {
                         self.equity_scheduler.enqueue_check(symbol).await;
                         return Ok(());
                     }
+                    Reorged { .. } => {
+                        // A reorg reversal moves net exposure like a manual
+                        // adjustment, but the event carries no fill price, so the
+                        // usdc leg cannot be reversed precisely here. Nudge an
+                        // equity check and let the polled inventory reconcile the
+                        // new balance.
+                        self.equity_scheduler.enqueue_check(symbol).await;
+                        return Ok(());
+                    }
                 };
 
                 let inventory_result = {
@@ -9509,6 +9518,74 @@ mod tests {
         assert_eq!(
             pending_equity_checks, 1,
             "ManualPositionAdjusted must enqueue exactly one immediate equity recheck"
+        );
+    }
+
+    #[tokio::test]
+    async fn reorged_via_reactor_enqueues_equity_recheck() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(5), shares(5))
+            .with_usdc(usdc(10000), usdc(10000));
+
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        // A reorg reversal carries no fill price, so the reactor cannot reverse
+        // the usdc leg precisely; it nudges an immediate equity check and leaves
+        // the polled inventory to reconcile the reversed balance, without
+        // mutating inventory directly here.
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                PositionEvent::Reorged {
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: shares(5),
+                    direction: Direction::Buy,
+                    reorg_depth: 1,
+                    reorged_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::Hedging),
+            Some(shares(5)),
+            "reorg reversal must not directly change hedging equity"
+        );
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::MarketMaking),
+            Some(shares(5)),
+            "reorg reversal must not directly change market-making equity"
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::Hedging),
+            Some(usdc(10000)),
+            "reorg reversal must not directly change hedging USDC"
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::MarketMaking),
+            Some(usdc(10000)),
+            "reorg reversal must not directly change market-making USDC"
+        );
+        drop(inventory);
+
+        let pending_equity_checks = sqlx_apalis::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<EquityRebalancingCheck>())
+        .fetch_one(trigger.equity_scheduler.queue().pool())
+        .await
+        .expect("count pending equity-check jobs after Reorged");
+
+        assert_eq!(
+            pending_equity_checks, 1,
+            "Reorged must enqueue exactly one immediate equity recheck"
         );
     }
 
