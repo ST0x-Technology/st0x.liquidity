@@ -29,6 +29,7 @@ use st0x_execution::MockExecutorCtx;
 
 use crate::trading::offchain::hedge::HedgeJobQueue;
 use crate::trading::onchain::trade_accountant::DexTradeAccountingJobQueue;
+use conductor::DatabasePools;
 
 /// Outer timeout for the entire graceful shutdown sequence. Must exceed
 /// the rebalancer drain timeout (60s) plus margin for supervisor shutdown
@@ -176,8 +177,9 @@ async fn run_bot_session_inner(
     #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
 ) -> anyhow::Result<()> {
     let pool = ctx.get_sqlite_pool().await?;
+    let apalis_pool = conductor::connect_apalis_pool(&ctx.database_url).await?;
     sqlx::migrate!().set_ignore_missing(true).run(&pool).await?;
-    conductor::setup_apalis_tables(&pool).await?;
+    conductor::setup_apalis_tables(&apalis_pool).await?;
 
     let inventory = Arc::new(inventory::BroadcastingInventory::new(
         inventory::InventoryView::default(),
@@ -197,9 +199,14 @@ async fn run_bot_session_inner(
         .await
         .with_context(|| format!("failed to bind apalis-board on port {}", ctx.board_port))?;
 
+    let pools = DatabasePools {
+        cqrs: pool,
+        apalis: apalis_pool,
+    };
+
     let server_supervisor = spawn_server_supervisor(
         &ctx,
-        &pool,
+        &pools,
         event_sender.clone(),
         inventory.clone(),
         recovery_cell.clone(),
@@ -209,7 +216,7 @@ async fn run_bot_session_inner(
     );
     let bot_task = tokio::spawn(Box::pin(run_conductor_session(
         ctx,
-        pool,
+        pools,
         event_sender,
         inventory,
         shutdown_token.clone(),
@@ -275,7 +282,7 @@ impl SupervisedTask for ServerTask {
 
 fn spawn_server_supervisor(
     ctx: &Ctx,
-    pool: &SqlitePool,
+    pools: &DatabasePools,
     event_sender: broadcast::Sender<Statement>,
     inventory: Arc<inventory::BroadcastingInventory>,
     recovery: Arc<tokio::sync::OnceCell<api::RecoveryHandle>>,
@@ -285,7 +292,7 @@ fn spawn_server_supervisor(
 ) -> SupervisorHandle {
     let state = AppState {
         ctx: ctx.clone(),
-        pool: pool.clone(),
+        pool: pools.cqrs.clone(),
         event_sender,
         inventory,
         settings: dashboard::settings_from_ctx(ctx),
@@ -302,8 +309,8 @@ fn spawn_server_supervisor(
     // (`/apalis-board-web-*`) and the wasm calls `/api/v1/*` directly,
     // so it must own its origin. Run it on its own port instead of
     // nesting under the main router.
-    let dex_storage = DexTradeAccountingJobQueue::new(pool).into_storage();
-    let hedge_storage = HedgeJobQueue::new(pool).into_storage();
+    let dex_storage = DexTradeAccountingJobQueue::new(&pools.apalis).into_storage();
+    let hedge_storage = HedgeJobQueue::new(&pools.apalis).into_storage();
     let board_api = ApiBuilder::new(Router::new())
         .register(dex_storage)
         .register(hedge_storage)
@@ -448,7 +455,7 @@ fn check_bot_result(result: Result<anyhow::Result<()>, JoinError>) -> anyhow::Re
 #[tracing::instrument(skip_all, target = "startup", level = tracing::Level::INFO)]
 async fn run_conductor_session(
     ctx: Ctx,
-    pool: SqlitePool,
+    pools: DatabasePools,
     event_sender: broadcast::Sender<Statement>,
     inventory: Arc<inventory::BroadcastingInventory>,
     shutdown_token: tokio_util::sync::CancellationToken,
@@ -458,10 +465,11 @@ async fn run_conductor_session(
     let result = match ctx.broker.clone() {
         BrokerCtx::DryRun => {
             info!(target: "startup", "Initializing test executor for dry-run mode");
+            let pools = pools.clone();
             Box::pin(conductor::Conductor::run(
                 MockExecutorCtx,
                 ctx,
-                pool,
+                pools,
                 event_sender,
                 inventory,
                 shutdown_token,
@@ -476,7 +484,7 @@ async fn run_conductor_session(
             Box::pin(conductor::Conductor::run(
                 alpaca_auth,
                 ctx,
-                pool,
+                pools,
                 event_sender,
                 inventory,
                 shutdown_token,
@@ -512,12 +520,6 @@ mod tests {
     // `Ctx::load_files` parses `orderbook` into `Address`, so runtime tests
     // only exercise already-validated addresses. Invalid orderbook input is
     // covered in `config::tests::load_files_rejects_invalid_orderbook_address`.
-
-    async fn create_test_pool() -> SqlitePool {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
-        pool
-    }
 
     fn create_test_event_sender() -> broadcast::Sender<Statement> {
         let (sender, _) = broadcast::channel(16);
@@ -680,13 +682,16 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(address!(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
-        let pool = create_test_pool().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         // Port 1 refuses connections immediately, so the startup RPC probe
         // fails fast rather than hanging on a retry loop.
         ctx.evm.rpc_url = "http://127.0.0.1:1".parse().unwrap();
         let error = Box::pin(run_conductor_session(
             ctx,
-            pool,
+            DatabasePools {
+                cqrs: pool,
+                apalis: apalis_pool,
+            },
             create_test_event_sender(),
             create_test_inventory(),
             tokio_util::sync::CancellationToken::new(),
@@ -710,10 +715,13 @@ mod tests {
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
         ctx.evm.rpc_url = "http://127.0.0.1:1".parse().unwrap();
-        let pool = create_test_pool().await;
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let error = Box::pin(run_conductor_session(
             ctx,
-            pool,
+            DatabasePools {
+                cqrs: pool,
+                apalis: apalis_pool,
+            },
             create_test_event_sender(),
             create_test_inventory(),
             tokio_util::sync::CancellationToken::new(),

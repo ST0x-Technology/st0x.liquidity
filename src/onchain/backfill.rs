@@ -414,13 +414,11 @@ mod tests {
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::rpc::types::Log;
     use rain_math_float::Float;
-    use sqlx::SqlitePool;
     use url::Url;
 
     use super::*;
     use crate::bindings::IRaindexV6;
-    use crate::conductor::setup_apalis_tables;
-    use crate::test_utils::{get_test_order, setup_test_db};
+    use crate::test_utils::{get_test_order, setup_test_db, setup_test_pools};
     use st0x_config::EvmCtx;
 
     fn test_retry_strategy() -> ExponentialBuilder {
@@ -430,14 +428,13 @@ mod tests {
             .with_max_delay(Duration::from_millis(10))
     }
 
-    async fn setup_job_queue(pool: &SqlitePool) -> DexTradeAccountingJobQueue {
-        setup_apalis_tables(pool).await.unwrap();
-        DexTradeAccountingJobQueue::new(pool)
+    fn setup_job_queue(apalis_pool: &apalis_sqlite::SqlitePool) -> DexTradeAccountingJobQueue {
+        DexTradeAccountingJobQueue::new(apalis_pool)
     }
 
-    async fn job_count(pool: &SqlitePool) -> i64 {
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM Jobs")
-            .fetch_one(pool)
+    async fn job_count(apalis_pool: &apalis_sqlite::SqlitePool) -> i64 {
+        sqlx_apalis::query_scalar::<_, i64>("SELECT COUNT(*) FROM Jobs")
+            .fetch_one(apalis_pool)
             .await
             .unwrap()
     }
@@ -499,8 +496,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_backfill_events_empty_results() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([])); // clear events
@@ -527,7 +524,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 0);
+        assert_eq!(job_count(&apalis_pool).await, 0);
         assert_eq!(
             load_backfill_checkpoint(&pool, &evm_ctx).await.unwrap(),
             Some(100)
@@ -536,8 +533,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_backfill_events_skips_when_checkpoint_is_caught_up() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -563,7 +560,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 0);
+        assert_eq!(job_count(&apalis_pool).await, 0);
         assert_eq!(
             load_backfill_checkpoint(&pool, &evm_ctx).await.unwrap(),
             Some(100)
@@ -572,8 +569,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_backfill_events_skip_preserves_newer_checkpoint() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -724,8 +721,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_backfill_events_with_clear_v3_events() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -785,13 +782,13 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 1);
+        assert_eq!(job_count(&apalis_pool).await, 1);
     }
 
     #[tokio::test]
     async fn test_backfill_events_with_take_order_v3_events() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -853,13 +850,13 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 1);
+        assert_eq!(job_count(&apalis_pool).await, 1);
     }
 
     #[tokio::test]
     async fn test_backfill_events_enqueues_all_events() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -952,13 +949,13 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 2);
+        assert_eq!(job_count(&apalis_pool).await, 2);
     }
 
     #[tokio::test]
     async fn test_backfill_events_rpc_failure() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -997,8 +994,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_backfill_events_block_range() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -1025,7 +1022,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 0);
+        assert_eq!(job_count(&apalis_pool).await, 0);
     }
 
     fn create_test_take_event(
@@ -1077,8 +1074,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_backfill_events_preserves_chronological_order() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -1125,13 +1122,13 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 2);
+        assert_eq!(job_count(&apalis_pool).await, 2);
     }
 
     #[tokio::test]
     async fn test_backfill_events_batch_count_verification() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -1166,13 +1163,13 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 0);
+        assert_eq!(job_count(&apalis_pool).await, 0);
     }
 
     #[tokio::test]
     async fn test_backfill_events_batch_boundary_verification() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -1207,13 +1204,13 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 0);
+        assert_eq!(job_count(&apalis_pool).await, 0);
     }
 
     #[tokio::test]
     async fn test_process_batch_with_realistic_data() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -1251,13 +1248,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(enqueued_count, 1);
-        assert_eq!(job_count(&pool).await, 1);
+        assert_eq!(job_count(&apalis_pool).await, 1);
     }
 
     #[tokio::test]
     async fn test_backfill_events_large_block_range_batching() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -1287,13 +1284,13 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 0);
+        assert_eq!(job_count(&apalis_pool).await, 0);
     }
 
     #[tokio::test]
     async fn test_backfill_events_mixed_valid_and_invalid_events() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -1346,7 +1343,7 @@ mod tests {
         .unwrap();
 
         // Both events should be enqueued (filtering happens during processing, not backfill)
-        assert_eq!(job_count(&pool).await, 2);
+        assert_eq!(job_count(&apalis_pool).await, 2);
     }
 
     fn create_clear_log(orderbook: Address, order: &IRaindexV6::OrderV4, tx_hash: TxHash) -> Log {
@@ -1383,8 +1380,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_backfill_events_mixed_clear_and_take_events() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -1425,13 +1422,13 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 2);
+        assert_eq!(job_count(&apalis_pool).await, 2);
     }
 
     #[tokio::test]
     async fn test_process_batch_retry_mechanism() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -1466,8 +1463,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_batch_exhausted_retries() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -1506,8 +1503,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_backfill_events_partial_batch_failure() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -1554,8 +1551,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_backfill_events_corrupted_log_data() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -1602,7 +1599,7 @@ mod tests {
         .unwrap();
 
         // Corrupted logs are silently ignored during backfill
-        assert_eq!(job_count(&pool).await, 0);
+        assert_eq!(job_count(&apalis_pool).await, 0);
     }
 
     #[tokio::test]
@@ -1611,8 +1608,8 @@ mod tests {
         // boundary, so a `removed: true` log here implies a deep
         // reorg. We must skip it (logged as error) rather than
         // ingesting a vanished event.
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let order = get_test_order();
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
@@ -1651,7 +1648,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            job_count(&pool).await,
+            job_count(&apalis_pool).await,
             0,
             "logs with removed=true must be skipped, not ingested"
         );
@@ -1659,8 +1656,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_backfill_events_single_block_range() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -1687,13 +1684,13 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 0);
+        assert_eq!(job_count(&apalis_pool).await, 0);
     }
 
     #[tokio::test]
     async fn test_enqueue_batch_events_database_failure() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -1722,8 +1719,8 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        // Close the database to simulate connection failure
-        pool.close().await;
+        // Close the apalis pool to simulate job-queue connection failure.
+        apalis_pool.close().await;
 
         let result = enqueue_batch_events(
             &provider,
@@ -1744,8 +1741,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_enqueue_batch_events_errors_when_node_tip_behind_requested_range() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -1785,13 +1782,13 @@ mod tests {
             ),
             "expected NodeLaggingBehindRequest {{ observed_tip: 50, required_tip: 100 }}, got {error:?}"
         );
-        assert_eq!(job_count(&pool).await, 0);
+        assert_eq!(job_count(&apalis_pool).await, 0);
     }
 
     #[tokio::test]
     async fn test_enqueue_batch_events_filter_creation() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -1822,8 +1819,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_enqueue_batch_events_partial_enqueue_failure() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -1881,8 +1878,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_backfill_events_concurrent_batch_processing() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -1930,13 +1927,13 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 1);
+        assert_eq!(job_count(&apalis_pool).await, 1);
     }
 
     #[tokio::test]
     async fn test_enqueue_batch_events_retry_exponential_backoff() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -1977,8 +1974,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_backfill_events_zero_blocks() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -2001,13 +1998,13 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 0);
+        assert_eq!(job_count(&apalis_pool).await, 0);
     }
 
     #[tokio::test]
     async fn test_enqueue_batch_events_mixed_log_types() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -2079,13 +2076,13 @@ mod tests {
 
         let enqueued = result.unwrap();
         assert_eq!(enqueued, 2);
-        assert_eq!(job_count(&pool).await, 2);
+        assert_eq!(job_count(&apalis_pool).await, 2);
     }
 
     #[tokio::test]
     async fn test_backfill_starts_from_deployment_block() {
-        let pool = setup_test_db().await;
-        let job_queue = setup_job_queue(&pool).await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let job_queue = setup_job_queue(&apalis_pool);
         let evm_ctx = EvmCtx {
             rpc_url: Url::parse("http://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
@@ -2113,6 +2110,6 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(job_count(&pool).await, 0);
+        assert_eq!(job_count(&apalis_pool).await, 0);
     }
 }

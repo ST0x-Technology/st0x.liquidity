@@ -13,6 +13,7 @@ use anyhow::Context;
 use apalis::prelude::Status;
 use chrono::Utc;
 use sqlx::SqlitePool;
+use sqlx_apalis::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -90,9 +91,34 @@ use crate::wrapped_equity_recovery::{
 pub(crate) use builder::CqrsFrameworks;
 use manifest::QueryManifest;
 
+/// CQRS/event-store and apalis worker pools over the same SQLite database.
+#[derive(Clone)]
+pub(crate) struct DatabasePools {
+    pub(crate) cqrs: SqlitePool,
+    pub(crate) apalis: apalis_sqlite::SqlitePool,
+}
+
+/// Opens an apalis-side pool (sqlx 0.8) against the same database as the
+/// CQRS pool (sqlx 0.9). apalis workers read the `Jobs` table through this
+/// pool; the event store writes events through the CQRS pool.
+pub(crate) async fn connect_apalis_pool(
+    database_url: &str,
+) -> Result<apalis_sqlite::SqlitePool, apalis_sqlite::SqlxError> {
+    let options: SqliteConnectOptions = st0x_config::effective_sqlite_url(database_url)
+        .parse::<SqliteConnectOptions>()?
+        .create_if_missing(true)
+        .auto_vacuum(SqliteAutoVacuum::Incremental)
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(std::time::Duration::from_secs(10));
+
+    apalis_sqlite::SqlitePool::connect_with(options).await
+}
+
 /// Sets up apalis SQLite storage tables, tolerating pre-existing
 /// application migrations in the shared `_sqlx_migrations` table.
-pub(crate) async fn setup_apalis_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+pub(crate) async fn setup_apalis_tables(
+    pool: &apalis_sqlite::SqlitePool,
+) -> Result<(), apalis_sqlite::SqlxError> {
     apalis_sqlite::SqliteStorage::migrations()
         .set_ignore_missing(true)
         .run(pool)
@@ -220,7 +246,7 @@ impl Conductor {
     pub(crate) async fn run<E>(
         executor_ctx: impl TryIntoExecutor<Executor = E>,
         ctx: Ctx,
-        pool: SqlitePool,
+        pools: DatabasePools,
         event_sender: broadcast::Sender<Statement>,
         inventory: Arc<BroadcastingInventory>,
         shutdown_token: CancellationToken,
@@ -233,6 +259,10 @@ impl Conductor {
         TradeAccountingError: From<E::Error>,
         crate::offchain::order::JobError: From<E::Error>,
     {
+        let DatabasePools {
+            cqrs: pool,
+            apalis: apalis_pool,
+        } = pools;
         let executor = executor_ctx.try_into_executor().await?;
 
         // Single HTTP transport: drives continuous eth_getLogs fill polling
@@ -250,10 +280,10 @@ impl Conductor {
             .context("failed to reach RPC endpoint at startup")?;
         let cache = SymbolCache::default();
 
-        setup_apalis_tables(&pool).await?;
-        let job_queue = DexTradeAccountingJobQueue::new(&pool);
-        let backfill_queue = BackfillJobQueue::new(&pool);
-        let schedulers = RebalancingSchedulers::new(&pool);
+        setup_apalis_tables(&apalis_pool).await?;
+        let job_queue = DexTradeAccountingJobQueue::new(&apalis_pool);
+        let backfill_queue = BackfillJobQueue::new(&apalis_pool);
+        let schedulers = RebalancingSchedulers::new(&apalis_pool);
 
         let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
             .build(())
@@ -264,7 +294,7 @@ impl Conductor {
                 .build(())
                 .await?;
 
-        let seed_vault_registry_queue = SeedVaultRegistryJobQueue::new(&pool);
+        let seed_vault_registry_queue = SeedVaultRegistryJobQueue::new(&apalis_pool);
         let seed_vault_registry_ctx = Arc::new(
             SeedVaultRegistryCtx::from_config(vault_registry.clone(), &ctx).map_err(|err| *err)?,
         );
@@ -366,13 +396,13 @@ impl Conductor {
             snapshot,
         };
 
-        let hedge_queue = crate::conductor::job::JobQueue::new(&pool);
-        let mut poll_status_queue = PollOrderStatusJobQueue::new(&pool);
-        let reconcile_queue = ReconcileOrderFillJobQueue::new(&pool);
-        let rejection_queue = HandleOrderRejectionJobQueue::new(&pool);
+        let hedge_queue = crate::conductor::job::JobQueue::new(&apalis_pool);
+        let mut poll_status_queue = PollOrderStatusJobQueue::new(&apalis_pool);
+        let reconcile_queue = ReconcileOrderFillJobQueue::new(&apalis_pool);
+        let rejection_queue = HandleOrderRejectionJobQueue::new(&apalis_pool);
 
-        let wrapped_equity_recovery_queue = WrappedEquityRecoveryJobQueue::new(&pool);
-        let unwrapped_equity_recovery_queue = UnwrappedEquityRecoveryJobQueue::new(&pool);
+        let wrapped_equity_recovery_queue = WrappedEquityRecoveryJobQueue::new(&apalis_pool);
+        let unwrapped_equity_recovery_queue = UnwrappedEquityRecoveryJobQueue::new(&apalis_pool);
 
         let wrapped_equity_recovery_ctx = match (
             wrapped_equity_recovery_store,
@@ -411,7 +441,7 @@ impl Conductor {
             requeue_recovery_orphans(&unwrapped_equity_recovery_queue, "unwrapped equity").await?;
         }
 
-        let check_positions_queue = CheckPositionsJobQueue::new(&pool);
+        let check_positions_queue = CheckPositionsJobQueue::new(&apalis_pool);
 
         recover_submitted_offchain_orders(
             &frameworks.offchain_order_projection,
@@ -420,10 +450,11 @@ impl Conductor {
         )
         .await?;
 
-        bootstrap_check_positions(&pool, &check_positions_queue).await?;
+        bootstrap_check_positions(&apalis_pool, &check_positions_queue).await?;
 
         let job_cleanup = spawn_finished_job_cleanup(
             pool.clone(),
+            apalis_pool.clone(),
             Duration::from_secs(ctx.apalis_finished_job_cleanup_interval_secs),
         );
 
@@ -718,7 +749,11 @@ fn check_monitor_drain_result(
     }
 }
 
-fn spawn_finished_job_cleanup(pool: SqlitePool, cleanup_interval: Duration) -> JoinHandle<()> {
+fn spawn_finished_job_cleanup(
+    pool: SqlitePool,
+    apalis_pool: apalis_sqlite::SqlitePool,
+    cleanup_interval: Duration,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(cleanup_interval);
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -726,7 +761,7 @@ fn spawn_finished_job_cleanup(pool: SqlitePool, cleanup_interval: Duration) -> J
         loop {
             interval.tick().await;
 
-            let cleanup_result = sqlx::query(
+            let cleanup_result = sqlx_apalis::query(
                 "DELETE FROM Jobs \
                  WHERE status = ? \
                  OR status = ? \
@@ -735,7 +770,7 @@ fn spawn_finished_job_cleanup(pool: SqlitePool, cleanup_interval: Duration) -> J
             .bind(Status::Done.to_string())
             .bind(Status::Killed.to_string())
             .bind(Status::Failed.to_string())
-            .execute(&pool)
+            .execute(&apalis_pool)
             .await
             .map(|outcome| outcome.rows_affected());
 
@@ -796,27 +831,12 @@ async fn hydrate_single_snapshot(
         return;
     };
 
-    let events = snapshot.hydration_events();
-    if events.is_empty() {
+    let event_count = snapshot.hydrate_inventory(inventory).await;
+    if event_count == 0 {
         return;
     }
 
-    apply_hydration_events(inventory, &events).await;
-    info!(%id, event_count = events.len(), "Hydrated InventoryView from persisted snapshot");
-}
-
-async fn apply_hydration_events(
-    inventory: &Arc<BroadcastingInventory>,
-    events: &[crate::inventory::snapshot::InventorySnapshotEvent],
-) {
-    let now = chrono::Utc::now();
-    let mut view = inventory.write().await;
-
-    for event in events {
-        if let Ok(updated) = view.clone().apply_snapshot_event(event, now) {
-            *view = updated;
-        }
-    }
+    info!(%id, event_count, "Hydrated InventoryView from persisted snapshot");
 }
 
 struct RebalancingInfrastructure {
@@ -2311,7 +2331,9 @@ mod tests {
     use crate::offchain::order::OrderPlacementResult;
     use crate::onchain::trade::OnchainTrade;
     use crate::rebalancing::{RebalancingSchedulers, RebalancingService, TriggeredOperation};
-    use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
+    use crate::test_utils::{
+        OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db, setup_test_pools,
+    };
     use crate::trading::onchain::inclusion::EmittedOnChain;
     use crate::unwrapped_equity_recovery::UnwrappedEquityRecoveryJob;
     use crate::unwrapped_equity_recovery::aggregate::UnwrappedEquityRecoveryId;
@@ -2340,8 +2362,8 @@ mod tests {
         (Arc::new(Broadcaster::new(sender, pool.clone())), receiver)
     }
 
-    async fn insert_finished_job(pool: &SqlitePool, id: &str) {
-        sqlx::query(
+    async fn insert_finished_job(apalis_pool: &apalis_sqlite::SqlitePool, id: &str) {
+        sqlx_apalis::query(
             "INSERT INTO Jobs \
              (job, id, job_type, status, attempts, max_attempts, run_at, priority) \
              VALUES (?, ?, 'test', ?, 1, 25, 0, 0)",
@@ -2349,16 +2371,15 @@ mod tests {
         .bind(vec![0_u8])
         .bind(id)
         .bind(Status::Done.to_string())
-        .execute(pool)
+        .execute(apalis_pool)
         .await
         .unwrap();
     }
 
     #[tokio::test]
     async fn requeue_recovery_orphans_resets_unwrapped_recovery_rows() {
-        let pool = setup_test_db().await;
-        setup_apalis_tables(&pool).await.unwrap();
-        let mut queue = UnwrappedEquityRecoveryJobQueue::new(&pool);
+        let (_pool, apalis_pool) = setup_test_pools().await;
+        let mut queue = UnwrappedEquityRecoveryJobQueue::new(&apalis_pool);
         let job_type = std::any::type_name::<UnwrappedEquityRecoveryJob>();
 
         queue
@@ -2369,10 +2390,10 @@ mod tests {
             .await
             .unwrap();
 
-        sqlx::query("UPDATE Jobs SET status = ?, lock_at = 1 WHERE job_type = ?")
+        sqlx_apalis::query("UPDATE Jobs SET status = ?, lock_at = 1 WHERE job_type = ?")
             .bind(Status::Running.to_string())
             .bind(job_type)
-            .execute(&pool)
+            .execute(&apalis_pool)
             .await
             .unwrap();
 
@@ -2381,26 +2402,26 @@ mod tests {
             .unwrap();
 
         let (status, lock_by): (String, Option<String>) =
-            sqlx::query_as("SELECT status, lock_by FROM Jobs WHERE job_type = ?")
+            sqlx_apalis::query_as("SELECT status, lock_by FROM Jobs WHERE job_type = ?")
                 .bind(job_type)
-                .fetch_one(&pool)
+                .fetch_one(&apalis_pool)
                 .await
                 .unwrap();
         assert_eq!(status, Status::Pending.to_string());
         assert_eq!(lock_by, None);
     }
 
-    async fn job_count(pool: &SqlitePool) -> i64 {
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM Jobs")
-            .fetch_one(pool)
+    async fn job_count(apalis_pool: &apalis_sqlite::SqlitePool) -> i64 {
+        sqlx_apalis::query_scalar::<_, i64>("SELECT COUNT(*) FROM Jobs")
+            .fetch_one(apalis_pool)
             .await
             .unwrap()
     }
 
-    async fn wait_for_job_count(pool: &SqlitePool, expected_count: i64) {
+    async fn wait_for_job_count(apalis_pool: &apalis_sqlite::SqlitePool, expected_count: i64) {
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                let count = job_count(pool).await;
+                let count = job_count(apalis_pool).await;
                 if count == expected_count {
                     return;
                 }
@@ -2450,13 +2471,13 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_finished_job_cleanup_runs_until_aborted() {
-        let pool = setup_test_db().await;
-        setup_apalis_tables(&pool).await.unwrap();
-        insert_finished_job(&pool, "done").await;
+        let (pool, apalis_pool) = setup_test_pools().await;
+        insert_finished_job(&apalis_pool, "done").await;
 
-        let handle = spawn_finished_job_cleanup(pool.clone(), Duration::from_secs(60));
+        let handle =
+            spawn_finished_job_cleanup(pool.clone(), apalis_pool.clone(), Duration::from_secs(60));
 
-        wait_for_job_count(&pool, 0).await;
+        wait_for_job_count(&apalis_pool, 0).await;
         handle.abort();
         let join_error = handle.await.unwrap_err();
 
@@ -3009,14 +3030,11 @@ mod tests {
         )
     }
 
-    async fn trade_processing_cqrs_with_threshold(
+    fn trade_processing_cqrs_with_threshold(
         frameworks: &CqrsFrameworks,
         threshold: ExecutionThreshold,
-        pool: &SqlitePool,
+        apalis_pool: &apalis_sqlite::SqlitePool,
     ) -> TradeProcessingCqrs {
-        // Tests reuse this helper; constructing PollOrderStatusJobQueue is
-        // cheap but pushing into it requires apalis tables to exist.
-        setup_apalis_tables(pool).await.unwrap();
         TradeProcessingCqrs {
             onchain_trade: frameworks.onchain_trade.clone(),
             position: frameworks.position.clone(),
@@ -3028,7 +3046,7 @@ mod tests {
                 cash: None,
             },
             counter_trade_submission_lock: Arc::new(Mutex::new(())),
-            poll_status_queue: PollOrderStatusJobQueue::new(pool),
+            poll_status_queue: PollOrderStatusJobQueue::new(apalis_pool),
         }
     }
 
@@ -3058,15 +3076,14 @@ mod tests {
 
     #[tokio::test]
     async fn trade_below_threshold_does_not_place_order() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _offchain_order_projection) =
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
-            &pool,
-        )
-        .await;
+            &apalis_pool,
+        );
 
         let trade_event = make_trade_event(10);
         let trade = test_trade_with_amount(float!(0.5), 10);
@@ -3099,15 +3116,14 @@ mod tests {
 
     #[tokio::test]
     async fn trade_above_threshold_places_offchain_order() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, offchain_order_projection) =
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
-            &pool,
-        )
-        .await;
+            &apalis_pool,
+        );
 
         let trade_event = make_trade_event(20);
         let trade = test_trade_with_amount(float!(1.5), 20);
@@ -3147,15 +3163,14 @@ mod tests {
 
     #[tokio::test]
     async fn trade_above_threshold_skips_counter_trade_without_offchain_inventory() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, offchain_order_projection) =
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
-            &pool,
-        )
-        .await;
+            &apalis_pool,
+        );
 
         let trade_event = make_trade_event(21);
         let trade = test_trade_with_amount_and_direction(float!(1.5), 21, Direction::Buy);
@@ -3199,15 +3214,14 @@ mod tests {
 
     #[tokio::test]
     async fn trade_above_threshold_places_partial_hedge_with_available_inventory() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, offchain_order_projection) =
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
-            &pool,
-        )
-        .await;
+            &apalis_pool,
+        );
 
         let trade_event = make_trade_event(22);
         // Onchain buy of 5 shares -> position net = +5 -> hedge needs to sell 5
@@ -3264,15 +3278,14 @@ mod tests {
 
     #[tokio::test]
     async fn trade_above_threshold_still_skips_with_zero_inventory() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, offchain_order_projection) =
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
-            &pool,
-        )
-        .await;
+            &apalis_pool,
+        );
 
         let trade_event = make_trade_event(23);
         let trade = test_trade_with_amount_and_direction(float!(1.5), 23, Direction::Buy);
@@ -3311,15 +3324,14 @@ mod tests {
 
     #[tokio::test]
     async fn multiple_trades_accumulate_then_trigger() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _offchain_order_projection) =
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
-            &pool,
-        )
-        .await;
+            &apalis_pool,
+        );
 
         let trade_event_1 = make_trade_event(30);
         let trade_1 = test_trade_with_amount(float!(0.5), 30);
@@ -3357,15 +3369,14 @@ mod tests {
 
     #[tokio::test]
     async fn pending_order_blocks_new_execution() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _offchain_order_projection) =
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
-            &pool,
-        )
-        .await;
+            &apalis_pool,
+        );
 
         let trade_event_1 = make_trade_event(40);
         let trade_1 = test_trade_with_amount(float!(1.5), 40);
@@ -3408,15 +3419,14 @@ mod tests {
 
     #[tokio::test]
     async fn periodic_checker_executes_after_order_completion() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _offchain_order_projection) =
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
-            &pool,
-        )
-        .await;
+            &apalis_pool,
+        );
 
         // Process first trade -> places order
         let trade_event_1 = make_trade_event(50);
@@ -3505,15 +3515,14 @@ mod tests {
 
     #[tokio::test]
     async fn periodic_checker_skips_counter_trade_without_buying_power() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, offchain_order_projection) =
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
-            &pool,
-        )
-        .await;
+            &apalis_pool,
+        );
 
         acknowledge_fill(&cqrs.position, "AAPL", "1", Direction::Sell, 1).await;
 
@@ -3567,15 +3576,14 @@ mod tests {
 
     #[tokio::test]
     async fn periodic_checker_reserves_buying_power_across_batch() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, offchain_order_projection) =
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
-            &pool,
-        )
-        .await;
+            &apalis_pool,
+        );
 
         acknowledge_fill(&cqrs.position, "AAPL", "1", Direction::Sell, 1).await;
         acknowledge_fill(&cqrs.position, "MSFT", "1", Direction::Sell, 2).await;
@@ -3632,15 +3640,14 @@ mod tests {
 
     #[tokio::test]
     async fn periodic_checker_places_partial_hedge_with_limited_inventory() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, offchain_order_projection) =
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
-            &pool,
-        )
-        .await;
+            &apalis_pool,
+        );
 
         // Onchain buy -> positive net -> hedge needs to sell
         acknowledge_fill(&cqrs.position, "AAPL", "5", Direction::Buy, 1).await;
@@ -3729,7 +3736,7 @@ mod tests {
             }
         }
 
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let order_placer: Arc<dyn OrderPlacer> = Arc::new(FailOnceOrderPlacer {
             attempts: AtomicUsize::new(0),
         });
@@ -3738,9 +3745,8 @@ mod tests {
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
-            &pool,
-        )
-        .await;
+            &apalis_pool,
+        );
 
         acknowledge_fill(&cqrs.position, "AAPL", "1", Direction::Sell, 1).await;
         acknowledge_fill(&cqrs.position, "MSFT", "1", Direction::Sell, 2).await;
@@ -3825,7 +3831,7 @@ mod tests {
 
     #[tokio::test]
     async fn position_events_reach_rebalancing_service() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let symbol = Symbol::new("AAPL").unwrap();
 
         let orderbook = address!("0x0000000000000000000000000000000000000001");
@@ -3883,7 +3889,7 @@ mod tests {
             inventory,
             operation_sender,
             Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         ));
         let reactor = trigger.clone();
 
@@ -3925,7 +3931,7 @@ mod tests {
 
     #[tokio::test]
     async fn inventory_updated_after_fill_via_cqrs() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let symbol = Symbol::new("AAPL").unwrap();
 
         let orderbook = address!("0x0000000000000000000000000000000000000001");
@@ -3978,7 +3984,7 @@ mod tests {
             Arc::clone(&inventory),
             operation_sender,
             Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         ));
         let reactor = trigger.clone();
 
@@ -4022,7 +4028,7 @@ mod tests {
 
     #[tokio::test]
     async fn balanced_position_event_does_not_trigger_rebalancing() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let symbol = Symbol::new("AAPL").unwrap();
 
         let orderbook = address!("0x0000000000000000000000000000000000000001");
@@ -4099,7 +4105,7 @@ mod tests {
             inventory,
             operation_sender,
             Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         ));
         let reactor = trigger.clone();
 
@@ -4147,7 +4153,7 @@ mod tests {
         Symbol,
         Arc<RebalancingService>,
     ) {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let symbol = Symbol::new("AAPL").unwrap();
 
         let orderbook = address!("0x0000000000000000000000000000000000000001");
@@ -4230,7 +4236,7 @@ mod tests {
             inventory,
             operation_sender,
             Arc::new(MockWrapper::new()),
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         ));
         let reactor = trigger.clone();
 
@@ -4488,7 +4494,7 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_rebalancing_setup_broadcasts_live_position_updates() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let symbol = Symbol::new("AAPL").unwrap();
         let ctx = create_test_ctx_with_order_owner(Address::ZERO);
         let (event_sender, mut event_receiver) = broadcast::channel(16);
@@ -4510,7 +4516,7 @@ mod tests {
             event_sender,
             vault_registry,
             vault_registry_projection,
-            RebalancingSchedulers::new(&pool),
+            RebalancingSchedulers::new(&apalis_pool),
         )
         .await
         .unwrap();
@@ -4576,15 +4582,14 @@ mod tests {
             Arc::new(RejectingOrderPlacer)
         }
 
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _offchain_order_projection) =
             create_cqrs_frameworks_with_order_placer(&pool, failing_order_placer()).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
-            &pool,
-        )
-        .await;
+            &apalis_pool,
+        );
 
         let trade_event = make_trade_event(70);
         let trade = test_trade_with_amount(float!(1.5), 70);
@@ -4618,9 +4623,8 @@ mod tests {
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
-            &pool,
-        )
-        .await;
+            &apalis_pool,
+        );
 
         let executor = st0x_execution::MockExecutor::new();
 
@@ -4671,7 +4675,7 @@ mod tests {
             Arc::new(RejectingOrderPlacer)
         }
 
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
 
         // Build CQRS with a rejecting broker
         let (frameworks, _) =
@@ -4679,9 +4683,8 @@ mod tests {
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
-            &pool,
-        )
-        .await;
+            &apalis_pool,
+        );
 
         // Accumulate a position by acknowledging an onchain fill
         let symbol = Symbol::new("AAPL").unwrap();
@@ -4746,15 +4749,14 @@ mod tests {
 
     #[tokio::test]
     async fn enrichment_fields_present_emits_enrich_event() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _offchain_order_projection) =
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
-            &pool,
-        )
-        .await;
+            &apalis_pool,
+        );
 
         let trade_event = make_trade_event(50);
 
@@ -4799,15 +4801,14 @@ mod tests {
 
     #[tokio::test]
     async fn missing_enrichment_fields_skips_enrich_event() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _offchain_order_projection) =
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
-            &pool,
-        )
-        .await;
+            &apalis_pool,
+        );
 
         let trade_event = make_trade_event(60);
 
@@ -5287,15 +5288,14 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_post_place_state_none_clears_position_pending() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _projection) =
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
-            &pool,
-        )
-        .await;
+            &apalis_pool,
+        );
 
         let symbol = Symbol::new("AAPL").unwrap();
         let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
@@ -5334,15 +5334,14 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_post_place_state_pending_clears_position_pending() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _projection) =
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
-            &pool,
-        )
-        .await;
+            &apalis_pool,
+        );
 
         let symbol = Symbol::new("AAPL").unwrap();
         let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
@@ -5464,15 +5463,14 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_post_place_state_filled_clears_position_pending() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _projection) =
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
-            &pool,
-        )
-        .await;
+            &apalis_pool,
+        );
 
         let symbol = Symbol::new("AAPL").unwrap();
         let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();
@@ -5518,15 +5516,14 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_post_place_state_failed_clears_position_pending() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let (frameworks, _projection) =
             create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
         let cqrs = trade_processing_cqrs_with_threshold(
             &frameworks,
             ExecutionThreshold::whole_share(),
-            &pool,
-        )
-        .await;
+            &apalis_pool,
+        );
 
         let symbol = Symbol::new("AAPL").unwrap();
         let shares = Positive::new(FractionalShares::new(float!(2))).unwrap();

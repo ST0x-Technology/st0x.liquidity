@@ -48,6 +48,8 @@ pub(crate) struct CheckPositionsCtx<E: Executor + Clone + Send + Sync + 'static>
 pub(crate) enum CheckPositionsError {
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
+    #[error("Apalis database error: {0}")]
+    ApalisDatabase(#[from] sqlx_apalis::Error),
     #[error("Position projection query error: {0}")]
     PositionProjection(#[from] st0x_event_sorcery::ProjectionError<Position>),
     #[error("Failed to enqueue follow-up job: {0}")]
@@ -211,17 +213,19 @@ where
 /// restart, multiplying scan load and duplicate hedge enqueues. The fresh
 /// push guarantees the periodic scan starts immediately on this run.
 pub(crate) async fn bootstrap_check_positions(
-    pool: &SqlitePool,
+    apalis_pool: &apalis_sqlite::SqlitePool,
     queue: &CheckPositionsJobQueue,
 ) -> Result<(), CheckPositionsError> {
-    purge_pending_check_positions_jobs(pool).await?;
+    purge_pending_check_positions_jobs(apalis_pool).await?;
     queue.clone().push(CheckPositions).await?;
     Ok(())
 }
 
-async fn purge_pending_check_positions_jobs(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
+async fn purge_pending_check_positions_jobs(
+    apalis_pool: &apalis_sqlite::SqlitePool,
+) -> Result<u64, sqlx_apalis::Error> {
     let job_type = std::any::type_name::<CheckPositions>();
-    let deleted = sqlx::query(
+    let deleted = sqlx_apalis::query(
         "DELETE FROM Jobs WHERE job_type = ? AND (status IN (?, ?) \
          OR (status = ? AND attempts < max_attempts))",
     )
@@ -229,7 +233,7 @@ async fn purge_pending_check_positions_jobs(pool: &SqlitePool) -> Result<u64, sq
     .bind(Status::Pending.to_string())
     .bind(Status::Running.to_string())
     .bind(Status::Failed.to_string())
-    .execute(pool)
+    .execute(apalis_pool)
     .await?
     .rows_affected();
 
@@ -256,20 +260,18 @@ mod tests {
     };
 
     use super::*;
-    use crate::conductor::setup_apalis_tables;
     use crate::position::{PositionCommand, TradeId};
-    use crate::test_utils::setup_test_db;
+    use crate::test_utils::setup_test_pools;
 
     async fn build_ctx(
         pool: SqlitePool,
+        apalis_pool: apalis_sqlite::SqlitePool,
         ctx_cfg: Ctx,
         check_interval: Duration,
     ) -> (
         CheckPositionsCtx<MockExecutor>,
         Arc<st0x_event_sorcery::Store<Position>>,
     ) {
-        setup_apalis_tables(&pool).await.unwrap();
-
         let (position, position_projection) = StoreBuilder::<Position>::new(pool.clone())
             .build(())
             .await
@@ -280,8 +282,8 @@ mod tests {
         let ctx = CheckPositionsCtx {
             executor,
             position_projection,
-            hedge_queue: HedgeJobQueue::new(&pool),
-            check_positions_queue: CheckPositionsJobQueue::new(&pool),
+            hedge_queue: HedgeJobQueue::new(&apalis_pool),
+            check_positions_queue: CheckPositionsJobQueue::new(&apalis_pool),
             ctx: ctx_cfg,
             pool,
             check_interval,
@@ -316,10 +318,10 @@ mod tests {
             .unwrap();
     }
 
-    async fn count_jobs(pool: &SqlitePool, job_type: &str) -> i64 {
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
+    async fn count_jobs(apalis_pool: &apalis_sqlite::SqlitePool, job_type: &str) -> i64 {
+        sqlx_apalis::query_scalar::<_, i64>("SELECT COUNT(*) FROM Jobs WHERE job_type = ?")
             .bind(job_type)
-            .fetch_one(pool)
+            .fetch_one(apalis_pool)
             .await
             .unwrap()
     }
@@ -367,9 +369,15 @@ mod tests {
 
     #[tokio::test]
     async fn enqueues_one_hedge_per_ready_symbol() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let cfg = dry_run_ctx(&["AAPL", "TSLA"]);
-        let (ctx, position) = build_ctx(pool.clone(), cfg, Duration::from_secs(60)).await;
+        let (ctx, position) = build_ctx(
+            pool.clone(),
+            apalis_pool.clone(),
+            cfg,
+            Duration::from_secs(60),
+        )
+        .await;
 
         let aapl = Symbol::new("AAPL").unwrap();
         let tsla = Symbol::new("TSLA").unwrap();
@@ -391,14 +399,20 @@ mod tests {
 
         CheckPositions.perform(&ctx).await.unwrap();
 
-        assert_eq!(count_jobs(&pool, &hedge_job_type()).await, 2);
+        assert_eq!(count_jobs(&apalis_pool, &hedge_job_type()).await, 2);
     }
 
     #[tokio::test]
     async fn no_positions_above_threshold_enqueues_no_hedge_jobs() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let cfg = dry_run_ctx(&["AAPL"]);
-        let (ctx, position) = build_ctx(pool.clone(), cfg, Duration::from_secs(60)).await;
+        let (ctx, position) = build_ctx(
+            pool.clone(),
+            apalis_pool.clone(),
+            cfg,
+            Duration::from_secs(60),
+        )
+        .await;
 
         let aapl = Symbol::new("AAPL").unwrap();
 
@@ -412,25 +426,29 @@ mod tests {
 
         CheckPositions.perform(&ctx).await.unwrap();
 
-        assert_eq!(count_jobs(&pool, &hedge_job_type()).await, 0);
+        assert_eq!(count_jobs(&apalis_pool, &hedge_job_type()).await, 0);
     }
 
     #[tokio::test]
     async fn reschedules_itself_with_configured_interval() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let cfg = dry_run_ctx(&["AAPL"]);
         let interval = Duration::from_secs(42);
-        let (ctx, _position) = build_ctx(pool.clone(), cfg, interval).await;
+        let (ctx, _position) = build_ctx(pool.clone(), apalis_pool.clone(), cfg, interval).await;
 
         CheckPositions.perform(&ctx).await.unwrap();
 
-        assert_eq!(count_jobs(&pool, &check_positions_job_type()).await, 1);
+        assert_eq!(
+            count_jobs(&apalis_pool, &check_positions_job_type()).await,
+            1
+        );
 
-        let run_at: i64 = sqlx::query_scalar("SELECT run_at FROM Jobs WHERE job_type = ? LIMIT 1")
-            .bind(check_positions_job_type())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let run_at: i64 =
+            sqlx_apalis::query_scalar("SELECT run_at FROM Jobs WHERE job_type = ? LIMIT 1")
+                .bind(check_positions_job_type())
+                .fetch_one(&apalis_pool)
+                .await
+                .unwrap();
 
         let now = chrono::Utc::now().timestamp();
         let expected = now + i64::try_from(interval.as_secs()).unwrap();
@@ -442,11 +460,17 @@ mod tests {
 
     #[tokio::test]
     async fn skips_trading_disabled_symbols_without_blocking_others() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         // RKLB is intentionally absent from the trading config -- the scan
         // must skip it without aborting the rest of the loop.
         let cfg = dry_run_ctx(&["AAPL", "TSLA"]);
-        let (ctx, position) = build_ctx(pool.clone(), cfg, Duration::from_secs(60)).await;
+        let (ctx, position) = build_ctx(
+            pool.clone(),
+            apalis_pool.clone(),
+            cfg,
+            Duration::from_secs(60),
+        )
+        .await;
 
         let aapl = Symbol::new("AAPL").unwrap();
         let rklb = Symbol::new("RKLB").unwrap();
@@ -465,7 +489,7 @@ mod tests {
         CheckPositions.perform(&ctx).await.unwrap();
 
         assert_eq!(
-            count_jobs(&pool, &hedge_job_type()).await,
+            count_jobs(&apalis_pool, &hedge_job_type()).await,
             2,
             "AAPL and TSLA should produce hedges; RKLB (untraded) is skipped"
         );
@@ -473,13 +497,18 @@ mod tests {
 
     #[tokio::test]
     async fn purge_removes_pending_running_and_retryable_failed_but_keeps_terminal() {
-        let pool = setup_test_db().await;
-        setup_apalis_tables(&pool).await.unwrap();
+        let (_pool, apalis_pool) = setup_test_pools().await;
 
         let job_type = check_positions_job_type();
 
-        async fn insert(pool: &SqlitePool, job_type: &str, id: &str, status: &str, attempts: i64) {
-            sqlx::query(
+        async fn insert(
+            apalis_pool: &apalis_sqlite::SqlitePool,
+            job_type: &str,
+            id: &str,
+            status: &str,
+            attempts: i64,
+        ) {
+            sqlx_apalis::query(
                 "INSERT INTO Jobs (job, id, job_type, status, attempts, max_attempts) \
                  VALUES (?, ?, ?, ?, ?, 25)",
             )
@@ -488,13 +517,13 @@ mod tests {
             .bind(job_type)
             .bind(status)
             .bind(attempts)
-            .execute(pool)
+            .execute(apalis_pool)
             .await
             .unwrap();
         }
 
         insert(
-            &pool,
+            &apalis_pool,
             &job_type,
             "pending-1",
             &Status::Pending.to_string(),
@@ -502,7 +531,7 @@ mod tests {
         )
         .await;
         insert(
-            &pool,
+            &apalis_pool,
             &job_type,
             "running-1",
             &Status::Running.to_string(),
@@ -510,7 +539,7 @@ mod tests {
         )
         .await;
         insert(
-            &pool,
+            &apalis_pool,
             &job_type,
             "failed-retryable",
             &Status::Failed.to_string(),
@@ -518,24 +547,41 @@ mod tests {
         )
         .await;
         insert(
-            &pool,
+            &apalis_pool,
             &job_type,
             "failed-exhausted",
             &Status::Failed.to_string(),
             25,
         )
         .await;
-        insert(&pool, &job_type, "done-1", &Status::Done.to_string(), 1).await;
-        insert(&pool, &job_type, "killed-1", &Status::Killed.to_string(), 1).await;
+        insert(
+            &apalis_pool,
+            &job_type,
+            "done-1",
+            &Status::Done.to_string(),
+            1,
+        )
+        .await;
+        insert(
+            &apalis_pool,
+            &job_type,
+            "killed-1",
+            &Status::Killed.to_string(),
+            1,
+        )
+        .await;
 
-        let deleted = purge_pending_check_positions_jobs(&pool).await.unwrap();
-        assert_eq!(deleted, 3);
-
-        let remaining: Vec<String> = sqlx::query_scalar("SELECT id FROM Jobs WHERE job_type = ?")
-            .bind(&job_type)
-            .fetch_all(&pool)
+        let deleted = purge_pending_check_positions_jobs(&apalis_pool)
             .await
             .unwrap();
+        assert_eq!(deleted, 3);
+
+        let remaining: Vec<String> =
+            sqlx_apalis::query_scalar("SELECT id FROM Jobs WHERE job_type = ?")
+                .bind(&job_type)
+                .fetch_all(&apalis_pool)
+                .await
+                .unwrap();
         assert_eq!(remaining.len(), 3);
         assert!(remaining.contains(&"failed-exhausted".to_string()));
         assert!(remaining.contains(&"done-1".to_string()));

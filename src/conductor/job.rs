@@ -11,10 +11,9 @@ use apalis_core::backend::TaskSinkError;
 use apalis_core::backend::poll_strategy::{BackoffConfig, IntervalStrategy, StrategyBuilder};
 use apalis_core::worker::context::WorkerContext;
 use apalis_core::worker::event::Event;
-use apalis_sqlite::{Config, SqliteContext, SqliteStorage};
+use apalis_sqlite::{Config, SqliteContext, SqlitePool, SqliteStorage, SqlxError};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use sqlx::SqlitePool;
 use std::fmt;
 use std::sync::Arc;
 #[cfg(any(test, feature = "test-support"))]
@@ -79,7 +78,7 @@ pub(crate) struct JobQueue<Task>(Storage<Task>);
 /// `#[from]` it into their own error enums instead of boxing.
 #[derive(Debug, thiserror::Error)]
 #[error("Failed to enqueue apalis job: {0}")]
-pub(crate) struct QueuePushError(#[from] pub(crate) TaskSinkError<sqlx::Error>);
+pub(crate) struct QueuePushError(#[from] pub(crate) TaskSinkError<SqlxError>);
 
 impl<Task> Clone for JobQueue<Task> {
     fn clone(&self) -> Self {
@@ -154,7 +153,7 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
     /// invalidates everything queued before it.
     pub(crate) async fn cancel_all_pending(&self) {
         let job_type = std::any::type_name::<Task>();
-        if let Err(error) = sqlx::query(
+        if let Err(error) = sqlx_apalis::query(
             "UPDATE Jobs SET status = 'Done' \
              WHERE status = 'Pending' AND job_type = ?",
         )
@@ -188,9 +187,9 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
     /// so a latched job awaiting operator reconciliation is not re-driven on
     /// every restart. `attempts` is preserved because a crash is not a failed
     /// attempt against the retry budget.
-    pub(crate) async fn requeue_orphaned(&self) -> Result<u64, sqlx::Error> {
+    pub(crate) async fn requeue_orphaned(&self) -> Result<u64, SqlxError> {
         let job_type = std::any::type_name::<Task>();
-        let result = sqlx::query(
+        let result = sqlx_apalis::query(
             "UPDATE Jobs SET status = 'Pending', lock_by = NULL, lock_at = NULL \
              WHERE job_type = ? AND status IN ('Running', 'Queued')",
         )
@@ -210,9 +209,9 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
     /// Used by the order-fill poller to avoid stacking overlapping backfill
     /// ranges: while a previous range is still being processed the checkpoint
     /// has not advanced yet, so re-enqueuing would re-scan the same blocks.
-    pub(crate) async fn has_in_flight(&self) -> Result<bool, sqlx::Error> {
+    pub(crate) async fn has_in_flight(&self) -> Result<bool, SqlxError> {
         let job_type = std::any::type_name::<Task>();
-        let in_flight = sqlx::query_scalar::<_, i64>(
+        let in_flight = sqlx_apalis::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM Jobs \
              WHERE job_type = ? AND status NOT IN ('Done', 'Failed', 'Killed')",
         )
@@ -588,19 +587,16 @@ mod tests {
     use apalis_core::worker::event::Event;
     use apalis_core::worker::ext::circuit_breaker::{CircuitBreaker, config::CircuitBreakerConfig};
     use apalis_core::worker::ext::event_listener::EventListenerExt;
-    use sqlx::SqlitePool;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use super::*;
-    use crate::conductor::setup_apalis_tables;
-    use crate::test_utils::setup_test_db;
+    use crate::test_utils::setup_test_apalis_pool;
 
     #[tokio::test]
     async fn has_in_flight_detects_pending_and_ignores_terminal() {
-        let pool = setup_test_db().await;
-        setup_apalis_tables(&pool).await.unwrap();
-        let mut queue = JobQueue::<u32>::new(&pool);
+        let apalis_pool = setup_test_apalis_pool().await;
+        let mut queue = JobQueue::<u32>::new(&apalis_pool);
 
         assert!(
             !queue.has_in_flight().await.unwrap(),
@@ -614,9 +610,9 @@ mod tests {
         );
 
         // Drive the row to a terminal state; it must no longer count.
-        sqlx::query("UPDATE Jobs SET status = 'Done' WHERE job_type = ?")
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Done' WHERE job_type = ?")
             .bind(std::any::type_name::<u32>())
-            .execute(&pool)
+            .execute(&apalis_pool)
             .await
             .unwrap();
         assert!(
@@ -804,10 +800,9 @@ mod tests {
     /// the worker must not pick up the next job with stale state.
     #[tokio::test]
     async fn job_failure_after_retries_halts_processing() {
-        let pool = setup_test_db().await;
-        setup_apalis_tables(&pool).await.unwrap();
+        let apalis_pool = setup_test_apalis_pool().await;
 
-        let mut queue: JobQueue<TestJob> = JobQueue::new(&pool);
+        let mut queue: JobQueue<TestJob> = JobQueue::new(&apalis_pool);
         queue.push(TestJob { should_fail: true }).await.unwrap();
         queue.push(TestJob { should_fail: false }).await.unwrap();
 
@@ -859,13 +854,13 @@ mod tests {
     }
 
     async fn insert_job(
-        pool: &SqlitePool,
+        apalis_pool: &apalis_sqlite::SqlitePool,
         id: &str,
         status: Status,
         attempts: i64,
         max_attempts: i64,
     ) {
-        sqlx::query(
+        sqlx_apalis::query(
             "INSERT INTO Jobs \
              (job, id, job_type, status, attempts, max_attempts, run_at, priority) \
              VALUES (?, ?, 'test', ?, ?, ?, 0, 0)",
@@ -875,31 +870,30 @@ mod tests {
         .bind(status.to_string())
         .bind(attempts)
         .bind(max_attempts)
-        .execute(pool)
+        .execute(apalis_pool)
         .await
         .unwrap();
     }
 
-    async fn job_ids(pool: &SqlitePool) -> Vec<String> {
-        sqlx::query_scalar::<_, String>("SELECT id FROM Jobs ORDER BY id")
-            .fetch_all(pool)
+    async fn job_ids(apalis_pool: &apalis_sqlite::SqlitePool) -> Vec<String> {
+        sqlx_apalis::query_scalar::<_, String>("SELECT id FROM Jobs ORDER BY id")
+            .fetch_all(apalis_pool)
             .await
             .unwrap()
     }
 
     #[tokio::test]
     async fn cleanup_finished_jobs_deletes_terminal_rows() {
-        let pool = setup_test_db().await;
-        setup_apalis_tables(&pool).await.unwrap();
+        let apalis_pool = setup_test_apalis_pool().await;
 
-        insert_job(&pool, "done", Status::Done, 1, 25).await;
-        insert_job(&pool, "killed", Status::Killed, 1, 25).await;
-        insert_job(&pool, "failed-terminal", Status::Failed, 25, 25).await;
-        insert_job(&pool, "failed-retryable", Status::Failed, 3, 25).await;
-        insert_job(&pool, "pending", Status::Pending, 0, 25).await;
-        insert_job(&pool, "running", Status::Running, 1, 25).await;
+        insert_job(&apalis_pool, "done", Status::Done, 1, 25).await;
+        insert_job(&apalis_pool, "killed", Status::Killed, 1, 25).await;
+        insert_job(&apalis_pool, "failed-terminal", Status::Failed, 25, 25).await;
+        insert_job(&apalis_pool, "failed-retryable", Status::Failed, 3, 25).await;
+        insert_job(&apalis_pool, "pending", Status::Pending, 0, 25).await;
+        insert_job(&apalis_pool, "running", Status::Running, 1, 25).await;
 
-        let deleted = sqlx::query(
+        let deleted = sqlx_apalis::query(
             "DELETE FROM Jobs \
              WHERE status = ? \
              OR status = ? \
@@ -908,14 +902,14 @@ mod tests {
         .bind(Status::Done.to_string())
         .bind(Status::Killed.to_string())
         .bind(Status::Failed.to_string())
-        .execute(&pool)
+        .execute(&apalis_pool)
         .await
         .unwrap()
         .rows_affected();
 
         assert_eq!(deleted, 3);
         assert_eq!(
-            job_ids(&pool).await,
+            job_ids(&apalis_pool).await,
             vec![
                 "failed-retryable".to_string(),
                 "pending".to_string(),
@@ -925,13 +919,13 @@ mod tests {
     }
 
     async fn insert_locked_job(
-        pool: &SqlitePool,
+        apalis_pool: &apalis_sqlite::SqlitePool,
         id: &str,
         job_type: &str,
         status: &str,
         lock_by: Option<&str>,
     ) {
-        sqlx::query(
+        sqlx_apalis::query(
             "INSERT INTO Jobs \
              (job, id, job_type, status, attempts, max_attempts, run_at, priority, lock_by, lock_at) \
              VALUES (?, ?, ?, ?, 0, 25, 0, 0, ?, ?)",
@@ -942,74 +936,102 @@ mod tests {
         .bind(status)
         .bind(lock_by)
         .bind(lock_by.map(|_| 0_i64))
-        .execute(pool)
+        .execute(apalis_pool)
         .await
         .unwrap();
     }
 
-    async fn status_of(pool: &SqlitePool, id: &str) -> String {
-        sqlx::query_scalar::<_, String>("SELECT status FROM Jobs WHERE id = ?")
+    async fn status_of(apalis_pool: &apalis_sqlite::SqlitePool, id: &str) -> String {
+        sqlx_apalis::query_scalar::<_, String>("SELECT status FROM Jobs WHERE id = ?")
             .bind(id)
-            .fetch_one(pool)
+            .fetch_one(apalis_pool)
             .await
             .unwrap()
     }
 
-    async fn lock_by_of(pool: &SqlitePool, id: &str) -> Option<String> {
-        sqlx::query_scalar::<_, Option<String>>("SELECT lock_by FROM Jobs WHERE id = ?")
+    async fn lock_by_of(apalis_pool: &apalis_sqlite::SqlitePool, id: &str) -> Option<String> {
+        sqlx_apalis::query_scalar::<_, Option<String>>("SELECT lock_by FROM Jobs WHERE id = ?")
             .bind(id)
-            .fetch_one(pool)
+            .fetch_one(apalis_pool)
             .await
             .unwrap()
     }
 
-    async fn insert_worker(pool: &SqlitePool, id: &str) {
-        sqlx::query(
+    async fn insert_worker(apalis_pool: &apalis_sqlite::SqlitePool, id: &str) {
+        sqlx_apalis::query(
             "INSERT INTO Workers (id, worker_type, storage_name) VALUES (?, 'test', 'test')",
         )
         .bind(id)
-        .execute(pool)
+        .execute(apalis_pool)
         .await
         .unwrap();
     }
 
     #[tokio::test]
     async fn requeue_orphaned_resets_only_in_flight_rows_of_this_queue() {
-        let pool = setup_test_db().await;
+        let apalis_pool = setup_test_apalis_pool().await;
         let job_type = std::any::type_name::<TestJob>();
 
         // A previous process died holding the lock on these in-flight rows.
-        insert_worker(&pool, "dead-worker").await;
-        insert_locked_job(&pool, "running", job_type, "Running", Some("dead-worker")).await;
-        insert_locked_job(&pool, "queued", job_type, "Queued", Some("dead-worker")).await;
-        insert_locked_job(&pool, "pending", job_type, "Pending", None).await;
-        insert_locked_job(&pool, "failed", job_type, "Failed", Some("dead-worker")).await;
-        insert_locked_job(&pool, "done", job_type, "Done", Some("dead-worker")).await;
+        insert_worker(&apalis_pool, "dead-worker").await;
+        insert_locked_job(
+            &apalis_pool,
+            "running",
+            job_type,
+            "Running",
+            Some("dead-worker"),
+        )
+        .await;
+        insert_locked_job(
+            &apalis_pool,
+            "queued",
+            job_type,
+            "Queued",
+            Some("dead-worker"),
+        )
+        .await;
+        insert_locked_job(&apalis_pool, "pending", job_type, "Pending", None).await;
+        insert_locked_job(
+            &apalis_pool,
+            "failed",
+            job_type,
+            "Failed",
+            Some("dead-worker"),
+        )
+        .await;
+        insert_locked_job(&apalis_pool, "done", job_type, "Done", Some("dead-worker")).await;
         // A Running row of a different queue's job type must be left alone.
-        insert_locked_job(&pool, "other", "other::Job", "Running", Some("dead-worker")).await;
+        insert_locked_job(
+            &apalis_pool,
+            "other",
+            "other::Job",
+            "Running",
+            Some("dead-worker"),
+        )
+        .await;
 
-        let queue = JobQueue::<TestJob>::new(&pool);
+        let queue = JobQueue::<TestJob>::new(&apalis_pool);
         let reset = queue.requeue_orphaned().await.unwrap();
 
         assert_eq!(reset, 2, "only this queue's Running + Queued rows reset");
-        assert_eq!(status_of(&pool, "running").await, "Pending");
-        assert_eq!(status_of(&pool, "queued").await, "Pending");
+        assert_eq!(status_of(&apalis_pool, "running").await, "Pending");
+        assert_eq!(status_of(&apalis_pool, "queued").await, "Pending");
         assert_eq!(
-            lock_by_of(&pool, "running").await,
+            lock_by_of(&apalis_pool, "running").await,
             None,
             "lock cleared so the apalis monitor re-picks the row",
         );
-        assert_eq!(lock_by_of(&pool, "queued").await, None);
+        assert_eq!(lock_by_of(&apalis_pool, "queued").await, None);
 
-        assert_eq!(status_of(&pool, "pending").await, "Pending");
+        assert_eq!(status_of(&apalis_pool, "pending").await, "Pending");
         assert_eq!(
-            status_of(&pool, "failed").await,
+            status_of(&apalis_pool, "failed").await,
             "Failed",
             "a latched failure awaiting operator reconciliation is not re-driven",
         );
-        assert_eq!(status_of(&pool, "done").await, "Done");
+        assert_eq!(status_of(&apalis_pool, "done").await, "Done");
         assert_eq!(
-            status_of(&pool, "other").await,
+            status_of(&apalis_pool, "other").await,
             "Running",
             "another queue's in-flight row is untouched",
         );

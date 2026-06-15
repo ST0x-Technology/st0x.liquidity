@@ -253,7 +253,7 @@ mod tests {
     use crate::offchain::order::OffchainOrder;
     use crate::onchain_trade::OnChainTrade;
     use crate::position::Position;
-    use crate::test_utils::{get_test_log, get_test_order, setup_test_db};
+    use crate::test_utils::{get_test_log, get_test_order, setup_test_pools};
     use st0x_config::ExecutionThreshold;
     use st0x_config::create_test_ctx_with_order_owner;
 
@@ -290,7 +290,7 @@ mod tests {
 
     #[tokio::test]
     async fn perform_returns_ok_when_event_filtered_out() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let executor = MockExecutorCtx.try_into_executor().await.unwrap();
@@ -328,10 +328,10 @@ mod tests {
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: ctx.assets.clone(),
             counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
-            poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(&pool),
+            poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(&apalis_pool),
         };
 
-        let job_queue = DexTradeAccountingJobQueue::new(&pool);
+        let job_queue = DexTradeAccountingJobQueue::new(&apalis_pool);
 
         let accountant_ctx = AccountantCtx {
             orderbook: ctx.evm.orderbook,
@@ -354,7 +354,7 @@ mod tests {
     /// should be skipped gracefully instead of causing a fatal error.
     #[tokio::test]
     async fn perform_skips_take_order_with_non_hedgeable_pair() {
-        let pool = setup_test_db().await;
+        let (pool, apalis_pool) = setup_test_pools().await;
         let asserter = Asserter::new();
 
         // The order owner matches so the event passes the owner filter.
@@ -455,10 +455,10 @@ mod tests {
             execution_threshold: ExecutionThreshold::whole_share(),
             assets: ctx.assets.clone(),
             counter_trade_submission_lock: Arc::new(tokio::sync::Mutex::new(())),
-            poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(&pool),
+            poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(&apalis_pool),
         };
 
-        let job_queue = DexTradeAccountingJobQueue::new(&pool);
+        let job_queue = DexTradeAccountingJobQueue::new(&apalis_pool);
 
         let accountant_ctx = AccountantCtx {
             orderbook: ctx.evm.orderbook,

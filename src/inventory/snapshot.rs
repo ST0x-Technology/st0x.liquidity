@@ -11,7 +11,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::str::FromStr;
+use std::sync::Arc;
 use thiserror::Error;
+
+use super::BroadcastingInventory;
 
 use st0x_event_sorcery::{CompactionPolicy, DomainEvent, EventSourced, Never, Nil};
 use st0x_execution::{FractionalShares, Symbol};
@@ -389,20 +392,44 @@ impl EventSourced for InventorySnapshot {
 }
 
 impl InventorySnapshot {
+    /// Fold persisted snapshot fields into the in-memory [`InventoryView`].
+    ///
+    /// Each field is applied as it is emitted -- no intermediate event
+    /// buffer -- so startup hydration matches the persisted snapshot even
+    /// when deduplication suppresses the first post-restart poll.
+    pub(crate) async fn hydrate_inventory(&self, inventory: &Arc<BroadcastingInventory>) -> usize {
+        let now = Utc::now();
+        let mut view = inventory.write().await;
+        let mut event_count = 0usize;
+
+        self.each_hydration_event(|event| {
+            event_count += 1;
+            if let Ok(updated) = view.clone().apply_snapshot_event(&event, now) {
+                *view = updated;
+            }
+        });
+
+        event_count
+    }
+
     /// Produce events representing the full persisted state.
     ///
-    /// Used to hydrate the in-memory [`InventoryView`] on startup so
-    /// that the runtime projection has the same state as the
-    /// persisted snapshot, even when deduplication suppresses the
-    /// first post-restart poll (unchanged values emit no events).
+    /// Test helper for verifying hydration event coverage; production
+    /// startup uses [`Self::hydrate_inventory`] instead.
+    #[cfg(test)]
     pub(crate) fn hydration_events(&self) -> Vec<InventorySnapshotEvent> {
-        let fetched_at = self.last_updated;
         let mut events = Vec::new();
+        self.each_hydration_event(|event| events.push(event));
+        events
+    }
+
+    fn each_hydration_event(&self, mut emit: impl FnMut(InventorySnapshotEvent)) {
+        let fetched_at = self.last_updated;
 
         if let Some(fetched_at) = self.onchain_equity_fetched_at
             && !self.onchain_equity.is_empty()
         {
-            events.push(InventorySnapshotEvent::OnchainEquity {
+            emit(InventorySnapshotEvent::OnchainEquity {
                 balances: self.onchain_equity.clone(),
                 fetched_at,
             });
@@ -411,7 +438,7 @@ impl InventorySnapshot {
         if let (Some(usdc_balance), Some(fetched_at)) =
             (self.onchain_usdc, self.onchain_usdc_fetched_at)
         {
-            events.push(InventorySnapshotEvent::OnchainUsdc {
+            emit(InventorySnapshotEvent::OnchainUsdc {
                 usdc_balance,
                 fetched_at,
             });
@@ -420,7 +447,7 @@ impl InventorySnapshot {
         if let Some(fetched_at) = self.offchain_equity_fetched_at
             && !self.offchain_equity.is_empty()
         {
-            events.push(InventorySnapshotEvent::OffchainEquity {
+            emit(InventorySnapshotEvent::OffchainEquity {
                 positions: self.offchain_equity.clone(),
                 fetched_at,
             });
@@ -429,7 +456,7 @@ impl InventorySnapshot {
         if let (Some(usd_balance_cents), Some(fetched_at)) =
             (self.offchain_usd_cents, self.offchain_usd_fetched_at)
         {
-            events.push(InventorySnapshotEvent::OffchainUsd {
+            emit(InventorySnapshotEvent::OffchainUsd {
                 usd_balance_cents,
                 gross_usd_cents: self.offchain_gross_usd_cents,
                 fetched_at,
@@ -437,49 +464,49 @@ impl InventorySnapshot {
         }
 
         if self.offchain_cash_buying_power_cents.is_some() {
-            events.push(InventorySnapshotEvent::OffchainCashBuyingPower {
+            emit(InventorySnapshotEvent::OffchainCashBuyingPower {
                 cash_buying_power_cents: self.offchain_cash_buying_power_cents,
                 fetched_at,
             });
         }
 
         if self.offchain_cash_withdrawable_cents.is_some() {
-            events.push(InventorySnapshotEvent::OffchainCashWithdrawable {
+            emit(InventorySnapshotEvent::OffchainCashWithdrawable {
                 cash_withdrawable_cents: self.offchain_cash_withdrawable_cents,
                 fetched_at,
             });
         }
 
         if let Some(usdc_balance) = self.alpaca_usdc {
-            events.push(InventorySnapshotEvent::AlpacaUsdc {
+            emit(InventorySnapshotEvent::AlpacaUsdc {
                 usdc_balance,
                 fetched_at,
             });
         }
 
         if let Some(usdc_balance) = self.ethereum_usdc {
-            events.push(InventorySnapshotEvent::EthereumUsdc {
+            emit(InventorySnapshotEvent::EthereumUsdc {
                 usdc_balance,
                 fetched_at,
             });
         }
 
         if let Some(usdc_balance) = self.base_wallet_usdc {
-            events.push(InventorySnapshotEvent::BaseWalletUsdc {
+            emit(InventorySnapshotEvent::BaseWalletUsdc {
                 usdc_balance,
                 fetched_at,
             });
         }
 
         if !self.base_wallet_unwrapped_equity.is_empty() {
-            events.push(InventorySnapshotEvent::BaseWalletUnwrappedEquity {
+            emit(InventorySnapshotEvent::BaseWalletUnwrappedEquity {
                 balances: self.base_wallet_unwrapped_equity.clone(),
                 fetched_at,
             });
         }
 
         if !self.base_wallet_wrapped_equity.is_empty() {
-            events.push(InventorySnapshotEvent::BaseWalletWrappedEquity {
+            emit(InventorySnapshotEvent::BaseWalletWrappedEquity {
                 balances: self.base_wallet_wrapped_equity.clone(),
                 fetched_at,
             });
@@ -488,14 +515,12 @@ impl InventorySnapshot {
         if let Some(fetched_at) = self.inflight_equity_fetched_at
             && (!self.inflight_mints.is_empty() || !self.inflight_redemptions.is_empty())
         {
-            events.push(InventorySnapshotEvent::InflightEquity {
+            emit(InventorySnapshotEvent::InflightEquity {
                 mints: self.inflight_mints.clone(),
                 redemptions: self.inflight_redemptions.clone(),
                 fetched_at,
             });
         }
-
-        events
     }
 
     fn apply_event(&mut self, event: &InventorySnapshotEvent) {
