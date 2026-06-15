@@ -642,12 +642,17 @@ pub(super) async fn process_found_trade<W: Write>(
         anyhow::bail!("Fill {trade_id}: missing block_number, cannot witness fill");
     };
 
+    // process-tx reconstructs the fill from the transaction and does not carry
+    // the originating block hash (OnchainTrade stores only block number and
+    // timestamp), so a manually recovered fill is witnessed without a reorg
+    // hash. Such a fill is past reorg risk by the time an operator accounts it.
     let FillAccountingOutcome::Accounted { trade_id } = account_for_onchain_fill(
         pool,
         &onchain_trade_store,
         &position_store,
         &onchain_trade,
         block_number,
+        None,
         ctx.execution_threshold,
     )
     .await?
@@ -1931,6 +1936,7 @@ mod tests {
                     direction: onchain_trade.direction,
                     price_usdc: onchain_trade.price.value(),
                     block_number: 1,
+                    block_hash: None,
                     block_timestamp,
                 },
             )
@@ -2030,6 +2036,7 @@ mod tests {
                     direction: onchain_trade.direction,
                     price_usdc: onchain_trade.price.value(),
                     block_number: 1,
+                    block_hash: None,
                     block_timestamp,
                 },
             )
@@ -2202,6 +2209,7 @@ mod tests {
             tx_hash: onchain_trade.tx_hash,
             log_index: onchain_trade.log_index,
             block_number: 42,
+            block_hash: None,
             block_timestamp: onchain_trade.block_timestamp,
         };
 
@@ -2726,6 +2734,7 @@ mod tests {
                     direction: onchain_trade.direction,
                     price_usdc: onchain_trade.price.value(),
                     block_number: 42,
+                    block_hash: None,
                     block_timestamp,
                 },
             )
@@ -2822,6 +2831,7 @@ mod tests {
                     direction: onchain_trade.direction,
                     price_usdc: onchain_trade.price.value(),
                     block_number: 42,
+                    block_hash: None,
                     block_timestamp,
                 },
             )
@@ -2945,6 +2955,7 @@ mod tests {
                     direction: fill_a.direction,
                     price_usdc: fill_a.price.value(),
                     block_number: 10,
+                    block_hash: None,
                     block_timestamp: block_timestamp_a,
                 },
             )
@@ -2974,6 +2985,7 @@ mod tests {
                     direction: fill_b.direction,
                     price_usdc: fill_b.price.value(),
                     block_number: 11,
+                    block_hash: None,
                     block_timestamp: block_timestamp_b,
                 },
             )
@@ -3103,6 +3115,7 @@ mod tests {
                     direction: fill_b.direction,
                     price_usdc: fill_b.price.value(),
                     block_number: 11,
+                    block_hash: None,
                     block_timestamp: block_timestamp_b,
                 },
             )
