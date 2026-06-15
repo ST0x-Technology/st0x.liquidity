@@ -3555,6 +3555,107 @@ mod tests {
         );
     }
 
+    /// A broker outage during trade accounting must record the fill and
+    /// defer the hedge, never lose it: the first attempt errors at the
+    /// broker preflight check (after witness and acknowledge persisted; the
+    /// mock's market-hours check passes, so the failure surfaces one step
+    /// later in `preflight_counter_trade`),
+    /// the apalis retry during the sustained outage dedupe-skips cleanly
+    /// instead of burning the retry budget against the dead broker, and
+    /// the first healthy position rescan places the hedge. One-sided
+    /// availability must produce visible deferred exposure, not silent
+    /// loss.
+    #[tokio::test]
+    async fn broker_outage_records_fill_and_defers_hedge_to_rescan() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, offchain_order_projection) =
+            create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer()).await;
+        let cqrs = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+
+        let failing_executor = MockExecutor::with_failure("connection refused");
+
+        let result = process_queued_trade(
+            &failing_executor,
+            &make_trade_event(50),
+            test_trade_with_amount(float!(1.5), 50),
+            &cqrs,
+            true,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(TradeAccountingError::Execution(_))),
+            "First attempt must error at the broker preflight check; got: {result:?}",
+        );
+
+        let retry = process_queued_trade(
+            &failing_executor,
+            &make_trade_event(50),
+            test_trade_with_amount(float!(1.5), 50),
+            &cqrs,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            retry, None,
+            "The retry during a sustained outage must dedupe-skip cleanly \
+             rather than re-erroring and exhausting the retry budget"
+        );
+
+        let position = cqrs
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .expect("position must exist after the outage attempt");
+        assert!(
+            position.net.inner().eq(float!(1.5)).unwrap(),
+            "The fill must be recorded exactly once despite the outage"
+        );
+        assert_eq!(
+            position.pending_offchain_order_id, None,
+            "No hedge can have been claimed against a dead broker"
+        );
+        assert_eq!(
+            offchain_order_projection.load_all().await.unwrap().len(),
+            0,
+            "No offchain order may exist during the outage"
+        );
+
+        check_and_execute_accumulated_positions(
+            &MockExecutor::new(),
+            AccumulatedPositionExecutionCtx {
+                position: &cqrs.position,
+                position_projection: &cqrs.position_projection,
+                offchain_order: &cqrs.offchain_order,
+                counter_trade_submission_lock: &cqrs.counter_trade_submission_lock,
+                threshold: &cqrs.execution_threshold,
+                assets: &cqrs.assets,
+            },
+            |_| true,
+        )
+        .await
+        .unwrap();
+
+        let recovered = cqrs
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap()
+            .expect("position must exist after the rescan");
+        let orders = offchain_order_projection.load_all().await.unwrap();
+        assert_eq!(orders.len(), 1, "Exactly one hedge after recovery");
+        assert_eq!(
+            recovered.pending_offchain_order_id,
+            Some(orders[0].0),
+            "The first healthy rescan must place the deferred hedge"
+        );
+    }
+
     /// Re-delivering the identical (tx_hash, log_index) trade through the
     /// accounting pipeline must be single-effect: one OnChainTrade fill
     /// event, one Position fill transition, one offchain order -- the

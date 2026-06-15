@@ -1,11 +1,12 @@
 //! Chaos tests for Alpaca broker fault tolerance.
 //!
-//! Drives the bot through scenarios where the broker processed a
-//! placement but the bot never received a usable acknowledgement: the
-//! Alpaca broker mock returns a 5xx after recording the order, or a
-//! latency proxy holds the response past the client's request timeout.
-//! Asserts the bot does not double-submit hedges when retrying a
-//! placement whose response was lost or late in flight.
+//! Drives the bot through scenarios where the broker misbehaves while
+//! the chain stays healthy: a 5xx returned after recording the order, a
+//! response held past the client's request timeout, and full outages
+//! (connection refused) hitting before a hedge exists or while one sits
+//! Submitted. Asserts the bot never double-submits, never silently
+//! drops a fill, keeps unhedged exposure operator-visible, and recovers
+//! to exactly one broker order once the broker returns.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -294,6 +295,150 @@ async fn placement_response_just_over_client_timeout_does_not_double_submit() ->
     Ok(())
 }
 
+/// Top-level hypothesis: a fill ingested while the broker is completely
+/// down -- connection refused, not slow -- must be recorded and visibly
+/// unhedged, never silently dropped, and the periodic `CheckPositions`
+/// rescan must place exactly one hedge once the broker returns.
+///
+/// Scenario: the [`LatencyProxy`]'s serve loop is severed after startup
+/// (the bot needs the broker reachable to construct its executor), so
+/// every broker call is refused while the chain keeps producing fills.
+/// The accounting job witnesses and acknowledges the fill before its
+/// broker readiness check errors; the retry dedupe-skips; several
+/// `CheckPositions` ticks fire against the dead broker and must swallow
+/// the errors without enqueueing anything. Mid-outage the position view
+/// shows the unhedged exposure (the durable operator-visible signal the
+/// dashboard renders). After restore, the first healthy rescan hedges.
+#[test_log::test(tokio::test)]
+async fn broker_outage_defers_hedge_until_rescan_after_restore() -> anyhow::Result<()> {
+    let equity_symbol = "AAPL";
+    let onchain_price = float!(155.00);
+    let broker_fill_price = float!(150.25);
+    let sell_amount = float!(10.75);
+
+    let infra = TestInfra::start(vec![(equity_symbol, broker_fill_price)], vec![]).await?;
+    let mut latency = LatencyProxy::start(infra.broker_service.base_url().parse()?).await?;
+
+    let current_block = infra.base_chain.provider.get_block_number().await?;
+    let ctx = build_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .assets(infra.assets_config())
+        .broker_url_override(latency.endpoint.clone())
+        .call()?;
+    let mut bot = spawn_bot(ctx);
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    latency.sever();
+
+    let take_result = infra
+        .base_chain
+        .take_order()
+        .symbol(equity_symbol)
+        .amount(sell_amount)
+        .price(onchain_price)
+        .direction(TakeDirection::SellEquity)
+        .call()
+        .await?;
+
+    // The fill must be recorded even with the broker dark.
+    poll_for_events(&mut bot, &infra.db_path, "OnChainTradeEvent::Filled", 1).await;
+
+    // Let several CheckPositions ticks (2s interval) fire against the
+    // dead broker -- the negative assertions below are only meaningful
+    // if the scan actually ran during the outage.
+    wait_for_processing(&mut bot, 6).await;
+
+    let mid_outage_orders = infra.broker_service.orders().len();
+    assert_eq!(
+        mid_outage_orders, 0,
+        "Nothing can have reached the broker during the outage; got \
+         {mid_outage_orders} orders",
+    );
+
+    let pool = connect_db(&infra.db_path).await?;
+    let offchain_events = count_events(&pool, "OffchainOrder").await?;
+    // CheckPositions is a self-rescheduling job: each completed tick is a `Done`
+    // row, so a non-zero count proves the scan actually ran (and swallowed the
+    // broker error) during the outage -- without this the negative assertions
+    // below could pass vacuously if the scan never fired.
+    let (scan_runs,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM Jobs WHERE job_type = ? AND status = 'Done'")
+            .bind(st0x_hedge::check_positions_job_type())
+            .fetch_one(&pool)
+            .await?;
+    let position = Projection::<Position>::sqlite(pool.clone())
+        .load(&Symbol::new(equity_symbol)?)
+        .await?
+        .expect("position must exist mid-outage");
+    pool.close().await;
+
+    assert!(
+        scan_runs >= 1,
+        "At least one CheckPositions scan must have run against the dead broker \
+         for the deferral assertions to be meaningful; got {scan_runs}",
+    );
+    assert_eq!(
+        offchain_events, 0,
+        "No offchain order may exist while the broker is down"
+    );
+    assert_eq!(
+        position.accumulated_short,
+        FractionalShares::new(sell_amount),
+        "The position must visibly carry the unhedged fill"
+    );
+    assert_eq!(
+        position.pending_offchain_order_id, None,
+        "No hedge can be claimed against a dead broker"
+    );
+
+    latency.restore().await?;
+
+    poll_for_events_with_timeout(
+        &mut bot,
+        &infra.db_path,
+        "OffchainOrderEvent::Filled",
+        1,
+        Duration::from_secs(120),
+    )
+    .await;
+
+    let orders = infra.broker_service.orders();
+    let order_count = orders.len();
+    assert_eq!(
+        order_count, 1,
+        "Exactly one hedge after the broker returned; got {order_count}",
+    );
+
+    let expected_position = ExpectedPosition::builder()
+        .symbol(equity_symbol)
+        .amount(sell_amount)
+        .direction(TakeDirection::SellEquity)
+        .onchain_price(onchain_price)
+        .broker_fill_price(broker_fill_price)
+        .expected_accumulated_long(float!(0))
+        .expected_accumulated_short(sell_amount)
+        .expected_net(float!(0))
+        .build();
+
+    assert_full_hedging_flow(
+        &[expected_position],
+        &[take_result],
+        &infra.base_chain.provider,
+        infra.base_chain.orderbook,
+        infra.base_chain.owner,
+        &infra.broker_service,
+        &infra.db_path.display().to_string(),
+    )
+    .await?;
+
+    bot.abort();
+    Ok(())
+}
+
 /// Top-level hypothesis: an Alpaca placement whose response is held well
 /// past the client's request timeout must not produce two orders when the
 /// bot recovers.
@@ -385,4 +530,134 @@ fn alpaca_client_timeout_constants_bracket_placement_delay_boundaries() {
         PLACEMENT_RESPONSE_WELL_OVER_TIMEOUT > PLACEMENT_RESPONSE_JUST_OVER_TIMEOUT,
         "well-over delay must remain above the timeout boundary",
     );
+}
+
+/// Top-level hypothesis: a broker outage while a hedge sits `Submitted`
+/// must end in a loud halt -- never a silently un-polled order -- and a
+/// restart with the broker restored must resume polling to exactly one
+/// filled broker order.
+///
+/// Scenario: the broker mock holds the order "new" indefinitely, the
+/// proxy is severed while the order awaits its fill, and `PollOrderStatus`
+/// exhausts its retry budget against the refused connections. The
+/// fail-stop circuit breaker then halts the bot (the deliberate
+/// fail-stop posture: a one-sided trade must page an operator, not
+/// accumulate silent exposure). On restart with the broker back,
+/// `recover_submitted_offchain_orders` re-enqueues the poll and the
+/// order completes.
+#[test_log::test(tokio::test)]
+async fn broker_outage_with_submitted_order_halts_bot_and_restart_recovers() -> anyhow::Result<()> {
+    let equity_symbol = "AAPL";
+    let onchain_price = float!(155.00);
+    let broker_fill_price = float!(150.25);
+    let sell_amount = float!(10.75);
+
+    let infra = TestInfra::start(vec![(equity_symbol, broker_fill_price)], vec![]).await?;
+    let mut latency = LatencyProxy::start(infra.broker_service.base_url().parse()?).await?;
+
+    // Keep the order un-filled so the outage lands while it sits
+    // Submitted, awaiting status polls.
+    infra
+        .broker_service
+        .set_symbol_fill_delay(Symbol::new(equity_symbol)?, 10_000);
+
+    let current_block = infra.base_chain.provider.get_block_number().await?;
+    let ctx = build_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .assets(infra.assets_config())
+        .broker_url_override(latency.endpoint.clone())
+        .call()?;
+    let mut bot = spawn_bot(ctx);
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let take_result = infra
+        .base_chain
+        .take_order()
+        .symbol(equity_symbol)
+        .amount(sell_amount)
+        .price(onchain_price)
+        .direction(TakeDirection::SellEquity)
+        .call()
+        .await?;
+
+    poll_for_aggregate_events_containing(&mut bot, &infra.db_path, "OffchainOrder", "Submitted", 1)
+        .await;
+
+    latency.sever();
+
+    // PollOrderStatus exhausts its retries against refused connections;
+    // the fail-stop breaker must halt the bot loudly.
+    let join_result = tokio::time::timeout(Duration::from_secs(60), &mut bot)
+        .await
+        .expect("Bot must halt within 60s of the broker going dark with an order in flight");
+    let error = join_result
+        .expect("Bot task must fail, not panic")
+        .expect_err("Bot must fail-stop, not keep running with an un-pollable order");
+    let chain = format!("{error:#}");
+    assert!(
+        chain.contains("Apalis worker failed after retries"),
+        "Bot error chain should contain the terminal job failure, got: {chain}",
+    );
+
+    // Broker comes back; let the order fill on the next poll.
+    infra
+        .broker_service
+        .set_symbol_fill_delay(Symbol::new(equity_symbol)?, 0);
+    latency.restore().await?;
+
+    let ctx2 = build_ctx()
+        .chain(&infra.base_chain)
+        .broker(&infra.broker_service)
+        .db_path(&infra.db_path)
+        .deployment_block(current_block)
+        .assets(infra.assets_config())
+        .broker_url_override(latency.endpoint.clone())
+        .call()?;
+    let mut bot2 = spawn_bot(ctx2);
+
+    poll_for_events_with_timeout(
+        &mut bot2,
+        &infra.db_path,
+        "OffchainOrderEvent::Filled",
+        1,
+        Duration::from_secs(120),
+    )
+    .await;
+
+    let orders = infra.broker_service.orders();
+    let order_count = orders.len();
+    assert_eq!(
+        order_count, 1,
+        "Exactly one broker order after the restart resumed polling; got \
+         {order_count}",
+    );
+
+    let expected_position = ExpectedPosition::builder()
+        .symbol(equity_symbol)
+        .amount(sell_amount)
+        .direction(TakeDirection::SellEquity)
+        .onchain_price(onchain_price)
+        .broker_fill_price(broker_fill_price)
+        .expected_accumulated_long(float!(0))
+        .expected_accumulated_short(sell_amount)
+        .expected_net(float!(0))
+        .build();
+
+    assert_full_hedging_flow(
+        &[expected_position],
+        &[take_result],
+        &infra.base_chain.provider,
+        infra.base_chain.orderbook,
+        infra.base_chain.owner,
+        &infra.broker_service,
+        &infra.db_path.display().to_string(),
+    )
+    .await?;
+
+    bot2.abort();
+    Ok(())
 }
