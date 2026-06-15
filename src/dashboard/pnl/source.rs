@@ -390,9 +390,17 @@ async fn load_position_rows(
 
     let mut onchain = QueryBuilder::<Sqlite>::new(
         "SELECT event_rowid, symbol, tx_hash, log_index, shares, direction, price_usd, \
-         executed_at FROM pnl_onchain_fill WHERE event_rowid <= ",
+         executed_at FROM pnl_onchain_fill AS fill WHERE fill.event_rowid <= ",
     );
     onchain.push_bind(as_of_rowid);
+    onchain.push(
+        " AND NOT EXISTS (\
+           SELECT 1 FROM pnl_onchain_reorg AS reorg \
+           WHERE reorg.original_fill_event_rowid = fill.event_rowid \
+             AND reorg.event_rowid <= ",
+    );
+    onchain.push_bind(as_of_rowid);
+    onchain.push(")");
     push_symbol_filter(&mut onchain, symbols);
     for (event_rowid, symbol, tx_hash, log_index, shares, direction, price_usd, executed_at) in
         onchain
