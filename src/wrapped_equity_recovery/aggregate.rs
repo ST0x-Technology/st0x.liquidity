@@ -586,6 +586,7 @@ mod tests {
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::tokenization::mock::MockTokenizer;
+    use crate::tokenized_equity_mint::issuer_request_id;
     use crate::vault_lookup::MockVaultLookup;
 
     use super::*;
@@ -757,7 +758,7 @@ mod tests {
     async fn dispatch_to_mint_records_failure_when_resume_mint_fails() {
         let services = test_services().await;
         let detected = detected_state();
-        let mint_id = IssuerRequestId::new("ISS-NONEXISTENT");
+        let mint_id = issuer_request_id("ISS-NONEXISTENT");
 
         let events = detected
             .transition(

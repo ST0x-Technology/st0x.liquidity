@@ -862,6 +862,7 @@ fn event_payload_inner(step: &str, payload: &str, sequence: i64) -> serde_json::
             .as_object()
             .and_then(|obj| obj.get(step).cloned())
             .unwrap_or(parsed),
+
         Err(error) => {
             warn!(
                 target: "dashboard",
@@ -870,6 +871,7 @@ fn event_payload_inner(step: &str, payload: &str, sequence: i64) -> serde_json::
                 sequence,
                 "Failed to parse event payload for display"
             );
+
             serde_json::json!({
                 "parseError": error.to_string(),
                 "sequence": sequence,
@@ -911,25 +913,31 @@ fn stuck_mint_info(rows: &[(String, String, i64)]) -> Option<StuckTransferInfo> 
                 quantity: requested,
                 ..
             } => quantity = Some(FractionalShares::new(requested).to_string()),
+
             MintAccepted { .. } => accepted = true,
+
             MintAcceptanceFailed { .. } if accepted => {
                 terminal = Some((StuckLocation::Issuer, StuckReason::MintAcceptanceFailed));
             }
+
             WrappingFailed { .. } => {
                 terminal = Some((
                     StuckLocation::BotWalletUnwrapped,
                     StuckReason::WrappingFailed,
                 ));
             }
+
             RaindexDepositFailed { .. } => {
                 terminal = Some((
                     StuckLocation::BotWalletWrapped,
                     StuckReason::RaindexDepositFailed,
                 ));
             }
+
             // Neither strands equity: a rejected mint never left the issuer,
             // and a deposited mint completed successfully.
             MintRejected { .. } | DepositedIntoRaindex { .. } => return None,
+
             // Recovery un-failed the mint and put it back on the success path,
             // so any stuck state observed before it no longer applies; the
             // mint is re-derived from subsequent events (it may fail again).
@@ -972,6 +980,7 @@ fn stuck_redemption_info(rows: &[(String, String, i64)]) -> Option<StuckTransfer
                 requested_quantity = requested_quantity
                     .or_else(|| Some(FractionalShares::new(quantity).to_string()));
             }
+
             WithdrawnFromRaindex {
                 quantity,
                 wrapped_amount,
@@ -982,6 +991,7 @@ fn stuck_redemption_info(rows: &[(String, String, i64)]) -> Option<StuckTransfer
                     .or_else(|| Some(FractionalShares::new(quantity).to_string()));
                 withdrawn_amount = Some(actual_wrapped_amount.unwrap_or(wrapped_amount));
             }
+
             TokensUnwrapped {
                 quantity,
                 unwrapped_amount,
@@ -995,24 +1005,29 @@ fn stuck_redemption_info(rows: &[(String, String, i64)]) -> Option<StuckTransfer
                     .map(|qty| FractionalShares::new(qty).to_string())
                     .or_else(|| shares_from_u256_18_decimal(unwrapped_amount));
             }
+
             TokensSent { .. } => sent = true,
+
             DetectionFailed { .. } if sent => {
                 terminal = Some((
                     StuckLocation::RedemptionWallet,
                     StuckReason::DetectionFailed,
                 ));
             }
+
             RedemptionRejected { .. } if sent => {
                 terminal = Some((
                     StuckLocation::RedemptionWallet,
                     StuckReason::RedemptionRejected,
                 ));
             }
+
             // A terminal success (including recovery, which evolves straight to
             // Completed) means nothing is stranded.
             TransferFailed { .. } | Completed { .. } | ProviderCompletionRecovered { .. } => {
                 return None;
             }
+
             DetectionFailed { .. }
             | RedemptionRejected { .. }
             | UnwrapPending { .. }
@@ -1390,15 +1405,21 @@ async fn recheck_transfer(
 
     let outcome = match kind {
         TransferKind::EquityMint => {
+            let mint_id: IssuerRequestId = id.parse().map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("Invalid mint ID: {error}"),
+                    }),
+                )
+            })?;
+
             handle
                 .transfer
-                .recover_mint(
-                    &IssuerRequestId::new(&id),
-                    &state.pool,
-                    &handle.rebalancing_service,
-                )
+                .recover_mint(&mint_id, &state.pool, &handle.rebalancing_service)
                 .await
         }
+
         TransferKind::EquityRedemption => {
             let redemption_id = id.parse::<RedemptionAggregateId>().map_err(|error| {
                 (
@@ -1408,11 +1429,13 @@ async fn recheck_transfer(
                     }),
                 )
             })?;
+
             handle
                 .transfer
                 .recover_redemption(&redemption_id, &handle.rebalancing_service)
                 .await
         }
+
         TransferKind::UsdcBridge => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -1444,20 +1467,20 @@ async fn recheck_transfer(
 /// references aggregate/request ids; internal failures stay generic so they do
 /// not leak internals (the full error is logged at the call site).
 fn recheck_error_response(error: &RecheckError) -> (StatusCode, String) {
+    use RecheckError::{
+        Database, MalformedWallet, Mint, MissingTxHash, NoAcceptedRequest, Rebalancing, Redemption,
+        Tokenizer,
+    };
+
     match error {
-        RecheckError::NoAcceptedRequest(_)
-        | RecheckError::MissingTxHash(_)
-        | RecheckError::MalformedWallet { .. } => {
+        NoAcceptedRequest(_) | MissingTxHash(_) | MalformedWallet { .. } => {
             (StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
         }
-        RecheckError::Tokenizer(_) => (
+        Tokenizer(_) => (
             StatusCode::BAD_GATEWAY,
             "Tokenization provider unavailable; retry later".to_string(),
         ),
-        RecheckError::Mint(_)
-        | RecheckError::Redemption(_)
-        | RecheckError::Rebalancing(_)
-        | RecheckError::Database(_) => (
+        Mint(_) | Redemption(_) | Rebalancing(_) | Database(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to recheck transfer".to_string(),
         ),
@@ -1498,6 +1521,7 @@ mod tests {
     use super::*;
     use crate::dashboard;
     use crate::inventory::{self, BroadcastingInventory};
+    use crate::tokenized_equity_mint::issuer_request_id;
 
     async fn empty_app_state(ctx: Ctx) -> AppState {
         let (sender, _) = broadcast::channel(16);
@@ -1520,6 +1544,11 @@ mod tests {
 
     #[test]
     fn stuck_mint_info_reports_accepted_provider_failure() {
+        let mint_id = issuer_request_id("mint-1");
+        let mint_accepted_payload = format!(
+            r#"{{"MintAccepted":{{"issuer_request_id":"{mint_id}","tokenization_request_id":"tok-1","accepted_at":"2026-01-01T00:00:01Z"}}}}"#
+        );
+
         let rows = vec![
             event_row(
                 "TokenizedEquityMintEvent::MintRequested",
@@ -1528,7 +1557,7 @@ mod tests {
             ),
             event_row(
                 "TokenizedEquityMintEvent::MintAccepted",
-                r#"{"MintAccepted":{"issuer_request_id":"mint-1","tokenization_request_id":"tok-1","accepted_at":"2026-01-01T00:00:01Z"}}"#,
+                &mint_accepted_payload,
                 1,
             ),
             event_row(
@@ -2403,17 +2432,17 @@ mod tests {
     #[test]
     fn recheck_error_response_distinguishes_recoverability() {
         use crate::tokenization::{MintVerificationError, TokenizerError};
-        use crate::tokenized_equity_mint::TokenizationRequestId;
+        use crate::tokenized_equity_mint::{TokenizationRequestId, issuer_request_id};
 
         // Not-recoverable: the persisted aggregate state forbids recovery, so
         // retrying will not help -> 422 carrying the typed reason.
-        let (status, message) = recheck_error_response(&RecheckError::NoAcceptedRequest(
-            IssuerRequestId::new("mint-1"),
-        ));
+        let mint_id = issuer_request_id("mint-1");
+        let (status, message) =
+            recheck_error_response(&RecheckError::NoAcceptedRequest(mint_id.clone()));
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(
             message,
-            "mint mint-1 has no accepted provider request to re-check"
+            format!("mint {mint_id} has no accepted provider request to re-check")
         );
 
         let (status, _) = recheck_error_response(&RecheckError::MissingTxHash(
@@ -2423,7 +2452,7 @@ mod tests {
 
         let parse_error = "not-an-address".parse::<Address>().unwrap_err();
         let (status, _) = recheck_error_response(&RecheckError::MalformedWallet {
-            id: IssuerRequestId::new("mint-1"),
+            id: mint_id,
             source: parse_error,
         });
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);

@@ -139,9 +139,9 @@ mod tests {
     };
     use crate::onchain::mock::MockRaindex;
     use crate::position::{PositionCommand, TradeId};
+    use crate::rebalancing::equity::TransferEquityToMarketMaking;
     use crate::rebalancing::{
-        RebalancingSchedulers, RebalancingService, RebalancingServiceConfig, TriggeredOperation,
-        drain_pending_jobs,
+        RebalancingSchedulers, RebalancingService, RebalancingServiceConfig, drain_pending_jobs,
     };
     use crate::test_utils::setup_test_pools;
     use crate::tokenization::mock::MockTokenizer;
@@ -360,7 +360,7 @@ mod tests {
             tokenizer: Arc::new(MockTokenizer::new()),
             wrapper: Arc::new(MockWrapper::new()),
         };
-        let built = manifest.build(pool, services).await.unwrap();
+        let built = manifest.build(pool.clone(), services).await.unwrap();
 
         built
             .position
@@ -413,10 +413,24 @@ mod tests {
         }
 
         drain_pending_jobs(&rebalancing_service).await.unwrap();
-        let triggered = operation_receiver.try_recv();
+        let pending_mint_jobs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferEquityToMarketMaking>())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            pending_mint_jobs, 1,
+            "expected the rebalancing subscriber to enqueue a mint job on the position event"
+        );
+
         assert!(
-            matches!(triggered, Ok(TriggeredOperation::Mint { .. })),
-            "expected rebalancing subscriber to receive position event, got {triggered:?}"
+            matches!(
+                operation_receiver.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "mints must not be dispatched over the mpsc channel"
         );
     }
 }

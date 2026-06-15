@@ -44,8 +44,10 @@ use chrono::{DateTime, Utc};
 use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use std::fmt::Display;
 use std::str::FromStr;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use st0x_dto::{EquityMintOperation, EquityMintStatus, TransferOperation};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
@@ -55,28 +57,38 @@ use st0x_finance::Id;
 use crate::rebalancing::equity::EquityTransferServices;
 use crate::tokenization::TokenizationRequestStatus;
 
-/// Alpaca issuer request identifier returned when a tokenization request is accepted.
+/// Our internal tracking id for a tokenized equity mint, chosen at enqueue time.
+///
+/// Mirrors [`crate::usdc_rebalance::UsdcRebalanceId`]: a UUID so invalid ids are
+/// unrepresentable and apalis/CLI retries always target the same aggregate.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub(crate) struct IssuerRequestId(pub(crate) String);
+pub(crate) struct IssuerRequestId(pub(crate) Uuid);
 
 impl IssuerRequestId {
-    pub(crate) fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
+    pub(crate) fn generate() -> Self {
+        Self(Uuid::new_v4())
     }
 }
 
-impl std::fmt::Display for IssuerRequestId {
+impl Display for IssuerRequestId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
 impl FromStr for IssuerRequestId {
-    type Err = std::convert::Infallible;
+    type Err = uuid::Error;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(Self(value.to_string()))
+        Ok(Self(Uuid::parse_str(value)?))
     }
+}
+
+/// Deterministic issuer request id for tests. Maps a human-readable label to a
+/// UUID v5 so test aggregate ids stay valid [`IssuerRequestId`] values.
+#[cfg(test)]
+pub(crate) fn issuer_request_id(label: &str) -> IssuerRequestId {
+    IssuerRequestId(Uuid::new_v5(&Uuid::NAMESPACE_OID, label.as_bytes()))
 }
 
 /// Alpaca tokenization request identifier used to track the mint operation through their API.
@@ -1084,7 +1096,7 @@ impl TokenizedEquityMint {
                 requested_at,
                 ..
             } => TransferOperation::EquityMint(EquityMintOperation {
-                id: Id::new(issuer_request_id.clone()),
+                id: Id::new(issuer_request_id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: Minting,
@@ -1099,7 +1111,7 @@ impl TokenizedEquityMint {
                 accepted_at,
                 ..
             } => TransferOperation::EquityMint(EquityMintOperation {
-                id: Id::new(issuer_request_id.clone()),
+                id: Id::new(issuer_request_id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: Minting,
@@ -1121,7 +1133,7 @@ impl TokenizedEquityMint {
                 received_at,
                 ..
             } => TransferOperation::EquityMint(EquityMintOperation {
-                id: Id::new(issuer_request_id.clone()),
+                id: Id::new(issuer_request_id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: Wrapping,
@@ -1143,7 +1155,7 @@ impl TokenizedEquityMint {
                 wrapped_at,
                 ..
             } => TransferOperation::EquityMint(EquityMintOperation {
-                id: Id::new(issuer_request_id.clone()),
+                id: Id::new(issuer_request_id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: Depositing,
@@ -1158,7 +1170,7 @@ impl TokenizedEquityMint {
                 deposited_at,
                 ..
             } => TransferOperation::EquityMint(EquityMintOperation {
-                id: Id::new(issuer_request_id.clone()),
+                id: Id::new(issuer_request_id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: Completed {
@@ -1175,7 +1187,7 @@ impl TokenizedEquityMint {
                 failed_at,
                 ..
             } => TransferOperation::EquityMint(EquityMintOperation {
-                id: Id::new(issuer_request_id.clone()),
+                id: Id::new(issuer_request_id.to_string()),
                 symbol: symbol.clone(),
                 quantity: FractionalShares::new(*quantity),
                 status: Failed {
@@ -1219,7 +1231,12 @@ pub(crate) async fn interrupted_mint_ids(
     .fetch_all(pool)
     .await?;
 
-    Ok(rows.into_iter().map(IssuerRequestId::new).collect())
+    rows.into_iter()
+        .map(|row| {
+            row.parse()
+                .map_err(|error| sqlx::Error::Decode(Box::new(error)))
+        })
+        .collect::<Result<Vec<_>, _>>()
 }
 
 /// Our tokenized equity tokens use 18 decimals.
@@ -1993,7 +2010,7 @@ mod tests {
 
     fn mint_command() -> TokenizedEquityMintCommand {
         TokenizedEquityMintCommand::RequestMint {
-            issuer_request_id: IssuerRequestId::new("ISS001"),
+            issuer_request_id: issuer_request_id("ISS001"),
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(10),
             wallet: Address::ZERO,
@@ -2011,7 +2028,7 @@ mod tests {
 
     fn mint_accepted_event() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintAccepted {
-            issuer_request_id: IssuerRequestId("ISS123".to_string()),
+            issuer_request_id: issuer_request_id("ISS123"),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
             accepted_at: Utc::now(),
         }
@@ -2069,6 +2086,12 @@ mod tests {
         )
     }
 
+    fn mint_accepted_payload(id: &IssuerRequestId) -> String {
+        format!(
+            r#"{{"MintAccepted":{{"issuer_request_id":"{id}","tokenization_request_id":"TOK001","accepted_at":"2026-01-01T00:00:00Z"}}}}"#
+        )
+    }
+
     #[tokio::test]
     async fn initialize_emits_requested_and_accepted() {
         let events = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
@@ -2087,7 +2110,7 @@ mod tests {
             matches!(
                 &events[1],
                 TokenizedEquityMintEvent::MintAccepted { issuer_request_id, .. }
-                    if *issuer_request_id == IssuerRequestId::new("ISS001")
+                    if *issuer_request_id == super::issuer_request_id("ISS001")
             ),
             "Expected MintAccepted with ISS001, got: {:?}",
             events[1]
@@ -2098,7 +2121,7 @@ mod tests {
     async fn poll_after_acceptance_emits_tokens_received() {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
 
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
         store.send(&id, mint_command()).await.unwrap();
         store
             .send(&id, TokenizedEquityMintCommand::Poll)
@@ -2118,7 +2141,7 @@ mod tests {
         let tokenizer = MockTokenizer::new().with_fees(expected_fees);
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
 
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
         store.send(&id, mint_command()).await.unwrap();
         store
             .send(&id, TokenizedEquityMintCommand::Poll)
@@ -2143,7 +2166,7 @@ mod tests {
     async fn poll_completed_with_wrong_token_symbol_errors() {
         let tokenizer = MockTokenizer::new().with_token_symbol_override("tGME");
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
         let error = store
@@ -2176,7 +2199,7 @@ mod tests {
     async fn poll_completed_with_missing_token_symbol_errors() {
         let tokenizer = MockTokenizer::new().with_no_token_symbol();
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
         let error = store
@@ -2207,7 +2230,7 @@ mod tests {
     async fn poll_rejected_emits_acceptance_failed() {
         let tokenizer = MockTokenizer::new().with_mint_poll_outcome(MockMintPollOutcome::Rejected);
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
         store
@@ -2227,7 +2250,7 @@ mod tests {
         let deposited = TokenizedEquityMint::DepositedIntoRaindex {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(100.5),
-            issuer_request_id: IssuerRequestId("ISS123".to_string()),
+            issuer_request_id: issuer_request_id("ISS123"),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
             token_tx_hash: TxHash::random(),
             wrap_tx_hash: TxHash::random(),
@@ -2237,7 +2260,7 @@ mod tests {
         };
 
         let event = TokenizedEquityMintEvent::MintAccepted {
-            issuer_request_id: IssuerRequestId("ISS999".to_string()),
+            issuer_request_id: issuer_request_id("ISS999"),
             tokenization_request_id: TokenizationRequestId("TOK999".to_string()),
             accepted_at: Utc::now(),
         };
@@ -2272,7 +2295,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(100.5),
             wallet: Address::random(),
-            issuer_request_id: IssuerRequestId("ISS123".to_string()),
+            issuer_request_id: issuer_request_id("ISS123"),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
             requested_at: Utc::now(),
             accepted_at: Utc::now(),
@@ -2331,7 +2354,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(100.5),
             wallet: Address::random(),
-            issuer_request_id: IssuerRequestId("ISS123".to_string()),
+            issuer_request_id: issuer_request_id("ISS123"),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
             requested_at: Utc::now(),
             accepted_at: Utc::now(),
@@ -2380,7 +2403,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(100.5),
             wallet: Address::random(),
-            issuer_request_id: IssuerRequestId("ISS123".to_string()),
+            issuer_request_id: issuer_request_id("ISS123"),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
             requested_at: Utc::now(),
             accepted_at: Utc::now(),
@@ -2401,7 +2424,7 @@ mod tests {
         let tokenizer =
             MockTokenizer::new().with_mint_request_outcome(MockMintRequestOutcome::Rejected);
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
 
@@ -2417,7 +2440,7 @@ mod tests {
         let tokenizer =
             MockTokenizer::new().with_mint_request_outcome(MockMintRequestOutcome::ApiError);
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         let error = store.send(&id, mint_command()).await.unwrap_err();
         assert!(
@@ -2435,7 +2458,7 @@ mod tests {
     async fn poll_pending_emits_acceptance_failed() {
         let tokenizer = MockTokenizer::new().with_mint_poll_outcome(MockMintPollOutcome::Pending);
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
         store
@@ -2454,7 +2477,7 @@ mod tests {
     async fn poll_error_emits_acceptance_failed() {
         let tokenizer = MockTokenizer::new().with_mint_poll_outcome(MockMintPollOutcome::PollError);
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(tokenizer));
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
         store
@@ -2478,12 +2501,12 @@ mod tests {
             vault_lookup: Arc::new(mock_vault_lookup()),
             wrapper: Arc::new(MockWrapper::new()),
         });
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
 
         let recorded_id = tokenizer.last_issuer_request_id().unwrap();
-        assert_eq!(recorded_id, IssuerRequestId::new("ISS001"));
+        assert_eq!(recorded_id, issuer_request_id("ISS001"));
     }
 
     #[test]
@@ -2515,7 +2538,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: float!(10),
             wallet: Address::random(),
-            issuer_request_id: IssuerRequestId::new("ISS001"),
+            issuer_request_id: issuer_request_id("ISS001"),
             tokenization_request_id: TokenizationRequestId("REQ001".to_string()),
             tx_hash: TxHash::random(),
             shares_minted: U256::from(10_000_000_000_000_000_000_u128),
@@ -2544,7 +2567,7 @@ mod tests {
     #[tokio::test]
     async fn wrap_tokens_is_pure_state_transition() {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
         store
@@ -2572,7 +2595,7 @@ mod tests {
     #[tokio::test]
     async fn deposit_to_vault_is_pure_state_transition() {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
         store
@@ -2610,9 +2633,12 @@ mod tests {
     async fn interrupted_mint_ids_returns_only_non_terminal_mints() {
         let pool = crate::test_utils::setup_test_db().await;
 
+        let mint_accepted_id = issuer_request_id("mint-accepted");
+        let mint_deposited_id = issuer_request_id("mint-deposited");
+
         insert_event(
             &pool,
-            "mint-accepted",
+            &mint_accepted_id.to_string(),
             0,
             "TokenizedEquityMintEvent::MintRequested",
             &mint_requested_payload("AAPL"),
@@ -2620,16 +2646,16 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "mint-accepted",
+            &mint_accepted_id.to_string(),
             1,
             "TokenizedEquityMintEvent::MintAccepted",
-            r#"{"MintAccepted":{"issuer_request_id":"ISS001","tokenization_request_id":"TOK001","accepted_at":"2026-01-01T00:00:00Z"}}"#,
+            &mint_accepted_payload(&mint_accepted_id),
         )
         .await;
 
         insert_event(
             &pool,
-            "mint-deposited",
+            &mint_deposited_id.to_string(),
             0,
             "TokenizedEquityMintEvent::MintRequested",
             &mint_requested_payload("TSLA"),
@@ -2637,7 +2663,7 @@ mod tests {
         .await;
         insert_event(
             &pool,
-            "mint-deposited",
+            &mint_deposited_id.to_string(),
             1,
             "TokenizedEquityMintEvent::DepositedIntoRaindex",
             r#"{"DepositedIntoRaindex":{"vault_deposit_tx_hash":"0x0000000000000000000000000000000000000000000000000000000000000002","deposited_at":"2026-01-01T00:00:00Z"}}"#,
@@ -2645,7 +2671,7 @@ mod tests {
         .await;
 
         let result = interrupted_mint_ids(&pool).await.unwrap();
-        assert_eq!(result, vec![IssuerRequestId::new("mint-accepted")]);
+        assert_eq!(result, vec![mint_accepted_id]);
     }
 
     #[test]
@@ -2678,7 +2704,7 @@ mod tests {
 
     #[test]
     fn to_dto_maps_in_progress_variants() {
-        let id = IssuerRequestId::new("MINT-001");
+        let id = issuer_request_id("MINT-001");
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
         let later = now + chrono::Duration::seconds(60);
@@ -2693,7 +2719,7 @@ mod tests {
         let TransferOperation::EquityMint(op) = dto else {
             panic!("Expected EquityMint, got: {dto:?}");
         };
-        assert_eq!(op.id, Id::new("MINT-001"));
+        assert_eq!(op.id, Id::new(id.to_string()));
         assert_eq!(op.symbol, symbol);
         assert_eq!(op.quantity, FractionalShares::new(float!(10)));
         assert!(
@@ -2708,7 +2734,7 @@ mod tests {
             symbol: symbol.clone(),
             quantity: float!(10),
             wallet: Address::ZERO,
-            issuer_request_id: IssuerRequestId::new("ISS001"),
+            issuer_request_id: issuer_request_id("ISS001"),
             tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
             requested_at: now,
             accepted_at: later,
@@ -2728,7 +2754,7 @@ mod tests {
             symbol: symbol.clone(),
             quantity: float!(10),
             wallet: Address::ZERO,
-            issuer_request_id: IssuerRequestId::new("ISS001"),
+            issuer_request_id: issuer_request_id("ISS001"),
             tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
             tx_hash: TxHash::random(),
             shares_minted: U256::from(10_000_000_000_000_000_000_u128),
@@ -2752,7 +2778,7 @@ mod tests {
             symbol,
             quantity: float!(10),
             wallet: Address::ZERO,
-            issuer_request_id: IssuerRequestId::new("ISS001"),
+            issuer_request_id: issuer_request_id("ISS001"),
             tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
             tx_hash: TxHash::random(),
             shares_minted: U256::from(10_000_000_000_000_000_000_u128),
@@ -2777,7 +2803,7 @@ mod tests {
 
     #[test]
     fn to_dto_maps_terminal_variants() {
-        let id = IssuerRequestId::new("MINT-001");
+        let id = issuer_request_id("MINT-001");
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
         let later = now + chrono::Duration::seconds(60);
@@ -2785,7 +2811,7 @@ mod tests {
         let deposited = TokenizedEquityMint::DepositedIntoRaindex {
             symbol: symbol.clone(),
             quantity: float!(10),
-            issuer_request_id: IssuerRequestId::new("ISS001"),
+            issuer_request_id: issuer_request_id("ISS001"),
             tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
             token_tx_hash: TxHash::random(),
             wrap_tx_hash: TxHash::random(),
@@ -2839,7 +2865,7 @@ mod tests {
         };
 
         let recovered = TokenizedEquityMintEvent::ProviderCompletionRecovered {
-            issuer_request_id: IssuerRequestId::new("ISS001"),
+            issuer_request_id: issuer_request_id("ISS001"),
             wallet: Address::ZERO,
             tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
             tx_hash: TxHash::ZERO,
@@ -2876,7 +2902,7 @@ mod tests {
         // table. Assert the decimal-string form (independent of the type under
         // test) and a clean round-trip.
         let event = TokenizedEquityMintEvent::ProviderCompletionRecovered {
-            issuer_request_id: IssuerRequestId::new("ISS001"),
+            issuer_request_id: issuer_request_id("ISS001"),
             wallet: Address::ZERO,
             tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
             tx_hash: TxHash::ZERO,
@@ -2904,7 +2930,7 @@ mod tests {
         let error = TestHarness::<TokenizedEquityMint>::with(mint_services(MockTokenizer::new()))
             .given(vec![mint_requested_event()])
             .when(TokenizedEquityMintCommand::RecoverProviderCompletion {
-                issuer_request_id: IssuerRequestId::new("ISS001"),
+                issuer_request_id: issuer_request_id("ISS001"),
                 wallet: Address::ZERO,
                 tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
                 tx_hash: TxHash::ZERO,
@@ -2933,7 +2959,7 @@ mod tests {
                 vault_deposited_event(),
             ])
             .when(TokenizedEquityMintCommand::RecoverProviderCompletion {
-                issuer_request_id: IssuerRequestId::new("ISS001"),
+                issuer_request_id: issuer_request_id("ISS001"),
                 wallet: Address::ZERO,
                 tokenization_request_id: TokenizationRequestId("TOK001".to_string()),
                 tx_hash: TxHash::ZERO,
@@ -2954,7 +2980,7 @@ mod tests {
     #[tokio::test]
     async fn fail_acceptance_from_accepted_transitions_to_failed() {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
 
@@ -2978,7 +3004,7 @@ mod tests {
     #[tokio::test]
     async fn fail_wrapping_from_tokens_received_transitions_to_failed() {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
         store
@@ -3006,7 +3032,7 @@ mod tests {
     #[tokio::test]
     async fn fail_raindex_deposit_from_tokens_wrapped_transitions_to_failed() {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
         store
@@ -3044,7 +3070,7 @@ mod tests {
     #[tokio::test]
     async fn fail_wrapping_rejected_from_wrong_state() {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         // MintAccepted state -- FailWrapping requires TokensReceived
         store.send(&id, mint_command()).await.unwrap();
@@ -3067,7 +3093,7 @@ mod tests {
     #[tokio::test]
     async fn fail_acceptance_rejected_from_terminal_state() {
         let store = TestStore::<TokenizedEquityMint>::new(mint_services(MockTokenizer::new()));
-        let id = IssuerRequestId::new("ISS001");
+        let id = issuer_request_id("ISS001");
 
         store.send(&id, mint_command()).await.unwrap();
         store
