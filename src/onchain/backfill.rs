@@ -26,7 +26,7 @@ use crate::bindings::IRaindexV6::{ClearV3, TakeOrderV3};
 use crate::conductor::job::{Job, Label};
 use crate::onchain::trade::RaindexTradeEvent;
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeError, OnChainTradeId};
-use crate::position::{Position, PositionCommand, TradeId};
+use crate::position::{Position, PositionCommand, PositionError, TradeId};
 use crate::symbol::lock::get_symbol_lock;
 use crate::trading::onchain::inclusion::EmittedOnChain;
 use crate::trading::onchain::trade_accountant::{
@@ -273,19 +273,26 @@ pub(crate) fn backfill_start_from_checkpoint(
 }
 
 /// Reverses an already-accounted fill that a reorg dropped at or below the
-/// ingestion cutoff: appends `RecordReorg` to the `OnChainTrade` and `Position`
-/// aggregates through the CQRS framework (never direct SQL). A fill we never
-/// witnessed (e.g. a non-hedgeable pair) has nothing to reverse and is skipped.
+/// ingestion cutoff, exactly once across both aggregates (ADR 0012). Loads the
+/// `OnChainTrade` keyed by `(tx_hash, log_index)` and resumes at whichever step
+/// is unfinished, appending through the CQRS framework (never direct SQL):
 ///
-/// The two sends are NOT atomic, so this path is only partially crash-safe. A
-/// crash after the `OnChainTrade` reversal but before the `Position` reversal
-/// leaves the position impact unreversed; on retry the `OnChainTrade`
-/// `AlreadyReorged` guard short-circuits before the `Position` repair can run,
-/// so that window stays open. Closing it is the job of the exactly-once reorg
-/// accounting built later in this stack, which records reversal progress per
-/// trade. A retry that did not crash mid-reversal is safe: if neither send
-/// landed it re-reverses cleanly, and if both landed `AlreadyReorged` makes the
-/// re-run a no-op.
+/// - reorg-acknowledged -> fully reversed already; re-settle the position's
+///   bounded pending-reorg set to self-heal a prune that an earlier delivery
+///   crashed before issuing, then done;
+/// - not yet reorged -> record the reorg, reverse the position, acknowledge,
+///   then prune the pending-reorg set;
+/// - reorged but not acknowledged -> a prior delivery crashed mid-reversal;
+///   resume directly at the position reversal, then acknowledge and prune.
+///
+/// The `OnChainTrade` reorg-ack marker is written only after the position
+/// reversal succeeds, and the position rejects a `trade_id` it has already
+/// reversed, so a re-delivered backfill range neither skips nor double-applies a
+/// reversal. The final `SettleReorg` prunes the reversed `trade_id` from the
+/// position's bounded `pending_reorged_trade_ids` set once the marker is durable
+/// (ADR 0012); it is an idempotent no-op when the entry is already gone. A fill
+/// we never witnessed (e.g. a non-hedgeable pair) has nothing to reverse and is
+/// skipped.
 ///
 /// The `Position` reversal runs under the same per-symbol lock that
 /// `AccountForDexTrade` holds while it mutates position state, so a concurrent
@@ -309,28 +316,62 @@ async fn record_reorg(
         return Ok(());
     };
 
-    // Serialize against `AccountForDexTrade`, which holds this same per-symbol
-    // lock while it mutates position state; without it the `Position` reversal
-    // below could interleave with a concurrent live fill and corrupt the net.
+    // Serialize against concurrent fill accounting for this symbol. The
+    // `AccountForDexTrade` path holds this same per-symbol lock across its
+    // position writes; without it a reorg reversal and a live fill for the same
+    // symbol could interleave their `Position` writes and clobber one another.
     let symbol_lock = get_symbol_lock(&trade.symbol).await;
-    let _guard = symbol_lock.lock().await;
+    let _symbol_guard = symbol_lock.lock().await;
 
-    match onchain_trade
-        .send(trade_id, OnChainTradeCommand::RecordReorg { reorg_depth })
-        .await
-    {
-        Ok(()) => {}
-        // Already reversed by an earlier delivery. Whether the `Position`
-        // reversal followed it is not knowable here (see the crash window in
-        // this fn's docs), so stop rather than reverse again; repairing a
-        // half-applied reversal is the exactly-once accounting's job.
-        Err(AggregateError::UserError(LifecycleError::Apply(
-            OnChainTradeError::AlreadyReorged,
-        ))) => return Ok(()),
-        Err(error) => return Err(error.into()),
+    if trade.is_reorg_acknowledged() {
+        debug!(
+            target: "orderbook",
+            tx_hash = ?trade_id.tx_hash,
+            log_index = trade_id.log_index,
+            "Reorg already fully acknowledged; skipping"
+        );
+        // Self-heal: a prior delivery may have crashed between AcknowledgeReorg
+        // and SettleReorg, leaving the reversed `trade_id` in the position's
+        // bounded pending-reorg set. SettleReorg is an idempotent no-op when the
+        // entry is already pruned (ADR 0012), mirroring how the fill path's
+        // already-acknowledged branch re-settles.
+        position
+            .send(
+                &trade.symbol,
+                PositionCommand::SettleReorg {
+                    trade_id: TradeId {
+                        tx_hash: trade_id.tx_hash,
+                        log_index: trade_id.log_index,
+                    },
+                },
+            )
+            .await?;
+        return Ok(());
     }
 
-    position
+    // Start the reversal if it has not begun. `AlreadyReorged` means a prior
+    // delivery already started it (and crashed before acknowledging); fall
+    // through to the resume below either way.
+    if !trade.is_reorged() {
+        match onchain_trade
+            .send(trade_id, OnChainTradeCommand::RecordReorg { reorg_depth })
+            .await
+        {
+            Ok(())
+            | Err(AggregateError::UserError(LifecycleError::Apply(
+                OnChainTradeError::AlreadyReorged,
+            ))) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    // Reverse the position. `DuplicateReorg` means this resume re-drove a
+    // reversal an earlier delivery already applied -- idempotent, so proceed to
+    // the marker. On a resume, `reorg_depth` is recomputed from the current tip
+    // and may exceed the depth the `OnChainTrade` recorded at first detection;
+    // that divergence is acceptable because `reorg_depth` is audit-only and never
+    // gates the reversal (amount/direction come from the persisted trade).
+    match position
         .send(
             &trade.symbol,
             PositionCommand::RecordReorg {
@@ -340,7 +381,43 @@ async fn record_reorg(
                 },
                 amount: FractionalShares::new(trade.amount),
                 direction: trade.direction,
+                price_usdc: trade.price_usdc,
                 reorg_depth,
+            },
+        )
+        .await
+    {
+        Ok(())
+        | Err(AggregateError::UserError(LifecycleError::Apply(PositionError::DuplicateReorg {
+            ..
+        }))) => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    // Mark the reversal complete only now that the position write has succeeded,
+    // so a crash before this point resumes the position reversal on retry.
+    match onchain_trade
+        .send(trade_id, OnChainTradeCommand::AcknowledgeReorg)
+        .await
+    {
+        Ok(())
+        | Err(AggregateError::UserError(LifecycleError::Apply(
+            OnChainTradeError::AlreadyReorgAcknowledged,
+        ))) => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    // Prune the reversed `trade_id` from the position's bounded pending-reorg set
+    // now that the reorg-ack marker is durable (ADR 0012). A no-op when the entry
+    // is already gone, so a re-delivered range re-settles harmlessly.
+    position
+        .send(
+            &trade.symbol,
+            PositionCommand::SettleReorg {
+                trade_id: TradeId {
+                    tx_hash: trade_id.tx_hash,
+                    log_index: trade_id.log_index,
+                },
             },
         )
         .await?;
@@ -2733,6 +2810,11 @@ mod tests {
 
         assert_eq!(count_events(&pool, "OnChainTradeEvent::Reorged").await, 1);
         assert_eq!(count_events(&pool, "PositionEvent::Reorged").await, 1);
+        assert_eq!(
+            count_events(&pool, "OnChainTradeEvent::ReorgAcknowledged").await,
+            1,
+            "the reorg must be acknowledged exactly once after both reversals",
+        );
 
         let position_state = position.load(&symbol).await.unwrap().unwrap();
         assert_eq!(
@@ -2748,10 +2830,188 @@ mod tests {
             "last_reorged_at {last_reorged_at} must fall within the reversal window \
              [{before_reorg}, {after_reorg}]"
         );
+
+        let trade_state = onchain_trade
+            .load(&OnChainTradeId { tx_hash, log_index })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            trade_state.is_reorg_acknowledged(),
+            "the reversal must be acknowledged once both aggregates are reversed",
+        );
     }
 
-    /// A re-delivered backfill range must not double-reverse: the OnChainTrade
-    /// `AlreadyReorged` guard short-circuits the second emission.
+    /// The critical ADR 0012 case: a crash after `OnChainTrade::RecordReorg` but
+    /// before the `Position` reversal must NOT skip the reversal forever. A
+    /// re-delivery resumes the position reversal and acknowledges it.
+    #[tokio::test]
+    async fn record_reorg_resumes_position_reversal_after_crash() {
+        let pool = setup_test_db().await;
+
+        let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let tx_hash = TxHash::repeat_byte(0xab);
+        let log_index = 7;
+        let now = Utc::now();
+
+        seed_witnessed_fill(&onchain_trade, &position, &symbol, tx_hash, log_index, now).await;
+
+        // Simulate the crash: the reorg was recorded on the OnChainTrade, but the
+        // process died before the Position reversal. The position still reflects
+        // the (now-vanished) fill.
+        onchain_trade
+            .send(
+                &OnChainTradeId { tx_hash, log_index },
+                OnChainTradeCommand::RecordReorg { reorg_depth: 12 },
+            )
+            .await
+            .unwrap();
+        let pre_resume = position.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(
+            pre_resume.net,
+            FractionalShares::new(float!(5)),
+            "premise: the position still reflects the fill before the resume",
+        );
+
+        // Re-delivery resumes: it must reverse the position and acknowledge.
+        let removed = RemovedTrade {
+            trade_id: OnChainTradeId { tx_hash, log_index },
+            block_number: 100,
+        };
+        record_reorg(&onchain_trade, &position, &removed, 12)
+            .await
+            .unwrap();
+
+        let position_state = position.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(
+            position_state.net,
+            FractionalShares::ZERO,
+            "the crashed reversal must be recovered, returning the position to flat",
+        );
+        assert_eq!(count_events(&pool, "PositionEvent::Reorged").await, 1);
+
+        // The resumed reversal must carry the witnessed fill's price (150 USDC,
+        // from `seed_witnessed_fill`) so the reactor reverses the inventory's
+        // USDC leg with the real price instead of falling back to an equity
+        // nudge. Assert the persisted event's serialized `price_usdc` against the
+        // decimal-string literal the Float serializer emits.
+        let reorged_payload: String = sqlx::query_scalar(
+            "SELECT payload FROM events WHERE event_type = 'PositionEvent::Reorged'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let reorged: serde_json::Value = serde_json::from_str(&reorged_payload).unwrap();
+        assert_eq!(
+            reorged["Reorged"]["price_usdc"],
+            serde_json::json!("150"),
+            "the resumed Reorged event must carry the witnessed fill's price of 150 USDC",
+        );
+
+        let trade_state = onchain_trade
+            .load(&OnChainTradeId { tx_hash, log_index })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(trade_state.is_reorg_acknowledged());
+    }
+
+    /// `record_reorg`'s position reversal and the live `AccountForDexTrade` fill
+    /// path serialize on the SAME process-global per-symbol lock
+    /// ([`get_symbol_lock`]), so a reorg reversal cannot interleave its
+    /// `Position` writes with a concurrent live fill for the symbol and clobber
+    /// the net. The fill path holds `get_symbol_lock(trade.symbol.base())` across
+    /// its position writes (`trade_accountant`), and the reorg path holds
+    /// `get_symbol_lock(&trade.symbol)` for the same base ticker; both resolve to
+    /// one `Arc<Mutex>` in the global lock map. This test holds that exact lock
+    /// and proves the reversal is gated on it: while held `record_reorg` parks on
+    /// `lock().await` (it can never reach the reversal, so the timeout always
+    /// elapses and the net stays at the fill), and releasing it lets the reversal
+    /// run to flat.
+    ///
+    /// Limitation: this does not drive a real concurrent `AccountForDexTrade`
+    /// against the reorg -- a fully deterministic two-writer interleaving would
+    /// need production scheduling seams. It proves the contention mechanism (the
+    /// shared per-symbol lock) that makes such an interleave impossible, which is
+    /// the invariant under test, not a staged race.
+    #[tokio::test]
+    async fn record_reorg_reversal_blocks_on_the_per_symbol_lock() {
+        let pool = setup_test_db().await;
+
+        let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        // A symbol unique to this test keeps the process-global per-symbol lock
+        // uncontended by other tests sharing the static lock map.
+        let symbol = Symbol::new("REORGLOCK").unwrap();
+        let tx_hash = TxHash::repeat_byte(0xab);
+        let log_index = 7;
+        let now = Utc::now();
+
+        seed_witnessed_fill(&onchain_trade, &position, &symbol, tx_hash, log_index, now).await;
+
+        let removed = RemovedTrade {
+            trade_id: OnChainTradeId { tx_hash, log_index },
+            block_number: 100,
+        };
+
+        // Hold the same per-symbol lock the live fill path acquires. While it is
+        // held `record_reorg` reaches `lock().await` and parks, so the reversal
+        // can never run and the timeout always elapses.
+        let guard = get_symbol_lock(&symbol).await.lock_owned().await;
+
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            record_reorg(&onchain_trade, &position, &removed, 12),
+        )
+        .await;
+        blocked.unwrap_err();
+
+        let pre_release = position.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(
+            pre_release.net,
+            FractionalShares::new(float!(5)),
+            "the reversal must not run while the per-symbol lock is held",
+        );
+        assert_eq!(
+            count_events(&pool, "PositionEvent::Reorged").await,
+            0,
+            "no Reorged event may be emitted while the lock blocks the reversal",
+        );
+
+        // Releasing the lock lets the same reversal proceed and return to flat.
+        drop(guard);
+        record_reorg(&onchain_trade, &position, &removed, 12)
+            .await
+            .unwrap();
+
+        let reversed = position.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(
+            reversed.net,
+            FractionalShares::ZERO,
+            "the reversal proceeds once the per-symbol lock is released",
+        );
+        assert_eq!(count_events(&pool, "PositionEvent::Reorged").await, 1);
+    }
+
+    /// A re-delivered backfill range must not double-reverse: once acknowledged,
+    /// the reorg is a no-op, and an unacknowledged re-drive is caught by the
+    /// position's `DuplicateReorg` guard (ADR 0012).
     #[tokio::test]
     async fn record_reorg_is_idempotent_across_redelivery() {
         let pool = setup_test_db().await;
@@ -2785,12 +3045,103 @@ mod tests {
 
         assert_eq!(count_events(&pool, "OnChainTradeEvent::Reorged").await, 1);
         assert_eq!(count_events(&pool, "PositionEvent::Reorged").await, 1);
+        assert_eq!(
+            count_events(&pool, "OnChainTradeEvent::ReorgAcknowledged").await,
+            1,
+            "a re-delivery must not re-emit the acknowledgement (idempotent)",
+        );
 
         let position_state = position.load(&symbol).await.unwrap().unwrap();
         assert_eq!(
             position_state.net,
             FractionalShares::ZERO,
             "a re-delivery must not reverse the fill twice",
+        );
+    }
+
+    /// ADR 0012: a crash after the `Position` reversal but before
+    /// `AcknowledgeReorg` must not double-reverse. The re-delivery finds the
+    /// position already reversed (`DuplicateReorg`, idempotent) and only needs to
+    /// write the acknowledgement marker.
+    #[tokio::test]
+    async fn record_reorg_resumes_acknowledge_after_crash_post_position_reversal() {
+        let pool = setup_test_db().await;
+
+        let onchain_trade = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let (position, _projection) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let tx_hash = TxHash::repeat_byte(0xab);
+        let log_index = 7;
+        let now = Utc::now();
+
+        seed_witnessed_fill(&onchain_trade, &position, &symbol, tx_hash, log_index, now).await;
+
+        // Simulate the crash AFTER both the OnChainTrade reorg marker and the
+        // Position reversal succeeded, but BEFORE AcknowledgeReorg: both
+        // aggregates are reversed yet the trade is not reorg-acknowledged.
+        let trade_id = OnChainTradeId { tx_hash, log_index };
+        onchain_trade
+            .send(
+                &trade_id,
+                OnChainTradeCommand::RecordReorg { reorg_depth: 12 },
+            )
+            .await
+            .unwrap();
+        position
+            .send(
+                &symbol,
+                PositionCommand::RecordReorg {
+                    trade_id: TradeId { tx_hash, log_index },
+                    amount: FractionalShares::new(float!(5)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    reorg_depth: 12,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            !onchain_trade
+                .load(&trade_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_reorg_acknowledged(),
+            "premise: the reversal is not yet acknowledged",
+        );
+
+        // Re-delivery resumes: the position reversal is idempotent
+        // (`DuplicateReorg`) and the trade is acknowledged without double-reversing.
+        let removed = RemovedTrade {
+            trade_id: OnChainTradeId { tx_hash, log_index },
+            block_number: 100,
+        };
+        record_reorg(&onchain_trade, &position, &removed, 12)
+            .await
+            .unwrap();
+
+        let position_state = position.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(
+            position_state.net,
+            FractionalShares::ZERO,
+            "the position must not be reversed a second time",
+        );
+        assert_eq!(count_events(&pool, "PositionEvent::Reorged").await, 1);
+        assert!(
+            onchain_trade
+                .load(&trade_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_reorg_acknowledged(),
+            "the resume must write the acknowledgement marker",
         );
     }
 
