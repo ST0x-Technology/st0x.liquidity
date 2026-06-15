@@ -646,7 +646,7 @@ pub(super) async fn process_found_trade<W: Write>(
     // the originating block hash (OnchainTrade stores only block number and
     // timestamp), so a manually recovered fill is witnessed without a reorg
     // hash. Such a fill is past reorg risk by the time an operator accounts it.
-    let FillAccountingOutcome::Accounted { trade_id } = account_for_onchain_fill(
+    let trade_id = match account_for_onchain_fill(
         pool,
         &onchain_trade_store,
         &position_store,
@@ -656,13 +656,24 @@ pub(super) async fn process_found_trade<W: Write>(
         ctx.execution_threshold,
     )
     .await?
-    else {
-        writeln!(
-            stdout,
-            "Fill {trade_id} is already fully accounted. Nothing to do; \
-             the normal pipeline will hedge any unhedged position exposure."
-        )?;
-        return Ok(());
+    {
+        FillAccountingOutcome::Accounted { trade_id } => trade_id,
+        FillAccountingOutcome::AlreadyAcknowledged => {
+            writeln!(
+                stdout,
+                "Fill {trade_id} is already fully accounted. Nothing to do; \
+                 the normal pipeline will hedge any unhedged position exposure."
+            )?;
+            return Ok(());
+        }
+        FillAccountingOutcome::Reorged => {
+            writeln!(
+                stdout,
+                "Fill {trade_id} was invalidated by a reorg before acknowledgement. \
+                 Nothing to account; the fill no longer exists on the canonical chain."
+            )?;
+            return Ok(());
+        }
     };
 
     let executor_type = ctx.broker.to_supported_executor();
