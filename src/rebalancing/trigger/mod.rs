@@ -38,7 +38,8 @@ use crate::inventory::{
 };
 use crate::position::{Position, PositionEvent};
 use crate::rebalancing::equity::{
-    TransferEquityToMarketMaking, TransferEquityToMarketMakingJobQueue,
+    TransferEquityToHedgingJobQueue, TransferEquityToMarketMaking,
+    TransferEquityToMarketMakingJobQueue,
 };
 use crate::rebalancing::usdc::{
     TransferUsdcToHedging, TransferUsdcToHedgingJobQueue, TransferUsdcToMarketMaking,
@@ -73,6 +74,7 @@ pub(crate) struct RebalancingSchedulers {
     pub(crate) transfer_usdc_to_hedging: TransferUsdcToHedgingJobQueue,
     pub(crate) transfer_usdc_to_market_making: TransferUsdcToMarketMakingJobQueue,
     pub(crate) transfer_equity_to_market_making: TransferEquityToMarketMakingJobQueue,
+    pub(crate) transfer_equity_to_hedging: TransferEquityToHedgingJobQueue,
 }
 
 impl RebalancingSchedulers {
@@ -85,6 +87,7 @@ impl RebalancingSchedulers {
             transfer_usdc_to_hedging: TransferUsdcToHedgingJobQueue::new(pool),
             transfer_usdc_to_market_making: TransferUsdcToMarketMakingJobQueue::new(pool),
             transfer_equity_to_market_making: TransferEquityToMarketMakingJobQueue::new(pool),
+            transfer_equity_to_hedging: TransferEquityToHedgingJobQueue::new(pool),
         }
     }
 }
@@ -557,6 +560,9 @@ impl RebalancingService {
             unwrapped_equity_recovery: unwrapped_equity_recovery_queue,
             transfer_usdc_to_hedging: transfer_usdc_to_hedging_queue,
             transfer_equity_to_market_making: transfer_equity_to_market_making_queue,
+            // Consumed by the conductor's worker wiring only until the
+            // trigger enqueues redemptions directly.
+            transfer_equity_to_hedging: _,
             transfer_usdc_to_market_making: transfer_usdc_to_market_making_queue,
         } = schedulers;
         Self {
@@ -3986,7 +3992,7 @@ mod tests {
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
     use crate::conductor::job::Job;
-    use crate::equity_redemption::DetectionFailure;
+    use crate::equity_redemption::{DetectionFailure, redemption_aggregate_id};
     use crate::inventory::snapshot::{
         InventorySnapshot, InventorySnapshotEvent, InventorySnapshotId,
     };
@@ -4170,7 +4176,7 @@ mod tests {
     async fn recover_redemption_state_restores_tracking_and_inflight() {
         let (trigger, _receiver) = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let redemption_id = RedemptionAggregateId::new("redemption-recovery");
+        let redemption_id = redemption_aggregate_id("redemption-recovery");
         let detected_at = Utc::now();
         let redemption_tx = TxHash::random();
 
@@ -4342,7 +4348,7 @@ mod tests {
     async fn recovery_after_explicit_redemption_failure_moves_equity_to_hedging() {
         let (trigger, _receiver) = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let redemption_id = RedemptionAggregateId::new("redemption-explicit-recovery");
+        let redemption_id = redemption_aggregate_id("redemption-explicit-recovery");
 
         // An explicit DetectionFailed/RedemptionRejected does not touch
         // inventory, so the in-flight is still held at MarketMaking (onchain):
@@ -4398,7 +4404,7 @@ mod tests {
     async fn recovery_after_timeout_redemption_failure_clears_tombstone_and_moves_equity() {
         let (trigger, _receiver) = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let redemption_id = RedemptionAggregateId::new("redemption-timeout-recovery");
+        let redemption_id = redemption_aggregate_id("redemption-timeout-recovery");
 
         // A timeout cleared the MarketMaking in-flight and tombstoned the
         // aggregate; available stays debited at 90.
@@ -4597,8 +4603,8 @@ mod tests {
     async fn redemption_recovery_claim_refuses_a_different_redemption_without_mutating() {
         let (trigger, _receiver) = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let recovering = RedemptionAggregateId::new("recovering-redemption");
-        let other = RedemptionAggregateId::new("other-redemption");
+        let recovering = redemption_aggregate_id("recovering-redemption");
+        let other = redemption_aggregate_id("other-redemption");
         let tombstone_at = Utc::now();
 
         // Timeout shape with a *different* redemption owning the slot. The claim
@@ -4659,7 +4665,7 @@ mod tests {
     async fn redemption_recovery_claim_succeeds_for_self_owned_slot() {
         let (trigger, _receiver) = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let recovering = RedemptionAggregateId::new("recovering-redemption");
+        let recovering = redemption_aggregate_id("recovering-redemption");
         let tombstone_at = Utc::now();
 
         *trigger.inventory.write().await = InventoryView::default()
@@ -4874,7 +4880,7 @@ mod tests {
     async fn rollback_after_timeout_redemption_dispatch_failure_restores_tombstone() {
         let (trigger, _receiver) = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let redemption_id = RedemptionAggregateId::new("redemption-timeout-rollback");
+        let redemption_id = redemption_aggregate_id("redemption-timeout-rollback");
         let tombstone_at = Utc::now();
 
         // Timeout cleared the MarketMaking in-flight and tombstoned; 90/0.
@@ -4961,7 +4967,7 @@ mod tests {
     async fn rollback_after_explicit_redemption_dispatch_failure_keeps_inflight() {
         let (trigger, _receiver) = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let redemption_id = RedemptionAggregateId::new("redemption-explicit-rollback");
+        let redemption_id = redemption_aggregate_id("redemption-explicit-rollback");
 
         // An explicit failure left the MarketMaking in-flight in place: 90
         // available, 10 in-flight. Rebuild does not touch inventory here.
@@ -5020,7 +5026,7 @@ mod tests {
     async fn rollback_redemption_clears_self_owned_active_redemption() {
         let (trigger, _receiver) = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let redemption_id = RedemptionAggregateId::new("redemption-self-owned");
+        let redemption_id = redemption_aggregate_id("redemption-self-owned");
 
         // Explicit-failure shape with the slot still self-owned (a reactor-less
         // failure the live process never observed -- the claim treats this as
@@ -5069,8 +5075,8 @@ mod tests {
     async fn rollback_redemption_keeps_active_redemption_owned_by_other_id() {
         let (trigger, _receiver) = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let redemption_id = RedemptionAggregateId::new("redemption-rollback");
-        let other_id = RedemptionAggregateId::new("other-redemption");
+        let redemption_id = redemption_aggregate_id("redemption-rollback");
+        let other_id = redemption_aggregate_id("other-redemption");
 
         // No owner at claim time -> claim succeeds.
         *trigger.inventory.write().await = InventoryView::default()
@@ -5233,7 +5239,7 @@ mod tests {
     async fn pending_request_ownership_exposes_active_redemption_request_id() {
         let (trigger, _receiver) = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let redemption_id = RedemptionAggregateId::new("owned-redemption");
+        let redemption_id = redemption_aggregate_id("owned-redemption");
         let tokenization_request_id = TokenizationRequestId("owned-redemption-request".to_string());
         let redemption_tx = TxHash::random();
 
@@ -5332,7 +5338,7 @@ mod tests {
         for terminal_event in terminal_events {
             let (trigger, _receiver) = make_trigger().await;
             let symbol = Symbol::new("AAPL").unwrap();
-            let redemption_id = RedemptionAggregateId::new("failing-redemption");
+            let redemption_id = redemption_aggregate_id("failing-redemption");
             let tokenization_request_id =
                 TokenizationRequestId("failing-redemption-request".to_string());
             let redemption_tx = TxHash::random();
@@ -5406,7 +5412,7 @@ mod tests {
     async fn recover_redemption_state_keeps_requested_quantity_until_unwrap_confirms() {
         let (trigger, _receiver) = make_trigger().await;
         let symbol = Symbol::new("COIN").unwrap();
-        let redemption_id = RedemptionAggregateId::new("partial-redemption-recovery");
+        let redemption_id = redemption_aggregate_id("partial-redemption-recovery");
         let requested_quantity = float!(37.143292455);
         let actual_wrapped_amount = U256::from(33_681_456_848_531_939_569_u128);
         let requested_fractional = FractionalShares::new(requested_quantity);
@@ -6778,7 +6784,7 @@ mod tests {
         }
 
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = RedemptionAggregateId::new("redemption-1");
+        let id = redemption_aggregate_id("redemption-1");
 
         harness
             .receive::<EquityRedemption>(
@@ -7127,7 +7133,7 @@ mod tests {
             guard.insert(symbol.clone());
         }
 
-        let id = RedemptionAggregateId::new("redemption-transfer-fail");
+        let id = redemption_aggregate_id("redemption-transfer-fail");
 
         harness
             .receive::<EquityRedemption>(
@@ -7170,7 +7176,7 @@ mod tests {
             guard.insert(symbol.clone());
         }
 
-        let id = RedemptionAggregateId::new("redemption-detection-fail");
+        let id = redemption_aggregate_id("redemption-detection-fail");
 
         harness
             .receive::<EquityRedemption>(
@@ -7213,7 +7219,7 @@ mod tests {
             guard.insert(symbol.clone());
         }
 
-        let id = RedemptionAggregateId::new("redemption-rejected");
+        let id = redemption_aggregate_id("redemption-rejected");
 
         harness
             .receive::<EquityRedemption>(
@@ -7592,7 +7598,7 @@ mod tests {
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = RedemptionAggregateId::new("redemption-blocks");
+        let id = redemption_aggregate_id("redemption-blocks");
 
         // Verify imbalance triggers before reactor events
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
@@ -7645,7 +7651,7 @@ mod tests {
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = RedemptionAggregateId::new("redemption-rebalances");
+        let id = redemption_aggregate_id("redemption-rebalances");
 
         // Full redemption flow: WithdrawnFromRaindex -> Completed
         harness
@@ -13708,7 +13714,7 @@ mod tests {
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = RedemptionAggregateId::new("redemption-transfer-cancel");
+        let id = redemption_aggregate_id("redemption-transfer-cancel");
 
         // Verify initial imbalance
         trigger.check_and_trigger_equity(&symbol).await.unwrap();
@@ -13927,7 +13933,7 @@ mod tests {
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = RedemptionAggregateId::new("redemption-rejected-absent-skip");
+        let id = redemption_aggregate_id("redemption-rejected-absent-skip");
 
         // WithdrawnFromRaindex: start inflight
         harness
@@ -13996,7 +14002,7 @@ mod tests {
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = RedemptionAggregateId::new("redemption-detection-absent-skip");
+        let id = redemption_aggregate_id("redemption-detection-absent-skip");
 
         harness
             .receive::<EquityRedemption>(
@@ -14062,7 +14068,7 @@ mod tests {
             make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = RedemptionAggregateId::new("redemption-completed-zeroed");
+        let id = redemption_aggregate_id("redemption-completed-zeroed");
 
         // WithdrawnFromRaindex -> Completed: TransferOp::Complete zeros inflight
         harness
@@ -14294,7 +14300,7 @@ mod tests {
         };
 
         // Simulate: WithdrawnFromRaindex starts inflight for the symbol
-        let redemption_id = RedemptionAggregateId::new("redemption-stale-regression");
+        let redemption_id = redemption_aggregate_id("redemption-stale-regression");
         harness
             .receive::<EquityRedemption>(
                 redemption_id.clone(),
@@ -14460,7 +14466,7 @@ mod tests {
         .await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = RedemptionAggregateId::new("timed-out-redemption");
+        let id = redemption_aggregate_id("timed-out-redemption");
 
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
@@ -14611,7 +14617,7 @@ mod tests {
         .await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = RedemptionAggregateId::new("timed-out-redemption-retrigger");
+        let id = redemption_aggregate_id("timed-out-redemption-retrigger");
 
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
@@ -14709,7 +14715,7 @@ mod tests {
         )
         .await;
         let trigger = reactor.clone();
-        let id = RedemptionAggregateId::new("timed-out-still-pending");
+        let id = redemption_aggregate_id("timed-out-still-pending");
         let redemption_tx = TxHash::random();
         let tokenization_request_id = TokenizationRequestId("stuck-at-alpaca".to_string());
 
@@ -15004,7 +15010,7 @@ mod tests {
         )
         .await;
         let trigger = reactor.clone();
-        let id = RedemptionAggregateId::new("timed-out-redemption-late-withdrawal");
+        let id = redemption_aggregate_id("timed-out-redemption-late-withdrawal");
 
         trigger.redemption_tracking.write().await.insert(
             id.clone(),
@@ -15068,7 +15074,7 @@ mod tests {
     async fn timed_out_redemption_cleanup_clears_active_redemption_id() {
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
-        let id = RedemptionAggregateId::new("timed-out-redemption-active-id");
+        let id = redemption_aggregate_id("timed-out-redemption-active-id");
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(50), shares(50))
             .update_equity(
@@ -15125,7 +15131,7 @@ mod tests {
         )
         .await;
         let trigger = reactor.clone();
-        let id = RedemptionAggregateId::new("redemption-sync-gate-tombstone");
+        let id = redemption_aggregate_id("redemption-sync-gate-tombstone");
         let sync_guard = trigger.redemption_event_sync.lock().await;
         let trigger_for_task = Arc::clone(&trigger);
         let task_symbol = symbol.clone();
@@ -15457,7 +15463,7 @@ mod tests {
             - ChronoDuration::from_std(TIMEOUT_TOMBSTONE_RETENTION).unwrap()
             - ChronoDuration::seconds(1);
         let mint_id = issuer_request_id("stale-mint");
-        let redemption_id = RedemptionAggregateId::new("stale-redemption");
+        let redemption_id = redemption_aggregate_id("stale-redemption");
         let usdc_id = UsdcRebalanceId(Uuid::new_v4());
 
         trigger
@@ -15602,7 +15608,7 @@ mod tests {
         )
         .await;
         let trigger = reactor.clone();
-        let id = RedemptionAggregateId::new("redemption-active-id");
+        let id = redemption_aggregate_id("redemption-active-id");
 
         trigger
             .on_redemption(id.clone(), make_withdrawn_from_raindex(&symbol, float!(10)))
@@ -15631,7 +15637,7 @@ mod tests {
         )
         .await;
         let trigger = reactor.clone();
-        let id = RedemptionAggregateId::new("redemption-clear-id");
+        let id = redemption_aggregate_id("redemption-clear-id");
 
         trigger
             .on_redemption(id.clone(), make_withdrawn_from_raindex(&symbol, float!(10)))

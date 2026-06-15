@@ -583,6 +583,7 @@ mod tests {
     use st0x_raindex::RaindexVaultId;
     use st0x_wrapper::MockWrapper;
 
+    use crate::equity_redemption::redemption_aggregate_id;
     use crate::onchain::mock::MockRaindex;
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::tokenization::mock::MockTokenizer;
@@ -787,7 +788,7 @@ mod tests {
     async fn dispatch_to_redemption_records_failure_when_resume_redemption_fails() {
         let services = test_services().await;
         let detected = detected_state();
-        let redemption_id = RedemptionAggregateId("nonexistent".to_string());
+        let redemption_id = redemption_aggregate_id("nonexistent");
 
         let events = detected
             .transition(

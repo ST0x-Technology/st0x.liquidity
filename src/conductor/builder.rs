@@ -44,6 +44,7 @@ use crate::onchain_trade::OnChainTrade;
 use crate::position::Position;
 use crate::position_check::{CheckPositions, CheckPositionsCtx, CheckPositionsJobQueue};
 use crate::rebalancing::equity::{
+    TransferEquityToHedging, TransferEquityToHedgingCtx, TransferEquityToHedgingJobQueue,
     TransferEquityToMarketMaking, TransferEquityToMarketMakingCtx,
     TransferEquityToMarketMakingJobQueue,
 };
@@ -120,6 +121,8 @@ pub(crate) fn spawn<Prov, Exec>(
     transfer_usdc_to_market_making_ctx: Option<Arc<TransferUsdcToMarketMakingCtx>>,
     transfer_equity_to_market_making_queue: TransferEquityToMarketMakingJobQueue,
     transfer_equity_to_market_making_ctx: Option<Arc<TransferEquityToMarketMakingCtx>>,
+    transfer_equity_to_hedging_queue: TransferEquityToHedgingJobQueue,
+    transfer_equity_to_hedging_ctx: Option<Arc<TransferEquityToHedgingCtx>>,
     rebalancing_service: Option<Arc<RebalancingService>>,
     seed_vault_registry_queue: SeedVaultRegistryJobQueue,
     seed_vault_registry_ctx: Arc<SeedVaultRegistryCtx>,
@@ -352,6 +355,8 @@ where
         transfer_usdc_to_market_making_ctx,
         transfer_equity_to_market_making_queue,
         transfer_equity_to_market_making_ctx,
+        transfer_equity_to_hedging_queue,
+        transfer_equity_to_hedging_ctx,
         apalis_shutdown_token,
         seed_vault_registry_queue,
         #[cfg(any(test, feature = "test-support"))]
@@ -408,6 +413,8 @@ where
     transfer_usdc_to_market_making_ctx: Option<Arc<TransferUsdcToMarketMakingCtx>>,
     transfer_equity_to_market_making_queue: TransferEquityToMarketMakingJobQueue,
     transfer_equity_to_market_making_ctx: Option<Arc<TransferEquityToMarketMakingCtx>>,
+    transfer_equity_to_hedging_queue: TransferEquityToHedgingJobQueue,
+    transfer_equity_to_hedging_ctx: Option<Arc<TransferEquityToHedgingCtx>>,
     apalis_shutdown_token: CancellationToken,
     seed_vault_registry_queue: SeedVaultRegistryJobQueue,
     #[cfg(any(test, feature = "test-support"))]
@@ -451,6 +458,8 @@ where
             transfer_usdc_to_market_making_ctx,
             transfer_equity_to_market_making_queue,
             transfer_equity_to_market_making_ctx,
+            transfer_equity_to_hedging_queue,
+            transfer_equity_to_hedging_ctx,
             apalis_shutdown_token,
             seed_vault_registry_queue,
             #[cfg(any(test, feature = "test-support"))]
@@ -485,6 +494,8 @@ where
         let failure_injector_for_transfer_usdc_to_market_making = failure_injector.clone();
         #[cfg(any(test, feature = "test-support"))]
         let failure_injector_for_transfer_equity_to_market_making = failure_injector.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let failure_injector_for_transfer_equity_to_hedging = failure_injector.clone();
         let failure_notify = Arc::new(tokio::sync::Notify::new());
         let failure_notify_for_hedge = failure_notify.clone();
         let failure_notify_for_backfill = failure_notify.clone();
@@ -500,6 +511,7 @@ where
         let failure_notify_for_transfer_usdc_to_hedging = failure_notify.clone();
         let failure_notify_for_transfer_usdc_to_market_making = failure_notify.clone();
         let failure_notify_for_transfer_equity_to_market_making = failure_notify.clone();
+        let failure_notify_for_transfer_equity_to_hedging = failure_notify.clone();
         let failure_notify_for_select = failure_notify.clone();
 
         let fail_stop = CircuitBreakerConfig::default()
@@ -519,6 +531,7 @@ where
         let fail_stop_for_transfer_usdc_to_hedging = fail_stop.clone();
         let fail_stop_for_transfer_usdc_to_market_making = fail_stop.clone();
         let fail_stop_for_transfer_equity_to_market_making = fail_stop.clone();
+        let fail_stop_for_transfer_equity_to_hedging = fail_stop.clone();
 
         let accountant_ctx_for_backfill = accountant_ctx.clone();
 
@@ -704,6 +717,16 @@ where
                 failure_notify_for_transfer_equity_to_market_making,
                 #[cfg(any(test, feature = "test-support"))]
                 failure_injector_for_transfer_equity_to_market_making,
+            );
+
+            let apalis_monitor = register_transfer_equity_to_hedging_worker(
+                apalis_monitor,
+                transfer_equity_to_hedging_ctx,
+                transfer_equity_to_hedging_queue,
+                fail_stop_for_transfer_equity_to_hedging,
+                failure_notify_for_transfer_equity_to_hedging,
+                #[cfg(any(test, feature = "test-support"))]
+                failure_injector_for_transfer_equity_to_hedging,
             );
 
             let is_draining = apalis_shutdown_token.clone();
@@ -932,6 +955,38 @@ fn register_transfer_equity_to_market_making_worker(
     monitor.register(move |index| {
         build_supervised_worker!(
             ::<TransferEquityToMarketMakingCtx, TransferEquityToMarketMaking>,
+            index,
+            transfer_queue.clone(),
+            transfer_ctx.clone(),
+            fail_stop.clone(),
+            failure_notify.clone(),
+            #[cfg(any(test, feature = "test-support"))]
+            failure_injector.clone(),
+        )
+    })
+}
+
+/// Sibling of [`register_transfer_equity_to_market_making_worker`] for the
+/// redemption (market-making -> hedging) direction.
+fn register_transfer_equity_to_hedging_worker(
+    monitor: Monitor,
+    transfer_ctx: Option<Arc<TransferEquityToHedgingCtx>>,
+    transfer_queue: TransferEquityToHedgingJobQueue,
+    fail_stop: CircuitBreakerConfig,
+    failure_notify: Arc<tokio::sync::Notify>,
+    #[cfg(any(test, feature = "test-support"))] failure_injector: FailureInjector,
+) -> Monitor {
+    let Some(transfer_ctx) = transfer_ctx else {
+        warn!(
+            "TransferEquityToHedging worker not registered: rebalancing disabled \
+             (no transfer ctx). Equity redemptions will not be processed."
+        );
+        return monitor;
+    };
+
+    monitor.register(move |index| {
+        build_supervised_worker!(
+            ::<TransferEquityToHedgingCtx, TransferEquityToHedging>,
             index,
             transfer_queue.clone(),
             transfer_ctx.clone(),
