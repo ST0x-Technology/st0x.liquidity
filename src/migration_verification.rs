@@ -820,6 +820,7 @@ mod tests {
             direction: Direction::Buy,
             price_usdc: float!(1),
             block_number: Some(1),
+            block_hash: None,
             block_timestamp: now,
             filled_at: now,
             enrichment: None,

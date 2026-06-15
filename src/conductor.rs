@@ -10,7 +10,7 @@ mod manifest;
 pub(crate) mod monitor;
 mod trading_queues;
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, B256};
 use alloy::providers::fillers::{
     BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
 };
@@ -3409,6 +3409,7 @@ pub(crate) async fn execute_witness_trade(
     onchain_trade: &Store<OnChainTrade>,
     trade: &OnchainTrade,
     block_number: u64,
+    block_hash: Option<B256>,
     block_timestamp: DateTime<Utc>,
 ) -> Result<bool, SendError<OnChainTrade>> {
     let trade_id = OnChainTradeId {
@@ -3427,6 +3428,7 @@ pub(crate) async fn execute_witness_trade(
         direction: trade.direction,
         price_usdc,
         block_number,
+        block_hash,
         block_timestamp,
     };
 
@@ -3666,6 +3668,7 @@ pub async fn account_for_onchain_fill(
     position: &Store<Position>,
     trade: &OnchainTrade,
     block_number: u64,
+    block_hash: Option<B256>,
     threshold: ExecutionThreshold,
 ) -> Result<FillAccountingOutcome, TradeAccountingError> {
     let trade_id = OnChainTradeId {
@@ -3716,8 +3719,14 @@ pub async fn account_for_onchain_fill(
             );
         }
         Ok(None) => {
-            let witnessed =
-                execute_witness_trade(onchain_trade, trade, block_number, block_timestamp).await?;
+            let witnessed = execute_witness_trade(
+                onchain_trade,
+                trade,
+                block_number,
+                block_hash,
+                block_timestamp,
+            )
+            .await?;
 
             if !witnessed {
                 match onchain_trade.load(&trade_id).await? {
@@ -3767,6 +3776,7 @@ where
         &cqrs.position,
         &trade,
         trade_event.block_number,
+        trade_event.block_hash,
         cqrs.execution_threshold,
     )
     .await?
@@ -5223,6 +5233,7 @@ mod tests {
                     direction: Direction::Buy,
                     price_usdc: float!(150),
                     block_number: 1,
+                    block_hash: None,
                     block_timestamp: chrono::Utc::now(),
                 },
             )
@@ -7695,6 +7706,51 @@ mod tests {
         );
     }
 
+    /// The emitted log's block hash must thread end-to-end through ingestion
+    /// into the witnessed fill, where reorg detection later reads it to tell a
+    /// re-observation on a different fork from a duplicate. The aggregate is the
+    /// system of record for the fill, so assert the hash survives there.
+    #[tokio::test]
+    async fn ingestion_threads_block_hash_into_witnessed_fill() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
+        let cqrs = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+
+        let block_hash = B256::from([0xcd; 32]);
+        let mut trade_event = make_trade_event(70);
+        trade_event.block_hash = Some(block_hash);
+
+        let trade = test_trade_with_amount(float!(1.5), 70);
+        let trade_id = OnChainTradeId {
+            chain: Chain::Base,
+            tx_hash: trade.tx_hash,
+            log_index: trade.log_index,
+        };
+
+        process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true)
+            .await
+            .unwrap()
+            .expect("1.5 shares should witness and hedge the fill");
+
+        let witnessed = cqrs
+            .onchain_trade
+            .load(&trade_id)
+            .await
+            .unwrap()
+            .expect("the witnessed trade aggregate must exist after ingestion");
+
+        assert_eq!(
+            witnessed.block_hash,
+            Some(block_hash),
+            "the emitted log's block hash must thread into the witnessed fill"
+        );
+    }
+
     /// A database write lock during the Witness write must surface as a
     /// retryable error, not silently drop the fill. Pre-fix,
     /// `execute_witness_trade` blanket-matched every `SendError` as a
@@ -7868,6 +7924,7 @@ mod tests {
             &cqrs.onchain_trade,
             &witnessing_trade,
             trade_event.block_number,
+            trade_event.block_hash,
             block_timestamp,
         )
         .await
@@ -8038,6 +8095,7 @@ mod tests {
             &cqrs.onchain_trade,
             &trade,
             trade_event.block_number,
+            trade_event.block_hash,
             block_timestamp,
         )
         .await
@@ -8111,6 +8169,7 @@ mod tests {
             &cqrs.onchain_trade,
             &trade,
             trade_event.block_number,
+            trade_event.block_hash,
             block_timestamp,
         )
         .await
@@ -8231,6 +8290,7 @@ mod tests {
             &cqrs.onchain_trade,
             &trade,
             trade_event.block_number,
+            trade_event.block_hash,
             block_timestamp,
         )
         .await
@@ -8373,6 +8433,7 @@ mod tests {
             &cqrs.onchain_trade,
             &trade_a,
             event_a.block_number,
+            event_a.block_hash,
             block_timestamp_a,
         )
         .await
