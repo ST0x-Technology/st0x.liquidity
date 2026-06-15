@@ -17,6 +17,7 @@ mod chaos_alpaca;
 mod chaos_combined;
 mod chaos_crash;
 mod chaos_db;
+mod chaos_load;
 mod chaos_rpc;
 mod full_system;
 mod hedging;
