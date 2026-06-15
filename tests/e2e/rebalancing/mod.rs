@@ -863,7 +863,7 @@ async fn equity_redemption_buy_literal_reciprocal_regression() -> anyhow::Result
 ///
 /// Expected CQRS event flow:
 /// - `UsdcRebalance`: ConversionInitiated -> ConversionConfirmed
-///   -> Initiated -> WithdrawalConfirmed -> BridgingInitiated
+///   -> Initiated -> WithdrawalConfirmed -> BridgingSubmitting -> BridgingInitiated
 ///   -> BridgeAttestationReceived -> Bridged -> DepositInitiated
 ///   -> DepositConfirmed
 ///
