@@ -2245,7 +2245,8 @@ impl Reactor for RebalancingService {
 
                 let timestamp = event.timestamp();
                 let mut clear_pending_offchain_order = false;
-                let (equity_update, usdc_update) = match &event {
+                let mut best_effort_reorg_reversal = false;
+                let updates = match &event {
                     OnChainOrderFilled {
                         amount,
                         direction,
@@ -2255,14 +2256,14 @@ impl Reactor for RebalancingService {
                         let equity_op: Operator = (*direction).into();
                         let quantity: Float = (*amount).into();
                         let usdc_value = (*price_usdc * quantity)?;
-                        (
+                        Ok::<_, RebalancingServiceError>((
                             Inventory::available(Venue::MarketMaking, equity_op, *amount),
                             Inventory::available(
                                 Venue::MarketMaking,
                                 equity_op.inverse(),
                                 Usdc::new(usdc_value),
                             ),
-                        )
+                        ))
                     }
                     OffChainOrderFilled {
                         shares_filled,
@@ -2284,14 +2285,14 @@ impl Reactor for RebalancingService {
                         let quantity: Float = shares_filled.inner().into();
                         let price_value = price.inner();
                         let usdc_value = (price_value * quantity)?;
-                        (
+                        Ok((
                             Inventory::available(Venue::Hedging, equity_op, shares_filled.inner()),
                             Inventory::available(
                                 Venue::Hedging,
                                 equity_op.inverse(),
                                 Usdc::new(usdc_value),
                             ),
-                        )
+                        ))
                     }
                     OffChainOrderPlaced { .. } => {
                         self.pending_offchain_order_symbols
@@ -2313,9 +2314,12 @@ impl Reactor for RebalancingService {
                     }
                     Initialized { .. }
                     | ThresholdUpdated { .. }
-                    // Dedup bookkeeping only (ADR 0010): no inventory effect.
+                    // Dedup bookkeeping only (ADR 0010 fills, ADR 0012 reorgs): no
+                    // inventory effect; the reversal's inventory move rode the
+                    // `Reorged` event, and the settle just prunes the pending set.
                     | OnChainFillApplied { .. }
-                    | OnChainFillSettled { .. } => {
+                    | OnChainFillSettled { .. }
+                    | ReorgSettled { .. } => {
                         return Ok(());
                     }
                     ManualPositionAdjusted { .. } => {
@@ -2326,27 +2330,72 @@ impl Reactor for RebalancingService {
                         self.equity_scheduler.enqueue_check(symbol).await;
                         return Ok(());
                     }
-                    Reorged { .. } => {
-                        // A reorg reversal moves net exposure like a manual
-                        // adjustment, but the event carries no fill price, so the
-                        // usdc leg cannot be reversed precisely here. Nudge an
-                        // equity check and let the polled inventory reconcile the
-                        // new balance.
+                    Reorged {
+                        price_usdc: None, ..
+                    } => {
+                        // A reorg event persisted before the price was carried
+                        // cannot have its USDC leg reversed
+                        // precisely; nudge an equity check and let the polled
+                        // inventory reconcile, as the pre-fix reactor did.
                         self.equity_scheduler.enqueue_check(symbol).await;
                         return Ok(());
                     }
+                    Reorged {
+                        amount,
+                        direction,
+                        price_usdc: Some(price_usdc),
+                        ..
+                    } => {
+                        // Best-effort: a reorg reversal can legitimately fail
+                        // (e.g. InsufficientAvailable after an unexpected sequence
+                        // of events). Nudge and let the next polling snapshot
+                        // reconcile rather than propagating an error that retries
+                        // the same impossible inventory op forever.
+                        best_effort_reorg_reversal = true;
+                        // A reorg reverses an earlier fill, so the inventory
+                        // effect is the exact inverse of the OnChainOrderFilled
+                        // arm above: the equity leg moves the opposite way and
+                        // the usdc leg follows. Reversing here (rather than
+                        // nudging) keeps the in-memory inventory consistent with
+                        // the reversed position until the next snapshot poll.
+                        let equity_op: Operator = (*direction).into();
+                        let quantity: Float = (*amount).into();
+                        // A price-math failure on a reorg reversal must take the
+                        // same best-effort path as an inventory failure below
+                        // (nudge, reconcile on the next snapshot), never propagate.
+                        (*price_usdc * quantity)
+                            .map(|usdc_value| {
+                                (
+                                    Inventory::available(
+                                        Venue::MarketMaking,
+                                        equity_op.inverse(),
+                                        *amount,
+                                    ),
+                                    Inventory::available(
+                                        Venue::MarketMaking,
+                                        equity_op,
+                                        Usdc::new(usdc_value),
+                                    ),
+                                )
+                            })
+                            .map_err(Into::into)
+                    }
                 };
 
-                let inventory_result = {
-                    let mut inventory = self.inventory.write().await;
-                    let result = inventory
-                        .clone()
-                        .update_equity(&symbol, equity_update, timestamp)
-                        .and_then(|inv| inv.update_usdc(usdc_update, timestamp));
-                    if let Ok(updated) = &result {
-                        *inventory = updated.clone();
+                let inventory_result = match updates {
+                    Ok((equity_update, usdc_update)) => {
+                        let mut inventory = self.inventory.write().await;
+                        let result = inventory
+                            .clone()
+                            .update_equity(&symbol, equity_update, timestamp)
+                            .and_then(|inv| inv.update_usdc(usdc_update, timestamp))
+                            .map_err(Into::into);
+                        if let Ok(updated) = &result {
+                            *inventory = updated.clone();
+                        }
+                        result
                     }
-                    result
+                    Err(error) => Err(error),
                 };
 
                 if clear_pending_offchain_order {
@@ -2379,6 +2428,18 @@ impl Reactor for RebalancingService {
                 }
 
                 if let Err(error) = inventory_result {
+                    if best_effort_reorg_reversal {
+                        warn!(
+                            target: "rebalance",
+                            %symbol,
+                            ?error,
+                            "Inventory reversal for a reorged fill failed; nudging an equity \
+                             check and relying on the next polling snapshot instead of \
+                             retrying an impossible operation"
+                        );
+                        self.equity_scheduler.enqueue_check(symbol).await;
+                        return Ok(());
+                    }
                     warn!(
                         target: "rebalance",
                         %symbol,
@@ -2387,6 +2448,7 @@ impl Reactor for RebalancingService {
                     );
                     return Ok(());
                 }
+
 
                 self.equity_scheduler.enqueue_check(symbol).await;
                 self.usdc_scheduler.enqueue_check().await;
@@ -7596,6 +7658,20 @@ mod tests {
         }
     }
 
+    fn make_onchain_reorg(amount: FractionalShares, direction: Direction) -> PositionEvent {
+        PositionEvent::Reorged {
+            trade_id: TradeId {
+                tx_hash: TxHash::random(),
+                log_index: 0,
+            },
+            amount,
+            direction,
+            price_usdc: Some(float!(150)),
+            reorg_depth: 1,
+            reorged_at: Utc::now(),
+        }
+    }
+
     fn make_offchain_fill(shares_filled: FractionalShares, direction: Direction) -> PositionEvent {
         make_offchain_fill_at(shares_filled, direction, Utc::now())
     }
@@ -9545,6 +9621,7 @@ mod tests {
                     },
                     amount: shares(5),
                     direction: Direction::Buy,
+                    price_usdc: None,
                     reorg_depth: 1,
                     reorged_at: Utc::now(),
                 },
@@ -9651,6 +9728,195 @@ mod tests {
             .unwrap();
 
         assert_eq!(onchain_usdc, usdc(11500));
+    }
+
+    /// A reorg reverses a fill's market-making inventory effect exactly, so a
+    /// fill followed by its reorg nets to zero -- closing the stale-inventory
+    /// window the reactor previously left open (ADR 0012).
+    #[tokio::test]
+    async fn reorged_via_reactor_reverses_market_making_inventory() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .with_usdc(usdc(10000), usdc(10000));
+
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(reactor.clone());
+
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_onchain_fill(shares(10), Direction::Buy),
+            )
+            .await
+            .unwrap();
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_onchain_reorg(shares(10), Direction::Buy),
+            )
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        let market_making_usdc = inventory.usdc_available(Venue::MarketMaking);
+        let market_making_equity = inventory.equity_available(&symbol, Venue::MarketMaking);
+        drop(inventory);
+
+        assert_eq!(
+            market_making_usdc,
+            Some(usdc(10000)),
+            "the reorg must reverse the fill's USDC inventory effect",
+        );
+        assert_eq!(
+            market_making_equity,
+            Some(shares(0)),
+            "the reorg must reverse the fill's equity inventory effect",
+        );
+    }
+
+    /// Sell-direction counterpart of the above: a Sell fill followed by its reorg
+    /// must net the market-making inventory back to where it started, reversing
+    /// both the equity and USDC legs in the opposite direction to a Buy.
+    #[tokio::test]
+    async fn reorged_sell_via_reactor_reverses_market_making_inventory() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        // Seed equity so the Sell fill has inventory to sell.
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(10), shares(10))
+            .with_usdc(usdc(10000), usdc(10000));
+
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(reactor.clone());
+
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_onchain_fill(shares(10), Direction::Sell),
+            )
+            .await
+            .unwrap();
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_onchain_reorg(shares(10), Direction::Sell),
+            )
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        let market_making_usdc = inventory.usdc_available(Venue::MarketMaking);
+        let market_making_equity = inventory.equity_available(&symbol, Venue::MarketMaking);
+        drop(inventory);
+
+        assert_eq!(
+            market_making_usdc,
+            Some(usdc(10000)),
+            "the reorg must reverse the Sell fill's USDC inventory effect",
+        );
+        assert_eq!(
+            market_making_equity,
+            Some(shares(10)),
+            "the reorg must reverse the Sell fill's equity inventory effect",
+        );
+    }
+
+    /// A reorg reversal the inventory cannot satisfy (here the equity leg would
+    /// underflow, with nothing to reverse) must NOT propagate an error: the
+    /// reactor nudges an equity check and lets the next polling snapshot
+    /// reconcile, rather than retrying an impossible inventory op forever.
+    #[tokio::test]
+    async fn reorg_reversal_inventory_failure_is_best_effort_not_an_error() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        // No equity available, so reversing a Buy fill (which subtracts equity)
+        // underflows -- the reversal is impossible.
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .with_usdc(usdc(10000), usdc(10000));
+
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(reactor.clone());
+
+        // Reorg with no preceding fill: the equity leg has nothing to reverse.
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_onchain_reorg(shares(10), Direction::Buy),
+            )
+            .await
+            .expect("an impossible reorg reversal must be best-effort, not an error");
+
+        let inventory = trigger.inventory.read().await;
+        let market_making_usdc = inventory.usdc_available(Venue::MarketMaking);
+        let market_making_equity = inventory.equity_available(&symbol, Venue::MarketMaking);
+        drop(inventory);
+
+        // The and_then chain rolls back on failure, so neither leg persisted.
+        assert_eq!(
+            market_making_equity,
+            Some(shares(0)),
+            "a failed reversal must leave equity untouched",
+        );
+        assert_eq!(
+            market_making_usdc,
+            Some(usdc(10000)),
+            "a failed reversal must leave USDC untouched",
+        );
+    }
+
+    /// A legacy reorg event with no carried price cannot reverse the USDC
+    /// leg precisely, so the reactor leaves inventory untouched and nudges an
+    /// equity check instead -- the pre-fix fallback, without erroring.
+    #[tokio::test]
+    async fn priceless_reorg_via_reactor_nudges_without_touching_inventory() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(5), shares(5))
+            .with_usdc(usdc(10000), usdc(10000));
+
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(reactor.clone());
+
+        let priceless_reorg = PositionEvent::Reorged {
+            trade_id: TradeId {
+                tx_hash: TxHash::random(),
+                log_index: 0,
+            },
+            amount: shares(5),
+            direction: Direction::Buy,
+            price_usdc: None,
+            reorg_depth: 1,
+            reorged_at: Utc::now(),
+        };
+        harness
+            .receive::<Position>(symbol.clone(), priceless_reorg)
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        let market_making_equity = inventory.equity_available(&symbol, Venue::MarketMaking);
+        let market_making_usdc = inventory.usdc_available(Venue::MarketMaking);
+        drop(inventory);
+
+        assert_eq!(market_making_equity, Some(shares(5)), "inventory untouched");
+        assert_eq!(market_making_usdc, Some(usdc(10000)), "inventory untouched");
+
+        let pending_equity_checks = sqlx_apalis::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<EquityRebalancingCheck>())
+        .fetch_one(trigger.equity_scheduler.queue().pool())
+        .await
+        .expect("count pending equity-check jobs after a priceless reorg");
+
+        assert_eq!(
+            pending_equity_checks, 1,
+            "a priceless reorg must nudge exactly one equity recheck",
+        );
     }
 
     #[tokio::test]
