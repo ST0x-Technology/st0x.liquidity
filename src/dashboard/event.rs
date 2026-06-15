@@ -225,6 +225,7 @@ mod tests {
                     direction: st0x_execution::Direction::Buy,
                     price_usdc: st0x_float_macro::float!(150),
                     block_number: 12345,
+                    block_hash: None,
                     block_timestamp: now,
                     filled_at: now,
                 },
