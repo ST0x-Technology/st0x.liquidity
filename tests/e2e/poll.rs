@@ -603,6 +603,34 @@ pub async fn poll_for_broker_fills(
     }
 }
 
+/// Polls until the broker mock's armed calendar failures begin draining,
+/// proving a market-hours readiness check actually hit the downed
+/// calendar. Crash-checks the bot while waiting.
+pub async fn poll_for_calendar_failures_consumed(
+    bot: &mut JoinHandle<anyhow::Result<()>>,
+    broker: &st0x_execution::alpaca_broker_api::AlpacaBrokerMock,
+    armed: usize,
+    timeout: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let context = "a calendar failure to be consumed by a readiness check";
+
+    loop {
+        sleep_or_crash(bot, context).await;
+
+        let remaining = broker.calendar_failures_remaining();
+        if remaining < armed {
+            return;
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Timed out after {timeout:?} waiting for {context}; \
+             still {remaining} of {armed} armed failures",
+        );
+    }
+}
+
 /// Fetches events for a specific aggregate type, ordered by insertion.
 pub async fn fetch_events_by_type(
     pool: &SqlitePool,

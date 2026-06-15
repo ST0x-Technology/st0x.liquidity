@@ -152,6 +152,17 @@ struct MockState {
     /// any caller-side retry creates a second order even though one
     /// already exists. Decrements per request until zero.
     transient_placement_failures_remaining: usize,
+    /// Number of upcoming `/v1/calendar` requests answered with a 503
+    /// before the endpoint resumes serving [`MockState::calendar_entries`].
+    /// Models a transient market-hours data outage. Decrements per
+    /// request until zero.
+    calendar_failures_remaining: usize,
+    /// Number of upcoming `place_order` requests answered with a 401
+    /// *before* the order is recorded -- the complement of
+    /// [`MockState::transient_placement_failures_remaining`]. Models a
+    /// session/credential expiry mid-request where the broker never
+    /// processed the placement. Decrements per request until zero.
+    unauthorized_placement_failures_remaining: usize,
 }
 
 /// Status of a whitelisted address.
@@ -314,6 +325,8 @@ impl AlpacaBrokerMock {
             wallet_balances: HashMap::new(),
             whitelisted_addresses: Vec::new(),
             transient_placement_failures_remaining: 0,
+            calendar_failures_remaining: 0,
+            unauthorized_placement_failures_remaining: 0,
         }));
 
         let server = MockServer::start_async().await;
@@ -355,6 +368,34 @@ impl AlpacaBrokerMock {
     /// second order with the same intent.
     pub fn set_transient_placement_failures(&self, count: usize) {
         lock(&self.state).transient_placement_failures_remaining = count;
+    }
+
+    /// Arms the mock to answer the next `count` `/v1/calendar` requests
+    /// with a 503 before resuming normal calendar service. Models a
+    /// transient market-hours data outage.
+    pub fn set_calendar_failures(&self, count: usize) {
+        lock(&self.state).calendar_failures_remaining = count;
+    }
+
+    /// Remaining armed calendar failures. Tests assert this reached zero
+    /// to prove the outage actually hit the market-hours path.
+    pub fn calendar_failures_remaining(&self) -> usize {
+        lock(&self.state).calendar_failures_remaining
+    }
+
+    /// Arms the mock to answer the next `count` `place_order` requests
+    /// with a 401 *before* recording anything -- the broker never
+    /// processed the placement. Models a session/credential expiry
+    /// mid-request, the complement of
+    /// [`AlpacaBrokerMock::set_transient_placement_failures`].
+    pub fn set_unauthorized_placement_failures(&self, count: usize) {
+        lock(&self.state).unauthorized_placement_failures_remaining = count;
+    }
+
+    /// Remaining armed unauthorized placement failures. Tests assert
+    /// this reached zero to prove the 401 was actually served.
+    pub fn unauthorized_placement_failures_remaining(&self) -> usize {
+        lock(&self.state).unauthorized_placement_failures_remaining
     }
 
     /// Sets a per-symbol fill delay: the order stays "new" for
@@ -766,7 +807,18 @@ fn register_calendar_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>
     server.mock(|when, then| {
         when.method(GET).path("/v1/calendar");
         then.respond_with(move |_request: &HttpMockRequest| {
-            let entries: Vec<Value> = lock(&state)
+            let mut state = lock(&state);
+
+            if state.calendar_failures_remaining > 0 {
+                state.calendar_failures_remaining -= 1;
+                drop(state);
+                return json_response(
+                    503,
+                    &json!({"message": "calendar temporarily unavailable (chaos)"}),
+                );
+            }
+
+            let entries: Vec<Value> = state
                 .calendar_entries
                 .iter()
                 .map(|entry| {
@@ -777,6 +829,7 @@ fn register_calendar_endpoint(server: &MockServer, state: &Arc<Mutex<MockState>>
                     })
                 })
                 .collect();
+            drop(state);
             json_response(200, &Value::Array(entries))
         });
     });
@@ -950,6 +1003,17 @@ fn register_order_placement_endpoint(server: &MockServer, state: &Arc<Mutex<Mock
             let order_id = Uuid::new_v4().to_string();
 
             let mut state = lock(&state);
+
+            // Session/credential expiry: reject before recording anything,
+            // so the caller's retry must place fresh rather than dedupe.
+            if state.unauthorized_placement_failures_remaining > 0 {
+                state.unauthorized_placement_failures_remaining -= 1;
+                drop(state);
+                return json_response(
+                    401,
+                    &json!({"message": "request is not authorized (chaos)"}),
+                );
+            }
 
             if matches!(state.mode, MockMode::PlacementFails) {
                 return json_response(422, &json!({"message": "order rejected"}));
@@ -1811,6 +1875,8 @@ mod tests {
             wallet_balances: HashMap::new(),
             whitelisted_addresses: vec![],
             transient_placement_failures_remaining: 0,
+            calendar_failures_remaining: 0,
+            unauthorized_placement_failures_remaining: 0,
         };
 
         let response = handle_crypto_order(
@@ -1856,6 +1922,8 @@ mod tests {
             wallet_balances: HashMap::from([("USDC".to_string(), float!(20))]),
             whitelisted_addresses: vec![],
             transient_placement_failures_remaining: 0,
+            calendar_failures_remaining: 0,
+            unauthorized_placement_failures_remaining: 0,
         };
 
         let response = handle_crypto_order(
@@ -1908,6 +1976,8 @@ mod tests {
             wallet_balances: HashMap::new(),
             whitelisted_addresses: vec![],
             transient_placement_failures_remaining: 0,
+            calendar_failures_remaining: 0,
+            unauthorized_placement_failures_remaining: 0,
         };
 
         let response = handle_crypto_order(
