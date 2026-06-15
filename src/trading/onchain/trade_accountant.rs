@@ -218,6 +218,8 @@ fn reconstruct_log(orderbook: Address, trade: &EmittedOnChain<RaindexTradeEvent>
 pub(crate) enum TradeAccountingError {
     #[error("Onchain trade processing error: {0}")]
     OnChain(#[from] OnChainError),
+    #[error("Onchain trade command failed: {0}")]
+    OnChainTradeCommand(#[from] SendError<crate::onchain_trade::OnChainTrade>),
     #[error("Vault registry command failed: {0}")]
     VaultRegistry(#[from] SendError<VaultRegistry>),
     #[error("Position command failed: {0}")]
