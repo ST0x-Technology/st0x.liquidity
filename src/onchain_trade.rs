@@ -91,6 +91,15 @@ pub(crate) struct OnChainTrade {
     /// existed, which is the resume-safe default.
     #[serde(default)]
     pub(crate) acknowledged_at: Option<DateTime<Utc>>,
+    /// Set once a reorg has invalidated this fill's block. Append-only: the
+    /// original fill fields are preserved and the trade is flagged reorged rather
+    /// than deleted, so the reversal stays auditable in the event log.
+    /// `OnChainTrade` has no projection (`PROJECTION: Nil`), so reorg state is
+    /// read from the event log and the `Position` aggregate, not from a view.
+    /// Absent on aggregates persisted before the field existed, which is the
+    /// not-reorged default.
+    #[serde(default)]
+    pub(crate) reorged_at: Option<DateTime<Utc>>,
 }
 
 #[async_trait]
@@ -104,7 +113,7 @@ impl EventSourced for OnChainTrade {
 
     const AGGREGATE_TYPE: &'static str = "OnChainTrade";
     const PROJECTION: Nil = Nil;
-    const SCHEMA_VERSION: u64 = 2;
+    const SCHEMA_VERSION: u64 = 3;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use OnChainTradeEvent::*;
@@ -129,9 +138,10 @@ impl EventSourced for OnChainTrade {
                 filled_at: *filled_at,
                 enrichment: None,
                 acknowledged_at: None,
+                reorged_at: None,
             }),
 
-            Enriched { .. } | Acknowledged { .. } => None,
+            Enriched { .. } | Acknowledged { .. } | Reorged { .. } => None,
         }
     }
 
@@ -155,6 +165,14 @@ impl EventSourced for OnChainTrade {
 
             Acknowledged { acknowledged_at } => Ok(Some(Self {
                 acknowledged_at: Some(*acknowledged_at),
+                ..entity.clone()
+            })),
+
+            // `reorg_depth` is intentionally not stored on aggregate state: it is
+            // audit detail that survives in the event log only. State just needs
+            // the `reorged_at` marker to know the fill was reversed.
+            Reorged { reorged_at, .. } => Ok(Some(Self {
+                reorged_at: Some(*reorged_at),
                 ..entity.clone()
             })),
 
@@ -188,7 +206,7 @@ impl EventSourced for OnChainTrade {
                 filled_at: Utc::now(),
             }]),
 
-            Enrich { .. } | Acknowledge => Err(OnChainTradeError::NotFilled),
+            Enrich { .. } | Acknowledge | RecordReorg { .. } => Err(OnChainTradeError::NotFilled),
         }
     }
 
@@ -228,12 +246,34 @@ impl EventSourced for OnChainTrade {
             }
 
             Acknowledge => {
+                // A reorg invalidated this fill's block, so its position impact
+                // must not be applied. Reject before the acknowledged guard: a
+                // retried `AccountForDexTrade` job landing after `RecordReorg`
+                // would otherwise complete the acknowledged marker while the
+                // conductor resume path (keyed on `!is_acknowledged()`) skips
+                // re-applying position impact -- leaving position and dedupe
+                // state inconsistent with a fill invalidated on-chain.
+                if self.is_reorged() {
+                    return Err(OnChainTradeError::CannotAcknowledgeReorgedFill);
+                }
+
                 if self.is_acknowledged() {
                     return Err(OnChainTradeError::AlreadyAcknowledged);
                 }
 
                 Ok(vec![Acknowledged {
                     acknowledged_at: Utc::now(),
+                }])
+            }
+
+            RecordReorg { reorg_depth } => {
+                if self.is_reorged() {
+                    return Err(OnChainTradeError::AlreadyReorged);
+                }
+
+                Ok(vec![Reorged {
+                    reorg_depth,
+                    reorged_at: Utc::now(),
                 }])
             }
         }
@@ -250,6 +290,13 @@ impl OnChainTrade {
     /// trade as fully processed.
     pub(crate) fn is_acknowledged(&self) -> bool {
         self.acknowledged_at.is_some()
+    }
+
+    /// Whether a reorg has invalidated this fill's block. Once set, the trade is
+    /// preserved (not deleted) and flagged reorged in the event log; reorg state
+    /// is read from there and the `Position` aggregate, not from a view.
+    pub(crate) fn is_reorged(&self) -> bool {
+        self.reorged_at.is_some()
     }
 
     pub(crate) fn to_trade(&self, id: &OnChainTradeId) -> Trade {
@@ -274,6 +321,10 @@ pub(crate) enum OnChainTradeError {
     AlreadyFilled,
     #[error("Trade has already been acknowledged by the position")]
     AlreadyAcknowledged,
+    #[error("Trade has already been recorded as reorged")]
+    AlreadyReorged,
+    #[error("Cannot acknowledge a fill whose block was reorged away")]
+    CannotAcknowledgeReorgedFill,
     #[error(
         "Effective gas price {effective_gas_price} exceeds i64::MAX \
          and cannot be stored in SQLite"
@@ -309,6 +360,9 @@ pub(crate) enum OnChainTradeCommand {
     /// Sent only after `AcknowledgeOnChainFill` succeeded, so the
     /// dedupe guard can distinguish "witnessed" from "fully accounted".
     Acknowledge,
+    /// Records that a reorg invalidated this fill's block. `reorg_depth` is
+    /// how many blocks deep the reorg ran, kept for the audit trail.
+    RecordReorg { reorg_depth: u64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -340,6 +394,10 @@ pub(crate) enum OnChainTradeEvent {
     },
     Acknowledged {
         acknowledged_at: DateTime<Utc>,
+    },
+    Reorged {
+        reorg_depth: u64,
+        reorged_at: DateTime<Utc>,
     },
 }
 
@@ -400,6 +458,16 @@ impl PartialEq for OnChainTradeEvent {
                     acknowledged_at: a2,
                 },
             ) => a1 == a2,
+            (
+                Self::Reorged {
+                    reorg_depth: depth_a,
+                    reorged_at: at_a,
+                },
+                Self::Reorged {
+                    reorg_depth: depth_b,
+                    reorged_at: at_b,
+                },
+            ) => depth_a == depth_b && at_a == at_b,
             _ => false,
         }
     }
@@ -413,6 +481,7 @@ impl DomainEvent for OnChainTradeEvent {
             Self::Filled { .. } => "OnChainTradeEvent::Filled".to_string(),
             Self::Enriched { .. } => "OnChainTradeEvent::Enriched".to_string(),
             Self::Acknowledged { .. } => "OnChainTradeEvent::Acknowledged".to_string(),
+            Self::Reorged { .. } => "OnChainTradeEvent::Reorged".to_string(),
         }
     }
 
@@ -707,6 +776,255 @@ mod tests {
         let error = TestHarness::<OnChainTrade>::with(())
             .given_no_previous_events()
             .when(OnChainTradeCommand::Acknowledge)
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(OnChainTradeError::NotFilled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn record_reorg_marks_filled_trade_reorged() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let events = TestHarness::<OnChainTrade>::with(())
+            .given(vec![OnChainTradeEvent::Filled {
+                symbol,
+                amount: float!(10.5),
+                direction: Direction::Buy,
+                price_usdc: float!(150.25),
+                block_number: 12345,
+                block_hash: None,
+                block_timestamp: now,
+                filled_at: now,
+            }])
+            .when(OnChainTradeCommand::RecordReorg { reorg_depth: 3 })
+            .await
+            .events();
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [OnChainTradeEvent::Reorged { reorg_depth: 3, .. }]
+            ),
+            "RecordReorg on a filled trade must emit Reorged carrying the depth; got {events:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn cannot_acknowledge_after_reorg() {
+        // A reorg invalidated the fill, so a retried AccountForDexTrade job that
+        // lands after RecordReorg must not complete the acknowledged marker --
+        // that would desync position/dedupe state from an on-chain-invalid fill.
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let error = TestHarness::<OnChainTrade>::with(())
+            .given(vec![
+                OnChainTradeEvent::Filled {
+                    symbol,
+                    amount: float!(10.5),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150.25),
+                    block_number: 12345,
+                    block_hash: None,
+                    block_timestamp: now,
+                    filled_at: now,
+                },
+                OnChainTradeEvent::Reorged {
+                    reorg_depth: 3,
+                    reorged_at: now,
+                },
+            ])
+            .when(OnChainTradeCommand::Acknowledge)
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(OnChainTradeError::CannotAcknowledgeReorgedFill)
+        ));
+    }
+
+    /// The reorg is append-only: marking a trade reorged must leave every
+    /// original fill field intact so the reorged trade stays auditable in the
+    /// event log with its original fill data.
+    #[test]
+    fn reorged_preserves_original_fill_data() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let trade = replay::<OnChainTrade>(vec![
+            OnChainTradeEvent::Filled {
+                symbol: symbol.clone(),
+                amount: float!(10.5),
+                direction: Direction::Buy,
+                price_usdc: float!(150.25),
+                block_number: 12345,
+                block_hash: None,
+                block_timestamp: now,
+                filled_at: now,
+            },
+            OnChainTradeEvent::Reorged {
+                reorg_depth: 3,
+                reorged_at: now,
+            },
+        ])
+        .unwrap()
+        .expect("replay must produce a live trade");
+
+        assert!(trade.is_reorged());
+        assert_eq!(trade.symbol, symbol);
+        assert!(trade.amount.eq(float!(10.5)).unwrap());
+        assert_eq!(trade.direction, Direction::Buy);
+        assert_eq!(trade.block_number, Some(12345));
+        assert_eq!(trade.filled_at, now);
+    }
+
+    /// Reorgs strike already-processed fills, so the marker must coexist with
+    /// the acknowledgement rather than replace it.
+    #[test]
+    fn reorg_after_acknowledge_preserves_both_markers() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let trade = replay::<OnChainTrade>(vec![
+            OnChainTradeEvent::Filled {
+                symbol,
+                amount: float!(10.5),
+                direction: Direction::Buy,
+                price_usdc: float!(150.25),
+                block_number: 12345,
+                block_hash: None,
+                block_timestamp: now,
+                filled_at: now,
+            },
+            OnChainTradeEvent::Acknowledged {
+                acknowledged_at: now,
+            },
+            OnChainTradeEvent::Reorged {
+                reorg_depth: 1,
+                reorged_at: now,
+            },
+        ])
+        .unwrap()
+        .expect("replay must produce a live trade");
+
+        assert!(trade.is_reorged());
+        assert!(trade.is_acknowledged());
+    }
+
+    /// Drives the command path end-to-end: an already-acknowledged fill struck
+    /// by a reorg must emit `Reorged`, keep its acknowledgement, and then reject
+    /// any retried `Acknowledge` with `CannotAcknowledgeReorgedFill` -- so a
+    /// re-delivered `AccountForDexTrade` job can never complete the marker on a
+    /// fill whose block was reorged away. The replay-only sibling is
+    /// `reorg_after_acknowledge_preserves_both_markers`; this one threads the
+    /// real events emitted by each command handler into the next step.
+    #[tokio::test]
+    async fn record_reorg_after_acknowledge_marks_reorged_and_blocks_reacknowledge() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let filled = OnChainTradeEvent::Filled {
+            symbol,
+            amount: float!(10.5),
+            direction: Direction::Buy,
+            price_usdc: float!(150.25),
+            block_number: 12345,
+            block_hash: None,
+            block_timestamp: now,
+            filled_at: now,
+        };
+
+        // Acknowledge the witnessed fill through the command handler.
+        let acknowledge_events = TestHarness::<OnChainTrade>::with(())
+            .given(vec![filled.clone()])
+            .when(OnChainTradeCommand::Acknowledge)
+            .await
+            .events();
+        let [acknowledged] = acknowledge_events.as_slice() else {
+            panic!("Acknowledge must emit a single marker; got {acknowledge_events:?}");
+        };
+        assert!(matches!(
+            acknowledged,
+            OnChainTradeEvent::Acknowledged { .. }
+        ));
+
+        // RecordReorg the now-acknowledged fill through the command handler.
+        let reorg_events = TestHarness::<OnChainTrade>::with(())
+            .given(vec![filled.clone(), acknowledged.clone()])
+            .when(OnChainTradeCommand::RecordReorg { reorg_depth: 4 })
+            .await
+            .events();
+        let [reorged] = reorg_events.as_slice() else {
+            panic!("RecordReorg must emit a single marker; got {reorg_events:?}");
+        };
+        assert!(matches!(
+            reorged,
+            OnChainTradeEvent::Reorged { reorg_depth: 4, .. }
+        ));
+
+        // (a) The live aggregate carries both markers after the command sequence.
+        let trade =
+            replay::<OnChainTrade>(vec![filled.clone(), acknowledged.clone(), reorged.clone()])
+                .unwrap()
+                .expect("replay must produce a live trade");
+        assert!(trade.is_reorged());
+        assert!(trade.is_acknowledged());
+
+        // (b) A retried Acknowledge after the reorg is rejected.
+        let error = TestHarness::<OnChainTrade>::with(())
+            .given(vec![filled, acknowledged.clone(), reorged.clone()])
+            .when(OnChainTradeCommand::Acknowledge)
+            .await
+            .then_expect_error();
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(OnChainTradeError::CannotAcknowledgeReorgedFill)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cannot_reorg_twice() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let error = TestHarness::<OnChainTrade>::with(())
+            .given(vec![
+                OnChainTradeEvent::Filled {
+                    symbol,
+                    amount: float!(10.5),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150.25),
+                    block_number: 12345,
+                    block_hash: None,
+                    block_timestamp: now,
+                    filled_at: now,
+                },
+                OnChainTradeEvent::Reorged {
+                    reorg_depth: 2,
+                    reorged_at: now,
+                },
+            ])
+            .when(OnChainTradeCommand::RecordReorg { reorg_depth: 5 })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(OnChainTradeError::AlreadyReorged)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cannot_reorg_unfilled_trade() {
+        let error = TestHarness::<OnChainTrade>::with(())
+            .given_no_previous_events()
+            .when(OnChainTradeCommand::RecordReorg { reorg_depth: 1 })
             .await
             .then_expect_error();
 

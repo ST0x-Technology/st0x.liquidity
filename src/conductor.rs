@@ -2188,23 +2188,50 @@ pub(crate) async fn execute_acknowledge_fill(
     }
 }
 
+/// Outcome of the acknowledge marker write on the `OnChainTrade` aggregate.
+pub(crate) enum FillMarkOutcome {
+    /// The acknowledgement marker is durable -- freshly written, or already
+    /// present from a prior attempt (an idempotent resume). The fill may be
+    /// settled and hedged.
+    Marked,
+    /// A reorg invalidated this fill between the `process_queued_trade`
+    /// reorg-skip guard and the marker write, so `Acknowledge` was rejected with
+    /// `CannotAcknowledgeReorgedFill`. The marker is NOT durable: the fill must
+    /// not be settled (its marker-durable precondition is unmet) or hedged
+    /// (a broker order for a fill that no longer exists on the canonical chain
+    /// is wrong-way exposure). The position impact the acknowledge already
+    /// applied is left for the reorg reversal flow (built across the rest of the
+    /// reorg stack) to reverse.
+    Reorged,
+}
+
 /// Marks the trade acknowledged on the `OnChainTrade` aggregate after the
 /// position write succeeded, completing the exactly-once pair (ADR 0005).
-/// A re-driven marker (`AlreadyAcknowledged`) is idempotent;
+/// A re-driven marker (`AlreadyAcknowledged`) is idempotent and reports
+/// [`FillMarkOutcome::Marked`]; a fill reorged mid-pair reports
+/// [`FillMarkOutcome::Reorged`] so the caller skips settle and hedge;
 /// infrastructure errors propagate so the apalis retry re-drives the
 /// idempotent acknowledge pair.
 pub(crate) async fn execute_mark_acknowledged(
     onchain_trade: &Store<OnChainTrade>,
     trade_id: &OnChainTradeId,
-) -> Result<(), SendError<OnChainTrade>> {
+) -> Result<FillMarkOutcome, SendError<OnChainTrade>> {
     match onchain_trade
         .send(trade_id, OnChainTradeCommand::Acknowledge)
         .await
     {
+        // `AlreadyAcknowledged`: a prior attempt already acknowledged (resume).
         Ok(())
         | Err(AggregateError::UserError(LifecycleError::Apply(
             OnChainTradeError::AlreadyAcknowledged,
-        ))) => Ok(()),
+        ))) => Ok(FillMarkOutcome::Marked),
+        // The fill was reorged between the `process_queued_trade` reorg-skip
+        // guard and this send. Surface it so the caller terminates cleanly
+        // without settling or hedging an invalidated fill, instead of swallowing
+        // it as success and letting the pipeline place a broker hedge.
+        Err(AggregateError::UserError(LifecycleError::Apply(
+            OnChainTradeError::CannotAcknowledgeReorgedFill,
+        ))) => Ok(FillMarkOutcome::Reorged),
         Err(error) => Err(error),
     }
 }
@@ -2282,6 +2309,19 @@ where
             execute_settle_fill(&cqrs.position, &trade).await?;
             return Ok(None);
         }
+        // A reorg invalidated this fill's block before it was acknowledged.
+        // Skip it as terminal: applying its position impact would account for a
+        // fill that no longer exists, and `Acknowledge` now rejects a reorged
+        // trade -- a retried job would otherwise apply impact then fail the
+        // acknowledge and retry forever.
+        Ok(Some(state)) if state.is_reorged() => {
+            warn!(
+                ?trade_id,
+                symbol = %trade.symbol,
+                "Trade was reorged before acknowledgement; skipping fill accounting"
+            );
+            return Ok(None);
+        }
         Ok(Some(state)) => {
             info!(
                 ?trade_id,
@@ -2327,7 +2367,24 @@ where
         block_timestamp,
     )
     .await?;
-    execute_mark_acknowledged(&cqrs.onchain_trade, &trade_id).await?;
+    // A reorg can land between the load-time skip guard above and this marker
+    // write. When it does, the acknowledge marker is not durable, so the fill
+    // must not be settled or hedged -- placing a broker order for a fill that no
+    // longer exists on the canonical chain is wrong-way exposure. Bail before
+    // settle and hedge; the position impact the acknowledge above applied is left
+    // for the reorg reversal flow (built across the rest of the reorg stack) to
+    // reverse.
+    if matches!(
+        execute_mark_acknowledged(&cqrs.onchain_trade, &trade_id).await?,
+        FillMarkOutcome::Reorged
+    ) {
+        warn!(
+            ?trade_id,
+            symbol = %trade.symbol,
+            "Fill reorged during the acknowledge pair; skipping settle and hedge"
+        );
+        return Ok(None);
+    }
     // Prune the pending-acknowledgement entry now that the marker is durable
     // (ADR 0010), before any early return below, so the threshold-not-met and
     // placement-skip paths still settle.
@@ -5118,6 +5175,150 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn reorged_trade_skipped_by_resume_path() {
+        // A trade reorged before acknowledgement must be skipped by the resume
+        // path: applying its position impact would account for a fill that no
+        // longer exists, and `Acknowledge` rejects a reorged trade -- a retried
+        // job would otherwise apply impact and then loop on that rejection.
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
+        let cqrs = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+
+        let trade_event = make_trade_event(61);
+        let trade = OnchainTradeBuilder::default()
+            .with_symbol("wtAAPL")
+            .with_equity_token(TEST_EQUITY_TOKEN)
+            .with_amount(float!("1.5"))
+            .with_log_index(61)
+            .build();
+        let block_timestamp = trade
+            .block_timestamp
+            .expect("test trade carries a block timestamp");
+        let trade_id = OnChainTradeId {
+            tx_hash: trade.tx_hash,
+            log_index: trade.log_index,
+        };
+
+        // Witness the fill, then reorg it before acknowledgement -- the window
+        // where a stale AccountForDexTrade job is still queued.
+        let witnessed = execute_witness_trade(
+            &cqrs.onchain_trade,
+            &trade,
+            trade_event.block_number,
+            trade_event.block_hash,
+            block_timestamp,
+        )
+        .await
+        .unwrap();
+        assert!(witnessed, "premise: the witness write must succeed");
+        cqrs.onchain_trade
+            .send(
+                &trade_id,
+                OnChainTradeCommand::RecordReorg { reorg_depth: 3 },
+            )
+            .await
+            .unwrap();
+
+        let result = process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true)
+            .await
+            .expect("a reorged trade must be skipped cleanly, not error and retry");
+
+        assert_eq!(result, None, "a reorged trade must enqueue no hedge");
+        let state = cqrs
+            .onchain_trade
+            .load(&trade_id)
+            .await
+            .unwrap()
+            .expect("the reorged aggregate still exists");
+        assert!(
+            !state.is_acknowledged(),
+            "a reorged trade must not be acknowledged -- its impact is reversed via the reorg path",
+        );
+    }
+
+    /// End-to-end assurance that a reorged fill is never hedged by the
+    /// trade-accounting pipeline. The 1.5-share fill is above the hedging
+    /// threshold, so absent the reorg `process_queued_trade` would place a
+    /// broker hedge (cf. `trade_above_threshold_places_offchain_order`).
+    /// Reorging its block before the queued job runs makes
+    /// `process_queued_trade` hit its load-time reorg-skip guard and
+    /// short-circuit before the acknowledge/settle/hedge path, so no offchain
+    /// order is placed.
+    ///
+    /// This exercises the load-time guard, not the mid-pipeline race (a reorg
+    /// landing between the load and the acknowledge-marker write), which cannot
+    /// be injected deterministically here and is unit-covered by
+    /// `execute_mark_acknowledged_signals_reorged_trade`. `MockExecutor` records
+    /// no placed orders, so "not hedged" is asserted via the absent
+    /// offchain-order id and the absence of any position impact / pending hedge.
+    #[tokio::test]
+    async fn process_queued_trade_does_not_hedge_a_reorged_fill() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
+        let cqrs = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+
+        let trade_event = make_trade_event(63);
+        let trade = test_trade_with_amount(float!(1.5), 63);
+        let block_timestamp = trade
+            .block_timestamp
+            .expect("test trade carries a block timestamp");
+        let trade_id = OnChainTradeId {
+            tx_hash: trade.tx_hash,
+            log_index: trade.log_index,
+        };
+
+        // Witness the above-threshold fill, then reorg its block away before the
+        // queued AccountForDexTrade job runs.
+        let witnessed = execute_witness_trade(
+            &cqrs.onchain_trade,
+            &trade,
+            trade_event.block_number,
+            trade_event.block_hash,
+            block_timestamp,
+        )
+        .await
+        .unwrap();
+        assert!(witnessed, "premise: the witness write must succeed");
+        cqrs.onchain_trade
+            .send(
+                &trade_id,
+                OnChainTradeCommand::RecordReorg { reorg_depth: 3 },
+            )
+            .await
+            .unwrap();
+
+        let result = process_queued_trade(&MockExecutor::new(), &trade_event, trade, &cqrs, true)
+            .await
+            .expect("a reorged fill must be skipped cleanly, not error and retry");
+
+        assert_eq!(
+            result, None,
+            "a reorged fill must not be hedged -- no offchain order id is returned"
+        );
+
+        // The skip short-circuits before the acknowledge/settle/hedge path, so
+        // the position is never created and no offchain hedge is pending.
+        let position = cqrs
+            .position_projection
+            .load(&Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            position.is_none(),
+            "a reorged fill must short-circuit before the hedge path, leaving no position or \
+             pending offchain order",
+        );
+    }
+
     /// Composed coverage for the second crash window (ADR 0005): a crash
     /// between the position write (`execute_acknowledge_fill`) and the
     /// `OnChainTrade` acknowledgement marker (`execute_mark_acknowledged`)
@@ -5284,12 +5485,73 @@ mod tests {
         .await
         .unwrap();
 
-        execute_mark_acknowledged(&cqrs.onchain_trade, &trade_id)
+        assert!(
+            matches!(
+                execute_mark_acknowledged(&cqrs.onchain_trade, &trade_id).await,
+                Ok(FillMarkOutcome::Marked)
+            ),
+            "the first marker write must succeed and mark the fill"
+        );
+        assert!(
+            matches!(
+                execute_mark_acknowledged(&cqrs.onchain_trade, &trade_id).await,
+                Ok(FillMarkOutcome::Marked)
+            ),
+            "re-driving the marker must be idempotent (Marked), not propagate an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_mark_acknowledged_signals_reorged_trade() {
+        // The `process_queued_trade` reorg-skip guard normally prevents a reorged
+        // trade from reaching the acknowledge marker, but a reorg landing between
+        // that guard and this send makes `Acknowledge` return
+        // `CannotAcknowledgeReorgedFill`. The marker write must surface that as
+        // `FillMarkOutcome::Reorged` so `process_queued_trade` skips settle and
+        // hedge instead of swallowing it and placing a broker order for the
+        // invalidated fill.
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
+        let cqrs = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+
+        let trade_event = make_trade_event(62);
+        let trade = test_trade_with_amount(float!(1.5), 62);
+        let block_timestamp = trade
+            .block_timestamp
+            .expect("test trade carries a block timestamp");
+        let trade_id = OnChainTradeId {
+            tx_hash: trade.tx_hash,
+            log_index: trade.log_index,
+        };
+
+        execute_witness_trade(
+            &cqrs.onchain_trade,
+            &trade,
+            trade_event.block_number,
+            trade_event.block_hash,
+            block_timestamp,
+        )
+        .await
+        .unwrap();
+        cqrs.onchain_trade
+            .send(
+                &trade_id,
+                OnChainTradeCommand::RecordReorg { reorg_depth: 3 },
+            )
             .await
-            .expect("the first marker write must succeed");
-        execute_mark_acknowledged(&cqrs.onchain_trade, &trade_id)
-            .await
-            .expect("re-driving the marker must be idempotent, not propagate an error");
+            .unwrap();
+
+        assert!(
+            matches!(
+                execute_mark_acknowledged(&cqrs.onchain_trade, &trade_id).await,
+                Ok(FillMarkOutcome::Reorged)
+            ),
+            "marking a reorged trade must signal Reorged so the caller skips settle and hedge"
+        );
     }
 
     /// Exactly-once across multiple same-symbol fills: once a fill is
