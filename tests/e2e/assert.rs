@@ -239,15 +239,18 @@ fn assert_onchain_trade_events(
     events: &[StoredEvent],
     expected_count: usize,
 ) {
+    // Count witnessed fills, not raw aggregate events: each trade also
+    // carries an `Acknowledged` marker event (ADR 0005), so the fill
+    // event is the one-per-take invariant.
     let all_trades: Vec<&StoredEvent> = events
         .iter()
-        .filter(|event| event.aggregate_type == "OnChainTrade")
+        .filter(|event| event.event_type == "OnChainTradeEvent::Filled")
         .collect();
 
     assert_eq!(
         all_trades.len(),
         expected_count,
-        "Expected exactly {expected_count} OnChainTrade events, got {}",
+        "Expected exactly {expected_count} witnessed OnChainTrade fills, got {}",
         all_trades.len(),
     );
 

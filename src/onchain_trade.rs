@@ -77,6 +77,14 @@ pub(crate) struct OnChainTrade {
     pub(crate) block_timestamp: DateTime<Utc>,
     pub(crate) filled_at: DateTime<Utc>,
     pub(crate) enrichment: Option<Enrichment>,
+    /// Set once the `Position` aggregate has acknowledged this fill.
+    /// The trade-accounting dedupe treats only acknowledged trades as
+    /// fully processed, so a job re-delivered after a crash between the
+    /// witness and acknowledge writes resumes instead of skipping
+    /// (ADR 0005). Absent on aggregates persisted before the marker
+    /// existed, which is the resume-safe default.
+    #[serde(default)]
+    pub(crate) acknowledged_at: Option<DateTime<Utc>>,
 }
 
 #[async_trait]
@@ -90,7 +98,7 @@ impl EventSourced for OnChainTrade {
 
     const AGGREGATE_TYPE: &'static str = "OnChainTrade";
     const PROJECTION: Nil = Nil;
-    const SCHEMA_VERSION: u64 = 1;
+    const SCHEMA_VERSION: u64 = 2;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use OnChainTradeEvent::*;
@@ -112,9 +120,10 @@ impl EventSourced for OnChainTrade {
                 block_timestamp: *block_timestamp,
                 filled_at: *filled_at,
                 enrichment: None,
+                acknowledged_at: None,
             }),
 
-            Enriched { .. } => None,
+            Enriched { .. } | Acknowledged { .. } => None,
         }
     }
 
@@ -133,6 +142,11 @@ impl EventSourced for OnChainTrade {
                     pyth_price: pyth_price.clone(),
                     enriched_at: *enriched_at,
                 }),
+                ..entity.clone()
+            })),
+
+            Acknowledged { acknowledged_at } => Ok(Some(Self {
+                acknowledged_at: Some(*acknowledged_at),
                 ..entity.clone()
             })),
 
@@ -164,7 +178,7 @@ impl EventSourced for OnChainTrade {
                 filled_at: Utc::now(),
             }]),
 
-            Enrich { .. } => Err(OnChainTradeError::NotFilled),
+            Enrich { .. } | Acknowledge => Err(OnChainTradeError::NotFilled),
         }
     }
 
@@ -202,6 +216,16 @@ impl EventSourced for OnChainTrade {
                     enriched_at: Utc::now(),
                 }])
             }
+
+            Acknowledge => {
+                if self.is_acknowledged() {
+                    return Err(OnChainTradeError::AlreadyAcknowledged);
+                }
+
+                Ok(vec![Acknowledged {
+                    acknowledged_at: Utc::now(),
+                }])
+            }
         }
     }
 }
@@ -209,6 +233,13 @@ impl EventSourced for OnChainTrade {
 impl OnChainTrade {
     pub(crate) fn is_enriched(&self) -> bool {
         self.enrichment.is_some()
+    }
+
+    /// Whether the `Position` aggregate has acknowledged this fill --
+    /// the condition under which the trade-accounting dedupe treats the
+    /// trade as fully processed.
+    pub(crate) fn is_acknowledged(&self) -> bool {
+        self.acknowledged_at.is_some()
     }
 
     pub(crate) fn to_trade(&self, id: &OnChainTradeId) -> Trade {
@@ -231,6 +262,8 @@ pub(crate) enum OnChainTradeError {
     AlreadyEnriched,
     #[error("Trade has already been filled")]
     AlreadyFilled,
+    #[error("Trade has already been acknowledged by the position")]
+    AlreadyAcknowledged,
     #[error(
         "Effective gas price {effective_gas_price} exceeds i64::MAX \
          and cannot be stored in SQLite"
@@ -261,6 +294,10 @@ pub(crate) enum OnChainTradeCommand {
         effective_gas_price: u128,
         pyth_price: PythPrice,
     },
+    /// Marks the fill as acknowledged by the `Position` aggregate.
+    /// Sent only after `AcknowledgeOnChainFill` succeeded, so the
+    /// dedupe guard can distinguish "witnessed" from "fully accounted".
+    Acknowledge,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -287,6 +324,9 @@ pub(crate) enum OnChainTradeEvent {
         effective_gas_price: u128,
         pyth_price: PythPrice,
         enriched_at: DateTime<Utc>,
+    },
+    Acknowledged {
+        acknowledged_at: DateTime<Utc>,
     },
 }
 
@@ -336,6 +376,14 @@ impl PartialEq for OnChainTradeEvent {
                     enriched_at: e2,
                 },
             ) => g1 == g2 && egp1 == egp2 && pp1 == pp2 && e1 == e2,
+            (
+                Self::Acknowledged {
+                    acknowledged_at: a1,
+                },
+                Self::Acknowledged {
+                    acknowledged_at: a2,
+                },
+            ) => a1 == a2,
             _ => false,
         }
     }
@@ -348,6 +396,7 @@ impl DomainEvent for OnChainTradeEvent {
         match self {
             Self::Filled { .. } => "OnChainTradeEvent::Filled".to_string(),
             Self::Enriched { .. } => "OnChainTradeEvent::Enriched".to_string(),
+            Self::Acknowledged { .. } => "OnChainTradeEvent::Acknowledged".to_string(),
         }
     }
 
@@ -540,6 +589,116 @@ mod tests {
             error,
             LifecycleError::Apply(OnChainTradeError::GasPriceOutOfRange { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn acknowledge_marks_witnessed_trade() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let events = TestHarness::<OnChainTrade>::with(())
+            .given(vec![OnChainTradeEvent::Filled {
+                symbol,
+                amount: float!(10.5),
+                direction: Direction::Buy,
+                price_usdc: float!(150.25),
+                block_number: 12345,
+                block_timestamp: now,
+                filled_at: now,
+            }])
+            .when(OnChainTradeCommand::Acknowledge)
+            .await
+            .events();
+
+        assert!(
+            matches!(events.as_slice(), [OnChainTradeEvent::Acknowledged { .. }]),
+            "Acknowledge on a witnessed trade must emit the marker; got {events:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn cannot_acknowledge_twice() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let error = TestHarness::<OnChainTrade>::with(())
+            .given(vec![
+                OnChainTradeEvent::Filled {
+                    symbol,
+                    amount: float!(10.5),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150.25),
+                    block_number: 12345,
+                    block_timestamp: now,
+                    filled_at: now,
+                },
+                OnChainTradeEvent::Acknowledged {
+                    acknowledged_at: now,
+                },
+            ])
+            .when(OnChainTradeCommand::Acknowledge)
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(OnChainTradeError::AlreadyAcknowledged)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cannot_acknowledge_unwitnessed_trade() {
+        let error = TestHarness::<OnChainTrade>::with(())
+            .given_no_previous_events()
+            .when(OnChainTradeCommand::Acknowledge)
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(OnChainTradeError::NotFilled)
+        ));
+    }
+
+    /// Production emits `Enriched` before `Acknowledged`: enrichment runs
+    /// in the fresh-trade path, then the position acknowledges the fill.
+    /// The `Acknowledged` evolve handler must preserve the enrichment it
+    /// finds so both markers survive in the live aggregate.
+    #[tokio::test]
+    async fn acknowledge_after_enrich_preserves_both_markers() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let trade = replay::<OnChainTrade>(vec![
+            OnChainTradeEvent::Filled {
+                symbol,
+                amount: float!(10.5),
+                direction: Direction::Buy,
+                price_usdc: float!(150.25),
+                block_number: 12345,
+                block_timestamp: now,
+                filled_at: now,
+            },
+            OnChainTradeEvent::Enriched {
+                gas_used: 21000,
+                effective_gas_price: 100,
+                pyth_price: PythPrice {
+                    value: "150250000".to_string(),
+                    expo: -6,
+                    conf: "50000".to_string(),
+                    publish_time: now,
+                },
+                enriched_at: now,
+            },
+            OnChainTradeEvent::Acknowledged {
+                acknowledged_at: now,
+            },
+        ])
+        .unwrap()
+        .expect("replay must produce a live trade");
+
+        assert!(trade.is_acknowledged());
+        assert!(trade.is_enriched());
     }
 
     #[tokio::test]

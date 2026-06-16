@@ -233,6 +233,10 @@ pub(crate) enum TradeAccountingError {
     AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
     #[error("Failed to enqueue PollOrderStatus job: {0}")]
     EnqueuePollJob(#[from] crate::conductor::job::QueuePushError),
+    #[error("Missing block_timestamp for fill {trade_id}; cannot account for it")]
+    MissingBlockTimestamp {
+        trade_id: crate::onchain_trade::OnChainTradeId,
+    },
 }
 
 #[cfg(test)]

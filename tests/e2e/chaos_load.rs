@@ -24,7 +24,7 @@ use std::time::Duration;
 use crate::chaos::ChaosProxy;
 use crate::hedging::assertions::*;
 use crate::poll::{
-    connect_db, count_events_by_type, poll_for_all_jobs_done, poll_for_broker_fills,
+    connect_db, count_events_of_type, poll_for_all_jobs_done, poll_for_broker_fills,
     poll_for_events, spawn_bot,
 };
 
@@ -49,12 +49,14 @@ async fn assert_no_stuck_offchain_orders(db_path: &std::path::Path) -> anyhow::R
     Ok(())
 }
 
-/// Counts witnessed onchain trades; under bursts every assertion on
-/// effects must use exact aggregate counts, never broker order counts
-/// (trades legitimately batch into fewer orders).
+/// Counts witnessed onchain fills; under bursts every assertion on
+/// effects must use exact event counts, never broker order counts
+/// (trades legitimately batch into fewer orders). Counts the `Filled`
+/// event specifically -- each trade also carries an `Acknowledged`
+/// marker (ADR 0005).
 async fn assert_witnessed_trades(db_path: &std::path::Path, expected: i64) -> anyhow::Result<()> {
     let pool = connect_db(db_path).await?;
-    let witnessed = count_events_by_type(&pool, "OnChainTradeEvent::Filled").await?;
+    let witnessed = count_events_of_type(&pool, "OnChainTradeEvent::Filled").await?;
     pool.close().await;
 
     assert_eq!(
