@@ -22,6 +22,7 @@ enum MockFailure {
     ConfirmWrap,
     RetryableConfirmWrap,
     Unwrap,
+    Donate,
     Lookup,
     DerivativeLookup,
     /// Fails `wait_for_block` with `NodeBehindRequiredBlock` (budget exhausted).
@@ -100,6 +101,13 @@ impl MockWrapper {
     pub fn failing_unwrap() -> Self {
         let mut mock = Self::new();
         mock.failure = MockFailure::Unwrap;
+        mock
+    }
+
+    /// Creates a mock wrapper that fails on donate (NAV-bump transfer) operations.
+    pub fn failing_donate() -> Self {
+        let mut mock = Self::new();
+        mock.failure = MockFailure::Donate;
         mock
     }
 
@@ -227,6 +235,23 @@ impl Wrapper for MockWrapper {
         }
         // 1:1 ratio for mock - underlying amount equals wrapped amount
         Ok((self.unwrap_tx, wrapped_amount))
+    }
+
+    async fn donate(
+        &self,
+        _wrapped_token: Address,
+        _underlying_amount: U256,
+    ) -> Result<TxHash, WrapperError> {
+        if self.failure == MockFailure::Donate {
+            return Err(WrapperError::Evm(EvmError::Transport(RpcError::ErrorResp(
+                alloy::rpc::json_rpc::ErrorPayload {
+                    code: -32000,
+                    message: "wrapper donation transfer failed".into(),
+                    data: None,
+                },
+            ))));
+        }
+        Ok(TxHash::random())
     }
 
     async fn submit_wrap(

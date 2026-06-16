@@ -160,6 +160,43 @@ impl<W: Wallet> Wrapper for WrapperService<W> {
         Ok((tx_hash, assets))
     }
 
+    async fn donate(
+        &self,
+        wrapped_token: Address,
+        underlying_amount: U256,
+    ) -> Result<TxHash, WrapperError> {
+        let underlying_token: Address = self
+            .wallet
+            .call::<OpenChainErrorRegistry, _>(wrapped_token, IERC4626::assetCall {})
+            .await?;
+
+        info!(
+            target: "orderbook",
+            %underlying_token,
+            %wrapped_token,
+            %underlying_amount,
+            "Donating underlying into ERC-4626 wrapper to bump NAV"
+        );
+
+        let receipt = self
+            .wallet
+            .submit::<OpenChainErrorRegistry, _>(
+                underlying_token,
+                IERC20::transferCall {
+                    to: wrapped_token,
+                    amount: underlying_amount,
+                },
+                "ERC20 transfer donating into ERC4626 wrapper",
+            )
+            .await?;
+
+        let tx_hash = receipt.transaction_hash;
+
+        info!(target: "orderbook", %tx_hash, "Wrapper NAV donation confirmed");
+
+        Ok(tx_hash)
+    }
+
     async fn submit_wrap(
         &self,
         wrapped_token: Address,

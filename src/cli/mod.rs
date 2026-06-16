@@ -263,6 +263,21 @@ pub enum Commands {
         quantity: Positive<FractionalShares>,
     },
 
+    /// Donate tokenized equity into its ERC-4626 wrapper to bump the wrapper NAV
+    ///
+    /// A bare transfer of the underlying into the vault raises its share price
+    /// (`convertToAssets`) without minting new wrapped shares -- the dividend /
+    /// corporate-action NAV bump. Point `--config`/`--secrets` at the dividend
+    /// turnkey wallet to fund it from issuance.
+    DonateEquity {
+        /// Stock symbol (e.g., AAPL, TSLA)
+        #[arg(short = 's', long = "symbol")]
+        symbol: Symbol,
+        /// Number of tokenized shares to donate into the wrapper (must be positive)
+        #[arg(short = 'q', long = "quantity", value_parser = parse_positive_shares)]
+        quantity: Positive<FractionalShares>,
+    },
+
     /// Transfer USDC between trading venues (Raindex <-> Alpaca)
     ///
     /// Requires Alpaca broker and rebalancing environment variables.
@@ -741,6 +756,10 @@ enum SimpleCommand {
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
     },
+    DonateEquity {
+        symbol: Symbol,
+        quantity: Positive<FractionalShares>,
+    },
     AlpacaDeposit {
         amount: Usdc,
     },
@@ -1027,6 +1046,9 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
         Commands::UnwrapEquity { symbol, quantity } => {
             Ok(SimpleCommand::UnwrapEquity { symbol, quantity })
         }
+        Commands::DonateEquity { symbol, quantity } => {
+            Ok(SimpleCommand::DonateEquity { symbol, quantity })
+        }
         Commands::AlpacaDeposit { amount } => Ok(SimpleCommand::AlpacaDeposit { amount }),
         Commands::AlpacaWithdraw { amount, to_address } => {
             Ok(SimpleCommand::AlpacaWithdraw { amount, to_address })
@@ -1216,6 +1238,9 @@ async fn run_simple_command<W: Write>(
         }
         SimpleCommand::UnwrapEquity { symbol, quantity } => {
             wrapper::unwrap_equity_command(stdout, symbol, quantity, ctx).await
+        }
+        SimpleCommand::DonateEquity { symbol, quantity } => {
+            wrapper::donate_equity_command(stdout, symbol, quantity, ctx).await
         }
         SimpleCommand::AlpacaDeposit { amount } => {
             alpaca_wallet::alpaca_deposit_command::<OpenChainErrorRegistry, _>(stdout, amount, ctx)

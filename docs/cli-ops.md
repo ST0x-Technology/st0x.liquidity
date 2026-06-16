@@ -61,6 +61,47 @@ stox alpaca-tokenize -s COIN -q 10 \
   Use the Fireblocks liquidity address
   (`0xbd41F40D91eE4E816Ada1Aa842e94aEb6B6385a6`)
 
+### Applying a Dividend NAV Bump (Donating into the Wrapper)
+
+When a dividend or corporate action revalues an equity, bump the wtStock
+wrapper's NAV by buying the equivalent shares with the dividend cash, tokenizing
+them, and **donating** the tokenized shares into the wrapper. A bare ERC-20
+transfer into the ERC-4626 vault raises its `convertToAssets` ratio without
+minting any wrapped shares -- see [wrapper-nav-bump.md](wrapper-nav-bump.md) for
+why.
+
+Run these against the **dividend turnkey wallet** by passing
+`--config`/`--secrets` explicitly (overriding the server defaults noted at the
+top of this guide), at a config whose `[wallet]` section selects the issuance
+turnkey signer -- so the buy/tokenize/donate are funded and signed by that
+wallet rather than the market-making wallet.
+
+**Step 1: Buy the shares offchain (dividend cash)**
+
+```
+stox buy -s COIN -q 10
+```
+
+**Step 2: Tokenize (mint) to the dividend wallet**
+
+```
+stox alpaca-tokenize -s COIN -q 10 \
+  -t 0x626757e6f50675d17fcad312e82f989ae7a23d38 \
+  -r <dividend turnkey wallet address>
+```
+
+**Step 3: Donate the tokenized shares into the wrapper (the NAV bump)**
+
+```
+stox donate-equity -s COIN -q 10
+```
+
+`donate-equity` looks up the symbol's wrapper (`tokenized_equity_derivative`)
+and its underlying, then transfers the underlying into the wrapper and waits for
+confirmation. No wrapped shares are minted -- every existing wtCOIN holder's
+shares are simply worth more. Use `wrap-equity` instead only when you want to
+_receive_ wrapped shares (a deposit), never for a dividend bump.
+
 ### Selling and Redeeming (Liquidating Tokenized Shares)
 
 Reverse of buying and minting: redeem tokens offchain, then sell the shares.
