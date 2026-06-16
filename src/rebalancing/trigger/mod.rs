@@ -5620,6 +5620,7 @@ mod tests {
                     token: Address::random(),
                     wrapped_amount: actual_wrapped_amount,
                     raindex_withdraw_tx: TxHash::random(),
+                    raindex_withdraw_block: None,
                     withdrawn_at,
                 },
             )

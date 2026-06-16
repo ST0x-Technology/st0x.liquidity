@@ -254,6 +254,10 @@ pub(crate) enum TokenizedEquityMintCommand {
     WrapTokens {
         wrap_tx_hash: TxHash,
         wrapped_shares: U256,
+        /// Block where the wrap tx confirmed. Mandatory on the live command so
+        /// a new `TokensWrapped` event can never skip the node-sync wait before
+        /// deposit. The persisted event keeps `Option<u64>` for legacy replay.
+        wrap_block: u64,
     },
     DepositToVault {
         vault_deposit_tx_hash: TxHash,
@@ -335,6 +339,10 @@ pub(crate) enum TokenizedEquityMintEvent {
         wrap_tx_hash: TxHash,
         wrapped_shares: U256,
         wrapped_at: DateTime<Utc>,
+        /// Block where the wrap tx confirmed; `None` for events emitted before this field was
+        /// added (schema backward-compatibility).
+        #[serde(default)]
+        wrap_block: Option<u64>,
     },
     /// Wrapping failed after tokens were received.
     WrappingFailed {
@@ -477,13 +485,15 @@ impl PartialEq for TokenizedEquityMintEvent {
                     wrap_tx_hash: hash_a,
                     wrapped_shares: shares_a,
                     wrapped_at: time_a,
+                    wrap_block: block_a,
                 },
                 Self::TokensWrapped {
                     wrap_tx_hash: hash_b,
                     wrapped_shares: shares_b,
                     wrapped_at: time_b,
+                    wrap_block: block_b,
                 },
-            ) => hash_a == hash_b && shares_a == shares_b && time_a == time_b,
+            ) => hash_a == hash_b && shares_a == shares_b && time_a == time_b && block_a == block_b,
             (
                 Self::WrappingFailed {
                     symbol: sym_a,
@@ -703,6 +713,9 @@ pub(crate) enum TokenizedEquityMint {
         shares_minted: U256,
         wrap_tx_hash: TxHash,
         wrapped_shares: U256,
+        /// Block where the wrap tx confirmed; `None` for aggregates persisted before this field.
+        #[serde(default)]
+        wrap_block: Option<u64>,
         requested_at: DateTime<Utc>,
         accepted_at: DateTime<Utc>,
         received_at: DateTime<Utc>,
@@ -920,6 +933,7 @@ impl PartialEq for TokenizedEquityMint {
                     shares_minted: mint_a,
                     wrap_tx_hash: wrap_hash_a,
                     wrapped_shares: wrap_shares_a,
+                    wrap_block: wrap_block_a,
                     requested_at: req_a,
                     accepted_at: acc_a,
                     received_at: recv_a,
@@ -935,6 +949,7 @@ impl PartialEq for TokenizedEquityMint {
                     shares_minted: mint_b,
                     wrap_tx_hash: wrap_hash_b,
                     wrapped_shares: wrap_shares_b,
+                    wrap_block: wrap_block_b,
                     requested_at: req_b,
                     accepted_at: acc_b,
                     received_at: recv_b,
@@ -950,6 +965,7 @@ impl PartialEq for TokenizedEquityMint {
                     && mint_a == mint_b
                     && wrap_hash_a == wrap_hash_b
                     && wrap_shares_a == wrap_shares_b
+                    && wrap_block_a == wrap_block_b
                     && req_a == req_b
                     && acc_a == acc_b
                     && recv_a == recv_b
@@ -1485,6 +1501,7 @@ impl EventSourced for TokenizedEquityMint {
                 wrap_tx_hash,
                 wrapped_shares,
                 wrapped_at,
+                wrap_block,
             } => match entity {
                 Self::TokensReceived {
                     symbol,
@@ -1521,6 +1538,7 @@ impl EventSourced for TokenizedEquityMint {
                     shares_minted: *shares_minted,
                     wrap_tx_hash: *wrap_tx_hash,
                     wrapped_shares: *wrapped_shares,
+                    wrap_block: *wrap_block,
                     requested_at: *requested_at,
                     accepted_at: *accepted_at,
                     received_at: *received_at,
@@ -1547,6 +1565,7 @@ impl EventSourced for TokenizedEquityMint {
                     accepted_at,
                     received_at,
                     wrapped_at,
+                    ..
                 } = entity
                 else {
                     return Ok(None);
@@ -1863,12 +1882,14 @@ impl EventSourced for TokenizedEquityMint {
             TokenizedEquityMintCommand::WrapTokens {
                 wrap_tx_hash,
                 wrapped_shares,
+                wrap_block,
             } => match self {
                 Self::TokensReceived { .. } | Self::WrapSubmitted { .. } => {
                     Ok(vec![TokensWrapped {
                         wrap_tx_hash,
                         wrapped_shares,
                         wrapped_at: Utc::now(),
+                        wrap_block: Some(wrap_block),
                     }])
                 }
                 Self::MintRequested { .. } | Self::MintAccepted { .. } => {
@@ -2048,6 +2069,7 @@ mod tests {
             wrap_tx_hash: TxHash::random(),
             wrapped_shares: U256::from(100_000_000_000_000_000_000_u128),
             wrapped_at: Utc::now(),
+            wrap_block: None,
         }
     }
 
@@ -2413,6 +2435,7 @@ mod tests {
             wrap_tx_hash: TxHash::random(),
             wrapped_shares: U256::from(100_000_000_000_000_000_000_u128),
             wrapped_at: Utc::now(),
+            wrap_block: None,
         };
 
         let result = TokenizedEquityMint::evolve(&accepted, &event).unwrap();
@@ -2580,6 +2603,7 @@ mod tests {
                 TokenizedEquityMintCommand::WrapTokens {
                     wrap_tx_hash: TxHash::random(),
                     wrapped_shares: U256::from(10_000_000_000_000_000_000_u128),
+                    wrap_block: 1,
                 },
             )
             .await
@@ -2608,6 +2632,7 @@ mod tests {
                 TokenizedEquityMintCommand::WrapTokens {
                     wrap_tx_hash: TxHash::random(),
                     wrapped_shares: U256::from(10_000_000_000_000_000_000_u128),
+                    wrap_block: 1,
                 },
             )
             .await
@@ -2784,6 +2809,7 @@ mod tests {
             shares_minted: U256::from(10_000_000_000_000_000_000_u128),
             wrap_tx_hash: TxHash::random(),
             wrapped_shares: U256::from(10_000_000_000_000_000_000_u128),
+            wrap_block: None,
             requested_at: now,
             accepted_at: now,
             received_at: now,
@@ -3045,6 +3071,7 @@ mod tests {
                 TokenizedEquityMintCommand::WrapTokens {
                     wrap_tx_hash: TxHash::random(),
                     wrapped_shares: U256::from(100u64),
+                    wrap_block: 1,
                 },
             )
             .await

@@ -32,7 +32,9 @@ use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::EvmError;
 use st0x_execution::{FractionalShares, SharesConversionError, Symbol};
 use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
-use st0x_wrapper::{UnderlyingPerWrapped, Wrapper, WrapperError};
+use st0x_wrapper::{
+    UnderlyingPerWrapped, UnwrapConfirmation, WrapConfirmation, Wrapper, WrapperError,
+};
 
 use super::RebalancingService;
 use super::trigger::RecoveryClaim;
@@ -283,6 +285,10 @@ impl Tokenizer for PanickingTokenizer {
         unimplemented!("PanickingTokenizer: not available in CLI context")
     }
 
+    async fn wait_for_block(&self, _: u64) -> Result<(), EvmError> {
+        unimplemented!("PanickingTokenizer: not available in CLI context")
+    }
+
     async fn send_for_redemption(&self, _: Address, _: U256) -> Result<TxHash, TokenizerError> {
         unimplemented!("PanickingTokenizer: not available in CLI context")
     }
@@ -360,7 +366,7 @@ impl Wrapper for PanickingWrapper {
         unimplemented!("PanickingWrapper: not available in CLI context")
     }
 
-    async fn confirm_wrap(&self, _: Address, _: TxHash) -> Result<U256, WrapperError> {
+    async fn confirm_wrap(&self, _: Address, _: TxHash) -> Result<WrapConfirmation, WrapperError> {
         unimplemented!("PanickingWrapper: not available in CLI context")
     }
 
@@ -374,7 +380,15 @@ impl Wrapper for PanickingWrapper {
         unimplemented!("PanickingWrapper: not available in CLI context")
     }
 
-    async fn confirm_unwrap(&self, _: Address, _: TxHash) -> Result<U256, WrapperError> {
+    async fn confirm_unwrap(
+        &self,
+        _: Address,
+        _: TxHash,
+    ) -> Result<UnwrapConfirmation, WrapperError> {
+        unimplemented!("PanickingWrapper: not available in CLI context")
+    }
+
+    async fn wait_for_block(&self, _: u64) -> Result<(), WrapperError> {
         unimplemented!("PanickingWrapper: not available in CLI context")
     }
 
@@ -514,6 +528,20 @@ pub(crate) enum RedemptionError {
     Rejected,
 }
 
+/// Result of wrapping received mint tokens into ERC-4626 shares.
+///
+/// Returned by [`CrossVenueEquityTransfer::wrap_received_mint`] to give
+/// each element a clear domain name and avoid positional ambiguity in the
+/// `(Address, U256, u64)` tuple it replaces.
+struct WrappedMintResult {
+    /// ERC-4626 derivative token address (the vault).
+    token: Address,
+    /// Number of ERC-4626 shares minted by the wrap.
+    shares: U256,
+    /// Block number in which the wrap transaction was confirmed.
+    block: u64,
+}
+
 /// Orchestrates equity transfers between Raindex and Alpaca.
 ///
 /// Holds CQRS stores for both directions and domain service traits for
@@ -607,17 +635,22 @@ impl CrossVenueEquityTransfer {
     ) -> Result<(), MintError> {
         self.verify_received_mint(&tokens_received).await?;
 
-        let (wrapped_token, wrapped_shares) = self
+        let WrappedMintResult {
+            token,
+            shares,
+            block,
+        } = self
             .wrap_received_mint(issuer_request_id, &tokens_received)
             .await?;
 
-        self.deposit_wrapped_mint(
-            issuer_request_id,
-            &tokens_received.symbol,
-            wrapped_token,
-            wrapped_shares,
-        )
-        .await
+        // Wait for the RPC node to catch up to the block where the wrap tx
+        // confirmed before depositing. Without this, a load-balanced backend
+        // that hasn't indexed the wrap block yet sees the wrapped-token balance
+        // as zero and the vault deposit reverts with ERC20InsufficientBalance.
+        self.wrapper.wait_for_block(block).await?;
+
+        self.deposit_wrapped_mint(issuer_request_id, &tokens_received.symbol, token, shares)
+            .await
     }
 
     async fn deposit_wrapped_mint(
@@ -750,14 +783,14 @@ impl CrossVenueEquityTransfer {
         &self,
         issuer_request_id: &IssuerRequestId,
         tokens_received: &TokensReceivedData,
-    ) -> Result<(Address, U256), MintError> {
+    ) -> Result<WrappedMintResult, MintError> {
         info!(target: "rebalance", "Onchain verification passed, wrapping into ERC-4626 shares");
 
-        let wrapped_token = self.wrapper.lookup_derivative(&tokens_received.symbol)?;
+        let token = self.wrapper.lookup_derivative(&tokens_received.symbol)?;
 
         let wrap_tx_hash = self
             .wrapper
-            .submit_wrap(wrapped_token, tokens_received.shares_minted, self.wallet)
+            .submit_wrap(token, tokens_received.shares_minted, self.wallet)
             .await?;
 
         self.mint_store
@@ -767,23 +800,26 @@ impl CrossVenueEquityTransfer {
             )
             .await?;
 
-        let wrapped_shares = self
-            .wrapper
-            .confirm_wrap(wrapped_token, wrap_tx_hash)
-            .await?;
+        let WrapConfirmation { shares, block } =
+            self.wrapper.confirm_wrap(token, wrap_tx_hash).await?;
 
         self.mint_store
             .send(
                 issuer_request_id,
                 TokenizedEquityMintCommand::WrapTokens {
                     wrap_tx_hash,
-                    wrapped_shares,
+                    wrapped_shares: shares,
+                    wrap_block: block,
                 },
             )
             .await?;
 
-        info!(target: "rebalance", %wrap_tx_hash, %wrapped_shares, "Tokens wrapped, depositing to Raindex vault");
-        Ok((wrapped_token, wrapped_shares))
+        info!(target: "rebalance", %wrap_tx_hash, %shares, "Tokens wrapped, depositing to Raindex vault");
+        Ok(WrappedMintResult {
+            token,
+            shares,
+            block,
+        })
     }
 
     #[allow(clippy::cognitive_complexity)]
@@ -813,7 +849,10 @@ impl CrossVenueEquityTransfer {
                 } => {
                     info!(%issuer_request_id, %wrap_tx_hash, "Resuming submitted wrap");
                     let wrapped_token = self.wrapper.lookup_derivative(&symbol)?;
-                    let wrapped_shares = self
+                    let WrapConfirmation {
+                        shares: wrapped_shares,
+                        block: wrap_block,
+                    } = self
                         .wrapper
                         .confirm_wrap(wrapped_token, wrap_tx_hash)
                         .await?;
@@ -824,9 +863,12 @@ impl CrossVenueEquityTransfer {
                             TokenizedEquityMintCommand::WrapTokens {
                                 wrap_tx_hash,
                                 wrapped_shares,
+                                wrap_block,
                             },
                         )
                         .await?;
+
+                    self.wrapper.wait_for_block(wrap_block).await?;
 
                     info!(target: "rebalance", %wrap_tx_hash, %wrapped_shares, "Wrap confirmed on resume, depositing to Raindex vault");
                     return self
@@ -841,10 +883,16 @@ impl CrossVenueEquityTransfer {
                 TokenizedEquityMint::TokensWrapped {
                     symbol,
                     wrapped_shares,
+                    wrap_block,
                     ..
                 } => {
                     info!(%issuer_request_id, "Resuming wrapped mint");
                     let wrapped_token = self.wrapper.lookup_derivative(&symbol)?;
+
+                    // Skip the wait for legacy aggregates persisted before wrap_block was added.
+                    if let Some(block) = wrap_block {
+                        self.wrapper.wait_for_block(block).await?;
+                    }
 
                     return self
                         .try_deposit_or_recover(
@@ -1636,7 +1684,7 @@ mod tests {
     use crate::tokenization::mock::{
         MockCompletionOutcome, MockDetectionOutcome, MockTokenizer, MockVerificationOutcome,
     };
-    use crate::tokenized_equity_mint::issuer_request_id;
+    use crate::tokenized_equity_mint::{TokenizedEquityMintEvent, issuer_request_id};
     use crate::usdc_rebalance::UsdcRebalance;
     use crate::vault_lookup::MockVaultLookup;
     use crate::vault_registry::VaultRegistry;
@@ -2014,15 +2062,27 @@ mod tests {
         raindex: Arc<dyn Raindex>,
         wrapper: Arc<dyn Wrapper>,
     ) -> CrossVenueEquityTransfer {
+        let (transfer, _pool) = create_equity_transfer_with_pool(tokenizer, raindex, wrapper).await;
+        transfer
+    }
+
+    /// Like [`create_equity_transfer`] but also returns the backing pool, so a
+    /// test can seed legacy events directly (e.g. a `TokensWrapped` event
+    /// persisted before the `wrap_block` field existed).
+    async fn create_equity_transfer_with_pool(
+        tokenizer: Arc<dyn Tokenizer>,
+        raindex: Arc<dyn Raindex>,
+        wrapper: Arc<dyn Wrapper>,
+    ) -> (CrossVenueEquityTransfer, SqlitePool) {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
         let services = mock_services();
 
         let mint_store = Arc::new(test_store(pool.clone(), services.clone()));
-        let redemption_store = Arc::new(test_store(pool, services));
+        let redemption_store = Arc::new(test_store(pool.clone(), services));
         let vault_lookup = mock_vault_lookup();
 
-        CrossVenueEquityTransfer::new(
+        let transfer = CrossVenueEquityTransfer::new(
             raindex,
             Arc::new(vault_lookup),
             tokenizer,
@@ -2030,7 +2090,9 @@ mod tests {
             Address::random(),
             mint_store,
             redemption_store,
-        )
+        );
+
+        (transfer, pool)
     }
 
     #[tokio::test]
@@ -2782,6 +2844,7 @@ mod tests {
                 TokenizedEquityMintCommand::WrapTokens {
                     wrap_tx_hash: wrap_tx,
                     wrapped_shares,
+                    wrap_block: 1,
                 },
             )
             .await
@@ -2889,6 +2952,412 @@ mod tests {
             vault_deposit_tx_hash,
             TxHash::ZERO,
             "Recovered deposit must use TxHash::ZERO sentinel"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_mint_from_tokens_wrapped_calls_wait_for_block_with_wrap_block() {
+        // Keep a typed reference so we can inspect both wait_for_block and
+        // deposit call records after resume. Ordering is verified by confirming
+        // both happened: wait_for_block must be called (the guard) and the
+        // deposit must also succeed (proving the guard did not abort the flow).
+        // Strict sequential ordering (wait_for_block strictly before deposit)
+        // cannot be asserted with the current separate-mock seam — the
+        // existing test `mint_transfer_fails_when_wait_for_block_fails` covers
+        // the abort path, proving the guard is on the critical path.
+        let mock_wrapper: Arc<MockWrapper> = Arc::new(MockWrapper::new());
+        let mock_raindex: Arc<MockRaindex> = Arc::new(MockRaindex::new());
+        let wrap_tx = TxHash::random();
+        let wrap_block = 9999u64;
+
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new()),
+            Arc::clone(&mock_raindex) as Arc<dyn Raindex>,
+            Arc::clone(&mock_wrapper) as Arc<dyn Wrapper>,
+        )
+        .await;
+
+        let id = issuer_request_id("ISS-TOKENS-WRAPPED-WAIT");
+
+        // Advance aggregate to TokensWrapped state manually.
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(10),
+                    wallet: transfer.wallet,
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer
+            .mint_store
+            .send(&id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SubmitWrap {
+                    wrap_tx_hash: wrap_tx,
+                },
+            )
+            .await
+            .unwrap();
+
+        let wrapped_shares = U256::from(10_000_000_000_000_000_000u128);
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::WrapTokens {
+                    wrap_tx_hash: wrap_tx,
+                    wrapped_shares,
+                    wrap_block,
+                },
+            )
+            .await
+            .unwrap();
+
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::TokensWrapped { .. }),
+            "Expected TokensWrapped state before resume, got: {entity:?}"
+        );
+
+        transfer.resume_mint(&id).await.unwrap();
+
+        let calls = mock_wrapper.wait_for_block_calls();
+
+        assert_eq!(
+            calls,
+            vec![wrap_block],
+            "wait_for_block must be called exactly once with wrap_block={wrap_block} on TokensWrapped resume"
+        );
+
+        // Confirm the deposit also ran — proving wait_for_block did not abort
+        // the flow and the guard is on the critical path to deposit.
+        // (strict sequential ordering is covered by the abort test
+        // `resume_mint_from_tokens_wrapped_fails_when_wait_for_block_fails`)
+        assert_eq!(
+            mock_raindex.last_deposited_token(),
+            Some(Address::ZERO),
+            "submit_deposit must have been called with the derivative token after wait_for_block on TokensWrapped resume"
+        );
+    }
+
+    /// Verifies that `resume_mint` from `TokensWrapped` state with `wrap_block:
+    /// None` skips `wait_for_block` entirely (backward-compat path for aggregates
+    /// persisted before the field was added).
+    ///
+    /// If the `if let Some(block) = wrap_block` guard is accidentally removed,
+    /// this test catches it: `wait_for_block` would be called with a sentinel
+    /// value (0 or similar) and the assertion below would fail.
+    #[tokio::test]
+    async fn resume_mint_from_tokens_wrapped_skips_wait_for_block_when_wrap_block_is_none() {
+        let mock_wrapper: Arc<MockWrapper> = Arc::new(MockWrapper::new());
+        let wrap_tx = TxHash::random();
+
+        let (transfer, pool) = create_equity_transfer_with_pool(
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockRaindex::new()),
+            Arc::clone(&mock_wrapper) as Arc<dyn Wrapper>,
+        )
+        .await;
+
+        let id = issuer_request_id("ISS-TOKENS-WRAPPED-NO-BLOCK");
+
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(10),
+                    wallet: transfer.wallet,
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer
+            .mint_store
+            .send(&id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SubmitWrap {
+                    wrap_tx_hash: wrap_tx,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Simulate a legacy aggregate: a `TokensWrapped` event persisted before
+        // the `wrap_block` field existed. The live `WrapTokens` command now
+        // requires `wrap_block`, so the only way to reach a `wrap_block: None`
+        // state is to replay an old event -- seeded here directly with the
+        // field omitted, exercising the `#[serde(default)]` backward-compat path.
+        let wrapped_shares = U256::from(10_000_000_000_000_000_000u128);
+        let legacy_payload = {
+            let mut value = serde_json::to_value(TokenizedEquityMintEvent::TokensWrapped {
+                wrap_tx_hash: wrap_tx,
+                wrapped_shares,
+                wrapped_at: Utc::now(),
+                wrap_block: None,
+            })
+            .unwrap();
+            value["TokensWrapped"]
+                .as_object_mut()
+                .unwrap()
+                .remove("wrap_block");
+            value.to_string()
+        };
+
+        let IssuerRequestId(raw_id) = &id;
+        let next_sequence: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(sequence), -1) + 1 FROM events WHERE aggregate_id = ?",
+        )
+        .bind(raw_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        insert_mint_event(
+            &pool,
+            &id,
+            next_sequence,
+            "TokenizedEquityMintEvent::TokensWrapped",
+            &legacy_payload,
+        )
+        .await;
+
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::TokensWrapped { .. }),
+            "Expected TokensWrapped state before resume, got: {entity:?}"
+        );
+
+        transfer.resume_mint(&id).await.unwrap();
+
+        assert_eq!(
+            mock_wrapper.wait_for_block_calls(),
+            Vec::<u64>::new(),
+            "wait_for_block must NOT be called when wrap_block is None (legacy aggregate)"
+        );
+    }
+
+    /// Verifies that `resume_mint` from `TokensWrapped` state propagates a
+    /// `wait_for_block` failure as `MintError::Wrapper(WrapperError::Evm(..))`,
+    /// and that the deposit does NOT run when `wait_for_block` fails.
+    ///
+    /// This proves that `wait_for_block` is on the critical path before the
+    /// deposit in the `TokensWrapped` resume branch. A refactor that swaps the
+    /// order (deposit first, wait_for_block second) would make this test fail
+    /// while the happy-path test still passes.
+    #[tokio::test]
+    async fn resume_mint_from_tokens_wrapped_fails_when_wait_for_block_fails() {
+        let mock_raindex: Arc<MockRaindex> = Arc::new(MockRaindex::new());
+        let wrap_tx = TxHash::random();
+
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new()),
+            Arc::clone(&mock_raindex) as Arc<dyn Raindex>,
+            Arc::new(MockWrapper::failing_wait_for_block()),
+        )
+        .await;
+
+        let id = issuer_request_id("ISS-TOKENS-WRAPPED-WAIT-FAIL");
+
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(10),
+                    wallet: transfer.wallet,
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer
+            .mint_store
+            .send(&id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SubmitWrap {
+                    wrap_tx_hash: wrap_tx,
+                },
+            )
+            .await
+            .unwrap();
+
+        let wrapped_shares = U256::from(10_000_000_000_000_000_000u128);
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::WrapTokens {
+                    wrap_tx_hash: wrap_tx,
+                    wrapped_shares,
+                    wrap_block: 9999u64,
+                },
+            )
+            .await
+            .unwrap();
+
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::TokensWrapped { .. }),
+            "expected TokensWrapped state before resume, got: {entity:?}"
+        );
+
+        let error = transfer
+            .resume_mint(&id)
+            .await
+            .expect_err("wait_for_block failure must propagate from TokensWrapped resume");
+
+        assert!(
+            matches!(
+                error,
+                MintError::Wrapper(WrapperError::Evm(EvmError::NodeBehindRequiredBlock { .. }))
+            ),
+            "expected MintError::Wrapper wrapping NodeBehindRequiredBlock, got: {error:?}"
+        );
+
+        assert!(
+            mock_raindex.last_deposited_token().is_none(),
+            "deposit must NOT run when wait_for_block fails in TokensWrapped resume"
+        );
+    }
+
+    /// Verifies that `resume_mint` from `WrapSubmitted` state propagates a
+    /// `wait_for_block` failure as `MintError::Wrapper(WrapperError::Evm(..))`.
+    ///
+    /// The `WrapSubmitted` branch calls `wait_for_block` unconditionally (block
+    /// comes from a freshly confirmed tx). A missing `?` or wrong error mapping
+    /// would let the flow silently proceed to deposit against a stale node --
+    /// the exact regression this PR was written to prevent.
+    #[tokio::test]
+    async fn resume_mint_from_wrap_submitted_fails_when_wait_for_block_fails() {
+        let mock_wrapper = MockWrapper::failing_wait_for_block();
+        let wrap_tx = TxHash::random();
+
+        // Pre-seed so confirm_wrap recognises the tx hash stored in WrapSubmitted.
+        mock_wrapper.seed_submitted_amount(wrap_tx, U256::from(10_000_000_000_000_000_000u128));
+
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockRaindex::new()),
+            Arc::new(mock_wrapper),
+        )
+        .await;
+
+        let id = issuer_request_id("ISS-WRAP-SUBMITTED-WAIT-FAIL");
+
+        // Advance to WrapSubmitted: RequestMint -> Poll -> SubmitWrap
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    issuer_request_id: id.clone(),
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(10),
+                    wallet: transfer.wallet,
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer
+            .mint_store
+            .send(&id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+
+        transfer
+            .mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::SubmitWrap {
+                    wrap_tx_hash: wrap_tx,
+                },
+            )
+            .await
+            .unwrap();
+
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::WrapSubmitted { .. }),
+            "expected WrapSubmitted state before resume, got: {entity:?}"
+        );
+
+        let error = transfer
+            .resume_mint(&id)
+            .await
+            .expect_err("wait_for_block failure must propagate from WrapSubmitted resume");
+
+        assert!(
+            matches!(
+                error,
+                MintError::Wrapper(WrapperError::Evm(EvmError::NodeBehindRequiredBlock { .. }))
+            ),
+            "expected MintError::Wrapper wrapping NodeBehindRequiredBlock, got: {error:?}"
+        );
+    }
+
+    /// Verifies that the mint happy-path propagates a `wait_for_block` failure
+    /// as `MintTransferError::PostReceipt(MintError::Wrapper(..))`.
+    ///
+    /// `finalize_received_mint` calls `wait_for_block(wrap_block)` unconditionally
+    /// after wrapping. A missing `?` or wrong error mapping would let the flow
+    /// silently deposit against a stale node.
+    #[tokio::test]
+    async fn mint_transfer_fails_when_wait_for_block_fails() {
+        let transfer = create_equity_transfer(
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::failing_wait_for_block()),
+        )
+        .await;
+
+        let error = transfer
+            .resume_equity_to_market_making(
+                &issuer_request_id("ISS-WAIT-BLOCK-FAIL"),
+                &Symbol::new("AAPL").unwrap(),
+                FractionalShares::new(float!(10.0)),
+            )
+            .await
+            .expect_err("wait_for_block failure must propagate in the mint happy path");
+
+        assert!(
+            matches!(
+                error,
+                MintTransferError::PostReceipt(MintError::Wrapper(WrapperError::Evm(
+                    EvmError::NodeBehindRequiredBlock { .. }
+                )))
+            ),
+            "expected PostReceipt(Wrapper(NodeBehindRequiredBlock)), got: {error:?}"
         );
     }
 }

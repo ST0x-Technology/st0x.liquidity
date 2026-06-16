@@ -35,6 +35,11 @@ pub(crate) enum ConfirmTxBehavior {
     Succeed,
     Fail,
     Retryable,
+    /// Returns a successful receipt but with `block_number: None`.
+    /// Simulates the conformant-but-rare RPC edge case where a receipt
+    /// is returned without a block number (e.g. a pending or uncle-block
+    /// receipt from a load-balanced RPC).
+    SucceedWithoutBlockNumber,
 }
 
 /// Arguments captured from the last `submit_deposit` call.
@@ -245,6 +250,21 @@ impl Raindex for MockRaindex {
             }
             ConfirmTxBehavior::Retryable => {
                 return Err(RaindexError::ScanInconclusive { from_block: 0 });
+            }
+            ConfirmTxBehavior::SucceedWithoutBlockNumber => {
+                let logs = self
+                    .withdraw_transfer
+                    .lock()
+                    .unwrap()
+                    .map(|WithdrawCall { token, amount }| {
+                        let amount = self.withdraw_actual_amount.unwrap_or(amount);
+                        vec![transfer_log(token, Address::ZERO, amount)]
+                    })
+                    .unwrap_or_default();
+
+                let mut receipt = successful_receipt(tx_hash, logs);
+                receipt.block_number = None;
+                return Ok(receipt);
             }
             ConfirmTxBehavior::Succeed => {}
         }

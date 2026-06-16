@@ -6635,6 +6635,7 @@ dependencies = [
  "alloy-primitives",
  "async-trait",
  "rain-math-float",
+ "serde_json",
  "st0x-evm",
  "st0x-execution",
  "st0x-float-macro",

@@ -47,7 +47,7 @@ use uuid::Uuid;
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_raindex::Raindex;
-use st0x_wrapper::{Wrapper, WrapperError};
+use st0x_wrapper::{WrapConfirmation, Wrapper, WrapperError, node_sync_attempts};
 
 use crate::equity_redemption::RedemptionAggregateId;
 use crate::rebalancing::equity::CrossVenueEquityTransfer;
@@ -86,9 +86,11 @@ pub(crate) struct UnwrappedEquityRecoveryServices {
 }
 
 /// Domain errors returned from the aggregate's `initialize`/`transition`
-/// handlers. Service failures (raindex/wrapper/transfer) do NOT flow through
-/// this enum -- they are recorded as `RecoveryFailed` events instead, so
-/// failures remain first-class entries in the audit trail.
+/// handlers. Terminal service failures (raindex/wrapper/transfer) are recorded
+/// as `RecoveryFailed` events so failures remain first-class entries in the
+/// audit trail. Retryable service failures that should leave the aggregate
+/// in-place instead surface as errors through this enum (e.g. `NodeSyncFailed`
+/// and the `Retryable*Confirmation` variants).
 #[derive(Debug, Clone, Serialize, Deserialize, Error, PartialEq, Eq)]
 pub(crate) enum UnwrappedEquityRecoveryError {
     #[error("recovery already initialized")]
@@ -108,6 +110,8 @@ pub(crate) enum UnwrappedEquityRecoveryError {
 
     #[error("deposit confirmation for tx {vault_deposit_tx_hash} is retryable")]
     RetryableDepositConfirmation { vault_deposit_tx_hash: TxHash },
+    #[error("RPC node did not catch up to wrap block {required_block} after {attempts} polls")]
+    NodeSyncFailed { required_block: u64, attempts: u32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -185,6 +189,10 @@ pub(crate) enum UnwrappedEquityRecoveryEvent {
         wrap_tx_hash: TxHash,
         wrapped_amount: U256,
         confirmed_at: DateTime<Utc>,
+        /// Block where the wrap tx confirmed; `None` for events emitted before this field was
+        /// added (schema backward-compatibility).
+        #[serde(default)]
+        wrap_block: Option<u64>,
     },
 
     OrphanDepositSubmitted {
@@ -267,6 +275,9 @@ pub(crate) enum UnwrappedEquityRecovery {
         wrap_submitted_at: DateTime<Utc>,
         wrapped_amount: U256,
         wrap_confirmed_at: DateTime<Utc>,
+        /// Block where the wrap tx confirmed; `None` for aggregates persisted before this field.
+        #[serde(default)]
+        wrap_block: Option<u64>,
     },
 
     OrphanDepositSubmitted {
@@ -410,6 +421,7 @@ impl EventSourced for UnwrappedEquityRecovery {
                     wrap_tx_hash: confirm_wrap_tx_hash,
                     wrapped_amount,
                     confirmed_at,
+                    wrap_block,
                 },
             ) if wrap_tx_hash == confirm_wrap_tx_hash => Some(Self::OrphanWrapped {
                 symbol: symbol.clone(),
@@ -419,6 +431,7 @@ impl EventSourced for UnwrappedEquityRecovery {
                 wrap_submitted_at: *wrap_submitted_at,
                 wrapped_amount: *wrapped_amount,
                 wrap_confirmed_at: *confirmed_at,
+                wrap_block: *wrap_block,
             }),
 
             (
@@ -542,10 +555,27 @@ impl EventSourced for UnwrappedEquityRecovery {
                 Self::OrphanWrapped {
                     symbol,
                     wrapped_amount,
+                    wrap_block,
                     ..
                 },
                 SubmitOrphanDeposit,
-            ) => submit_orphan_deposit_or_fail(services, symbol, *wrapped_amount).await,
+            ) => {
+                // Skip the wait for legacy aggregates persisted before wrap_block was added.
+                if let Some(block) = wrap_block {
+                    services
+                        .wrapper
+                        .wait_for_block(*block)
+                        .await
+                        .inspect_err(|error| {
+                            warn!(target: "rebalance", %symbol, ?error, "Unwrapped equity recovery: wait_for_block failed");
+                        })
+                        .map_err(|error| UnwrappedEquityRecoveryError::NodeSyncFailed {
+                            required_block: *block,
+                            attempts: node_sync_attempts(&error),
+                        })?;
+                }
+                submit_orphan_deposit_or_fail(services, symbol, *wrapped_amount).await
+            }
 
             (
                 Self::OrphanDepositSubmitted {
@@ -687,12 +717,16 @@ async fn confirm_orphan_wrap_or_fail(
         .confirm_wrap(wrapped_token, wrap_tx_hash)
         .await
     {
-        Ok(wrapped_amount) => {
+        Ok(WrapConfirmation {
+            shares: wrapped_amount,
+            block: wrap_block,
+        }) => {
             info!(target: "rebalance", %symbol, %wrap_tx_hash, %wrapped_amount, "Unwrapped equity recovery: confirm_wrap succeeded");
             Ok(vec![UnwrappedEquityRecoveryEvent::OrphanWrapped {
                 wrap_tx_hash,
                 wrapped_amount,
                 confirmed_at: Utc::now(),
+                wrap_block: Some(wrap_block),
             }])
         }
         Err(error) => {
@@ -812,6 +846,7 @@ mod tests {
     use rain_math_float::Float;
 
     use st0x_event_sorcery::EventSourced;
+    use st0x_evm::NODE_SYNC_MAX_ATTEMPTS;
     use st0x_execution::{FractionalShares, Symbol};
     use st0x_raindex::RaindexVaultId;
     use st0x_wrapper::MockWrapper;
@@ -864,6 +899,7 @@ mod tests {
             wrap_submitted_at: Utc::now(),
             wrapped_amount: U256::from(123u64),
             wrap_confirmed_at: Utc::now(),
+            wrap_block: None,
         }
     }
 
@@ -976,6 +1012,7 @@ mod tests {
                 wrap_tx_hash: FAKE_WRAP_TX,
                 wrapped_amount,
                 confirmed_at: wrapped_at,
+                wrap_block: None,
             },
         )
         .unwrap()
@@ -1567,6 +1604,7 @@ mod tests {
             wrap_tx_hash: OTHER_TX,
             wrapped_amount: U256::from(1u64),
             confirmed_at: Utc::now(),
+            wrap_block: None,
         };
         let error = UnwrappedEquityRecovery::evolve(&submitted, &mismatched).unwrap_err();
         assert!(matches!(
@@ -1602,5 +1640,134 @@ mod tests {
         let id = UnwrappedEquityRecoveryId(Uuid::new_v4());
         let parsed = id.to_string().parse::<UnwrappedEquityRecoveryId>().unwrap();
         assert_eq!(id, parsed);
+    }
+
+    #[tokio::test]
+    async fn submit_orphan_deposit_with_wrap_block_calls_wait_for_block() {
+        let raindex = Arc::new(MockRaindex::new());
+        let mock_wrapper = Arc::new(MockWrapper::new().with_wrapped_token(Address::random()));
+        let services = services_with(
+            raindex.clone(),
+            Arc::clone(&mock_wrapper) as Arc<dyn Wrapper>,
+        )
+        .await;
+
+        let state = UnwrappedEquityRecovery::OrphanWrapped {
+            symbol: aapl(),
+            shares: one_share(),
+            detected_at: Utc::now(),
+            wrap_tx_hash: FAKE_WRAP_TX,
+            wrap_submitted_at: Utc::now(),
+            wrapped_amount: U256::from(123u64),
+            wrap_confirmed_at: Utc::now(),
+            wrap_block: Some(9999),
+        };
+
+        let events = state
+            .transition(
+                UnwrappedEquityRecoveryCommand::SubmitOrphanDeposit,
+                &services,
+            )
+            .await
+            .expect("SubmitOrphanDeposit with wrap_block=Some(9999) should succeed");
+
+        let [UnwrappedEquityRecoveryEvent::OrphanDepositSubmitted { .. }] = events.as_slice()
+        else {
+            panic!("expected OrphanDepositSubmitted, got {events:?}");
+        };
+
+        assert_eq!(
+            mock_wrapper.wait_for_block_calls(),
+            vec![9999u64],
+            "wait_for_block must be called exactly once with wrap_block=9999"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_orphan_deposit_propagates_err_when_wait_for_block_fails() {
+        let services = services_with(
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::failing_wait_for_block()),
+        )
+        .await;
+
+        let state = UnwrappedEquityRecovery::OrphanWrapped {
+            symbol: aapl(),
+            shares: one_share(),
+            detected_at: Utc::now(),
+            wrap_tx_hash: FAKE_WRAP_TX,
+            wrap_submitted_at: Utc::now(),
+            wrapped_amount: U256::from(123u64),
+            wrap_confirmed_at: Utc::now(),
+            wrap_block: Some(9999),
+        };
+
+        let error = state
+            .transition(
+                UnwrappedEquityRecoveryCommand::SubmitOrphanDeposit,
+                &services,
+            )
+            .await
+            .expect_err("wait_for_block failure must propagate as retryable Err");
+
+        assert!(
+            matches!(
+                error,
+                UnwrappedEquityRecoveryError::NodeSyncFailed {
+                    required_block: 9999,
+                    ..
+                }
+            ),
+            "wait_for_block failure must surface as NodeSyncFailed, got: {error:?}"
+        );
+    }
+
+    /// Verifies that the `_ => NODE_SYNC_MAX_ATTEMPTS` fallback arm in the
+    /// `SubmitOrphanDeposit` error-mapping closure is exercised when
+    /// `wait_for_block` fails with a transport error (as opposed to the
+    /// `NodeBehindRequiredBlock` arm covered by
+    /// `submit_orphan_deposit_propagates_err_when_wait_for_block_fails`).
+    ///
+    /// A transport error means every poll failed before any block number was
+    /// observed, so the budget was fully consumed; the fallback must still
+    /// produce `NodeSyncFailed` with `attempts == NODE_SYNC_MAX_ATTEMPTS`.
+    #[tokio::test]
+    async fn submit_orphan_deposit_propagates_err_when_wait_for_block_fails_with_transport_error() {
+        let services = services_with(
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::failing_wait_for_block_transport_error()),
+        )
+        .await;
+
+        let state = UnwrappedEquityRecovery::OrphanWrapped {
+            symbol: aapl(),
+            shares: one_share(),
+            detected_at: Utc::now(),
+            wrap_tx_hash: FAKE_WRAP_TX,
+            wrap_submitted_at: Utc::now(),
+            wrapped_amount: U256::from(123u64),
+            wrap_confirmed_at: Utc::now(),
+            wrap_block: Some(9999),
+        };
+
+        let error = state
+            .transition(
+                UnwrappedEquityRecoveryCommand::SubmitOrphanDeposit,
+                &services,
+            )
+            .await
+            .expect_err("transport error from wait_for_block must propagate as retryable Err");
+
+        assert!(
+            matches!(
+                error,
+                UnwrappedEquityRecoveryError::NodeSyncFailed {
+                    required_block: 9999,
+                    attempts: NODE_SYNC_MAX_ATTEMPTS,
+                }
+            ),
+            "transport error must map to NodeSyncFailed with attempts=NODE_SYNC_MAX_ATTEMPTS, \
+             got: {error:?}"
+        );
     }
 }

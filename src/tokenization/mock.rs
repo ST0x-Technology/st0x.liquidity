@@ -6,6 +6,7 @@ use rain_math_float::Float;
 use reqwest::StatusCode;
 use std::sync::Mutex;
 
+use st0x_evm::{EvmError, NODE_SYNC_MAX_ATTEMPTS};
 use st0x_execution::{FractionalShares, Symbol};
 
 use super::{
@@ -74,6 +75,14 @@ enum MockSendOutcome {
     ApiError,
 }
 
+/// Configurable outcome for `wait_for_block`.
+#[derive(Clone, Copy)]
+enum MockWaitForBlockOutcome {
+    Succeed,
+    /// Fail with `NodeBehindRequiredBlock` (budget exhausted while behind).
+    NodeBehind,
+}
+
 /// Configurable outcome for `list_pending_requests`.
 #[derive(Clone, Copy)]
 enum MockListPendingOutcome {
@@ -90,6 +99,8 @@ pub(crate) struct MockTokenizer {
     completion_outcome: Option<MockCompletionOutcome>,
     verification_outcome: MockVerificationOutcome,
     send_outcome: MockSendOutcome,
+    wait_for_block_outcome: MockWaitForBlockOutcome,
+    wait_for_block_calls: Mutex<Vec<u64>>,
     list_pending_outcome: MockListPendingOutcome,
     last_issuer_request_id: Mutex<Option<IssuerRequestId>>,
     pending_requests: Vec<TokenizationRequest>,
@@ -110,6 +121,8 @@ impl MockTokenizer {
             completion_outcome: None,
             verification_outcome: MockVerificationOutcome::Success,
             send_outcome: MockSendOutcome::Succeed,
+            wait_for_block_outcome: MockWaitForBlockOutcome::Succeed,
+            wait_for_block_calls: Mutex::new(Vec::new()),
             list_pending_outcome: MockListPendingOutcome::Succeed,
             last_issuer_request_id: Mutex::new(None),
             token_symbol_behavior: MockTokenSymbolBehavior::Default,
@@ -146,6 +159,18 @@ impl MockTokenizer {
     pub(crate) fn with_send_failure(mut self) -> Self {
         self.send_outcome = MockSendOutcome::ApiError;
         self
+    }
+
+    /// Makes `wait_for_block` fail with `NodeBehindRequiredBlock` (budget
+    /// exhausted while the node stayed behind the required block).
+    pub(crate) fn failing_wait_for_block(mut self) -> Self {
+        self.wait_for_block_outcome = MockWaitForBlockOutcome::NodeBehind;
+        self
+    }
+
+    /// Returns the block numbers passed to `wait_for_block`, in call order.
+    pub(crate) fn wait_for_block_calls(&self) -> Vec<u64> {
+        self.wait_for_block_calls.lock().unwrap().clone()
     }
 
     pub(crate) fn with_list_pending_failure(mut self) -> Self {
@@ -258,6 +283,19 @@ impl Tokenizer for MockTokenizer {
 
     fn redemption_wallet(&self) -> Option<Address> {
         self.redemption_wallet
+    }
+
+    async fn wait_for_block(&self, block: u64) -> Result<(), EvmError> {
+        self.wait_for_block_calls.lock().unwrap().push(block);
+
+        match self.wait_for_block_outcome {
+            MockWaitForBlockOutcome::Succeed => Ok(()),
+            MockWaitForBlockOutcome::NodeBehind => Err(EvmError::NodeBehindRequiredBlock {
+                observed_tip: 0,
+                required_block: block,
+                attempts: NODE_SYNC_MAX_ATTEMPTS,
+            }),
+        }
     }
 
     async fn send_for_redemption(

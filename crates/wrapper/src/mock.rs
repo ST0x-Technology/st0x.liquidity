@@ -6,10 +6,12 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 
-use st0x_evm::EvmError;
+use st0x_evm::{EvmError, NODE_SYNC_MAX_ATTEMPTS};
 use st0x_execution::Symbol;
 
-use crate::{RATIO_ONE, UnderlyingPerWrapped, Wrapper, WrapperError};
+use crate::{
+    RATIO_ONE, UnderlyingPerWrapped, UnwrapConfirmation, WrapConfirmation, Wrapper, WrapperError,
+};
 
 /// Which operation the mock should simulate failing.
 #[derive(Default, PartialEq, Eq)]
@@ -22,6 +24,12 @@ enum MockFailure {
     Unwrap,
     Lookup,
     DerivativeLookup,
+    /// Fails `wait_for_block` with `NodeBehindRequiredBlock` (budget exhausted).
+    WaitForBlock,
+    /// Fails `wait_for_block` with a transport error (all polls failed before
+    /// any block number was observed). Tests the `_ => NODE_SYNC_MAX_ATTEMPTS`
+    /// fallback arm in error-mapping closures.
+    WaitForBlockTransportError,
 }
 
 /// Mock wrapper for testing that returns predictable values.
@@ -34,6 +42,8 @@ pub struct MockWrapper {
     failure: MockFailure,
     /// Maps tx hashes to their submitted amounts for confirm methods.
     submitted_amounts: Mutex<HashMap<TxHash, U256>>,
+    /// Blocks passed to `wait_for_block` calls, in order.
+    wait_for_block_calls: Mutex<Vec<u64>>,
 }
 
 impl MockWrapper {
@@ -46,6 +56,7 @@ impl MockWrapper {
             ratio: RATIO_ONE,
             failure: MockFailure::None,
             submitted_amounts: Mutex::new(HashMap::new()),
+            wait_for_block_calls: Mutex::new(Vec::new()),
         }
     }
 
@@ -59,6 +70,7 @@ impl MockWrapper {
             ratio,
             failure: MockFailure::None,
             submitted_amounts: Mutex::new(HashMap::new()),
+            wait_for_block_calls: Mutex::new(Vec::new()),
         }
     }
 
@@ -123,6 +135,25 @@ impl MockWrapper {
         mock
     }
 
+    /// Creates a mock wrapper that fails `wait_for_block` with a
+    /// `NodeBehindRequiredBlock` error (budget exhausted, at least one poll
+    /// succeeded but always returned a stale tip).
+    pub fn failing_wait_for_block() -> Self {
+        let mut mock = Self::new();
+        mock.failure = MockFailure::WaitForBlock;
+        mock
+    }
+
+    /// Creates a mock wrapper that fails `wait_for_block` with a transport
+    /// error (simulating all polls failing before any block number was observed).
+    /// Used to test the `_ => NODE_SYNC_MAX_ATTEMPTS` fallback arm in
+    /// error-mapping closures.
+    pub fn failing_wait_for_block_transport_error() -> Self {
+        let mut mock = Self::new();
+        mock.failure = MockFailure::WaitForBlockTransportError;
+        mock
+    }
+
     /// Pre-seeds a tx hash into `submitted_amounts` so that `confirm_wrap`
     /// recognises it. Used by tests that manually advance the aggregate to
     /// `WrapSubmitted` without going through `submit_wrap`.
@@ -131,6 +162,14 @@ impl MockWrapper {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(tx_hash, amount);
+    }
+
+    /// Returns a snapshot of the block numbers passed to `wait_for_block`, in call order.
+    pub fn wait_for_block_calls(&self) -> Vec<u64> {
+        self.wait_for_block_calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -211,7 +250,7 @@ impl Wrapper for MockWrapper {
         &self,
         _wrapped_token: Address,
         tx_hash: TxHash,
-    ) -> Result<U256, WrapperError> {
+    ) -> Result<WrapConfirmation, WrapperError> {
         if self.failure == MockFailure::ConfirmWrap {
             return Err(WrapperError::MissingDepositEvent);
         }
@@ -225,12 +264,16 @@ impl Wrapper for MockWrapper {
             ))));
         }
 
-        // 1:1 ratio — return the amount that was submitted for this tx
-        self.submitted_amounts
+        // 1:1 ratio — return the amount that was submitted for this tx.
+        // Block number is 0 in the mock (no real chain).
+        let shares = self
+            .submitted_amounts
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&tx_hash)
-            .ok_or(WrapperError::MissingDepositEvent)
+            .ok_or(WrapperError::MissingDepositEvent)?;
+
+        Ok(WrapConfirmation { shares, block: 0 })
     }
 
     async fn submit_unwrap(
@@ -254,13 +297,39 @@ impl Wrapper for MockWrapper {
         &self,
         _wrapped_token: Address,
         tx_hash: TxHash,
-    ) -> Result<U256, WrapperError> {
-        // 1:1 ratio — return the amount that was submitted for this tx
-        self.submitted_amounts
+    ) -> Result<UnwrapConfirmation, WrapperError> {
+        // 1:1 ratio — return the amount that was submitted for this tx.
+        // Block number is 0 in the mock (no real chain).
+        let assets = self
+            .submitted_amounts
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&tx_hash)
-            .ok_or(WrapperError::MissingWithdrawEvent)
+            .ok_or(WrapperError::MissingWithdrawEvent)?;
+
+        Ok(UnwrapConfirmation { assets, block: 0 })
+    }
+
+    async fn wait_for_block(&self, block: u64) -> Result<(), WrapperError> {
+        self.wait_for_block_calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(block);
+        if self.failure == MockFailure::WaitForBlock {
+            return Err(WrapperError::Evm(EvmError::NodeBehindRequiredBlock {
+                observed_tip: 0,
+                required_block: block,
+                attempts: NODE_SYNC_MAX_ATTEMPTS,
+            }));
+        }
+
+        if self.failure == MockFailure::WaitForBlockTransportError {
+            return Err(WrapperError::Evm(EvmError::Transport(
+                alloy::transports::RpcError::NullResp,
+            )));
+        }
+
+        Ok(())
     }
 
     fn owner(&self) -> Address {

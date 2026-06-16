@@ -12,7 +12,7 @@ use alloy::contract::Error as ContractError;
 use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
 
-use st0x_evm::EvmError;
+use st0x_evm::{EvmError, NODE_SYNC_MAX_ATTEMPTS};
 use st0x_execution::Symbol;
 
 mod ratio;
@@ -30,6 +30,34 @@ pub use service::WrapperService;
 
 #[cfg(feature = "mock")]
 pub use mock::MockWrapper;
+
+/// Result returned by [`Wrapper::confirm_wrap`]: the shares minted and the block
+/// in which the deposit transaction was included.
+///
+/// The block number is returned so callers can pass it to
+/// [`Wrapper::wait_for_block`] before submitting any dependent on-chain write
+/// that reads the wrapped token balance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WrapConfirmation {
+    /// Actual ERC-4626 shares minted by the deposit.
+    pub shares: U256,
+    /// Block number of the confirmed deposit transaction.
+    pub block: u64,
+}
+
+/// Result returned by [`Wrapper::confirm_unwrap`]: the underlying amount
+/// received and the block in which the redeem transaction was included.
+///
+/// The block number is returned so callers can pass it to
+/// [`Wrapper::wait_for_block`] before submitting any dependent on-chain write
+/// that reads the unwrapped balance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnwrapConfirmation {
+    /// Actual underlying tokens returned by the redeem.
+    pub assets: U256,
+    /// Block number of the confirmed redeem transaction.
+    pub block: u64,
+}
 
 /// The underlying and derivative (ERC-4626 vault) token addresses for a wrappable
 /// equity symbol.
@@ -76,6 +104,43 @@ pub enum WrapperError {
     Contract(#[from] ContractError),
     #[error("Ratio error: {0}")]
     Ratio(#[from] RatioError),
+    #[error("transaction receipt for tx {tx_hash} is missing a block number")]
+    MissingBlockNumber { tx_hash: TxHash },
+}
+
+/// Extracts the number of polling attempts from a `WrapperError` returned by
+/// `Wrapper::wait_for_block`.
+///
+/// Returns the actual attempt count when the error is
+/// `WrapperError::Evm(NodeBehindRequiredBlock { attempts, .. })` — the node
+/// polled that many times and never caught up. Falls back to
+/// [`NODE_SYNC_MAX_ATTEMPTS`] for any other error variant (e.g. a transport
+/// error where every poll failed before any block number was observed, consuming
+/// the full budget without ever recording a successful tip).
+///
+/// Both error paths indicate the full polling budget was consumed; the
+/// difference is only in what diagnostic information is available. Callers use
+/// the extracted attempt count to populate their own `NodeSyncFailed` error
+/// variant.
+pub fn node_sync_attempts(error: &WrapperError) -> u32 {
+    match error {
+        WrapperError::Evm(EvmError::NodeBehindRequiredBlock { attempts, .. }) => *attempts,
+        // All other Evm sub-variants signal full budget consumption with no
+        // recorded attempt count, so fall back to the maximum. The inner
+        // EvmError match uses a wildcard here because EvmError has feature-gated
+        // variants (turnkey, local-signer) that cannot be enumerated from this
+        // crate without mirroring all their cfg gates. The outer WrapperError
+        // match is exhaustive, which is where new variants are most likely to
+        // carry a meaningful attempt count.
+        WrapperError::Evm(_)
+        | WrapperError::SymbolNotConfigured(_)
+        | WrapperError::MissingDepositEvent
+        | WrapperError::MissingWithdrawEvent
+        | WrapperError::RedeemExceedsMax { .. }
+        | WrapperError::Contract(_)
+        | WrapperError::Ratio(_)
+        | WrapperError::MissingBlockNumber { .. } => NODE_SYNC_MAX_ATTEMPTS,
+    }
 }
 
 /// Trait for wrapping and unwrapping tokens via ERC-4626 vaults.
@@ -131,13 +196,18 @@ pub trait Wrapper: Send + Sync {
         receiver: Address,
     ) -> Result<TxHash, WrapperError>;
 
-    /// Wait for a previously submitted wrap transaction to confirm
-    /// and extract the shares minted from the receipt.
+    /// Wait for a previously submitted wrap transaction to confirm,
+    /// extract the shares minted from the receipt, and return the
+    /// confirmation block number alongside the shares.
+    ///
+    /// The block number is returned so callers can pass it to
+    /// [`Wrapper::wait_for_block`] before submitting any dependent
+    /// on-chain write that reads the wrapped token balance.
     async fn confirm_wrap(
         &self,
         wrapped_token: Address,
         tx_hash: TxHash,
-    ) -> Result<U256, WrapperError>;
+    ) -> Result<WrapConfirmation, WrapperError>;
 
     /// Submit an ERC-4626 redeem without waiting for confirmation.
     ///
@@ -160,13 +230,32 @@ pub trait Wrapper: Send + Sync {
         owner: Address,
     ) -> Result<TxHash, WrapperError>;
 
-    /// Wait for a previously submitted unwrap transaction to confirm
-    /// and extract the underlying amount received from the receipt.
+    /// Wait for a previously submitted unwrap transaction to confirm and
+    /// extract the underlying amount received and the block it confirmed in.
+    ///
+    /// The block number is returned alongside the amount so callers can pass
+    /// it to [`Wrapper::wait_for_block`] before submitting any dependent
+    /// on-chain write that reads the unwrapped balance.
     async fn confirm_unwrap(
         &self,
         wrapped_token: Address,
         tx_hash: TxHash,
-    ) -> Result<U256, WrapperError>;
+    ) -> Result<UnwrapConfirmation, WrapperError>;
+
+    /// Block until the RPC node's tip is at least `block`.
+    ///
+    /// Load-balanced RPCs may route the next request to a backend that has
+    /// not yet indexed the block produced by a just-confirmed transaction.
+    /// Call this with the block number returned by [`confirm_unwrap`] before
+    /// submitting any dependent on-chain write that reads the unwrapped
+    /// token balance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WrapperError::Evm`] wrapping
+    /// [`st0x_evm::EvmError::NodeBehindRequiredBlock`] if the node never
+    /// catches up within the retry budget.
+    async fn wait_for_block(&self, block: u64) -> Result<(), WrapperError>;
 
     /// Returns the market maker wallet address that owns the wrapped tokens.
     fn owner(&self) -> Address;

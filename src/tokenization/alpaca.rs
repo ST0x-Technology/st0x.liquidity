@@ -37,7 +37,10 @@ use thiserror::Error;
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, error, info, trace, warn};
 
-use st0x_evm::{EvmError, IntoErrorRegistry, OpenChainErrorRegistry, Wallet};
+use st0x_evm::{
+    EvmError, IntoErrorRegistry, NODE_SYNC_MAX_ATTEMPTS, NODE_SYNC_POLL_INTERVAL,
+    OpenChainErrorRegistry, Wallet, wait_for_node_sync,
+};
 use st0x_execution::{AlpacaAccountId, FractionalShares, Symbol};
 
 use super::{MintVerificationError, Tokenizer, TokenizerError};
@@ -128,6 +131,12 @@ impl<W: Wallet> AlpacaTokenizationService<W> {
         self.client
             .send_tokens_for_redemption::<Registry>(token, amount)
             .await
+    }
+
+    /// Wait for the redemption provider's RPC node to reach `block` before the
+    /// redemption transfer, polling the same provider the transfer uses.
+    pub(crate) async fn wait_for_block(&self, block: u64) -> Result<(), EvmError> {
+        self.client.wait_for_block(block).await
     }
 
     /// Poll until Alpaca detects a redemption transfer.
@@ -669,6 +678,19 @@ impl<W: Wallet> AlpacaTokenizationClient<W> {
         Ok(receipt.transaction_hash)
     }
 
+    /// Wait for this client's RPC node to reach `block` before a dependent
+    /// write, polling the wallet's own provider so the gate applies to the
+    /// node that performs the transfer.
+    async fn wait_for_block(&self, block: u64) -> Result<(), EvmError> {
+        wait_for_node_sync(
+            self.wallet.provider(),
+            block,
+            NODE_SYNC_POLL_INTERVAL,
+            NODE_SYNC_MAX_ATTEMPTS,
+        )
+        .await
+    }
+
     /// Find a redemption request by its onchain transaction hash.
     ///
     /// This polls the Alpaca API to check if they have detected a token transfer
@@ -923,6 +945,10 @@ impl<W: Wallet> Tokenizer for AlpacaTokenizationService<W> {
 
     fn redemption_wallet(&self) -> Option<Address> {
         Self::redemption_wallet(self)
+    }
+
+    async fn wait_for_block(&self, block: u64) -> Result<(), EvmError> {
+        Self::wait_for_block(self, block).await
     }
 
     async fn send_for_redemption(
@@ -1520,6 +1546,35 @@ pub(crate) mod tests {
             balance, transfer_amount,
             "redemption wallet should have received tokens"
         );
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_block_succeeds_when_node_already_at_block() {
+        let (_anvil, endpoint, key) = setup_anvil();
+        let wallet = RawPrivateKeyWallet::new(
+            &key,
+            ProviderBuilder::new().connect(&endpoint).await.unwrap(),
+            1,
+        )
+        .unwrap();
+
+        // The wait polls the wallet's own provider, so a block it already
+        // reports must clear the gate on the first poll.
+        let current_block = wallet.signing_provider().get_block_number().await.unwrap();
+
+        let client = AlpacaTokenizationClient::new(
+            "http://unused.invalid".to_string(),
+            TEST_ACCOUNT_ID,
+            "test_api_key".to_string(),
+            "test_api_secret".to_string(),
+            wallet,
+            Some(TEST_REDEMPTION_WALLET),
+        );
+
+        client
+            .wait_for_block(current_block)
+            .await
+            .expect("wait_for_block must succeed when the node is already at the block");
     }
 
     #[tokio::test]

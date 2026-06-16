@@ -288,7 +288,7 @@ mod tests {
 
     use st0x_evm::Evm;
     use st0x_evm::local::RawPrivateKeyWallet;
-    use st0x_wrapper::{UnderlyingPerWrapped, WrappedEquity};
+    use st0x_wrapper::{UnderlyingPerWrapped, UnwrapConfirmation, WrapConfirmation, WrappedEquity};
 
     use super::*;
     use crate::bindings::TestERC20;
@@ -359,7 +359,7 @@ mod tests {
             &self,
             _wrapped_token: Address,
             _tx_hash: TxHash,
-        ) -> Result<U256, WrapperError> {
+        ) -> Result<WrapConfirmation, WrapperError> {
             unimplemented!("confirm_wrap not used by approval target building")
         }
 
@@ -377,8 +377,12 @@ mod tests {
             &self,
             _wrapped_token: Address,
             _tx_hash: TxHash,
-        ) -> Result<U256, WrapperError> {
+        ) -> Result<UnwrapConfirmation, WrapperError> {
             unimplemented!("confirm_unwrap not used by approval target building")
+        }
+
+        async fn wait_for_block(&self, _block: u64) -> Result<(), WrapperError> {
+            unimplemented!("wait_for_block not used by approval target building")
         }
 
         fn owner(&self) -> Address {
