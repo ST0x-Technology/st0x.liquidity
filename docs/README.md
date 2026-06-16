@@ -61,3 +61,4 @@ changes the behavior. If you delete a feature, delete or revise the doc.
 | [observability.md](observability.md)               | Tracing, metrics, logging conventions                                      |
 | [sqlx.md](sqlx.md)                                 | sqlx usage notes and pitfalls                                              |
 | [ttdd.md](ttdd.md)                                 | Type-driven TDD workflow                                                   |
+| [wrapper-nav-bump.md](wrapper-nav-bump.md)         | How the wtStock ERC-4626 wrapper NAV is bumped (bare ERC-20 transfer)      |
