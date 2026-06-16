@@ -193,6 +193,7 @@ export default defineConfig({
           '/logs': backendProxy(),
           '/health': backendProxy(),
           '/orders': backendProxy(),
+          '/performance': backendProxy(),
           '/trades': backendProxy(),
           '/transfers': backendProxy(),
           '/performance': backendProxy(),
