@@ -665,6 +665,7 @@ mod tests {
     use url::Url;
     use uuid::uuid;
 
+    use st0x_config::create_test_issuance_ctx;
     use st0x_config::{
         AssetsConfig, BrokerCtx, EquitiesConfig, EvmCtx, ExecutionThreshold, LogLevel, TradingMode,
     };
@@ -709,6 +710,7 @@ mod tests {
             },
             travel_rule: None,
             rest_api: None,
+            issuance: create_test_issuance_ctx(),
             redemption_wallet: None,
         }
     }

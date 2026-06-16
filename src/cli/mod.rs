@@ -1481,6 +1481,7 @@ mod tests {
     use crate::test_utils::{positive_shares, setup_test_db};
     use st0x_config::EvmCtx;
     use st0x_config::ExecutionThreshold;
+    use st0x_config::create_test_issuance_ctx;
     use st0x_config::{AssetsConfig, BrokerCtx, EquitiesConfig, LogLevel, TradingMode};
 
     fn create_test_ctx() -> Ctx {
@@ -1516,6 +1517,7 @@ mod tests {
             },
             travel_rule: None,
             rest_api: None,
+            issuance: create_test_issuance_ctx(),
             redemption_wallet: None,
         }
     }
@@ -2161,6 +2163,10 @@ mod tests {
 
                 [wallet]
                 private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+                [issuance]
+                base_url = "http://issuance.test:8000"
+                api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
             "#,
         )
         .unwrap();

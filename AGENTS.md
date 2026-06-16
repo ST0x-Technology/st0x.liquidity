@@ -420,9 +420,16 @@ Idempotency via `(tx_hash, log_index)` keys.
 Plaintext config (`--config`, see `example.config.toml`) and encrypted secrets
 (`--secrets`, see `example.secrets.toml`).
 
-**CRITICAL: No silent fallback defaults.** Unless explicitly told otherwise,
-every operational parameter must be explicitly configured -- missing config
-fields must fail in tests and at startup, not silently assume values.
+**CRITICAL: No silent fallback defaults.** Unless told otherwise, every
+operational parameter must be explicitly configured -- missing fields must fail
+in tests and at startup, never assume values.
+
+**CRITICAL: A secrets-schema change needs an encrypted-secret update.** When a
+field is added to or required in the secrets file, the deployed
+`secret/st0x-hedge.toml.age` (shared by prod + staging) must gain it before
+deploy, or the `validate-config` gate in `deploy.nix` fails the deploy closed.
+CI cannot see it, so reviewers and review-agents must treat a secrets-schema
+change with no matching `.age` update as a blocker.
 
 ### Naming Conventions
 
@@ -449,13 +456,11 @@ is the source of truth for terminology and naming conventions.
 - **Comprehensive Error Handling**: Custom error types (`OnChainError`,
   `AlpacaBrokerApiError`) with proper propagation
 - **CRITICAL: Onchain Transaction Confirmations**: All onchain operations must
-  explicitly wait for the configured number of confirmations before proceeding.
-  Load-balanced RPC providers (like dRPC) may route subsequent requests to
-  different nodes that haven't seen recent transactions yet. Use
-  `REQUIRED_CONFIRMATIONS` from `crate::onchain` and call
-  `.with_required_confirmations(self.required_confirmations).get_receipt()` on
-  all pending transactions. Never use bare `.get_receipt().await` in production
-  code paths.
+  wait for the configured confirmations -- load-balanced RPC providers (e.g.
+  dRPC) may route later requests to nodes that haven't seen the tx. Call
+  `.with_required_confirmations(self.required_confirmations).get_receipt()`
+  (count from `REQUIRED_CONFIRMATIONS` in `crate::onchain`) on all pending txs;
+  never bare `.get_receipt().await` in production.
 - **CRITICAL: CQRS/Event Sourcing Architecture**: **NEVER write directly to the
   `events` table** — no direct INSERTs, no manual sequence numbers, no bypassing
   `CqrsFramework`. Always use `CqrsFramework::execute()` or
