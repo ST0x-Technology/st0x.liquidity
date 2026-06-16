@@ -655,6 +655,11 @@ pub enum PositionError {
     )]
     PendingExecution { offchain_order_id: OffchainOrderId },
     #[error(
+        "Cannot acknowledge onchain fill: trade {trade_id} \
+         was already applied to this position"
+    )]
+    DuplicateTrade { trade_id: TradeId },
+    #[error(
         "Cannot manually adjust position: already have \
          pending execution {offchain_order_id:?}"
     )]
@@ -1348,6 +1353,61 @@ mod tests {
             .events();
 
         assert_eq!(events.len(), 1);
+    }
+
+    /// Reproduction for the double-count half of the Witness/Acknowledge
+    /// gap (ADR 0005): the position must reject a trade id it has
+    /// already applied. The resume path re-drives the acknowledge step
+    /// after a crash between the position write and the acknowledgement
+    /// marker; without this rejection the re-drive counts the same fill
+    /// twice.
+    #[tokio::test]
+    #[ignore = "fails until the exactly-once fill-accounting fix; un-ignored on the fix branch"]
+    async fn duplicate_acknowledge_on_chain_fill_is_rejected() {
+        let threshold = one_share_threshold();
+        let trade_id = TradeId {
+            tx_hash: TxHash::random(),
+            log_index: 1,
+        };
+
+        let error = TestHarness::<Position>::with(())
+            .given(vec![
+                PositionEvent::Initialized {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    threshold,
+                    initialized_at: Utc::now(),
+                },
+                PositionEvent::OnChainOrderFilled {
+                    trade_id: trade_id.clone(),
+                    amount: FractionalShares::new(float!(0.5)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: Utc::now(),
+                    seen_at: Utc::now(),
+                },
+            ])
+            .when(PositionCommand::AcknowledgeOnChainFill {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold,
+                trade_id: trade_id.clone(),
+                amount: FractionalShares::new(float!(0.5)),
+                direction: Direction::Buy,
+                price_usdc: float!(150),
+                block_timestamp: Utc::now(),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(PositionError::DuplicateTrade {
+                    trade_id: ref rejected
+                }) if *rejected == trade_id
+            ),
+            "Re-driving an already-applied trade must be rejected as a \
+             duplicate, not double-counted; got: {error:?}",
+        );
     }
 
     #[tokio::test]
