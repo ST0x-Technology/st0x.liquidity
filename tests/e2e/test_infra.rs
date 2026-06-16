@@ -100,6 +100,11 @@ pub struct TestInfra<P> {
     pub broker_service: Arc<AlpacaBrokerMock>,
     pub tokenization_service: AlpacaTokenizationMock,
     pub attestation_service: CctpAttestationMock,
+    /// Mock issuance freeze-status endpoint (always reports not-frozen) so the
+    /// rebalancing freeze guard lets e2e flows through. Kept alive for the test.
+    _issuance_service: httpmock::MockServer,
+    /// Base URL of `_issuance_service`, for wiring into the bot's issuance ctx.
+    pub issuance_base_url: url::Url,
     /// `(symbol, vault_address, underlying_address)` per deployed equity vault.
     pub equity_addresses: Vec<(String, Address, Address)>,
 }
@@ -167,6 +172,9 @@ impl TestInfra<()> {
 
         let attestation_service = CctpAttestationMock::start().await;
         debug!("CCTP attestation mock started");
+
+        let issuance_service = start_issuance_mock().await;
+        let issuance_base_url = issuance_service.base_url().parse()?;
         info!("Test infrastructure ready");
 
         Ok(TestInfra {
@@ -176,6 +184,8 @@ impl TestInfra<()> {
             broker_service,
             tokenization_service,
             attestation_service,
+            _issuance_service: issuance_service,
+            issuance_base_url,
             equity_addresses,
         })
     }
@@ -251,6 +261,21 @@ async fn start_broker_mock(
     debug!(broker_url = %broker_service.base_url(), "Broker mock started");
 
     Ok(broker_service)
+}
+
+/// Starts a mock issuance HTTP server whose freeze-status endpoint always
+/// reports the asset enabled and not frozen, so the rebalancing freeze guard
+/// lets e2e rebalancing flows proceed (production points this at real issuance).
+async fn start_issuance_mock() -> httpmock::MockServer {
+    let server = httpmock::MockServer::start_async().await;
+    server.mock(|when, then| {
+        when.method(httpmock::Method::GET);
+        then.status(200).json_body(serde_json::json!({
+            "underlying": "TEST",
+            "status": "enabled",
+        }));
+    });
+    server
 }
 
 type MockBrokerState = (Vec<(Symbol, Float)>, Vec<MockPosition>);
