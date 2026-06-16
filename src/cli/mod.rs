@@ -2,6 +2,7 @@
 
 mod alpaca_wallet;
 mod cctp;
+mod dividend;
 mod rebalancing;
 mod repair;
 mod submit;
@@ -263,6 +264,37 @@ pub enum Commands {
         quantity: Positive<FractionalShares>,
     },
 
+    /// Donate tokenized equity into its ERC-4626 wrapper to bump the wrapper NAV
+    ///
+    /// A bare transfer of the underlying into the vault raises its share price
+    /// (`convertToAssets`) without minting new wrapped shares -- the dividend /
+    /// corporate-action NAV bump. Point `--config`/`--secrets` at the dividend
+    /// turnkey wallet to fund it from issuance.
+    DonateEquity {
+        /// Stock symbol (e.g., AAPL, TSLA)
+        #[arg(short = 's', long = "symbol")]
+        symbol: Symbol,
+        /// Number of tokenized shares to donate into the wrapper (must be positive)
+        #[arg(short = 'q', long = "quantity", value_parser = parse_positive_shares)]
+        quantity: Positive<FractionalShares>,
+    },
+
+    /// Apply a dividend NAV bump in one step: buy the equity, tokenize it, and
+    /// donate it into the wrapper
+    ///
+    /// Runs buy -> tokenize -> donate in sequence, waiting for each step to
+    /// settle (buy fill, tokens onchain, donate receipt). Shares are tokenized
+    /// to and donated from the configured `[wallet]`; point `--config` /
+    /// `--secrets` at the issuer turnkey wallet.
+    DividendBump {
+        /// Stock symbol (e.g., AAPL, TSLA)
+        #[arg(short = 's', long = "symbol")]
+        symbol: Symbol,
+        /// Number of shares to buy, tokenize, and donate (must be positive)
+        #[arg(short = 'q', long = "quantity", value_parser = parse_positive_shares)]
+        quantity: Positive<FractionalShares>,
+    },
+
     /// Transfer USDC between trading venues (Raindex <-> Alpaca)
     ///
     /// Requires Alpaca broker and rebalancing environment variables.
@@ -504,15 +536,13 @@ pub enum Commands {
     /// This is an isolated test command that only interacts with Alpaca's API,
     /// without any Raindex/vault operations.
     AlpacaTokenize {
-        /// Stock symbol (e.g., AAPL, TSLA)
+        /// Stock symbol (e.g., AAPL, TSLA) -- resolves the tokenized-equity
+        /// address from `[assets.equities]`
         #[arg(short = 's', long = "symbol")]
         symbol: Symbol,
         /// Number of shares to tokenize (supports fractional shares)
         #[arg(short = 'q', long = "quantity")]
         quantity: FractionalShares,
-        /// Token contract address (to verify balance after tokenization)
-        #[arg(short = 't', long = "token")]
-        token: Address,
         /// Recipient wallet address (defaults to configured wallet address)
         #[arg(short = 'r', long = "recipient")]
         recipient: Option<Address>,
@@ -524,15 +554,13 @@ pub enum Commands {
     /// This is an isolated test command that only interacts with Alpaca's API,
     /// without any Raindex/vault operations.
     AlpacaRedeem {
-        /// Stock symbol (e.g., AAPL, TSLA)
+        /// Stock symbol (e.g., AAPL, TSLA) -- resolves the tokenized-equity
+        /// address from `[assets.equities]`
         #[arg(short = 's', long = "symbol")]
         symbol: Symbol,
         /// Number of shares to redeem (supports fractional shares)
         #[arg(short = 'q', long = "quantity")]
         quantity: FractionalShares,
-        /// Token contract address
-        #[arg(short = 't', long = "token")]
-        token: Address,
         /// Alpaca redemption wallet (overrides [tokenization] config)
         #[arg(long = "redemption-wallet")]
         redemption_wallet: Option<Address>,
@@ -738,6 +766,10 @@ enum SimpleCommand {
         quantity: Positive<FractionalShares>,
     },
     UnwrapEquity {
+        symbol: Symbol,
+        quantity: Positive<FractionalShares>,
+    },
+    DonateEquity {
         symbol: Symbol,
         quantity: Positive<FractionalShares>,
     },
@@ -950,14 +982,16 @@ enum ProviderCommand {
     AlpacaTokenize {
         symbol: Symbol,
         quantity: FractionalShares,
-        token: Address,
         recipient: Option<Address>,
     },
     AlpacaRedeem {
         symbol: Symbol,
         quantity: FractionalShares,
-        token: Address,
         redemption_wallet: Option<Address>,
+    },
+    DividendBump {
+        symbol: Symbol,
+        quantity: Positive<FractionalShares>,
     },
     AlpacaTokenizationRequests,
 }
@@ -1026,6 +1060,9 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
         }
         Commands::UnwrapEquity { symbol, quantity } => {
             Ok(SimpleCommand::UnwrapEquity { symbol, quantity })
+        }
+        Commands::DonateEquity { symbol, quantity } => {
+            Ok(SimpleCommand::DonateEquity { symbol, quantity })
         }
         Commands::AlpacaDeposit { amount } => Ok(SimpleCommand::AlpacaDeposit { amount }),
         Commands::AlpacaWithdraw { amount, to_address } => {
@@ -1097,25 +1134,24 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
         Commands::AlpacaTokenize {
             symbol,
             quantity,
-            token,
             recipient,
         } => Err(ProviderCommand::AlpacaTokenize {
             symbol,
             quantity,
-            token,
             recipient,
         }),
         Commands::AlpacaRedeem {
             symbol,
             quantity,
-            token,
             redemption_wallet,
         } => Err(ProviderCommand::AlpacaRedeem {
             symbol,
             quantity,
-            token,
             redemption_wallet,
         }),
+        Commands::DividendBump { symbol, quantity } => {
+            Err(ProviderCommand::DividendBump { symbol, quantity })
+        }
         Commands::OrderStatus { order_id } => Ok(SimpleCommand::OrderStatus { order_id }),
         Commands::Submit { to, data, yes } => Ok(SimpleCommand::Submit { to, data, yes }),
         Commands::RebuildView { aggregate, id, all } => {
@@ -1216,6 +1252,9 @@ async fn run_simple_command<W: Write>(
         }
         SimpleCommand::UnwrapEquity { symbol, quantity } => {
             wrapper::unwrap_equity_command(stdout, symbol, quantity, ctx).await
+        }
+        SimpleCommand::DonateEquity { symbol, quantity } => {
+            wrapper::donate_equity_command(stdout, symbol, quantity, ctx).await
         }
         SimpleCommand::AlpacaDeposit { amount } => {
             alpaca_wallet::alpaca_deposit_command::<OpenChainErrorRegistry, _>(stdout, amount, ctx)
@@ -1482,29 +1521,21 @@ async fn run_provider_command<W: Write>(
         ProviderCommand::AlpacaTokenize {
             symbol,
             quantity,
-            token,
             recipient,
         } => {
-            rebalancing::alpaca_tokenize_command(
-                stdout, symbol, quantity, token, recipient, ctx, provider,
-            )
-            .await
+            rebalancing::alpaca_tokenize_command(stdout, symbol, quantity, recipient, ctx, provider)
+                .await
         }
         ProviderCommand::AlpacaRedeem {
             symbol,
             quantity,
-            token,
             redemption_wallet,
         } => {
-            rebalancing::alpaca_redeem_command(
-                stdout,
-                symbol,
-                quantity,
-                token,
-                redemption_wallet,
-                ctx,
-            )
-            .await
+            rebalancing::alpaca_redeem_command(stdout, symbol, quantity, redemption_wallet, ctx)
+                .await
+        }
+        ProviderCommand::DividendBump { symbol, quantity } => {
+            dividend::dividend_bump_command(stdout, symbol, quantity, ctx, provider).await
         }
         ProviderCommand::AlpacaTokenizationRequests => {
             rebalancing::alpaca_tokenization_requests_command(stdout, ctx).await
@@ -1582,6 +1613,28 @@ mod tests {
             }
             other => panic!("expected buy command, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn dividend_bump_command_parses_symbol_and_quantity() {
+        let cli =
+            Cli::try_parse_from(["st0x-cli", "dividend-bump", "-s", "COIN", "-q", "10.5"]).unwrap();
+
+        match cli.command {
+            Commands::DividendBump { symbol, quantity } => {
+                assert_eq!(symbol, Symbol::new("COIN").unwrap());
+                assert_eq!(quantity, positive_shares("10.5"));
+            }
+            other => panic!("expected dividend-bump command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dividend_bump_command_rejects_zero_quantity() {
+        let error = Cli::try_parse_from(["st0x-cli", "dividend-bump", "-s", "COIN", "-q", "0"])
+            .unwrap_err();
+        let rendered = error.to_string();
+        assert!(rendered.contains('0'), "unexpected clap error: {rendered}");
     }
 
     #[test]
@@ -1671,6 +1724,7 @@ mod tests {
                 | ProviderCommand::ResetAllowance { .. }
                 | ProviderCommand::AlpacaTokenize { .. }
                 | ProviderCommand::AlpacaRedeem { .. }
+                | ProviderCommand::DividendBump { .. }
                 | ProviderCommand::AlpacaTokenizationRequests,
             ) => panic!("expected simple command classification"),
         }
@@ -1692,6 +1746,7 @@ mod tests {
                 | ProviderCommand::ResetAllowance { .. }
                 | ProviderCommand::AlpacaTokenize { .. }
                 | ProviderCommand::AlpacaRedeem { .. }
+                | ProviderCommand::DividendBump { .. }
                 | ProviderCommand::AlpacaTokenizationRequests,
             ) => panic!("expected process-tx provider command"),
             Ok(_) => panic!("expected provider command classification"),
@@ -1818,6 +1873,7 @@ mod tests {
                 | ProviderCommand::ResetAllowance { .. }
                 | ProviderCommand::AlpacaTokenize { .. }
                 | ProviderCommand::AlpacaRedeem { .. }
+                | ProviderCommand::DividendBump { .. }
                 | ProviderCommand::AlpacaTokenizationRequests,
             ) => panic!("expected simple command classification, got provider command"),
         }
@@ -1847,6 +1903,7 @@ mod tests {
                 | ProviderCommand::ResetAllowance { .. }
                 | ProviderCommand::AlpacaTokenize { .. }
                 | ProviderCommand::AlpacaRedeem { .. }
+                | ProviderCommand::DividendBump { .. }
                 | ProviderCommand::AlpacaTokenizationRequests,
             ) => panic!("expected simple command classification, got provider command"),
         }
@@ -1873,6 +1930,7 @@ mod tests {
                 | ProviderCommand::ResetAllowance { .. }
                 | ProviderCommand::AlpacaTokenize { .. }
                 | ProviderCommand::AlpacaRedeem { .. }
+                | ProviderCommand::DividendBump { .. }
                 | ProviderCommand::AlpacaTokenizationRequests,
             ) => panic!("expected simple command classification, got provider command"),
         }
@@ -2140,6 +2198,7 @@ mod tests {
                 | ProviderCommand::ResetAllowance { .. }
                 | ProviderCommand::AlpacaTokenize { .. }
                 | ProviderCommand::AlpacaRedeem { .. }
+                | ProviderCommand::DividendBump { .. }
                 | ProviderCommand::AlpacaTokenizationRequests,
             ) => panic!("expected simple command classification"),
         }

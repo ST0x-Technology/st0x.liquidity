@@ -15,6 +15,8 @@ let
 
   certDir = "/var/lib/tailscale-cert";
 
+  # `stox` runs the CLI as the market-making bot: it defaults to the deployed
+  # liquidity config/secrets so operators don't pass --config/--secrets.
   cli = pkgs.writeShellApplication {
     name = "stox";
     runtimeInputs = [ st0x-cli ];
@@ -22,6 +24,22 @@ let
       exec st0x-cli \
         --config "''${STOX_CONFIG:-/run/st0x/st0x-hedge.config}" \
         --secrets "''${STOX_SECRETS:-/run/agenix/st0x-hedge.toml}" \
+        "$@"
+    '';
+  };
+
+  # `s01` runs the same CLI as the issuer: it defaults to the issuer
+  # config/secrets (separate turnkey wallet + Alpaca account + DB) so the
+  # dividend bump (buy -> tokenize -> donate) is funded and signed by the
+  # issuer rather than the market-making wallet. Override with
+  # S01_CONFIG/S01_SECRETS to point at an ad-hoc issuer config.
+  s01 = pkgs.writeShellApplication {
+    name = "s01";
+    runtimeInputs = [ st0x-cli ];
+    text = ''
+      exec st0x-cli \
+        --config "''${S01_CONFIG:-/run/st0x/s01-issuer.config}" \
+        --secrets "''${S01_SECRETS:-/run/agenix/s01-issuer.toml}" \
         "$@"
     '';
   };
@@ -219,6 +237,7 @@ in
     vim
     zellij
     cli
+    s01
   ];
 
   system.stateVersion = "24.11";
