@@ -299,6 +299,11 @@
     }),
   )
 
+  // Each percentile line has one point per sampled time bucket, so the first
+  // line's point count is the number of buckets with samples. A trend needs at
+  // least two; a single bucket would otherwise render as a few floating dots.
+  const seriesBucketCount = $derived(seriesLayout.lines[0]?.points.length ?? 0)
+
   const rangeButtonClass = (active: boolean): string =>
     `rounded px-2 py-1 text-xs font-medium transition-colors ${active ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground hover:text-foreground'}`
 
@@ -515,9 +520,14 @@
       </div>
     </Card.Header>
     <Card.Content>
-      {#if (seriesLayout.lines[0]?.points.length ?? 0) === 0}
+      {#if seriesBucketCount === 0}
         <p class="py-6 text-center text-sm text-muted-foreground">
           No samples for this stage in the selected range.
+        </p>
+      {:else if seriesBucketCount === 1}
+        <p class="py-6 text-center text-sm text-muted-foreground">
+          Only one time bucket has samples in this range, so there's no trend to
+          plot yet. Widen the range or wait for more data to accumulate.
         </p>
       {:else}
         <div class="flex items-start gap-2">
