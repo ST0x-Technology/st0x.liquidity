@@ -426,7 +426,7 @@ pub struct Ctx {
     pub inventory_poll_interval: u64,
     /// Interval (seconds) between continuous `eth_getLogs` polls for orderbook
     /// fills. Each tick enqueues a backfill range over the unprocessed blocks
-    /// (capped at `tip - required_confirmations`).
+    /// (capped at the chain's latest finalized block).
     pub order_fill_poll_interval: u64,
     pub apalis_finished_job_cleanup_interval_secs: u64,
     pub broker: BrokerCtx,

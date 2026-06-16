@@ -196,15 +196,34 @@ where
     }
 }
 
+/// Derives the block to resume backfill from, given the persisted checkpoint
+/// (or its absence). Resumes at `checkpoint + 1` floored at `deployment_block`;
+/// a cold start with no checkpoint begins at `deployment_block`. Pure so a
+/// caller that already holds the checkpoint (the fill monitor's poll loop) can
+/// reuse it without a second read.
+pub(crate) fn backfill_start_from_checkpoint(
+    checkpoint: Option<u64>,
+    deployment_block: u64,
+) -> u64 {
+    checkpoint.map_or(deployment_block, |last_processed_block| {
+        (last_processed_block + 1).max(deployment_block)
+    })
+}
+
+/// Loads the checkpoint and derives the backfill resume point in one call.
+/// Test-only: production resolves the resume point in the fill monitor's poll
+/// loop, which already holds the checkpoint, via
+/// [`backfill_start_from_checkpoint`].
+#[cfg(test)]
 pub(crate) async fn backfill_start_block(
     pool: &SqlitePool,
     evm_ctx: &EvmCtx,
 ) -> Result<u64, OnChainError> {
-    load_backfill_checkpoint(pool, evm_ctx)
-        .await?
-        .map_or(Ok(evm_ctx.deployment_block), |last_processed_block| {
-            Ok((last_processed_block + 1).max(evm_ctx.deployment_block))
-        })
+    let checkpoint = load_backfill_checkpoint(pool, evm_ctx).await?;
+    Ok(backfill_start_from_checkpoint(
+        checkpoint,
+        evm_ctx.deployment_block,
+    ))
 }
 
 pub(crate) async fn load_backfill_checkpoint(
@@ -316,19 +335,19 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
         .chain(take_logs)
         .sorted_by_key(|log| (log.block_number, log.log_index))
         .filter(|log| {
-            // Callers cap `to_block` at the confirmation boundary,
-            // so `removed: true` here implies a deep reorg crossing
-            // that depth. Surface it loudly rather than silently
-            // ingesting; skip the log so we don't persist a vanished
-            // event.
+            // Callers cap `to_block` at the chain's finalized block,
+            // which cannot reorg, so `removed: true` here implies a
+            // reorg crossing finality. Surface it loudly rather than
+            // silently ingesting; skip the log so we don't persist a
+            // vanished event.
             if log.removed {
                 error!(
                     target: "orderbook",
                     tx_hash = ?log.transaction_hash,
                     log_index = ?log.log_index,
                     block_number = ?log.block_number,
-                    "Backfill returned `removed: true` for a log past the confirmation depth -- \
-                     deep reorg detected; skipping"
+                    "Backfill returned `removed: true` for a log past the finalized block -- \
+                     reorg crossing finality detected; skipping"
                 );
                 return false;
             }
@@ -494,6 +513,21 @@ mod tests {
         let start_block = backfill_start_block(&pool, &evm_ctx).await.unwrap();
 
         assert_eq!(start_block, 50);
+    }
+
+    #[test]
+    fn backfill_start_from_checkpoint_uses_deployment_block_without_checkpoint() {
+        assert_eq!(backfill_start_from_checkpoint(None, 50), 50);
+    }
+
+    #[test]
+    fn backfill_start_from_checkpoint_resumes_after_checkpoint() {
+        assert_eq!(backfill_start_from_checkpoint(Some(80), 50), 81);
+    }
+
+    #[test]
+    fn backfill_start_from_checkpoint_floors_at_deployment_block() {
+        assert_eq!(backfill_start_from_checkpoint(Some(20), 50), 50);
     }
 
     #[tokio::test]

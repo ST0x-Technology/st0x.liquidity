@@ -50,11 +50,15 @@ SupervisorBuilder::default()
 
 Defined in `src/conductor/monitor/order_fills.rs`. Drives continuous HTTP
 `eth_getLogs` ingestion of `ClearV3`/`TakeOrderV3` fills. It is a supervised
-interval task: every `order_fill_poll_interval` seconds it reads the chain tip,
-derives a cutoff at `tip - required_confirmations`, and enqueues a
-`BackfillRange` job for `(checkpoint+1, cutoff)`. The `backfill-worker` fetches
-the logs and pushes an `AccountForDexTrade` job per fill, advancing the
-persisted checkpoint only on success.
+interval task: every `order_fill_poll_interval` seconds it reads the chain's
+latest finalized block via `eth_getBlockByNumber("finalized")`, uses it as the
+cutoff, and enqueues a `BackfillRange` job for `(checkpoint+1, cutoff)` (no
+finalized block yet -> nothing enqueued). The `backfill-worker` fetches the logs
+and pushes an `AccountForDexTrade` job per fill, advancing the persisted
+checkpoint only on success. Capping at the finalized block is genuine
+single-chain reorg protection (a finalized block cannot reorg); it is unrelated
+to `required_confirmations`, which now governs only transaction-submission
+paths.
 
 ```rust
 struct OrderFillMonitor<P> {
@@ -274,13 +278,13 @@ restart, while the old vault remains registered so inventory polling can surface
 any stranded balance.
 
 Ingestion is checkpoint-driven `eth_getLogs` polling, not a live subscription,
-so no events are missed across downtime. Deriving the cutoff
-(`tip - required_confirmations`) is not a startup phase -- the
-`OrderFillMonitor` poll loop reads the chain tip every tick and enqueues a
-`BackfillRange` job for the gap since the persisted checkpoint. The backfill and
-trade-accounting workers start together in Phase 4; catch-up backfill runs
-continuously after spawn while the monitor always resumes from the persisted
-checkpoint and re-scans any gap.
+so no events are missed across downtime. Reading the finalized-block cutoff
+(`eth_getBlockByNumber("finalized")`) is not a startup phase -- the
+`OrderFillMonitor` poll loop reads the latest finalized block every tick and
+enqueues a `BackfillRange` job for the gap since the persisted checkpoint. The
+backfill and trade-accounting workers start together in Phase 4; catch-up
+backfill runs continuously after spawn while the monitor always resumes from the
+persisted checkpoint and re-scans any gap.
 
 Backfill reads the last successful checkpoint from SQLite. The configured
 `deployment_block` seeds only the first run; subsequent runs start at
