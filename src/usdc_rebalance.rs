@@ -85,7 +85,7 @@ use uuid::Uuid;
 use st0x_dto::{TransferOperation, UsdcBridgeOperation, UsdcBridgeStatus};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
 use st0x_execution::ClientOrderId;
-use st0x_finance::{Id, Usdc};
+use st0x_finance::{HasZero, Id, Usdc};
 
 use crate::alpaca_wallet::AlpacaTransferId;
 
@@ -165,6 +165,21 @@ pub(crate) enum UsdcRebalanceError {
     /// Withdrawal has not been confirmed yet
     #[error("Withdrawal has not been confirmed")]
     WithdrawalNotConfirmed,
+
+    /// `BeginBridging` carried a burn amount outside the valid actual-burn
+    /// range `(0, nominal]`. The manager only emits `0 < burn <= nominal`, so
+    /// this rejects a malformed event before it is persisted and trusted by
+    /// crash-safe resume.
+    #[error("burn amount {burn_amount} is outside the valid range (0, {nominal}]")]
+    InvalidBurnAmount { burn_amount: Usdc, nominal: Usdc },
+    /// A `BeginBridging` burn amount could not be compared against the nominal
+    /// amount because the underlying `Float` comparison errored. We fail closed
+    /// -- rejecting the event rather than letting `Usdc`'s `PartialOrd` collapse
+    /// the error to a silent "in range" -- so an un-comparable burn amount is
+    /// never persisted and trusted by crash-safe resume. `FloatError` is not
+    /// carried because this error must stay `Serialize`/`Eq` for the aggregate.
+    #[error("burn amount {burn_amount} could not be compared against nominal {nominal}")]
+    BurnAmountUncomparable { burn_amount: Usdc, nominal: Usdc },
     /// Bridging has not been initiated yet
     #[error("Bridging has not been initiated")]
     BridgingNotInitiated,
@@ -247,7 +262,10 @@ pub(crate) enum UsdcRebalanceCommand {
     /// Record the intent to burn for CCTP bridging BEFORE the on-chain call.
     /// Captures the chain head (`from_block`) for crash recovery, mirroring
     /// [`BeginWithdrawal`]. Valid only from `WithdrawalComplete` state.
-    BeginBridging { from_block: u64 },
+    BeginBridging {
+        from_block: u64,
+        burn_amount: Option<Usdc>,
+    },
     /// Record the CCTP burn transaction. Valid only from `BridgingSubmitting` state.
     InitiateBridging { burn_tx: TxHash },
     /// Record the Circle attestation. Valid from `Bridging` or
@@ -371,6 +389,10 @@ pub(crate) enum UsdcRebalanceEvent {
     BridgingSubmitting {
         from_block: u64,
         submitting_at: DateTime<Utc>,
+        /// Actual burn amount (received after Alpaca withdrawal fees).
+        /// `None` for events persisted before this field existed.
+        #[serde(default)]
+        burn_amount: Option<Usdc>,
     },
     /// CCTP burn transaction submitted. Records burn hash for attestation lookup.
     BridgingInitiated {
@@ -572,6 +594,10 @@ pub(crate) enum UsdcRebalance {
         amount: Usdc,
         from_block: u64,
         initiated_at: DateTime<Utc>,
+        /// Actual burn amount (received after Alpaca withdrawal fees).
+        /// `None` for aggregates persisted before this field existed.
+        #[serde(default)]
+        burn_amount: Option<Usdc>,
     },
     /// CCTP bridging has been initiated (burn transaction submitted)
     /// Note: cctp_nonce is not available here - it's only known after attestation.
@@ -1460,7 +1486,11 @@ impl EventSourced for UsdcRebalance {
             },
 
             (
-                BridgingSubmitting { from_block, .. },
+                BridgingSubmitting {
+                    from_block,
+                    burn_amount,
+                    ..
+                },
                 Self::WithdrawalComplete {
                     direction,
                     amount,
@@ -1472,6 +1502,7 @@ impl EventSourced for UsdcRebalance {
                 amount: *amount,
                 from_block: *from_block,
                 initiated_at: *initiated_at,
+                burn_amount: *burn_amount,
             },
 
             (
@@ -1483,9 +1514,28 @@ impl EventSourced for UsdcRebalance {
                     direction,
                     amount,
                     initiated_at,
+                    burn_amount,
                     ..
-                }
-                | Self::WithdrawalComplete {
+                },
+            ) => Self::Bridging {
+                direction: direction.clone(),
+                // Carry the actual burned amount (what was received after Alpaca
+                // withdrawal fees) into post-burn states so DTOs, recovery
+                // classification, and reconciliation see what was really burned,
+                // not the nominal. `None` for aggregates persisted before
+                // `burn_amount` existed, which fall back to the nominal amount.
+                amount: burn_amount.unwrap_or(*amount),
+                burn_tx_hash: *burn_tx_hash,
+                initiated_at: *initiated_at,
+                burned_at: *burned_at,
+            },
+
+            (
+                BridgingInitiated {
+                    burn_tx_hash,
+                    burned_at,
+                },
+                Self::WithdrawalComplete {
                     direction,
                     amount,
                     initiated_at,
@@ -1881,7 +1931,10 @@ impl EventSourced for UsdcRebalance {
                 self.transition_confirm_withdrawal(withdrawal_tx)
             }
             FailWithdrawal { reason } => self.transition_fail_withdrawal(reason),
-            BeginBridging { from_block } => self.transition_begin_bridging(from_block),
+            BeginBridging {
+                from_block,
+                burn_amount,
+            } => self.transition_begin_bridging(from_block, burn_amount),
             InitiateBridging { burn_tx } => self.transition_initiate_bridging(burn_tx),
             ReceiveAttestation {
                 attestation,
@@ -2133,6 +2186,7 @@ impl UsdcRebalance {
     fn transition_begin_bridging(
         &self,
         from_block: u64,
+        burn_amount: Option<Usdc>,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {
@@ -2142,10 +2196,48 @@ impl UsdcRebalance {
             | Self::WithdrawalSubmitting { .. }
             | Self::Withdrawing { .. }
             | Self::WithdrawalFailed { .. } => Err(UsdcRebalanceError::WithdrawalNotConfirmed),
-            Self::WithdrawalComplete { .. } => Ok(vec![BridgingSubmitting {
-                from_block,
-                submitting_at: Utc::now(),
-            }]),
+            Self::WithdrawalComplete { amount, .. } => {
+                // Reject a burn amount outside `(0, nominal]` before persisting:
+                // zero or above-nominal both signal a broken upstream invariant
+                // that crash-safe resume must not trust. `None` is the legacy
+                // path and stays accepted.
+                //
+                // Use the fallible `Float` comparisons and FAIL CLOSED: `Usdc`'s
+                // `PartialEq`/`PartialOrd` collapse a compare error to `false`,
+                // so a plain `==`/`>` would let an un-comparable burn amount slip
+                // through into durable `BridgingSubmitting`. A compare error is
+                // logged and surfaced as `BurnAmountUncomparable` instead.
+                if let Some(burn_amount) = burn_amount {
+                    let out_of_range = burn_amount
+                        .eq(&Usdc::ZERO)
+                        .and_then(|is_zero| Ok(is_zero || burn_amount.gt(amount)?))
+                        .inspect_err(|error| {
+                            warn!(
+                                ?error,
+                                %burn_amount,
+                                nominal = %amount,
+                                "Failed to compare burn amount against valid range; failing closed",
+                            );
+                        })
+                        .map_err(|_| UsdcRebalanceError::BurnAmountUncomparable {
+                            burn_amount,
+                            nominal: *amount,
+                        })?;
+
+                    if out_of_range {
+                        return Err(UsdcRebalanceError::InvalidBurnAmount {
+                            burn_amount,
+                            nominal: *amount,
+                        });
+                    }
+                }
+
+                Ok(vec![BridgingSubmitting {
+                    from_block,
+                    submitting_at: Utc::now(),
+                    burn_amount,
+                }])
+            }
             Self::BridgingSubmitting { .. }
             | Self::Bridging { .. }
             | Self::AwaitingAttestation { .. }
@@ -2950,7 +3042,10 @@ mod tests {
                     withdrawal_tx: None,
                 },
             ])
-            .when(UsdcRebalanceCommand::BeginBridging { from_block: 99 })
+            .when(UsdcRebalanceCommand::BeginBridging {
+                from_block: 99,
+                burn_amount: None,
+            })
             .await
             .events();
 
@@ -2983,6 +3078,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgingSubmitting {
                     from_block: 99,
                     submitting_at: Utc::now(),
+                    burn_amount: None,
                 },
             ])
             .when(UsdcRebalanceCommand::InitiateBridging { burn_tx })
@@ -3020,6 +3116,7 @@ mod tests {
             UsdcRebalanceEvent::BridgingSubmitting {
                 from_block: 99,
                 submitting_at: Utc::now(),
+                burn_amount: None,
             },
         ])
         .unwrap();
@@ -3027,6 +3124,236 @@ mod tests {
         assert!(
             matches!(state, Some(UsdcRebalance::BridgingSubmitting { from_block, .. }) if from_block == 99),
             "Expected BridgingSubmitting state after intent-first sequence, got {state:?}"
+        );
+    }
+
+    /// Hypothesis: `BeginBridging { burn_amount: Some(received) }` emits a
+    /// `BridgingSubmitting` event that carries `burn_amount: Some(received)`,
+    /// and replaying that event produces a `BridgingSubmitting` aggregate state
+    /// that also carries `burn_amount: Some(received)`.
+    #[tokio::test]
+    async fn begin_bridging_with_some_burn_amount_propagates_through_event_and_state() {
+        let received = Usdc::new(float!(998.00));
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc::new(float!(1000.00)),
+                    withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
+                },
+            ])
+            .when(UsdcRebalanceCommand::BeginBridging {
+                from_block: 42,
+                burn_amount: Some(received),
+            })
+            .await
+            .events();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::BridgingSubmitting {
+            from_block,
+            burn_amount,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected BridgingSubmitting event, got {:?}", events[0]);
+        };
+        assert_eq!(*from_block, 42);
+        assert_eq!(
+            *burn_amount,
+            Some(received),
+            "BridgingSubmitting event must carry burn_amount: Some(received)"
+        );
+
+        // Replay the emitted event and verify the aggregate state matches.
+        let state = replay::<UsdcRebalance>(vec![
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc::new(float!(1000.00)),
+                withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::WithdrawalConfirmed {
+                confirmed_at: Utc::now(),
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceEvent::BridgingSubmitting {
+                from_block: 42,
+                submitting_at: Utc::now(),
+                burn_amount: Some(received),
+            },
+        ])
+        .unwrap();
+
+        let Some(UsdcRebalance::BridgingSubmitting {
+            burn_amount: state_burn_amount,
+            ..
+        }) = state
+        else {
+            panic!("Expected BridgingSubmitting state; got: {state:?}");
+        };
+        assert_eq!(
+            state_burn_amount,
+            Some(received),
+            "Replayed BridgingSubmitting state must carry burn_amount: Some(received)"
+        );
+    }
+
+    /// After the burn is initiated, the `Bridging` state must carry the actual
+    /// burned amount (received after fees), not the nominal -- post-burn DTOs and
+    /// reconciliation downstream read `Bridging.amount`.
+    #[test]
+    fn bridging_state_carries_actual_burn_amount_not_nominal() {
+        let nominal = Usdc::new(float!(1000.00));
+        let received = Usdc::new(float!(998.00));
+
+        let state = replay::<UsdcRebalance>(vec![
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: nominal,
+                withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::WithdrawalConfirmed {
+                confirmed_at: Utc::now(),
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceEvent::BridgingSubmitting {
+                from_block: 42,
+                submitting_at: Utc::now(),
+                burn_amount: Some(received),
+            },
+            UsdcRebalanceEvent::BridgingInitiated {
+                burn_tx_hash: TxHash::ZERO,
+                burned_at: Utc::now(),
+            },
+        ])
+        .unwrap();
+
+        let Some(UsdcRebalance::Bridging { amount, .. }) = state else {
+            panic!("Expected Bridging state; got: {state:?}");
+        };
+        assert_eq!(
+            amount, received,
+            "Bridging.amount must be the actual burned amount, not the nominal"
+        );
+    }
+
+    /// A legacy `BridgingSubmitting` with `burn_amount: None` falls back to the
+    /// nominal amount when entering `Bridging`.
+    #[test]
+    fn bridging_state_falls_back_to_nominal_when_burn_amount_absent() {
+        let nominal = Usdc::new(float!(1000.00));
+
+        let state = replay::<UsdcRebalance>(vec![
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: nominal,
+                withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::WithdrawalConfirmed {
+                confirmed_at: Utc::now(),
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceEvent::BridgingSubmitting {
+                from_block: 42,
+                submitting_at: Utc::now(),
+                burn_amount: None,
+            },
+            UsdcRebalanceEvent::BridgingInitiated {
+                burn_tx_hash: TxHash::ZERO,
+                burned_at: Utc::now(),
+            },
+        ])
+        .unwrap();
+
+        let Some(UsdcRebalance::Bridging { amount, .. }) = state else {
+            panic!("Expected Bridging state; got: {state:?}");
+        };
+        assert_eq!(
+            amount, nominal,
+            "legacy burn_amount: None must use the nominal"
+        );
+    }
+
+    /// `BeginBridging` with a burn amount above the nominal is rejected before
+    /// any `BridgingSubmitting` event is persisted.
+    #[tokio::test]
+    async fn begin_bridging_rejects_burn_amount_above_nominal() {
+        let nominal = Usdc::new(float!(1000.00));
+        let above = Usdc::new(float!(1000.01));
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: nominal,
+                    withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
+                },
+            ])
+            .when(UsdcRebalanceCommand::BeginBridging {
+                from_block: 42,
+                burn_amount: Some(above),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(UsdcRebalanceError::InvalidBurnAmount { burn_amount, nominal: n })
+                    if burn_amount == above && n == nominal
+            ),
+            "expected InvalidBurnAmount for above-nominal burn, got: {error:?}"
+        );
+    }
+
+    /// `BeginBridging` with a zero burn amount is rejected before any
+    /// `BridgingSubmitting` event is persisted.
+    #[tokio::test]
+    async fn begin_bridging_rejects_zero_burn_amount() {
+        let nominal = Usdc::new(float!(1000.00));
+        let zero = Usdc::new(float!(0));
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![
+                UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: nominal,
+                    withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                    initiated_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::WithdrawalConfirmed {
+                    confirmed_at: Utc::now(),
+                    withdrawal_tx: None,
+                },
+            ])
+            .when(UsdcRebalanceCommand::BeginBridging {
+                from_block: 42,
+                burn_amount: Some(zero),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(UsdcRebalanceError::InvalidBurnAmount { burn_amount, nominal: n })
+                    if burn_amount == zero && n == nominal
+            ),
+            "expected InvalidBurnAmount for zero burn, got: {error:?}"
         );
     }
 
@@ -3666,6 +3993,7 @@ mod tests {
             amount,
             from_block: 100,
             initiated_at: now,
+            burn_amount: None,
         };
         assert_eq!(
             submitting.resumable_post_burn_transfer(),
@@ -7536,6 +7864,7 @@ mod tests {
                 amount,
                 from_block: 1,
                 initiated_at: now,
+                burn_amount: None,
             }
             .guard_recovery_tracking_data(),
             None,
@@ -7929,6 +8258,57 @@ mod tests {
         assert_eq!(withdrawal_tx, None);
     }
 
+    /// A `BridgingSubmitting` event persisted before `burn_amount` existed must
+    /// still deserialize, defaulting the field to `None` via `#[serde(default)]`.
+    /// Dropping the default would strand legacy in-flight bridging transfers.
+    #[test]
+    fn bridging_submitting_event_without_burn_amount_deserializes_to_none() {
+        let old_event = json!({
+            "BridgingSubmitting": {
+                "from_block": 42,
+                "submitting_at": "2026-01-01T00:00:00Z"
+            }
+        });
+
+        let event: UsdcRebalanceEvent =
+            from_value(old_event).expect("old BridgingSubmitting must still deserialize");
+
+        let UsdcRebalanceEvent::BridgingSubmitting { burn_amount, .. } = event else {
+            panic!("Expected BridgingSubmitting");
+        };
+        assert_eq!(burn_amount, None, "missing field must default to None");
+    }
+
+    /// State-level mirror: a `BridgingSubmitting` snapshot persisted before
+    /// `burn_amount` existed must still load, defaulting the field to `None`.
+    #[test]
+    fn bridging_submitting_snapshot_without_burn_amount_deserializes_to_none() {
+        let mut snapshot = to_value(UsdcRebalance::BridgingSubmitting {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc::new(float!(100.00)),
+            from_block: 42,
+            initiated_at: Utc::now(),
+            burn_amount: Some(Usdc::new(float!(99.99))),
+        })
+        .expect("BridgingSubmitting state serializes");
+
+        // Simulate a snapshot persisted before the `burn_amount` field existed.
+        snapshot
+            .get_mut("BridgingSubmitting")
+            .and_then(|value| value.as_object_mut())
+            .expect("externally-tagged BridgingSubmitting object")
+            .remove("burn_amount");
+
+        let state = from_value::<UsdcRebalance>(snapshot)
+            .expect("pre-field BridgingSubmitting snapshot must still load");
+
+        let UsdcRebalance::BridgingSubmitting { burn_amount, .. } = state else {
+            panic!("expected BridgingSubmitting, got {state:?}");
+        };
+
+        assert_eq!(burn_amount, None);
+    }
+
     /// T4: BeginBridging from WithdrawalComplete (AlpacaToBase direction) emits
     /// BridgingSubmitting and transitions to BridgingSubmitting state carrying
     /// direction: AlpacaToBase.
@@ -7949,7 +8329,10 @@ mod tests {
                     withdrawal_tx: None,
                 },
             ])
-            .when(UsdcRebalanceCommand::BeginBridging { from_block: 42 })
+            .when(UsdcRebalanceCommand::BeginBridging {
+                from_block: 42,
+                burn_amount: None,
+            })
             .await
             .events();
 
@@ -8009,6 +8392,7 @@ mod tests {
                 UsdcRebalanceEvent::BridgingSubmitting {
                     from_block: 42,
                     submitting_at: Utc::now(),
+                    burn_amount: None,
                 },
             ])
             .when(UsdcRebalanceCommand::InitiateBridging { burn_tx })
@@ -8035,6 +8419,7 @@ mod tests {
             UsdcRebalanceEvent::BridgingSubmitting {
                 from_block: 42,
                 submitting_at: Utc::now(),
+                burn_amount: None,
             },
             events[0].clone(),
         ])

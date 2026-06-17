@@ -131,14 +131,25 @@ pub(crate) enum UsdcTransferError {
         id: crate::usdc_rebalance::UsdcRebalanceId,
     },
     #[error(
-        "USDC rebalance {id}: market-maker Ethereum wallet holds {actual} USDC \
-         but {required} is required for the CCTP burn; waiting for withdrawal \
-         to settle on-chain"
+        "USDC rebalance {id}: market-maker Ethereum wallet holds zero USDC; \
+         any non-zero balance will unblock the CCTP burn \
+         (nominal amount: {nominal}); waiting for withdrawal to settle on-chain"
     )]
-    WalletUsdcInsufficient {
+    WalletUsdcInsufficient { id: UsdcRebalanceId, nominal: Usdc },
+    /// The wallet holds MORE USDC than the nominal amount for this rebalance.
+    /// The wallet-empty-between-rebalances invariant is broken: ambient or
+    /// residual USDC from a prior rebalance is present and cannot be
+    /// distinguished from this withdrawal's funds. The aggregate is moved to
+    /// `BridgingFailed` for operator reconciliation; no burn is attempted.
+    #[error(
+        "USDC rebalance {id}: market-maker wallet holds {balance} USDC, \
+         which exceeds the nominal {nominal}; ambient/residual USDC detected \
+         (wallet-empty invariant broken); failed for operator reconciliation"
+    )]
+    WalletUsdcAmbientBalance {
         id: UsdcRebalanceId,
-        required: alloy::primitives::U256,
-        actual: alloy::primitives::U256,
+        balance: Usdc,
+        nominal: Usdc,
     },
     #[error(
         "USDC rebalance {id}: withdrawal tx {tx} has only {actual} confirmations, \

@@ -12574,7 +12574,13 @@ mod tests {
             .await
             .unwrap();
         store
-            .send(&id, UsdcRebalanceCommand::BeginBridging { from_block: 99 })
+            .send(
+                &id,
+                UsdcRebalanceCommand::BeginBridging {
+                    from_block: 99,
+                    burn_amount: None,
+                },
+            )
             .await
             .unwrap();
 
