@@ -267,26 +267,22 @@ where
     async fn perform(&self, ctx: &Ctx) -> Result<Self::Output, Self::Error>;
 }
 
-/// Builds a `Worker` for a `Job<Ctx>` impl.
+/// Shared worker-construction body for [`build_supervised_worker!`] and
+/// [`build_best_effort_worker!`]. Not part of the public crate API; always
+/// called via one of the two public macros. Must be exported so the outer
+/// macros can call it from expansion sites in sibling modules.
 ///
-/// Mirrors the `work::<Ctx, Job>` turbofish style: pass the same two
-/// types and the macro expands to a fully-wired worker (queue backend,
-/// retry policy, fail-stop circuit breaker, terminal-failure notifier,
-/// `.build(work::<Ctx, Job>)`).
-///
-/// A macro because `.build()` returns a deeply-nested
-/// `Worker<Args, Ctx, Backend, Svc, Middleware>` whose `Svc` and
-/// `Middleware` types accumulate from the layer stack and have no
-/// public alias or `impl Trait` shorthand. Macro expansion lets the
-/// compiler infer the type at the call site.
-macro_rules! build_supervised_worker {
+/// `$on_event:expr` must be a value of type
+/// `impl Fn(&WorkerContext, &Event) + Send + Sync + 'static`, produced by
+/// either [`on_terminal_failure`] or [`on_terminal_failure_log_only`].
+macro_rules! build_worker_inner {
     (
         ::<$ctx_type:ty, $job:ty>,
         $index:expr,
         $queue:expr,
         $ctx:expr,
-        $fail_stop:expr,
-        $failure_notify:expr
+        $circuit:expr,
+        $on_event:expr
         $(, $failure_injector:expr)? $(,)?
     ) => {{
         use ::apalis::layers::WorkerBuilderExt;
@@ -316,16 +312,93 @@ macro_rules! build_supervised_worker {
                 RetryPolicy::retries(3)
                     .with_backoff($crate::conductor::job::RETRY_BACKOFF.clone()),
             )
-            .break_circuit_with($fail_stop)
-            .on_event($crate::conductor::job::on_terminal_failure(
-                $failure_notify,
-                <$job as $crate::conductor::job::Job<$ctx_type>>::TERMINAL_FAILURE_MSG,
-            ))
+            .break_circuit_with($circuit)
+            .on_event($on_event)
             .build($crate::conductor::job::work::<$ctx_type, $job>)
     }};
 }
 
+pub(crate) use build_worker_inner;
+
+/// Builds a `Worker` for a `Job<Ctx>` impl.
+///
+/// Mirrors the `work::<Ctx, Job>` turbofish style: pass the same two
+/// types and the macro expands to a fully-wired worker (queue backend,
+/// retry policy, fail-stop circuit breaker, terminal-failure notifier,
+/// `.build(work::<Ctx, Job>)`).
+///
+/// A macro because `.build()` returns a deeply-nested
+/// `Worker<Args, Ctx, Backend, Svc, Middleware>` whose `Svc` and
+/// `Middleware` types accumulate from the layer stack and have no
+/// public alias or `impl Trait` shorthand. Macro expansion lets the
+/// compiler infer the type at the call site.
+macro_rules! build_supervised_worker {
+    (
+        ::<$ctx_type:ty, $job:ty>,
+        $index:expr,
+        $queue:expr,
+        $ctx:expr,
+        $fail_stop:expr,
+        $failure_notify:expr
+        $(, $failure_injector:expr)? $(,)?
+    ) => {{
+        build_worker_inner!(
+            ::<$ctx_type, $job>,
+            $index,
+            $queue,
+            $ctx,
+            $fail_stop,
+            $crate::conductor::job::on_terminal_failure(
+                $failure_notify,
+                <$job as $crate::conductor::job::Job<$ctx_type>>::TERMINAL_FAILURE_MSG,
+            )
+            $(, $failure_injector)?
+        )
+    }};
+}
+
 pub(crate) use build_supervised_worker;
+
+/// Builds a best-effort `Worker` for a `Job<Ctx>` impl.
+///
+/// Identical to [`build_supervised_worker!`] but uses
+/// [`on_terminal_failure_log_only`] instead of [`on_terminal_failure`]:
+/// a terminal job failure is logged at `error!` level but does NOT trip the
+/// conductor-wide fail-stop and does NOT stop the worker.
+///
+/// Callers MUST pass a permissive `CircuitBreakerConfig` (e.g. high
+/// `failure_threshold`, short `recovery_timeout`) so a single failing job
+/// does not latch the worker idle for a long period. Passing the conductor-wide
+/// fail-stop config (threshold 1, 1-year timeout) would silently neutralise
+/// the best-effort guarantee.
+///
+/// Use for background recovery workers (e.g. `ResumeTokenizationAggregate`)
+/// where a persistently failing individual job must not block processing of
+/// sibling jobs or bring down hedging and fill detection.
+macro_rules! build_best_effort_worker {
+    (
+        ::<$ctx_type:ty, $job:ty>,
+        $index:expr,
+        $queue:expr,
+        $ctx:expr,
+        $circuit:expr
+        $(, $failure_injector:expr)? $(,)?
+    ) => {{
+        build_worker_inner!(
+            ::<$ctx_type, $job>,
+            $index,
+            $queue,
+            $ctx,
+            $circuit,
+            $crate::conductor::job::on_terminal_failure_log_only(
+                <$job as $crate::conductor::job::Job<$ctx_type>>::TERMINAL_FAILURE_MSG,
+            )
+            $(, $failure_injector)?
+        )
+    }};
+}
+
+pub(crate) use build_best_effort_worker;
 
 /// Human-readable identifier for an enqueued job, used in structured logging.
 #[derive(Debug)]
@@ -368,6 +441,7 @@ pub enum JobKind {
     TransferUsdcToMarketMaking,
     TransferEquityToMarketMaking,
     TransferEquityToHedging,
+    ResumeTokenizationAggregate,
 }
 
 /// Job execution error. Wraps the concrete `Job::Error` type at
@@ -408,6 +482,7 @@ pub struct FailureInjector {
     transfer_usdc_to_market_making: Arc<Mutex<InjectionState>>,
     transfer_equity_to_market_making: Arc<Mutex<InjectionState>>,
     transfer_equity_to_hedging: Arc<Mutex<InjectionState>>,
+    resume_tokenization_aggregate: Arc<Mutex<InjectionState>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -446,6 +521,7 @@ impl FailureInjector {
             transfer_usdc_to_market_making: Arc::new(Mutex::new(InjectionState::Idle)),
             transfer_equity_to_market_making: Arc::new(Mutex::new(InjectionState::Idle)),
             transfer_equity_to_hedging: Arc::new(Mutex::new(InjectionState::Idle)),
+            resume_tokenization_aggregate: Arc::new(Mutex::new(InjectionState::Idle)),
         }
     }
 
@@ -496,6 +572,7 @@ impl FailureInjector {
             JobKind::TransferUsdcToMarketMaking => &self.transfer_usdc_to_market_making,
             JobKind::TransferEquityToMarketMaking => &self.transfer_equity_to_market_making,
             JobKind::TransferEquityToHedging => &self.transfer_equity_to_hedging,
+            JobKind::ResumeTokenizationAggregate => &self.resume_tokenization_aggregate,
         };
 
         match mutex.lock() {
@@ -583,6 +660,27 @@ pub(crate) fn on_terminal_failure(
             error!(%err, worker = %ctx.name(), "{error_msg}");
             failure_notify.notify_waiters();
             let _ = ctx.stop();
+        }
+    }
+}
+
+/// On-event handler for workers where terminal failure must not crash the
+/// conductor. Logs the error at `error!` level but does NOT call
+/// `failure_notify.notify_waiters()` and does NOT call `ctx.stop()`.
+/// Used for best-effort background workers (e.g. `ResumeTokenizationAggregate`)
+/// where a persistently failing individual job should not bring down hedging
+/// and fill detection. The worker circuit-breaker config must also be
+/// permissive — see [`build_best_effort_worker!`].
+///
+/// Structural invariant: unlike [`on_terminal_failure`], this function takes
+/// no `Notify` argument and therefore can never call `notify_waiters()` or
+/// `ctx.stop()`, regardless of how it is called.
+pub(crate) fn on_terminal_failure_log_only(
+    error_msg: &'static str,
+) -> impl Fn(&WorkerContext, &Event) + Send + Sync + 'static {
+    move |ctx, event| {
+        if let Event::Error(err) = event {
+            error!(%err, worker = %ctx.name(), "{error_msg}");
         }
     }
 }
@@ -777,6 +875,7 @@ mod tests {
 
     struct TestCtx {
         success_count: AtomicUsize,
+        success_notify: Arc<tokio::sync::Notify>,
     }
 
     impl Job<TestCtx> for TestJob {
@@ -796,6 +895,7 @@ mod tests {
             }
 
             ctx.success_count.fetch_add(1, Ordering::SeqCst);
+            ctx.success_notify.notify_waiters();
             Ok(())
         }
     }
@@ -816,6 +916,7 @@ mod tests {
 
         let ctx = Arc::new(TestCtx {
             success_count: AtomicUsize::new(0),
+            success_notify: Arc::new(tokio::sync::Notify::new()),
         });
         let ctx_for_assert = ctx.clone();
 
@@ -923,6 +1024,83 @@ mod tests {
                 "pending".to_string(),
                 "running".to_string()
             ]
+        );
+    }
+
+    /// With a permissive circuit-breaker config, a terminally-failing job does
+    /// NOT latch the worker idle: the circuit opens briefly (short
+    /// `recovery_timeout`) and then closes so subsequent jobs can run. This is
+    /// the key behavioral contract of the best-effort worker design.
+    ///
+    /// Regression test: the previous code passed the conductor-wide fail-stop
+    /// config (threshold 1, 1-year timeout) to the best-effort worker,
+    /// permanently blocking all sibling jobs after the first terminal failure.
+    ///
+    /// Goes through `build_best_effort_worker!` with the same permissive
+    /// `CircuitBreakerConfig` that `register_resume_tokenization_worker` in
+    /// `conductor/builder.rs` constructs, so the test validates the real
+    /// production path.
+    #[tokio::test]
+    async fn best_effort_circuit_does_not_latch_on_single_terminal_failure() {
+        let apalis_pool = setup_test_apalis_pool().await;
+
+        let mut queue: JobQueue<TestJob> = JobQueue::new(&apalis_pool);
+        // Failing job first, then a successful one. With a permissive circuit
+        // breaker (threshold = u32::MAX), the second job must still complete.
+        queue.push(TestJob { should_fail: true }).await.unwrap();
+        queue.push(TestJob { should_fail: false }).await.unwrap();
+
+        // success_notify is wired into TestCtx; TestJob::perform calls
+        // notify_waiters() after each successful run.
+        let success_notify = Arc::new(tokio::sync::Notify::new());
+        let ctx = Arc::new(TestCtx {
+            success_count: AtomicUsize::new(0),
+            success_notify: success_notify.clone(),
+        });
+        let ctx_for_assert = ctx.clone();
+
+        // Mirror the production config from register_resume_tokenization_worker:
+        // high threshold + short recovery so a single failure reopens the circuit
+        // quickly but does not permanently latch the worker idle.
+        let best_effort_circuit = CircuitBreakerConfig::default()
+            .with_failure_threshold(u32::MAX)
+            .with_recovery_timeout(Duration::from_secs(10));
+
+        let monitor_handle = tokio::spawn({
+            let monitor = Monitor::new()
+                .should_restart(|_ctx, _error, _attempt| false)
+                .register(move |index| {
+                    build_best_effort_worker!(
+                        ::<TestCtx, TestJob>,
+                        index,
+                        queue.clone(),
+                        ctx.clone(),
+                        best_effort_circuit.clone(),
+                        FailureInjector::new(),
+                    )
+                });
+            async move { monitor.run().await }
+        });
+
+        // Wait deterministically for the successful job to complete.
+        // TestJob::perform fires success_notify after incrementing success_count,
+        // so this unblocks as soon as job 2 succeeds -- no fixed sleep needed.
+        //
+        // The 30s budget accounts for the production RETRY_BACKOFF baked into
+        // build_best_effort_worker! via build_worker_inner!: 3 retries at 1s,
+        // 2s, 4s = 7s before the failing job goes terminal, plus the 10s
+        // recovery_timeout before the circuit closes. 30s gives ~3x headroom
+        // over the 17s worst case so the test is not flaky under CI load.
+        tokio::time::timeout(Duration::from_secs(30), success_notify.notified())
+            .await
+            .expect("second job must complete within 30s; circuit must not latch indefinitely");
+
+        monitor_handle.abort();
+
+        assert_eq!(
+            ctx_for_assert.success_count.load(Ordering::SeqCst),
+            1,
+            "second job must complete even after the first job terminally fails;              a permissive circuit breaker must not latch idle on a single failure"
         );
     }
 
