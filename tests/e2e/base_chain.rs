@@ -19,8 +19,9 @@ use rain_math_float::Float;
 use std::collections::HashMap;
 
 use st0x_evm::test_chain::{evm_mapping_slot, solidity_short_string};
+pub use st0x_evm::{IERC20, USDC_BASE};
+pub use st0x_hedge::bindings::DeployableERC20;
 use st0x_hedge::bindings::IRaindexV6::{self, TakeOrderV3};
-pub use st0x_hedge::bindings::{DeployableERC20, IERC20};
 use st0x_hedge::bindings::{Deployer, Interpreter, Parser, RaindexV6, Store as RainStore};
 
 /// Rounds a Float to `decimals` decimal places and formats as a string.
@@ -43,10 +44,6 @@ fn format_float(value: Float) -> anyhow::Result<String> {
         .format_with_scientific(false)
         .map_err(|err| anyhow::anyhow!("format_with_scientific failed: {err:?}"))
 }
-
-/// Base chain USDC address, defined locally so e2e tests don't
-/// need `st0x_hedge` to export the constant.
-pub const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
 
 // Rainlang interpreter components deploy to deterministic "zoltu" addresses; the
 // expression deployer references the parser/store/interpreter by these hardcoded
