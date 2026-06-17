@@ -31,25 +31,30 @@ use alloy::primitives::{Address, TxHash};
 use std::sync::Arc;
 use tracing::error;
 
-use st0x_execution::{AlpacaAccountId, Positive};
 use st0x_finance::Usdc;
 
-pub(crate) use client::{AlpacaWalletClient, AlpacaWalletError};
-pub(crate) use status::PollingConfig;
-pub(crate) use transfer::{AlpacaTransferId, Network, TokenSymbol, Transfer, TransferStatus};
-pub(crate) use whitelist::{TravelRuleInfo, WhitelistEntry, WhitelistStatus};
+use crate::{AlpacaAccountId, Positive};
+
+#[cfg(any(test, feature = "test-support"))]
+pub use client::AlpacaWalletClient;
+#[cfg(not(any(test, feature = "test-support")))]
+use client::AlpacaWalletClient;
+pub use client::AlpacaWalletError;
+pub use status::PollingConfig;
+pub use transfer::{AlpacaTransferId, Network, TokenSymbol, Transfer, TransferStatus};
+pub use whitelist::{TravelRuleInfo, WhitelistEntry, WhitelistStatus};
 
 /// Service facade for Alpaca crypto wallet operations.
 ///
 /// Provides a high-level API for deposit address lookup, deposits, withdrawals,
 /// and transfer polling.
-pub(crate) struct AlpacaWalletService {
+pub struct AlpacaWalletService {
     client: Arc<AlpacaWalletClient>,
     polling_config: PollingConfig,
 }
 
 impl AlpacaWalletService {
-    pub(crate) fn new(
+    pub fn new(
         base_url: String,
         account_id: AlpacaAccountId,
         api_key: String,
@@ -63,8 +68,8 @@ impl AlpacaWalletService {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_with_client(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new_with_client(
         client: AlpacaWalletClient,
         polling_config: Option<PollingConfig>,
     ) -> Self {
@@ -83,7 +88,7 @@ impl AlpacaWalletService {
     /// Returns an error if:
     /// - The address is not whitelisted and approved
     /// - The API call fails
-    pub(crate) async fn initiate_withdrawal(
+    pub async fn initiate_withdrawal(
         &self,
         amount: Positive<Usdc>,
         asset: &TokenSymbol,
@@ -116,7 +121,7 @@ impl AlpacaWalletService {
     /// - The transfer times out
     /// - An invalid status regression is detected
     /// - The API call fails persistently
-    pub(crate) async fn poll_transfer_until_complete(
+    pub async fn poll_transfer_until_complete(
         &self,
         transfer_id: &AlpacaTransferId,
     ) -> Result<Transfer, AlpacaWalletError> {
@@ -133,14 +138,14 @@ impl AlpacaWalletService {
     /// Returns an error if:
     /// - The deposit times out (not detected within timeout)
     /// - The API call fails persistently
-    pub(crate) async fn poll_deposit_by_tx_hash(
+    pub async fn poll_deposit_by_tx_hash(
         &self,
         tx_hash: &TxHash,
     ) -> Result<Transfer, AlpacaWalletError> {
         status::poll_deposit_by_tx_hash(&self.client, tx_hash, &self.polling_config).await
     }
 
-    pub(crate) async fn get_wallet_address(
+    pub async fn get_wallet_address(
         &self,
         asset: &TokenSymbol,
         network: &Network,
@@ -148,7 +153,7 @@ impl AlpacaWalletService {
         self.client.get_wallet_address(asset, network).await
     }
 
-    pub(crate) async fn create_whitelist_entry(
+    pub async fn create_whitelist_entry(
         &self,
         address: &Address,
         asset: &TokenSymbol,
@@ -164,7 +169,7 @@ impl AlpacaWalletService {
     ///
     /// Returns the entries that were deleted. Errors if no entries
     /// match the address.
-    pub(crate) async fn remove_whitelist_entries(
+    pub async fn remove_whitelist_entries(
         &self,
         address: &Address,
     ) -> Result<Vec<whitelist::WhitelistEntry>, AlpacaWalletError> {
@@ -189,7 +194,7 @@ impl AlpacaWalletService {
     /// Patches travel rule info on all existing whitelisted addresses.
     ///
     /// Returns all whitelist entries that were patched.
-    pub(crate) async fn patch_all_whitelist_travel_rules(
+    pub async fn patch_all_whitelist_travel_rules(
         &self,
         travel_rule_info: &TravelRuleInfo,
     ) -> Result<Vec<whitelist::WhitelistEntry>, AlpacaWalletError> {
@@ -214,14 +219,14 @@ impl AlpacaWalletService {
     }
 
     /// Gets all whitelisted addresses for this account.
-    pub(crate) async fn get_whitelisted_addresses(
+    pub async fn get_whitelisted_addresses(
         &self,
     ) -> Result<Vec<whitelist::WhitelistEntry>, AlpacaWalletError> {
         self.client.get_whitelisted_addresses().await
     }
 
     /// Lists all transfers for this account.
-    pub(crate) async fn list_all_transfers(&self) -> Result<Vec<Transfer>, AlpacaWalletError> {
+    pub async fn list_all_transfers(&self) -> Result<Vec<Transfer>, AlpacaWalletError> {
         transfer::list_all_transfers(&self.client).await
     }
 }
@@ -234,7 +239,7 @@ mod tests {
     use std::time::Duration;
     use uuid::{Uuid, uuid};
 
-    use st0x_execution::AlpacaAccountId;
+    use crate::AlpacaAccountId;
 
     use super::*;
     use st0x_float_macro::float;

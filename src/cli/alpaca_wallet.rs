@@ -7,17 +7,14 @@ use uuid::Uuid;
 
 use st0x_evm::{Evm, IERC20, IntoErrorRegistry, USDC_ETHEREUM, USDC_ETHEREUM_SEPOLIA, Wallet};
 use st0x_execution::{
-    AlpacaAccountId, AlpacaBrokerApi, ClientOrderId, ConversionDirection, Executor,
-    FractionalShares, Positive, Symbol,
+    AlpacaAccountId, AlpacaBrokerApi, AlpacaWalletService, ClientOrderId, ConversionDirection,
+    Executor, FractionalShares, Network, Positive, Symbol, TokenSymbol, TransferStatus,
+    TravelRuleInfo, WhitelistEntry, WhitelistStatus,
 };
 use st0x_finance::Usdc;
 use st0x_float_serde::format_float_with_fallback;
 
 use super::ConvertDirection;
-use crate::alpaca_wallet::{
-    AlpacaWalletService, Network, TokenSymbol, TransferStatus, TravelRuleInfo, WhitelistEntry,
-    WhitelistStatus,
-};
 use st0x_config::{BrokerCtx, Ctx};
 
 pub(super) async fn alpaca_deposit_command<Registry: IntoErrorRegistry, W: Write>(
@@ -357,7 +354,7 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
             "missing [broker.travel_rule] in config -- required for Alpaca whitelist creation"
         )
     })?;
-    let travel_rule_info = TravelRuleInfo::from_config(travel_rule_config);
+    let travel_rule_info = TravelRuleInfo::new(travel_rule_config.beneficiary_entity_name.clone());
 
     let alpaca_wallet = AlpacaWalletService::new(
         alpaca_auth.base_url().to_string(),
@@ -461,7 +458,7 @@ pub(super) async fn alpaca_whitelist_patch_travel_rule_command<W: Write>(
             "missing [broker.travel_rule] in config -- required for travel rule patching"
         )
     })?;
-    let travel_rule_info = TravelRuleInfo::from_config(travel_rule_config);
+    let travel_rule_info = TravelRuleInfo::new(travel_rule_config.beneficiary_entity_name.clone());
 
     writeln!(
         stdout,

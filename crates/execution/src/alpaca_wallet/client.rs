@@ -7,10 +7,9 @@ use reqwest::{Client, Method, Response, StatusCode};
 use thiserror::Error;
 use tracing::{trace, warn};
 
-use st0x_execution::AlpacaAccountId;
-
 use super::transfer::{AlpacaTransferId, Network, TokenSymbol, TransferStatus};
 use super::whitelist::{TravelRuleInfo, WhitelistEntry, WhitelistStatus};
+use crate::AlpacaAccountId;
 
 #[derive(Debug, Error)]
 pub enum AlpacaWalletError {
@@ -70,7 +69,7 @@ pub struct AlpacaWalletClient {
 }
 
 impl AlpacaWalletClient {
-    pub(crate) fn new(
+    pub fn new(
         base_url: String,
         account_id: AlpacaAccountId,
         api_key: String,
@@ -380,8 +379,6 @@ mod tests {
     use httpmock::prelude::*;
     use serde_json::json;
     use uuid::uuid;
-
-    use st0x_config::TravelRuleConfig;
 
     use super::*;
 
@@ -780,9 +777,7 @@ mod tests {
     async fn test_patch_whitelist_travel_rule_sends_expected_body() {
         let server = MockServer::start();
 
-        let travel_rule = TravelRuleInfo::from_config(&TravelRuleConfig {
-            beneficiary_entity_name: "Acme Corp".to_string(),
-        });
+        let travel_rule = TravelRuleInfo::new("Acme Corp".to_string());
 
         let whitelist_id = "wl-abc-123";
 
