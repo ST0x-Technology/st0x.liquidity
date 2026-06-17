@@ -17,15 +17,13 @@ use st0x_bridge::{Attestation, Bridge, BridgeDirection, BurnReceipt, MintReceipt
 use st0x_event_sorcery::Store;
 use st0x_evm::{USDC_BASE, Wallet};
 use st0x_execution::{
-    AlpacaBrokerApi, ClientOrderId, ConversionDirection, CryptoOrderOutcome, Positive,
+    AlpacaBrokerApi, AlpacaTransferId, AlpacaWalletService, ClientOrderId, ConversionDirection,
+    CryptoOrderOutcome, Network, Positive, TokenSymbol, Transfer, TransferStatus,
 };
 use st0x_finance::Usdc;
 use st0x_raindex::{Raindex, RaindexService, RaindexVaultId};
 
 use super::UsdcTransferError;
-use crate::alpaca_wallet::{
-    AlpacaTransferId, AlpacaWalletService, Network, TokenSymbol, Transfer, TransferStatus,
-};
 use crate::usdc_rebalance::{
     RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
 };
@@ -2930,12 +2928,10 @@ mod tests {
     use st0x_event_sorcery::{AggregateError, LifecycleError, test_store};
     use st0x_evm::local::RawPrivateKeyWallet;
     use st0x_evm::{Evm, IERC20, NoOpErrorRegistry, Wallet};
+    use st0x_execution::{AlpacaTransferId, AlpacaWalletClient, AlpacaWalletError, PollingConfig};
     use st0x_raindex::RaindexService;
 
     use super::*;
-    use crate::alpaca_wallet::{
-        AlpacaTransferId, AlpacaWalletClient, AlpacaWalletError, PollingConfig,
-    };
     use crate::usdc_rebalance::{RebalanceDirection, TransferRef, UsdcRebalanceError};
     use st0x_finance::UsdcConversionError;
 

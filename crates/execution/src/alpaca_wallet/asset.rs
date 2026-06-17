@@ -47,7 +47,7 @@ mod tests {
     use serde_json::json;
     use uuid::uuid;
 
-    use st0x_execution::AlpacaAccountId;
+    use crate::AlpacaAccountId;
 
     use super::*;
 

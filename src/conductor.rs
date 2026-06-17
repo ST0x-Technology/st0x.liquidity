@@ -33,13 +33,13 @@ use st0x_event_sorcery::{
 };
 use st0x_evm::{USDC_BASE, Wallet};
 use st0x_execution::{
-    ClientOrderId, CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason,
-    ExecutionError, Executor, FractionalShares, MarketOrder, Symbol, TryIntoExecutor,
+    AlpacaWalletService, ClientOrderId, CounterTradePreflight, CounterTradeReservation,
+    CounterTradeSkipReason, ExecutionError, Executor, FractionalShares, MarketOrder, Symbol,
+    TryIntoExecutor,
 };
 use st0x_raindex::{RaindexService, RaindexVaultId};
 use st0x_wrapper::WrapperService;
 
-use crate::alpaca_wallet::AlpacaWalletService;
 use crate::conductor::exit::{ConductorExit, MonitorTaskError};
 use crate::conductor::monitor::order_fills::{FinalityProbe, probe_finalized_block_support};
 use crate::dashboard::Broadcaster;

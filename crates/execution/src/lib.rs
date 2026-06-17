@@ -18,6 +18,7 @@ pub use st0x_float_macro::float;
 
 pub mod alpaca_broker_api;
 mod alpaca_market_data;
+mod alpaca_wallet;
 pub mod error;
 pub mod mock;
 pub mod order;
@@ -32,6 +33,13 @@ pub use mock::{MockExecutor, MockExecutorCtx};
 pub use order::{
     ClientOrderId, ClientOrderIdError, MarketOrder, OrderPlacement, OrderState, OrderStatus,
     OrderUpdate,
+};
+
+#[cfg(any(test, feature = "test-support"))]
+pub use alpaca_wallet::AlpacaWalletClient;
+pub use alpaca_wallet::{
+    AlpacaTransferId, AlpacaWalletError, AlpacaWalletService, Network, PollingConfig, TokenSymbol,
+    Transfer, TransferStatus, TravelRuleInfo, WhitelistEntry, WhitelistStatus,
 };
 
 pub use st0x_finance::{

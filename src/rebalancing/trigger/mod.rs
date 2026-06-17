@@ -4262,14 +4262,14 @@ mod tests {
         EntityList, Never, Reactor, ReactorHarness, TestStore, deps, test_store,
     };
     use st0x_execution::{
-        ClientOrderId, Direction, ExecutorOrderId, HasZero, Positive, SupportedExecutor,
+        AlpacaTransferId, ClientOrderId, Direction, ExecutorOrderId, HasZero, Positive,
+        SupportedExecutor,
     };
     use st0x_finance::{Usd, Usdc};
     use st0x_float_macro::float;
     use st0x_wrapper::MockWrapper;
 
     use super::*;
-    use crate::alpaca_wallet::AlpacaTransferId;
     use crate::conductor::job::Job;
     use crate::equity_redemption::{DetectionFailure, redemption_aggregate_id};
     use crate::inventory::snapshot::{
@@ -14088,7 +14088,7 @@ mod tests {
         let store = TestStore::<UsdcRebalance>::with_reactor(Arc::clone(&spy));
 
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let transfer_id = crate::alpaca_wallet::AlpacaTransferId::from(Uuid::new_v4());
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
         let tx_hash =
             fixed_bytes!("0x3333333333333333333333333333333333333333333333333333333333333333");
 
