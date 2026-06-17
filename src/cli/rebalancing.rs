@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 use st0x_event_sorcery::StoreBuilder;
-use st0x_evm::{Evm, OpenChainErrorRegistry, ReadOnlyEvm};
+use st0x_evm::{Evm, IERC20, OpenChainErrorRegistry, ReadOnlyEvm, USDC_BASE, USDC_ETHEREUM};
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Executor, FractionalShares, Symbol,
     TimeInForce,
@@ -24,9 +24,7 @@ use st0x_wrapper::{Wrapper, WrapperService};
 
 use super::{TransferDirection, TransferType};
 use crate::alpaca_wallet::AlpacaWalletService;
-use crate::bindings::IERC20;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId};
-use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::rebalancing::equity::{CrossVenueEquityTransfer, EquityTransferServices};
 use crate::rebalancing::to_wrapped_equities;
 use crate::rebalancing::usdc::{CrossVenueCashTransfer, UsdcSettlementParams, UsdcTransferError};

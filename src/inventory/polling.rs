@@ -17,16 +17,14 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use tracing::{debug, warn};
 
 use st0x_event_sorcery::{SendError, Store};
-use st0x_evm::{Evm, EvmError, OpenChainErrorRegistry, Wallet};
+use st0x_evm::{Evm, EvmError, IERC20, OpenChainErrorRegistry, USDC_BASE, USDC_ETHEREUM, Wallet};
 use st0x_execution::{Executor, FractionalShares, InventoryResult, SharesConversionError, Symbol};
 use st0x_finance::{HasZero, Usd, UsdToCentsError, Usdc};
 use st0x_raindex::{RaindexError, RaindexService, RaindexVaultId};
 
-use crate::bindings::IERC20;
 use crate::inventory::snapshot::{
     InventorySnapshot, InventorySnapshotCommand, InventorySnapshotId,
 };
-use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::rebalancing::usdc::{UsdcTransferError, u256_to_usdc};
 use crate::tokenization::{TokenizationRequestType, Tokenizer, TokenizerError};
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};

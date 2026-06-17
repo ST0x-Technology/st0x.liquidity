@@ -477,12 +477,12 @@ mod tests {
     use alloy::sol_types::SolCall;
     use rain_math_float::Float;
 
+    use st0x_evm::IPyth::getPriceUnsafeCall;
+    use st0x_evm::PythStructs::Price;
     use st0x_evm::ReadOnlyEvm;
 
     use super::*;
-    use crate::bindings::IPyth::getPriceUnsafeCall;
     use crate::bindings::IRaindexV6;
-    use crate::bindings::PythStructs::Price;
     use crate::symbol::cache::SymbolCache;
     use st0x_config::EvmCtx;
     use st0x_float_macro::float;

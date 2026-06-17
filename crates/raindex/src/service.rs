@@ -23,11 +23,11 @@ use async_trait::async_trait;
 use rain_math_float::Float;
 use tracing::{debug, info};
 
-use st0x_evm::{Evm, IntoErrorRegistry, OpenChainErrorRegistry, Wallet};
+use st0x_evm::{Evm, IntoErrorRegistry, OpenChainErrorRegistry, USDC_BASE, Wallet};
 use st0x_execution::FractionalShares;
 use st0x_finance::Usdc;
 
-use crate::{Raindex, RaindexError, RaindexVaultId, USDC_BASE};
+use crate::{Raindex, RaindexError, RaindexVaultId};
 
 sol!(
     #![sol(all_derives = true, rpc)]

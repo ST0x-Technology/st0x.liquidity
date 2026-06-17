@@ -7,13 +7,10 @@ use std::io::Write;
 use thiserror::Error;
 
 use st0x_config::Ctx;
-use st0x_evm::{Evm, OpenChainErrorRegistry};
+use st0x_evm::{Evm, IERC20, OpenChainErrorRegistry, USDC_BASE};
 use st0x_float_macro::float;
 use st0x_float_serde::format_float_with_fallback;
 use st0x_raindex::{Raindex, RaindexService, RaindexVaultId};
-
-use crate::bindings::IERC20;
-use crate::onchain::USDC_BASE;
 
 pub(super) struct Deposit {
     pub(super) amount: Float,
@@ -194,12 +191,12 @@ mod tests {
     use alloy::sol_types::SolCall;
     use url::Url;
 
+    use st0x_evm::IERC20::decimalsCall;
     use st0x_evm::ReadOnlyEvm;
 
     use st0x_finance::Usdc;
 
     use super::*;
-    use crate::bindings::IERC20::decimalsCall;
     use crate::inventory::ImbalanceThreshold;
     use st0x_config::EvmCtx;
     use st0x_config::ExecutionThreshold;
@@ -573,7 +570,7 @@ mod tests {
             "Expected vault ID in output (proving lookup succeeded), got: {output}"
         );
         assert!(
-            output.contains(&crate::onchain::USDC_BASE.to_string()),
+            output.contains(&USDC_BASE.to_string()),
             "Expected USDC token in output, got: {output}"
         );
     }

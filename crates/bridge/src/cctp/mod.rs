@@ -1051,12 +1051,10 @@ mod tests {
     use rand::Rng;
     use st0x_evm::NoOpErrorRegistry;
     use st0x_evm::local::RawPrivateKeyWallet;
+    use st0x_evm::{USDC_BASE, USDC_ETHEREUM};
 
     use super::*;
     use crate::{Attestation, Bridge};
-
-    const USDC_ETHEREUM: Address = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
-    const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
 
     fn setup_anvil() -> (AnvilInstance, String, B256) {
         let anvil = Anvil::new().spawn();
